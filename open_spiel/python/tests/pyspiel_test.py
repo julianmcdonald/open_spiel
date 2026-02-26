@@ -67,6 +67,7 @@ EXPECTED_MANDATORY_GAMES = frozenset([
     "deep_sea",
     "dots_and_boxes",
     "dou_dizhu",
+    "dune_imperium",
     "efg_game",
     "einstein_wurfelt_nicht",
     "euchre",

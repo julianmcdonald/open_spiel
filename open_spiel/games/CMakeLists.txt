@@ -236,6 +236,11 @@ if (${OPEN_SPIEL_BUILD_WITH_ACPC})
 endif()
 
 
+list(APPEND GAME_SOURCES
+  dune_imperium/dune_imperium.cc
+  dune_imperium/dune_imperium.h
+)
+
 add_library (games OBJECT ${GAME_SOURCES})
 
 target_include_directories (games PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -731,3 +736,8 @@ add_test(y_test y_test)
 add_executable(yacht_test yacht/yacht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(yacht_test yacht_test)
+
+add_executable(dune_imperium_test dune_imperium/dune_imperium_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_test dune_imperium_test)
+
