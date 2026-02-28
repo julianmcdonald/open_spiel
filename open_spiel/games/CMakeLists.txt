@@ -239,6 +239,20 @@ endif()
 list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium.cc
   dune_imperium/dune_imperium.h
+  dune_imperium/dune_imperium_board.cc
+  dune_imperium/dune_imperium_board.h
+  dune_imperium/dune_imperium_cards.cc
+  dune_imperium/dune_imperium_cards.h
+  dune_imperium/dune_imperium_common.cc
+  dune_imperium/dune_imperium_common.h
+  dune_imperium/dune_imperium_state_agent.cc
+  dune_imperium/dune_imperium_state_combat.cc
+  dune_imperium/dune_imperium_state_intrigue.cc
+  dune_imperium/dune_imperium_state_reveal.cc
+  dune_imperium/dune_imperium_state_tech.cc
+  dune_imperium/dune_imperium_state_util.cc
+  dune_imperium/dune_imperium_util.cc
+  dune_imperium/dune_imperium_util.h
 )
 
 add_library (games OBJECT ${GAME_SOURCES})
@@ -737,7 +751,23 @@ add_executable(yacht_test yacht/yacht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(yacht_test yacht_test)
 
-add_executable(dune_imperium_test dune_imperium/dune_imperium_test.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_test dune_imperium/dune_imperium_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_test dune_imperium_test)
+
+add_executable(dune_imperium_board_spaces_test dune_imperium/dune_imperium_board_spaces_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_board_spaces_test dune_imperium_board_spaces_test)
+
+add_executable(dune_imperium_cards_test dune_imperium/dune_imperium_cards_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_cards_test dune_imperium_cards_test)
+
+add_executable(dune_imperium_cards2_test dune_imperium/dune_imperium_cards2_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_cards2_test dune_imperium_cards2_test)
+
+add_executable(dune_imperium_leaders_test dune_imperium/dune_imperium_leaders_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_leaders_test dune_imperium_leaders_test)
 
