@@ -255,6 +255,16 @@ list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium_util.h
 )
 
+list(APPEND GAME_SOURCES
+  dune_imperium/dune_imperium.cc
+  dune_imperium/dune_imperium.h
+  dune_imperium/dune_imperium_cards.cc
+  dune_imperium/dune_imperium_cards.h
+  dune_imperium/dune_imperium_board.cc
+  dune_imperium/dune_imperium_board.h
+  dune_imperium/dune_imperium_state_util.cc
+)
+
 add_library (games OBJECT ${GAME_SOURCES})
 
 target_include_directories (games PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -767,7 +777,12 @@ add_executable(dune_imperium_cards2_test dune_imperium/dune_imperium_cards2_test
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_cards2_test dune_imperium_cards2_test)
 
+add_executable(dune_imperium_intrigue_test dune_imperium/dune_imperium_intrigue_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_intrigue_test dune_imperium_intrigue_test)
+
 add_executable(dune_imperium_leaders_test dune_imperium/dune_imperium_leaders_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_leaders_test dune_imperium_leaders_test)
+
 
