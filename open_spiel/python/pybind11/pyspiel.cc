@@ -51,6 +51,7 @@
 #include "open_spiel/python/pybind11/games_crazy_eights.h"
 #include "open_spiel/python/pybind11/games_crazyhouse.h"
 #include "open_spiel/python/pybind11/games_dots_and_boxes.h"
+#include "open_spiel/python/pybind11/games_dune_imperium.h"
 #include "open_spiel/python/pybind11/games_euchre.h"
 #include "open_spiel/python/pybind11/games_gin_rummy.h"
 #include "open_spiel/python/pybind11/games_go.h"
@@ -773,6 +774,7 @@ PYBIND11_MODULE(pyspiel, m) {
   init_pyspiel_games_connect_four(m);
   init_pyspiel_games_crazy_eights(m);
   init_pyspiel_games_dots_and_boxes(m);
+  init_pyspiel_games_dune_imperium(m);
   init_pyspiel_games_euchre(m);
   init_pyspiel_games_gin_rummy(m);
   init_pyspiel_games_go(m);
