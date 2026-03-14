@@ -21,6 +21,7 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_content.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include "open_spiel/spiel.h"
 #include "pybind11/include/pybind11/pybind11.h"
 #include "pybind11/include/pybind11/stl.h"
@@ -39,6 +40,15 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
 
   // ---- Enums ----
 
+  // --- Structs & Helpers ---
+  py::class_<open_spiel::dune_imperium::IntrigueCard>(di, "IntrigueCard")
+      .def_readonly("id", &open_spiel::dune_imperium::IntrigueCard::id)
+      .def_readonly("name", &open_spiel::dune_imperium::IntrigueCard::name)
+      .def_readonly("combat_strength_bonus", &open_spiel::dune_imperium::IntrigueCard::combat_strength_bonus);
+
+  di.def("get_intrigue_card", [](int id) -> const open_spiel::dune_imperium::IntrigueCard* {
+    return open_spiel::dune_imperium::FindIntrigueCardById(id);
+  }, py::arg("id"), py::return_value_policy::reference_internal);
   py::enum_<GamePhase>(di, "GamePhase")
     .value("LEADER_OFFER_CHANCE", GamePhase::kLeaderOfferChance)
     .value("LEADER_DRAFT", GamePhase::kLeaderDraft)
