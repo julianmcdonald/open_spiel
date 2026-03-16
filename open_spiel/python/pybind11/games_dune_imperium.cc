@@ -197,6 +197,34 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"), py::return_value_policy::reference_internal)
     .def("get_player_discard", &DuneImperiumState::GetPlayerDiscardForTesting,
          py::arg("player"), py::return_value_policy::reference_internal)
+    .def("set_player_discard", &DuneImperiumState::SetPlayerDiscardForTesting,
+         py::arg("player"), py::arg("discard"))
+
+    // --- Deck Pool (opponent card probability tracking) ---
+    .def("set_deck_pool_total_cards",
+         &DuneImperiumState::SetDeckPoolTotalCardsForTesting,
+         py::arg("player"), py::arg("cards"))
+    .def("get_deck_pool_total_cards",
+         &DuneImperiumState::GetDeckPoolTotalCardsForTesting,
+         py::arg("player"))
+    .def("set_deck_pool_discard",
+         &DuneImperiumState::SetDeckPoolDiscardForTesting,
+         py::arg("player"), py::arg("cards"))
+    .def("get_deck_pool_discard",
+         &DuneImperiumState::GetDeckPoolDiscardForTesting,
+         py::arg("player"))
+    .def("set_deck_pool_draw_deck",
+         &DuneImperiumState::SetDeckPoolDrawDeckForTesting,
+         py::arg("player"), py::arg("cards"))
+    .def("get_deck_pool_draw_deck",
+         &DuneImperiumState::GetDeckPoolDrawDeckForTesting,
+         py::arg("player"))
+    .def("set_deck_pool_cards_drawn",
+         &DuneImperiumState::SetDeckPoolCardsDrawnForTesting,
+         py::arg("player"), py::arg("count"))
+    .def("get_deck_pool_cards_drawn",
+         &DuneImperiumState::GetDeckPoolCardsDrawnForTesting,
+         py::arg("player"))
     .def("get_imperium_row", &DuneImperiumState::GetImperiumRowForTesting,
          py::return_value_policy::reference_internal)
     .def("get_imperium_draw_deck", &DuneImperiumState::GetImperiumDrawDeckForTesting,
@@ -254,6 +282,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("combat_intrigue_bonus", &DuneImperiumState::CombatIntrigueBonus,
          py::arg("player"))
+    .def("set_combat_intrigue_bonus",
+         &DuneImperiumState::SetCombatIntrigueBonusForTesting,
+         py::arg("player"), py::arg("bonus"))
     .def("get_reveal_persuasion_bonus",
          &DuneImperiumState::GetRevealPersuasionBonusForTesting,
          py::arg("player"))
@@ -264,6 +295,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_played_agent_cards", &DuneImperiumState::GetPlayedAgentCardsForTesting,
          py::arg("player"), py::return_value_policy::reference_internal)
     .def("has_swordmaster", &DuneImperiumState::HasSwordmaster,
+         py::arg("player"))
+    .def("has_high_council", &DuneImperiumState::HasHighCouncil,
          py::arg("player"))
     .def("get_player_solari_direct", &DuneImperiumState::GetPlayerSolari,
          py::arg("player"))
