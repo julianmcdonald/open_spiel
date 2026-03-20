@@ -323,6 +323,20 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("get_win_reward_solari", &DuneImperiumState::GetWinRewardSolariForTesting,
          py::arg("player"))
+    .def("get_vladimir_secret_factions",
+         &DuneImperiumState::GetVladimirSecretFactionsForTesting,
+         py::arg("player"))
+    .def("get_vladimir_revealed",
+         &DuneImperiumState::GetVladimirRevealedForTesting,
+         py::arg("player"))
+    .def("get_hundro_player",
+         &DuneImperiumState::GetHundroPlayerForTesting)
+    .def("get_hundro_known_drawn_intrigue",
+         &DuneImperiumState::GetHundroKnownDrawnIntrigueForTesting,
+         py::arg("player"))
+    .def("get_intrigue_deck_top_cards",
+         &DuneImperiumState::GetIntrigueDeckTopCardsForTesting,
+         py::return_value_policy::reference_internal)
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
