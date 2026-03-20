@@ -321,6 +321,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("space_action"))
     .def("get_tleilaxu_track", &DuneImperiumState::GetTleilaxuTrackForTesting,
          py::arg("player"))
+    .def("get_research_top_pos", &DuneImperiumState::GetResearchTopPosForTesting,
+         py::arg("player"))
+    .def("get_research_bottom_col", &DuneImperiumState::GetResearchBottomColForTesting,
+         py::arg("player"))
+    .def("get_research_bottom_row", &DuneImperiumState::GetResearchBottomRowForTesting,
+         py::arg("player"))
     .def("get_win_reward_solari", &DuneImperiumState::GetWinRewardSolariForTesting,
          py::arg("player"))
     .def("get_vladimir_secret_factions",
