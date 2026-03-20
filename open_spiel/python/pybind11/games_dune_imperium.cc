@@ -263,6 +263,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("get_bonus_spice", &DuneImperiumState::GetBonusSpiceForTesting,
          py::arg("space_action"))
+    .def("get_tech_market", &DuneImperiumState::GetTechMarketForTesting,
+         py::return_value_policy::reference_internal)
     .def("get_tech_negotiators", &DuneImperiumState::GetTechNegotiatorsForTesting,
          py::arg("player"))
     .def("get_player_agents_remaining",
