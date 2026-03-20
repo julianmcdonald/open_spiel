@@ -263,6 +263,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("get_player_tech_tiles", &DuneImperiumState::GetPlayerTechTilesForTesting,
          py::arg("player"))
+    .def("is_tech_flipped", &DuneImperiumState::IsTechFlippedForTesting,
+         py::arg("player"), py::arg("tech_id"))
     .def("get_bonus_spice", &DuneImperiumState::GetBonusSpiceForTesting,
          py::arg("space_action"))
     .def("get_tech_market", &DuneImperiumState::GetTechMarketForTesting,
@@ -343,6 +345,15 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_intrigue_deck_top_cards",
          &DuneImperiumState::GetIntrigueDeckTopCardsForTesting,
          py::return_value_policy::reference_internal)
+    .def("get_tessia_snooper_tokens",
+         [](const DuneImperiumState& state, int player) {
+           auto tokens = state.GetTessiaSnooperTokens(player);
+           return std::vector<bool>(tokens.begin(), tokens.end());
+         },
+         py::arg("player"))
+    .def("get_tessia_rewards_claimed",
+         &DuneImperiumState::GetTessiaSnooperRewardsClaimed,
+         py::arg("player"))
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
