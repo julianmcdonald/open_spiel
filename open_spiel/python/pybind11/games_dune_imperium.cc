@@ -227,6 +227,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("get_imperium_row", &DuneImperiumState::GetImperiumRowForTesting,
          py::return_value_policy::reference_internal)
+    .def("get_tleilaxu_row", &DuneImperiumState::GetTleilaxuRowForTesting,
+         py::return_value_policy::reference_internal)
     .def("get_imperium_draw_deck", &DuneImperiumState::GetImperiumDrawDeckForTesting,
          py::return_value_policy::reference_internal)
     .def("get_imperium_discard", &DuneImperiumState::GetImperiumDiscardForTesting,
