@@ -354,6 +354,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_tessia_rewards_claimed",
          &DuneImperiumState::GetTessiaSnooperRewardsClaimed,
          py::arg("player"))
+    .def("get_paul_known_top_card",
+         &DuneImperiumState::GetPaulKnownTopCardForTesting,
+         py::arg("player"))
+    .def("set_paul_known_top_card",
+         &DuneImperiumState::SetPaulKnownTopCardForTesting,
+         py::arg("player"), py::arg("card_id"))
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
