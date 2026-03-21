@@ -286,6 +286,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("combat_card_bonus", &DuneImperiumState::CombatCardBonus,
          py::arg("player"))
+    .def("set_combat_card_bonus",
+         &DuneImperiumState::SetCombatCardBonusForTesting,
+         py::arg("player"), py::arg("bonus"))
     .def("combat_intrigue_bonus", &DuneImperiumState::CombatIntrigueBonus,
          py::arg("player"))
     .def("set_combat_intrigue_bonus",
