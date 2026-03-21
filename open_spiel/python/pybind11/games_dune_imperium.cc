@@ -348,6 +348,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_intrigue_deck_top_cards",
          &DuneImperiumState::GetIntrigueDeckTopCardsForTesting,
          py::return_value_policy::reference_internal)
+    .def("set_intrigue_deck_top_cards",
+         &DuneImperiumState::SetIntrigueDeckTopCardsForTesting,
+         py::arg("cards"))
+    .def("set_hundro_player",
+         &DuneImperiumState::SetHundroPlayerForTesting,
+         py::arg("player"))
     .def("get_tessia_snooper_tokens",
          [](const DuneImperiumState& state, int player) {
            auto tokens = state.GetTessiaSnooperTokens(player);
