@@ -387,6 +387,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("set_paul_known_top_card",
          &DuneImperiumState::SetPaulKnownTopCardForTesting,
          py::arg("player"), py::arg("card_id"))
+    .def("get_player_trashed_cards",
+         &DuneImperiumState::GetPlayerTrashedCards,
+         py::arg("player"))
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
