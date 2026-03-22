@@ -22,6 +22,7 @@
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_content.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_util.h"
 #include "open_spiel/spiel.h"
 #include "pybind11/include/pybind11/pybind11.h"
 #include "pybind11/include/pybind11/stl.h"
@@ -34,6 +35,7 @@ using open_spiel::dune_imperium::DuneImperiumGame;
 using open_spiel::dune_imperium::GamePhase;
 using open_spiel::dune_imperium::Faction;
 using open_spiel::dune_imperium::LeaderId;
+using open_spiel::dune_imperium::ImperiumCard;
 
 void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
   py::module_ di = m.def_submodule("dune_imperium");
@@ -48,6 +50,18 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
 
   di.def("get_intrigue_card", [](int id) -> const open_spiel::dune_imperium::IntrigueCard* {
     return open_spiel::dune_imperium::FindIntrigueCardById(id);
+  }, py::arg("id"), py::return_value_policy::reference_internal);
+
+  py::class_<ImperiumCard>(di, "ImperiumCard")
+      .def_readonly("id", &ImperiumCard::id)
+      .def_readonly("name", &ImperiumCard::name)
+      .def_readonly("agent_swords", &ImperiumCard::agent_swords)
+      .def_readonly("reveal_swords", &ImperiumCard::reveal_swords)
+      .def_readonly("reveal_troops", &ImperiumCard::reveal_troops)
+      .def_readonly("agent_troops", &ImperiumCard::agent_troops);
+
+  di.def("get_imperium_card", [](int id) -> const ImperiumCard* {
+    return open_spiel::dune_imperium::FindImperiumCardById(id);
   }, py::arg("id"), py::return_value_policy::reference_internal);
   py::enum_<GamePhase>(di, "GamePhase")
     .value("LEADER_OFFER_CHANCE", GamePhase::kLeaderOfferChance)
@@ -396,5 +410,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("total_troops", &DuneImperiumState::TotalTroopsForTesting,
          py::arg("player"))
     .def("lose_troops", &DuneImperiumState::LoseTroopsForTesting,
-         py::arg("player"), py::arg("count"));
+         py::arg("player"), py::arg("count"))
+    .def("combat_strength", [](const DuneImperiumState& s, int player) {
+      return open_spiel::dune_imperium::CombatStrength(s, player);
+    }, py::arg("player"));
 }
