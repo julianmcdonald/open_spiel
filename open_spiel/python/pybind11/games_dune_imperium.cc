@@ -233,6 +233,10 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::return_value_policy::reference_internal)
     .def("get_imperium_discard", &DuneImperiumState::GetImperiumDiscardForTesting,
          py::return_value_policy::reference_internal)
+    .def("get_intrigue_discard", &DuneImperiumState::GetIntrigueDiscardForTesting,
+         py::return_value_policy::reference_internal)
+    .def("set_intrigue_discard", &DuneImperiumState::SetIntrigueDiscardForTesting,
+         py::arg("discard"))
     .def("get_intrigue_hand", &DuneImperiumState::GetIntrigueHandForTesting,
          py::arg("player"), py::return_value_policy::reference_internal)
     .def("get_intrigue_draw_deck", &DuneImperiumState::GetIntrigueDrawDeckForTesting,
