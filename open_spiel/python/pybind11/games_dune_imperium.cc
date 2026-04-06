@@ -214,6 +214,15 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("set_player_discard", &DuneImperiumState::SetPlayerDiscardForTesting,
          py::arg("player"), py::arg("discard"))
 
+    // --- Revealed zone injection (OCR bridge) ---
+    .def("get_revealed_cards",
+         &DuneImperiumState::GetRevealedCardsForTesting,
+         py::arg("player"),
+         py::return_value_policy::reference_internal)
+    .def("set_revealed_cards",
+         &DuneImperiumState::SetRevealedCardsForTesting,
+         py::arg("player"), py::arg("cards"))
+
     // --- Deck Pool (opponent card probability tracking) ---
     .def("set_deck_pool_total_cards",
          &DuneImperiumState::SetDeckPoolTotalCardsForTesting,
