@@ -390,6 +390,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_player_trashed_cards",
          &DuneImperiumState::GetPlayerTrashedCards,
          py::arg("player"))
+    .def("get_pending_intrigue_choice_kind",
+         &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
