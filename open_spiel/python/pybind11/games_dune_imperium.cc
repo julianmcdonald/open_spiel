@@ -55,7 +55,6 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
   py::class_<ImperiumCard>(di, "ImperiumCard")
       .def_readonly("id", &ImperiumCard::id)
       .def_readonly("name", &ImperiumCard::name)
-      .def_readonly("agent_swords", &ImperiumCard::agent_swords)
       .def_readonly("reveal_swords", &ImperiumCard::reveal_swords)
       .def_readonly("reveal_troops", &ImperiumCard::reveal_troops)
       .def_readonly("agent_troops", &ImperiumCard::agent_troops);
