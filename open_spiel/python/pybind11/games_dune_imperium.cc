@@ -398,6 +398,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("ilesa_set_aside_card",
          &DuneImperiumState::SetAsideCardForIlesa,
          py::arg("player"))
+    .def("set_ilesa_set_aside_card",
+         &DuneImperiumState::SetIlesaSetAsideCardForTesting,
+         py::arg("player"), py::arg("card_id"))
     .def("get_player_trashed_cards",
          &DuneImperiumState::GetPlayerTrashedCards,
          py::arg("player"))
