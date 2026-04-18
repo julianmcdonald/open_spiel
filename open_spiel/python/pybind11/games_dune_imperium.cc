@@ -300,6 +300,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_player_agents_remaining",
          &DuneImperiumState::GetPlayerAgentsRemainingForTesting,
          py::arg("player"))
+    .def("get_specimens", &DuneImperiumState::GetSpecimensForTesting,
+         py::arg("player"))
     .def("get_player_cards_in_hand", &DuneImperiumState::GetPlayerCardsInHand,
          py::arg("player"))
     .def("get_pending_intrigue_player", &DuneImperiumState::pending_intrigue_draws_player)
@@ -348,6 +350,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("is_space_reachable", &DuneImperiumState::IsSpaceReachableForTesting,
          py::arg("space_action"))
     .def("get_tleilaxu_track", &DuneImperiumState::GetTleilaxuTrackForTesting,
+         py::arg("player"))
+    .def("get_research_bottom_col", &DuneImperiumState::GetResearchBottomColForTesting,
          py::arg("player"))
     .def("get_research_bottom_row", &DuneImperiumState::GetResearchBottomRowForTesting,
          py::arg("player"))
