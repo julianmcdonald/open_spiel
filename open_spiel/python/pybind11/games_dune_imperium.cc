@@ -142,6 +142,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"), py::arg("persuasion"))
     .def("set_player_influence", &DuneImperiumState::SetPlayerInfluenceForTesting,
          py::arg("player"), py::arg("faction"), py::arg("influence"))
+    .def("set_vladimir_secret_factions",
+         &DuneImperiumState::SetVladimirSecretFactionsForTesting,
+         py::arg("player"), py::arg("first"), py::arg("second"))
     .def("set_player_troops_in_garrison",
          &DuneImperiumState::SetPlayerTroopsInGarrisonForTesting,
          py::arg("player"), py::arg("amount"))
