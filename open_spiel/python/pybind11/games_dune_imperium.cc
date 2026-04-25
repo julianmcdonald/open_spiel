@@ -392,6 +392,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_paul_known_top_card",
          &DuneImperiumState::GetPaulKnownTopCardForTesting,
          py::arg("player"))
+    .def("deck_reshuffle_count",
+         &DuneImperiumState::deck_reshuffle_count,
+         py::arg("player"))
     .def("set_paul_known_top_card",
          &DuneImperiumState::SetPaulKnownTopCardForTesting,
          py::arg("player"), py::arg("card_id"))
