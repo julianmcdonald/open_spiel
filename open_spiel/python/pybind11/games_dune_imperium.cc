@@ -409,6 +409,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
          py::arg("player"))
     .def("get_pending_intrigue_choice_kind",
          &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
+    .def("get_pending_intrigue_choice_player",
+         &DuneImperiumState::GetPendingIntrigueChoicePlayerForTesting)
 
     // --- Action helpers ---
     .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
