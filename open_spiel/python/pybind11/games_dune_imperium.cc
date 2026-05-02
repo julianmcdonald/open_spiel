@@ -308,6 +308,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module& m) {
     .def("get_player_cards_in_hand", &DuneImperiumState::GetPlayerCardsInHand,
          py::arg("player"))
     .def("get_pending_intrigue_player", &DuneImperiumState::pending_intrigue_draws_player)
+    .def("get_pending_draw_player", &DuneImperiumState::pending_player_draw_player)
     .def("troops_in_combat", &DuneImperiumState::TroopsInCombat,
          py::arg("player"))
     .def("dreadnoughts_in_combat", &DuneImperiumState::DreadnoughtsInCombat,
