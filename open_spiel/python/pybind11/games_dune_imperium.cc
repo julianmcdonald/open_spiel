@@ -34,6 +34,7 @@ using open_spiel::dune_imperium::GamePhase;
 using open_spiel::dune_imperium::ImperiumCard;
 using open_spiel::dune_imperium::LeaderId;
 
+#pragma GCC optimize("no-var-tracking-assignments")
 void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
   py::module_ di = m.def_submodule("dune_imperium");
 
