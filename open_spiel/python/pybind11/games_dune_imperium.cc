@@ -309,6 +309,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetAgentSpaceOwnerForTesting,
            py::arg("board_index"))
       .def("player_leader", &DuneImperiumState::PlayerLeader, py::arg("player"))
+      .def("get_phase", &DuneImperiumState::phase)
       .def("get_player_tech_tiles",
            &DuneImperiumState::GetPlayerTechTilesForTesting, py::arg("player"))
       .def("is_tech_flipped", &DuneImperiumState::IsTechFlippedForTesting,
