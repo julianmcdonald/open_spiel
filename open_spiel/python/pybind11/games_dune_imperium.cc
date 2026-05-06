@@ -355,6 +355,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("get_played_agent_cards",
            &DuneImperiumState::GetPlayedAgentCardsForTesting, py::arg("player"),
            py::return_value_policy::reference_internal)
+      .def("pending_shipping_choice", &DuneImperiumState::pending_shipping_choice)
+      .def("pending_shipping_player", &DuneImperiumState::pending_shipping_player)
+      .def("pending_shipping_needs_level1_choice", &DuneImperiumState::pending_shipping_needs_level1_choice)
+      .def("pending_shipping_needs_influence_choice", &DuneImperiumState::pending_shipping_needs_influence_choice)
+      .def("pending_shipping_needs_tech_choice", &DuneImperiumState::pending_shipping_needs_tech_choice)
+      .def("pending_shipping_needs_troops_choice", &DuneImperiumState::pending_shipping_needs_troops_choice)
       .def("has_swordmaster", &DuneImperiumState::HasSwordmaster,
            py::arg("player"))
       .def("has_high_council", &DuneImperiumState::HasHighCouncil,
