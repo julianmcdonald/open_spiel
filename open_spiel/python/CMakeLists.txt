@@ -133,6 +133,7 @@ endif()
 
 add_library(pyspiel MODULE ${PYTHON_BINDINGS} ${OPEN_SPIEL_OBJECTS})
 target_link_directories(pyspiel PUBLIC ${Python3_LIBRARY_DIRS})
+target_compile_options(pyspiel PRIVATE -Wno-deprecated-declarations -Wno-attributes -fno-var-tracking-assignments)
 
 # Without this, the binary is called `libpyspiel.so`
 set_target_properties(pyspiel PROPERTIES PREFIX "")
