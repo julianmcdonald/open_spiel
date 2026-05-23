@@ -17,6 +17,7 @@ around two major important design criteria:
     justification, we tend to avoid introducing dependencies to keep things easy
     to install and more portable.
 
+<!-- disableFinding(HEADING_REPEAT_H1) -->
 # Support expectations
 
 We, the OpenSpiel authors, definitely engage in supporting the community. As it
@@ -59,7 +60,7 @@ merged.
 
 To help you understand better the framework as a whole you can go to
 [openspielgraph](https://openspielgraph.netlify.app) and use an interactive
-graph that shows the OpenSpiel repository in a wide and easy to undestand way.
+graph that shows the OpenSpiel repository in a wide and easy to understand way.
 
 By providing intuitive visual representations, it simplifies the debugging
 process, aids in the optimization of algorithms, and fosters a more efficient
@@ -76,8 +77,8 @@ Agreement (CLA). See
 for the details.
 
 Here, we outline our current highest priorities: this is where we need the most
-help. There are also suggestion for larger features and research projects. Of course,
-all contributions are welcome. 
+help. There are also suggestion for larger features and research projects. Of
+course, all contributions are welcome.
 
 Before making a contribution to OpenSpiel, please read the guidelines. We also
 kindly request that you contact us before writing any large piece of code, in
@@ -86,16 +87,17 @@ considered and may have some design advice on its implementation. Please also
 note that some games may have copyrights which might require legal approval.
 Otherwise, happy hacking!
 
--   **Long-term and Ongoing Maintenance**. This is the most important way to help.
-    Having OpenSpiel bug-free and working smoothly is the highest priority. Things
-    can stop working for a variety of reasons due to version changes and backward
-    incompatibility, but also due to discovering new problems that require some time
-    to fix. To see these items, look for issues with the "help wanted" tag on the
+-   **Long-term and Ongoing Maintenance**. This is the most important way to
+    help. Having OpenSpiel bug-free and working smoothly is the highest
+    priority. Things can stop working for a variety of reasons due to version
+    changes and backward incompatibility, but also due to discovering new
+    problems that require some time to fix. To see these items, look for issues
+    with the "help wanted" tag on the
     [Issues page](https://github.com/google-deepmind/open_spiel/issues).
 
 -   **New Features and Algorithms**. There are regular requests for new features
-    and algorithms that we just don't have time to provide. Look for issues with the
-    "contribution welcome" tag on the
+    and algorithms that we just don't have time to provide. Look for issues with
+    the "contribution welcome" tag on the
     [Issues page](https://github.com/google-deepmind/open_spiel/issues).
 
 -   **Windows support**. Native Windows support was added in early 2022, but
@@ -107,9 +109,12 @@ Otherwise, happy hacking!
 
 -   **Visualizations of games**. There exists an interactive viewer for
     OpenSpiel games called [SpielViz](https://github.com/michalsustr/spielviz).
-    Contributions to this project, and more visualization tools with OpenSpiel,
-    are very welcome as they could help immensely with debugging and testing
-    the AI beyond the console.
+    A standalone visualization library called
+    [spielviz](https://github.com/kvr06-ai/spielviz) (`pip install spielviz`) is
+    also available for rendering game trees, information sets, and strategy
+    profiles. Contributions to this project, and more visualization tools with
+    OpenSpiel, are very welcome as they could help immensely with debugging and
+    testing the AI beyond the console.
 
 -   **Structured Action Spaces**. Currently, actions are integers between 0 and
     some value. There is no easy way to interpret what each action means in a
@@ -121,12 +126,12 @@ Otherwise, happy hacking!
     action to the action taken.
 
 -   **APIs for other languages** (Go, Rust, Julia). We currently have these
-    supported but little beyond the core API and random simulation tests. Several
-    are very basic (or experimental). It would be nice to properly support these
-    by having a few simple algorithms run via the bindings on OpenSpiel games. 
+    supported but little beyond the core API and random simulation tests.
+    Several are very basic (or experimental). It would be nice to properly
+    support these by having a few simple algorithms run via the bindings on
+    OpenSpiel games.
 
 -   **New Games**. New games are always welcome. If you do not have one in mind,
     check out the
     [Call for New Games](https://github.com/google-deepmind/open_spiel/issues/843)
     issue.
-

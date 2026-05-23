@@ -216,6 +216,10 @@ void GomokuState::CheckWinFromLastMove(Action last_move) {
       black_score_ = 1.0;
       white_score_ = -1.0;
     }
+  } else if (move_count_ >= board_.NumCells()) {
+    terminal_ = true;
+    black_score_ = 0.0;
+    white_score_ = 0.0;
   }
   const auto* gomoku = static_cast<const GomokuGame*>(game_.get());
   // If anti-scoring is enabled, flip the scores.
@@ -489,6 +493,7 @@ GomokuState::GomokuState(std::shared_ptr<const Game> game,
     }
     board_.AtIndex(i) = s;
   }
+  move_count_ = initial_stones_;
   zobrist_hash_ = ComputeZobrist(board_);
 }
 

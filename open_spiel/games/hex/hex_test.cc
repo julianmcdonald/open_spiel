@@ -75,6 +75,7 @@ void BasicHexTests() {
   testing::RandomSimTest(*LoadGame("hex(num_cols=2,num_rows=3)"), 10);
   testing::RandomSimTest(*LoadGame("hex(num_cols=2,num_rows=2)"), 10);
   testing::RandomSimTest(*LoadGame("hex(swap=true)"), 10);
+  testing::RandomSimTest(*LoadGame("hex(plain_obs_tensor=true,swap=true)"), 10);
 }
 
 }  // namespace

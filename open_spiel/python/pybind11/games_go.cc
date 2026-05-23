@@ -19,12 +19,14 @@
 #include <utility>
 
 #include "open_spiel/games/go/go.h"
+#include "open_spiel/games/go/sgf_game_loader.h"
 #include "open_spiel/spiel.h"
 
 namespace py = ::pybind11;
 using open_spiel::Game;
 using open_spiel::State;
 using open_spiel::go::GoState;
+using open_spiel::go::GoGame;
 using open_spiel::go::GoStateStruct;
 
 void open_spiel::init_pyspiel_games_go(py::module& m) {
@@ -55,4 +57,26 @@ void open_spiel::init_pyspiel_games_go(py::module& m) {
             return dynamic_cast<GoState*>(
                 game_and_state.second.release());
           }));
+
+  py::classh<GoGame, Game>(go, "GoGame")
+      .def("komi", &open_spiel::go::GoGame::komi)
+      .def("board_size", &open_spiel::go::GoGame::board_size)
+      .def("handicap", &open_spiel::go::GoGame::handicap)
+      // Pickle support
+      .def(py::pickle(
+          [](std::shared_ptr<const GoGame> game) {  // __getstate__
+            return game->ToString();
+          },
+          [](const std::string& data) {  // __setstate__
+            return std::dynamic_pointer_cast<GoGame>(
+                std::const_pointer_cast<Game>(LoadGame(data)));
+          }));
+
+  // Args: sgf_filename (string). Returns a vector of (game, state) tuples.
+  go.def("load_games_from_sgf_file", &open_spiel::go::LoadGamesFromSGFFile,
+         "Load games from an SGF file.");
+
+  // Args: sgf_string (string). Returns a vector of (game, state) tuples.
+  go.def("load_games_from_sgf_string", &open_spiel::go::LoadGamesFromSGFString,
+         "Load games from an SGF string.");
 }

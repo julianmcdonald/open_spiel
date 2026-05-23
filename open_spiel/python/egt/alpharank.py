@@ -59,7 +59,8 @@ def _get_payoff(payoff_table_k, payoffs_are_hpt_format, strat_profile, k=None):
 
   if payoffs_are_hpt_format:
     # All games are supported when using HPTs
-    assert k is not None
+    if k is None:
+      raise ValueError('Agent index k must be provided for HPT format payoffs')
 
     # Compute HPT distribution (vector of # of players per strategy)
     distribution = payoff_table_k.get_distribution_from_profile(strat_profile)
@@ -150,7 +151,10 @@ def _get_rho_sr(payoff_table,
           payoff_table, payoffs_are_hpt_format, strat_profile=[s, r], k=0)
       u = alpha * (payoff_rs - payoff_sr)
     else:
-      assert payoff_sum is not None
+      if payoff_sum is None:
+        raise ValueError(
+            'payoff_sum must not be None for multi-population games'
+        )
       u = alpha * m / (m - 1) * (payoff_rs - payoff_sum / 2)
 
     if np.isclose(u, 0, atol=1e-14):
@@ -159,7 +163,8 @@ def _get_rho_sr(payoff_table,
     else:
       result = (1 - np.exp(-u)) / (1 - np.exp(-m * u))
   else:
-    assert payoff_sum is None
+    if payoff_sum is not None:
+      raise ValueError('payoff_sum must be None for single-population games')
     summed = 0
     for l in range(1, m):
       t_mult = 1.
@@ -479,8 +484,15 @@ def sweep_pi_vs_epsilon(payoff_tables,
   else:
     num_profiles = utils.get_num_profiles(num_strats_per_population)
 
-  assert (strat_labels is None or isinstance(strat_labels, dict)
-          or (len(strat_labels) == num_profiles))
+  if not (
+      strat_labels is None
+      or isinstance(strat_labels, dict)
+      or (len(strat_labels) == num_profiles)
+  ):
+    raise ValueError(
+        'strat_labels must be None, a dict, or a list of length num_profiles'
+        ' ({}). Got length {}.'.format(num_profiles, len(strat_labels))
+    )
 
   pi_list = np.empty((num_profiles, 0))
   pi, alpha, m = None, None, None  # Unused in infinite-alpha regime
@@ -509,16 +521,21 @@ def sweep_pi_vs_epsilon(payoff_tables,
       epsilon *= epsilon_mult_factor
       num_iters += 1
       alpharank_succeeded_once = True
-      assert num_iters < max_iters, ('Alpharank stationary distr. not found'
-                                     'after {} iterations of pi_vs_epsilon'
-                                     'sweep'.format(num_iters))
+      if num_iters >= max_iters:
+        raise RuntimeError(
+            'AlphaRank stationary distribution not found after {} iterations '
+            'of pi_vs_epsilon sweep'.format(num_iters)
+        )
 
-    except ValueError as _:
-      print('Error: ', _, epsilon, min_epsilon)
+    except ValueError as value_error:
+      print('Error: ', value_error, epsilon, min_epsilon)
       # Case where epsilon has been decreased beyond desirable limits but no
       # distribution found.
-      assert epsilon >= min_epsilon, ('AlphaRank stationary distr. not found &'
-                                      'epsilon < min_epsilon.')
+      if epsilon < min_epsilon:
+        raise RuntimeError(
+            'AlphaRank stationary distribution not found and '
+            'epsilon < min_epsilon.'
+        ) from value_error
       # Case where epsilon >= min_epsilon, but still small enough that it causes
       # causes exceptions due to precision issues. So increase it.
       epsilon /= epsilon_mult_factor
@@ -604,8 +621,15 @@ def sweep_pi_vs_alpha(payoff_tables,
   else:
     num_profiles = utils.get_num_profiles(num_strats_per_population)
 
-  assert (strat_labels is None or isinstance(strat_labels, dict)
-          or (len(strat_labels) == num_profiles))
+  if not (
+      strat_labels is None
+      or isinstance(strat_labels, dict)
+      or (len(strat_labels) == num_profiles)
+  ):
+    raise ValueError(
+        'strat_labels must be None, a dict, or a list of length num_profiles'
+        ' ({}). Got length {}.'.format(num_profiles, len(strat_labels))
+    )
 
   pi_list = np.empty((num_profiles, 0))
   alpha_list = []
@@ -842,4 +866,3 @@ def suggest_alpha(payoff_tables, tol=.1):
         gap = min(gap, f_r - f_s)
 
   return -np.log(tol)/gap
-

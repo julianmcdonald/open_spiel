@@ -5,6 +5,8 @@ set(GAME_SOURCES
   antichess/antichess.h
   backgammon/backgammon.cc
   backgammon/backgammon.h
+  banqi/banqi.cc
+  banqi/banqi.h
   bargaining/bargaining.cc
   bargaining/bargaining.h
   bargaining/bargaining_instances1000.cc
@@ -28,6 +30,8 @@ set(GAME_SOURCES
   catch/catch.h
   checkers/checkers.cc
   checkers/checkers.h
+  chinese_checkers/chinese_checkers.cc
+  chinese_checkers/chinese_checkers.h
   chess/chess.cc
   chess/chess.h
   chess/chess_board.cc
@@ -96,6 +100,8 @@ set(GAME_SOURCES
   go/go.h
   go/go_board.cc
   go/go_board.h
+  go/sgf_game_loader.cc
+  go/sgf_game_loader.h
   gomoku/gomoku.cc
   gomoku/gomoku.h
   gomoku/gomoku_grid.h
@@ -188,8 +194,14 @@ set(GAME_SOURCES
   rbc/rbc.h
   sheriff/sheriff.cc
   sheriff/sheriff.h
+  shogi/shogi.cc
+  shogi/shogi.h
+  shogi/shogi_board.cc
+  shogi/shogi_board.h
   skat/skat.cc
   skat/skat.h
+  snake/snake.cc
+  snake/snake.h
   solitaire/solitaire.cc
   solitaire/solitaire.h
   spades/spades.cc
@@ -223,6 +235,8 @@ set(GAME_SOURCES
   ultimate_tic_tac_toe/ultimate_tic_tac_toe.cc
   y/y.cc
   y/y.h
+  xiangqi/xiangqi.cc
+  xiangqi/xiangqi.h
   yacht/yacht.cc
   yacht/yacht.h
 )
@@ -360,6 +374,10 @@ add_executable(backgammon_test backgammon/backgammon_test.cc ${OPEN_SPIEL_OBJECT
                $<TARGET_OBJECTS:tests>)
 add_test(backgammon_test backgammon_test)
 
+add_executable(banqi_test banqi/banqi_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(banqi_test banqi_test)
+
 add_executable(bargaining_instance_generator bargaining/bargaining_instance_generator.cc
                ${OPEN_SPIEL_OBJECTS})
 add_executable(bargaining_test bargaining/bargaining_test.cc ${OPEN_SPIEL_OBJECTS}
@@ -393,6 +411,10 @@ add_test(catch_test catch_test)
 add_executable(checkers_test checkers/checkers_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(checkers_test checkers_test)
+
+add_executable(chinese_checkers_test chinese_checkers/chinese_checkers_test.cc
+               ${OPEN_SPIEL_OBJECTS} $<TARGET_OBJECTS:tests>)
+add_test(chinese_checkers_test chinese_checkers_test)
 
 add_executable(chess_test chess/chess_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
@@ -523,6 +545,10 @@ add_test(gin_rummy_test gin_rummy_test)
 add_executable(go_test go/go_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(go_test go_test)
+
+add_executable(sgf_game_loader_test go/sgf_game_loader_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(sgf_game_loader_test sgf_game_loader_test)
 
 add_executable(phantom_go_test phantom_go/phantom_go_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
@@ -690,9 +716,17 @@ add_executable(sheriff_test sheriff/sheriff_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(sheriff_test sheriff_test)
 
+add_executable(shogi_test shogi/shogi_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(shogi_test shogi_test)
+
 add_executable(skat_test skat/skat_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(skat_test skat_test)
+
+add_executable(snake_test snake/snake_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(snake_test snake_test)
 
 add_executable(solitaire_test solitaire/solitaire_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
@@ -756,6 +790,10 @@ endif()
 add_executable(y_test y/y_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(y_test y_test)
+
+add_executable(xiangqi_test xiangqi/xiangqi_test.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(xiangqi_test xiangqi_test)
 
 add_executable(yacht_test yacht/yacht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
