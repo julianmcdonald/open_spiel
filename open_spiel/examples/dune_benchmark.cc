@@ -59,6 +59,19 @@ class GlobalReplayBuffer {
     }
   }
 
+  std::vector<Transition> SampleBatch(size_t batch_size) {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    std::vector<Transition> batch;
+    if (buffer_.empty()) return batch;
+    
+    batch.reserve(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      size_t idx = rand() % buffer_.size();
+      batch.push_back(buffer_[idx]);
+    }
+    return batch;
+  }
+
   size_t Size() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     return buffer_.size();
@@ -82,6 +95,34 @@ struct DummyTorchModel : torch::nn::Module {
     return policy_head->forward(x);
   }
 };
+
+void TrainStep(std::shared_ptr<DummyTorchModel> model, 
+               torch::optim::Optimizer& optimizer, 
+               const std::vector<Transition>& batch, 
+               int64_t obs_size) {
+  size_t batch_size = batch.size();
+  if (batch_size == 0) return;
+
+  std::vector<float> flat_states;
+  std::vector<float> flat_rewards;
+  flat_states.reserve(batch_size * obs_size);
+  flat_rewards.reserve(batch_size);
+
+  for (const auto& transition : batch) {
+    flat_states.insert(flat_states.end(), transition.spatial_tensor.begin(), transition.spatial_tensor.end());
+    flat_rewards.push_back(transition.reward_target);
+  }
+
+  torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).clone();
+  torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
+
+  optimizer.zero_grad();
+  torch::Tensor pred_logits = model->forward(states);
+  torch::Tensor mock_values = pred_logits.mean(/*dim=*/1, /*keepdim=*/true);
+  torch::Tensor loss = torch::nn::functional::mse_loss(mock_values, rewards);
+  loss.backward();
+  optimizer.step();
+}
 
 int TorchSimulation(std::mt19937* rng, const Game& game, DummyTorchModel* model, int64_t obs_size, std::vector<Transition>& trajectory) {
   std::unique_ptr<State> state = game.NewInitialState();
@@ -395,6 +436,25 @@ int main(int argc, char** argv) {
   double seconds = elapsed.count();
   int moves = total_moves.load();
   int completed = games_completed.load();
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  if (model != nullptr && global_buffer.Size() > 0) {
+    std::cout << "\nStarting optimization validation phase...\n";
+    model->train(); // Toggle to training mode to enable gradient tracking
+
+    // Initialize Adam Optimizer
+    torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(1e-3));
+
+    // Sample a single training batch of size 32
+    size_t batch_size = 32;
+    std::vector<open_spiel::Transition> batch = global_buffer.SampleBatch(batch_size);
+    std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
+
+    // Execute backprop step
+    open_spiel::TrainStep(model, optimizer, batch, obs_size);
+    std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
+  }
+#endif
 
   std::cout << absl::StrFormat("\n=== Benchmark Completed ===\n");
   std::cout << absl::StrFormat("Elapsed Time: %.3f seconds\n", seconds);
