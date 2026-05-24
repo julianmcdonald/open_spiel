@@ -21,6 +21,7 @@
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
+#include "dune_network.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The name of the game to play.");
@@ -33,6 +34,7 @@ ABSL_FLAG(int, min_train_size, 1024, "Minimum buffer transitions before starting
 ABSL_FLAG(int, train_batch_size, 32, "Batch size for background SGD updates.");
 ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight synchronizations.");
 ABSL_FLAG(int, buffer_capacity, 100000, "Maximum capacity of the global replay buffer.");
+ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate before the GPU is allowed to pull 1 training batch. Set <= 0 to disable throttling.");
 
 namespace open_spiel {
 
@@ -51,20 +53,21 @@ class GlobalReplayBuffer {
   std::deque<std::shared_ptr<Transition>> buffer_;
   std::mutex buffer_mutex_;
   size_t max_capacity_;
+  std::atomic<uint64_t> total_inserted_{0};
 
  public:
   GlobalReplayBuffer(size_t capacity) : max_capacity_(capacity) {}
 
   void PushTrajectory(std::vector<Transition>& local_trajectory) {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
-    
+    size_t num_inserted = local_trajectory.size();
     for (auto& transition : local_trajectory) {
       buffer_.push_back(std::make_shared<Transition>(std::move(transition)));
     }
-    
     while (buffer_.size() > max_capacity_) {
       buffer_.pop_front();
     }
+    total_inserted_.fetch_add(num_inserted, std::memory_order_relaxed);
   }
 
   std::vector<std::shared_ptr<Transition>> SampleBatch(size_t batch_size) {
@@ -86,67 +89,16 @@ class GlobalReplayBuffer {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     return buffer_.size();
   }
+
+  uint64_t GetTotalInserted() const {
+    return total_inserted_.load(std::memory_order_relaxed);
+  }
 };
 
 namespace {
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-struct ResBlockImpl : torch::nn::Module {
-  torch::nn::Linear fc1{nullptr};
-  torch::nn::Linear fc2{nullptr};
-  torch::nn::LayerNorm ln1{nullptr};
-  torch::nn::LayerNorm ln2{nullptr};
-
-  ResBlockImpl(int64_t dim) {
-    fc1 = register_module("fc1", torch::nn::Linear(dim, dim));
-    fc2 = register_module("fc2", torch::nn::Linear(dim, dim));
-    ln1 = register_module("ln1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
-    ln2 = register_module("ln2", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
-  }
-
-  torch::Tensor forward(torch::Tensor x) {
-    torch::Tensor residual = x;
-    x = torch::relu(ln1->forward(fc1->forward(x)));
-    x = ln2->forward(fc2->forward(x));
-    return torch::relu(x + residual);
-  }
-};
-TORCH_MODULE(ResBlock);
-
-struct SharedDunePolicyValueNetImpl : torch::nn::Module {
-  torch::nn::Linear input_layer{nullptr};
-  std::shared_ptr<ResBlockImpl> res1{nullptr};
-  std::shared_ptr<ResBlockImpl> res2{nullptr};
-  torch::nn::Linear policy_head{nullptr};
-  torch::nn::Linear value_head{nullptr};
-
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim, int64_t action_dim) {
-    input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
-    
-    // Register the underlying implementation object wrapped in shared_ptr to solve template deduction
-    res1 = register_module("res1", std::make_shared<ResBlockImpl>(hidden_dim));
-    res2 = register_module("res2", std::make_shared<ResBlockImpl>(hidden_dim));
-    
-    policy_head = register_module("policy_head", torch::nn::Linear(hidden_dim, action_dim));
-    value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
-  }
-
-  struct ModelOutputs {
-    torch::Tensor logits;
-    torch::Tensor values;
-  };
-
-  ModelOutputs forward(torch::Tensor x) {
-    x = torch::relu(input_layer->forward(x));
-    x = res1->forward(x);
-    x = res2->forward(x);
-    
-    torch::Tensor logits = policy_head->forward(x);
-    torch::Tensor values = torch::tanh(value_head->forward(x));
-    return {logits, values};
-  }
-};
-TORCH_MODULE(SharedDunePolicyValueNet);
+// Shared network architecture imported from dune_network.h
 
 void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                     std::unique_ptr<torch::optim::Adam>& optimizer, 
@@ -265,6 +217,18 @@ void OptimizationWorker(
 
     // 2. Training Loop
     while (!stop_training.load()) {
+      int train_ratio = absl::GetFlag(FLAGS_train_ratio);
+      if (train_ratio > 0) {
+        uint64_t current_inserted = global_buffer->GetTotalInserted();
+        if (current_inserted >= static_cast<uint64_t>(min_train_size)) {
+          uint64_t allowed_steps = (current_inserted - min_train_size) / train_ratio;
+          if (static_cast<uint64_t>(training_steps.load()) >= allowed_steps) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+          }
+        }
+      }
+
       std::vector<std::shared_ptr<Transition>> batch = global_buffer->SampleBatch(train_batch_size);
       if (batch.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

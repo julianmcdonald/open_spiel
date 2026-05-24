@@ -4,6 +4,9 @@ add_test(benchmark_game_test benchmark_game --game=tic_tac_toe --sims=100 --atte
 if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
+
+  add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_evaluator ${TORCH_LIBRARIES})
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()
