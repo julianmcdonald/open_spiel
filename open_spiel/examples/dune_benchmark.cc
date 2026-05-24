@@ -11,6 +11,7 @@
 #include <deque>
 #include <mutex>
 #include <iterator>
+#include <filesystem>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -24,6 +25,8 @@
 ABSL_FLAG(std::string, game, "dune_imperium", "The name of the game to play.");
 ABSL_FLAG(int, games, 1000, "How many games to play in total.");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
+ABSL_FLAG(std::string, model_checkpoint, "dune_stage_a_model.pt", "Path to load/save model checkpoint.");
+ABSL_FLAG(std::string, optim_checkpoint, "dune_stage_a_optimizer.pt", "Path to load/save optimizer checkpoint.");
 
 namespace open_spiel {
 
@@ -137,6 +140,42 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);
+
+void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                    torch::optim::Adam& optimizer, 
+                    const std::string& model_path, 
+                    const std::string& optim_path) {
+  if (std::filesystem::exists(model_path)) {
+    try {
+      torch::load(model, model_path);
+      std::cout << "Successfully loaded model weights from " << model_path << "\n";
+      
+      if (std::filesystem::exists(optim_path)) {
+        torch::load(optimizer, optim_path);
+        std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
+      } else {
+        std::cout << "Optimizer checkpoint not found at " << optim_path << ". Starting with default optimizer state.\n";
+      }
+    } catch (const c10::Error& e) {
+      std::cerr << "Error loading checkpoint: " << e.msg() << "\n";
+    }
+  } else {
+    std::cout << "No existing checkpoint found at " << model_path << ". Starting from scratch.\n";
+  }
+}
+
+void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                    torch::optim::Adam& optimizer, 
+                    const std::string& model_path, 
+                    const std::string& optim_path) {
+  try {
+    torch::save(model, model_path);
+    torch::save(optimizer, optim_path);
+    std::cout << "Checkpoint saved successfully.\n";
+  } catch (const c10::Error& e) {
+    std::cerr << "Error saving checkpoint: " << e.msg() << "\n";
+  }
+}
 
 void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                torch::optim::Optimizer& optimizer, 
@@ -510,10 +549,20 @@ int main(int argc, char** argv) {
   int64_t action_size = game->NumDistinctActions();
   
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model = nullptr;
+  std::unique_ptr<torch::optim::Adam> optimizer = nullptr;
+  std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+
   if (obs_size > 0) {
     model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     model->eval(); // Put into evaluation mode
     std::cout << absl::StrFormat("Initialized SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
+    
+    // Initialize Adam Optimizer at startup
+    optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(1e-3));
+    
+    // Load existing checkpoint if it exists
+    open_spiel::LoadCheckpoint(model, *optimizer, model_path, optim_path);
   }
 #endif
 
@@ -549,21 +598,21 @@ int main(int argc, char** argv) {
   int completed = games_completed.load();
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-  if (model != nullptr && global_buffer.Size() > 0) {
+  if (model != nullptr && global_buffer.Size() > 0 && optimizer != nullptr) {
     std::cout << "\nStarting optimization validation phase...\n";
     model->train(); // Toggle to training mode to enable gradient tracking
-
-    // Initialize Adam Optimizer
-    torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(1e-3));
 
     // Sample a single training batch of size 32
     size_t batch_size = 32;
     std::vector<open_spiel::Transition> batch = global_buffer.SampleBatch(batch_size);
     std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
 
-    // Execute backprop step
-    open_spiel::TrainStep(model, optimizer, batch, obs_size, action_size);
+    // Execute backprop step using the startup-initialized optimizer
+    open_spiel::TrainStep(model, *optimizer, batch, obs_size, action_size);
     std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
+    
+    // Save updated checkpoint
+    open_spiel::SaveCheckpoint(model, *optimizer, model_path, optim_path);
   }
 #endif
 
