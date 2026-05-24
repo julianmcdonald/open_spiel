@@ -10,6 +10,7 @@
 #include <memory>
 #include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <iterator>
 #include <filesystem>
 
@@ -27,6 +28,10 @@ ABSL_FLAG(int, games, 1000, "How many games to play in total.");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
 ABSL_FLAG(std::string, model_checkpoint, "dune_stage_a_model.pt", "Path to load/save model checkpoint.");
 ABSL_FLAG(std::string, optim_checkpoint, "dune_stage_a_optimizer.pt", "Path to load/save optimizer checkpoint.");
+ABSL_FLAG(bool, async_mode, false, "Whether to run optimization asynchronously in a background thread.");
+ABSL_FLAG(int, min_train_size, 1024, "Minimum buffer transitions before starting SGD training.");
+ABSL_FLAG(int, train_batch_size, 32, "Batch size for background SGD updates.");
+ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight synchronizations.");
 
 namespace open_spiel {
 
@@ -181,6 +186,85 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                torch::optim::Optimizer& optimizer, 
                const std::vector<Transition>& batch, 
                int64_t obs_size,
+               int64_t action_dim);
+
+void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model, 
+                std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
+                std::shared_mutex* sync_mutex) {
+  std::unique_lock<std::shared_mutex> lock(*sync_mutex);
+  torch::NoGradGuard no_grad;
+
+  auto train_params = training_model->parameters();
+  auto infer_params = inference_model->parameters();
+  auto train_buffers = training_model->buffers();
+  auto infer_buffers = inference_model->buffers();
+
+  for (size_t i = 0; i < train_params.size(); ++i) {
+    infer_params[i].copy_(train_params[i]);
+  }
+  for (size_t i = 0; i < train_buffers.size(); ++i) {
+    infer_buffers[i].copy_(train_buffers[i]);
+  }
+}
+
+void OptimizationWorker(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
+    torch::optim::Adam* optimizer,
+    GlobalReplayBuffer* global_buffer,
+    int64_t obs_size,
+    int64_t action_size,
+    std::shared_mutex* sync_mutex,
+    std::atomic<bool>& stop_training,
+    std::atomic<int>& training_steps,
+    int min_train_size,
+    int train_batch_size,
+    int sync_interval,
+    const std::string& model_path,
+    const std::string& optim_path) {
+  
+  // 1. Warmup Phase: wait until the global replay buffer has enough transitions
+  while (global_buffer->Size() < static_cast<size_t>(min_train_size) && !stop_training.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  if (!stop_training.load()) {
+    std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n";
+  }
+
+  // 2. Training Loop
+  while (!stop_training.load()) {
+    std::vector<Transition> batch = global_buffer->SampleBatch(train_batch_size);
+    if (batch.empty()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
+
+    // Lock-free optimization step on training_model
+    TrainStep(training_model, *optimizer, batch, obs_size, action_size);
+
+    int step = training_steps.fetch_add(1) + 1;
+
+    // Periodic model synchronization
+    if (step % sync_interval == 0) {
+      SyncModels(training_model, inference_model, sync_mutex);
+    }
+
+    // Periodic checkpoint saving (runs in background, no sync_mutex needed)
+    if (step % 500 == 0) {
+      SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+    }
+  }
+  
+  // Final synchronization at shutdown to ensure inference_model has latest weights
+  SyncModels(training_model, inference_model, sync_mutex);
+  std::cout << "Background optimization worker stopped cleanly. Total steps: " << training_steps.load() << "\n";
+}
+
+void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+               torch::optim::Optimizer& optimizer, 
+               const std::vector<Transition>& batch, 
+               int64_t obs_size,
                int64_t action_dim) {
   size_t batch_size = batch.size();
   if (batch_size == 0) return;
@@ -266,7 +350,7 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   optimizer.step();
 }
 
-int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory) {
+int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory, std::shared_mutex* sync_mutex) {
   std::unique_ptr<State> state = game.NewInitialState();
 
   bool provides_info_state_tensor =
@@ -337,8 +421,14 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
       // Convert C++ Vector to LibTorch Tensor (Zero-copy mapping)
       torch::Tensor state_tensor = torch::from_blob(obs.data(), {1, obs_size}, torch::kFloat);
       
-      // Forward Pass
-      torch::Tensor logits = model->forward(state_tensor).logits;
+      // Forward Pass with shared read lock
+      torch::Tensor logits;
+      if (sync_mutex != nullptr) {
+        std::shared_lock<std::shared_mutex> lock(*sync_mutex);
+        logits = model->forward(state_tensor).logits;
+      } else {
+        logits = model->forward(state_tensor).logits;
+      }
 
       // Select action randomly to guarantee state progression, mirroring RandomSimulation
       std::uniform_int_distribution<int> dis(0, actions.size() - 1);
@@ -479,6 +569,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
                   GlobalReplayBuffer* global_buffer, int64_t obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                   , SharedDunePolicyValueNetImpl* model
+                  , std::shared_mutex* sync_mutex
 #endif
 ) {
   std::mt19937 rng(std::random_device{}() + thread_id);
@@ -492,7 +583,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
     std::vector<Transition> local_trajectory;
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
     if (model != nullptr) {
-      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory);
+      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory, sync_mutex);
     } else {
       moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
     }
@@ -548,21 +639,33 @@ int main(int argc, char** argv) {
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   int64_t action_size = game->NumDistinctActions();
   
-  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model = nullptr;
   std::unique_ptr<torch::optim::Adam> optimizer = nullptr;
   std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
   std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
 
+  std::shared_mutex sync_mutex;
+  std::thread optimization_thread;
+  std::atomic<bool> stop_training(false);
+  std::atomic<int> training_steps(0);
+
   if (obs_size > 0) {
-    model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
-    model->eval(); // Put into evaluation mode
-    std::cout << absl::StrFormat("Initialized SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
+    training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
+    inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     
-    // Initialize Adam Optimizer at startup
-    optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(1e-3));
+    training_model->train(); // training model stays in train mode permanently
+    inference_model->eval(); // inference model stays in eval mode permanently
+    
+    std::cout << absl::StrFormat("Initialized Double-Buffered SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
+    
+    // Initialize Adam Optimizer at startup against training_model parameters
+    optimizer = std::make_unique<torch::optim::Adam>(training_model->parameters(), torch::optim::AdamOptions(1e-3));
     
     // Load existing checkpoint if it exists
-    open_spiel::LoadCheckpoint(model, *optimizer, model_path, optim_path);
+    open_spiel::LoadCheckpoint(training_model, *optimizer, model_path, optim_path);
+    // Initial weight synchronization
+    open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
   }
 #endif
 
@@ -571,6 +674,28 @@ int main(int argc, char** argv) {
 
   std::atomic<int> games_completed(0);
   std::atomic<int> total_moves(0);
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  // Start background optimization thread if async_mode is enabled
+  bool async_mode = absl::GetFlag(FLAGS_async_mode);
+  if (async_mode && training_model != nullptr) {
+    int min_train_size = absl::GetFlag(FLAGS_min_train_size);
+    int train_batch_size = absl::GetFlag(FLAGS_train_batch_size);
+    int sync_interval = absl::GetFlag(FLAGS_sync_interval);
+
+    std::cout << absl::StrFormat("Starting Asynchronous Optimization Worker (Min Train Size: %d, Batch Size: %d, Sync Interval: %d)...\n", 
+                                 min_train_size, train_batch_size, sync_interval);
+
+    optimization_thread = std::thread(
+        open_spiel::OptimizationWorker,
+        training_model, inference_model, optimizer.get(), &global_buffer,
+        obs_size, action_size, &sync_mutex,
+        std::ref(stop_training), std::ref(training_steps),
+        min_train_size, train_batch_size, sync_interval,
+        model_path, optim_path
+    );
+  }
+#endif
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -581,7 +706,7 @@ int main(int argc, char** argv) {
                          std::ref(games_completed), total_games, std::ref(total_moves),
                          &global_buffer, obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                         , model.get()
+                         , inference_model.get(), &sync_mutex
 #endif
     );
   }
@@ -589,6 +714,14 @@ int main(int argc, char** argv) {
   for (auto& t : threads) {
     t.join();
   }
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  // Stop background training and join thread
+  if (async_mode && optimization_thread.joinable()) {
+    stop_training.store(true);
+    optimization_thread.join();
+  }
+#endif
 
   auto end_time = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> elapsed = end_time - start_time;
@@ -598,21 +731,28 @@ int main(int argc, char** argv) {
   int completed = games_completed.load();
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-  if (model != nullptr && global_buffer.Size() > 0 && optimizer != nullptr) {
-    std::cout << "\nStarting optimization validation phase...\n";
-    model->train(); // Toggle to training mode to enable gradient tracking
+  if (training_model != nullptr && global_buffer.Size() > 0 && optimizer != nullptr) {
+    if (async_mode) {
+      std::cout << absl::StrFormat("\nAsynchronous training completed. Total background SGD steps executed: %d\n", training_steps.load());
+      // Save checkpoint of training_model at program termination
+      open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+    } else {
+      std::cout << "\nStarting optimization validation phase (Synchronous Mode)...\n";
+      // Sample a single training batch of size 32
+      size_t batch_size = 32;
+      std::vector<open_spiel::Transition> batch = global_buffer.SampleBatch(batch_size);
+      std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
 
-    // Sample a single training batch of size 32
-    size_t batch_size = 32;
-    std::vector<open_spiel::Transition> batch = global_buffer.SampleBatch(batch_size);
-    std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
+      // Execute backprop step using the startup-initialized optimizer
+      open_spiel::TrainStep(training_model, *optimizer, batch, obs_size, action_size);
+      std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
+      
+      // Sync training weights to inference weights for completeness
+      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
-    // Execute backprop step using the startup-initialized optimizer
-    open_spiel::TrainStep(model, *optimizer, batch, obs_size, action_size);
-    std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
-    
-    // Save updated checkpoint
-    open_spiel::SaveCheckpoint(model, *optimizer, model_path, optim_path);
+      // Save updated checkpoint
+      open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+    }
   }
 #endif
 
