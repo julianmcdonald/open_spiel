@@ -149,9 +149,18 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   std::vector<float> flat_states;
   std::vector<float> flat_masks;
   std::vector<float> flat_rewards;
+  std::vector<float> flat_prev_logits;
+  std::vector<float> flat_base_logits;
+  std::vector<float> flat_q_values;
+  std::vector<int64_t> flat_actions_taken;
+
   flat_states.reserve(batch_size * obs_size);
   flat_masks.reserve(batch_size * action_dim);
   flat_rewards.reserve(batch_size);
+  flat_prev_logits.reserve(batch_size * action_dim);
+  flat_base_logits.reserve(batch_size * action_dim);
+  flat_q_values.reserve(batch_size);
+  flat_actions_taken.reserve(batch_size);
 
   for (const auto& transition : batch) {
     flat_states.insert(flat_states.end(), transition.spatial_tensor.begin(), transition.spatial_tensor.end());
@@ -160,11 +169,20 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     }
     // Scale target reward: divide by 2.25 to bound target in [-0.77, 1.00]
     flat_rewards.push_back(transition.reward_target / 2.25f);
+
+    flat_prev_logits.insert(flat_prev_logits.end(), transition.prev_logits.begin(), transition.prev_logits.end());
+    flat_base_logits.insert(flat_base_logits.end(), transition.base_logits.begin(), transition.base_logits.end());
+    flat_q_values.push_back(transition.q_value);
+    flat_actions_taken.push_back(transition.action_taken);
   }
 
   torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).clone();
   torch::Tensor masks = torch::from_blob(flat_masks.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
   torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
+  torch::Tensor prev_logits = torch::from_blob(flat_prev_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
+  torch::Tensor base_logits = torch::from_blob(flat_base_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
+  torch::Tensor q_values = torch::from_blob(flat_q_values.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
+  torch::Tensor actions_taken = torch::from_blob(flat_actions_taken.data(), {(int64_t)batch_size, 1}, torch::kLong).clone();
 
   optimizer.zero_grad();
   auto outputs = model->forward(states);
@@ -180,11 +198,27 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   // Value Loss (MSE between scaled zero-sum returns and Tanh bounded prediction)
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
-  // Mock Policy Loss for optimization verification (KL divergence against a softmax distribution over masked logits)
-  torch::Tensor mock_target = torch::softmax(masked_logits, /*dim=*/-1).detach();
+  // MMD Policy Loss
+  float eta = 0.1f;
+  float alpha = 0.05f;
+
+  // Construct sparse Q-values for the action taken, zero elsewhere
+  torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::kFloat);
+  q_vector.scatter_(1, actions_taken, q_values);
+
+  // Calculate the theoretical MMD target logits
+  torch::Tensor target_logits = (prev_logits + eta * q_vector + eta * alpha * base_logits) / (1.0f + eta * alpha);
+
+  // Apply the same legal action mask to the target logits to prevent pulling towards illegal actions
+  torch::Tensor masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
+
+  // Softmax the target logits to create the target probability distribution (detached from the autograd graph)
+  torch::Tensor target_probs = torch::softmax(masked_target_logits, /*dim=*/-1).detach();
+
+  // Compute the KL Divergence between current log_probs and the MMD target distribution
   torch::Tensor policy_loss = torch::nn::functional::kl_div(
       log_probs, 
-      mock_target, 
+      target_probs, 
       torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean)
   );
 
@@ -272,12 +306,16 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
       Action action = actions[dis(*rng)];
       state->ApplyAction(action);
 
+      // Copy forward-pass logits into the transition record
+      std::vector<float> prev_logits_vec(action_size, 0.0f);
+      std::memcpy(prev_logits_vec.data(), logits.contiguous().data_ptr<float>(), action_size * sizeof(float));
+
       // Push to trajectory
       Transition transition;
       transition.spatial_tensor = std::move(obs);
       transition.legal_actions_mask = std::move(legal_actions_mask);
       transition.action_taken = action;
-      transition.prev_logits = std::vector<float>(action_size, 0.0f);
+      transition.prev_logits = std::move(prev_logits_vec);
       transition.base_logits = std::vector<float>(action_size, 0.0f);
       transition.q_value = 0.0f;
       transition.reward_target = 0.0f;
@@ -290,7 +328,9 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
   std::vector<double> returns = state->Returns();
   for (auto& transition : trajectory) {
     if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
-      transition.reward_target = static_cast<float>(returns[transition.player_id]);
+      float reward = static_cast<float>(returns[transition.player_id]);
+      transition.reward_target = reward;
+      transition.q_value = reward;
     }
   }
 
@@ -386,7 +426,9 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
   std::vector<double> returns = state->Returns();
   for (auto& transition : trajectory) {
     if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
-      transition.reward_target = static_cast<float>(returns[transition.player_id]);
+      float reward = static_cast<float>(returns[transition.player_id]);
+      transition.reward_target = reward;
+      transition.q_value = reward;
     }
   }
 
