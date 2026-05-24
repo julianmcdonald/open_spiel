@@ -1,7 +1,12 @@
 add_executable(benchmark_game benchmark_game.cc ${OPEN_SPIEL_OBJECTS})
 add_test(benchmark_game_test benchmark_game --game=tic_tac_toe --sims=100 --attempts=2)
 
-add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
+if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
+  add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
+else()
+  add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
+endif()
 
 add_executable(cfr_example cfr_example.cc ${OPEN_SPIEL_OBJECTS})
 add_test(cfr_example_test cfr_example)
@@ -47,23 +52,23 @@ add_executable(tabular_q_learning_example tabular_q_learning_example.cc ${OPEN_S
 
 add_executable(count_all_states count_all_states.cc ${OPEN_SPIEL_OBJECTS})
 
-if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
-  add_executable(alpha_zero_torch_example alpha_zero_torch_example.cc
-                ${OPEN_SPIEL_OBJECTS}
-                $<TARGET_OBJECTS:alpha_zero_torch>)
-  target_link_libraries (alpha_zero_torch_example ${TORCH_LIBRARIES})
-
-  add_executable(alpha_zero_torch_game_example alpha_zero_torch_game_example.cc
-                ${OPEN_SPIEL_OBJECTS}
-                $<TARGET_OBJECTS:alpha_zero_torch>
-                $<TARGET_OBJECTS:bots>)
-  target_link_libraries (alpha_zero_torch_game_example ${TORCH_LIBRARIES})
-
-  add_executable(dqn_torch_example dqn_torch_example.cc
-                ${OPEN_SPIEL_OBJECTS}
-                $<TARGET_OBJECTS:dqn_torch>)
-  target_link_libraries (dqn_torch_example ${TORCH_LIBRARIES})
-endif ()
+# if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
+#   add_executable(alpha_zero_torch_example alpha_zero_torch_example.cc
+#                 ${OPEN_SPIEL_OBJECTS}
+#                 $<TARGET_OBJECTS:alpha_zero_torch>)
+#   target_link_libraries (alpha_zero_torch_example ${TORCH_LIBRARIES})
+# 
+#   add_executable(alpha_zero_torch_game_example alpha_zero_torch_game_example.cc
+#                 ${OPEN_SPIEL_OBJECTS}
+#                 $<TARGET_OBJECTS:alpha_zero_torch>
+#                 $<TARGET_OBJECTS:bots>)
+#   target_link_libraries (alpha_zero_torch_game_example ${TORCH_LIBRARIES})
+# 
+#   add_executable(dqn_torch_example dqn_torch_example.cc
+#                 ${OPEN_SPIEL_OBJECTS}
+#                 $<TARGET_OBJECTS:dqn_torch>)
+#   target_link_libraries (dqn_torch_example ${TORCH_LIBRARIES})
+# endif ()
 
 if (BUILD_SHARED_LIB)
   if (WIN32)

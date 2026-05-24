@@ -255,7 +255,7 @@ endif()
 if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libtorch/libtorch")
   find_package(Torch REQUIRED)
-  add_subdirectory(libtorch)
+  # add_subdirectory(libtorch)
   include_directories(${TORCH_INCLUDE_DIRS})
   # Use following to link your_target_executable with torch libraries:
   # target_link_libraries(your_target_executable ${TORCH_LIBRARIES})

@@ -1,5 +1,5 @@
 // Timed, multi-threaded Dune Imperium self-play benchmark driver
-// Bypasses LibTorch to establish a pure C++ engine performance baseline.
+// Supports both a pure C++ engine baseline and a LibTorch tensor inference benchmark.
 
 #include <iostream>
 #include <random>
@@ -7,41 +7,95 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <deque>
+#include <mutex>
+#include <iterator>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/spiel.h"
 
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include <torch/torch.h>
+#endif
+
 ABSL_FLAG(std::string, game, "dune_imperium", "The name of the game to play.");
 ABSL_FLAG(int, games, 1000, "How many games to play in total.");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
 
 namespace open_spiel {
+
+struct Transition {
+  std::vector<float> spatial_tensor;     // Flattened observation tensor
+  std::vector<int> legal_actions_mask;   // 1 for legal, 0 for illegal
+  int64_t action_taken;                  // Action ID chosen
+  std::vector<float> prev_logits;        // Raw policy logits (z_k)
+  std::vector<float> base_logits;        // Raw logits (z_base)
+  float q_value;                         // Estimated action-value Q(s, a)
+  float reward_target;                   // Mapped zero-sum reward
+  int player_id;                         // Seat ID of the deciding player
+};
+
+class GlobalReplayBuffer {
+ private:
+  std::deque<Transition> buffer_;
+  std::mutex buffer_mutex_;
+  size_t max_capacity_;
+
+ public:
+  GlobalReplayBuffer(size_t capacity) : max_capacity_(capacity) {}
+
+  void PushTrajectory(std::vector<Transition>& local_trajectory) {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    
+    buffer_.insert(buffer_.end(), 
+                   std::make_move_iterator(local_trajectory.begin()), 
+                   std::make_move_iterator(local_trajectory.end()));
+                   
+    while (buffer_.size() > max_capacity_) {
+      buffer_.pop_front();
+    }
+  }
+
+  size_t Size() {
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    return buffer_.size();
+  }
+};
+
 namespace {
 
-int RandomSimulation(std::mt19937* rng, const Game& game) {
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+struct DummyTorchModel : torch::nn::Module {
+  torch::nn::Linear fc{nullptr};
+  torch::nn::Linear policy_head{nullptr};
+  
+  DummyTorchModel(int64_t input_dim, int64_t action_dim) {
+    fc = register_module("fc", torch::nn::Linear(input_dim, 256));
+    policy_head = register_module("policy_head", torch::nn::Linear(256, action_dim));
+  }
+
+  torch::Tensor forward(torch::Tensor x) {
+    x = torch::relu(fc->forward(x));
+    return policy_head->forward(x);
+  }
+};
+
+int TorchSimulation(std::mt19937* rng, const Game& game, DummyTorchModel* model, int64_t obs_size, std::vector<Transition>& trajectory) {
   std::unique_ptr<State> state = game.NewInitialState();
 
   bool provides_info_state_tensor =
       game.GetType().provides_information_state_tensor;
   bool provides_observations_tensor =
       game.GetType().provides_observation_tensor;
-  std::vector<float> obs;
-  if (provides_info_state_tensor) {
-    obs = std::vector<float>(game.InformationStateTensorSize());
-  } else if (provides_observations_tensor) {
-    obs = std::vector<float>(game.ObservationTensorSize());
-  }
+
+  // CRITICAL: Disable gradient tracking for self-play generation
+  torch::NoGradGuard no_grad;
 
   int game_length = 0;
   while (!state->IsTerminal()) {
-    if (provides_info_state_tensor && state->CurrentPlayer() >= 0) {
-      state->InformationStateTensor(state->CurrentPlayer(),
-                                    absl::MakeSpan(obs));
-    } else if (provides_observations_tensor && state->CurrentPlayer() >= 0) {
-      state->ObservationTensor(state->CurrentPlayer(), absl::MakeSpan(obs));
-    }
     ++game_length;
     if (game_length > 5000) {
       std::cerr << "Possible infinite loop detected! Game length: " << game_length
@@ -72,6 +126,109 @@ int RandomSimulation(std::mt19937* rng, const Game& game) {
       }
       state->ApplyActions(joint_action);
     } else {
+      Player current_player = state->CurrentPlayer();
+      std::vector<Action> actions = state->LegalActions();
+      if (actions.empty()) {
+        std::cerr << "Spiel Fatal Error: Non-terminal state has empty LegalActions(). Player: " 
+                  << state->CurrentPlayer() << "\nState string:\n" << state->ToString() << std::endl;
+        std::abort();
+      }
+
+      // 1. Allocate and populate observation vector via span
+      std::vector<float> obs(obs_size, 0.0f);
+      if (provides_info_state_tensor && current_player >= 0) {
+        state->InformationStateTensor(current_player, absl::MakeSpan(obs));
+      } else if (provides_observations_tensor && current_player >= 0) {
+        state->ObservationTensor(current_player, absl::MakeSpan(obs));
+      }
+
+      // 2. Assemble legal actions mask
+      int64_t action_size = game.NumDistinctActions();
+      std::vector<int> legal_actions_mask(action_size, 0);
+      for (Action a : actions) {
+        if (a >= 0 && a < action_size) {
+          legal_actions_mask[a] = 1;
+        }
+      }
+
+      // Convert C++ Vector to LibTorch Tensor (Zero-copy mapping)
+      torch::Tensor state_tensor = torch::from_blob(obs.data(), {1, obs_size}, torch::kFloat);
+      
+      // Forward Pass
+      torch::Tensor logits = model->forward(state_tensor);
+
+      // Select action randomly to guarantee state progression, mirroring RandomSimulation
+      std::uniform_int_distribution<int> dis(0, actions.size() - 1);
+      Action action = actions[dis(*rng)];
+      state->ApplyAction(action);
+
+      // Push to trajectory
+      Transition transition;
+      transition.spatial_tensor = std::move(obs);
+      transition.legal_actions_mask = std::move(legal_actions_mask);
+      transition.action_taken = action;
+      transition.prev_logits = std::vector<float>(action_size, 0.0f);
+      transition.base_logits = std::vector<float>(action_size, 0.0f);
+      transition.q_value = 0.0f;
+      transition.reward_target = 0.0f;
+      transition.player_id = current_player;
+      trajectory.push_back(std::move(transition));
+    }
+  }
+
+  // Populate rewards at game terminal state
+  std::vector<double> returns = state->Returns();
+  for (auto& transition : trajectory) {
+    if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
+      transition.reward_target = static_cast<float>(returns[transition.player_id]);
+    }
+  }
+
+  return game_length;
+}
+#endif
+
+int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std::vector<Transition>& trajectory) {
+  std::unique_ptr<State> state = game.NewInitialState();
+
+  bool provides_info_state_tensor =
+      game.GetType().provides_information_state_tensor;
+  bool provides_observations_tensor =
+      game.GetType().provides_observation_tensor;
+
+  int game_length = 0;
+  while (!state->IsTerminal()) {
+    ++game_length;
+    if (game_length > 5000) {
+      std::cerr << "Possible infinite loop detected! Game length: " << game_length
+                << " Player: " << state->CurrentPlayer()
+                << "\nState string:\n" << state->ToString() << std::endl;
+      std::abort();
+    }
+    if (state->IsChanceNode()) {
+      std::vector<std::pair<Action, double>> outcomes = state->ChanceOutcomes();
+      Action action;
+      if (game.GetType().chance_mode ==
+          GameType::ChanceMode::kSampledStochastic) {
+        action = outcomes.front().first;
+      } else {
+        action = SampleAction(outcomes, *rng).first;
+      }
+      state->ApplyAction(action);
+    } else if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+      std::vector<Action> joint_action;
+      for (int p = 0; p < game.NumPlayers(); p++) {
+        std::vector<Action> actions = state->LegalActions(p);
+        Action action = 0;
+        if (!actions.empty()) {
+          std::uniform_int_distribution<int> dis(0, actions.size() - 1);
+          action = actions[dis(*rng)];
+        }
+        joint_action.push_back(action);
+      }
+      state->ApplyActions(joint_action);
+    } else {
+      Player current_player = state->CurrentPlayer();
       std::vector<Action> actions = state->LegalActions();
       if (actions.empty()) {
         std::cerr << "Spiel Fatal Error: Non-terminal state has empty LegalActions(). Player: " 
@@ -80,14 +237,59 @@ int RandomSimulation(std::mt19937* rng, const Game& game) {
       }
       std::uniform_int_distribution<int> dis(0, actions.size() - 1);
       Action action = actions[dis(*rng)];
+
+      // 1. Allocate and populate observation vector via span
+      std::vector<float> obs(obs_size, 0.0f);
+      if (provides_info_state_tensor && current_player >= 0) {
+        state->InformationStateTensor(current_player, absl::MakeSpan(obs));
+      } else if (provides_observations_tensor && current_player >= 0) {
+        state->ObservationTensor(current_player, absl::MakeSpan(obs));
+      }
+
+      // 2. Assemble legal actions mask
+      int64_t action_size = game.NumDistinctActions();
+      std::vector<int> legal_actions_mask(action_size, 0);
+      for (Action a : actions) {
+        if (a >= 0 && a < action_size) {
+          legal_actions_mask[a] = 1;
+        }
+      }
+
+      // Apply action
       state->ApplyAction(action);
+
+      // Push to trajectory
+      Transition transition;
+      transition.spatial_tensor = std::move(obs);
+      transition.legal_actions_mask = std::move(legal_actions_mask);
+      transition.action_taken = action;
+      transition.prev_logits = std::vector<float>(action_size, 0.0f);
+      transition.base_logits = std::vector<float>(action_size, 0.0f);
+      transition.q_value = 0.0f;
+      transition.reward_target = 0.0f;
+      transition.player_id = current_player;
+      trajectory.push_back(std::move(transition));
     }
   }
+
+  // Populate rewards at game terminal state
+  std::vector<double> returns = state->Returns();
+  for (auto& transition : trajectory) {
+    if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
+      transition.reward_target = static_cast<float>(returns[transition.player_id]);
+    }
+  }
+
   return game_length;
 }
 
 void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_completed,
-                  int total_games, std::atomic<int>& total_moves) {
+                  int total_games, std::atomic<int>& total_moves,
+                  GlobalReplayBuffer* global_buffer, int64_t obs_size
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+                  , DummyTorchModel* model
+#endif
+) {
   std::mt19937 rng(std::random_device{}() + thread_id);
   int moves = 0;
   while (true) {
@@ -96,7 +298,17 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
       games_completed.fetch_sub(1);
       break;
     }
-    moves += RandomSimulation(&rng, *game);
+    std::vector<Transition> local_trajectory;
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+    if (model != nullptr) {
+      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory);
+    } else {
+      moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
+    }
+#else
+    moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
+#endif
+    global_buffer->PushTrajectory(local_trajectory);
   }
   total_moves.fetch_add(moves);
 }
@@ -107,6 +319,12 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  // Clamp internal LibTorch CPU threads to 1 to prevent severe thread pool thrashing
+  at::set_num_threads(1);
+  at::set_num_interop_threads(1);
+#endif
+
   std::string game_name = absl::GetFlag(FLAGS_game);
   int total_games = absl::GetFlag(FLAGS_games);
   int num_threads = absl::GetFlag(FLAGS_threads);
@@ -116,7 +334,39 @@ int main(int argc, char** argv) {
   std::cout << absl::StrFormat("Total games to simulate: %d\n", total_games);
   std::cout << absl::StrFormat("Number of threads: %d\n", num_threads);
 
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  std::cout << "LibTorch Inference Mode: ENABLED\n";
+#else
+  std::cout << "LibTorch Inference Mode: DISABLED (Pure C++ Random Baseline)\n";
+#endif
+
   auto game = open_spiel::LoadGame(game_name);
+
+  // General observation shape retrieval
+  int64_t obs_size = 0;
+  bool provides_info_state_tensor =
+      game->GetType().provides_information_state_tensor;
+  bool provides_observations_tensor =
+      game->GetType().provides_observation_tensor;
+  if (provides_info_state_tensor) {
+    obs_size = game->InformationStateTensorSize();
+  } else if (provides_observations_tensor) {
+    obs_size = game->ObservationTensorSize();
+  }
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  int64_t action_size = game->NumDistinctActions();
+  
+  std::shared_ptr<open_spiel::DummyTorchModel> model = nullptr;
+  if (obs_size > 0) {
+    model = std::make_shared<open_spiel::DummyTorchModel>(obs_size, action_size);
+    model->eval(); // Put into evaluation mode
+    std::cout << absl::StrFormat("Initialized DummyTorchModel (Input Dim: %d, Action Dim: %d)\n", obs_size, action_size);
+  }
+#endif
+
+  // Construct global thread-safe replay buffer
+  open_spiel::GlobalReplayBuffer global_buffer(1000000);
 
   std::atomic<int> games_completed(0);
   std::atomic<int> total_moves(0);
@@ -127,7 +377,12 @@ int main(int argc, char** argv) {
   threads.reserve(num_threads);
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back(open_spiel::ThreadWorker, i, game.get(),
-                         std::ref(games_completed), total_games, std::ref(total_moves));
+                         std::ref(games_completed), total_games, std::ref(total_moves),
+                         &global_buffer, obs_size
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+                         , model.get()
+#endif
+    );
   }
 
   for (auto& t : threads) {
@@ -145,6 +400,7 @@ int main(int argc, char** argv) {
   std::cout << absl::StrFormat("Elapsed Time: %.3f seconds\n", seconds);
   std::cout << absl::StrFormat("Games Completed: %d\n", completed);
   std::cout << absl::StrFormat("Total Moves Executed: %d\n", moves);
+  std::cout << absl::StrFormat("Final Global Buffer Size: %zu transitions\n", global_buffer.Size());
   std::cout << absl::StrFormat("Games Per Second (GPS): %.2f\n", completed / seconds);
   std::cout << absl::StrFormat("Moves Per Second (MPS): %.2f\n", moves / seconds);
 
