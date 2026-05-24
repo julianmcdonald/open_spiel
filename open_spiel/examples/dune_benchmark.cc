@@ -32,15 +32,15 @@ ABSL_FLAG(bool, async_mode, false, "Whether to run optimization asynchronously i
 ABSL_FLAG(int, min_train_size, 1024, "Minimum buffer transitions before starting SGD training.");
 ABSL_FLAG(int, train_batch_size, 32, "Batch size for background SGD updates.");
 ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight synchronizations.");
+ABSL_FLAG(int, buffer_capacity, 100000, "Maximum capacity of the global replay buffer.");
 
 namespace open_spiel {
 
 struct Transition {
   std::vector<float> spatial_tensor;     // Flattened observation tensor
-  std::vector<int> legal_actions_mask;   // 1 for legal, 0 for illegal
+  std::vector<Action> legal_actions;     // Sparse list of legal action IDs (saves 99% RAM)
   int64_t action_taken;                  // Action ID chosen
   std::vector<float> prev_logits;        // Raw policy logits (z_k)
-  std::vector<float> base_logits;        // Raw logits (z_base)
   float q_value;                         // Estimated action-value Q(s, a)
   float reward_target;                   // Mapped zero-sum reward
   int player_id;                         // Seat ID of the deciding player
@@ -48,7 +48,7 @@ struct Transition {
 
 class GlobalReplayBuffer {
  private:
-  std::deque<Transition> buffer_;
+  std::deque<std::shared_ptr<Transition>> buffer_;
   std::mutex buffer_mutex_;
   size_t max_capacity_;
 
@@ -58,24 +58,26 @@ class GlobalReplayBuffer {
   void PushTrajectory(std::vector<Transition>& local_trajectory) {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     
-    buffer_.insert(buffer_.end(), 
-                   std::make_move_iterator(local_trajectory.begin()), 
-                   std::make_move_iterator(local_trajectory.end()));
-                   
+    for (auto& transition : local_trajectory) {
+      buffer_.push_back(std::make_shared<Transition>(std::move(transition)));
+    }
+    
     while (buffer_.size() > max_capacity_) {
       buffer_.pop_front();
     }
   }
 
-  std::vector<Transition> SampleBatch(size_t batch_size) {
+  std::vector<std::shared_ptr<Transition>> SampleBatch(size_t batch_size) {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
-    std::vector<Transition> batch;
+    std::vector<std::shared_ptr<Transition>> batch;
     if (buffer_.empty()) return batch;
     
     batch.reserve(batch_size);
+    std::uniform_int_distribution<size_t> dis(0, buffer_.size() - 1);
+    static thread_local std::mt19937 rng(std::random_device{}());
+    
     for (size_t i = 0; i < batch_size; ++i) {
-      size_t idx = rand() % buffer_.size();
-      batch.push_back(buffer_[idx]);
+      batch.push_back(buffer_[dis(rng)]);
     }
     return batch;
   }
@@ -147,25 +149,52 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
 TORCH_MODULE(SharedDunePolicyValueNet);
 
 void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-                    torch::optim::Adam& optimizer, 
+                    std::unique_ptr<torch::optim::Adam>& optimizer, 
                     const std::string& model_path, 
-                    const std::string& optim_path) {
+                    const std::string& optim_path,
+                    torch::Device device) {
   if (std::filesystem::exists(model_path)) {
     try {
       torch::load(model, model_path);
       std::cout << "Successfully loaded model weights from " << model_path << "\n";
-      
-      if (std::filesystem::exists(optim_path)) {
-        torch::load(optimizer, optim_path);
-        std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
-      } else {
-        std::cout << "Optimizer checkpoint not found at " << optim_path << ". Starting with default optimizer state.\n";
-      }
     } catch (const c10::Error& e) {
       std::cerr << "Error loading checkpoint: " << e.msg() << "\n";
     }
   } else {
     std::cout << "No existing checkpoint found at " << model_path << ". Starting from scratch.\n";
+  }
+
+  // Move model to its target hardware device AFTER loading weights
+  model->to(device);
+
+  // Initialize Adam Optimizer AFTER model weights have been moved to the target hardware device
+  optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(1e-3));
+
+  if (std::filesystem::exists(optim_path)) {
+    try {
+      torch::load(*optimizer, optim_path);
+      std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
+      
+      // Move all loaded optimizer state tensors (momentum buffers) to target device to prevent CPU-GPU mismatches
+      for (auto& pair : optimizer->state()) {
+        auto& state_ptr = pair.second;
+        if (auto adam_state = dynamic_cast<torch::optim::AdamParamState*>(state_ptr.get())) {
+          if (adam_state->exp_avg().defined()) {
+            adam_state->exp_avg() = adam_state->exp_avg().to(device);
+          }
+          if (adam_state->exp_avg_sq().defined()) {
+            adam_state->exp_avg_sq() = adam_state->exp_avg_sq().to(device);
+          }
+          if (adam_state->max_exp_avg_sq().defined()) {
+            adam_state->max_exp_avg_sq() = adam_state->max_exp_avg_sq().to(device);
+          }
+        }
+      }
+    } catch (const c10::Error& e) {
+      std::cerr << "Error loading optimizer checkpoint: " << e.msg() << "\n";
+    }
+  } else {
+    std::cout << "Optimizer checkpoint not found at " << optim_path << ". Starting with default optimizer state.\n";
   }
 }
 
@@ -182,11 +211,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   }
 }
 
-void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-               torch::optim::Optimizer& optimizer, 
-               const std::vector<Transition>& batch, 
-               int64_t obs_size,
-               int64_t action_dim);
+std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                                  torch::optim::Optimizer& optimizer, 
+                                  const std::vector<std::shared_ptr<Transition>>& batch, 
+                                  int64_t obs_size,
+                                  int64_t action_dim,
+                                  torch::Device device);
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model, 
                 std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
@@ -200,10 +230,10 @@ void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
   auto infer_buffers = inference_model->buffers();
 
   for (size_t i = 0; i < train_params.size(); ++i) {
-    infer_params[i].copy_(train_params[i]);
+    infer_params[i].copy_(train_params[i].to(torch::kCPU));
   }
   for (size_t i = 0; i < train_buffers.size(); ++i) {
-    infer_buffers[i].copy_(train_buffers[i]);
+    infer_buffers[i].copy_(train_buffers[i].to(torch::kCPU));
   }
 }
 
@@ -221,53 +251,70 @@ void OptimizationWorker(
     int train_batch_size,
     int sync_interval,
     const std::string& model_path,
-    const std::string& optim_path) {
-  
-  // 1. Warmup Phase: wait until the global replay buffer has enough transitions
-  while (global_buffer->Size() < static_cast<size_t>(min_train_size) && !stop_training.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-
-  if (!stop_training.load()) {
-    std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n";
-  }
-
-  // 2. Training Loop
-  while (!stop_training.load()) {
-    std::vector<Transition> batch = global_buffer->SampleBatch(train_batch_size);
-    if (batch.empty()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
+    const std::string& optim_path,
+    torch::Device device) {
+  try {
+    // 1. Warmup Phase: wait until the global replay buffer has enough transitions
+    while (global_buffer->Size() < static_cast<size_t>(min_train_size) && !stop_training.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // Lock-free optimization step on training_model
-    TrainStep(training_model, *optimizer, batch, obs_size, action_size);
-
-    int step = training_steps.fetch_add(1) + 1;
-
-    // Periodic model synchronization
-    if (step % sync_interval == 0) {
-      SyncModels(training_model, inference_model, sync_mutex);
+    if (!stop_training.load()) {
+      std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n";
     }
 
-    // Periodic checkpoint saving (runs in background, no sync_mutex needed)
-    if (step % 500 == 0) {
-      SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+    // 2. Training Loop
+    while (!stop_training.load()) {
+      std::vector<std::shared_ptr<Transition>> batch = global_buffer->SampleBatch(train_batch_size);
+      if (batch.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+
+      // Lock-free optimization step on training_model
+      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, obs_size, action_size, device);
+
+      int step = training_steps.fetch_add(1) + 1;
+
+      // Periodic model synchronization
+      if (step % sync_interval == 0) {
+        SyncModels(training_model, inference_model, sync_mutex);
+        std::cout << absl::StrFormat("Step %5d | Buffer Size: %6zu | Value Loss (MSE): %.6f | Policy Loss (KL): %.6f\n",
+                                     step, global_buffer->Size(), v_loss, p_loss) << std::flush;
+      }
+
+      // Periodic checkpoint saving (runs in background, no sync_mutex needed)
+      if (step % 500 == 0) {
+        SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      }
     }
+    
+    // Final synchronization at shutdown to ensure inference_model has latest weights
+    SyncModels(training_model, inference_model, sync_mutex);
+    std::cout << "Background optimization worker stopped cleanly. Total steps: " << training_steps.load() << "\n";
+  } catch (const c10::Error& e) {
+    std::cerr << "\n============================================\n"
+              << "CRITICAL PyTorch error in Asynchronous Optimization Worker thread:\n"
+              << e.what() << "\n"
+              << "============================================\n" << std::endl;
+    std::abort();
+  } catch (const std::exception& e) {
+    std::cerr << "\n============================================\n"
+              << "CRITICAL Exception in Asynchronous Optimization Worker thread:\n"
+              << e.what() << "\n"
+              << "============================================\n" << std::endl;
+    std::abort();
   }
-  
-  // Final synchronization at shutdown to ensure inference_model has latest weights
-  SyncModels(training_model, inference_model, sync_mutex);
-  std::cout << "Background optimization worker stopped cleanly. Total steps: " << training_steps.load() << "\n";
 }
 
-void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-               torch::optim::Optimizer& optimizer, 
-               const std::vector<Transition>& batch, 
-               int64_t obs_size,
-               int64_t action_dim) {
+std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                                  torch::optim::Optimizer& optimizer, 
+                                  const std::vector<std::shared_ptr<Transition>>& batch, 
+                                  int64_t obs_size,
+                                  int64_t action_dim,
+                                  torch::Device device) {
   size_t batch_size = batch.size();
-  if (batch_size == 0) return;
+  if (batch_size == 0) return {0.0f, 0.0f};
 
   std::vector<float> flat_states;
   std::vector<float> flat_masks;
@@ -286,26 +333,36 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   flat_actions_taken.reserve(batch_size);
 
   for (const auto& transition : batch) {
-    flat_states.insert(flat_states.end(), transition.spatial_tensor.begin(), transition.spatial_tensor.end());
-    for (int mask_val : transition.legal_actions_mask) {
-      flat_masks.push_back(static_cast<float>(mask_val));
+    flat_states.insert(flat_states.end(), transition->spatial_tensor.begin(), transition->spatial_tensor.end());
+    
+    // Reconstruct dense mask on the fly
+    std::vector<float> dense_mask(action_dim, 0.0f);
+    for (Action action_id : transition->legal_actions) {
+      if (action_id >= 0 && action_id < action_dim) {
+        dense_mask[action_id] = 1.0f;
+      }
     }
-    // Scale target reward: divide by 2.25 to bound target in [-0.77, 1.00]
-    flat_rewards.push_back(transition.reward_target / 2.25f);
+    flat_masks.insert(flat_masks.end(), dense_mask.begin(), dense_mask.end());
 
-    flat_prev_logits.insert(flat_prev_logits.end(), transition.prev_logits.begin(), transition.prev_logits.end());
-    flat_base_logits.insert(flat_base_logits.end(), transition.base_logits.begin(), transition.base_logits.end());
-    flat_q_values.push_back(transition.q_value);
-    flat_actions_taken.push_back(transition.action_taken);
+    // Scale target reward: divide by 2.25 to bound target in [-0.77, 1.00]
+    flat_rewards.push_back(transition->reward_target / 2.25f);
+
+    flat_prev_logits.insert(flat_prev_logits.end(), transition->prev_logits.begin(), transition->prev_logits.end());
+    
+    // Reconstruct zero base logits on the fly
+    flat_base_logits.insert(flat_base_logits.end(), action_dim, 0.0f);
+
+    flat_q_values.push_back(transition->q_value);
+    flat_actions_taken.push_back(transition->action_taken);
   }
 
-  torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).clone();
-  torch::Tensor masks = torch::from_blob(flat_masks.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
-  torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
-  torch::Tensor prev_logits = torch::from_blob(flat_prev_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
-  torch::Tensor base_logits = torch::from_blob(flat_base_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
-  torch::Tensor q_values = torch::from_blob(flat_q_values.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
-  torch::Tensor actions_taken = torch::from_blob(flat_actions_taken.data(), {(int64_t)batch_size, 1}, torch::kLong).clone();
+  torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).to(device);
+  torch::Tensor masks = torch::from_blob(flat_masks.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
+  torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).to(device);
+  torch::Tensor prev_logits = torch::from_blob(flat_prev_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
+  torch::Tensor base_logits = torch::from_blob(flat_base_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
+  torch::Tensor q_values = torch::from_blob(flat_q_values.data(), {(int64_t)batch_size, 1}, torch::kFloat).to(device);
+  torch::Tensor actions_taken = torch::from_blob(flat_actions_taken.data(), {(int64_t)batch_size, 1}, torch::kLong).to(device);
 
   optimizer.zero_grad();
   auto outputs = model->forward(states);
@@ -326,7 +383,7 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   float alpha = 0.05f;
 
   // Construct sparse Q-values for the action taken, zero elsewhere
-  torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::kFloat);
+  torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
   q_vector.scatter_(1, actions_taken, q_values);
 
   // Calculate the theoretical MMD target logits
@@ -346,8 +403,14 @@ void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   );
 
   torch::Tensor total_loss = policy_loss + value_loss;
+
+  float p_loss_val = policy_loss.item<float>();
+  float v_loss_val = value_loss.item<float>();
+
   total_loss.backward();
   optimizer.step();
+
+  return {v_loss_val, p_loss_val};
 }
 
 int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory, std::shared_mutex* sync_mutex) {
@@ -409,14 +472,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
         state->ObservationTensor(current_player, absl::MakeSpan(obs));
       }
 
-      // 2. Assemble legal actions mask
       int64_t action_size = game.NumDistinctActions();
-      std::vector<int> legal_actions_mask(action_size, 0);
-      for (Action a : actions) {
-        if (a >= 0 && a < action_size) {
-          legal_actions_mask[a] = 1;
-        }
-      }
 
       // Convert C++ Vector to LibTorch Tensor (Zero-copy mapping)
       torch::Tensor state_tensor = torch::from_blob(obs.data(), {1, obs_size}, torch::kFloat);
@@ -442,10 +498,9 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
       // Push to trajectory
       Transition transition;
       transition.spatial_tensor = std::move(obs);
-      transition.legal_actions_mask = std::move(legal_actions_mask);
+      transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
       transition.action_taken = action;
       transition.prev_logits = std::move(prev_logits_vec);
-      transition.base_logits = std::vector<float>(action_size, 0.0f);
       transition.q_value = 0.0f;
       transition.reward_target = 0.0f;
       transition.player_id = current_player;
@@ -525,14 +580,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
         state->ObservationTensor(current_player, absl::MakeSpan(obs));
       }
 
-      // 2. Assemble legal actions mask
       int64_t action_size = game.NumDistinctActions();
-      std::vector<int> legal_actions_mask(action_size, 0);
-      for (Action a : actions) {
-        if (a >= 0 && a < action_size) {
-          legal_actions_mask[a] = 1;
-        }
-      }
 
       // Apply action
       state->ApplyAction(action);
@@ -540,10 +588,9 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       // Push to trajectory
       Transition transition;
       transition.spatial_tensor = std::move(obs);
-      transition.legal_actions_mask = std::move(legal_actions_mask);
+      transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
       transition.action_taken = action;
       transition.prev_logits = std::vector<float>(action_size, 0.0f);
-      transition.base_logits = std::vector<float>(action_size, 0.0f);
       transition.q_value = 0.0f;
       transition.reward_target = 0.0f;
       transition.player_id = current_player;
@@ -639,6 +686,12 @@ int main(int argc, char** argv) {
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   int64_t action_size = game->NumDistinctActions();
   
+  torch::Device train_device(torch::kCPU);
+  if (torch::cuda::is_available()) {
+    train_device = torch::Device(torch::kCUDA);
+    std::cout << "CUDA is available! Optimization Worker will execute on GPU.\n";
+  }
+
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model = nullptr;
   std::unique_ptr<torch::optim::Adam> optimizer = nullptr;
@@ -654,23 +707,22 @@ int main(int argc, char** argv) {
     training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     
+    inference_model->to(torch::kCPU);
+
     training_model->train(); // training model stays in train mode permanently
     inference_model->eval(); // inference model stays in eval mode permanently
     
     std::cout << absl::StrFormat("Initialized Double-Buffered SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
     
-    // Initialize Adam Optimizer at startup against training_model parameters
-    optimizer = std::make_unique<torch::optim::Adam>(training_model->parameters(), torch::optim::AdamOptions(1e-3));
-    
-    // Load existing checkpoint if it exists
-    open_spiel::LoadCheckpoint(training_model, *optimizer, model_path, optim_path);
+    // Load existing checkpoint and set up the training model and optimizer correctly on the target hardware device
+    open_spiel::LoadCheckpoint(training_model, optimizer, model_path, optim_path, train_device);
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
   }
 #endif
 
   // Construct global thread-safe replay buffer
-  open_spiel::GlobalReplayBuffer global_buffer(1000000);
+  open_spiel::GlobalReplayBuffer global_buffer(absl::GetFlag(FLAGS_buffer_capacity));
 
   std::atomic<int> games_completed(0);
   std::atomic<int> total_moves(0);
@@ -692,7 +744,7 @@ int main(int argc, char** argv) {
         obs_size, action_size, &sync_mutex,
         std::ref(stop_training), std::ref(training_steps),
         min_train_size, train_batch_size, sync_interval,
-        model_path, optim_path
+        model_path, optim_path, train_device
     );
   }
 #endif
@@ -740,11 +792,11 @@ int main(int argc, char** argv) {
       std::cout << "\nStarting optimization validation phase (Synchronous Mode)...\n";
       // Sample a single training batch of size 32
       size_t batch_size = 32;
-      std::vector<open_spiel::Transition> batch = global_buffer.SampleBatch(batch_size);
+      std::vector<std::shared_ptr<open_spiel::Transition>> batch = global_buffer.SampleBatch(batch_size);
       std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
 
       // Execute backprop step using the startup-initialized optimizer
-      open_spiel::TrainStep(training_model, *optimizer, batch, obs_size, action_size);
+      open_spiel::TrainStep(training_model, *optimizer, batch, obs_size, action_size, train_device);
       std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
       
       // Sync training weights to inference weights for completeness
