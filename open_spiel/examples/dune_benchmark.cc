@@ -81,50 +81,119 @@ class GlobalReplayBuffer {
 namespace {
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-struct DummyTorchModel : torch::nn::Module {
-  torch::nn::Linear fc{nullptr};
-  torch::nn::Linear policy_head{nullptr};
-  
-  DummyTorchModel(int64_t input_dim, int64_t action_dim) {
-    fc = register_module("fc", torch::nn::Linear(input_dim, 256));
-    policy_head = register_module("policy_head", torch::nn::Linear(256, action_dim));
+struct ResBlockImpl : torch::nn::Module {
+  torch::nn::Linear fc1{nullptr};
+  torch::nn::Linear fc2{nullptr};
+  torch::nn::LayerNorm ln1{nullptr};
+  torch::nn::LayerNorm ln2{nullptr};
+
+  ResBlockImpl(int64_t dim) {
+    fc1 = register_module("fc1", torch::nn::Linear(dim, dim));
+    fc2 = register_module("fc2", torch::nn::Linear(dim, dim));
+    ln1 = register_module("ln1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
+    ln2 = register_module("ln2", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
   }
 
   torch::Tensor forward(torch::Tensor x) {
-    x = torch::relu(fc->forward(x));
-    return policy_head->forward(x);
+    torch::Tensor residual = x;
+    x = torch::relu(ln1->forward(fc1->forward(x)));
+    x = ln2->forward(fc2->forward(x));
+    return torch::relu(x + residual);
   }
 };
+TORCH_MODULE(ResBlock);
 
-void TrainStep(std::shared_ptr<DummyTorchModel> model, 
+struct SharedDunePolicyValueNetImpl : torch::nn::Module {
+  torch::nn::Linear input_layer{nullptr};
+  std::shared_ptr<ResBlockImpl> res1{nullptr};
+  std::shared_ptr<ResBlockImpl> res2{nullptr};
+  torch::nn::Linear policy_head{nullptr};
+  torch::nn::Linear value_head{nullptr};
+
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim, int64_t action_dim) {
+    input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
+    
+    // Register the underlying implementation object wrapped in shared_ptr to solve template deduction
+    res1 = register_module("res1", std::make_shared<ResBlockImpl>(hidden_dim));
+    res2 = register_module("res2", std::make_shared<ResBlockImpl>(hidden_dim));
+    
+    policy_head = register_module("policy_head", torch::nn::Linear(hidden_dim, action_dim));
+    value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
+  }
+
+  struct ModelOutputs {
+    torch::Tensor logits;
+    torch::Tensor values;
+  };
+
+  ModelOutputs forward(torch::Tensor x) {
+    x = torch::relu(input_layer->forward(x));
+    x = res1->forward(x);
+    x = res2->forward(x);
+    
+    torch::Tensor logits = policy_head->forward(x);
+    torch::Tensor values = torch::tanh(value_head->forward(x));
+    return {logits, values};
+  }
+};
+TORCH_MODULE(SharedDunePolicyValueNet);
+
+void TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                torch::optim::Optimizer& optimizer, 
                const std::vector<Transition>& batch, 
-               int64_t obs_size) {
+               int64_t obs_size,
+               int64_t action_dim) {
   size_t batch_size = batch.size();
   if (batch_size == 0) return;
 
   std::vector<float> flat_states;
+  std::vector<float> flat_masks;
   std::vector<float> flat_rewards;
   flat_states.reserve(batch_size * obs_size);
+  flat_masks.reserve(batch_size * action_dim);
   flat_rewards.reserve(batch_size);
 
   for (const auto& transition : batch) {
     flat_states.insert(flat_states.end(), transition.spatial_tensor.begin(), transition.spatial_tensor.end());
-    flat_rewards.push_back(transition.reward_target);
+    for (int mask_val : transition.legal_actions_mask) {
+      flat_masks.push_back(static_cast<float>(mask_val));
+    }
+    // Scale target reward: divide by 2.25 to bound target in [-0.77, 1.00]
+    flat_rewards.push_back(transition.reward_target / 2.25f);
   }
 
   torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).clone();
+  torch::Tensor masks = torch::from_blob(flat_masks.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).clone();
   torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).clone();
 
   optimizer.zero_grad();
-  torch::Tensor pred_logits = model->forward(states);
-  torch::Tensor mock_values = pred_logits.mean(/*dim=*/1, /*keepdim=*/true);
-  torch::Tensor loss = torch::nn::functional::mse_loss(mock_values, rewards);
-  loss.backward();
+  auto outputs = model->forward(states);
+  torch::Tensor pred_logits = outputs.logits;
+  torch::Tensor pred_values = outputs.values;
+
+  // Mask illegal action logits (mask == 0) with a large negative value (-1e9f)
+  torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
+
+  // Compute log_softmax over masked logits
+  torch::Tensor log_probs = torch::log_softmax(masked_logits, /*dim=*/-1);
+
+  // Value Loss (MSE between scaled zero-sum returns and Tanh bounded prediction)
+  torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
+
+  // Mock Policy Loss for optimization verification (KL divergence against a softmax distribution over masked logits)
+  torch::Tensor mock_target = torch::softmax(masked_logits, /*dim=*/-1).detach();
+  torch::Tensor policy_loss = torch::nn::functional::kl_div(
+      log_probs, 
+      mock_target, 
+      torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean)
+  );
+
+  torch::Tensor total_loss = policy_loss + value_loss;
+  total_loss.backward();
   optimizer.step();
 }
 
-int TorchSimulation(std::mt19937* rng, const Game& game, DummyTorchModel* model, int64_t obs_size, std::vector<Transition>& trajectory) {
+int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory) {
   std::unique_ptr<State> state = game.NewInitialState();
 
   bool provides_info_state_tensor =
@@ -196,7 +265,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, DummyTorchModel* model,
       torch::Tensor state_tensor = torch::from_blob(obs.data(), {1, obs_size}, torch::kFloat);
       
       // Forward Pass
-      torch::Tensor logits = model->forward(state_tensor);
+      torch::Tensor logits = model->forward(state_tensor).logits;
 
       // Select action randomly to guarantee state progression, mirroring RandomSimulation
       std::uniform_int_distribution<int> dis(0, actions.size() - 1);
@@ -328,7 +397,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
                   int total_games, std::atomic<int>& total_moves,
                   GlobalReplayBuffer* global_buffer, int64_t obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                  , DummyTorchModel* model
+                  , SharedDunePolicyValueNetImpl* model
 #endif
 ) {
   std::mt19937 rng(std::random_device{}() + thread_id);
@@ -398,11 +467,11 @@ int main(int argc, char** argv) {
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   int64_t action_size = game->NumDistinctActions();
   
-  std::shared_ptr<open_spiel::DummyTorchModel> model = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model = nullptr;
   if (obs_size > 0) {
-    model = std::make_shared<open_spiel::DummyTorchModel>(obs_size, action_size);
+    model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     model->eval(); // Put into evaluation mode
-    std::cout << absl::StrFormat("Initialized DummyTorchModel (Input Dim: %d, Action Dim: %d)\n", obs_size, action_size);
+    std::cout << absl::StrFormat("Initialized SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
   }
 #endif
 
@@ -451,7 +520,7 @@ int main(int argc, char** argv) {
     std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
 
     // Execute backprop step
-    open_spiel::TrainStep(model, optimizer, batch, obs_size);
+    open_spiel::TrainStep(model, optimizer, batch, obs_size, action_size);
     std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
   }
 #endif
