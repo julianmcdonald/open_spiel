@@ -40,6 +40,9 @@ ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate b
 ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
 ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained in intermediate shaped rewards.");
 ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
+ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
+ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
+ABSL_FLAG(double, mmd_alpha, 0.1, "MMD entropy parameter alpha.");
 
 namespace open_spiel {
 
@@ -124,13 +127,23 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   // Move model to its target hardware device AFTER loading weights
   model->to(device);
 
+  double learning_rate = absl::GetFlag(FLAGS_learning_rate);
+
   // Initialize Adam Optimizer AFTER model weights have been moved to the target hardware device
-  optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(1e-3));
+  optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(learning_rate));
 
   if (std::filesystem::exists(optim_path)) {
     try {
       torch::load(*optimizer, optim_path);
       std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
+
+      // CRITICAL FIX: PyTorch's load() overwrites the learning rate with the one saved in the file.
+      // We must explicitly override it to ensure the Abseil flag is respected!
+      for (auto& param_group : optimizer->param_groups()) {
+        if (param_group.has_options()) {
+          static_cast<torch::optim::AdamOptions&>(param_group.options()).lr(learning_rate);
+        }
+      }
       
       // Move all loaded optimizer state tensors (momentum buffers) to target device to prevent CPU-GPU mismatches
       for (auto& pair : optimizer->state()) {
@@ -361,8 +374,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
   // MMD Policy Loss
-  float eta = 0.1f;
-  float alpha = 0.05f;
+  float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
+  float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
 
   // Construct sparse Q-values for the action taken, zero elsewhere
   torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
