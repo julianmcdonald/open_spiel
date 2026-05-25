@@ -18,10 +18,12 @@
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/spiel.h"
-
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
 #include "dune_network.h"
+#include <cmath>
+#include <algorithm>
+#include "open_spiel/games/dune_imperium/dune_imperium.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The name of the game to play.");
@@ -35,6 +37,9 @@ ABSL_FLAG(int, train_batch_size, 32, "Batch size for background SGD updates.");
 ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight synchronizations.");
 ABSL_FLAG(int, buffer_capacity, 100000, "Maximum capacity of the global replay buffer.");
 ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate before the GPU is allowed to pull 1 training batch. Set <= 0 to disable throttling.");
+ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
+ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained in intermediate shaped rewards.");
+ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
 
 namespace open_spiel {
 
@@ -204,7 +209,8 @@ void OptimizationWorker(
     int sync_interval,
     const std::string& model_path,
     const std::string& optim_path,
-    torch::Device device) {
+    torch::Device device,
+    std::atomic<float>* reward_lambda) {
   try {
     // 1. Warmup Phase: wait until the global replay buffer has enough transitions
     while (global_buffer->Size() < static_cast<size_t>(min_train_size) && !stop_training.load()) {
@@ -240,11 +246,23 @@ void OptimizationWorker(
 
       int step = training_steps.fetch_add(1) + 1;
 
+      // Update linear decay for the intermediate reward shaping lambda
+      if (reward_lambda != nullptr) {
+        int decay_horizon = absl::GetFlag(FLAGS_decay_horizon);
+        if (step < decay_horizon) {
+          float new_lambda = 1.0f - (static_cast<float>(step) / decay_horizon);
+          reward_lambda->store(new_lambda, std::memory_order_relaxed);
+        } else {
+          reward_lambda->store(0.0f, std::memory_order_relaxed);
+        }
+      }
+
       // Periodic model synchronization
       if (step % sync_interval == 0) {
         SyncModels(training_model, inference_model, sync_mutex);
-        std::cout << absl::StrFormat("Step %5d | Buffer Size: %6zu | Value Loss (MSE): %.6f | Policy Loss (KL): %.6f\n",
-                                     step, global_buffer->Size(), v_loss, p_loss) << std::flush;
+        float current_lambda = (reward_lambda != nullptr) ? reward_lambda->load(std::memory_order_relaxed) : 0.0f;
+        std::cout << absl::StrFormat("Step %5d | Buffer Size: %6zu | Lambda: %.4f | Value Loss (MSE): %.6f | Policy Loss (KL): %.6f\n",
+                                     step, global_buffer->Size(), current_lambda, v_loss, p_loss) << std::flush;
       }
 
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
@@ -377,7 +395,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   return {v_loss_val, p_loss_val};
 }
 
-int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory, std::shared_mutex* sync_mutex) {
+int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory, std::shared_mutex* sync_mutex, std::atomic<float>* reward_lambda) {
   std::unique_ptr<State> state = game.NewInitialState();
 
   bool provides_info_state_tensor =
@@ -387,6 +405,20 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
 
   // CRITICAL: Disable gradient tracking for self-play generation
   torch::NoGradGuard no_grad;
+
+  // Initialize VP tracking for all players (before the action loop)
+  const dune_imperium::DuneImperiumState* dune_state = 
+      dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+  std::vector<int> current_vps(game.NumPlayers(), 0);
+  if (dune_state != nullptr) {
+    for (int p = 0; p < game.NumPlayers(); ++p) {
+      current_vps[p] = dune_state->GetPlayerVpForTesting(p);
+    }
+  }
+
+  // Micro-optimized flag retrieval outside the state progression loop
+  double temp = absl::GetFlag(FLAGS_temperature);
+  double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
 
   int game_length = 0;
   while (!state->IsTerminal()) {
@@ -450,14 +482,54 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
         logits = model->forward(state_tensor).logits;
       }
 
-      // Select action randomly to guarantee state progression, mirroring RandomSimulation
-      std::uniform_int_distribution<int> dis(0, actions.size() - 1);
-      Action action = actions[dis(*rng)];
-      state->ApplyAction(action);
-
       // Copy forward-pass logits into the transition record
       std::vector<float> prev_logits_vec(action_size, 0.0f);
       std::memcpy(prev_logits_vec.data(), logits.contiguous().data_ptr<float>(), action_size * sizeof(float));
+
+      // Fast CPU Softmax Action Selection using the configured temperature
+      Action action = actions.front();
+      if (temp > 0.001) {
+        std::vector<double> action_probs;
+        action_probs.reserve(actions.size());
+        
+        // Find max logit among LEGAL actions for numerical stability
+        float max_logit = -1e9f;
+        for (Action a : actions) {
+          if (prev_logits_vec[a] > max_logit) max_logit = prev_logits_vec[a];
+        }
+        
+        for (Action a : actions) {
+          action_probs.push_back(std::exp((prev_logits_vec[a] - max_logit) / temp));
+        }
+        
+        // Sample action probabilistically from the network's beliefs
+        std::discrete_distribution<size_t> dist(action_probs.begin(), action_probs.end());
+        action = actions[dist(*rng)];
+      } else {
+        // Fallback Argmax (Greedy selection when Temp is 0)
+        float max_logit = -1e9f;
+        for (Action a : actions) {
+          if (prev_logits_vec[a] > max_logit) {
+            max_logit = prev_logits_vec[a];
+            action = a;
+          }
+        }
+      }
+
+      state->ApplyAction(action);
+
+      // Shaped Reward VP Gain Detection
+      float shaped_bonus = 0.0f;
+      if (dune_state != nullptr) {
+        int new_vp = dune_state->GetPlayerVpForTesting(current_player);
+        int vp_gained = new_vp - current_vps[current_player];
+        current_vps[current_player] = new_vp;
+
+        if (vp_gained > 0 && reward_lambda != nullptr) {
+          float current_lambda = reward_lambda->load(std::memory_order_relaxed);
+          shaped_bonus = vp_gained * static_cast<float>(shaped_weight) * current_lambda;
+        }
+      }
 
       // Push to trajectory
       Transition transition;
@@ -465,20 +537,30 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
       transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
       transition.action_taken = action;
       transition.prev_logits = std::move(prev_logits_vec);
-      transition.q_value = 0.0f;
-      transition.reward_target = 0.0f;
+      transition.q_value = shaped_bonus;
+      transition.reward_target = shaped_bonus;
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
   }
 
-  // Populate rewards at game terminal state
+  // Clamped Backward Monte Carlo Returns to protect Tanh Value bounds
   std::vector<double> returns = state->Returns();
-  for (auto& transition : trajectory) {
-    if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
-      float reward = static_cast<float>(returns[transition.player_id]);
-      transition.reward_target = reward;
-      transition.q_value = reward;
+  std::vector<float> running_shaped(game.NumPlayers(), 0.0f);
+  for (auto it = trajectory.rbegin(); it != trajectory.rend(); ++it) {
+    if (it->player_id >= 0 && it->player_id < game.NumPlayers()) {
+      int p = it->player_id;
+      float immediate_shaped = it->reward_target; // holds the shaped_bonus set mid-game
+      running_shaped[p] += immediate_shaped;
+      
+      float terminal_reward = static_cast<float>(returns[p]);
+      float combined_reward = running_shaped[p] + terminal_reward;
+
+      // CRITICAL FIX: Clamp to safely fit inside the Neural Network's Tanh bounds [-2.25, 2.25]
+      combined_reward = std::clamp(combined_reward, -2.25f, 2.25f);
+
+      it->reward_target = combined_reward;
+      it->q_value = combined_reward;
     }
   }
 
@@ -581,6 +663,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                   , SharedDunePolicyValueNetImpl* model
                   , std::shared_mutex* sync_mutex
+                  , std::atomic<float>* reward_lambda
 #endif
 ) {
   std::mt19937 rng(std::random_device{}() + thread_id);
@@ -594,7 +677,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
     std::vector<Transition> local_trajectory;
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
     if (model != nullptr) {
-      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory, sync_mutex);
+      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory, sync_mutex, reward_lambda);
     } else {
       moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
     }
@@ -666,6 +749,7 @@ int main(int argc, char** argv) {
   std::thread optimization_thread;
   std::atomic<bool> stop_training(false);
   std::atomic<int> training_steps(0);
+  std::atomic<float> reward_lambda{1.0f};
 
   if (obs_size > 0) {
     training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
@@ -708,7 +792,8 @@ int main(int argc, char** argv) {
         obs_size, action_size, &sync_mutex,
         std::ref(stop_training), std::ref(training_steps),
         min_train_size, train_batch_size, sync_interval,
-        model_path, optim_path, train_device
+        model_path, optim_path, train_device,
+        &reward_lambda
     );
   }
 #endif
@@ -722,7 +807,7 @@ int main(int argc, char** argv) {
                          std::ref(games_completed), total_games, std::ref(total_moves),
                          &global_buffer, obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                         , inference_model.get(), &sync_mutex
+                         , inference_model.get(), &sync_mutex, &reward_lambda
 #endif
     );
   }
