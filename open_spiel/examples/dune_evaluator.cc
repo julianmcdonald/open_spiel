@@ -1,9 +1,9 @@
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <iomanip>
 #include <filesystem>
 
 #include "open_spiel/spiel.h"
@@ -21,7 +21,104 @@ struct ActionProb {
   std::string name;
 };
 
+static int ParseRound(const std::string& state_str) {
+  size_t pos = state_str.find("round=");
+  if (pos != std::string::npos) {
+    size_t end_pos = state_str.find(" ", pos);
+    if (end_pos != std::string::npos) {
+      std::string round_str = state_str.substr(pos + 6, end_pos - (pos + 6));
+      try {
+        return std::stoi(round_str);
+      } catch (...) {
+        return 1;
+      }
+    }
+  }
+  return 1;
+}
+
+static std::string CleanActionName(const std::string& raw_name) {
+  // 1. Agent card selection
+  if (raw_name.rfind("SelectAgentCard(", 0) == 0) {
+    std::string card = raw_name.substr(16);
+    if (!card.empty() && card.back() == ')') {
+      card.pop_back();
+    }
+    return "plays " + card;
+  }
+
+  // 2. Agent space placement
+  if (raw_name.rfind("PlaceAgent[", 0) == 0) {
+    std::string space = raw_name.substr(11);
+    if (!space.empty() && space.back() == ']') {
+      space.pop_back();
+    }
+    return "to " + space;
+  }
+
+  // 3. Card Reveals
+  if (raw_name == "Reveal") {
+    return "reveals cards";
+  }
+
+  // 4. Purchases from Imperium Row
+  if (raw_name.rfind("BuyImperiumRow[", 0) == 0) {
+    size_t colon_pos = raw_name.find(":");
+    if (colon_pos != std::string::npos) {
+      std::string card = raw_name.substr(colon_pos + 1);
+      if (!card.empty() && card.back() == ']') {
+        card.pop_back();
+      }
+      return "buys " + card;
+    }
+  }
+
+  // 5. Tech / Tleilaxu acquisitions
+  if (raw_name.rfind("AcquireTech[", 0) == 0) {
+    return "acquires Tech " + raw_name.substr(12);
+  }
+  if (raw_name.rfind("AcquireTleilaxu[", 0) == 0) {
+    return "acquires Tleilaxu " + raw_name.substr(16);
+  }
+
+  return "";
+}
+
 int main(int argc, char* argv[]) {
+  // Parse command-line arguments
+  std::string model_checkpoint = "dune_stage_a_run11_model.pt";
+  bool interactive = true;
+  std::string output_file = "";
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--non-interactive" || arg == "-n") {
+      interactive = false;
+    } else if (arg == "--output" || arg == "-o") {
+      if (i + 1 < argc) {
+        output_file = argv[++i];
+      } else {
+        std::cerr << "Error: --output requires a file path.\n";
+        return 1;
+      }
+    } else {
+      model_checkpoint = arg;
+    }
+  }
+
+  std::ofstream out_file;
+  std::streambuf* cout_buf = nullptr;
+  if (!output_file.empty()) {
+    out_file.open(output_file);
+    if (!out_file.is_open()) {
+      std::cerr << "Failed to open output file: " << output_file << "\n";
+      return 1;
+    }
+    cout_buf = std::cout.rdbuf();
+    std::cout.rdbuf(out_file.rdbuf());
+    std::cerr << "[INFO] Running evaluation... Output is being saved to: " << output_file << "\n";
+  }
+
   std::cout << "=== Dune: Imperium AI Evaluator ===\n";
 
   // 1. Initialize the Game
@@ -37,15 +134,12 @@ int main(int argc, char* argv[]) {
   inference_model->eval(); // Disable Dropout/BatchNorm variance
 
   // 3. Robust Multi-Path Checkpoint Loading
-  std::string model_checkpoint = "dune_stage_a_model.pt";
-  if (argc > 1) {
-    model_checkpoint = argv[1];
-  } else if (!std::filesystem::exists(model_checkpoint)) {
+  if (!std::filesystem::exists(model_checkpoint)) {
     std::vector<std::string> paths = {
-      "../../../dune_stage_a_model.pt",
-      "../../dune_stage_a_model.pt",
-      "../dune_stage_a_model.pt",
-      "/home/warcr/projects/dune_drl/dune_stage_a_model.pt"
+      "../../../dune_stage_a_run11_model.pt",
+      "../../dune_stage_a_run11_model.pt",
+      "../dune_stage_a_run11_model.pt",
+      "/home/warcr/projects/dune_drl/dune_stage_a_run11_model.pt"
     };
     for (const auto& path : paths) {
       if (std::filesystem::exists(path)) {
@@ -77,6 +171,10 @@ int main(int argc, char* argv[]) {
   // 5. The Interactive Step-by-Step Loop
   torch::NoGradGuard no_grad; // Crucial: prevents memory leaks during evaluation
   
+  std::string last_state_str = "";
+  Action last_action = -1;
+  int last_round_tracker = 0;
+
   while (!state->IsTerminal()) {
     
     // --- CHANCE NODES (Decks, Market Reveals) ---
@@ -89,12 +187,29 @@ int main(int argc, char* argv[]) {
       continue; 
     }
 
-    std::cout << "----------------------------------------------------\n";
     Player current_player = state->CurrentPlayer();
-    std::cout << "Current Player: P" << current_player << "\n";
-    
-    // Print native OpenSpiel board visualization
-    std::cout << "Board State:\n" << state->ToString() << "\n";
+
+    // Track round transition and print score at the end of every round
+    int current_round = ParseRound(state->ToString());
+    if (current_round > last_round_tracker) {
+      if (last_round_tracker > 0) {
+        const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+        std::cout << "\n>>> Round " << last_round_tracker << " Completed! Victory Points: ";
+        if (dune_state) {
+          for (int i = 0; i < 4; ++i) {
+            std::cout << "P" << i << ": " << dune_state->GetPlayerVpForTesting(i) << "  ";
+          }
+        } else {
+          auto returns = state->Returns();
+          for (size_t i = 0; i < returns.size(); ++i) {
+            std::cout << "P" << i << ": " << (int)returns[i] << "  ";
+          }
+        }
+        std::cout << "\n\n" << std::flush;
+      }
+      std::cout << ">>> Round " << current_round << " Start\n" << std::flush;
+      last_round_tracker = current_round;
+    }
 
     // --- TENSOR PREPARATION ---
     // Use InformationStateTensor to match the 5584-float dimension exactly
@@ -103,14 +218,6 @@ int main(int argc, char* argv[]) {
 
     // --- QUERY THE NETWORK ---
     auto output = inference_model->forward(input_tensor);
-    
-    // Extract Value (Win Probability) - Move back to CPU for extraction
-    float raw_value = output.values.to(torch::kCPU).item<float>();
-    // Convert Tanh [-1.0, 1.0] to Percentage [0%, 100%]
-    float win_pct = ((raw_value + 1.0f) / 2.0f) * 100.0f;
-    
-    std::cout << "\n>> AI Evaluation: " << std::fixed << std::setprecision(1) 
-              << win_pct << "% estimated chance to win.\n";
 
     // Extract Policy (Action Probabilities)
     std::vector<Action> legal_actions = state->LegalActions();
@@ -136,30 +243,61 @@ int main(int argc, char* argv[]) {
         return a.probability > b.probability;
       });
 
-    // Print Top Decisions
-    std::cout << ">> Top Considered Moves:\n";
-    int display_count = std::min(3, (int)ranked_actions.size());
-    for (int i = 0; i < display_count; ++i) {
-      std::cout << "   " << i + 1 << ". " << ranked_actions[i].name 
-                << " (" << std::fixed << std::setprecision(1) << ranked_actions[i].probability * 100.0f << "%)\n";
+    // Execute the #1 chosen action
+    std::string current_state_str = state->ToString();
+    Action chosen_action = ranked_actions.front().action;
+    std::string chosen_action_name = ranked_actions.front().name;
+
+    if (current_state_str == last_state_str && chosen_action == last_action) {
+      std::cerr << "[WARNING] Deterministic loop detected on action: " << chosen_action_name 
+                << ". Falling back to the next best considered move.\n";
+      if (ranked_actions.size() > 1) {
+        chosen_action = ranked_actions[1].action;
+        chosen_action_name = ranked_actions[1].name;
+      } else {
+        std::cerr << "[ERROR] No alternative legal actions available to break the loop!\n";
+      }
     }
 
-    // Execute the #1 chosen action
-    Action chosen_action = ranked_actions.front().action;
-    std::cout << "\n>> AI Executes: " << ranked_actions.front().name << "\n\n";
+    last_state_str = current_state_str;
+    last_action = chosen_action;
+
+    // Only log if it's an agent placement action
+    std::string clean_act = CleanActionName(chosen_action_name);
+    if (!clean_act.empty()) {
+      std::cout << "[Player P" << current_player << "] " << clean_act << "\n" << std::flush;
+    }
+
     state->ApplyAction(chosen_action);
     
-    std::cout << "Press Enter to advance to the next turn...";
-    std::cin.ignore();
+    if (interactive) {
+      std::cout << "Press Enter to advance to the next turn..." << std::flush;
+      std::cin.ignore();
+    } else {
+      std::cout << std::flush;
+    }
   }
 
   std::cout << "\n=== Game Over ===\n";
-  std::cout << "Final Returns (Scores): ";
+  const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+  if (dune_state) {
+    std::cout << "Final Victory Points: ";
+    for (int i = 0; i < 4; ++i) {
+      std::cout << "P" << i << ": " << dune_state->GetPlayerVpForTesting(i) << "  ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "Final Returns (Utility): ";
   auto returns = state->Returns();
   for (size_t i = 0; i < returns.size(); ++i) {
     std::cout << "P" << i << ": " << returns[i] << "  ";
   }
-  std::cout << "\n";
+  std::cout << "\n" << std::flush;
+
+  if (cout_buf) {
+    std::cout.rdbuf(cout_buf);
+    std::cout << "[INFO] Evaluation completed successfully! Logs saved to: " << output_file << "\n";
+  }
 
   return 0;
 }
