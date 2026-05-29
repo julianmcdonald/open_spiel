@@ -339,8 +339,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     }
     flat_masks.insert(flat_masks.end(), dense_mask.begin(), dense_mask.end());
 
-    // Scale target reward: divide by 2.25 to bound target in [-0.77, 1.00]
-    flat_rewards.push_back(transition->reward_target / 2.25f);
+    // Scale target reward: divide by 4.0 to bound target in [-1.00, 1.00]
+    flat_rewards.push_back(transition->reward_target / 4.0f);
 
     flat_prev_logits.insert(flat_prev_logits.end(), transition->prev_logits.begin(), transition->prev_logits.end());
     
@@ -569,8 +569,8 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
       float terminal_reward = static_cast<float>(returns[p]);
       float combined_reward = running_shaped[p] + terminal_reward;
 
-      // CRITICAL FIX: Clamp to safely fit inside the Neural Network's Tanh bounds [-2.25, 2.25]
-      combined_reward = std::clamp(combined_reward, -2.25f, 2.25f);
+      // CRITICAL FIX: Clamp to safely fit inside the Neural Network's Tanh bounds [-4.0, 4.0]
+      combined_reward = std::clamp(combined_reward, -4.0f, 4.0f);
 
       it->reward_target = combined_reward;
       it->q_value = combined_reward;
