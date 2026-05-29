@@ -33,6 +33,8 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
   std::shared_ptr<ResBlockImpl> res1{nullptr};
   std::shared_ptr<ResBlockImpl> res2{nullptr};
+  std::shared_ptr<ResBlockImpl> res3{nullptr};
+  std::shared_ptr<ResBlockImpl> res4{nullptr};
   torch::nn::Linear policy_head{nullptr};
   torch::nn::Linear value_head{nullptr};
 
@@ -42,6 +44,8 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     // Register the underlying implementation objects wrapped in shared_ptr to solve template deduction
     res1 = register_module("res1", std::make_shared<ResBlockImpl>(hidden_dim));
     res2 = register_module("res2", std::make_shared<ResBlockImpl>(hidden_dim));
+    res3 = register_module("res3", std::make_shared<ResBlockImpl>(hidden_dim));
+    res4 = register_module("res4", std::make_shared<ResBlockImpl>(hidden_dim));
     
     policy_head = register_module("policy_head", torch::nn::Linear(hidden_dim, action_dim));
     value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
@@ -56,6 +60,8 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     x = torch::relu(input_layer->forward(x));
     x = res1->forward(x);
     x = res2->forward(x);
+    x = res3->forward(x);
+    x = res4->forward(x);
     
     torch::Tensor logits = policy_head->forward(x);
     torch::Tensor values = torch::tanh(value_head->forward(x));
