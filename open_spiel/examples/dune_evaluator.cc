@@ -47,6 +47,15 @@ static std::string CleanActionName(const std::string& raw_name) {
     return "plays " + card;
   }
 
+  // 1b. Graft partner selection
+  if (raw_name.rfind("SelectGraftPartner(", 0) == 0) {
+    std::string card = raw_name.substr(19);
+    if (!card.empty() && card.back() == ')') {
+      card.pop_back();
+    }
+    return "grafts " + card;
+  }
+
   // 2. Agent space placement
   if (raw_name.rfind("PlaceAgent[", 0) == 0) {
     std::string space = raw_name.substr(11);
@@ -258,18 +267,23 @@ int main(int argc, char* argv[]) {
     if (current_round > last_round_tracker) {
       if (last_round_tracker > 0) {
         const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
-        std::cout << "\n>>> Round " << last_round_tracker << " Completed! Victory Points: ";
+        std::cout << "\n>>> Round " << last_round_tracker << " Completed!\n";
         if (dune_state) {
           for (int i = 0; i < 4; ++i) {
-            std::cout << "P" << i << ": " << dune_state->GetPlayerVpForTesting(i) << "  ";
+            std::cout << "  P" << i << ": " << dune_state->GetPlayerVpForTesting(i) << " VP"
+                      << " (Spice: " << dune_state->GetPlayerSpiceForTesting(i)
+                      << ", Solari: " << dune_state->GetPlayerSolariForTesting(i)
+                      << ", Water: " << dune_state->GetPlayerWaterForTesting(i) << ")\n";
           }
         } else {
+          std::cout << "Victory Points: ";
           auto returns = state->Returns();
           for (size_t i = 0; i < returns.size(); ++i) {
             std::cout << "P" << i << ": " << (int)returns[i] << "  ";
           }
+          std::cout << "\n";
         }
-        std::cout << "\n\n" << std::flush;
+        std::cout << "\n" << std::flush;
       }
       std::cout << ">>> Round " << current_round << " Start\n" << std::flush;
       last_round_tracker = current_round;
