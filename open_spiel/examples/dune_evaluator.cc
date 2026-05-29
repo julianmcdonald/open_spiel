@@ -191,23 +191,45 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Device Management
+  torch::Device device(torch::kCPU);
   try {
-    torch::load(inference_model, model_checkpoint);
-    std::cout << "Successfully loaded brain from " << model_checkpoint << "\n";
-  } catch (const c10::Error& e) {
-    std::cerr << "\n[ERROR] Failed to load checkpoint.\n";
-    std::cerr << "PyTorch says: " << e.msg() << "\n";
-    return 1;
+    if (torch::cuda::is_available()) {
+      device = torch::Device(torch::kCUDA);
+    }
+  } catch (...) {
+    device = torch::Device(torch::kCPU);
   }
 
-  // 4. Device Management (Map Model and Tensors to CUDA if available, CPU otherwise)
-  torch::Device device(torch::kCPU);
-  if (torch::cuda::is_available()) {
-    device = torch::Device(torch::kCUDA);
-    std::cout << "CUDA is available! Running inference on CUDA device.\n\n";
-  } else {
-    std::cout << "Running inference on CPU.\n\n";
+  // Load Model weights with explicit device mapping
+  try {
+    std::cout << "Loading model checkpoint onto " << device << "...\n";
+    torch::serialize::InputArchive archive;
+    archive.load_from(model_checkpoint, device);
+    inference_model->load(archive);
+    std::cout << "Successfully loaded model weights from " << model_checkpoint << "\n";
+  } catch (const c10::Error& e) {
+    if (device.is_cuda()) {
+      std::cerr << "\n[WARNING] Failed to load checkpoint onto CUDA device. Falling back to CPU.\n";
+      std::cerr << "Error details: " << e.msg() << "\n";
+      device = torch::Device(torch::kCPU);
+      try {
+        torch::serialize::InputArchive archive;
+        archive.load_from(model_checkpoint, device);
+        inference_model->load(archive);
+        std::cout << "Successfully loaded model weights onto CPU as fallback.\n";
+      } catch (const c10::Error& fallback_err) {
+        std::cerr << "\n[ERROR] Failed to load checkpoint on CPU: " << model_checkpoint << "\n";
+        std::cerr << "PyTorch says: " << fallback_err.msg() << "\n";
+        return 1;
+      }
+    } else {
+      std::cerr << "\n[ERROR] Failed to load checkpoint: " << model_checkpoint << "\n";
+      std::cerr << "PyTorch says: " << e.msg() << "\n";
+      return 1;
+    }
   }
+
   inference_model->to(device);
 
   // 5. The Interactive Step-by-Step Loop

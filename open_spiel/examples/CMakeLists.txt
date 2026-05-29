@@ -7,6 +7,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator ${TORCH_LIBRARIES})
+
+  add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()
