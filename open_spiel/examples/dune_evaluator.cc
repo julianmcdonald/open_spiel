@@ -75,10 +75,52 @@ static std::string CleanActionName(const std::string& raw_name) {
 
   // 5. Tech / Tleilaxu acquisitions
   if (raw_name.rfind("AcquireTech[", 0) == 0) {
-    return "acquires Tech " + raw_name.substr(12);
+    size_t colon_pos = raw_name.find(":");
+    if (colon_pos != std::string::npos) {
+      std::string tech = raw_name.substr(colon_pos + 1);
+      if (!tech.empty() && tech.back() == ']') {
+        tech.pop_back();
+      }
+      return "acquires Tech " + tech;
+    } else {
+      std::string tech = raw_name.substr(12);
+      if (!tech.empty() && tech.back() == ']') {
+        tech.pop_back();
+      }
+      return "acquires Tech " + tech;
+    }
+  }
+  if (raw_name.rfind("AcquireTechWithSolari[", 0) == 0) {
+    size_t colon_pos = raw_name.find(":");
+    if (colon_pos != std::string::npos) {
+      std::string tech = raw_name.substr(colon_pos + 1);
+      if (!tech.empty() && tech.back() == ']') {
+        tech.pop_back();
+      }
+      return "acquires Tech " + tech + " (with Solari)";
+    } else {
+      std::string tech = raw_name.substr(22);
+      if (!tech.empty() && tech.back() == ']') {
+        tech.pop_back();
+      }
+      return "acquires Tech " + tech + " (with Solari)";
+    }
   }
   if (raw_name.rfind("AcquireTleilaxu[", 0) == 0) {
-    return "acquires Tleilaxu " + raw_name.substr(16);
+    size_t colon_pos = raw_name.find(":");
+    if (colon_pos != std::string::npos) {
+      std::string card = raw_name.substr(colon_pos + 1);
+      if (!card.empty() && card.back() == ']') {
+        card.pop_back();
+      }
+      return "acquires Tleilaxu " + card;
+    } else {
+      std::string card = raw_name.substr(16);
+      if (!card.empty() && card.back() == ']') {
+        card.pop_back();
+      }
+      return "acquires Tleilaxu " + card;
+    }
   }
 
   return "";
