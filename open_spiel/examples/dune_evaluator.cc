@@ -8,6 +8,8 @@
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_content.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include <torch/torch.h>
 
 // Import the synced shared architecture
@@ -130,6 +132,21 @@ static std::string CleanActionName(const std::string& raw_name) {
       }
       return "acquires Tleilaxu " + card;
     }
+  }
+
+  // 6. Leader Draft
+  if (raw_name.rfind("LeaderPick[", 0) == 0) {
+    std::string leader_id_str = raw_name.substr(11);
+    if (!leader_id_str.empty() && leader_id_str.back() == ']') {
+      leader_id_str.pop_back();
+    }
+    try {
+      int leader_id = std::stoi(leader_id_str);
+      if (leader_id >= 0 && leader_id < dune_imperium::kNumLeaders) {
+        return "drafts " + std::string(dune_imperium::kLeaders[leader_id].name);
+      }
+    } catch (...) {}
+    return "drafts leader " + leader_id_str;
   }
 
   return "";
@@ -347,6 +364,22 @@ int main(int argc, char* argv[]) {
     }
 
     state->ApplyAction(chosen_action);
+
+    // Check if a graft partner was automatically or interactively selected
+    if (chosen_action >= dune_imperium::kActionSelectAgentCard0 &&
+        chosen_action < dune_imperium::kActionSelectAgentCard0 + 256) {
+      int card_id = static_cast<int>(chosen_action - dune_imperium::kActionSelectAgentCard0);
+      const auto* post_dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      if (post_dune_state) {
+        int partner_id = post_dune_state->GraftedPartnerCardForTesting(current_player, card_id);
+        if (partner_id != dune_imperium::kInvalidCard) {
+          const auto* partner_card = dune_imperium::FindImperiumCardById(partner_id);
+          if (partner_card) {
+            std::cout << "[Player P" << current_player << "] grafts " << partner_card->name << "\n" << std::flush;
+          }
+        }
+      }
+    }
     
     if (interactive) {
       std::cout << "Press Enter to advance to the next turn..." << std::flush;
