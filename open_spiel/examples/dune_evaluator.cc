@@ -124,13 +124,13 @@ static std::string CleanActionName(const std::string& raw_name) {
       if (!card.empty() && card.back() == ']') {
         card.pop_back();
       }
-      return "acquires Tleilaxu " + card;
+      return "acquires " + card;
     } else {
       std::string card = raw_name.substr(16);
       if (!card.empty() && card.back() == ']') {
         card.pop_back();
       }
-      return "acquires Tleilaxu " + card;
+      return "acquires " + card;
     }
   }
 
