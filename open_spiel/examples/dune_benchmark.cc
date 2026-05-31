@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
 
     // Instantiate the BatchedEvaluator with target batch size 128, timeout 2ms, and train_device
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
-        inference_model, 128, 2, train_device, &sync_mutex);
+        inference_model, 64, 2, train_device, &sync_mutex); // 64 target batch, 2ms timeout
   }
 #endif
 
