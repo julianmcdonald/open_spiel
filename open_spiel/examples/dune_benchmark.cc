@@ -180,10 +180,36 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     std::cerr << "Error saving checkpoint: " << e.msg() << "\n";
   }
 }
+struct PersistentTrainBuffers {
+  torch::Tensor states, masks, rewards, prev_logits, q_values, actions_taken;
+  
+  float *p_states, *p_masks, *p_rewards, *p_prev, *p_q;
+  int64_t *p_actions;
+
+  void Initialize(int64_t max_batch_size, int64_t obs_size, int64_t action_dim, bool is_cuda) {
+    auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(is_cuda);
+    auto long_opts = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(is_cuda);
+
+    states = torch::empty({max_batch_size, obs_size}, float_opts);
+    masks = torch::empty({max_batch_size, action_dim}, float_opts);
+    rewards = torch::empty({max_batch_size, 1}, float_opts);
+    prev_logits = torch::empty({max_batch_size, action_dim}, float_opts);
+    q_values = torch::empty({max_batch_size, 1}, float_opts);
+    actions_taken = torch::empty({max_batch_size, 1}, long_opts);
+
+    p_states = states.data_ptr<float>();
+    p_masks = masks.data_ptr<float>();
+    p_rewards = rewards.data_ptr<float>();
+    p_prev = prev_logits.data_ptr<float>();
+    p_q = q_values.data_ptr<float>();
+    p_actions = actions_taken.data_ptr<int64_t>();
+  }
+};
 
 std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                                   torch::optim::Optimizer& optimizer, 
-                                  const std::vector<std::shared_ptr<Transition>>& batch, 
+                                  const std::vector<std::shared_ptr<Transition>>& batch,
+                                  PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
                                   torch::Device device);
@@ -200,10 +226,10 @@ void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
   auto infer_buffers = inference_model->buffers();
 
   for (size_t i = 0; i < train_params.size(); ++i) {
-    infer_params[i].copy_(train_params[i].to(torch::kCPU));
+    infer_params[i].copy_(train_params[i].to(infer_params[i].device()));
   }
   for (size_t i = 0; i < train_buffers.size(); ++i) {
-    infer_buffers[i].copy_(train_buffers[i].to(torch::kCPU));
+    infer_buffers[i].copy_(train_buffers[i].to(infer_buffers[i].device()));
   }
 }
 
@@ -235,6 +261,9 @@ void OptimizationWorker(
     }
 
     // 2. Training Loop
+    PersistentTrainBuffers train_buffers;
+    train_buffers.Initialize(train_batch_size, obs_size, action_size, device.is_cuda());
+
     while (!stop_training.load()) {
       int train_ratio = absl::GetFlag(FLAGS_train_ratio);
       if (train_ratio > 0) {
@@ -255,7 +284,7 @@ void OptimizationWorker(
       }
 
       // Lock-free optimization step on training_model
-      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, obs_size, action_size, device);
+      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, train_buffers, obs_size, action_size, device);
 
       int step = training_steps.fetch_add(1) + 1;
 
@@ -304,60 +333,38 @@ void OptimizationWorker(
 
 std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                                   torch::optim::Optimizer& optimizer, 
-                                  const std::vector<std::shared_ptr<Transition>>& batch, 
+                                  const std::vector<std::shared_ptr<Transition>>& batch,
+                                  PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
                                   torch::Device device) {
   size_t batch_size = batch.size();
   if (batch_size == 0) return {0.0f, 0.0f};
 
-  std::vector<float> flat_states;
-  std::vector<float> flat_masks;
-  std::vector<float> flat_rewards;
-  std::vector<float> flat_prev_logits;
-  std::vector<float> flat_base_logits;
-  std::vector<float> flat_q_values;
-  std::vector<int64_t> flat_actions_taken;
-
-  flat_states.reserve(batch_size * obs_size);
-  flat_masks.reserve(batch_size * action_dim);
-  flat_rewards.reserve(batch_size);
-  flat_prev_logits.reserve(batch_size * action_dim);
-  flat_base_logits.reserve(batch_size * action_dim);
-  flat_q_values.reserve(batch_size);
-  flat_actions_taken.reserve(batch_size);
-
-  for (const auto& transition : batch) {
-    flat_states.insert(flat_states.end(), transition->spatial_tensor.begin(), transition->spatial_tensor.end());
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& t = batch[i];
+    std::memcpy(buffers.p_states + i * obs_size, t->spatial_tensor.data(), obs_size * sizeof(float));
+    std::memcpy(buffers.p_prev + i * action_dim, t->prev_logits.data(), action_dim * sizeof(float));
     
-    // Reconstruct dense mask on the fly
-    std::vector<float> dense_mask(action_dim, 0.0f);
-    for (Action action_id : transition->legal_actions) {
-      if (action_id >= 0 && action_id < action_dim) {
-        dense_mask[action_id] = 1.0f;
-      }
+    // Efficient sparse-to-dense mask filling
+    std::fill(buffers.p_masks + i * action_dim, buffers.p_masks + (i + 1) * action_dim, 0.0f);
+    for (Action a : t->legal_actions) {
+      if (a >= 0 && a < action_dim) buffers.p_masks[i * action_dim + a] = 1.0f;
     }
-    flat_masks.insert(flat_masks.end(), dense_mask.begin(), dense_mask.end());
 
-    // Scale target reward: divide by 4.0 to bound target in [-1.00, 1.00]
-    flat_rewards.push_back(transition->reward_target / 4.0f);
-
-    flat_prev_logits.insert(flat_prev_logits.end(), transition->prev_logits.begin(), transition->prev_logits.end());
-    
-    // Reconstruct zero base logits on the fly
-    flat_base_logits.insert(flat_base_logits.end(), action_dim, 0.0f);
-
-    flat_q_values.push_back(transition->q_value);
-    flat_actions_taken.push_back(transition->action_taken);
+    buffers.p_rewards[i] = t->reward_target / 4.0f;
+    buffers.p_q[i] = t->q_value;
+    buffers.p_actions[i] = t->action_taken;
   }
 
-  torch::Tensor states = torch::from_blob(flat_states.data(), {(int64_t)batch_size, obs_size}, torch::kFloat).to(device);
-  torch::Tensor masks = torch::from_blob(flat_masks.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
-  torch::Tensor rewards = torch::from_blob(flat_rewards.data(), {(int64_t)batch_size, 1}, torch::kFloat).to(device);
-  torch::Tensor prev_logits = torch::from_blob(flat_prev_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
-  torch::Tensor base_logits = torch::from_blob(flat_base_logits.data(), {(int64_t)batch_size, action_dim}, torch::kFloat).to(device);
-  torch::Tensor q_values = torch::from_blob(flat_q_values.data(), {(int64_t)batch_size, 1}, torch::kFloat).to(device);
-  torch::Tensor actions_taken = torch::from_blob(flat_actions_taken.data(), {(int64_t)batch_size, 1}, torch::kLong).to(device);
+  // Non-blocking H2D transfer from pinned memory using .slice()
+  bool is_cuda = device.is_cuda();
+  torch::Tensor states = is_cuda ? buffers.states.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.states.slice(0, 0, batch_size);
+  torch::Tensor masks = is_cuda ? buffers.masks.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.masks.slice(0, 0, batch_size);
+  torch::Tensor rewards = is_cuda ? buffers.rewards.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.rewards.slice(0, 0, batch_size);
+  torch::Tensor prev_logits = is_cuda ? buffers.prev_logits.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.prev_logits.slice(0, 0, batch_size);
+  torch::Tensor q_values = is_cuda ? buffers.q_values.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.q_values.slice(0, 0, batch_size);
+  torch::Tensor actions_taken = is_cuda ? buffers.actions_taken.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.actions_taken.slice(0, 0, batch_size);
 
   optimizer.zero_grad();
   auto outputs = model->forward(states);
@@ -382,7 +389,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   q_vector.scatter_(1, actions_taken, q_values);
 
   // Calculate the theoretical MMD target logits
-  torch::Tensor target_logits = (prev_logits + eta * q_vector + eta * alpha * base_logits) / (1.0f + eta * alpha);
+  torch::Tensor target_logits = (prev_logits + eta * q_vector) / (1.0f + eta * alpha);
 
   // Apply the same legal action mask to the target logits to prevent pulling towards illegal actions
   torch::Tensor masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
@@ -408,7 +415,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   return {v_loss_val, p_loss_val};
 }
 
-int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNetImpl* model, int64_t obs_size, std::vector<Transition>& trajectory, std::shared_mutex* sync_mutex, std::atomic<float>* reward_lambda) {
+int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size, std::vector<Transition>& trajectory, std::atomic<float>* reward_lambda) {
   std::unique_ptr<State> state = game.NewInitialState();
 
   bool provides_info_state_tensor =
@@ -483,21 +490,9 @@ int TorchSimulation(std::mt19937* rng, const Game& game, SharedDunePolicyValueNe
 
       int64_t action_size = game.NumDistinctActions();
 
-      // Convert C++ Vector to LibTorch Tensor (Zero-copy mapping)
-      torch::Tensor state_tensor = torch::from_blob(obs.data(), {1, obs_size}, torch::kFloat);
-      
-      // Forward Pass with shared read lock
-      torch::Tensor logits;
-      if (sync_mutex != nullptr) {
-        std::shared_lock<std::shared_mutex> lock(*sync_mutex);
-        logits = model->forward(state_tensor).logits;
-      } else {
-        logits = model->forward(state_tensor).logits;
-      }
-
-      // Copy forward-pass logits into the transition record
-      std::vector<float> prev_logits_vec(action_size, 0.0f);
-      std::memcpy(prev_logits_vec.data(), logits.contiguous().data_ptr<float>(), action_size * sizeof(float));
+      // Query the batched evaluator (actor thread goes to sleep, OS multiplexes)
+      EvalResult result = evaluator->Evaluate(obs);
+      std::vector<float> prev_logits_vec = std::move(result.logits);
 
       // Fast CPU Softmax Action Selection using the configured temperature
       Action action = actions.front();
@@ -674,8 +669,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
                   int total_games, std::atomic<int>& total_moves,
                   GlobalReplayBuffer* global_buffer, int64_t obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                  , SharedDunePolicyValueNetImpl* model
-                  , std::shared_mutex* sync_mutex
+                  , std::shared_ptr<BatchedEvaluator> evaluator
                   , std::atomic<float>* reward_lambda
 #endif
 ) {
@@ -689,8 +683,8 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
     }
     std::vector<Transition> local_trajectory;
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-    if (model != nullptr) {
-      moves += TorchSimulation(&rng, *game, model, obs_size, local_trajectory, sync_mutex, reward_lambda);
+    if (evaluator != nullptr) {
+      moves += TorchSimulation(&rng, *game, evaluator, obs_size, local_trajectory, reward_lambda);
     } else {
       moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
     }
@@ -763,12 +757,13 @@ int main(int argc, char** argv) {
   std::atomic<bool> stop_training(false);
   std::atomic<int> training_steps(0);
   std::atomic<float> reward_lambda{1.0f};
+  std::shared_ptr<open_spiel::BatchedEvaluator> evaluator = nullptr;
 
   if (obs_size > 0) {
     training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
     
-    inference_model->to(torch::kCPU);
+    inference_model->to(train_device);
 
     training_model->train(); // training model stays in train mode permanently
     inference_model->eval(); // inference model stays in eval mode permanently
@@ -779,6 +774,10 @@ int main(int argc, char** argv) {
     open_spiel::LoadCheckpoint(training_model, optimizer, model_path, optim_path, train_device);
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+
+    // Instantiate the BatchedEvaluator with target batch size 128, timeout 2ms, and train_device
+    evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
+        inference_model, 128, 2, train_device, &sync_mutex);
   }
 #endif
 
@@ -820,7 +819,7 @@ int main(int argc, char** argv) {
                          std::ref(games_completed), total_games, std::ref(total_moves),
                          &global_buffer, obs_size
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                         , inference_model.get(), &sync_mutex, &reward_lambda
+                         , evaluator, &reward_lambda
 #endif
     );
   }
@@ -858,7 +857,9 @@ int main(int argc, char** argv) {
       std::cout << absl::StrFormat("Sampled %zu transitions from replay buffer.\n", batch.size());
 
       // Execute backprop step using the startup-initialized optimizer
-      open_spiel::TrainStep(training_model, *optimizer, batch, obs_size, action_size, train_device);
+      open_spiel::PersistentTrainBuffers sync_buffers;
+      sync_buffers.Initialize(batch_size, obs_size, action_size, train_device.is_cuda());
+      open_spiel::TrainStep(training_model, *optimizer, batch, sync_buffers, obs_size, action_size, train_device);
       std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
       
       // Sync training weights to inference weights for completeness

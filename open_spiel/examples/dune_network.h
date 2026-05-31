@@ -2,6 +2,15 @@
 
 #include <torch/torch.h>
 #include <memory>
+#include <vector>
+#include <deque>
+#include <future>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <shared_mutex>
+#include <ATen/autocast_mode.h>
 
 namespace open_spiel {
 
@@ -69,5 +78,203 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);
+
+struct EvalResult {
+    std::vector<float> logits;
+    float value; 
+};
+
+class BatchedEvaluator {
+public:
+    BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                     int target_batch_size, 
+                     int timeout_ms, 
+                     torch::Device device,
+                     std::shared_mutex* sync_mutex)
+        : model_(model), target_batch_size_(target_batch_size), 
+          timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), stop_(false) {
+        
+        // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
+        if (device_.is_cuda()) {
+            at::globalContext().setAllowTF32CuBLAS(true);
+            at::globalContext().setAllowTF32CuDNN(true);
+        }
+        
+        model_->eval(); // Defensive hygiene: ResBlocks use LayerNorm so this is a no-op, but protects future Dropout additions.
+        runner_thread_ = std::thread(&BatchedEvaluator::Runner, this);
+    }
+
+    ~BatchedEvaluator() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (runner_thread_.joinable()) runner_thread_.join();
+    }
+
+    // Called by the actor threads
+    EvalResult Evaluate(const std::vector<float>& obs) {
+        std::promise<EvalResult> promise;
+        std::future<EvalResult> future = promise.get_future();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requests_.push_back({&obs, std::move(promise)}); // Pass address
+            if (requests_.size() == 1) {
+                first_request_ts_ = std::chrono::steady_clock::now();
+            }
+        }
+        
+        cv_.notify_one(); // Wake up the runner thread
+        
+        // The actor thread goes to sleep right here! OS multiplexing takes over.
+        return future.get();
+    }
+
+private:
+    struct Request {
+        const std::vector<float>* obs; // Storing a pointer instead of copying!
+        std::promise<EvalResult> promise;
+    };
+
+    struct AutocastGuard {
+        c10::DeviceType device_type_;
+        bool previous_state_;
+        AutocastGuard(c10::DeviceType device_type, bool enabled)
+            : device_type_(device_type) {
+            previous_state_ = at::autocast::is_autocast_enabled(device_type_);
+            at::autocast::set_autocast_enabled(device_type_, enabled);
+        }
+        ~AutocastGuard() {
+            at::autocast::set_autocast_enabled(device_type_, previous_state_);
+        }
+    };
+
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
+    int target_batch_size_;
+    int timeout_ms_;
+    torch::Device device_;
+    std::shared_mutex* sync_mutex_;
+    
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Request> requests_;
+    std::chrono::steady_clock::time_point first_request_ts_;
+    
+    bool stop_;
+    std::thread runner_thread_;
+
+    void Runner() {
+        torch::NoGradGuard no_grad;
+        torch::Tensor pinned_stacked_obs;
+        bool pinned_allocated = false;
+
+        while (true) {
+            std::vector<Request> batch;
+            
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                
+                // 1. Wait until we have at least one request or we are shutting down
+                cv_.wait(lock, [this]() { return stop_ || !requests_.empty(); });
+                if (stop_ && requests_.empty()) break;
+                
+                // 2. We have requests. Calculate the absolute timeout deadline
+                auto deadline = first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
+                
+                // 3. Wait until the batch is full OR the timeout expires (Deadlock fix!)
+                cv_.wait_until(lock, deadline, [this, deadline]() {
+                    return stop_ || requests_.size() >= target_batch_size_ || 
+                           std::chrono::steady_clock::now() >= deadline;
+                });
+
+                if (stop_ && requests_.empty()) break;
+
+                // 4. Scoop up the batch
+                size_t actual_batch = std::min((size_t)target_batch_size_, requests_.size());
+                batch.reserve(actual_batch);
+                for (size_t i = 0; i < actual_batch; ++i) {
+                    batch.push_back(std::move(requests_.front()));
+                    requests_.pop_front();
+                }
+                
+                // Reset the timer if there are leftovers
+                if (!requests_.empty()) {
+                    first_request_ts_ = std::chrono::steady_clock::now();
+                }
+            }
+
+            if (batch.empty()) continue;
+
+            size_t batch_size = batch.size();
+            size_t obs_size = batch[0].obs->size(); // Add pointer arrow
+
+            // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop
+            if (!pinned_allocated) {
+                if (device_.is_cuda()) {
+                    auto options = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)obs_size}, options);
+                } else {
+                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)obs_size}, torch::kFloat32);
+                }
+                pinned_allocated = true;
+            }
+            
+            float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
+            for (size_t i = 0; i < batch_size; ++i) {
+                // Add pointer arrow to obs->data()
+                std::memcpy(dest_ptr + i * obs_size, batch[i].obs->data(), obs_size * sizeof(float));
+            }
+
+            // Non-blocking H2D transfer using .slice() for partial batches
+            torch::Tensor device_obs = device_.is_cuda() 
+                ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true) 
+                : pinned_stacked_obs.slice(0, 0, batch_size);
+
+            // B. FORWARD PASS WITH AMP (FP16/TF32) AND WRITE PROTECTION
+            torch::Tensor pred_logits, pred_values;
+            {
+                std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
+                if (device_.is_cuda()) {
+                    AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                    auto outputs = model_->forward(device_obs);
+                    pred_logits = outputs.logits;
+                    pred_values = outputs.values;
+                } else {
+                    auto outputs = model_->forward(device_obs);
+                    pred_logits = outputs.logits;
+                    pred_values = outputs.values;
+                }
+            }
+
+            // C. NON-BLOCKING D2H TRANSFER
+            if (device_.is_cuda()) {
+                pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                
+                // D. CRITICAL: Wait for asynchronous transfers to complete before reading!
+                torch::cuda::synchronize();
+            } else {
+                pred_logits = pred_logits.contiguous();
+                pred_values = pred_values.contiguous();
+            }
+
+            // --- DISTRIBUTE RESULTS & WAKE THREADS ---
+            float* logits_ptr = pred_logits.data_ptr<float>();
+            float* values_ptr = pred_values.data_ptr<float>();
+            size_t action_dim = pred_logits.size(1);
+
+            for (size_t i = 0; i < batch_size; ++i) {
+                EvalResult result;
+                result.logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
+                result.value = values_ptr[i];
+                
+                // Setting this value instantly wakes up the specific parked actor thread!
+                batch[i].promise.set_value(std::move(result));
+            }
+        }
+    }
+};
 
 } // namespace open_spiel
