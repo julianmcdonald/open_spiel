@@ -13,6 +13,7 @@
 #include <shared_mutex>
 #include <iterator>
 #include <filesystem>
+#include <optional>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -43,6 +44,10 @@ ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
 ABSL_FLAG(double, mmd_alpha, 0.1, "MMD entropy parameter alpha.");
+ABSL_FLAG(int, eval_batch_size, 64, "Target batch size for the evaluation queue.");
+ABSL_FLAG(int, eval_timeout_ms, 2, "Timeout in milliseconds for the evaluation queue.");
+ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension of the network.");
+ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks.");
 
 namespace open_spiel {
 
@@ -367,9 +372,25 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor actions_taken = is_cuda ? buffers.actions_taken.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.actions_taken.slice(0, 0, batch_size);
 
   optimizer.zero_grad();
-  auto outputs = model->forward(states);
-  torch::Tensor pred_logits = outputs.logits;
-  torch::Tensor pred_values = outputs.values;
+  torch::Tensor pred_logits, pred_values;
+  {
+    // 1. Keep the guard alive for this entire scope block
+    std::optional<AutocastGuard> autocast_guard;
+    if (device.is_cuda()) {
+      // Initializes the guard in-place, enabling Autocast
+      autocast_guard.emplace(c10::DeviceType::CUDA, true);
+    }
+    
+    // 2. Execute forward pass (will use BF16 natively on Ada Lovelace!)
+    auto outputs = model->forward(states);
+    pred_logits = outputs.logits;
+    pred_values = outputs.values;
+  } // <--- guard is safely destructed here, restoring previous Autocast state!
+
+  // 3. Cast back to Float32 outside the Autocast scope
+  // (Even if running on CPU, casting Float32 to Float32 is a safe, fast no-op)
+  pred_logits = pred_logits.to(torch::kFloat32);
+  pred_values = pred_values.to(torch::kFloat32);
 
   // Mask illegal action logits (mask == 0) with a large negative value (-1e9f)
   torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
@@ -744,6 +765,13 @@ int main(int argc, char** argv) {
   if (torch::cuda::is_available()) {
     train_device = torch::Device(torch::kCUDA);
     std::cout << "CUDA is available! Optimization Worker will execute on GPU.\n";
+    
+    // Enable TF32 globally
+    at::globalContext().setAllowTF32CuBLAS(true);
+    at::globalContext().setAllowTF32CuDNN(true);
+    
+    // CRITICAL: Force Autocast to use BF16 natively on Ada Lovelace
+    at::autocast::set_autocast_dtype(c10::DeviceType::CUDA, at::ScalarType::BFloat16);
   }
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;
@@ -760,24 +788,32 @@ int main(int argc, char** argv) {
   std::shared_ptr<open_spiel::BatchedEvaluator> evaluator = nullptr;
 
   if (obs_size > 0) {
-    training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
-    inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
+    int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+    int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+    int eval_batch_size = absl::GetFlag(FLAGS_eval_batch_size);
+    int eval_timeout_ms = absl::GetFlag(FLAGS_eval_timeout_ms);
+
+    training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
+    inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
     
     inference_model->to(train_device);
 
     training_model->train(); // training model stays in train mode permanently
     inference_model->eval(); // inference model stays in eval mode permanently
     
-    std::cout << absl::StrFormat("Initialized Double-Buffered SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: 1024, Action Dim: %d)\n", obs_size, action_size);
+    std::cout << absl::StrFormat("Initialized Double-Buffered SharedDunePolicyValueNet (Input Dim: %d, Hidden Dim: %d, Action Dim: %d, Blocks: %d)\n", 
+                                 obs_size, hidden_dim, action_size, num_blocks);
     
     // Load existing checkpoint and set up the training model and optimizer correctly on the target hardware device
     open_spiel::LoadCheckpoint(training_model, optimizer, model_path, optim_path, train_device);
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
-    // Instantiate the BatchedEvaluator with target batch size 128, timeout 2ms, and train_device
+    // Instantiate the BatchedEvaluator with target batch size, timeout, and train_device
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
-        inference_model, 64, 2, train_device, &sync_mutex); // 64 target batch, 2ms timeout
+        inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex);
+    std::cout << absl::StrFormat("BatchedEvaluator initialized with target batch size: %d, timeout: %d ms\n", 
+                                 eval_batch_size, eval_timeout_ms);
   }
 #endif
 

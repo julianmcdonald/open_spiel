@@ -75,6 +75,8 @@ void WorkerThread(
     bool provides_observations_tensor,
     std::atomic<int>& next_game_id,
     int total_games,
+    int hidden_dim,
+    int num_blocks,
     ThreadStats& stats) {
   // InferenceMode is faster than NoGradGuard - disables autograd, view tracking, version counting
   torch::InferenceMode inference_guard;
@@ -83,7 +85,7 @@ void WorkerThread(
   torch::Device device(torch::kCPU);
 
   // Initialize and load local models for thread safety
-  auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
+  auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
   model_a->eval();
   try {
     torch::serialize::InputArchive archive;
@@ -97,7 +99,7 @@ void WorkerThread(
 
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_b = nullptr;
   if (use_opponent_model) {
-    model_b = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 1024, action_size);
+    model_b = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
     model_b->eval();
     try {
       torch::serialize::InputArchive archive;
@@ -207,7 +209,9 @@ void WorkerThread(
 void RunEvaluation(const std::string& model_checkpoint,
                    const std::string& opponent_checkpoint,
                    int total_games = 1000,
-                   int requested_threads = 0) {
+                   int requested_threads = 0,
+                   int hidden_dim = 1024,
+                   int num_blocks = 4) {
   // Get clean names using std::filesystem::path
   std::string model_name = std::filesystem::path(model_checkpoint).filename().string();
   bool use_opponent_model = (!opponent_checkpoint.empty() && opponent_checkpoint != "random");
@@ -260,7 +264,7 @@ void RunEvaluation(const std::string& model_checkpoint,
     threads.emplace_back(
         WorkerThread, t, game, model_checkpoint, opponent_checkpoint, use_opponent_model,
         obs_size, action_size, provides_info_state_tensor, provides_observations_tensor,
-        std::ref(next_game_id), total_games, std::ref(thread_stats_vec[t]));
+        std::ref(next_game_id), total_games, hidden_dim, num_blocks, std::ref(thread_stats_vec[t]));
   }
 
   // Join all threads
@@ -321,11 +325,13 @@ int main(int argc, char* argv[]) {
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
 
-  // Usage: dune_eval_1000 <model_a> <num_games> [opponent_model|"random"] [num_threads]
+  // Usage: dune_eval_1000 <model_a> <num_games> [opponent_model|"random"] [num_threads] [hidden_dim] [num_blocks]
   std::string model_checkpoint = "/home/warcr/projects/dune_drl/dune_stage_a_run1_model.pt";
   int num_games = 1000;
   std::string opponent_checkpoint = "";
   int num_threads = 0;  // 0 = auto-detect
+  int hidden_dim = 1024;
+  int num_blocks = 4;
 
   if (argc > 1) {
     model_checkpoint = argv[1];
@@ -347,7 +353,21 @@ int main(int argc, char* argv[]) {
       std::cerr << "Warning: invalid thread count specified. Using auto-detect.\n";
     }
   }
+  if (argc > 5) {
+    try {
+      hidden_dim = std::stoi(argv[5]);
+    } catch (...) {
+      std::cerr << "Warning: invalid hidden dimension specified. Defaulting to 1024.\n";
+    }
+  }
+  if (argc > 6) {
+    try {
+      num_blocks = std::stoi(argv[6]);
+    } catch (...) {
+      std::cerr << "Warning: invalid block count specified. Defaulting to 4.\n";
+    }
+  }
 
-  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads);
+  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads, hidden_dim, num_blocks);
   return 0;
 }

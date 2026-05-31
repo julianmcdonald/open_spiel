@@ -40,21 +40,19 @@ TORCH_MODULE(ResBlock);
 // 2. Main Dual-Headed Policy-Value Network Definition
 struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
-  std::shared_ptr<ResBlockImpl> res1{nullptr};
-  std::shared_ptr<ResBlockImpl> res2{nullptr};
-  std::shared_ptr<ResBlockImpl> res3{nullptr};
-  std::shared_ptr<ResBlockImpl> res4{nullptr};
+  std::vector<std::shared_ptr<ResBlockImpl>> res_blocks;
   torch::nn::Linear policy_head{nullptr};
   torch::nn::Linear value_head{nullptr};
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim, int64_t action_dim) {
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8) {
     input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
     
-    // Register the underlying implementation objects wrapped in shared_ptr to solve template deduction
-    res1 = register_module("res1", std::make_shared<ResBlockImpl>(hidden_dim));
-    res2 = register_module("res2", std::make_shared<ResBlockImpl>(hidden_dim));
-    res3 = register_module("res3", std::make_shared<ResBlockImpl>(hidden_dim));
-    res4 = register_module("res4", std::make_shared<ResBlockImpl>(hidden_dim));
+    // Register custom submodules dynamically (res1, res2, etc.)
+    for (int i = 0; i < num_blocks; ++i) {
+      auto block = std::make_shared<ResBlockImpl>(hidden_dim);
+      res_blocks.push_back(block);
+      register_module("res" + std::to_string(i + 1), block);
+    }
     
     policy_head = register_module("policy_head", torch::nn::Linear(hidden_dim, action_dim));
     value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
@@ -67,10 +65,9 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
 
   ModelOutputs forward(torch::Tensor x) {
     x = torch::relu(input_layer->forward(x));
-    x = res1->forward(x);
-    x = res2->forward(x);
-    x = res3->forward(x);
-    x = res4->forward(x);
+    for (auto& block : res_blocks) {
+      x = block->forward(x);
+    }
     
     torch::Tensor logits = policy_head->forward(x);
     torch::Tensor values = torch::tanh(value_head->forward(x));
@@ -78,6 +75,19 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);
+
+struct AutocastGuard {
+    c10::DeviceType device_type_;
+    bool previous_state_;
+    AutocastGuard(c10::DeviceType device_type, bool enabled)
+        : device_type_(device_type) {
+        previous_state_ = at::autocast::is_autocast_enabled(device_type_);
+        at::autocast::set_autocast_enabled(device_type_, enabled);
+    }
+    ~AutocastGuard() {
+        at::autocast::set_autocast_enabled(device_type_, previous_state_);
+    }
+};
 
 struct EvalResult {
     std::vector<float> logits;
@@ -138,18 +148,7 @@ private:
         std::promise<EvalResult> promise;
     };
 
-    struct AutocastGuard {
-        c10::DeviceType device_type_;
-        bool previous_state_;
-        AutocastGuard(c10::DeviceType device_type, bool enabled)
-            : device_type_(device_type) {
-            previous_state_ = at::autocast::is_autocast_enabled(device_type_);
-            at::autocast::set_autocast_enabled(device_type_, enabled);
-        }
-        ~AutocastGuard() {
-            at::autocast::set_autocast_enabled(device_type_, previous_state_);
-        }
-    };
+
 
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
     int target_batch_size_;
