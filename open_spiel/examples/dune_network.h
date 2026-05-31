@@ -248,10 +248,10 @@ private:
                 }
             }
 
-            // C. NON-BLOCKING D2H TRANSFER
+            // C. NON-BLOCKING D2H TRANSFER (cast AMP FP16 outputs back to Float32)
             if (device_.is_cuda()) {
-                pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                pred_logits = pred_logits.to(torch::kFloat32).to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                pred_values = pred_values.to(torch::kFloat32).to(torch::kCPU, /*non_blocking=*/true).contiguous();
                 
                 // D. CRITICAL: Wait for asynchronous transfers to complete before reading!
                 torch::cuda::synchronize();
