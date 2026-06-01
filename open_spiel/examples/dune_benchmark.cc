@@ -332,8 +332,11 @@ void OptimizationWorker(
       }
 
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
-      if (step % 500 == 0) {
-        SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      if (step % 100000 == 0) {
+        // ROTATING CHECKPOINTS: Enforce saving to a new numbered file every time
+        std::string step_model_path = absl::StrCat("dune_stage_c_model_step_", step, ".pt");
+        std::string step_optim_path = absl::StrCat("dune_stage_c_optimizer_step_", step, ".pt");
+        SaveCheckpoint(training_model, *optimizer, step_model_path, step_optim_path);
       }
     }
     
@@ -430,16 +433,64 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   float p_loss_val = policy_loss.item<float>();
   float v_loss_val = value_loss.item<float>();
 
-  // 1. FATAL SAFETY GUARD: Prevent checkpoint poisoning
+  // 1. FATAL SAFETY GUARD & TENSOR AUTOPSY
   if (std::isnan(p_loss_val) || std::isnan(v_loss_val)) {
-    std::cerr << "\n[FATAL] NaN loss detected! Aborting backprop to protect healthy checkpoint on disk.\n";
+    std::cerr << "\n================ TENSOR AUTOPSY =================\n";
+    std::cerr << "[FATAL] NaN loss detected! Isolating the source...\n";
+    std::cerr << "Losses -> Policy (KL): " << p_loss_val << " | Value (MSE): " << v_loss_val << "\n";
+    
+    auto check_nan = [](const torch::Tensor& t, const std::string& name) {
+        if (!t.defined()) return;
+        bool has_nan = t.isnan().any().item<bool>();
+        bool has_inf = t.isinf().any().item<bool>();
+        std::cerr << " - '" << name << "' has NaN/Inf: " << (has_nan || has_inf ? "YES" : "NO") << "\n";
+    };
+
+    std::cerr << "\nINPUTS (From C++ Replay Buffer):\n";
+    check_nan(states, "states");
+    check_nan(rewards, "rewards");
+    check_nan(prev_logits, "prev_logits");
+    check_nan(q_values, "q_values");
+    
+    std::cerr << "\nMODEL OUTPUTS (Forward Pass):\n";
+    check_nan(pred_logits, "pred_logits");
+    check_nan(pred_values, "pred_values");
+    
+    std::cerr << "\nLOSS MATH INTERMEDIATES:\n";
+    check_nan(log_probs, "log_probs");
+    check_nan(target_probs, "target_probs");
+    
+    std::cerr << "\nMODEL WEIGHTS:\n";
+    bool weights_bad = false;
+    for (const auto& param : model->parameters()) {
+        if (param.isnan().any().item<bool>() || param.isinf().any().item<bool>()) {
+            weights_bad = true;
+            break;
+        }
+    }
+    std::cerr << " - Model weights have NaN/Inf: " << (weights_bad ? "YES" : "NO") << "\n";
+
+    std::cerr << "\nEDGE CASES:\n";
+    std::cerr << " - Any state has ZERO valid actions? " << ((masks.sum(1) == 0.0f).any().item<bool>() ? "YES" : "NO") << "\n";
+    
+    std::cerr << "=================================================\n";
+    std::cerr << "Aborting to protect healthy checkpoints on disk.\n";
     std::exit(EXIT_FAILURE);
   }
 
   total_loss.backward();
 
-  // 2. GRADIENT CLIPPING: Protect the Adam optimizer from gradient explosions!
-  torch::nn::utils::clip_grad_norm_(model->parameters(), absl::GetFlag(FLAGS_grad_clip_norm));
+  // 2. GRADIENT CLIPPING & SECONDARY GUARD
+  double grad_norm = torch::nn::utils::clip_grad_norm_(model->parameters(), absl::GetFlag(FLAGS_grad_clip_norm));
+  
+  if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
+      std::cerr << "\n=========================================\n";
+      std::cerr << "[FATAL] NaN/Inf detected in Gradient Norm: " << grad_norm << "\n";
+      std::cerr << "The backward pass produced invalid gradients (likely BF16 overflow).\n";
+      std::cerr << "Aborting optimizer step to prevent injecting NaNs into model weights.\n";
+      std::cerr << "=========================================\n";
+      std::exit(EXIT_FAILURE);
+  }
 
   optimizer.step();
 
