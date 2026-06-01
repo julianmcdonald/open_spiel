@@ -48,6 +48,7 @@ ABSL_FLAG(int, eval_batch_size, 64, "Target batch size for the evaluation queue.
 ABSL_FLAG(int, eval_timeout_ms, 2, "Timeout in milliseconds for the evaluation queue.");
 ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension of the network.");
 ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks.");
+ABSL_FLAG(double, grad_clip_norm, 1.0, "Maximum gradient norm for clipping.");
 
 namespace open_spiel {
 
@@ -425,10 +426,24 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
       log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
 
   torch::Tensor total_loss = policy_loss + value_loss;
+
+  float p_loss_val = policy_loss.item<float>();
+  float v_loss_val = value_loss.item<float>();
+
+  // 1. FATAL SAFETY GUARD: Prevent checkpoint poisoning
+  if (std::isnan(p_loss_val) || std::isnan(v_loss_val)) {
+    std::cerr << "\n[FATAL] NaN loss detected! Aborting backprop to protect healthy checkpoint on disk.\n";
+    std::exit(EXIT_FAILURE);
+  }
+
   total_loss.backward();
+
+  // 2. GRADIENT CLIPPING: Protect the Adam optimizer from gradient explosions!
+  torch::nn::utils::clip_grad_norm_(model->parameters(), absl::GetFlag(FLAGS_grad_clip_norm));
+
   optimizer.step();
 
-  return {value_loss.item<float>(), policy_loss.item<float>()};
+  return {v_loss_val, p_loss_val};
 }
 
 int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size, std::vector<Transition>& trajectory, std::atomic<float>* reward_lambda) {
