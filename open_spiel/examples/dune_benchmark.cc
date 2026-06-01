@@ -402,14 +402,10 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   optimizer.zero_grad();
   torch::Tensor pred_logits, pred_values;
   {
-    std::optional<AutocastGuard> autocast_guard;
-    if (device.is_cuda()) autocast_guard.emplace(c10::DeviceType::CUDA, true);
     auto outputs = model->forward(states);
     pred_logits = outputs.logits;
     pred_values = outputs.values;
   }
-  pred_logits = pred_logits.to(torch::kFloat32);
-  pred_values = pred_values.to(torch::kFloat32);
 
   torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
   torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
