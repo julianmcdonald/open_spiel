@@ -186,12 +186,18 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   }
 }
 struct PersistentTrainBuffers {
+  // Pinned host memory
   torch::Tensor states, masks, rewards, prev_logits, q_values, actions_taken;
-  
   float *p_states, *p_masks, *p_rewards, *p_prev, *p_q;
   int64_t *p_actions;
 
+  // Persistent device-static tensors for zero-allocation H2D transfers
+  torch::Tensor d_states, d_masks, d_rewards, d_prev_logits, d_q_values, d_actions_taken;
+
+  bool is_cuda_ = false;
+
   void Initialize(int64_t max_batch_size, int64_t obs_size, int64_t action_dim, bool is_cuda) {
+    is_cuda_ = is_cuda;
     auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(is_cuda);
     auto long_opts = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(is_cuda);
 
@@ -208,6 +214,18 @@ struct PersistentTrainBuffers {
     p_prev = prev_logits.data_ptr<float>();
     p_q = q_values.data_ptr<float>();
     p_actions = actions_taken.data_ptr<int64_t>();
+
+    if (is_cuda) {
+      auto d_f = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+      auto d_l = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+      
+      d_states = torch::empty({max_batch_size, obs_size}, d_f);
+      d_masks = torch::empty({max_batch_size, action_dim}, d_f);
+      d_rewards = torch::empty({max_batch_size, 1}, d_f);
+      d_prev_logits = torch::empty({max_batch_size, action_dim}, d_f);
+      d_q_values = torch::empty({max_batch_size, 1}, d_f);
+      d_actions_taken = torch::empty({max_batch_size, 1}, d_l);
+    }
   }
 };
 
@@ -350,90 +368,67 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     const auto& t = batch[i];
     std::memcpy(buffers.p_states + i * obs_size, t->spatial_tensor.data(), obs_size * sizeof(float));
     std::memcpy(buffers.p_prev + i * action_dim, t->prev_logits.data(), action_dim * sizeof(float));
-    
-    // Efficient sparse-to-dense mask filling
     std::fill(buffers.p_masks + i * action_dim, buffers.p_masks + (i + 1) * action_dim, 0.0f);
     for (Action a : t->legal_actions) {
       if (a >= 0 && a < action_dim) buffers.p_masks[i * action_dim + a] = 1.0f;
     }
-
     buffers.p_rewards[i] = t->reward_target / 4.0f;
     buffers.p_q[i] = t->q_value;
     buffers.p_actions[i] = t->action_taken;
   }
 
-  // Non-blocking H2D transfer from pinned memory using .slice()
-  bool is_cuda = device.is_cuda();
-  torch::Tensor states = is_cuda ? buffers.states.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.states.slice(0, 0, batch_size);
-  torch::Tensor masks = is_cuda ? buffers.masks.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.masks.slice(0, 0, batch_size);
-  torch::Tensor rewards = is_cuda ? buffers.rewards.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.rewards.slice(0, 0, batch_size);
-  torch::Tensor prev_logits = is_cuda ? buffers.prev_logits.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.prev_logits.slice(0, 0, batch_size);
-  torch::Tensor q_values = is_cuda ? buffers.q_values.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.q_values.slice(0, 0, batch_size);
-  torch::Tensor actions_taken = is_cuda ? buffers.actions_taken.slice(0, 0, batch_size).to(device, /*non_blocking=*/true) : buffers.actions_taken.slice(0, 0, batch_size);
+  // Zero-Allocation H2D Transfer: copy from pinned host into persistent device memory
+  if (buffers.is_cuda_) {
+    buffers.d_states.slice(0, 0, batch_size).copy_(buffers.states.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_masks.slice(0, 0, batch_size).copy_(buffers.masks.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_rewards.slice(0, 0, batch_size).copy_(buffers.rewards.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_prev_logits.slice(0, 0, batch_size).copy_(buffers.prev_logits.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_q_values.slice(0, 0, batch_size).copy_(buffers.q_values.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_actions_taken.slice(0, 0, batch_size).copy_(buffers.actions_taken.slice(0, 0, batch_size), /*non_blocking=*/true);
+  }
+
+  // Use persistent device tensors (zero-alloc) on CUDA, or sliced pinned tensors on CPU
+  torch::Tensor states = buffers.is_cuda_ ? buffers.d_states.slice(0, 0, batch_size) : buffers.states.slice(0, 0, batch_size);
+  torch::Tensor masks = buffers.is_cuda_ ? buffers.d_masks.slice(0, 0, batch_size) : buffers.masks.slice(0, 0, batch_size);
+  torch::Tensor rewards = buffers.is_cuda_ ? buffers.d_rewards.slice(0, 0, batch_size) : buffers.rewards.slice(0, 0, batch_size);
+  torch::Tensor prev_logits = buffers.is_cuda_ ? buffers.d_prev_logits.slice(0, 0, batch_size) : buffers.prev_logits.slice(0, 0, batch_size);
+  torch::Tensor q_values = buffers.is_cuda_ ? buffers.d_q_values.slice(0, 0, batch_size) : buffers.q_values.slice(0, 0, batch_size);
+  torch::Tensor actions_taken = buffers.is_cuda_ ? buffers.d_actions_taken.slice(0, 0, batch_size) : buffers.actions_taken.slice(0, 0, batch_size);
 
   optimizer.zero_grad();
   torch::Tensor pred_logits, pred_values;
   {
-    // 1. Keep the guard alive for this entire scope block
     std::optional<AutocastGuard> autocast_guard;
-    if (device.is_cuda()) {
-      // Initializes the guard in-place, enabling Autocast
-      autocast_guard.emplace(c10::DeviceType::CUDA, true);
-    }
-    
-    // 2. Execute forward pass (will use BF16 natively on Ada Lovelace!)
+    if (device.is_cuda()) autocast_guard.emplace(c10::DeviceType::CUDA, true);
     auto outputs = model->forward(states);
     pred_logits = outputs.logits;
     pred_values = outputs.values;
-  } // <--- guard is safely destructed here, restoring previous Autocast state!
-
-  // 3. Cast back to Float32 outside the Autocast scope
-  // (Even if running on CPU, casting Float32 to Float32 is a safe, fast no-op)
+  }
   pred_logits = pred_logits.to(torch::kFloat32);
   pred_values = pred_values.to(torch::kFloat32);
 
-  // Mask illegal action logits (mask == 0) with a large negative value (-1e9f)
   torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
-
-  // Compute log_softmax over masked logits
-  torch::Tensor log_probs = torch::log_softmax(masked_logits, /*dim=*/-1);
-
-  // Value Loss (MSE between scaled zero-sum returns and Tanh bounded prediction)
+  torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
-  // MMD Policy Loss
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
 
-  // Construct sparse Q-values for the action taken, zero elsewhere
   torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
   q_vector.scatter_(1, actions_taken, q_values);
 
-  // Calculate the theoretical MMD target logits
   torch::Tensor target_logits = (prev_logits + eta * q_vector) / (1.0f + eta * alpha);
-
-  // Apply the same legal action mask to the target logits to prevent pulling towards illegal actions
   torch::Tensor masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
+  torch::Tensor target_probs = torch::softmax(masked_target_logits, -1).detach();
 
-  // Softmax the target logits to create the target probability distribution (detached from the autograd graph)
-  torch::Tensor target_probs = torch::softmax(masked_target_logits, /*dim=*/-1).detach();
-
-  // Compute the KL Divergence between current log_probs and the MMD target distribution
   torch::Tensor policy_loss = torch::nn::functional::kl_div(
-      log_probs, 
-      target_probs, 
-      torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean)
-  );
+      log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
 
   torch::Tensor total_loss = policy_loss + value_loss;
-
-  float p_loss_val = policy_loss.item<float>();
-  float v_loss_val = value_loss.item<float>();
-
   total_loss.backward();
   optimizer.step();
 
-  return {v_loss_val, p_loss_val};
+  return {value_loss.item<float>(), policy_loss.item<float>()};
 }
 
 int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size, std::vector<Transition>& trajectory, std::atomic<float>* reward_lambda) {

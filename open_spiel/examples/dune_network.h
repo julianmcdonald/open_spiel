@@ -4,13 +4,16 @@
 #include <memory>
 #include <vector>
 #include <deque>
-#include <future>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <shared_mutex>
 #include <ATen/autocast_mode.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace open_spiel {
 
@@ -125,30 +128,48 @@ public:
 
     // Called by the actor threads
     EvalResult Evaluate(const std::vector<float>& obs) {
-        std::promise<EvalResult> promise;
-        std::future<EvalResult> future = promise.get_future();
+        EvalResult result; // Stack allocated!
+        std::atomic<bool> ready{false};
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            requests_.push_back({&obs, std::move(promise)}); // Pass address
-            if (requests_.size() == 1) {
-                first_request_ts_ = std::chrono::steady_clock::now();
+            requests_.push_back({&obs, &result, &ready});
+            
+            // Only wake the Runner on the first arrival or when the batch is full
+            if (requests_.size() == 1 || requests_.size() >= (size_t)target_batch_size_) {
+                cv_.notify_one(); 
             }
         }
         
-        cv_.notify_one(); // Wake up the runner thread
+        // HYBRID WAIT: Spin briefly to catch ultra-fast GPU responses, then park.
+        int spin_count = 0;
+        while (!ready.load(std::memory_order_acquire)) {
+            if (spin_count < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause(); // Emits PAUSE instruction to prevent pipeline flushing
+#else
+                std::this_thread::yield();
+#endif
+                spin_count++;
+            } else {
+                // Park safely (Zero CPU burn)
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, [&] { return ready.load(std::memory_order_acquire); });
+            }
+        }
         
-        // The actor thread goes to sleep right here! OS multiplexing takes over.
-        return future.get();
+        return result; // Move semantics
     }
 
 private:
     struct Request {
-        const std::vector<float>* obs; // Storing a pointer instead of copying!
-        std::promise<EvalResult> promise;
+        const std::vector<float>* obs;
+        EvalResult* result_dest;
+        std::atomic<bool>* ready_flag;
     };
-
-
+    
+    std::mutex park_mutex_;
+    std::condition_variable park_cv_;
 
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
     int target_batch_size_;
@@ -184,7 +205,7 @@ private:
                 
                 // 3. Wait until the batch is full OR the timeout expires (Deadlock fix!)
                 cv_.wait_until(lock, deadline, [this, deadline]() {
-                    return stop_ || requests_.size() >= target_batch_size_ || 
+                    return stop_ || requests_.size() >= (size_t)target_batch_size_ || 
                            std::chrono::steady_clock::now() >= deadline;
                 });
 
@@ -265,13 +286,17 @@ private:
             size_t action_dim = pred_logits.size(1);
 
             for (size_t i = 0; i < batch_size; ++i) {
-                EvalResult result;
-                result.logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
-                result.value = values_ptr[i];
+                batch[i].result_dest->logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
+                batch[i].result_dest->value = values_ptr[i];
                 
-                // Setting this value instantly wakes up the specific parked actor thread!
-                batch[i].promise.set_value(std::move(result));
+                // Set the atomic flag (fast spinning threads will catch this instantly)
+                batch[i].ready_flag->store(true, std::memory_order_release);
             }
+            
+            // Memory barrier to guarantee parked threads see the ready flag, 
+            // followed by a SINGLE broadcast syscall (instead of 64 individual futex wakes)
+            { std::lock_guard<std::mutex> park_lock(park_mutex_); }
+            park_cv_.notify_all();
         }
     }
 };
