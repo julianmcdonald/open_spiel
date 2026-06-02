@@ -49,6 +49,7 @@ ABSL_FLAG(int, eval_timeout_ms, 2, "Timeout in milliseconds for the evaluation q
 ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension of the network.");
 ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks.");
 ABSL_FLAG(double, grad_clip_norm, 1.0, "Maximum gradient norm for clipping.");
+ABSL_FLAG(double, gae_lambda, 1.0, "Lambda parameter for GAE.");
 
 namespace open_spiel {
 
@@ -59,6 +60,7 @@ struct Transition {
   std::vector<float> prev_logits;        // Raw policy logits (z_k)
   float q_value;                         // Estimated action-value Q(s, a)
   float reward_target;                   // Mapped zero-sum reward
+  float v_value;                         // Value Network estimate V(s)
   int player_id;                         // Seat ID of the deciding player
 };
 
@@ -376,7 +378,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     for (Action a : t->legal_actions) {
       if (a >= 0 && a < action_dim) buffers.p_masks[i * action_dim + a] = 1.0f;
     }
-    buffers.p_rewards[i] = t->reward_target / 4.0f;
+    buffers.p_rewards[i] = t->reward_target;
     buffers.p_q[i] = t->q_value;
     buffers.p_actions[i] = t->action_taken;
   }
@@ -428,6 +430,14 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
 
   float p_loss_val = policy_loss.item<float>();
   float v_loss_val = value_loss.item<float>();
+
+  // Diagnostic for eta scaling
+  static int log_counter = 0;
+  if (++log_counter % 1000 == 0) {
+      float mean_abs_q = q_vector.abs().mean().item<float>();
+      std::cout << "\n[Diagnostic] Mean Abs Signal (Q/Advantage): " << mean_abs_q 
+                << " | Current Eta: " << eta << "\n";
+  }
 
   // 1. FATAL SAFETY GUARD & TENSOR AUTOPSY
   if (std::isnan(p_loss_val) || std::isnan(v_loss_val)) {
@@ -570,6 +580,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
 
       // Query the batched evaluator (actor thread goes to sleep, OS multiplexes)
       EvalResult result = evaluator->Evaluate(obs);
+      float current_value = result.value;
       std::vector<float> prev_logits_vec = std::move(result.logits);
 
       // Fast CPU Softmax Action Selection using the configured temperature
@@ -625,28 +636,51 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       transition.prev_logits = std::move(prev_logits_vec);
       transition.q_value = shaped_bonus;
       transition.reward_target = shaped_bonus;
+      transition.v_value = current_value; // Store the V(s) value
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
   }
 
-  // Clamped Backward Monte Carlo Returns to protect Tanh Value bounds
+  // Per-Player GAE Computation
   std::vector<double> returns = state->Returns();
-  std::vector<float> running_shaped(game.NumPlayers(), 0.0f);
+  double gae_lambda = absl::GetFlag(FLAGS_gae_lambda);
+  std::vector<float> last_val(game.NumPlayers(), 0.0f);
+  std::vector<float> last_gae(game.NumPlayers(), 0.0f);
+  std::vector<bool> seen_last_action(game.NumPlayers(), false);
+
   for (auto it = trajectory.rbegin(); it != trajectory.rend(); ++it) {
     if (it->player_id >= 0 && it->player_id < game.NumPlayers()) {
       int p = it->player_id;
-      float immediate_shaped = it->reward_target; // holds the shaped_bonus set mid-game
-      running_shaped[p] += immediate_shaped;
+      float r_i = it->reward_target; // holds shaped_bonus VP gain
+
+      // Chronologically last action check (first step seen going backward)
+      if (!seen_last_action[p]) {
+        r_i += static_cast<float>(returns[p]);
+        seen_last_action[p] = true;
+      }
+
+      // Normalize total reward to [-1.0, 1.0] scale
+      r_i = r_i / 4.0f;
+      r_i = std::clamp(r_i, -1.0f, 1.0f);
+
+      float V_i = it->v_value;
       
-      float terminal_reward = static_cast<float>(returns[p]);
-      float combined_reward = running_shaped[p] + terminal_reward;
+      // δ_i = r_i + γ * V_{i+1} - V_i
+      // Episodic finite horizon: γ = 1.0
+      float delta_i = r_i + last_val[p] - V_i;
 
-      // CRITICAL FIX: Clamp to safely fit inside the Neural Network's Tanh bounds [-4.0, 4.0]
-      combined_reward = std::clamp(combined_reward, -4.0f, 4.0f);
+      // A_i = δ_i + γ * λ * A_{i+1}
+      // Episodic finite horizon: γ = 1.0
+      float A_i = delta_i + gae_lambda * last_gae[p];
 
-      it->reward_target = combined_reward;
-      it->q_value = combined_reward;
+      // Wiring the signals
+      it->q_value = A_i;
+      it->reward_target = A_i + V_i; // TD(λ) return target
+
+      // Update trackers
+      last_val[p] = V_i;
+      last_gae[p] = A_i;
     }
   }
 
@@ -725,6 +759,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       transition.prev_logits = std::vector<float>(action_size, 0.0f);
       transition.q_value = 0.0f;
       transition.reward_target = 0.0f;
+      transition.v_value = 0.0f; // Store V(s) = 0.0f explicitly
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
@@ -735,8 +770,8 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
   for (auto& transition : trajectory) {
     if (transition.player_id >= 0 && transition.player_id < static_cast<int>(returns.size())) {
       float reward = static_cast<float>(returns[transition.player_id]);
-      transition.reward_target = reward;
-      transition.q_value = reward;
+      transition.reward_target = reward / 4.0f; // Scale consistently
+      transition.q_value = reward / 4.0f;        // Scale consistently
     }
   }
 
