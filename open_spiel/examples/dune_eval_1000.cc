@@ -330,8 +330,8 @@ int main(int argc, char* argv[]) {
   int num_games = 1000;
   std::string opponent_checkpoint = "";
   int num_threads = 0;  // 0 = auto-detect
-  int hidden_dim = 1024;
-  int num_blocks = 4;
+  int hidden_dim = 2048;
+  int num_blocks = 8;
 
   if (argc > 1) {
     model_checkpoint = argv[1];

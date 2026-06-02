@@ -157,6 +157,8 @@ int main(int argc, char* argv[]) {
   std::string model_checkpoint = "dune_stage_a_run11_model.pt";
   bool interactive = true;
   std::string output_file = "";
+  int64_t hidden_dim = 2048;
+  int num_blocks = 8;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -167,6 +169,20 @@ int main(int argc, char* argv[]) {
         output_file = argv[++i];
       } else {
         std::cerr << "Error: --output requires a file path.\n";
+        return 1;
+      }
+    } else if (arg == "--hidden_dim" || arg == "--hidden-dim") {
+      if (i + 1 < argc) {
+        hidden_dim = std::stoll(argv[++i]);
+      } else {
+        std::cerr << "Error: --hidden_dim requires an integer.\n";
+        return 1;
+      }
+    } else if (arg == "--num_blocks" || arg == "--num-blocks") {
+      if (i + 1 < argc) {
+        num_blocks = std::stoi(argv[++i]);
+      } else {
+        std::cerr << "Error: --num_blocks requires an integer.\n";
         return 1;
       }
     } else {
@@ -195,10 +211,9 @@ int main(int argc, char* argv[]) {
 
   // 2. Initialize the Network
   int64_t obs_size = 5584; // Must match InformationStateTensor shape
-  int64_t hidden_dim = 1024;
   int64_t action_size = 2391;
   
-  auto inference_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size);
+  auto inference_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
   inference_model->eval(); // Disable Dropout/BatchNorm variance
 
   // 3. Robust Multi-Path Checkpoint Loading
