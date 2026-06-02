@@ -298,7 +298,8 @@ void OptimizationWorker(
         uint64_t current_inserted = global_buffer->GetTotalInserted();
         if (current_inserted >= static_cast<uint64_t>(min_train_size)) {
           uint64_t allowed_steps = (current_inserted - min_train_size) / train_ratio;
-          if (static_cast<uint64_t>(training_steps.load()) >= allowed_steps) {
+          uint64_t local_steps = static_cast<uint64_t>(training_steps.load()) - absl::GetFlag(FLAGS_start_step);
+          if (local_steps >= allowed_steps) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
           }
