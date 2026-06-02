@@ -434,7 +434,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   // Diagnostic for eta scaling
   static int log_counter = 0;
   if (++log_counter % 1000 == 0) {
-      float mean_abs_q = q_vector.abs().mean().item<float>();
+      float mean_abs_q = q_values.abs().mean().item<float>();
       std::cout << "\n[Diagnostic] Mean Abs Signal (Q/Advantage): " << mean_abs_q 
                 << " | Current Eta: " << eta << "\n";
   }
