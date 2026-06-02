@@ -50,6 +50,8 @@ ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension of the network.");
 ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks.");
 ABSL_FLAG(double, grad_clip_norm, 1.0, "Maximum gradient norm for clipping.");
 ABSL_FLAG(double, gae_lambda, 1.0, "Lambda parameter for GAE.");
+ABSL_FLAG(int, start_step, 0, "Global training step to resume from to keep decay math aligned.");
+ABSL_FLAG(std::string, run_prefix, "dune_stage_c", "Prefix for saving rotating checkpoints.");
 
 namespace open_spiel {
 
@@ -336,8 +338,9 @@ void OptimizationWorker(
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
       if (step % 100000 == 0) {
         // ROTATING CHECKPOINTS: Enforce saving to a new numbered file every time
-        std::string step_model_path = absl::StrCat("dune_stage_c_model_step_", step, ".pt");
-        std::string step_optim_path = absl::StrCat("dune_stage_c_optimizer_step_", step, ".pt");
+        std::string run_prefix = absl::GetFlag(FLAGS_run_prefix);
+        std::string step_model_path = absl::StrCat(run_prefix, "_model_step_", step, ".pt");
+        std::string step_optim_path = absl::StrCat(run_prefix, "_optimizer_step_", step, ".pt");
         SaveCheckpoint(training_model, *optimizer, step_model_path, step_optim_path);
       }
     }
@@ -875,7 +878,7 @@ int main(int argc, char** argv) {
   std::shared_mutex sync_mutex;
   std::thread optimization_thread;
   std::atomic<bool> stop_training(false);
-  std::atomic<int> training_steps(0);
+  std::atomic<int> training_steps(absl::GetFlag(FLAGS_start_step));
   std::atomic<float> reward_lambda{1.0f};
   std::shared_ptr<open_spiel::BatchedEvaluator> evaluator = nullptr;
 
