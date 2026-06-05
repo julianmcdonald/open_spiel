@@ -133,6 +133,9 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (requests_.empty()) {
+                first_request_ts_ = std::chrono::steady_clock::now();
+            }
             requests_.push_back({&obs, &result, &ready});
             
             // Only wake the Runner on the first arrival or when the batch is full

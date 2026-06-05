@@ -695,15 +695,6 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       it->q_value = A_i;
       it->reward_target = A_i + V_i; // TD(λ) return target
 
-      // DIAGNOSTIC DUMP: Print the first 10 computed GAE tuples
-      static std::atomic<int> dump_count{0};
-      if (dump_count.fetch_add(1) < 10) {
-        std::cout << "[GAE Dump] Player: " << p 
-                  << " | R_i (scaled/clamped reward): " << r_i 
-                  << " | V_i (value estimate): " << V_i 
-                  << " | A_i (advantage): " << A_i 
-                  << " | Target (R_i + V_{i+1}): " << it->reward_target << std::endl;
-      }
 
       // Update trackers
       last_val[p] = V_i;
