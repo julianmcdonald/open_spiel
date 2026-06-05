@@ -285,7 +285,7 @@ void OptimizationWorker(
     }
 
     if (!stop_training.load()) {
-      std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n";
+      std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n" << std::flush;
     }
 
     // 2. Training Loop
@@ -417,18 +417,6 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
-  // Side-by-side value path diagnostic
-  static std::atomic<int> diagnosis_counter{0};
-  if (diagnosis_counter.fetch_add(1) < 5) {
-    torch::Tensor pred_values_cpu = pred_values.to(torch::kCPU);
-    float* pred_ptr = pred_values_cpu.data_ptr<float>();
-    std::cout << "\n--- Value Diagnosis (Step " << diagnosis_counter.load() << ") ---\n";
-    for (size_t i = 0; i < std::min((size_t)10, batch.size()); ++i) {
-      std::cout << absl::StrFormat("  Idx %2d | Target: % .4f | Inference V: % .4f | Training V: % .4f\n",
-                                   i, batch[i]->reward_target, batch[i]->v_value, pred_ptr[i]);
-    }
-    std::cout << "------------------------------------\n\n";
-  }
 
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
