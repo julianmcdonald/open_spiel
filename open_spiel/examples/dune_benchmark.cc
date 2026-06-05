@@ -860,7 +860,7 @@ int main(int argc, char** argv) {
   int64_t action_size = game->NumDistinctActions();
   
   torch::Device train_device(torch::kCPU);
-  if (false && torch::cuda::is_available()) {
+  if (torch::cuda::is_available()) {
     train_device = torch::Device(torch::kCUDA);
     std::cout << "CUDA is available! Optimization Worker will execute on GPU.\n";
     
