@@ -679,8 +679,8 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       // Episodic finite horizon: γ = 1.0
       float A_i = delta_i + gae_lambda * last_gae[p];
 
-      // Wiring the signals
-      it->q_value = A_i;
+      // Wiring the signals: q_value must be the TD(λ) return estimate (Q-value), not advantage, to avoid MMD target logit bias.
+      it->q_value = A_i + V_i;
       it->reward_target = A_i + V_i; // TD(λ) return target
 
 
