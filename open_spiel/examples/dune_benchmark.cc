@@ -125,7 +125,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     torch::Device device) {
   if (std::filesystem::exists(model_path)) {
     try {
-      torch::load(model, model_path);
+      torch::load(model, model_path, device);
       std::cout << "Successfully loaded model weights from " << model_path << "\n";
     } catch (const c10::Error& e) {
       std::cerr << "Error loading checkpoint: " << e.msg() << "\n";
@@ -144,7 +144,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
 
   if (std::filesystem::exists(optim_path)) {
     try {
-      torch::load(*optimizer, optim_path);
+      torch::load(*optimizer, optim_path, device);
       std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
 
       // CRITICAL FIX: PyTorch's load() overwrites the learning rate with the one saved in the file.
@@ -417,6 +417,19 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
+  // Side-by-side value path diagnostic
+  static std::atomic<int> diagnosis_counter{0};
+  if (diagnosis_counter.fetch_add(1) < 5) {
+    torch::Tensor pred_values_cpu = pred_values.to(torch::kCPU);
+    float* pred_ptr = pred_values_cpu.data_ptr<float>();
+    std::cout << "\n--- Value Diagnosis (Step " << diagnosis_counter.load() << ") ---\n";
+    for (size_t i = 0; i < std::min((size_t)10, batch.size()); ++i) {
+      std::cout << absl::StrFormat("  Idx %2d | Target: % .4f | Inference V: % .4f | Training V: % .4f\n",
+                                   i, batch[i]->reward_target, batch[i]->v_value, pred_ptr[i]);
+    }
+    std::cout << "------------------------------------\n\n";
+  }
+
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
 
@@ -682,6 +695,16 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       it->q_value = A_i;
       it->reward_target = A_i + V_i; // TD(λ) return target
 
+      // DIAGNOSTIC DUMP: Print the first 10 computed GAE tuples
+      static std::atomic<int> dump_count{0};
+      if (dump_count.fetch_add(1) < 10) {
+        std::cout << "[GAE Dump] Player: " << p 
+                  << " | R_i (scaled/clamped reward): " << r_i 
+                  << " | V_i (value estimate): " << V_i 
+                  << " | A_i (advantage): " << A_i 
+                  << " | Target (R_i + V_{i+1}): " << it->reward_target << std::endl;
+      }
+
       // Update trackers
       last_val[p] = V_i;
       last_gae[p] = A_i;
@@ -858,7 +881,7 @@ int main(int argc, char** argv) {
   int64_t action_size = game->NumDistinctActions();
   
   torch::Device train_device(torch::kCPU);
-  if (torch::cuda::is_available()) {
+  if (false && torch::cuda::is_available()) {
     train_device = torch::Device(torch::kCUDA);
     std::cout << "CUDA is available! Optimization Worker will execute on GPU.\n";
     

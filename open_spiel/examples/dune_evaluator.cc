@@ -210,7 +210,7 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<State> state = game->NewInitialState();
 
   // 2. Initialize the Network
-  int64_t obs_size = 5584; // Must match InformationStateTensor shape
+  int64_t obs_size = game->InformationStateTensorShape()[0];
   int64_t action_size = 2391;
   
   auto inference_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
@@ -322,7 +322,7 @@ int main(int argc, char* argv[]) {
     }
 
     // --- TENSOR PREPARATION ---
-    // Use InformationStateTensor to match the 5584-float dimension exactly
+    // Use InformationStateTensor to match the dynamic tensor shape
     std::vector<float> obs_tensor = state->InformationStateTensor();
     torch::Tensor input_tensor = torch::from_blob(obs_tensor.data(), {1, obs_size}, torch::kFloat).to(device);
 
