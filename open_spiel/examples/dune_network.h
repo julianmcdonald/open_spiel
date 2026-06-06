@@ -103,9 +103,11 @@ public:
                      int target_batch_size, 
                      int timeout_ms, 
                      torch::Device device,
-                     std::shared_mutex* sync_mutex)
+                     std::shared_mutex* sync_mutex,
+                     float logit_cap = 0.0f)
         : model_(model), target_batch_size_(target_batch_size), 
-          timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), stop_(false) {
+          timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), 
+          logit_cap_(logit_cap), stop_(false) {
         
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {
@@ -179,6 +181,7 @@ private:
     int timeout_ms_;
     torch::Device device_;
     std::shared_mutex* sync_mutex_;
+    float logit_cap_;
     
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -269,6 +272,11 @@ private:
                     pred_logits = outputs.logits;
                     pred_values = outputs.values;
                 }
+            }
+
+            // LOGIT SOFT-CAP: Match TrainStep capping to keep collection and training logits consistent
+            if (logit_cap_ > 0.0f) {
+                pred_logits = logit_cap_ * torch::tanh(pred_logits / logit_cap_);
             }
 
             // C. NON-BLOCKING D2H TRANSFER (cast AMP FP16 outputs back to Float32)

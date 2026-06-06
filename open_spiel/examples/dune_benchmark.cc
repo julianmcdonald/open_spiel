@@ -52,6 +52,9 @@ ABSL_FLAG(double, grad_clip_norm, 1.0, "Maximum gradient norm for clipping.");
 ABSL_FLAG(double, gae_lambda, 1.0, "Lambda parameter for GAE.");
 ABSL_FLAG(int, start_step, 0, "Global training step to resume from to keep decay math aligned.");
 ABSL_FLAG(std::string, run_prefix, "dune_stage_c", "Prefix for saving rotating checkpoints.");
+ABSL_FLAG(double, logit_cap, 10.0, "Smooth tanh cap on policy logits to prevent runaway growth.");
+ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient (maximizes policy entropy to prevent collapse).");
+ABSL_FLAG(double, weight_decay, 1e-4, "AdamW decoupled weight decay coefficient.");
 
 namespace open_spiel {
 
@@ -119,7 +122,7 @@ namespace {
 // Shared network architecture imported from dune_network.h
 
 void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-                    std::unique_ptr<torch::optim::Adam>& optimizer, 
+                    std::unique_ptr<torch::optim::AdamW>& optimizer, 
                     const std::string& model_path, 
                     const std::string& optim_path,
                     torch::Device device) {
@@ -138,9 +141,10 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   model->to(device);
 
   double learning_rate = absl::GetFlag(FLAGS_learning_rate);
+  double weight_decay = absl::GetFlag(FLAGS_weight_decay);
 
-  // Initialize Adam Optimizer AFTER model weights have been moved to the target hardware device
-  optimizer = std::make_unique<torch::optim::Adam>(model->parameters(), torch::optim::AdamOptions(learning_rate));
+  // Initialize AdamW Optimizer AFTER model weights have been moved to the target hardware device
+  optimizer = std::make_unique<torch::optim::AdamW>(model->parameters(), torch::optim::AdamWOptions(learning_rate).weight_decay(weight_decay));
 
   if (std::filesystem::exists(optim_path)) {
     try {
@@ -151,14 +155,14 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       // We must explicitly override it to ensure the Abseil flag is respected!
       for (auto& param_group : optimizer->param_groups()) {
         if (param_group.has_options()) {
-          static_cast<torch::optim::AdamOptions&>(param_group.options()).lr(learning_rate);
+          static_cast<torch::optim::AdamWOptions&>(param_group.options()).lr(learning_rate);
         }
       }
       
       // Move all loaded optimizer state tensors (momentum buffers) to target device to prevent CPU-GPU mismatches
       for (auto& pair : optimizer->state()) {
         auto& state_ptr = pair.second;
-        if (auto adam_state = dynamic_cast<torch::optim::AdamParamState*>(state_ptr.get())) {
+        if (auto adam_state = dynamic_cast<torch::optim::AdamWParamState*>(state_ptr.get())) {
           if (adam_state->exp_avg().defined()) {
             adam_state->exp_avg() = adam_state->exp_avg().to(device);
           }
@@ -179,7 +183,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
 }
 
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-                    torch::optim::Adam& optimizer, 
+                    torch::optim::AdamW& optimizer, 
                     const std::string& model_path, 
                     const std::string& optim_path) {
   try {
@@ -264,7 +268,7 @@ void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
 void OptimizationWorker(
     std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
     std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
-    torch::optim::Adam* optimizer,
+    torch::optim::AdamW* optimizer,
     GlobalReplayBuffer* global_buffer,
     int64_t obs_size,
     int64_t action_size,
@@ -413,6 +417,12 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     pred_values = outputs.values;
   }
 
+  // LOGIT SOFT-CAP: Prevent unbounded logit growth using smooth tanh saturation
+  float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+  if (logit_cap > 0.0f) {
+    pred_logits = logit_cap * torch::tanh(pred_logits / logit_cap);
+  }
+
   torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
   torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
   torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
@@ -431,17 +441,32 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor policy_loss = torch::nn::functional::kl_div(
       log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
 
-  torch::Tensor total_loss = policy_loss + value_loss;
+  // ENTROPY BONUS: Maximize entropy over legal actions to prevent policy collapse
+  float entropy_coef = static_cast<float>(absl::GetFlag(FLAGS_entropy_coef));
+  torch::Tensor probs = torch::softmax(masked_logits, -1);
+  // Entropy = -sum(p * log(p)) over legal actions; masked slots contribute ~0
+  torch::Tensor entropy_per_sample = -(probs * log_probs).sum(-1); // [batch]
+  torch::Tensor mean_entropy = entropy_per_sample.mean();
+
+  torch::Tensor total_loss = policy_loss + value_loss - entropy_coef * mean_entropy;
 
   float p_loss_val = policy_loss.item<float>();
   float v_loss_val = value_loss.item<float>();
 
-  // Diagnostic for eta scaling
+  // Diagnostic for eta scaling and logit health
   static int log_counter = 0;
   if (++log_counter % 1000 == 0) {
       float mean_abs_q = q_values.abs().mean().item<float>();
-      std::cout << "\n[Diagnostic] Mean Abs Signal (Q/Advantage): " << mean_abs_q 
-                << " | Current Eta: " << eta << "\n";
+      float max_abs_logit = pred_logits.abs().max().item<float>();
+      // Top-1 softmax confidence (want < ~0.9, not ~0.97)
+      float mean_top1_prob = std::get<0>(probs.max(-1)).mean().item<float>();
+      float mean_ent = mean_entropy.item<float>();
+      std::cout << "\n[Diagnostic] Mean|Q|: " << mean_abs_q 
+                << " | Eta: " << eta
+                << " | Max|Logit|: " << max_abs_logit
+                << " | MeanTop1: " << mean_top1_prob
+                << " | Entropy: " << mean_ent
+                << " | PolicyKL: " << p_loss_val << "\n";
   }
 
   // 1. FATAL SAFETY GUARD & TENSOR AUTOPSY
@@ -874,7 +899,7 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model = nullptr;
-  std::unique_ptr<torch::optim::Adam> optimizer = nullptr;
+  std::unique_ptr<torch::optim::AdamW> optimizer = nullptr;
   std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
   std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
 
@@ -907,9 +932,29 @@ int main(int argc, char** argv) {
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
-    // Instantiate the BatchedEvaluator with target batch size, timeout, and train_device
+    // Step-0 Logit Health Check: probe the loaded model with a dummy forward pass
+    // and abort if raw logits already exceed the cap (indicates an exploded checkpoint)
+    float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+    if (logit_cap > 0.0f) {
+      torch::NoGradGuard no_grad;
+      torch::Tensor probe_input = torch::zeros({1, obs_size}, torch::TensorOptions().device(train_device));
+      auto probe_out = training_model->forward(probe_input);
+      float max_abs_logit = probe_out.logits.abs().max().item<float>();
+      std::cout << absl::StrFormat("[Step-0 Check] Max |raw logit|: %.2f (cap: %.1f)\n", max_abs_logit, logit_cap);
+      if (max_abs_logit > logit_cap) {
+        std::cerr << "\n=========================================\n"
+                  << "[FATAL] Loaded checkpoint has exploded logits!\n"
+                  << "Max |logit| = " << max_abs_logit << " > logit_cap = " << logit_cap << "\n"
+                  << "This checkpoint cannot be safely resumed with logit capping.\n"
+                  << "Start fresh or use an earlier checkpoint with healthy logits.\n"
+                  << "=========================================\n";
+        std::exit(EXIT_FAILURE);
+      }
+    }
+
+    // Instantiate the BatchedEvaluator with target batch size, timeout, train_device, and logit cap
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
-        inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex);
+        inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex, logit_cap);
     std::cout << absl::StrFormat("BatchedEvaluator initialized with target batch size: %d, timeout: %d ms\n", 
                                  eval_batch_size, eval_timeout_ms);
   }
