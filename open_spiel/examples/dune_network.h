@@ -109,6 +109,9 @@ public:
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), 
           logit_cap_(logit_cap), stop_(false) {
         
+        // Dynamically get the input layer dimension from the model's weights
+        model_input_dim_ = model_->input_layer->weight.size(1);
+        
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {
             at::globalContext().setAllowTF32CuBLAS(true);
@@ -150,12 +153,14 @@ public:
         int spin_count = 0;
         while (!ready.load(std::memory_order_acquire)) {
             if (spin_count < 4000) {
+                if (spin_count < 4000) {
 #if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause(); // Emits PAUSE instruction to prevent pipeline flushing
+                    _mm_pause(); // Emits PAUSE instruction to prevent pipeline flushing
 #else
-                std::this_thread::yield();
+                    std::this_thread::yield();
 #endif
-                spin_count++;
+                    spin_count++;
+                }
             } else {
                 // Park safely (Zero CPU burn)
                 std::unique_lock<std::mutex> park_lock(park_mutex_);
@@ -182,6 +187,7 @@ private:
     torch::Device device_;
     std::shared_mutex* sync_mutex_;
     float logit_cap_;
+    int64_t model_input_dim_;
     
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -236,21 +242,25 @@ private:
             size_t batch_size = batch.size();
             size_t obs_size = batch[0].obs->size(); // Add pointer arrow
 
-            // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop
+            // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop based on model_input_dim_
             if (!pinned_allocated) {
                 if (device_.is_cuda()) {
                     auto options = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
-                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)obs_size}, options);
+                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)model_input_dim_}, options);
                 } else {
-                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)obs_size}, torch::kFloat32);
+                    pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)model_input_dim_}, torch::kFloat32);
                 }
                 pinned_allocated = true;
             }
             
             float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
             for (size_t i = 0; i < batch_size; ++i) {
-                // Add pointer arrow to obs->data()
-                std::memcpy(dest_ptr + i * obs_size, batch[i].obs->data(), obs_size * sizeof(float));
+                // Copy the actual observation of size obs_size
+                std::memcpy(dest_ptr + i * model_input_dim_, batch[i].obs->data(), obs_size * sizeof(float));
+                // Zero-pad any trailing mismatch slots
+                if (model_input_dim_ > (int64_t)obs_size) {
+                    std::memset(dest_ptr + i * model_input_dim_ + obs_size, 0, (model_input_dim_ - obs_size) * sizeof(float));
+                }
             }
 
             // Non-blocking H2D transfer using .slice() for partial batches
