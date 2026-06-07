@@ -226,8 +226,9 @@ void RunEvaluation(const std::string& model_checkpoint,
   }
   model_a->to(device);
 
+  // logit_cap=10.0f must match training to ensure consistent action rankings
   auto model_a_evaluator = std::make_shared<BatchedEvaluator>(
-      model_a, eval_batch_size, eval_timeout_ms, device, sync_mutex.get());
+      model_a, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 10.0f);
 
   std::shared_ptr<BatchedEvaluator> model_b_evaluator = nullptr;
   if (use_opponent_model) {
@@ -243,7 +244,7 @@ void RunEvaluation(const std::string& model_checkpoint,
     }
     model_b->to(device);
     model_b_evaluator = std::make_shared<BatchedEvaluator>(
-        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get());
+        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 10.0f);
   }
 
   std::cout << "Starting evaluation of " << total_games << " games using " << num_threads

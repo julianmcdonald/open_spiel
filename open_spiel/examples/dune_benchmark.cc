@@ -36,7 +36,7 @@ ABSL_FLAG(bool, async_mode, false, "Whether to run optimization asynchronously i
 ABSL_FLAG(int, min_train_size, 1024, "Minimum buffer transitions before starting SGD training.");
 ABSL_FLAG(int, train_batch_size, 32, "Batch size for background SGD updates.");
 ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight synchronizations.");
-ABSL_FLAG(int, buffer_capacity, 100000, "Maximum capacity of the global replay buffer.");
+ABSL_FLAG(int, buffer_capacity, 30000, "Maximum capacity of the global replay buffer.");
 ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate before the GPU is allowed to pull 1 training batch. Set <= 0 to disable throttling.");
 ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
 ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained in intermediate shaped rewards.");
@@ -143,19 +143,52 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   double learning_rate = absl::GetFlag(FLAGS_learning_rate);
   double weight_decay = absl::GetFlag(FLAGS_weight_decay);
 
-  // Initialize AdamW Optimizer AFTER model weights have been moved to the target hardware device
-  optimizer = std::make_unique<torch::optim::AdamW>(model->parameters(), torch::optim::AdamWOptions(learning_rate).weight_decay(weight_decay));
+  std::vector<torch::Tensor> policy_params;
+  std::vector<torch::Tensor> other_params;
+  auto policy_params_set = model->policy_head->parameters();
+  for (auto& param : model->parameters()) {
+    bool is_policy = false;
+    for (auto& p : policy_params_set) {
+      if (param.is_same(p)) {
+        is_policy = true;
+        break;
+      }
+    }
+    if (is_policy) {
+      policy_params.push_back(param);
+    } else {
+      other_params.push_back(param);
+    }
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> groups;
+  groups.push_back(torch::optim::OptimizerParamGroup(policy_params)); // Group 0: Policy Head
+  groups.push_back(torch::optim::OptimizerParamGroup(other_params));  // Group 1: Torso/Value Head
+
+  // Initialize AdamW Optimizer with parameter groups
+  optimizer = std::make_unique<torch::optim::AdamW>(groups, torch::optim::AdamWOptions(learning_rate));
+
+  // Explicitly apply weight decays on the groups
+  static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[0].options()).weight_decay(1e-2);
+  static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[1].options()).weight_decay(weight_decay);
 
   if (std::filesystem::exists(optim_path)) {
     try {
       torch::load(*optimizer, optim_path, device);
       std::cout << "Successfully loaded optimizer state from " << optim_path << "\n";
 
-      // CRITICAL FIX: PyTorch's load() overwrites the learning rate with the one saved in the file.
-      // We must explicitly override it to ensure the Abseil flag is respected!
-      for (auto& param_group : optimizer->param_groups()) {
+      // CRITICAL FIX: PyTorch's load() overwrites the options with the ones saved in the file.
+      // We must explicitly override learning rate and weight decays to ensure the groups are correct!
+      for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+        auto& param_group = optimizer->param_groups()[g];
         if (param_group.has_options()) {
-          static_cast<torch::optim::AdamWOptions&>(param_group.options()).lr(learning_rate);
+          auto& options = static_cast<torch::optim::AdamWOptions&>(param_group.options());
+          options.lr(learning_rate);
+          if (g == 0) {
+            options.weight_decay(1e-2);
+          } else {
+            options.weight_decay(weight_decay);
+          }
         }
       }
       
@@ -457,13 +490,32 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   static int log_counter = 0;
   if (++log_counter % 1000 == 0) {
       float mean_abs_q = q_values.abs().mean().item<float>();
+      float std_q = q_values.std().item<float>();
       float max_abs_logit = pred_logits.abs().max().item<float>();
       // Top-1 softmax confidence (want < ~0.9, not ~0.97)
       float mean_top1_prob = std::get<0>(probs.max(-1)).mean().item<float>();
       float mean_ent = mean_entropy.item<float>();
+
+      double total_std_logits = 0.0;
+      int count = 0;
+      for (size_t i = 0; i < batch_size; ++i) {
+          auto mask_i = masks[i];
+          auto logits_i = pred_logits[i];
+          auto legal_logits_i = logits_i.masked_select(mask_i == 1.0f);
+          if (legal_logits_i.numel() > 1) {
+              total_std_logits += legal_logits_i.std().item<float>();
+              count++;
+          }
+      }
+      float mean_std_logits = (count > 0) ? (total_std_logits / count) : 0.0f;
+      float policy_weight_norm = model->policy_head->weight.norm().item<float>();
+
       std::cout << "\n[Diagnostic] Mean|Q|: " << mean_abs_q 
+                << " | Std|Q|: " << std_q
                 << " | Eta: " << eta
                 << " | Max|Logit|: " << max_abs_logit
+                << " | LogitStd: " << mean_std_logits
+                << " | PolNorm: " << policy_weight_norm
                 << " | MeanTop1: " << mean_top1_prob
                 << " | Entropy: " << mean_ent
                 << " | PolicyKL: " << p_loss_val << "\n";
