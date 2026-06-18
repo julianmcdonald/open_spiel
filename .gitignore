@@ -54,6 +54,8 @@ download_cache/
 get-pip.py
 open_spiel/scripts/shflags
 open_spiel/scripts/jill.sh
+open_spiel/libtorch/
+open_spiel/ortools/
 
 # julia wrapper
 Manifest.toml
