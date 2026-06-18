@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <deque>
@@ -255,11 +256,10 @@ private:
             
             float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
             for (size_t i = 0; i < batch_size; ++i) {
-                // Copy the actual observation of size obs_size
-                std::memcpy(dest_ptr + i * model_input_dim_, batch[i].obs->data(), obs_size * sizeof(float));
-                // Zero-pad any trailing mismatch slots
-                if (model_input_dim_ > (int64_t)obs_size) {
-                    std::memset(dest_ptr + i * model_input_dim_ + obs_size, 0, (model_input_dim_ - obs_size) * sizeof(float));
+                const int64_t copy_size = std::min<int64_t>(model_input_dim_, obs_size);
+                std::memcpy(dest_ptr + i * model_input_dim_, batch[i].obs->data(), copy_size * sizeof(float));
+                if (copy_size < model_input_dim_) {
+                    std::memset(dest_ptr + i * model_input_dim_ + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
                 }
             }
 

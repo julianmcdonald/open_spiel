@@ -55,6 +55,7 @@ ABSL_FLAG(std::string, run_prefix, "dune_stage_c", "Prefix for saving rotating c
 ABSL_FLAG(double, logit_cap, 10.0, "Smooth tanh cap on policy logits to prevent runaway growth.");
 ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient (maximizes policy entropy to prevent collapse).");
 ABSL_FLAG(double, weight_decay, 1e-4, "AdamW decoupled weight decay coefficient.");
+ABSL_FLAG(double, mmd_importance_clip, 20.0, "Maximum 1 / behavior_prob multiplier for sampled MMD targets. Set <= 0 to disable clipping.");
 
 namespace open_spiel {
 
@@ -63,9 +64,10 @@ struct Transition {
   std::vector<Action> legal_actions;     // Sparse list of legal action IDs (saves 99% RAM)
   int64_t action_taken;                  // Action ID chosen
   std::vector<float> prev_logits;        // Raw policy logits (z_k)
-  float q_value;                         // Estimated action-value Q(s, a)
-  float reward_target;                   // Mapped zero-sum reward
+  float q_value;                         // Sampled policy signal for MMD
+  float reward_target;                   // TD(lambda) value target
   float v_value;                         // Value Network estimate V(s)
+  float behavior_prob;                   // Probability of action_taken under the sampling policy
   int player_id;                         // Seat ID of the deciding player
 };
 
@@ -489,8 +491,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   // Diagnostic for eta scaling and logit health
   static int log_counter = 0;
   if (++log_counter % 1000 == 0) {
-      float mean_abs_q = q_values.abs().mean().item<float>();
-      float std_q = q_values.std().item<float>();
+      float mean_abs_policy_signal = q_values.abs().mean().item<float>();
+      float std_policy_signal = q_values.std().item<float>();
       float max_abs_logit = pred_logits.abs().max().item<float>();
       // Top-1 softmax confidence (want < ~0.9, not ~0.97)
       float mean_top1_prob = std::get<0>(probs.max(-1)).mean().item<float>();
@@ -510,8 +512,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
       float mean_std_logits = (count > 0) ? (total_std_logits / count) : 0.0f;
       float policy_weight_norm = model->policy_head->weight.norm().item<float>();
 
-      std::cout << "\n[Diagnostic] Mean|Q|: " << mean_abs_q 
-                << " | Std|Q|: " << std_q
+      std::cout << "\n[Diagnostic] Mean|PolicySignal|: " << mean_abs_policy_signal
+                << " | Std|PolicySignal|: " << std_policy_signal
                 << " | Eta: " << eta
                 << " | Max|Logit|: " << max_abs_logit
                 << " | LogitStd: " << mean_std_logits
@@ -667,6 +669,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
 
       // Fast CPU Softmax Action Selection using the configured temperature
       Action action = actions.front();
+      float behavior_prob = 1.0f;
       if (temp > 0.001) {
         std::vector<double> action_probs;
         action_probs.reserve(actions.size());
@@ -683,7 +686,18 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         
         // Sample action probabilistically from the network's beliefs
         std::discrete_distribution<size_t> dist(action_probs.begin(), action_probs.end());
-        action = actions[dist(*rng)];
+        size_t sampled_idx = dist(*rng);
+        action = actions[sampled_idx];
+
+        double total_weight = 0.0;
+        for (double weight : action_probs) {
+          total_weight += weight;
+        }
+        if (total_weight > 0.0 && std::isfinite(total_weight)) {
+          behavior_prob = static_cast<float>(action_probs[sampled_idx] / total_weight);
+        } else {
+          behavior_prob = 1.0f / static_cast<float>(actions.size());
+        }
       } else {
         // Fallback Argmax (Greedy selection when Temp is 0)
         float max_logit = -1e9f;
@@ -719,6 +733,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       transition.q_value = shaped_bonus;
       transition.reward_target = shaped_bonus;
       transition.v_value = current_value; // Store the V(s) value
+      transition.behavior_prob = behavior_prob;
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
@@ -756,9 +771,17 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       // Episodic finite horizon: γ = 1.0
       float A_i = delta_i + gae_lambda * last_gae[p];
 
-      // Wiring the signals: q_value must be the TD(λ) return estimate (Q-value), not advantage, to avoid MMD target logit bias.
-      it->q_value = A_i + V_i;
-      it->reward_target = A_i + V_i; // TD(λ) return target
+      // Value learning wants the TD(lambda) return. The sparse sampled MMD
+      // policy update wants an estimator of the full legal-action update. Use
+      // advantage plus behavior-probability correction; using the raw return
+      // here reinforces every sampled action in good states, even bad ones.
+      it->reward_target = A_i + V_i;
+      float importance = 1.0f / std::max(it->behavior_prob, 1e-6f);
+      float importance_clip = static_cast<float>(absl::GetFlag(FLAGS_mmd_importance_clip));
+      if (importance_clip > 0.0f) {
+        importance = std::min(importance, importance_clip);
+      }
+      it->q_value = A_i * importance;
 
 
       // Update trackers
@@ -843,6 +866,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       transition.q_value = 0.0f;
       transition.reward_target = 0.0f;
       transition.v_value = 0.0f; // Store V(s) = 0.0f explicitly
+      transition.behavior_prob = 1.0f / static_cast<float>(actions.size());
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
