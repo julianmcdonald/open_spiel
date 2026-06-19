@@ -332,6 +332,18 @@ int main(int argc, char* argv[]) {
     // Extract Policy (Action Probabilities)
     std::vector<Action> legal_actions = state->LegalActions();
     torch::Tensor policy_logits = output.logits.squeeze(0); // Remains on the model's device
+
+    std::vector<int64_t> legal_indices;
+    legal_indices.reserve(legal_actions.size());
+    for (Action a : legal_actions) {
+      legal_indices.push_back(static_cast<int64_t>(a));
+    }
+    torch::Tensor legal_index_tensor = torch::tensor(
+        legal_indices, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    torch::Tensor legal_mean = policy_logits.index_select(0, legal_index_tensor).mean();
+    policy_logits = policy_logits - legal_mean;
+    constexpr float kEvaluatorLogitCap = 10.0f;
+    policy_logits = kEvaluatorLogitCap * torch::tanh(policy_logits / kEvaluatorLogitCap);
     
     // Mask illegal actions on the active device
     torch::Tensor mask = torch::full({action_size}, -1e9f, torch::TensorOptions().device(device));

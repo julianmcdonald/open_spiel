@@ -56,6 +56,7 @@ ABSL_FLAG(std::string, run_prefix, "dune_stage_c", "Prefix for saving rotating c
 ABSL_FLAG(double, logit_cap, 10.0, "Smooth tanh cap on policy logits to prevent runaway growth.");
 ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient (maximizes policy entropy to prevent collapse).");
 ABSL_FLAG(double, weight_decay, 1e-4, "AdamW decoupled weight decay coefficient.");
+ABSL_FLAG(double, policy_weight_decay, 1e-2, "AdamW decoupled weight decay coefficient for the policy head only.");
 ABSL_FLAG(double, mmd_importance_clip, 20.0, "Maximum 1 / behavior_prob multiplier for sampled MMD targets. Set <= 0 to disable clipping.");
 ABSL_FLAG(int, max_train_steps, 0, "Maximum local async SGD steps to execute before stopping collection. Set <= 0 to disable.");
 ABSL_FLAG(bool, save_final_checkpoint, true, "Whether to save model and optimizer checkpoints when the benchmark exits.");
@@ -70,7 +71,7 @@ struct Transition {
   std::vector<float> spatial_tensor;     // Flattened observation tensor
   std::vector<Action> legal_actions;     // Sparse list of legal action IDs (saves 99% RAM)
   int64_t action_taken;                  // Action ID chosen
-  std::vector<float> prev_logits;        // Raw policy logits (z_k)
+  std::vector<float> prev_logits;        // Legal-centered, soft-capped behavior policy logits (z_k)
   float q_value;                         // Sampled policy signal for MMD
   float reward_target;                   // TD(lambda) value target
   float v_value;                         // Value Network estimate V(s)
@@ -151,6 +152,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
 
   double learning_rate = absl::GetFlag(FLAGS_learning_rate);
   double weight_decay = absl::GetFlag(FLAGS_weight_decay);
+  double policy_weight_decay = absl::GetFlag(FLAGS_policy_weight_decay);
 
   std::vector<torch::Tensor> policy_params;
   std::vector<torch::Tensor> other_params;
@@ -178,7 +180,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   optimizer = std::make_unique<torch::optim::AdamW>(groups, torch::optim::AdamWOptions(learning_rate));
 
   // Explicitly apply weight decays on the groups
-  static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[0].options()).weight_decay(1e-2);
+  static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[0].options()).weight_decay(policy_weight_decay);
   static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[1].options()).weight_decay(weight_decay);
 
   if (std::filesystem::exists(optim_path)) {
@@ -194,7 +196,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
           auto& options = static_cast<torch::optim::AdamWOptions&>(param_group.options());
           options.lr(learning_rate);
           if (g == 0) {
-            options.weight_decay(1e-2);
+            options.weight_decay(policy_weight_decay);
           } else {
             options.weight_decay(weight_decay);
           }
@@ -279,6 +281,30 @@ struct PersistentTrainBuffers {
     }
   }
 };
+
+torch::Tensor LegalLogitMean(const torch::Tensor& logits,
+                             const torch::Tensor& masks) {
+  torch::Tensor legal_counts = masks.sum(1, true).clamp_min(1.0);
+  return (logits * masks).sum(1, true) / legal_counts;
+}
+
+torch::Tensor CenterLegalLogitsTensor(const torch::Tensor& logits,
+                                      const torch::Tensor& masks) {
+  return logits - LegalLogitMean(logits, masks);
+}
+
+torch::Tensor ApplyLogitCapTensor(const torch::Tensor& logits,
+                                  float logit_cap) {
+  if (logit_cap <= 0.0f) return logits;
+  return logit_cap * torch::tanh(logits / logit_cap);
+}
+
+float LegalMaskedMaxAbs(const torch::Tensor& logits,
+                        const torch::Tensor& masks) {
+  torch::Tensor legal_values = logits.abs().masked_select(masks == 1.0f);
+  if (legal_values.numel() == 0) return 0.0f;
+  return legal_values.max().item<float>();
+}
 
 std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                                   torch::optim::Optimizer& optimizer, 
@@ -490,10 +516,11 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor actions_taken = buffers.is_cuda_ ? buffers.d_actions_taken.slice(0, 0, batch_size) : buffers.actions_taken.slice(0, 0, batch_size);
 
   optimizer.zero_grad();
-  torch::Tensor pred_logits, pred_values;
+  torch::Tensor raw_pred_logits, centered_raw_logits, pred_logits, pred_values;
   torch::Tensor masked_logits, log_probs, value_loss, q_vector, target_logits;
   torch::Tensor masked_target_logits, target_probs, policy_loss, probs;
   torch::Tensor entropy_per_sample, mean_entropy, total_loss;
+  torch::Tensor raw_legal_mean, centered_prev_logits;
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
@@ -501,13 +528,15 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
 
   auto compute_loss = [&]() {
     auto outputs = model->forward(states);
-    pred_logits = outputs.logits;
+    raw_pred_logits = outputs.logits;
     pred_values = outputs.values;
 
-    // LOGIT SOFT-CAP: Prevent unbounded logit growth using smooth tanh saturation
-    if (logit_cap > 0.0f) {
-      pred_logits = logit_cap * torch::tanh(pred_logits / logit_cap);
-    }
+    // Policy logits are invariant to a per-state additive constant. Center over
+    // legal actions before applying the cap so a harmless common offset cannot
+    // push the whole policy head into tanh saturation.
+    raw_legal_mean = LegalLogitMean(raw_pred_logits, masks);
+    centered_raw_logits = raw_pred_logits - raw_legal_mean;
+    pred_logits = ApplyLogitCapTensor(centered_raw_logits, logit_cap);
 
     masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
     log_probs = torch::log_softmax(masked_logits, -1);
@@ -516,7 +545,9 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
     q_vector.scatter_(1, actions_taken, q_values);
 
-    target_logits = (prev_logits + eta * q_vector) / (1.0f + eta * alpha);
+    centered_prev_logits = CenterLegalLogitsTensor(prev_logits, masks);
+    target_logits = (centered_prev_logits + eta * q_vector) / (1.0f + eta * alpha);
+    target_logits = CenterLegalLogitsTensor(target_logits, masks);
     masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
     target_probs = torch::softmax(masked_target_logits, -1).detach();
 
@@ -561,7 +592,11 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
       read_loss_values();
       float mean_abs_policy_signal = q_values.abs().mean().item<float>();
       float std_policy_signal = q_values.std().item<float>();
-      float max_abs_logit = pred_logits.abs().max().item<float>();
+      float raw_all_max_abs_logit = raw_pred_logits.abs().max().item<float>();
+      float raw_legal_offset_abs = raw_legal_mean.abs().mean().item<float>();
+      float raw_centered_legal_max_abs = LegalMaskedMaxAbs(centered_raw_logits, masks);
+      float capped_legal_max_abs = LegalMaskedMaxAbs(pred_logits, masks);
+      float target_legal_max_abs = LegalMaskedMaxAbs(target_logits, masks);
       // Top-1 softmax confidence (want < ~0.9, not ~0.97)
       float mean_top1_prob = std::get<0>(probs.max(-1)).mean().item<float>();
       float mean_ent = mean_entropy.item<float>();
@@ -583,7 +618,11 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
       std::cout << "\n[Diagnostic] Mean|PolicySignal|: " << mean_abs_policy_signal
                 << " | Std|PolicySignal|: " << std_policy_signal
                 << " | Eta: " << eta
-                << " | Max|Logit|: " << max_abs_logit
+                << " | RawAllMax|Logit|: " << raw_all_max_abs_logit
+                << " | RawLegalOffset: " << raw_legal_offset_abs
+                << " | RawMax|LegalCentered|: " << raw_centered_legal_max_abs
+                << " | CapMax|Legal|: " << capped_legal_max_abs
+                << " | TargetMax|Legal|: " << target_legal_max_abs
                 << " | LogitStd: " << mean_std_logits
                 << " | PolNorm: " << policy_weight_norm
                 << " | MeanTop1: " << mean_top1_prob
@@ -611,6 +650,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     check_nan(q_values, "q_values");
     
     std::cerr << "\nMODEL OUTPUTS (Forward Pass):\n";
+    check_nan(raw_pred_logits, "raw_pred_logits");
+    check_nan(centered_raw_logits, "centered_raw_logits");
     check_nan(pred_logits, "pred_logits");
     check_nan(pred_values, "pred_values");
     
@@ -679,6 +720,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   // Micro-optimized flag retrieval outside the state progression loop
   double temp = absl::GetFlag(FLAGS_temperature);
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
+  float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
   int game_length = 0;
   while (!state->IsTerminal()) {
@@ -734,6 +776,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       EvalResult result = evaluator->Evaluate(obs);
       float current_value = result.value;
       std::vector<float> prev_logits_vec = std::move(result.logits);
+      CenterAndCapLegalLogits(prev_logits_vec, actions, logit_cap);
 
       // Fast CPU Softmax Action Selection using the configured temperature
       Action action = actions.front();
@@ -1080,8 +1123,8 @@ int main(int argc, char** argv) {
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
-    // Step-0 Logit Health Check: probe the loaded model with a dummy forward pass
-    // and abort if raw logits already exceed the cap (indicates an exploded checkpoint)
+    // Step-0 Logit Health Check: this raw all-action probe is informational.
+    // Actual policy logits are centered over legal actions before any cap.
     float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
     if (logit_cap > 0.0f) {
       torch::NoGradGuard no_grad;
@@ -1090,25 +1133,21 @@ int main(int argc, char** argv) {
       float max_abs_logit = probe_out.logits.abs().max().item<float>();
       std::cout << absl::StrFormat("[Step-0 Check] Max |raw logit|: %.2f (cap: %.1f)\n", max_abs_logit, logit_cap);
       if (max_abs_logit > logit_cap) {
-        std::cerr << "\n=========================================\n"
-                  << "[FATAL] Loaded checkpoint has exploded logits!\n"
-                  << "Max |logit| = " << max_abs_logit << " > logit_cap = " << logit_cap << "\n"
-                  << "This checkpoint cannot be safely resumed with logit capping.\n"
-                  << "Start fresh or use an earlier checkpoint with healthy logits.\n"
-                  << "=========================================\n";
-        std::exit(EXIT_FAILURE);
+        std::cout << "[Step-0 Check] Raw all-action logits exceed the cap. Continuing because legal-centered diagnostics are now authoritative.\n";
       }
     }
 
     bool evaluator_device_synchronize = absl::GetFlag(FLAGS_evaluator_device_synchronize);
 
-    // Instantiate the BatchedEvaluator with target batch size, timeout, train_device, and logit cap
+    // Instantiate the BatchedEvaluator with target batch size and timeout. It returns
+    // raw logits; self-play applies legal-action centering plus the configured cap.
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
         inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex,
-        logit_cap, evaluator_device_synchronize);
+        0.0f, evaluator_device_synchronize);
     std::cout << absl::StrFormat(
-        "BatchedEvaluator initialized with target batch size: %d, timeout: %d ms, device synchronize: %s\n",
+        "BatchedEvaluator initialized with target batch size: %d, timeout: %d ms, legal-centered logit cap: %.1f, device synchronize: %s\n",
         eval_batch_size, eval_timeout_ms,
+        logit_cap,
         evaluator_device_synchronize ? "true" : "false");
   }
 #endif

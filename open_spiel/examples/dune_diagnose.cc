@@ -19,6 +19,8 @@ namespace open_spiel {
 namespace {
 
 struct DiagnosticStats {
+  double total_raw_centered_abs_max = 0.0;
+  double total_raw_offset_abs = 0.0;
   double total_std = 0.0;
   double total_range = 0.0;
   double total_top1 = 0.0;
@@ -52,7 +54,7 @@ void RunDiagnostic(const std::string& model_checkpoint,
 
   auto sync_mutex = std::make_shared<std::shared_mutex>();
   auto evaluator = std::make_shared<BatchedEvaluator>(
-      model, 1, 1, device, sync_mutex.get(), 10.0f);
+      model, 1, 1, device, sync_mutex.get(), 0.0f);
 
   std::random_device rd;
   std::mt19937 rng(rd());
@@ -87,6 +89,19 @@ void RunDiagnostic(const std::string& model_checkpoint,
 
       // Get policy predictions
       EvalResult result = evaluator->Evaluate(obs);
+
+      double raw_sum = 0.0;
+      for (Action a : legal_actions) {
+        raw_sum += result.logits[a];
+      }
+      double raw_mean = raw_sum / legal_actions.size();
+      double raw_centered_abs_max = 0.0;
+      for (Action a : legal_actions) {
+        raw_centered_abs_max = std::max(raw_centered_abs_max,
+                                        std::abs(static_cast<double>(result.logits[a]) - raw_mean));
+      }
+
+      CenterAndCapLegalLogits(result.logits, legal_actions, 10.0f);
 
       // Collect diagnostic metrics over legal actions
       std::vector<float> legal_logits;
@@ -140,6 +155,8 @@ void RunDiagnostic(const std::string& model_checkpoint,
       double range_logit = actual_max_logit - min_logit;
 
       // Accumulate
+      stats.total_raw_centered_abs_max += raw_centered_abs_max;
+      stats.total_raw_offset_abs += std::abs(raw_mean);
       stats.total_std += std_logit;
       stats.total_range += range_logit;
       stats.total_top1 += top1_prob;
@@ -167,12 +184,16 @@ void RunDiagnostic(const std::string& model_checkpoint,
     double avg_top1 = stats.total_top1 / stats.total_decisions;
     double avg_entropy = stats.total_entropy / stats.total_decisions;
     double avg_legal = stats.total_legal_count / stats.total_decisions;
+    double avg_raw_centered_abs_max = stats.total_raw_centered_abs_max / stats.total_decisions;
+    double avg_raw_offset_abs = stats.total_raw_offset_abs / stats.total_decisions;
 
     std::filesystem::path path(model_checkpoint);
     std::string filename = path.filename().string();
 
-    std::cout << absl::StrFormat("%-35s | %8d | %8.4f | %10.4f | %10.4f | %8.4f | %10.2f",
-                                 filename, stats.total_decisions, avg_std, avg_range, avg_top1, avg_entropy, avg_legal)
+    std::cout << absl::StrFormat("%-35s | %8d | %9.4f | %9.4f | %8.4f | %10.4f | %10.4f | %8.4f | %10.2f",
+                                 filename, stats.total_decisions, avg_raw_centered_abs_max,
+                                 avg_raw_offset_abs, avg_std, avg_range, avg_top1,
+                                 avg_entropy, avg_legal)
               << std::endl;
   }
 }
@@ -190,10 +211,11 @@ int main(int argc, char* argv[]) {
   int num_blocks = 8;
   int num_games = 5;
 
-  std::cout << absl::StrFormat("%-35s | %8s | %8s | %10s | %10s | %8s | %10s",
-                               "Checkpoint", "Decisions", "Avg Std", "Avg Range", "Avg Top1", "Entropy", "Avg Legal")
+  std::cout << absl::StrFormat("%-35s | %8s | %9s | %9s | %8s | %10s | %10s | %8s | %10s",
+                               "Checkpoint", "Decisions", "RawCtrMax", "RawOffset",
+                               "Cap Std", "Cap Range", "Avg Top1", "Entropy", "Avg Legal")
             << std::endl;
-  std::cout << std::string(105, '-') << std::endl;
+  std::cout << std::string(134, '-') << std::endl;
 
   for (int i = 1; i < argc; ++i) {
     std::string checkpoint = argv[i];

@@ -3,6 +3,7 @@
 #include <torch/torch.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -13,6 +14,8 @@
 #include <chrono>
 #include <shared_mutex>
 #include <ATen/autocast_mode.h>
+
+#include "open_spiel/spiel.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -117,6 +120,30 @@ struct EvalResult {
     std::vector<float> logits;
     float value; 
 };
+
+inline void CenterAndCapLegalLogits(std::vector<float>& logits,
+                                    const std::vector<Action>& legal_actions,
+                                    float logit_cap) {
+    if (logits.empty() || legal_actions.empty()) return;
+
+    double legal_sum = 0.0;
+    int legal_count = 0;
+    for (Action action : legal_actions) {
+        if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+            legal_sum += logits[action];
+            ++legal_count;
+        }
+    }
+    if (legal_count == 0) return;
+
+    const float legal_mean = static_cast<float>(legal_sum / legal_count);
+    for (float& logit : logits) {
+        logit -= legal_mean;
+        if (logit_cap > 0.0f) {
+            logit = logit_cap * std::tanh(logit / logit_cap);
+        }
+    }
+}
 
 class BatchedEvaluator {
 public:
@@ -333,10 +360,8 @@ private:
                 }
             }
 
-            // LOGIT SOFT-CAP: Match TrainStep capping to keep collection and training logits consistent
-            if (logit_cap_ > 0.0f) {
-                pred_logits = logit_cap_ * torch::tanh(pred_logits / logit_cap_);
-            }
+            // Return raw logits. The tanh soft-cap must be applied after
+            // legal-action centering, which requires the State's legal actions.
 
             // C. NON-BLOCKING D2H TRANSFER (cast AMP FP16 outputs back to Float32)
             if (device_.is_cuda()) {

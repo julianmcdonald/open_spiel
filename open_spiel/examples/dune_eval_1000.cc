@@ -26,6 +26,8 @@ struct ThreadStats {
   int games_by_seat[4] = {0, 0, 0, 0};
 };
 
+constexpr float kEvalLogitCap = 10.0f;
+
 // Batched worker: game threads submit observations to shared BatchedEvaluator(s).
 // The Runner thread inside BatchedEvaluator accumulates requests into batches,
 // runs one gemm (matrix-matrix multiply) using ALL CPU cores, then distributes
@@ -102,6 +104,7 @@ void BatchedWorkerThread(
         // Submit to BatchedEvaluator — this thread sleeps until the batch fires
         auto& evaluator = use_model ? model_evaluator : opponent_evaluator;
         EvalResult result = evaluator->Evaluate(obs);
+        CenterAndCapLegalLogits(result.logits, legal_actions, kEvalLogitCap);
 
         // Argmax over legal actions
         chosen_action = legal_actions.front();
@@ -226,9 +229,9 @@ void RunEvaluation(const std::string& model_checkpoint,
   }
   model_a->to(device);
 
-  // logit_cap=10.0f must match training to ensure consistent action rankings
+  // The evaluator returns raw logits; workers center over legal actions before capping.
   auto model_a_evaluator = std::make_shared<BatchedEvaluator>(
-      model_a, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 10.0f);
+      model_a, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f);
 
   std::shared_ptr<BatchedEvaluator> model_b_evaluator = nullptr;
   if (use_opponent_model) {
@@ -244,7 +247,7 @@ void RunEvaluation(const std::string& model_checkpoint,
     }
     model_b->to(device);
     model_b_evaluator = std::make_shared<BatchedEvaluator>(
-        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 10.0f);
+        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f);
   }
 
   std::cout << "Starting evaluation of " << total_games << " games using " << num_threads
