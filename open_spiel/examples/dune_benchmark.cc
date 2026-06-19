@@ -928,6 +928,8 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       current_vps[p] = dune_state->GetPlayerVpForTesting(p);
     }
   }
+  std::vector<int> last_transition_index(game.NumPlayers(), -1);
+  std::vector<float> shaped_bonus_by_player(game.NumPlayers(), 0.0f);
 
   // Micro-optimized flag retrieval outside the state progression loop
   double temp = absl::GetFlag(FLAGS_temperature);
@@ -1032,18 +1034,29 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         }
       }
 
+      size_t current_transition_index = trajectory.size();
       state->ApplyAction(action);
 
       // Shaped Reward VP Gain Detection
-      float shaped_bonus = 0.0f;
+      //
+      // VP can be awarded by deferred resolution triggered on another player's
+      // action, e.g. combat rewards on the final CombatPass. Track every
+      // player's VP after every decision and retro-credit positive deltas to
+      // that player's most recent transition.
+      std::fill(shaped_bonus_by_player.begin(), shaped_bonus_by_player.end(), 0.0f);
       if (dune_state != nullptr) {
-        int new_vp = dune_state->GetPlayerVpForTesting(current_player);
-        int vp_gained = new_vp - current_vps[current_player];
-        current_vps[current_player] = new_vp;
+        float current_lambda = reward_lambda != nullptr
+                                   ? reward_lambda->load(std::memory_order_relaxed)
+                                   : 0.0f;
+        for (int p = 0; p < game.NumPlayers(); ++p) {
+          int new_vp = dune_state->GetPlayerVpForTesting(p);
+          int vp_delta = new_vp - current_vps[p];
+          current_vps[p] = new_vp;
 
-        if (vp_gained > 0 && reward_lambda != nullptr) {
-          float current_lambda = reward_lambda->load(std::memory_order_relaxed);
-          shaped_bonus = vp_gained * static_cast<float>(shaped_weight) * current_lambda;
+          if (vp_delta > 0 && reward_lambda != nullptr) {
+            shaped_bonus_by_player[p] =
+                vp_delta * static_cast<float>(shaped_weight) * current_lambda;
+          }
         }
       }
 
@@ -1053,15 +1066,35 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
       transition.action_taken = action;
       transition.prev_logits = std::move(prev_logits_vec);
-      transition.q_value = shaped_bonus;
-      transition.advantage = shaped_bonus;
-      transition.reward_target = shaped_bonus;
+      float own_shaped_bonus =
+          (current_player >= 0 &&
+           current_player < static_cast<int>(shaped_bonus_by_player.size()))
+              ? shaped_bonus_by_player[current_player]
+              : 0.0f;
+      transition.q_value = own_shaped_bonus;
+      transition.advantage = own_shaped_bonus;
+      transition.reward_target = own_shaped_bonus;
       transition.v_value = current_value; // Store the V(s) value
       transition.behavior_prob = behavior_prob;
       transition.importance_multiplier = 1.0f;
       transition.training_step_inserted = 0;
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
+      if (current_player >= 0 && current_player < game.NumPlayers()) {
+        last_transition_index[current_player] =
+            static_cast<int>(current_transition_index);
+      }
+      for (int p = 0; p < game.NumPlayers(); ++p) {
+        if (p == current_player || shaped_bonus_by_player[p] <= 0.0f) {
+          continue;
+        }
+        int idx = last_transition_index[p];
+        if (idx >= 0 && idx < static_cast<int>(trajectory.size())) {
+          trajectory[idx].q_value += shaped_bonus_by_player[p];
+          trajectory[idx].advantage += shaped_bonus_by_player[p];
+          trajectory[idx].reward_target += shaped_bonus_by_player[p];
+        }
+      }
     }
   }
 
