@@ -376,7 +376,7 @@ void OptimizationWorker(
       }
 
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
-      if (step % 100000 == 0) {
+      if (step % 50000 == 0) {
         // ROTATING CHECKPOINTS: Enforce saving to a new numbered file every time
         std::string run_prefix = absl::GetFlag(FLAGS_run_prefix);
         std::string step_model_path = absl::StrCat(run_prefix, "_model_step_", step, ".pt");
@@ -1049,9 +1049,11 @@ int main(int argc, char** argv) {
     int min_train_size = absl::GetFlag(FLAGS_min_train_size);
     int train_batch_size = absl::GetFlag(FLAGS_train_batch_size);
     int sync_interval = absl::GetFlag(FLAGS_sync_interval);
+    int train_ratio = absl::GetFlag(FLAGS_train_ratio);
 
-    std::cout << absl::StrFormat("Starting Asynchronous Optimization Worker (Min Train Size: %d, Batch Size: %d, Sync Interval: %d)...\n", 
-                                 min_train_size, train_batch_size, sync_interval);
+    std::cout << absl::StrFormat(
+        "Starting Asynchronous Optimization Worker (Min Train Size: %d, Batch Size: %d, Sync Interval: %d, Train Ratio: %d)...\n",
+        min_train_size, train_batch_size, sync_interval, train_ratio);
 
     optimization_thread = std::thread(
         open_spiel::OptimizationWorker,
