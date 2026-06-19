@@ -2,6 +2,8 @@
 
 #include <torch/torch.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include <deque>
@@ -83,23 +85,30 @@ TORCH_MODULE(SharedDunePolicyValueNet);
 struct AutocastGuard {
     c10::DeviceType device_type_;
     bool previous_state_;
+    at::ScalarType previous_dtype_;
     AutocastGuard(c10::DeviceType device_type, bool enabled)
         : device_type_(device_type) {
         if (device_type_ == c10::DeviceType::CUDA) {
             previous_state_ = at::autocast::is_enabled();
+            previous_dtype_ = at::autocast::get_autocast_gpu_dtype();
+            at::autocast::set_autocast_gpu_dtype(at::ScalarType::BFloat16);
             at::autocast::set_enabled(enabled);
         } else if (device_type_ == c10::DeviceType::CPU) {
             previous_state_ = at::autocast::is_cpu_enabled();
+            previous_dtype_ = at::autocast::get_autocast_cpu_dtype();
             at::autocast::set_cpu_enabled(enabled);
         } else {
             previous_state_ = false;
+            previous_dtype_ = at::ScalarType::Undefined;
         }
     }
     ~AutocastGuard() {
         if (device_type_ == c10::DeviceType::CUDA) {
             at::autocast::set_enabled(previous_state_);
+            at::autocast::set_autocast_gpu_dtype(previous_dtype_);
         } else if (device_type_ == c10::DeviceType::CPU) {
             at::autocast::set_cpu_enabled(previous_state_);
+            at::autocast::set_autocast_cpu_dtype(previous_dtype_);
         }
     }
 };
@@ -111,15 +120,24 @@ struct EvalResult {
 
 class BatchedEvaluator {
 public:
+    struct Stats {
+        uint64_t batches;
+        uint64_t requests;
+        uint64_t max_batch_size;
+        double avg_batch_size;
+    };
+
     BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                      int target_batch_size, 
                      int timeout_ms, 
                      torch::Device device,
                      std::shared_mutex* sync_mutex,
-                     float logit_cap = 0.0f)
+                     float logit_cap = 0.0f,
+                     bool device_synchronize = true)
         : model_(model), target_batch_size_(target_batch_size), 
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), 
-          logit_cap_(logit_cap), stop_(false) {
+          logit_cap_(logit_cap), device_synchronize_(device_synchronize),
+          stop_(false) {
         
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
@@ -183,6 +201,14 @@ public:
         return result; // Move semantics
     }
 
+    Stats GetStats() const {
+        uint64_t batches = total_batches_.load(std::memory_order_relaxed);
+        uint64_t requests = total_requests_.load(std::memory_order_relaxed);
+        uint64_t max_batch = max_batch_size_seen_.load(std::memory_order_relaxed);
+        double avg_batch = batches > 0 ? static_cast<double>(requests) / batches : 0.0;
+        return {batches, requests, max_batch, avg_batch};
+    }
+
 private:
     struct Request {
         const std::vector<float>* obs;
@@ -199,6 +225,7 @@ private:
     torch::Device device_;
     std::shared_mutex* sync_mutex_;
     float logit_cap_;
+    bool device_synchronize_;
     int64_t model_input_dim_;
     
     std::mutex mutex_;
@@ -208,9 +235,12 @@ private:
     
     bool stop_;
     std::thread runner_thread_;
+    std::atomic<uint64_t> total_batches_{0};
+    std::atomic<uint64_t> total_requests_{0};
+    std::atomic<uint64_t> max_batch_size_seen_{0};
 
     void Runner() {
-        torch::NoGradGuard no_grad;
+        torch::InferenceMode inference_guard;
         torch::Tensor pinned_stacked_obs;
         bool pinned_allocated = false;
 
@@ -253,6 +283,14 @@ private:
 
             size_t batch_size = batch.size();
             size_t obs_size = batch[0].obs->size(); // Add pointer arrow
+            total_batches_.fetch_add(1, std::memory_order_relaxed);
+            total_requests_.fetch_add(static_cast<uint64_t>(batch_size), std::memory_order_relaxed);
+            uint64_t observed_max = max_batch_size_seen_.load(std::memory_order_relaxed);
+            while (batch_size > observed_max &&
+                   !max_batch_size_seen_.compare_exchange_weak(
+                       observed_max, static_cast<uint64_t>(batch_size),
+                       std::memory_order_relaxed, std::memory_order_relaxed)) {
+            }
 
             // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop based on model_input_dim_
             if (!pinned_allocated) {
@@ -302,11 +340,18 @@ private:
 
             // C. NON-BLOCKING D2H TRANSFER (cast AMP FP16 outputs back to Float32)
             if (device_.is_cuda()) {
-                pred_logits = pred_logits.to(torch::kFloat32).to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                pred_values = pred_values.to(torch::kFloat32).to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                
-                // D. CRITICAL: Wait for asynchronous transfers to complete before reading!
-                torch::cuda::synchronize();
+                pred_logits = pred_logits.to(torch::kFloat32);
+                pred_values = pred_values.to(torch::kFloat32);
+                if (device_synchronize_) {
+                    pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                    pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+
+                    // Wait for asynchronous transfers to complete before reading.
+                    torch::cuda::synchronize();
+                } else {
+                    pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/false).contiguous();
+                    pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/false).contiguous();
+                }
             } else {
                 pred_logits = pred_logits.contiguous();
                 pred_values = pred_values.contiguous();

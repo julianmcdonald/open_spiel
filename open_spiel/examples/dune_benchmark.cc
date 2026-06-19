@@ -14,6 +14,7 @@
 #include <iterator>
 #include <filesystem>
 #include <optional>
+#include <limits>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -56,6 +57,12 @@ ABSL_FLAG(double, logit_cap, 10.0, "Smooth tanh cap on policy logits to prevent 
 ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient (maximizes policy entropy to prevent collapse).");
 ABSL_FLAG(double, weight_decay, 1e-4, "AdamW decoupled weight decay coefficient.");
 ABSL_FLAG(double, mmd_importance_clip, 20.0, "Maximum 1 / behavior_prob multiplier for sampled MMD targets. Set <= 0 to disable clipping.");
+ABSL_FLAG(int, max_train_steps, 0, "Maximum local async SGD steps to execute before stopping collection. Set <= 0 to disable.");
+ABSL_FLAG(bool, save_final_checkpoint, true, "Whether to save model and optimizer checkpoints when the benchmark exits.");
+ABSL_FLAG(bool, train_amp, false, "Use CUDA BF16 autocast for the training forward/loss path.");
+ABSL_FLAG(int, loss_read_interval, 1, "Read CPU loss scalars every N local train steps. 1 preserves per-step NaN checks/log values.");
+ABSL_FLAG(int, train_diagnostic_interval, 1000, "Print expensive training diagnostics every N TrainStep calls. Set <= 0 to disable.");
+ABSL_FLAG(bool, evaluator_device_synchronize, true, "Use whole-device CUDA synchronize after evaluator D2H copies. False uses blocking D2H copies instead.");
 
 namespace open_spiel {
 
@@ -279,7 +286,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
                                   PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
-                                  torch::Device device);
+                                  torch::Device device,
+                                  bool read_loss_scalars);
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model, 
                 std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
@@ -309,10 +317,12 @@ void OptimizationWorker(
     int64_t action_size,
     std::shared_mutex* sync_mutex,
     std::atomic<bool>& stop_training,
+    std::atomic<bool>& stop_collection,
     std::atomic<int>& training_steps,
     int min_train_size,
     int train_batch_size,
     int sync_interval,
+    int max_train_steps,
     const std::string& model_path,
     const std::string& optim_path,
     torch::Device device,
@@ -330,6 +340,9 @@ void OptimizationWorker(
     // 2. Training Loop
     PersistentTrainBuffers train_buffers;
     train_buffers.Initialize(train_batch_size, obs_size, action_size, device.is_cuda());
+    float last_v_loss = std::numeric_limits<float>::quiet_NaN();
+    float last_p_loss = std::numeric_limits<float>::quiet_NaN();
+    auto optimization_start_time = std::chrono::high_resolution_clock::now();
 
     while (!stop_training.load()) {
       int train_ratio = absl::GetFlag(FLAGS_train_ratio);
@@ -351,10 +364,20 @@ void OptimizationWorker(
         continue;
       }
 
+      int next_step = training_steps.load(std::memory_order_relaxed) + 1;
+      int loss_read_interval = absl::GetFlag(FLAGS_loss_read_interval);
+      bool read_loss_scalars =
+          loss_read_interval <= 1 || (next_step % loss_read_interval == 0);
+
       // Lock-free optimization step on training_model
-      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, train_buffers, obs_size, action_size, device);
+      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, train_buffers, obs_size, action_size, device, read_loss_scalars);
+      if (read_loss_scalars) {
+        last_v_loss = v_loss;
+        last_p_loss = p_loss;
+      }
 
       int step = training_steps.fetch_add(1) + 1;
+      int local_steps = step - absl::GetFlag(FLAGS_start_step);
 
       // Update linear decay for the intermediate reward shaping lambda
       if (reward_lambda != nullptr) {
@@ -372,7 +395,16 @@ void OptimizationWorker(
         SyncModels(training_model, inference_model, sync_mutex);
         float current_lambda = (reward_lambda != nullptr) ? reward_lambda->load(std::memory_order_relaxed) : 0.0f;
         std::cout << absl::StrFormat("Step %5d | Buffer Size: %6zu | Lambda: %.4f | Value Loss (MSE): %.6f | Policy Loss (KL): %.6f\n",
-                                     step, global_buffer->Size(), current_lambda, v_loss, p_loss) << std::flush;
+                                     step, global_buffer->Size(), current_lambda, last_v_loss, last_p_loss) << std::flush;
+      }
+
+      if (max_train_steps > 0 && local_steps >= max_train_steps) {
+        std::cout << absl::StrFormat(
+            "Reached max local training steps (%d). Stopping collection after active games finish.\n",
+            max_train_steps) << std::flush;
+        stop_collection.store(true, std::memory_order_relaxed);
+        stop_training.store(true, std::memory_order_relaxed);
+        break;
       }
 
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
@@ -387,6 +419,18 @@ void OptimizationWorker(
     
     // Final synchronization at shutdown to ensure inference_model has latest weights
     SyncModels(training_model, inference_model, sync_mutex);
+    auto optimization_end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> optimization_elapsed =
+        optimization_end_time - optimization_start_time;
+    int local_steps_done = training_steps.load() - absl::GetFlag(FLAGS_start_step);
+    double optimization_seconds = optimization_elapsed.count();
+    if (optimization_seconds > 0.0) {
+      std::cout << absl::StrFormat(
+          "Optimizer Timing: %.3f sec | Local Steps: %d | Steps/sec: %.2f | Samples/sec: %.1f\n",
+          optimization_seconds, local_steps_done,
+          static_cast<double>(local_steps_done) / optimization_seconds,
+          static_cast<double>(local_steps_done) * train_batch_size / optimization_seconds);
+    }
     std::cout << "Background optimization worker stopped cleanly. Total steps: " << training_steps.load() << "\n";
   } catch (const c10::Error& e) {
     std::cerr << "\n============================================\n"
@@ -409,7 +453,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
                                   PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
-                                  torch::Device device) {
+                                  torch::Device device,
+                                  bool read_loss_scalars) {
   size_t batch_size = batch.size();
   if (batch_size == 0) return {0.0f, 0.0f};
 
@@ -446,51 +491,74 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
 
   optimizer.zero_grad();
   torch::Tensor pred_logits, pred_values;
-  {
+  torch::Tensor masked_logits, log_probs, value_loss, q_vector, target_logits;
+  torch::Tensor masked_target_logits, target_probs, policy_loss, probs;
+  torch::Tensor entropy_per_sample, mean_entropy, total_loss;
+  float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+  float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
+  float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
+  float entropy_coef = static_cast<float>(absl::GetFlag(FLAGS_entropy_coef));
+
+  auto compute_loss = [&]() {
     auto outputs = model->forward(states);
     pred_logits = outputs.logits;
     pred_values = outputs.values;
+
+    // LOGIT SOFT-CAP: Prevent unbounded logit growth using smooth tanh saturation
+    if (logit_cap > 0.0f) {
+      pred_logits = logit_cap * torch::tanh(pred_logits / logit_cap);
+    }
+
+    masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
+    log_probs = torch::log_softmax(masked_logits, -1);
+    value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
+
+    q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
+    q_vector.scatter_(1, actions_taken, q_values);
+
+    target_logits = (prev_logits + eta * q_vector) / (1.0f + eta * alpha);
+    masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
+    target_probs = torch::softmax(masked_target_logits, -1).detach();
+
+    policy_loss = torch::nn::functional::kl_div(
+        log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
+
+    // ENTROPY BONUS: Maximize entropy over legal actions to prevent policy collapse
+    probs = torch::softmax(masked_logits, -1);
+    // Entropy = -sum(p * log(p)) over legal actions; masked slots contribute ~0
+    entropy_per_sample = -(probs * log_probs).sum(-1); // [batch]
+    mean_entropy = entropy_per_sample.mean();
+
+    total_loss = policy_loss + value_loss - entropy_coef * mean_entropy;
+  };
+
+  if (device.is_cuda() && absl::GetFlag(FLAGS_train_amp)) {
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+    compute_loss();
+  } else {
+    compute_loss();
   }
 
-  // LOGIT SOFT-CAP: Prevent unbounded logit growth using smooth tanh saturation
-  float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
-  if (logit_cap > 0.0f) {
-    pred_logits = logit_cap * torch::tanh(pred_logits / logit_cap);
+  float p_loss_val = std::numeric_limits<float>::quiet_NaN();
+  float v_loss_val = std::numeric_limits<float>::quiet_NaN();
+  bool have_loss_scalars = false;
+  auto read_loss_values = [&]() {
+    if (!have_loss_scalars) {
+      p_loss_val = policy_loss.item<float>();
+      v_loss_val = value_loss.item<float>();
+      have_loss_scalars = true;
+    }
+  };
+  if (read_loss_scalars) {
+    read_loss_values();
   }
-
-  torch::Tensor masked_logits = pred_logits.masked_fill(masks == 0.0f, -1e9f);
-  torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-  torch::Tensor value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
-
-
-  float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
-  float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
-
-  torch::Tensor q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
-  q_vector.scatter_(1, actions_taken, q_values);
-
-  torch::Tensor target_logits = (prev_logits + eta * q_vector) / (1.0f + eta * alpha);
-  torch::Tensor masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
-  torch::Tensor target_probs = torch::softmax(masked_target_logits, -1).detach();
-
-  torch::Tensor policy_loss = torch::nn::functional::kl_div(
-      log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
-
-  // ENTROPY BONUS: Maximize entropy over legal actions to prevent policy collapse
-  float entropy_coef = static_cast<float>(absl::GetFlag(FLAGS_entropy_coef));
-  torch::Tensor probs = torch::softmax(masked_logits, -1);
-  // Entropy = -sum(p * log(p)) over legal actions; masked slots contribute ~0
-  torch::Tensor entropy_per_sample = -(probs * log_probs).sum(-1); // [batch]
-  torch::Tensor mean_entropy = entropy_per_sample.mean();
-
-  torch::Tensor total_loss = policy_loss + value_loss - entropy_coef * mean_entropy;
-
-  float p_loss_val = policy_loss.item<float>();
-  float v_loss_val = value_loss.item<float>();
 
   // Diagnostic for eta scaling and logit health
   static int log_counter = 0;
-  if (++log_counter % 1000 == 0) {
+  int diagnostic_step = ++log_counter;
+  int diagnostic_interval = absl::GetFlag(FLAGS_train_diagnostic_interval);
+  if (diagnostic_interval > 0 && diagnostic_step % diagnostic_interval == 0) {
+      read_loss_values();
       float mean_abs_policy_signal = q_values.abs().mean().item<float>();
       float std_policy_signal = q_values.std().item<float>();
       float max_abs_logit = pred_logits.abs().max().item<float>();
@@ -524,7 +592,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   }
 
   // 1. FATAL SAFETY GUARD & TENSOR AUTOPSY
-  if (std::isnan(p_loss_val) || std::isnan(v_loss_val)) {
+  if (have_loss_scalars && (std::isnan(p_loss_val) || std::isnan(v_loss_val))) {
     std::cerr << "\n================ TENSOR AUTOPSY =================\n";
     std::cerr << "[FATAL] NaN loss detected! Isolating the source...\n";
     std::cerr << "Losses -> Policy (KL): " << p_loss_val << " | Value (MSE): " << v_loss_val << "\n";
@@ -887,7 +955,8 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
 
 void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_completed,
                   int total_games, std::atomic<int>& total_moves,
-                  GlobalReplayBuffer* global_buffer, int64_t obs_size
+                  GlobalReplayBuffer* global_buffer, int64_t obs_size,
+                  std::atomic<bool>* stop_collection
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                   , std::shared_ptr<BatchedEvaluator> evaluator
                   , std::atomic<float>* reward_lambda
@@ -896,6 +965,9 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
   std::mt19937 rng(std::random_device{}() + thread_id);
   int moves = 0;
   while (true) {
+    if (stop_collection != nullptr && stop_collection->load(std::memory_order_relaxed)) {
+      break;
+    }
     int prev_completed = games_completed.fetch_add(1);
     if (prev_completed >= total_games) {
       games_completed.fetch_sub(1);
@@ -1028,11 +1100,16 @@ int main(int argc, char** argv) {
       }
     }
 
+    bool evaluator_device_synchronize = absl::GetFlag(FLAGS_evaluator_device_synchronize);
+
     // Instantiate the BatchedEvaluator with target batch size, timeout, train_device, and logit cap
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
-        inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex, logit_cap);
-    std::cout << absl::StrFormat("BatchedEvaluator initialized with target batch size: %d, timeout: %d ms\n", 
-                                 eval_batch_size, eval_timeout_ms);
+        inference_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex,
+        logit_cap, evaluator_device_synchronize);
+    std::cout << absl::StrFormat(
+        "BatchedEvaluator initialized with target batch size: %d, timeout: %d ms, device synchronize: %s\n",
+        eval_batch_size, eval_timeout_ms,
+        evaluator_device_synchronize ? "true" : "false");
   }
 #endif
 
@@ -1041,6 +1118,7 @@ int main(int argc, char** argv) {
 
   std::atomic<int> games_completed(0);
   std::atomic<int> total_moves(0);
+  std::atomic<bool> stop_collection(false);
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   // Start background optimization thread if async_mode is enabled
@@ -1050,17 +1128,22 @@ int main(int argc, char** argv) {
     int train_batch_size = absl::GetFlag(FLAGS_train_batch_size);
     int sync_interval = absl::GetFlag(FLAGS_sync_interval);
     int train_ratio = absl::GetFlag(FLAGS_train_ratio);
+    int max_train_steps = absl::GetFlag(FLAGS_max_train_steps);
+    bool train_amp = absl::GetFlag(FLAGS_train_amp);
+    int loss_read_interval = absl::GetFlag(FLAGS_loss_read_interval);
+    int diagnostic_interval = absl::GetFlag(FLAGS_train_diagnostic_interval);
 
     std::cout << absl::StrFormat(
-        "Starting Asynchronous Optimization Worker (Min Train Size: %d, Batch Size: %d, Sync Interval: %d, Train Ratio: %d)...\n",
-        min_train_size, train_batch_size, sync_interval, train_ratio);
+        "Starting Asynchronous Optimization Worker (Min Train Size: %d, Batch Size: %d, Sync Interval: %d, Train Ratio: %d, Max Local Steps: %d, Train AMP: %s, Loss Read Interval: %d, Diagnostic Interval: %d)...\n",
+        min_train_size, train_batch_size, sync_interval, train_ratio, max_train_steps,
+        train_amp ? "true" : "false", loss_read_interval, diagnostic_interval);
 
     optimization_thread = std::thread(
         open_spiel::OptimizationWorker,
         training_model, inference_model, optimizer.get(), &global_buffer,
         obs_size, action_size, &sync_mutex,
-        std::ref(stop_training), std::ref(training_steps),
-        min_train_size, train_batch_size, sync_interval,
+        std::ref(stop_training), std::ref(stop_collection), std::ref(training_steps),
+        min_train_size, train_batch_size, sync_interval, max_train_steps,
         model_path, optim_path, train_device,
         &reward_lambda
     );
@@ -1074,7 +1157,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back(open_spiel::ThreadWorker, i, game.get(),
                          std::ref(games_completed), total_games, std::ref(total_moves),
-                         &global_buffer, obs_size
+                         &global_buffer, obs_size, &stop_collection
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                          , evaluator, &reward_lambda
 #endif
@@ -1101,11 +1184,25 @@ int main(int argc, char** argv) {
   int completed = games_completed.load();
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  if (evaluator != nullptr) {
+    auto eval_stats = evaluator->GetStats();
+    std::cout << absl::StrFormat(
+        "\nEvaluator Stats: Requests=%llu | Batches=%llu | Avg Batch=%.2f | Max Batch=%llu\n",
+        static_cast<unsigned long long>(eval_stats.requests),
+        static_cast<unsigned long long>(eval_stats.batches),
+        eval_stats.avg_batch_size,
+        static_cast<unsigned long long>(eval_stats.max_batch_size));
+  }
+
   if (training_model != nullptr && global_buffer.Size() > 0 && optimizer != nullptr) {
     if (async_mode) {
       std::cout << absl::StrFormat("\nAsynchronous training completed. Total background SGD steps executed: %d\n", training_steps.load());
       // Save checkpoint of training_model at program termination
-      open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
+        open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      } else {
+        std::cout << "Final checkpoint save skipped (--save_final_checkpoint=false).\n";
+      }
     } else {
       std::cout << "\nStarting optimization validation phase (Synchronous Mode)...\n";
       // Sample a single training batch of size 32
@@ -1116,14 +1213,18 @@ int main(int argc, char** argv) {
       // Execute backprop step using the startup-initialized optimizer
       open_spiel::PersistentTrainBuffers sync_buffers;
       sync_buffers.Initialize(batch_size, obs_size, action_size, train_device.is_cuda());
-      open_spiel::TrainStep(training_model, *optimizer, batch, sync_buffers, obs_size, action_size, train_device);
+      open_spiel::TrainStep(training_model, *optimizer, batch, sync_buffers, obs_size, action_size, train_device, true);
       std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
       
       // Sync training weights to inference weights for completeness
       open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
       // Save updated checkpoint
-      open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
+        open_spiel::SaveCheckpoint(training_model, *optimizer, model_path, optim_path);
+      } else {
+        std::cout << "Final checkpoint save skipped (--save_final_checkpoint=false).\n";
+      }
     }
   }
 #endif
@@ -1132,6 +1233,8 @@ int main(int argc, char** argv) {
   std::cout << absl::StrFormat("Elapsed Time: %.3f seconds\n", seconds);
   std::cout << absl::StrFormat("Games Completed: %d\n", completed);
   std::cout << absl::StrFormat("Total Moves Executed: %d\n", moves);
+  std::cout << absl::StrFormat("Total Replay Transitions Inserted: %llu\n",
+                               static_cast<unsigned long long>(global_buffer.GetTotalInserted()));
   std::cout << absl::StrFormat("Final Global Buffer Size: %zu transitions\n", global_buffer.Size());
   std::cout << absl::StrFormat("Games Per Second (GPS): %.2f\n", completed / seconds);
   std::cout << absl::StrFormat("Moves Per Second (MPS): %.2f\n", moves / seconds);
