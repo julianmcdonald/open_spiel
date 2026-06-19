@@ -85,11 +85,22 @@ struct AutocastGuard {
     bool previous_state_;
     AutocastGuard(c10::DeviceType device_type, bool enabled)
         : device_type_(device_type) {
-        previous_state_ = at::autocast::is_autocast_enabled(device_type_);
-        at::autocast::set_autocast_enabled(device_type_, enabled);
+        if (device_type_ == c10::DeviceType::CUDA) {
+            previous_state_ = at::autocast::is_enabled();
+            at::autocast::set_enabled(enabled);
+        } else if (device_type_ == c10::DeviceType::CPU) {
+            previous_state_ = at::autocast::is_cpu_enabled();
+            at::autocast::set_cpu_enabled(enabled);
+        } else {
+            previous_state_ = false;
+        }
     }
     ~AutocastGuard() {
-        at::autocast::set_autocast_enabled(device_type_, previous_state_);
+        if (device_type_ == c10::DeviceType::CUDA) {
+            at::autocast::set_enabled(previous_state_);
+        } else if (device_type_ == c10::DeviceType::CPU) {
+            at::autocast::set_cpu_enabled(previous_state_);
+        }
     }
 };
 
