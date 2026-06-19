@@ -8,6 +8,9 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <sstream>
+#include <cctype>
+#include <functional>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -24,6 +27,9 @@ struct ThreadStats {
   int opponent_wins[3] = {0, 0, 0};
   int model_wins_by_seat[4] = {0, 0, 0, 0};
   int games_by_seat[4] = {0, 0, 0, 0};
+  int model_placements[4] = {0, 0, 0, 0};
+  double model_return_sum = 0.0;
+  double model_return_by_seat[4] = {0.0, 0.0, 0.0, 0.0};
 };
 
 constexpr float kEvalLogitCap = 10.0f;
@@ -37,7 +43,7 @@ void BatchedWorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
     std::shared_ptr<BatchedEvaluator> model_evaluator,
-    std::shared_ptr<BatchedEvaluator> opponent_evaluator,  // nullptr if random
+    const std::vector<std::shared_ptr<BatchedEvaluator>>& opponent_evaluators,
     int64_t obs_size,
     bool provides_info_state_tensor,
     bool provides_observations_tensor,
@@ -90,7 +96,7 @@ void BatchedWorkerThread(
       Action chosen_action = -1;
 
       bool use_model = (current_player == model_player);
-      bool use_opponent_model = (!use_model && opponent_evaluator != nullptr);
+      bool use_opponent_model = (!use_model && !opponent_evaluators.empty());
 
       if (use_model || use_opponent_model) {
         // Fill observation buffer
@@ -102,7 +108,12 @@ void BatchedWorkerThread(
         }
 
         // Submit to BatchedEvaluator — this thread sleeps until the batch fires
-        auto& evaluator = use_model ? model_evaluator : opponent_evaluator;
+        std::shared_ptr<BatchedEvaluator> evaluator = model_evaluator;
+        if (!use_model) {
+          size_t opponent_index =
+              static_cast<size_t>(g + current_player) % opponent_evaluators.size();
+          evaluator = opponent_evaluators[opponent_index];
+        }
         EvalResult result = evaluator->Evaluate(obs);
         CenterAndCapLegalLogits(result.logits, legal_actions, kEvalLogitCap);
 
@@ -143,7 +154,35 @@ void BatchedWorkerThread(
         stats.opponent_wins[relative_idx]++;
       }
     }
+
+    stats.model_return_sum += returns[model_player];
+    stats.model_return_by_seat[model_player] += returns[model_player];
+    int model_rank = 0;
+    for (int p = 0; p < 4; ++p) {
+      if (returns[p] > returns[model_player]) {
+        ++model_rank;
+      }
+    }
+    if (model_rank >= 0 && model_rank < 4) {
+      stats.model_placements[model_rank]++;
+    }
   }
+}
+
+std::vector<std::string> SplitCommaSeparated(const std::string& value) {
+  std::vector<std::string> items;
+  std::stringstream ss(value);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    }));
+    item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    }).base(), item.end());
+    if (!item.empty()) items.push_back(item);
+  }
+  return items;
 }
 
 void RunEvaluation(const std::string& model_checkpoint,
@@ -158,8 +197,17 @@ void RunEvaluation(const std::string& model_checkpoint,
   if (opp_hidden_dim < 0) opp_hidden_dim = hidden_dim;
   if (opp_num_blocks < 0) opp_num_blocks = num_blocks;
   std::string model_name = std::filesystem::path(model_checkpoint).filename().string();
-  bool use_opponent_model = (!opponent_checkpoint.empty() && opponent_checkpoint != "random");
-  std::string opponent_name = use_opponent_model ? std::filesystem::path(opponent_checkpoint).filename().string() : "Random Agent";
+  std::vector<std::string> opponent_paths;
+  if (!opponent_checkpoint.empty() && opponent_checkpoint != "random") {
+    opponent_paths = SplitCommaSeparated(opponent_checkpoint);
+  }
+  bool use_opponent_model = !opponent_paths.empty();
+  std::string opponent_name =
+      use_opponent_model
+          ? (opponent_paths.size() == 1
+                 ? std::filesystem::path(opponent_paths.front()).filename().string()
+                 : absl::StrFormat("Population(%d)", opponent_paths.size()))
+          : "Random Agent";
 
   // 1. Initialize Game
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -233,21 +281,24 @@ void RunEvaluation(const std::string& model_checkpoint,
   auto model_a_evaluator = std::make_shared<BatchedEvaluator>(
       model_a, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f);
 
-  std::shared_ptr<BatchedEvaluator> model_b_evaluator = nullptr;
+  std::vector<std::shared_ptr<BatchedEvaluator>> opponent_evaluators;
   if (use_opponent_model) {
+    opponent_evaluators.reserve(opponent_paths.size());
+  }
+  for (const std::string& opponent_path : opponent_paths) {
     auto model_b = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, opp_hidden_dim, action_size, opp_num_blocks);
     model_b->eval();
     try {
       torch::serialize::InputArchive archive;
-      archive.load_from(opponent_checkpoint, device);
+      archive.load_from(opponent_path, device);
       model_b->load(archive);
     } catch (const c10::Error& e) {
-      std::cerr << "Failed to load Model B checkpoint: " << opponent_checkpoint << "\n" << e.msg() << "\n";
+      std::cerr << "Failed to load opponent checkpoint: " << opponent_path << "\n" << e.msg() << "\n";
       std::exit(1);
     }
     model_b->to(device);
-    model_b_evaluator = std::make_shared<BatchedEvaluator>(
-        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f);
+    opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
+        model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f));
   }
 
   std::cout << "Starting evaluation of " << total_games << " games using " << num_threads
@@ -262,7 +313,8 @@ void RunEvaluation(const std::string& model_checkpoint,
 
   for (unsigned int t = 0; t < num_threads; ++t) {
     threads.emplace_back(
-        BatchedWorkerThread, t, game, model_a_evaluator, model_b_evaluator,
+        BatchedWorkerThread, t, game, model_a_evaluator,
+        std::cref(opponent_evaluators),
         obs_size, provides_info_state_tensor, provides_observations_tensor,
         std::ref(next_game_id), total_games, std::ref(thread_stats_vec[t]));
   }
@@ -279,6 +331,9 @@ void RunEvaluation(const std::string& model_checkpoint,
   int opponent_wins[3] = {0, 0, 0};
   int model_wins_by_seat[4] = {0, 0, 0, 0};
   int games_by_seat[4] = {0, 0, 0, 0};
+  int model_placements[4] = {0, 0, 0, 0};
+  double model_return_sum = 0.0;
+  double model_return_by_seat[4] = {0.0, 0.0, 0.0, 0.0};
 
   for (unsigned int t = 0; t < num_threads; ++t) {
     model_wins += thread_stats_vec[t].model_wins;
@@ -288,7 +343,12 @@ void RunEvaluation(const std::string& model_checkpoint,
     for (int s = 0; s < 4; ++s) {
       model_wins_by_seat[s] += thread_stats_vec[t].model_wins_by_seat[s];
       games_by_seat[s] += thread_stats_vec[t].games_by_seat[s];
+      model_return_by_seat[s] += thread_stats_vec[t].model_return_by_seat[s];
     }
+    for (int rank = 0; rank < 4; ++rank) {
+      model_placements[rank] += thread_stats_vec[t].model_placements[rank];
+    }
+    model_return_sum += thread_stats_vec[t].model_return_sum;
   }
 
   // 6. Print results
@@ -297,7 +357,7 @@ void RunEvaluation(const std::string& model_checkpoint,
             << absl::StrFormat("%.1f", total_games / elapsed_secs) << " games/sec).\n";
   std::cout << "Model checkpoint A (evaluated): " << model_checkpoint << "\n";
   if (use_opponent_model) {
-    std::cout << "Model checkpoint B (opponent):  " << opponent_checkpoint << "\n\n";
+    std::cout << "Opponent checkpoint(s):         " << opponent_checkpoint << "\n\n";
   } else {
     std::cout << "Opponents used:                 Random Agents\n\n";
   }
@@ -315,7 +375,24 @@ void RunEvaluation(const std::string& model_checkpoint,
   std::cout << "Eval Model Winrate by Seat:\n";
   for (int p = 0; p < 4; ++p) {
     double seat_winrate = games_by_seat[p] > 0 ? (model_wins_by_seat[p] * 100.0 / games_by_seat[p]) : 0.0;
-    std::cout << "  Seat P" << p << ": " << absl::StrFormat("%.2f%% (%d/%d wins)", seat_winrate, model_wins_by_seat[p], games_by_seat[p]) << "\n";
+    double seat_equity = games_by_seat[p] > 0 ? model_return_by_seat[p] / games_by_seat[p] : 0.0;
+    std::cout << "  Seat P" << p << ": "
+              << absl::StrFormat("%.2f%% (%d/%d wins), equity %.4f",
+                                  seat_winrate, model_wins_by_seat[p],
+                                  games_by_seat[p], seat_equity)
+              << "\n";
+  }
+
+  std::cout << "\nEval Model Placement Equity:\n";
+  std::cout << "  Mean return: "
+            << absl::StrFormat("%.4f", model_return_sum / total_games)
+            << "\n";
+  for (int rank = 0; rank < 4; ++rank) {
+    std::cout << "  Place " << (rank + 1) << ": "
+              << absl::StrFormat("%.2f%% (%d/%d)",
+                                  model_placements[rank] * 100.0 / total_games,
+                                  model_placements[rank], total_games)
+              << "\n";
   }
 }
 

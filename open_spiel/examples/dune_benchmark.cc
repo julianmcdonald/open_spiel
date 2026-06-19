@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <optional>
 #include <limits>
+#include <string>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -45,6 +46,11 @@ ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
 ABSL_FLAG(double, mmd_alpha, 0.1, "MMD entropy parameter alpha.");
+ABSL_FLAG(std::string, mmd_reference_mode, "uniform", "MMD reference policy mode: uniform, periodic, or ema.");
+ABSL_FLAG(int, mmd_reference_interval, 50000, "Training steps between reference-policy refreshes when --mmd_reference_mode=periodic.");
+ABSL_FLAG(double, mmd_reference_ema_decay, 0.999, "Parameter EMA decay for --mmd_reference_mode=ema.");
+ABSL_FLAG(std::string, policy_update_mode, "mmd", "Policy update mode: mmd or ppo.");
+ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "PPO ratio clipping epsilon when --policy_update_mode=ppo.");
 ABSL_FLAG(int, eval_batch_size, 64, "Target batch size for the evaluation queue.");
 ABSL_FLAG(int, eval_timeout_ms, 2, "Timeout in milliseconds for the evaluation queue.");
 ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension of the network.");
@@ -73,9 +79,12 @@ struct Transition {
   int64_t action_taken;                  // Action ID chosen
   std::vector<float> prev_logits;        // Legal-centered, soft-capped behavior policy logits (z_k)
   float q_value;                         // Sampled policy signal for MMD
+  float advantage;                       // Raw GAE advantage before MMD importance correction
   float reward_target;                   // TD(lambda) value target
   float v_value;                         // Value Network estimate V(s)
   float behavior_prob;                   // Probability of action_taken under the sampling policy
+  float importance_multiplier;           // Clipped sampled-MMD importance multiplier
+  int64_t training_step_inserted;         // Optimizer step when trajectory entered replay
   int player_id;                         // Seat ID of the deciding player
 };
 
@@ -89,10 +98,12 @@ class GlobalReplayBuffer {
  public:
   GlobalReplayBuffer(size_t capacity) : max_capacity_(capacity) {}
 
-  void PushTrajectory(std::vector<Transition>& local_trajectory) {
+  void PushTrajectory(std::vector<Transition>& local_trajectory,
+                      int64_t training_step_inserted = 0) {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     size_t num_inserted = local_trajectory.size();
     for (auto& transition : local_trajectory) {
+      transition.training_step_inserted = training_step_inserted;
       buffer_.push_back(std::make_shared<Transition>(std::move(transition)));
     }
     while (buffer_.size() > max_capacity_) {
@@ -240,12 +251,15 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
 }
 struct PersistentTrainBuffers {
   // Pinned host memory
-  torch::Tensor states, masks, rewards, prev_logits, q_values, actions_taken;
+  torch::Tensor states, masks, rewards, prev_logits, q_values;
+  torch::Tensor advantages, behavior_probs, actions_taken;
   float *p_states, *p_masks, *p_rewards, *p_prev, *p_q;
+  float *p_advantages, *p_behavior_probs;
   int64_t *p_actions;
 
   // Persistent device-static tensors for zero-allocation H2D transfers
-  torch::Tensor d_states, d_masks, d_rewards, d_prev_logits, d_q_values, d_actions_taken;
+  torch::Tensor d_states, d_masks, d_rewards, d_prev_logits, d_q_values;
+  torch::Tensor d_advantages, d_behavior_probs, d_actions_taken;
 
   bool is_cuda_ = false;
 
@@ -259,6 +273,8 @@ struct PersistentTrainBuffers {
     rewards = torch::empty({max_batch_size, 1}, float_opts);
     prev_logits = torch::empty({max_batch_size, action_dim}, float_opts);
     q_values = torch::empty({max_batch_size, 1}, float_opts);
+    advantages = torch::empty({max_batch_size, 1}, float_opts);
+    behavior_probs = torch::empty({max_batch_size, 1}, float_opts);
     actions_taken = torch::empty({max_batch_size, 1}, long_opts);
 
     p_states = states.data_ptr<float>();
@@ -266,6 +282,8 @@ struct PersistentTrainBuffers {
     p_rewards = rewards.data_ptr<float>();
     p_prev = prev_logits.data_ptr<float>();
     p_q = q_values.data_ptr<float>();
+    p_advantages = advantages.data_ptr<float>();
+    p_behavior_probs = behavior_probs.data_ptr<float>();
     p_actions = actions_taken.data_ptr<int64_t>();
 
     if (is_cuda) {
@@ -277,6 +295,8 @@ struct PersistentTrainBuffers {
       d_rewards = torch::empty({max_batch_size, 1}, d_f);
       d_prev_logits = torch::empty({max_batch_size, action_dim}, d_f);
       d_q_values = torch::empty({max_batch_size, 1}, d_f);
+      d_advantages = torch::empty({max_batch_size, 1}, d_f);
+      d_behavior_probs = torch::empty({max_batch_size, 1}, d_f);
       d_actions_taken = torch::empty({max_batch_size, 1}, d_l);
     }
   }
@@ -306,37 +326,85 @@ float LegalMaskedMaxAbs(const torch::Tensor& logits,
   return legal_values.max().item<float>();
 }
 
+float Percentile(std::vector<float> values, double quantile) {
+  if (values.empty()) return 0.0f;
+  std::sort(values.begin(), values.end());
+  quantile = std::clamp(quantile, 0.0, 1.0);
+  size_t index = static_cast<size_t>(std::llround(quantile * (values.size() - 1)));
+  index = std::min(index, values.size() - 1);
+  return values[index];
+}
+
+bool IsReferenceModeEnabled(const std::string& mode) {
+  return mode == "periodic" || mode == "ema";
+}
+
+bool IsPolicyUpdateModeValid(const std::string& mode) {
+  return mode == "mmd" || mode == "ppo";
+}
+
+void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source_model,
+                      std::shared_ptr<SharedDunePolicyValueNetImpl> target_model) {
+  torch::NoGradGuard no_grad;
+
+  auto source_params = source_model->parameters();
+  auto target_params = target_model->parameters();
+  auto source_buffers = source_model->buffers();
+  auto target_buffers = target_model->buffers();
+
+  for (size_t i = 0; i < source_params.size(); ++i) {
+    target_params[i].copy_(source_params[i].to(target_params[i].device()));
+  }
+  for (size_t i = 0; i < source_buffers.size(); ++i) {
+    target_buffers[i].copy_(source_buffers[i].to(target_buffers[i].device()));
+  }
+}
+
+void UpdateReferenceModelEma(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> source_model,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> reference_model,
+    double decay) {
+  torch::NoGradGuard no_grad;
+  decay = std::clamp(decay, 0.0, 1.0);
+  double update_weight = 1.0 - decay;
+
+  auto source_params = source_model->parameters();
+  auto reference_params = reference_model->parameters();
+  auto source_buffers = source_model->buffers();
+  auto reference_buffers = reference_model->buffers();
+
+  for (size_t i = 0; i < source_params.size(); ++i) {
+    torch::Tensor source = source_params[i].to(reference_params[i].device());
+    reference_params[i].mul_(decay);
+    reference_params[i].add_(source, update_weight);
+  }
+  for (size_t i = 0; i < source_buffers.size(); ++i) {
+    reference_buffers[i].copy_(source_buffers[i].to(reference_buffers[i].device()));
+  }
+}
+
 std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                                  std::shared_ptr<SharedDunePolicyValueNetImpl> reference_model,
                                   torch::optim::Optimizer& optimizer, 
                                   const std::vector<std::shared_ptr<Transition>>& batch,
                                   PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
                                   torch::Device device,
+                                  int64_t current_training_step,
                                   bool read_loss_scalars);
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model, 
                 std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
                 std::shared_mutex* sync_mutex) {
   std::unique_lock<std::shared_mutex> lock(*sync_mutex);
-  torch::NoGradGuard no_grad;
-
-  auto train_params = training_model->parameters();
-  auto infer_params = inference_model->parameters();
-  auto train_buffers = training_model->buffers();
-  auto infer_buffers = inference_model->buffers();
-
-  for (size_t i = 0; i < train_params.size(); ++i) {
-    infer_params[i].copy_(train_params[i].to(infer_params[i].device()));
-  }
-  for (size_t i = 0; i < train_buffers.size(); ++i) {
-    infer_buffers[i].copy_(train_buffers[i].to(infer_buffers[i].device()));
-  }
+  CopyModelWeights(training_model, inference_model);
 }
 
 void OptimizationWorker(
     std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
     std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> reference_model,
     torch::optim::AdamW* optimizer,
     GlobalReplayBuffer* global_buffer,
     int64_t obs_size,
@@ -361,6 +429,22 @@ void OptimizationWorker(
 
     if (!stop_training.load()) {
       std::cout << "Replay buffer warmup completed. Starting background optimization loop...\n" << std::flush;
+    }
+
+    std::string reference_mode = absl::GetFlag(FLAGS_mmd_reference_mode);
+    std::string policy_update_mode = absl::GetFlag(FLAGS_policy_update_mode);
+    bool use_mmd = policy_update_mode == "mmd";
+    bool reference_enabled =
+        use_mmd && IsReferenceModeEnabled(reference_mode) &&
+        reference_model != nullptr;
+    int reference_interval = std::max(1, absl::GetFlag(FLAGS_mmd_reference_interval));
+    double reference_ema_decay = absl::GetFlag(FLAGS_mmd_reference_ema_decay);
+    if (reference_enabled) {
+      CopyModelWeights(training_model, reference_model);
+      reference_model->eval();
+      std::cout << absl::StrFormat(
+          "MMD reference policy enabled: mode=%s, interval=%d, ema_decay=%.6f\n",
+          reference_mode, reference_interval, reference_ema_decay);
     }
 
     // 2. Training Loop
@@ -396,7 +480,9 @@ void OptimizationWorker(
           loss_read_interval <= 1 || (next_step % loss_read_interval == 0);
 
       // Lock-free optimization step on training_model
-      auto [v_loss, p_loss] = TrainStep(training_model, *optimizer, batch, train_buffers, obs_size, action_size, device, read_loss_scalars);
+      auto [v_loss, p_loss] = TrainStep(
+          training_model, reference_model, *optimizer, batch, train_buffers,
+          obs_size, action_size, device, next_step, read_loss_scalars);
       if (read_loss_scalars) {
         last_v_loss = v_loss;
         last_p_loss = p_loss;
@@ -404,6 +490,22 @@ void OptimizationWorker(
 
       int step = training_steps.fetch_add(1) + 1;
       int local_steps = step - absl::GetFlag(FLAGS_start_step);
+
+      if (reference_enabled) {
+        if (reference_mode == "ema") {
+          UpdateReferenceModelEma(training_model, reference_model,
+                                  reference_ema_decay);
+        } else if (reference_mode == "periodic" &&
+                   local_steps > 0 &&
+                   local_steps % reference_interval == 0) {
+          CopyModelWeights(training_model, reference_model);
+          reference_model->eval();
+          std::cout << absl::StrFormat(
+              "[MMD Reference] Refreshed periodic reference at step %d "
+              "(local %d).\n",
+              step, local_steps);
+        }
+      }
 
       // Update linear decay for the intermediate reward shaping lambda
       if (reward_lambda != nullptr) {
@@ -474,12 +576,14 @@ void OptimizationWorker(
 }
 
 std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
+                                  std::shared_ptr<SharedDunePolicyValueNetImpl> reference_model,
                                   torch::optim::Optimizer& optimizer, 
                                   const std::vector<std::shared_ptr<Transition>>& batch,
                                   PersistentTrainBuffers& buffers,
                                   int64_t obs_size,
                                   int64_t action_dim,
                                   torch::Device device,
+                                  int64_t current_training_step,
                                   bool read_loss_scalars) {
   size_t batch_size = batch.size();
   if (batch_size == 0) return {0.0f, 0.0f};
@@ -494,6 +598,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     }
     buffers.p_rewards[i] = t->reward_target;
     buffers.p_q[i] = t->q_value;
+    buffers.p_advantages[i] = t->advantage;
+    buffers.p_behavior_probs[i] = std::max(t->behavior_prob, 1e-8f);
     buffers.p_actions[i] = t->action_taken;
   }
 
@@ -504,6 +610,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     buffers.d_rewards.slice(0, 0, batch_size).copy_(buffers.rewards.slice(0, 0, batch_size), /*non_blocking=*/true);
     buffers.d_prev_logits.slice(0, 0, batch_size).copy_(buffers.prev_logits.slice(0, 0, batch_size), /*non_blocking=*/true);
     buffers.d_q_values.slice(0, 0, batch_size).copy_(buffers.q_values.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_advantages.slice(0, 0, batch_size).copy_(buffers.advantages.slice(0, 0, batch_size), /*non_blocking=*/true);
+    buffers.d_behavior_probs.slice(0, 0, batch_size).copy_(buffers.behavior_probs.slice(0, 0, batch_size), /*non_blocking=*/true);
     buffers.d_actions_taken.slice(0, 0, batch_size).copy_(buffers.actions_taken.slice(0, 0, batch_size), /*non_blocking=*/true);
   }
 
@@ -513,6 +621,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor rewards = buffers.is_cuda_ ? buffers.d_rewards.slice(0, 0, batch_size) : buffers.rewards.slice(0, 0, batch_size);
   torch::Tensor prev_logits = buffers.is_cuda_ ? buffers.d_prev_logits.slice(0, 0, batch_size) : buffers.prev_logits.slice(0, 0, batch_size);
   torch::Tensor q_values = buffers.is_cuda_ ? buffers.d_q_values.slice(0, 0, batch_size) : buffers.q_values.slice(0, 0, batch_size);
+  torch::Tensor advantages = buffers.is_cuda_ ? buffers.d_advantages.slice(0, 0, batch_size) : buffers.advantages.slice(0, 0, batch_size);
+  torch::Tensor behavior_probs_tensor = buffers.is_cuda_ ? buffers.d_behavior_probs.slice(0, 0, batch_size) : buffers.behavior_probs.slice(0, 0, batch_size);
   torch::Tensor actions_taken = buffers.is_cuda_ ? buffers.d_actions_taken.slice(0, 0, batch_size) : buffers.actions_taken.slice(0, 0, batch_size);
 
   optimizer.zero_grad();
@@ -520,11 +630,20 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor masked_logits, log_probs, value_loss, q_vector, target_logits;
   torch::Tensor masked_target_logits, target_probs, policy_loss, probs;
   torch::Tensor entropy_per_sample, mean_entropy, total_loss;
-  torch::Tensor raw_legal_mean, centered_prev_logits;
+  torch::Tensor raw_legal_mean, centered_prev_logits, reference_logits;
+  torch::Tensor centered_reference_logits;
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
   float entropy_coef = static_cast<float>(absl::GetFlag(FLAGS_entropy_coef));
+  float ppo_clip_epsilon =
+      static_cast<float>(absl::GetFlag(FLAGS_ppo_clip_epsilon));
+  std::string policy_update_mode = absl::GetFlag(FLAGS_policy_update_mode);
+  bool use_mmd = policy_update_mode == "mmd";
+  bool use_ppo = policy_update_mode == "ppo";
+  std::string reference_mode = absl::GetFlag(FLAGS_mmd_reference_mode);
+  bool use_reference =
+      use_mmd && IsReferenceModeEnabled(reference_mode) && reference_model != nullptr;
 
   auto compute_loss = [&]() {
     auto outputs = model->forward(states);
@@ -542,17 +661,48 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     log_probs = torch::log_softmax(masked_logits, -1);
     value_loss = torch::nn::functional::mse_loss(pred_values, rewards);
 
-    q_vector = torch::zeros({(int64_t)batch_size, action_dim}, torch::TensorOptions().device(device));
-    q_vector.scatter_(1, actions_taken, q_values);
-
     centered_prev_logits = CenterLegalLogitsTensor(prev_logits, masks);
-    target_logits = (centered_prev_logits + eta * q_vector) / (1.0f + eta * alpha);
-    target_logits = CenterLegalLogitsTensor(target_logits, masks);
-    masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
-    target_probs = torch::softmax(masked_target_logits, -1).detach();
+    if (use_mmd) {
+      q_vector = torch::zeros({(int64_t)batch_size, action_dim},
+                              torch::TensorOptions().device(device));
+      q_vector.scatter_(1, actions_taken, q_values);
 
-    policy_loss = torch::nn::functional::kl_div(
-        log_probs, target_probs, torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
+      target_logits = centered_prev_logits + eta * q_vector;
+      if (use_reference) {
+        torch::NoGradGuard no_grad;
+        auto reference_outputs = reference_model->forward(states);
+        reference_logits = reference_outputs.logits;
+        centered_reference_logits =
+            ApplyLogitCapTensor(CenterLegalLogitsTensor(reference_logits, masks),
+                                logit_cap);
+        target_logits = target_logits + eta * alpha * centered_reference_logits;
+      }
+      target_logits = target_logits / (1.0f + eta * alpha);
+      target_logits = CenterLegalLogitsTensor(target_logits, masks);
+      masked_target_logits = target_logits.masked_fill(masks == 0.0f, -1e9f);
+      target_probs = torch::softmax(masked_target_logits, -1).detach();
+
+      policy_loss = torch::nn::functional::kl_div(
+          log_probs, target_probs,
+          torch::nn::functional::KLDivFuncOptions().reduction(torch::kBatchMean));
+    } else if (use_ppo) {
+      torch::Tensor selected_log_probs = log_probs.gather(1, actions_taken);
+      torch::Tensor old_log_probs = behavior_probs_tensor.clamp_min(1e-8).log();
+      torch::Tensor ratios = torch::exp(selected_log_probs - old_log_probs);
+      torch::Tensor centered_advantages = advantages - advantages.mean();
+      torch::Tensor advantage_std =
+          centered_advantages.pow(2).mean().sqrt().clamp_min(1e-6);
+      torch::Tensor normalized_advantages =
+          (centered_advantages / advantage_std).detach();
+      torch::Tensor clipped_ratios =
+          ratios.clamp(1.0f - ppo_clip_epsilon, 1.0f + ppo_clip_epsilon);
+      policy_loss =
+          -torch::min(ratios * normalized_advantages,
+                      clipped_ratios * normalized_advantages)
+               .mean();
+    } else {
+      SPIEL_CHECK_TRUE(false);
+    }
 
     // ENTROPY BONUS: Maximize entropy over legal actions to prevent policy collapse
     probs = torch::softmax(masked_logits, -1);
@@ -596,10 +746,46 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
       float raw_legal_offset_abs = raw_legal_mean.abs().mean().item<float>();
       float raw_centered_legal_max_abs = LegalMaskedMaxAbs(centered_raw_logits, masks);
       float capped_legal_max_abs = LegalMaskedMaxAbs(pred_logits, masks);
-      float target_legal_max_abs = LegalMaskedMaxAbs(target_logits, masks);
+      float target_legal_max_abs =
+          use_mmd ? LegalMaskedMaxAbs(target_logits, masks) : 0.0f;
+      float reference_legal_max_abs =
+          use_reference ? LegalMaskedMaxAbs(centered_reference_logits, masks)
+                        : 0.0f;
+      torch::Tensor behavior_masked_logits =
+          centered_prev_logits.masked_fill(masks == 0.0f, -1e9f);
+      torch::Tensor behavior_log_probs =
+          torch::log_softmax(behavior_masked_logits, -1);
+      torch::Tensor behavior_probs =
+          torch::softmax(behavior_masked_logits, -1);
+      float behavior_current_kl =
+          (behavior_probs * (behavior_log_probs - log_probs))
+              .sum(-1)
+              .mean()
+              .item<float>();
       // Top-1 softmax confidence (want < ~0.9, not ~0.97)
       float mean_top1_prob = std::get<0>(probs.max(-1)).mean().item<float>();
       float mean_ent = mean_entropy.item<float>();
+
+      std::vector<float> abs_q_values;
+      std::vector<float> abs_advantages;
+      std::vector<float> abs_reward_targets;
+      std::vector<float> importance_multipliers;
+      std::vector<float> replay_ages;
+      abs_q_values.reserve(batch_size);
+      abs_advantages.reserve(batch_size);
+      abs_reward_targets.reserve(batch_size);
+      importance_multipliers.reserve(batch_size);
+      replay_ages.reserve(batch_size);
+      for (const auto& transition : batch) {
+        abs_q_values.push_back(std::abs(transition->q_value));
+        abs_advantages.push_back(std::abs(transition->advantage));
+        abs_reward_targets.push_back(std::abs(transition->reward_target));
+        importance_multipliers.push_back(transition->importance_multiplier);
+        int64_t age =
+            std::max<int64_t>(0, current_training_step -
+                                     transition->training_step_inserted);
+        replay_ages.push_back(static_cast<float>(age));
+      }
 
       double total_std_logits = 0.0;
       int count = 0;
@@ -617,17 +803,41 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
 
       std::cout << "\n[Diagnostic] Mean|PolicySignal|: " << mean_abs_policy_signal
                 << " | Std|PolicySignal|: " << std_policy_signal
+                << " | PolicyMode: " << policy_update_mode
                 << " | Eta: " << eta
                 << " | RawAllMax|Logit|: " << raw_all_max_abs_logit
                 << " | RawLegalOffset: " << raw_legal_offset_abs
                 << " | RawMax|LegalCentered|: " << raw_centered_legal_max_abs
                 << " | CapMax|Legal|: " << capped_legal_max_abs
                 << " | TargetMax|Legal|: " << target_legal_max_abs
+                << " | RefMax|Legal|: " << reference_legal_max_abs
                 << " | LogitStd: " << mean_std_logits
                 << " | PolNorm: " << policy_weight_norm
                 << " | MeanTop1: " << mean_top1_prob
                 << " | Entropy: " << mean_ent
-                << " | PolicyKL: " << p_loss_val << "\n";
+                << " | PolicyLoss: " << p_loss_val
+                << " | BehaviorToCurrentKL: " << behavior_current_kl
+                << " | ReplayAge(p50/p95/p99): "
+                << Percentile(replay_ages, 0.50) << "/"
+                << Percentile(replay_ages, 0.95) << "/"
+                << Percentile(replay_ages, 0.99)
+                << " | |Q|(p50/p95/p99): "
+                << Percentile(abs_q_values, 0.50) << "/"
+                << Percentile(abs_q_values, 0.95) << "/"
+                << Percentile(abs_q_values, 0.99)
+                << " | |Adv|(p50/p95/p99): "
+                << Percentile(abs_advantages, 0.50) << "/"
+                << Percentile(abs_advantages, 0.95) << "/"
+                << Percentile(abs_advantages, 0.99)
+                << " | |Target|(p50/p95/p99): "
+                << Percentile(abs_reward_targets, 0.50) << "/"
+                << Percentile(abs_reward_targets, 0.95) << "/"
+                << Percentile(abs_reward_targets, 0.99)
+                << " | Importance(p50/p95/p99): "
+                << Percentile(importance_multipliers, 0.50) << "/"
+                << Percentile(importance_multipliers, 0.95) << "/"
+                << Percentile(importance_multipliers, 0.99)
+                << "\n";
   }
 
   // 1. FATAL SAFETY GUARD & TENSOR AUTOPSY
@@ -648,6 +858,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     check_nan(rewards, "rewards");
     check_nan(prev_logits, "prev_logits");
     check_nan(q_values, "q_values");
+    check_nan(advantages, "advantages");
+    check_nan(behavior_probs_tensor, "behavior_probs");
     
     std::cerr << "\nMODEL OUTPUTS (Forward Pass):\n";
     check_nan(raw_pred_logits, "raw_pred_logits");
@@ -842,9 +1054,12 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       transition.action_taken = action;
       transition.prev_logits = std::move(prev_logits_vec);
       transition.q_value = shaped_bonus;
+      transition.advantage = shaped_bonus;
       transition.reward_target = shaped_bonus;
       transition.v_value = current_value; // Store the V(s) value
       transition.behavior_prob = behavior_prob;
+      transition.importance_multiplier = 1.0f;
+      transition.training_step_inserted = 0;
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
@@ -892,6 +1107,8 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       if (importance_clip > 0.0f) {
         importance = std::min(importance, importance_clip);
       }
+      it->importance_multiplier = importance;
+      it->advantage = A_i;
       it->q_value = A_i * importance;
 
 
@@ -975,9 +1192,12 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       transition.action_taken = action;
       transition.prev_logits = std::vector<float>(action_size, 0.0f);
       transition.q_value = 0.0f;
+      transition.advantage = 0.0f;
       transition.reward_target = 0.0f;
       transition.v_value = 0.0f; // Store V(s) = 0.0f explicitly
       transition.behavior_prob = 1.0f / static_cast<float>(actions.size());
+      transition.importance_multiplier = 1.0f;
+      transition.training_step_inserted = 0;
       transition.player_id = current_player;
       trajectory.push_back(std::move(transition));
     }
@@ -990,6 +1210,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       float reward = static_cast<float>(returns[transition.player_id]);
       transition.reward_target = reward / 4.0f; // Scale consistently
       transition.q_value = reward / 4.0f;        // Scale consistently
+      transition.advantage = reward / 4.0f;      // Scale consistently
     }
   }
 
@@ -1003,6 +1224,7 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                   , std::shared_ptr<BatchedEvaluator> evaluator
                   , std::atomic<float>* reward_lambda
+                  , std::atomic<int>* training_steps
 #endif
 ) {
   std::mt19937 rng(std::random_device{}() + thread_id);
@@ -1026,7 +1248,13 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
 #else
     moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
 #endif
-    global_buffer->PushTrajectory(local_trajectory);
+    int64_t inserted_step = 0;
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+    if (training_steps != nullptr) {
+      inserted_step = training_steps->load(std::memory_order_relaxed);
+    }
+#endif
+    global_buffer->PushTrajectory(local_trajectory, inserted_step);
   }
   total_moves.fetch_add(moves);
 }
@@ -1090,6 +1318,7 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> reference_model = nullptr;
   std::unique_ptr<torch::optim::AdamW> optimizer = nullptr;
   std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
   std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
@@ -1109,6 +1338,26 @@ int main(int argc, char** argv) {
 
     training_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
     inference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
+    std::string reference_mode = absl::GetFlag(FLAGS_mmd_reference_mode);
+    std::string policy_update_mode = absl::GetFlag(FLAGS_policy_update_mode);
+    if (!open_spiel::IsPolicyUpdateModeValid(policy_update_mode)) {
+      std::cerr << "Invalid --policy_update_mode='" << policy_update_mode
+                << "'. Expected one of: mmd, ppo.\n";
+      return 1;
+    }
+    if (reference_mode != "uniform" && reference_mode != "periodic" &&
+        reference_mode != "ema") {
+      std::cerr << "Invalid --mmd_reference_mode='" << reference_mode
+                << "'. Expected one of: uniform, periodic, ema.\n";
+      return 1;
+    }
+    if (policy_update_mode == "mmd" &&
+        open_spiel::IsReferenceModeEnabled(reference_mode)) {
+      reference_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+          obs_size, hidden_dim, action_size, num_blocks);
+      reference_model->to(train_device);
+      reference_model->eval();
+    }
     
     inference_model->to(train_device);
 
@@ -1122,6 +1371,13 @@ int main(int argc, char** argv) {
     open_spiel::LoadCheckpoint(training_model, optimizer, model_path, optim_path, train_device);
     // Initial weight synchronization
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+    if (reference_model != nullptr) {
+      open_spiel::CopyModelWeights(training_model, reference_model);
+      std::cout << absl::StrFormat(
+          "Initialized MMD reference policy model (mode=%s, interval=%d, ema_decay=%.6f)\n",
+          reference_mode, absl::GetFlag(FLAGS_mmd_reference_interval),
+          absl::GetFlag(FLAGS_mmd_reference_ema_decay));
+    }
 
     // Step-0 Logit Health Check: this raw all-action probe is informational.
     // Actual policy logits are centered over legal actions before any cap.
@@ -1149,6 +1405,13 @@ int main(int argc, char** argv) {
         eval_batch_size, eval_timeout_ms,
         logit_cap,
         evaluator_device_synchronize ? "true" : "false");
+    std::cout << absl::StrFormat(
+        "Policy update mode: %s%s\n",
+        absl::GetFlag(FLAGS_policy_update_mode),
+        absl::GetFlag(FLAGS_policy_update_mode) == "ppo"
+            ? absl::StrFormat(" (clip_epsilon=%.3f)",
+                              absl::GetFlag(FLAGS_ppo_clip_epsilon))
+            : "");
   }
 #endif
 
@@ -1179,7 +1442,7 @@ int main(int argc, char** argv) {
 
     optimization_thread = std::thread(
         open_spiel::OptimizationWorker,
-        training_model, inference_model, optimizer.get(), &global_buffer,
+        training_model, inference_model, reference_model, optimizer.get(), &global_buffer,
         obs_size, action_size, &sync_mutex,
         std::ref(stop_training), std::ref(stop_collection), std::ref(training_steps),
         min_train_size, train_batch_size, sync_interval, max_train_steps,
@@ -1198,7 +1461,7 @@ int main(int argc, char** argv) {
                          std::ref(games_completed), total_games, std::ref(total_moves),
                          &global_buffer, obs_size, &stop_collection
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-                         , evaluator, &reward_lambda
+                         , evaluator, &reward_lambda, &training_steps
 #endif
     );
   }
@@ -1252,7 +1515,9 @@ int main(int argc, char** argv) {
       // Execute backprop step using the startup-initialized optimizer
       open_spiel::PersistentTrainBuffers sync_buffers;
       sync_buffers.Initialize(batch_size, obs_size, action_size, train_device.is_cuda());
-      open_spiel::TrainStep(training_model, *optimizer, batch, sync_buffers, obs_size, action_size, train_device, true);
+      open_spiel::TrainStep(training_model, reference_model, *optimizer, batch,
+                            sync_buffers, obs_size, action_size, train_device,
+                            training_steps.load(), true);
       std::cout << "Optimization Step successfully completed (Forward + Loss + Backward + Weight Update)!\n";
       
       // Sync training weights to inference weights for completeness
