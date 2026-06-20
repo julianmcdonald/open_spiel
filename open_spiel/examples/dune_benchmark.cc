@@ -41,7 +41,7 @@ ABSL_FLAG(int, sync_interval, 100, "Number of training steps between weight sync
 ABSL_FLAG(int, buffer_capacity, 30000, "Maximum capacity of the global replay buffer.");
 ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate before the GPU is allowed to pull 1 training batch. Set <= 0 to disable throttling.");
 ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
-ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained in intermediate shaped rewards.");
+ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained or lost in intermediate shaped rewards.");
 ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
@@ -1053,7 +1053,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
           int vp_delta = new_vp - current_vps[p];
           current_vps[p] = new_vp;
 
-          if (vp_delta > 0 && reward_lambda != nullptr) {
+          if (vp_delta != 0 && reward_lambda != nullptr) {
             shaped_bonus_by_player[p] =
                 vp_delta * static_cast<float>(shaped_weight) * current_lambda;
           }
@@ -1085,7 +1085,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
             static_cast<int>(current_transition_index);
       }
       for (int p = 0; p < game.NumPlayers(); ++p) {
-        if (p == current_player || shaped_bonus_by_player[p] <= 0.0f) {
+        if (p == current_player || shaped_bonus_by_player[p] == 0.0f) {
           continue;
         }
         int idx = last_transition_index[p];
