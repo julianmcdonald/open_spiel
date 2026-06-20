@@ -5,6 +5,7 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
+#include <random>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -333,6 +334,7 @@ int main(int argc, char* argv[]) {
   std::string output_file = "";
   int64_t hidden_dim = 2048;
   int num_blocks = 8;
+  int seed = -1;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -343,6 +345,13 @@ int main(int argc, char* argv[]) {
         output_file = argv[++i];
       } else {
         std::cerr << "Error: --output requires a file path.\n";
+        return 1;
+      }
+    } else if (arg == "--seed") {
+      if (i + 1 < argc) {
+        seed = std::stoi(argv[++i]);
+      } else {
+        std::cerr << "Error: --seed requires an integer.\n";
         return 1;
       }
     } else if (arg == "--hidden_dim" || arg == "--hidden-dim") {
@@ -382,6 +391,11 @@ int main(int argc, char* argv[]) {
   // 1. Initialize the Game
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
   std::unique_ptr<State> state = game->NewInitialState();
+
+  std::mt19937 rng;
+  if (seed >= 0) {
+    rng.seed(seed);
+  }
 
   // 2. Initialize the Network
   int64_t obs_size = game->InformationStateTensorShape()[0];
@@ -459,12 +473,17 @@ int main(int argc, char* argv[]) {
     // --- CHANCE NODES (Decks, Market Reveals) ---
     if (state->IsChanceNode()) {
       auto outcomes = state->ChanceOutcomes();
-      // Take the first chance outcome for evaluation stability
       if (!outcomes.empty()) {
         const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
         BoardSnapshot old_snap = GetBoardSnapshot(dune_state);
 
-        state->ApplyAction(outcomes.front().first);
+        Action action;
+        if (seed >= 0) {
+          action = SampleAction(outcomes, rng).first;
+        } else {
+          action = outcomes.front().first;
+        }
+        state->ApplyAction(action);
 
         const auto* post_dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
         BoardSnapshot new_snap = GetBoardSnapshot(post_dune_state);
