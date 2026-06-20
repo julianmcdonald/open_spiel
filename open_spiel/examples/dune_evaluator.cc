@@ -247,10 +247,10 @@ static void CompareSnapshotsAndLog(const BoardSnapshot& old_snap, const BoardSna
   for (int f = 0; f < 4; ++f) {
     if (old_snap.alliance_owner[f] != new_snap.alliance_owner[f]) {
       std::string faction_name = (f == 0 ? "Emperor" : (f == 1 ? "Spacing Guild" : (f == 2 ? "Bene Gesserit" : "Fremen")));
-      if (old_snap.alliance_owner[f] != -1) {
+      if (old_snap.alliance_owner[f] >= 0) {
         std::cout << "  [VP Update] Player P" << old_snap.alliance_owner[f] << " loses alliance with " << faction_name << " (-1 VP)\n";
       }
-      if (new_snap.alliance_owner[f] != -1) {
+      if (new_snap.alliance_owner[f] >= 0) {
         std::cout << "  [VP Update] Player P" << new_snap.alliance_owner[f] << " gains alliance with " << faction_name << " (+1 VP)\n";
       }
     }
