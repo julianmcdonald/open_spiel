@@ -27,6 +27,7 @@
 #include <cmath>
 #include <algorithm>
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_util.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The name of the game to play.");
@@ -931,6 +932,18 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   std::vector<int> last_transition_index(game.NumPlayers(), -1);
   std::vector<float> shaped_bonus_by_player(game.NumPlayers(), 0.0f);
 
+  // Combat-causal credit tracking: per-player list of {transition_index,
+  // strength_delta} pairs for transitions where CombatStrength() increased.
+  // Combat VP is distributed proportionally by delta weight, avoiding
+  // crediting the trivially forced CombatPass action.
+  struct CombatCreditEvent {
+    int transition_index;
+    int strength_delta;
+  };
+  std::vector<std::vector<CombatCreditEvent>> combat_credit(game.NumPlayers());
+  std::vector<int> pre_combat_strength(game.NumPlayers(), 0);
+  dune_imperium::GamePhase pre_action_phase = dune_imperium::GamePhase::kDeal;
+
   // Micro-optimized flag retrieval outside the state progression loop
   double temp = absl::GetFlag(FLAGS_temperature);
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
@@ -1035,6 +1048,16 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       }
 
       size_t current_transition_index = trajectory.size();
+
+      // Snapshot phase and current player's combat strength before action
+      if (dune_state != nullptr) {
+        pre_action_phase = dune_state->phase();
+        if (current_player >= 0 && current_player < game.NumPlayers()) {
+          pre_combat_strength[current_player] =
+              dune_imperium::CombatStrength(*dune_state, current_player);
+        }
+      }
+
       state->ApplyAction(action);
 
       // Shaped Reward VP Gain Detection
@@ -1060,6 +1083,28 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         }
       }
 
+      // Clear combat tracking when a new combat phase begins
+      if (dune_state != nullptr &&
+          pre_action_phase != dune_imperium::GamePhase::kCombat &&
+          dune_state->phase() == dune_imperium::GamePhase::kCombat) {
+        for (auto& cc : combat_credit) cc.clear();
+      }
+
+      // Track combat-causal transitions: record when CombatStrength increases.
+      // Captures troop/dread deployments AND sword-boosting combat intrigues.
+      // Excludes CombatPass, Harvest Cells, Economic Positioning, etc.
+      if (dune_state != nullptr && current_player >= 0 &&
+          current_player < game.NumPlayers() &&
+          action != dune_imperium::kActionCombatPass) {
+        int post_strength =
+            dune_imperium::CombatStrength(*dune_state, current_player);
+        int delta = post_strength - pre_combat_strength[current_player];
+        if (delta > 0) {
+          combat_credit[current_player].push_back(
+              {static_cast<int>(current_transition_index), delta});
+        }
+      }
+
       // Push to trajectory
       Transition transition;
       transition.spatial_tensor = std::move(obs);
@@ -1071,6 +1116,35 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
            current_player < static_cast<int>(shaped_bonus_by_player.size()))
               ? shaped_bonus_by_player[current_player]
               : 0.0f;
+
+      // If CombatPass triggered own VP: redistribute positive VP to
+      // combat-causal transitions weighted by strength delta.
+      // Suppress negative VP on CombatPass (alliance theft side effects).
+      // Suppress positive VP if no combat events exist (GAE handles it).
+      if (action == dune_imperium::kActionCombatPass && own_shaped_bonus != 0.0f &&
+          current_player >= 0 && current_player < game.NumPlayers()) {
+        if (own_shaped_bonus > 0.0f &&
+            !combat_credit[current_player].empty()) {
+          int total_delta = 0;
+          for (const auto& ev : combat_credit[current_player])
+            total_delta += ev.strength_delta;
+          if (total_delta > 0) {
+            for (const auto& ev : combat_credit[current_player]) {
+              float weight = static_cast<float>(ev.strength_delta) /
+                             static_cast<float>(total_delta);
+              float bonus = own_shaped_bonus * weight;
+              if (ev.transition_index >= 0 &&
+                  ev.transition_index < static_cast<int>(trajectory.size())) {
+                trajectory[ev.transition_index].q_value += bonus;
+                trajectory[ev.transition_index].advantage += bonus;
+                trajectory[ev.transition_index].reward_target += bonus;
+              }
+            }
+          }
+        }
+        own_shaped_bonus = 0.0f;
+      }
+
       transition.q_value = own_shaped_bonus;
       transition.advantage = own_shaped_bonus;
       transition.reward_target = own_shaped_bonus;
@@ -1084,15 +1158,44 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         last_transition_index[current_player] =
             static_cast<int>(current_transition_index);
       }
+
+      // Retro-credit VP to other players.
       for (int p = 0; p < game.NumPlayers(); ++p) {
         if (p == current_player || shaped_bonus_by_player[p] == 0.0f) {
           continue;
         }
-        int idx = last_transition_index[p];
-        if (idx >= 0 && idx < static_cast<int>(trajectory.size())) {
-          trajectory[idx].q_value += shaped_bonus_by_player[p];
-          trajectory[idx].advantage += shaped_bonus_by_player[p];
-          trajectory[idx].reward_target += shaped_bonus_by_player[p];
+        if (action == dune_imperium::kActionCombatPass) {
+          // CombatPass triggered VP for another player: distribute positive
+          // VP across that player's combat-causal transitions by delta weight.
+          // Suppress negative VP (alliance theft) and positive VP with no
+          // combat events (GAE handles it via terminal returns).
+          if (shaped_bonus_by_player[p] > 0.0f &&
+              !combat_credit[p].empty()) {
+            int total_delta = 0;
+            for (const auto& ev : combat_credit[p])
+              total_delta += ev.strength_delta;
+            if (total_delta > 0) {
+              for (const auto& ev : combat_credit[p]) {
+                float weight = static_cast<float>(ev.strength_delta) /
+                               static_cast<float>(total_delta);
+                float bonus = shaped_bonus_by_player[p] * weight;
+                if (ev.transition_index >= 0 &&
+                    ev.transition_index < static_cast<int>(trajectory.size())) {
+                  trajectory[ev.transition_index].q_value += bonus;
+                  trajectory[ev.transition_index].advantage += bonus;
+                  trajectory[ev.transition_index].reward_target += bonus;
+                }
+              }
+            }
+          }
+        } else {
+          // Non-CombatPass VP: credit to most recent transition as before.
+          int idx = last_transition_index[p];
+          if (idx >= 0 && idx < static_cast<int>(trajectory.size())) {
+            trajectory[idx].q_value += shaped_bonus_by_player[p];
+            trajectory[idx].advantage += shaped_bonus_by_player[p];
+            trajectory[idx].reward_target += shaped_bonus_by_player[p];
+          }
         }
       }
     }
