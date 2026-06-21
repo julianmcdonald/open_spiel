@@ -43,6 +43,7 @@ ABSL_FLAG(int, buffer_capacity, 30000, "Maximum capacity of the global replay bu
 ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate before the GPU is allowed to pull 1 training batch. Set <= 0 to disable throttling.");
 ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
 ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained or lost in intermediate shaped rewards.");
+ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0, "Weight multiplier for Tleilaxu progress breadcrumbs (levels 4->5 and 5->6).");
 ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
@@ -924,9 +925,11 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   const dune_imperium::DuneImperiumState* dune_state = 
       dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
   std::vector<int> current_vps(game.NumPlayers(), 0);
+  std::vector<int> current_tleilaxu(game.NumPlayers(), 0);
   if (dune_state != nullptr) {
     for (int p = 0; p < game.NumPlayers(); ++p) {
       current_vps[p] = dune_state->GetPlayerVpForTesting(p);
+      current_tleilaxu[p] = dune_state->GetTleilaxuTrackForTesting(p);
     }
   }
   std::vector<int> last_transition_index(game.NumPlayers(), -1);
@@ -947,6 +950,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   // Micro-optimized flag retrieval outside the state progression loop
   double temp = absl::GetFlag(FLAGS_temperature);
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
+  double tleilaxu_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
   int game_length = 0;
@@ -1077,8 +1081,27 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
           current_vps[p] = new_vp;
 
           if (vp_delta != 0 && reward_lambda != nullptr) {
-            shaped_bonus_by_player[p] =
+            shaped_bonus_by_player[p] +=
                 vp_delta * static_cast<float>(shaped_weight) * current_lambda;
+          }
+
+          // Tleilaxu breadcrumb reward calculation
+          int new_tleilaxu = dune_state->GetTleilaxuTrackForTesting(p);
+          int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
+          current_tleilaxu[p] = new_tleilaxu;
+
+          if (tleilaxu_delta > 0 && tleilaxu_breadcrumb_weight > 0.0 && reward_lambda != nullptr) {
+            int breadcrumb_steps = 0;
+            int start_l = new_tleilaxu - tleilaxu_delta;
+            for (int l = start_l + 1; l <= new_tleilaxu; ++l) {
+              if (l == 5 || l == 6) {
+                breadcrumb_steps++;
+              }
+            }
+            if (breadcrumb_steps > 0) {
+              shaped_bonus_by_player[p] +=
+                  breadcrumb_steps * static_cast<float>(tleilaxu_breadcrumb_weight) * current_lambda;
+            }
           }
         }
       }
