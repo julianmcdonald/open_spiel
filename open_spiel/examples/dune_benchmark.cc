@@ -16,6 +16,7 @@
 #include <optional>
 #include <limits>
 #include <string>
+#include <sstream>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -74,7 +75,18 @@ ABSL_FLAG(int, loss_read_interval, 1, "Read CPU loss scalars every N local train
 ABSL_FLAG(int, train_diagnostic_interval, 1000, "Print expensive training diagnostics every N TrainStep calls. Set <= 0 to disable.");
 ABSL_FLAG(bool, evaluator_device_synchronize, true, "Use whole-device CUDA synchronize after evaluator D2H copies. False uses blocking D2H copies instead.");
 
+ABSL_FLAG(std::string, opponent_checkpoints, "", "Comma-separated list of paths to opponent model checkpoints.");
+ABSL_FLAG(std::string, opponent_mix, "", "Comma-separated list of probabilities/weights for each opponent checkpoint.");
+ABSL_FLAG(std::string, opponent_hidden_dims, "", "Comma-separated list of hidden dimensions for each opponent checkpoint.");
+ABSL_FLAG(std::string, opponent_num_blocks, "", "Comma-separated list of block counts for each opponent checkpoint.");
+ABSL_FLAG(std::string, learner_seat_mode, "self_play", "Mode of seat assignment: self_play or rotate.");
+ABSL_FLAG(double, opponent_temperature, 0.0, "Softmax temperature for opponent action selection.");
+
 namespace open_spiel {
+
+std::atomic<uint64_t> recorded_transitions_by_seat[4] = {0, 0, 0, 0};
+std::atomic<uint64_t> opponent_decisions_count{0};
+std::atomic<uint64_t> learner_seat_games_count[4] = {0, 0, 0, 0};
 
 struct Transition {
   std::vector<float> spatial_tensor;     // Flattened observation tensor
@@ -139,6 +151,29 @@ class GlobalReplayBuffer {
     return total_inserted_.load(std::memory_order_relaxed);
   }
 };
+
+std::vector<std::string> SplitCommaSeparated(const std::string& value) {
+  std::vector<std::string> items;
+  std::stringstream ss(value);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    }));
+    item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    }).base(), item.end());
+    if (!item.empty()) items.push_back(item);
+  }
+  return items;
+}
+
+bool IsLearnerTurn(Player current_player, Player learner_seat, const std::string& learner_seat_mode) {
+  if (learner_seat_mode == "rotate") {
+    return current_player == learner_seat;
+  }
+  return true; // Default self_play mode: all seats are learners
+}
 
 namespace {
 
@@ -911,8 +946,36 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   return {v_loss_val, p_loss_val};
 }
 
-int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size, std::vector<Transition>& trajectory, std::atomic<float>* reward_lambda) {
+int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size, std::vector<Transition>& trajectory, std::atomic<float>* reward_lambda,
+                    const std::vector<std::shared_ptr<BatchedEvaluator>>& opponent_evaluators,
+                    const std::vector<double>& opponent_mix,
+                    const std::string& learner_seat_mode,
+                    int game_id) {
   std::unique_ptr<State> state = game.NewInitialState();
+
+  Player learner_seat = -1;
+  if (learner_seat_mode == "rotate") {
+    learner_seat = game_id % 4;
+    learner_seat_games_count[learner_seat].fetch_add(1, std::memory_order_relaxed);
+  }
+
+  std::vector<std::shared_ptr<BatchedEvaluator>> seat_evaluators(game.NumPlayers(), nullptr);
+  if (learner_seat_mode == "rotate") {
+    std::discrete_distribution<size_t> opponent_dist(opponent_mix.begin(), opponent_mix.end());
+    for (int p = 0; p < game.NumPlayers(); ++p) {
+      if (p == learner_seat) {
+        seat_evaluators[p] = evaluator;
+      } else {
+        size_t opp_idx = opponent_dist(*rng);
+        SPIEL_CHECK_LT(opp_idx, opponent_evaluators.size());
+        seat_evaluators[p] = opponent_evaluators[opp_idx];
+      }
+    }
+  } else {
+    for (int p = 0; p < game.NumPlayers(); ++p) {
+      seat_evaluators[p] = evaluator;
+    }
+  }
 
   bool provides_info_state_tensor =
       game.GetType().provides_information_state_tensor;
@@ -950,6 +1013,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
 
   // Micro-optimized flag retrieval outside the state progression loop
   double temp = absl::GetFlag(FLAGS_temperature);
+  double opponent_temp = absl::GetFlag(FLAGS_opponent_temperature);
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
   double tleilaxu_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   double tleilaxu_level7_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
@@ -1005,16 +1069,24 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
 
       int64_t action_size = game.NumDistinctActions();
 
+      std::shared_ptr<BatchedEvaluator> current_evaluator = seat_evaluators[current_player];
+      SPIEL_CHECK_TRUE(current_evaluator != nullptr);
+
+      if (learner_seat_mode == "rotate" && current_player != learner_seat) {
+        opponent_decisions_count.fetch_add(1, std::memory_order_relaxed);
+      }
+
       // Query the batched evaluator (actor thread goes to sleep, OS multiplexes)
-      EvalResult result = evaluator->Evaluate(obs);
+      EvalResult result = current_evaluator->Evaluate(obs);
       float current_value = result.value;
       std::vector<float> prev_logits_vec = std::move(result.logits);
       CenterAndCapLegalLogits(prev_logits_vec, actions, logit_cap);
 
       // Fast CPU Softmax Action Selection using the configured temperature
+      double curr_temp = IsLearnerTurn(current_player, learner_seat, learner_seat_mode) ? temp : opponent_temp;
       Action action = actions.front();
       float behavior_prob = 1.0f;
-      if (temp > 0.001) {
+      if (curr_temp > 0.001) {
         std::vector<double> action_probs;
         action_probs.reserve(actions.size());
         
@@ -1025,7 +1097,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         }
         
         for (Action a : actions) {
-          action_probs.push_back(std::exp((prev_logits_vec[a] - max_logit) / temp));
+          action_probs.push_back(std::exp((prev_logits_vec[a] - max_logit) / curr_temp));
         }
         
         // Sample action probabilistically from the network's beliefs
@@ -1124,73 +1196,78 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         for (auto& cc : combat_credit) cc.clear();
       }
 
-      // Track combat-causal transitions: record when CombatStrength increases.
-      // Captures troop/dread deployments AND sword-boosting combat intrigues.
-      // Excludes CombatPass, Harvest Cells, Economic Positioning, etc.
-      if (dune_state != nullptr && current_player >= 0 &&
-          current_player < game.NumPlayers() &&
-          action != dune_imperium::kActionCombatPass) {
-        int post_strength =
-            dune_imperium::CombatStrength(*dune_state, current_player);
-        int delta = post_strength - pre_combat_strength[current_player];
-        if (delta > 0) {
-          combat_credit[current_player].push_back(
-              {static_cast<int>(current_transition_index), delta});
+      if (IsLearnerTurn(current_player, learner_seat, learner_seat_mode)) {
+        // Track combat-causal transitions: record when CombatStrength increases.
+        // Captures troop/dread deployments AND sword-boosting combat intrigues.
+        // Excludes CombatPass, Harvest Cells, Economic Positioning, etc.
+        if (dune_state != nullptr && current_player >= 0 &&
+            current_player < game.NumPlayers() &&
+            action != dune_imperium::kActionCombatPass) {
+          int post_strength =
+              dune_imperium::CombatStrength(*dune_state, current_player);
+          int delta = post_strength - pre_combat_strength[current_player];
+          if (delta > 0) {
+            combat_credit[current_player].push_back(
+                {static_cast<int>(current_transition_index), delta});
+          }
         }
-      }
 
-      // Push to trajectory
-      Transition transition;
-      transition.spatial_tensor = std::move(obs);
-      transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
-      transition.action_taken = action;
-      transition.prev_logits = std::move(prev_logits_vec);
-      float own_shaped_bonus =
-          (current_player >= 0 &&
-           current_player < static_cast<int>(shaped_bonus_by_player.size()))
-              ? shaped_bonus_by_player[current_player]
-              : 0.0f;
+        // Push to trajectory
+        Transition transition;
+        transition.spatial_tensor = std::move(obs);
+        transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
+        transition.action_taken = action;
+        transition.prev_logits = std::move(prev_logits_vec);
+        float own_shaped_bonus =
+            (current_player >= 0 &&
+             current_player < static_cast<int>(shaped_bonus_by_player.size()))
+                 ? shaped_bonus_by_player[current_player]
+                 : 0.0f;
 
-      // If CombatPass triggered own VP: redistribute positive VP to
-      // combat-causal transitions weighted by strength delta.
-      // Suppress negative VP on CombatPass (alliance theft side effects).
-      // Suppress positive VP if no combat events exist (GAE handles it).
-      if (action == dune_imperium::kActionCombatPass && own_shaped_bonus != 0.0f &&
-          current_player >= 0 && current_player < game.NumPlayers()) {
-        if (own_shaped_bonus > 0.0f &&
-            !combat_credit[current_player].empty()) {
-          int total_delta = 0;
-          for (const auto& ev : combat_credit[current_player])
-            total_delta += ev.strength_delta;
-          if (total_delta > 0) {
-            for (const auto& ev : combat_credit[current_player]) {
-              float weight = static_cast<float>(ev.strength_delta) /
-                             static_cast<float>(total_delta);
-              float bonus = own_shaped_bonus * weight;
-              if (ev.transition_index >= 0 &&
-                  ev.transition_index < static_cast<int>(trajectory.size())) {
-                trajectory[ev.transition_index].q_value += bonus;
-                trajectory[ev.transition_index].advantage += bonus;
-                trajectory[ev.transition_index].reward_target += bonus;
+        // If CombatPass triggered own VP: redistribute positive VP to
+        // combat-causal transitions weighted by strength delta.
+        // Suppress negative VP on CombatPass (alliance theft side effects).
+        // Suppress positive VP if no combat events exist (GAE handles it).
+        if (action == dune_imperium::kActionCombatPass && own_shaped_bonus != 0.0f &&
+            current_player >= 0 && current_player < game.NumPlayers()) {
+          if (own_shaped_bonus > 0.0f &&
+              !combat_credit[current_player].empty()) {
+            int total_delta = 0;
+            for (const auto& ev : combat_credit[current_player])
+              total_delta += ev.strength_delta;
+            if (total_delta > 0) {
+              for (const auto& ev : combat_credit[current_player]) {
+                float weight = static_cast<float>(ev.strength_delta) /
+                               static_cast<float>(total_delta);
+                float bonus = own_shaped_bonus * weight;
+                if (ev.transition_index >= 0 &&
+                    ev.transition_index < static_cast<int>(trajectory.size())) {
+                  trajectory[ev.transition_index].q_value += bonus;
+                  trajectory[ev.transition_index].advantage += bonus;
+                  trajectory[ev.transition_index].reward_target += bonus;
+                }
               }
             }
           }
+          own_shaped_bonus = 0.0f;
         }
-        own_shaped_bonus = 0.0f;
-      }
 
-      transition.q_value = own_shaped_bonus;
-      transition.advantage = own_shaped_bonus;
-      transition.reward_target = own_shaped_bonus;
-      transition.v_value = current_value; // Store the V(s) value
-      transition.behavior_prob = behavior_prob;
-      transition.importance_multiplier = 1.0f;
-      transition.training_step_inserted = 0;
-      transition.player_id = current_player;
-      trajectory.push_back(std::move(transition));
-      if (current_player >= 0 && current_player < game.NumPlayers()) {
-        last_transition_index[current_player] =
-            static_cast<int>(current_transition_index);
+        transition.q_value = own_shaped_bonus;
+        transition.advantage = own_shaped_bonus;
+        transition.reward_target = own_shaped_bonus;
+        transition.v_value = current_value; // Store the V(s) value
+        transition.behavior_prob = behavior_prob;
+        transition.importance_multiplier = 1.0f;
+        transition.training_step_inserted = 0;
+        transition.player_id = current_player;
+        
+        recorded_transitions_by_seat[current_player].fetch_add(1, std::memory_order_relaxed);
+
+        trajectory.push_back(std::move(transition));
+        if (current_player >= 0 && current_player < game.NumPlayers()) {
+          last_transition_index[current_player] =
+              static_cast<int>(current_transition_index);
+        }
       }
 
       // Retro-credit VP to other players.
@@ -1395,6 +1472,9 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
                   , std::shared_ptr<BatchedEvaluator> evaluator
                   , std::atomic<float>* reward_lambda
                   , std::atomic<int>* training_steps
+                  , const std::vector<std::shared_ptr<BatchedEvaluator>>& opponent_evaluators
+                  , const std::vector<double>& opponent_mix
+                  , const std::string& learner_seat_mode
 #endif
 ) {
   std::mt19937 rng(std::random_device{}() + thread_id);
@@ -1411,7 +1491,8 @@ void ThreadWorker(int thread_id, const Game* game, std::atomic<int>& games_compl
     std::vector<Transition> local_trajectory;
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
     if (evaluator != nullptr) {
-      moves += TorchSimulation(&rng, *game, evaluator, obs_size, local_trajectory, reward_lambda);
+      moves += TorchSimulation(&rng, *game, evaluator, obs_size, local_trajectory, reward_lambda,
+                               opponent_evaluators, opponent_mix, learner_seat_mode, prev_completed);
     } else {
       moves += RandomSimulation(&rng, *game, obs_size, local_trajectory);
     }
@@ -1499,6 +1580,9 @@ int main(int argc, char** argv) {
   std::atomic<int> training_steps(absl::GetFlag(FLAGS_start_step));
   std::atomic<float> reward_lambda{1.0f};
   std::shared_ptr<open_spiel::BatchedEvaluator> evaluator = nullptr;
+  std::vector<std::shared_ptr<open_spiel::BatchedEvaluator>> opponent_evaluators;
+  std::vector<double> opponent_mix_normalized;
+  std::string learner_seat_mode = absl::GetFlag(FLAGS_learner_seat_mode);
 
   if (obs_size > 0) {
     int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
@@ -1582,6 +1666,115 @@ int main(int argc, char** argv) {
             ? absl::StrFormat(" (clip_epsilon=%.3f)",
                               absl::GetFlag(FLAGS_ppo_clip_epsilon))
             : "");
+
+    // Validate learner_seat_mode
+    SPIEL_CHECK_TRUE(learner_seat_mode == "self_play" || learner_seat_mode == "rotate");
+    
+    std::string opponent_checkpoints_str = absl::GetFlag(FLAGS_opponent_checkpoints);
+    if (learner_seat_mode == "rotate") {
+      SPIEL_CHECK_TRUE(!opponent_checkpoints_str.empty());
+    }
+
+    if (!opponent_checkpoints_str.empty()) {
+      std::vector<std::string> opponent_paths = open_spiel::SplitCommaSeparated(opponent_checkpoints_str);
+      size_t num_opponents = opponent_paths.size();
+      
+      std::string opponent_hidden_dims_str = absl::GetFlag(FLAGS_opponent_hidden_dims);
+      std::string opponent_num_blocks_str = absl::GetFlag(FLAGS_opponent_num_blocks);
+      
+      std::vector<std::string> h_dims_str = open_spiel::SplitCommaSeparated(opponent_hidden_dims_str);
+      std::vector<std::string> n_blocks_str = open_spiel::SplitCommaSeparated(opponent_num_blocks_str);
+      
+      std::vector<int> opponent_hidden_dims(num_opponents);
+      std::vector<int> opponent_num_blocks(num_opponents);
+      
+      // Resolve hidden dims
+      if (h_dims_str.empty()) {
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_hidden_dims[i] = hidden_dim;
+        }
+      } else if (h_dims_str.size() == 1) {
+        int single_val = std::stoi(h_dims_str[0]);
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_hidden_dims[i] = single_val;
+        }
+      } else {
+        SPIEL_CHECK_EQ(h_dims_str.size(), num_opponents);
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_hidden_dims[i] = std::stoi(h_dims_str[i]);
+        }
+      }
+      
+      // Resolve num blocks
+      if (n_blocks_str.empty()) {
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_num_blocks[i] = num_blocks;
+        }
+      } else if (n_blocks_str.size() == 1) {
+        int single_val = std::stoi(n_blocks_str[0]);
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_num_blocks[i] = single_val;
+        }
+      } else {
+        SPIEL_CHECK_EQ(n_blocks_str.size(), num_opponents);
+        for (size_t i = 0; i < num_opponents; ++i) {
+          opponent_num_blocks[i] = std::stoi(n_blocks_str[i]);
+        }
+      }
+      
+      // Parse and validate opponent mix
+      std::string opponent_mix_str = absl::GetFlag(FLAGS_opponent_mix);
+      std::vector<std::string> mix_str_vals = open_spiel::SplitCommaSeparated(opponent_mix_str);
+      std::vector<double> raw_weights;
+      
+      if (mix_str_vals.empty()) {
+        raw_weights.assign(num_opponents, 1.0);
+      } else {
+        SPIEL_CHECK_EQ(mix_str_vals.size(), num_opponents);
+        for (const auto& w_str : mix_str_vals) {
+          double w = std::stod(w_str);
+          SPIEL_CHECK_TRUE(std::isfinite(w));
+          SPIEL_CHECK_GE(w, 0.0);
+          raw_weights.push_back(w);
+        }
+      }
+      
+      double sum_weights = 0.0;
+      for (double w : raw_weights) sum_weights += w;
+      SPIEL_CHECK_GT(sum_weights, 0.0);
+      
+      opponent_mix_normalized.reserve(num_opponents);
+      for (double w : raw_weights) {
+        opponent_mix_normalized.push_back(w / sum_weights);
+      }
+      
+      // Load opponent models and wrap in BatchedEvaluators
+      opponent_evaluators.reserve(num_opponents);
+      for (size_t i = 0; i < num_opponents; ++i) {
+        std::cout << absl::StrFormat("Loading opponent %d: %s (Architecture: %dx%d, Weight: %.4f)\n",
+                                     i, opponent_paths[i], opponent_hidden_dims[i], opponent_num_blocks[i],
+                                     opponent_mix_normalized[i]);
+        
+        auto opp_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, opponent_hidden_dims[i], action_size, opponent_num_blocks[i]);
+        opp_model->eval();
+        
+        try {
+          torch::serialize::InputArchive archive;
+          archive.load_from(opponent_paths[i], train_device);
+          opp_model->load(archive);
+        } catch (const c10::Error& e) {
+          std::cerr << "Failed to load opponent checkpoint: " << opponent_paths[i] << "\n" << e.msg() << "\n";
+          std::exit(1);
+        }
+        
+        opp_model->to(train_device);
+        
+        opponent_evaluators.push_back(std::make_shared<open_spiel::BatchedEvaluator>(
+            opp_model, eval_batch_size, eval_timeout_ms, train_device, &sync_mutex,
+            0.0f, evaluator_device_synchronize));
+      }
+    }
   }
 #endif
 
@@ -1632,6 +1825,7 @@ int main(int argc, char** argv) {
                          &global_buffer, obs_size, &stop_collection
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
                          , evaluator, &reward_lambda, &training_steps
+                         , opponent_evaluators, opponent_mix_normalized, learner_seat_mode
 #endif
     );
   }
@@ -1712,6 +1906,28 @@ int main(int argc, char** argv) {
   std::cout << absl::StrFormat("Final Global Buffer Size: %zu transitions\n", global_buffer.Size());
   std::cout << absl::StrFormat("Games Per Second (GPS): %.2f\n", completed / seconds);
   std::cout << absl::StrFormat("Moves Per Second (MPS): %.2f\n", moves / seconds);
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  if (learner_seat_mode == "rotate") {
+    std::cout << absl::StrFormat("\n=== Frozen-Population Diagnostics ===\n");
+    std::cout << absl::StrFormat("Learner Seat Games Played: P0:%d | P1:%d | P2:%d | P3:%d\n",
+                                 open_spiel::learner_seat_games_count[0].load(),
+                                 open_spiel::learner_seat_games_count[1].load(),
+                                 open_spiel::learner_seat_games_count[2].load(),
+                                 open_spiel::learner_seat_games_count[3].load());
+    std::cout << absl::StrFormat("Learner Transitions Recorded: P0:%llu | P1:%llu | P2:%llu | P3:%llu (Total: %llu)\n",
+                                 static_cast<unsigned long long>(open_spiel::recorded_transitions_by_seat[0].load()),
+                                 static_cast<unsigned long long>(open_spiel::recorded_transitions_by_seat[1].load()),
+                                 static_cast<unsigned long long>(open_spiel::recorded_transitions_by_seat[2].load()),
+                                 static_cast<unsigned long long>(open_spiel::recorded_transitions_by_seat[3].load()),
+                                 static_cast<unsigned long long>(open_spiel::recorded_transitions_by_seat[0].load() +
+                                                                  open_spiel::recorded_transitions_by_seat[1].load() +
+                                                                  open_spiel::recorded_transitions_by_seat[2].load() +
+                                                                  open_spiel::recorded_transitions_by_seat[3].load()));
+    std::cout << absl::StrFormat("Opponent Decisions Made: %llu\n",
+                                 static_cast<unsigned long long>(open_spiel::opponent_decisions_count.load()));
+  }
+#endif
 
   return 0;
 }
