@@ -44,6 +44,7 @@ ABSL_FLAG(int, train_ratio, 64, "The number of NEW moves the CPU must generate b
 ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to linearly decay the shaped reward lambda.");
 ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained or lost in intermediate shaped rewards.");
 ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0, "Weight multiplier for Tleilaxu progress breadcrumbs (levels 4->5 and 5->6).");
+ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0, "Weight multiplier for the Tleilaxu level 7 VP milestone breadcrumb.");
 ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
@@ -951,6 +952,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   double temp = absl::GetFlag(FLAGS_temperature);
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
   double tleilaxu_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+  double tleilaxu_level7_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
   int game_length = 0;
@@ -1090,17 +1092,26 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
           int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
           current_tleilaxu[p] = new_tleilaxu;
 
-          if (tleilaxu_delta > 0 && tleilaxu_breadcrumb_weight > 0.0 && reward_lambda != nullptr) {
-            int breadcrumb_steps = 0;
+          if (tleilaxu_delta > 0 && reward_lambda != nullptr &&
+              (tleilaxu_breadcrumb_weight > 0.0 ||
+               tleilaxu_level7_breadcrumb_weight > 0.0)) {
+            int approach_steps = 0;
+            int level7_steps = 0;
             int start_l = new_tleilaxu - tleilaxu_delta;
             for (int l = start_l + 1; l <= new_tleilaxu; ++l) {
               if (l == 5 || l == 6) {
-                breadcrumb_steps++;
+                approach_steps++;
+              } else if (l == 7) {
+                level7_steps++;
               }
             }
-            if (breadcrumb_steps > 0) {
+            if (approach_steps > 0) {
               shaped_bonus_by_player[p] +=
-                  breadcrumb_steps * static_cast<float>(tleilaxu_breadcrumb_weight) * current_lambda;
+                  approach_steps * static_cast<float>(tleilaxu_breadcrumb_weight) * current_lambda;
+            }
+            if (level7_steps > 0) {
+              shaped_bonus_by_player[p] +=
+                  level7_steps * static_cast<float>(tleilaxu_level7_breadcrumb_weight) * current_lambda;
             }
           }
         }
