@@ -1191,12 +1191,24 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
             }
           }
 
-          // Swordmaster breadcrumb: one-time reward when acquired
+          // Swordmaster breadcrumb: round-decayed reward when acquired
           if (swordmaster_breadcrumb_weight > 0.0 && !had_swordmaster[p] &&
               dune_state->HasSwordmaster(p)) {
             had_swordmaster[p] = true;
+            int round = dune_state->GetCurrentRound();
+            double round_multiplier;
+            if (round <= 2)      round_multiplier = 1.00;
+            else if (round == 3) round_multiplier = 0.85;
+            else if (round == 4) round_multiplier = 0.65;
+            else if (round == 5) round_multiplier = 0.45;
+            else if (round == 6) round_multiplier = 0.25;
+            else if (round == 7) round_multiplier = 0.15;
+            else if (round == 8) round_multiplier = 0.075;
+            else                 round_multiplier = 0.00;  // R9+ no breadcrumb
             shaped_bonus_by_player[p] +=
-                static_cast<float>(swordmaster_breadcrumb_weight) * current_lambda;
+                static_cast<float>(swordmaster_breadcrumb_weight *
+                                   round_multiplier) *
+                current_lambda;
           }
         }
       }
