@@ -75,6 +75,8 @@ ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu levels 5/6 breadcrumbs.");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
+ABSL_FLAG(double, swordmaster_breadcrumb_weight, 0.0,
+          "Weight for one-time Swordmaster acquisition breadcrumb.");
 ABSL_FLAG(int, decay_horizon, 12000000,
           "Transitions over which shaped reward lambda decays.");
 ABSL_FLAG(double, reward_scale, 4.0,
@@ -351,10 +353,12 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
       dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
   std::vector<int> current_vps(game.NumPlayers(), 0);
   std::vector<int> current_tleilaxu(game.NumPlayers(), 0);
+  std::vector<bool> had_swordmaster(game.NumPlayers(), false);
   if (dune_state != nullptr) {
     for (int p = 0; p < game.NumPlayers(); ++p) {
       current_vps[p] = dune_state->GetPlayerVpForTesting(p);
       current_tleilaxu[p] = dune_state->GetTleilaxuTrackForTesting(p);
+      had_swordmaster[p] = dune_state->HasSwordmaster(p);
     }
   }
 
@@ -374,6 +378,8 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
       absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   double tleilaxu_level7_breadcrumb_weight =
       absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  double swordmaster_breadcrumb_weight =
+      absl::GetFlag(FLAGS_swordmaster_breadcrumb_weight);
   int decay_horizon = std::max(1, absl::GetFlag(FLAGS_decay_horizon));
 
   torch::NoGradGuard no_grad;
@@ -480,6 +486,14 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
                   reward_lambda;
             }
           }
+        }
+
+        // Swordmaster breadcrumb: one-time reward when acquired
+        if (swordmaster_breadcrumb_weight > 0.0 && !had_swordmaster[p] &&
+            dune_state->HasSwordmaster(p)) {
+          had_swordmaster[p] = true;
+          shaped_bonus_by_player[p] +=
+              static_cast<float>(swordmaster_breadcrumb_weight) * reward_lambda;
         }
       }
     }

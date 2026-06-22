@@ -46,6 +46,7 @@ ABSL_FLAG(int, decay_horizon, 12000000, "Number of training steps over which to 
 ABSL_FLAG(double, shaped_reward_weight, 0.2, "Weight multiplier for each VP gained or lost in intermediate shaped rewards.");
 ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0, "Weight multiplier for Tleilaxu progress breadcrumbs (levels 4->5 and 5->6).");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0, "Weight multiplier for the Tleilaxu level 7 VP milestone breadcrumb.");
+ABSL_FLAG(double, swordmaster_breadcrumb_weight, 0.0, "Weight multiplier for one-time Swordmaster acquisition breadcrumb.");
 ABSL_FLAG(double, temperature, 1.0, "Softmax temperature for action selection (1.0 = standard, >1.0 = explore, 0.0 = greedy).");
 ABSL_FLAG(double, learning_rate, 1e-4, "Learning rate for the Adam optimizer.");
 ABSL_FLAG(double, mmd_eta, 0.2, "MMD entropy parameter eta.");
@@ -990,10 +991,12 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
       dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
   std::vector<int> current_vps(game.NumPlayers(), 0);
   std::vector<int> current_tleilaxu(game.NumPlayers(), 0);
+  std::vector<bool> had_swordmaster(game.NumPlayers(), false);
   if (dune_state != nullptr) {
     for (int p = 0; p < game.NumPlayers(); ++p) {
       current_vps[p] = dune_state->GetPlayerVpForTesting(p);
       current_tleilaxu[p] = dune_state->GetTleilaxuTrackForTesting(p);
+      had_swordmaster[p] = dune_state->HasSwordmaster(p);
     }
   }
   std::vector<int> last_transition_index(game.NumPlayers(), -1);
@@ -1017,6 +1020,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
   double shaped_weight = absl::GetFlag(FLAGS_shaped_reward_weight);
   double tleilaxu_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   double tleilaxu_level7_breadcrumb_weight = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  double swordmaster_breadcrumb_weight = absl::GetFlag(FLAGS_swordmaster_breadcrumb_weight);
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
   int game_length = 0;
@@ -1185,6 +1189,14 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
               shaped_bonus_by_player[p] +=
                   level7_steps * static_cast<float>(tleilaxu_level7_breadcrumb_weight) * current_lambda;
             }
+          }
+
+          // Swordmaster breadcrumb: one-time reward when acquired
+          if (swordmaster_breadcrumb_weight > 0.0 && !had_swordmaster[p] &&
+              dune_state->HasSwordmaster(p)) {
+            had_swordmaster[p] = true;
+            shaped_bonus_by_player[p] +=
+                static_cast<float>(swordmaster_breadcrumb_weight) * current_lambda;
           }
         }
       }
