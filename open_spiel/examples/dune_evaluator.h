@@ -1,0 +1,171 @@
+#pragma once
+
+#include <memory>
+#include <vector>
+#include <cmath>
+#include <cstring>
+#include <algorithm>
+#include <limits>
+
+#include <atomic>
+#include <iostream>
+
+#include "open_spiel/spiel.h"
+#include "open_spiel/algorithms/mcts.h"
+#include <torch/torch.h>
+
+#include "dune_network.h"
+
+namespace open_spiel {
+
+class DuneNNEvaluator : public algorithms::Evaluator {
+ public:
+  DuneNNEvaluator(
+      std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+      torch::Device device,
+      double value_scale = 1.0,
+      float logit_cap = 10.0f,
+      bool active_player_only = false)
+      : model_(model),
+        device_(device),
+        value_scale_(value_scale),
+        logit_cap_(logit_cap),
+        active_player_only_(active_player_only) {
+    model_->eval(); // Guard against BatchNorm/Dropout updates
+
+    // Dynamically retrieve the expected observation input size from the model
+    obs_size_ = model_->input_layer->weight.size(1);
+
+    // Pre-allocate a persistent CPU tensor to reuse across evaluation steps.
+    // Use pinned memory if target is CUDA to accelerate H2D transfers.
+    auto options = torch::TensorOptions().dtype(torch::kFloat32);
+    if (device_.is_cuda()) {
+      options = options.pinned_memory(true);
+    }
+    input_tensor_ = torch::empty({1, obs_size_}, options);
+  }
+
+  std::vector<double> Evaluate(const State& state) override {
+    torch::InferenceMode guard; // Fast ungrad inference
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda()); // Match training precision
+
+    int num_players = state.NumPlayers();
+    std::vector<double> values(num_players, 0.0);
+
+    // Note: IS-MCTS normally handles chance states recursively without calling
+    // Evaluate() on them. However, if defensively called on a chance node,
+    // state.CurrentPlayer() will return kChancePlayerId (-1). The sequential
+    // evaluation loop below safely processes player 0..3 observations, avoiding crashes.
+
+    if (active_player_only_) {
+      Player current_player = state.CurrentPlayer();
+      if (current_player >= 0 && current_player < num_players) {
+        std::vector<float> obs = state.InformationStateTensor(current_player);
+        CheckObsSize(obs.size());
+        
+        // Zero-allocation update: copy observation into the pre-allocated CPU buffer
+        std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+        torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
+        
+        auto outputs = model_->forward(device_tensor);
+        values[current_player] = outputs.values.item<double>() * value_scale_;
+      }
+      return values;
+    }
+
+    // Sequential evaluation for all 4 players
+    for (int p = 0; p < num_players; ++p) {
+      std::vector<float> obs = state.InformationStateTensor(p);
+      CheckObsSize(obs.size());
+      
+      std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+      torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
+      
+      auto outputs = model_->forward(device_tensor);
+      values[p] = outputs.values.item<double>() * value_scale_;
+    }
+    return values;
+  }
+
+  ActionsAndProbs Prior(const State& state) override {
+    torch::InferenceMode guard;
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda());
+
+    if (state.IsTerminal()) {
+      return {};
+    }
+    Player current_player = state.CurrentPlayer();
+    if (current_player < 0 || current_player >= state.NumPlayers()) {
+      return {};
+    }
+
+    std::vector<float> obs = state.InformationStateTensor(current_player);
+    CheckObsSize(obs.size());
+    std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+    torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
+
+    auto outputs = model_->forward(device_tensor);
+
+    std::vector<Action> legal_actions = state.LegalActions();
+    if (legal_actions.empty()) {
+      return {};
+    }
+
+    // Cast AMP FP16 outputs back to Float32 and move to CPU host
+    torch::Tensor logits_tensor = outputs.logits.squeeze(0).to(torch::kFloat32).to(torch::kCPU);
+    float* logits_ptr = logits_tensor.data_ptr<float>();
+    int64_t action_dim = logits_tensor.size(0);
+    std::vector<float> logits(logits_ptr, logits_ptr + action_dim);
+
+    CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+
+    // CPU-based softmax over legal actions
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (Action action : legal_actions) {
+      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+        max_logit = std::max(max_logit, static_cast<double>(logits[action]));
+      }
+    }
+
+    double sum_exp = 0.0;
+    std::vector<double> exps(legal_actions.size());
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      Action action = legal_actions[i];
+      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+        exps[i] = std::exp(logits[action] - max_logit);
+        sum_exp += exps[i];
+      } else {
+        exps[i] = 0.0;
+      }
+    }
+
+    ActionsAndProbs policy;
+    policy.reserve(legal_actions.size());
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
+      policy.push_back({legal_actions[i], prob});
+    }
+
+    return policy;
+  }
+
+ private:
+  void CheckObsSize(size_t size) const {
+    static std::atomic<bool> warned_mismatch{false};
+    if (size != static_cast<size_t>(obs_size_) && !warned_mismatch.exchange(true)) {
+      std::cerr << "[WARNING] DuneNNEvaluator: Observation size mismatch! Game state IST size = "
+                << size << ", but network expects input size = " << obs_size_
+                << ". Data will be truncated or padded.\n";
+    }
+  }
+
+  std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
+  torch::Device device_;
+  double value_scale_;
+  float logit_cap_;
+  bool active_player_only_;
+  int64_t obs_size_;
+  torch::Tensor input_tensor_;
+};
+
+} // namespace open_spiel
