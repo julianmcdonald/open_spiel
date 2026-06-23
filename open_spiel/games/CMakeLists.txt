@@ -823,4 +823,8 @@ add_executable(dune_imperium_leaders_test dune_imperium/dune_imperium_leaders_te
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_leaders_test dune_imperium_leaders_test)
 
+add_executable(dune_imperium_resample_test dune_imperium/dune_imperium_resample_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+               $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_resample_test dune_imperium_resample_test)
+
 
