@@ -330,6 +330,111 @@ void TestEndToEndRollouts() {
   std::cout << "Test 7 Passed!\n\n";
 }
 
+// Test 8: Canonical Observation and InfoState Sorting
+void TestCanonicalObservationSorting() {
+  std::cout << "Running Test 8: Canonical Observation Sorting...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state1 = game->NewInitialState();
+  while (state1->IsChanceNode()) {
+    state1->ApplyAction(state1->ChanceOutcomes().front().first);
+  }
+  std::unique_ptr<State> state2 = state1->Clone();
+
+  auto* dstate1 = static_cast<dune_imperium::DuneImperiumState*>(state1.get());
+  auto* dstate2 = static_cast<dune_imperium::DuneImperiumState*>(state2.get());
+
+  // Setup hands with different orderings but same elements
+  dstate1->SetPlayerHandForTesting(0, {1, 2, 3});
+  dstate2->SetPlayerHandForTesting(0, {3, 1, 2});
+
+  dstate1->SetPlayerDeckForTesting(0, {10, 20});
+  dstate2->SetPlayerDeckForTesting(0, {20, 10});
+
+  dstate1->SetPlayerIntriguesForTesting(0, {5, 6});
+  dstate2->SetPlayerIntriguesForTesting(0, {6, 5});
+
+  // Observations and InfoState strings must be exactly identical
+  assert(dstate1->ObservationString(0) == dstate2->ObservationString(0));
+  assert(dstate1->InformationStateString(0) == dstate2->InformationStateString(0));
+
+  std::cout << "Test 8 Passed!\n\n";
+}
+
+// Test 9: Opponent Model Path MCTS Search
+void TestOpponentModelPath() {
+  std::cout << "Running Test 9: Opponent Model Path...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() > 1);
+
+  // Mock priors and values
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.2, 0.3, 0.4, 0.1};
+
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+  // Instantiate MCTS bot with use_opponent_model = true
+  DunePUCTISMCTSBot bot(
+      /*seed=*/42,
+      evaluator,
+      /*puct_c=*/1.0,
+      /*max_simulations=*/10,
+      /*max_world_samples=*/-1,
+      /*temperature=*/1.0,
+      /*dirichlet_epsilon=*/0.0,
+      /*dirichlet_alpha=*/0.3,
+      /*value_scale=*/1.0,
+      /*use_observation_string=*/true,
+      /*allow_inconsistent_action_sets=*/true,
+      DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
+      /*use_opponent_model=*/true,
+      /*opponent_temperature=*/0.0,
+      /*verbose_diagnostics=*/false
+  );
+
+  ActionsAndProbs policy = bot.RunSearch(*state);
+  assert(!policy.empty());
+
+  std::cout << "Test 9 Passed!\n\n";
+}
+
+// Test 10: Hundro Coherence Resampling
+void TestHundroCoherenceResampling() {
+  std::cout << "Running Test 10: Hundro Coherence Resampling...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  auto* dstate = static_cast<dune_imperium::DuneImperiumState*>(state.get());
+
+  // Setup Hundro player to Player 1, and search player (player_id) to Player 0
+  dstate->SetHundroPlayerForTesting(1);
+  dstate->SetLeaderForTesting(1, static_cast<int>(dune_imperium::LeaderId::kHundroMoritani));
+
+  std::mt19937 rng(42);
+  auto sampler = [&rng]() { return absl::Uniform(rng, 0.0, 1.0); };
+
+  // Resample from Player 0's perspective (searcher who is NOT Hundro)
+  auto resampled = dstate->ResampleFromInfostate(0, sampler);
+  auto* dresampled = static_cast<dune_imperium::DuneImperiumState*>(resampled.get());
+
+  // Since the searcher is Player 0 (not Hundro), all entries in hundro_known_drawn_intrigue_ must be cleared to kInvalidCard
+  for (int p = 0; p < 4; ++p) {
+    assert(dresampled->GetHundroKnownDrawnIntrigueForTesting(p) == dune_imperium::kInvalidCard);
+  }
+
+  std::cout << "Test 10 Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -341,6 +446,9 @@ int main() {
   open_spiel::TestSingleActionBypass();
   open_spiel::TestChanceNodeTraversal();
   open_spiel::TestEndToEndRollouts();
+  open_spiel::TestCanonicalObservationSorting();
+  open_spiel::TestOpponentModelPath();
+  open_spiel::TestHundroCoherenceResampling();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

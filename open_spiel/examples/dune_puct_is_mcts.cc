@@ -19,7 +19,9 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
     int max_simulations, int max_world_samples, double temperature,
     double dirichlet_epsilon, double dirichlet_alpha, double value_scale,
     bool use_observation_string, bool allow_inconsistent_action_sets,
-    DuneISMCTSFinalPolicyType final_policy_type)
+    DuneISMCTSFinalPolicyType final_policy_type,
+    bool use_opponent_model, double opponent_temperature,
+    bool verbose_diagnostics)
     : rng_(seed),
       evaluator_(evaluator),
       puct_c_(puct_c),
@@ -32,6 +34,9 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
       use_observation_string_(use_observation_string),
       allow_inconsistent_action_sets_(allow_inconsistent_action_sets),
       final_policy_type_(final_policy_type),
+      use_opponent_model_(use_opponent_model),
+      opponent_temperature_(opponent_temperature),
+      verbose_diagnostics_(verbose_diagnostics),
       root_node_(nullptr) {}
 
 double DunePUCTISMCTSBot::RandomNumber() {
@@ -43,6 +48,11 @@ void DunePUCTISMCTSBot::Reset() {
   node_pool_.clear();
   root_samples_.clear();
   root_node_ = nullptr;
+  max_depth_this_search_ = 0;
+  sum_depth_this_search_ = 0.0;
+  num_sims_this_search_ = 0;
+  total_lookups_ = 0;
+  reused_lookups_ = 0;
 }
 
 std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state) const {
@@ -79,10 +89,13 @@ DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
 }
 
 DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
-  auto iter = nodes_.find(GetStateKey(state));
+  total_lookups_++;
+  auto key = GetStateKey(state);
+  auto iter = nodes_.find(key);
   if (iter == nodes_.end()) {
     return nullptr;
   }
+  reused_lookups_++;
   return iter->second;
 }
 
@@ -252,21 +265,74 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
   }
 }
 
-std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state) {
+std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth) {
+  max_depth_this_search_ = std::max(max_depth_this_search_, depth);
+
   if (state->IsTerminal()) {
     std::vector<double> returns = state->Returns();
     for (double& r : returns) {
       r /= value_scale_;
     }
+    sum_depth_this_search_ += depth;
+    num_sims_this_search_++;
     return returns;
   } else if (state->IsChanceNode()) {
     Action chance_action = SampleAction(state->ChanceOutcomes(), RandomNumber()).first;
     state->ApplyAction(chance_action);
-    return RunSimulation(state);
+    return RunSimulation(state, depth + 1);
   }
 
   std::vector<Action> legal_actions = state->LegalActions();
   Player cur_player = state->CurrentPlayer();
+
+  if (use_opponent_model_ && cur_player != searching_player_) {
+    ActionsAndProbs prior = evaluator_->Prior(*state);
+    Action chosen_action = kInvalidAction;
+    if (prior.empty()) {
+      if (!legal_actions.empty()) {
+        chosen_action = legal_actions[absl::Uniform(rng_, 0u, legal_actions.size())];
+      }
+    } else {
+      double temp = opponent_temperature_;
+      if (temp <= 0.0) {
+        chosen_action = prior[0].first;
+        double best_prob = prior[0].second;
+        for (const auto& ap : prior) {
+          if (ap.second > best_prob) {
+            best_prob = ap.second;
+            chosen_action = ap.first;
+          }
+        }
+      } else {
+        ActionsAndProbs scaled;
+        scaled.reserve(prior.size());
+        double sum = 0.0;
+        double inv_temp = 1.0 / temp;
+        for (const auto& ap : prior) {
+          double p = std::pow(std::max(ap.second, 1e-12), inv_temp);
+          scaled.push_back({ap.first, p});
+          sum += p;
+        }
+        for (auto& ap : scaled) {
+          ap.second /= sum;
+        }
+        chosen_action = SampleAction(scaled, RandomNumber()).first;
+      }
+    }
+
+    if (chosen_action != kInvalidAction) {
+      state->ApplyAction(chosen_action);
+      return RunSimulation(state, depth + 1);
+    } else {
+      std::vector<double> returns = state->Returns();
+      for (double& r : returns) {
+        r /= value_scale_;
+      }
+      sum_depth_this_search_ += depth;
+      num_sims_this_search_++;
+      return returns;
+    }
+  }
   
   DuneISMCTSNode* node = LookupOrCreateNode(*state);
   SPIEL_CHECK_TRUE(node != nullptr);
@@ -275,6 +341,8 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state) {
 
   if (node->total_visits == -1) {
     node->total_visits = 0;
+    sum_depth_this_search_ += depth;
+    num_sims_this_search_++;
     return evaluator_->Evaluate(*state);
   }
 
@@ -285,7 +353,7 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state) {
   node->child_info[chosen_action].visits++;
 
   state->ApplyAction(chosen_action);
-  std::vector<double> returns = RunSimulation(state);
+  std::vector<double> returns = RunSimulation(state, depth + 1);
   
   // Multi-player Max-N backup
   node->child_info[chosen_action].return_sum += returns[cur_player];
@@ -300,6 +368,8 @@ ActionsAndProbs DunePUCTISMCTSBot::RunSearch(const State& state) {
   if (legal_actions.size() == 1) {
     return {{legal_actions[0], 1.0}};
   }
+
+  searching_player_ = state.CurrentPlayer();
 
   root_node_ = CreateNewNode(state);
   InitializePriors(root_node_, state);
@@ -328,7 +398,18 @@ ActionsAndProbs DunePUCTISMCTSBot::RunSearch(const State& state) {
   for (int sim = 0; sim < max_simulations_; ++sim) {
     std::unique_ptr<State> sampled_root_state = SampleRootState(state);
     SPIEL_CHECK_TRUE(root_key == GetStateKey(*sampled_root_state));
-    RunSimulation(sampled_root_state.get());
+    RunSimulation(sampled_root_state.get(), 0);
+  }
+
+  if (verbose_diagnostics_ && (search_count_++ % 50 == 0)) {
+    double avg_depth = num_sims_this_search_ > 0 ? (sum_depth_this_search_ / num_sims_this_search_) : 0.0;
+    double reuse_rate = total_lookups_ > 0 ? (100.0 * reused_lookups_ / total_lookups_) : 0.0;
+    std::cout << "[IS-MCTS Diagnostics] Search " << search_count_
+              << " | Player P" << searching_player_
+              << " | Tree size: " << nodes_.size()
+              << " | Max depth: " << max_depth_this_search_
+              << " | Avg depth: " << avg_depth
+              << " | Node reuse: " << reuse_rate << "%\n" << std::flush;
   }
 
   return GetFinalPolicy(state, root_node_);

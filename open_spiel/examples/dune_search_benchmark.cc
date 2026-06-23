@@ -15,6 +15,7 @@
 #include <map>
 
 #include "open_spiel/spiel.h"
+#include "open_spiel/spiel_utils.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
@@ -43,13 +44,16 @@ ABSL_FLAG(double, opponent_temperature, 0.0, "Softmax temperature for opponent a
 ABSL_FLAG(double, dirichlet_epsilon, 0.0, "Dirichlet noise weight at root.");
 ABSL_FLAG(double, dirichlet_alpha, 0.3, "Dirichlet noise alpha.");
 ABSL_FLAG(bool, rotate_seat, true, "Rotate the seat of the search agent across games.");
+ABSL_FLAG(bool, use_opponent_model, false, "Whether non-search players in simulation follow the PPO prior policy instead of PUCT.");
+ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth diagnostics periodically.");
 
 namespace open_spiel {
 namespace {
 
 class DuneGreedyBot : public Bot {
  public:
-  DuneGreedyBot(std::unique_ptr<DuneNNEvaluator> evaluator) : evaluator_(std::move(evaluator)) {}
+  DuneGreedyBot(std::unique_ptr<DuneNNEvaluator> evaluator, int seed, double temperature)
+      : evaluator_(std::move(evaluator)), rng_(seed), temperature_(temperature) {}
   
   Action Step(const State& state) override {
     if (state.IsTerminal()) return kInvalidAction;
@@ -73,23 +77,46 @@ class DuneGreedyBot : public Bot {
   void RestartAt(const State& state) override {}
   
  private:
+  double RandomNumber() {
+    return absl::Uniform(rng_, 0.0, 1.0);
+  }
+
   Action SelectBestAction(const ActionsAndProbs& policy, const State& state) {
     if (policy.empty()) {
       auto legals = state.LegalActions();
       return legals.empty() ? kInvalidAction : legals.front();
     }
-    Action best_action = policy[0].first;
-    double best_prob = policy[0].second;
-    for (const auto& ap : policy) {
-      if (ap.second > best_prob) {
-        best_prob = ap.second;
-        best_action = ap.first;
+    double temp = temperature_;
+    if (temp <= 0.0) {
+      Action best_action = policy[0].first;
+      double best_prob = policy[0].second;
+      for (const auto& ap : policy) {
+        if (ap.second > best_prob) {
+          best_prob = ap.second;
+          best_action = ap.first;
+        }
       }
+      return best_action;
+    } else {
+      ActionsAndProbs scaled_policy;
+      scaled_policy.reserve(policy.size());
+      double sum = 0.0;
+      double inv_temp = 1.0 / temp;
+      for (const auto& ap : policy) {
+        double p = std::pow(std::max(ap.second, 1e-12), inv_temp);
+        scaled_policy.push_back({ap.first, p});
+        sum += p;
+      }
+      for (auto& ap : scaled_policy) {
+        ap.second /= sum;
+      }
+      return SampleAction(scaled_policy, RandomNumber()).first;
     }
-    return best_action;
   }
 
   std::unique_ptr<DuneNNEvaluator> evaluator_;
+  std::mt19937 rng_;
+  double temperature_;
 };
 
 class DuneRandomBot : public Bot {
@@ -172,13 +199,21 @@ void WorkerThread(
             absl::GetFlag(FLAGS_temperature),
             absl::GetFlag(FLAGS_dirichlet_epsilon),
             absl::GetFlag(FLAGS_dirichlet_alpha),
-            1.0
+            1.0,
+            /*use_observation_string=*/true,
+            /*allow_inconsistent_action_sets=*/true,
+            DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
+            absl::GetFlag(FLAGS_use_opponent_model),
+            absl::GetFlag(FLAGS_opponent_temperature),
+            absl::GetFlag(FLAGS_verbose_diagnostics)
         );
       } else {
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
               opponent_model, device, 1.0, 10.0f, /*active_player_only=*/false);
-          bots[p] = std::make_unique<DuneGreedyBot>(std::move(local_opp_eval));
+          bots[p] = std::make_unique<DuneGreedyBot>(
+              std::move(local_opp_eval), rng(),
+              absl::GetFlag(FLAGS_opponent_temperature));
         } else {
           bots[p] = std::make_unique<DuneRandomBot>(rng());
         }

@@ -47,7 +47,10 @@ class DunePUCTISMCTSBot : public Bot {
                     double value_scale = 4.0,
                     bool use_observation_string = true,
                     bool allow_inconsistent_action_sets = true,
-                    DuneISMCTSFinalPolicyType final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount);
+                    DuneISMCTSFinalPolicyType final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
+                    bool use_opponent_model = false,
+                    double opponent_temperature = 0.0,
+                    bool verbose_diagnostics = false);
 
   Action Step(const State& state) override;
   bool ProvidesPolicy() override { return true; }
@@ -71,7 +74,7 @@ class DunePUCTISMCTSBot : public Bot {
   DuneISMCTSNode* LookupNode(const State& state);
 
   // Core search procedures
-  std::vector<double> RunSimulation(State* state);
+  std::vector<double> RunSimulation(State* state, int depth = 0);
   Action SelectActionTreePolicy(DuneISMCTSNode* node, const std::vector<Action>& legal_actions);
   Action SelectActionPUCT(DuneISMCTSNode* node);
   void InitializePriors(DuneISMCTSNode* node, const State& state);
@@ -90,6 +93,17 @@ class DunePUCTISMCTSBot : public Bot {
   bool use_observation_string_;
   bool allow_inconsistent_action_sets_;
   DuneISMCTSFinalPolicyType final_policy_type_;
+  bool use_opponent_model_;
+  double opponent_temperature_;
+  bool verbose_diagnostics_;
+
+  Player searching_player_ = kInvalidPlayer;
+  int max_depth_this_search_ = 0;
+  double sum_depth_this_search_ = 0.0;
+  int num_sims_this_search_ = 0;
+  int total_lookups_ = 0;
+  int reused_lookups_ = 0;
+  int search_count_ = 0;
 
   absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*> nodes_;
   std::vector<std::unique_ptr<DuneISMCTSNode>> node_pool_;
