@@ -44,9 +44,8 @@ class DunePUCTISMCTSBot : public Bot {
                     double temperature = 1.0,
                     double dirichlet_epsilon = 0.0,
                     double dirichlet_alpha = 0.3,
-                    double value_scale = 4.0,
+                    double value_scale = 1.0,
                     bool use_observation_string = true,
-                    bool allow_inconsistent_action_sets = true,
                     DuneISMCTSFinalPolicyType final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
                     bool use_opponent_model = false,
                     double opponent_temperature = 0.0,
@@ -91,7 +90,6 @@ class DunePUCTISMCTSBot : public Bot {
   double dirichlet_alpha_;
   double value_scale_;
   bool use_observation_string_;
-  bool allow_inconsistent_action_sets_;
   DuneISMCTSFinalPolicyType final_policy_type_;
   bool use_opponent_model_;
   double opponent_temperature_;

@@ -161,25 +161,22 @@ int main(int argc, char* argv[]) {
     std::cout << "Test 2 Passed! Probability sum: " << prob_sum << "\n\n";
   }
 
-  // Test 3: Active-Player-Only Optimization
+  // Test 3: Sequential Evaluation Verification
   {
-    std::cout << "=== Test 3: Active-Player-Only Optimization ===\n";
-    DuneNNEvaluator eval_normal(model, device, 1.0, 10.0f, false);
-    DuneNNEvaluator eval_active_only(model, device, 1.0, 10.0f, true);
+    std::cout << "=== Test 3: Sequential Evaluation Verification ===\n";
+    DuneNNEvaluator evaluator(model, device, 1.0, 10.0f);
 
-    auto values_normal = eval_normal.Evaluate(*state);
-    auto values_active = eval_active_only.Evaluate(*state);
+    auto values = evaluator.Evaluate(*state);
 
-    assert(values_normal.size() == 4);
-    assert(values_active.size() == 4);
-
-    for (int p = 0; p < 4; ++p) {
-      if (p == acting_player) {
-        AssertAlmostEqual(values_active[p], values_normal[p], 1e-5);
-      } else {
-        assert(values_active[p] == 0.0);
-      }
+    assert(values.size() == 4);
+    std::cout << "Evaluated values: ";
+    for (double v : values) {
+      std::cout << v << " ";
+      assert(!std::isnan(v));
+      assert(!std::isinf(v));
     }
+    std::cout << "\n";
+
     std::cout << "Test 3 Passed!\n\n";
   }
 

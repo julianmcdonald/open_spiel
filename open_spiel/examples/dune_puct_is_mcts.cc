@@ -18,7 +18,7 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
     int seed, std::shared_ptr<algorithms::Evaluator> evaluator, double puct_c,
     int max_simulations, int max_world_samples, double temperature,
     double dirichlet_epsilon, double dirichlet_alpha, double value_scale,
-    bool use_observation_string, bool allow_inconsistent_action_sets,
+    bool use_observation_string,
     DuneISMCTSFinalPolicyType final_policy_type,
     bool use_opponent_model, double opponent_temperature,
     bool verbose_diagnostics)
@@ -32,7 +32,6 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
       dirichlet_alpha_(dirichlet_alpha),
       value_scale_(value_scale),
       use_observation_string_(use_observation_string),
-      allow_inconsistent_action_sets_(allow_inconsistent_action_sets),
       final_policy_type_(final_policy_type),
       use_opponent_model_(use_opponent_model),
       opponent_temperature_(opponent_temperature),
@@ -151,117 +150,53 @@ ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
 
 Action DunePUCTISMCTSBot::SelectActionTreePolicy(
     DuneISMCTSNode* node, const std::vector<Action>& legal_actions) {
-  if (allow_inconsistent_action_sets_) {
-    // Filter and normalize priors dynamically
-    ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
-    
-    // Check for unvisited legal actions
-    std::vector<std::pair<Action, double>> unvisited_candidates;
-    for (const auto& action_prob : normalized) {
-      Action a = action_prob.first;
-      double prior = action_prob.second;
-      auto iter = node->child_info.find(a);
-      if (iter == node->child_info.end() || iter->second.visits == 0) {
-        unvisited_candidates.push_back({a, prior});
-      }
+  // Filter and normalize priors dynamically
+  ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
+
+  // Calculate First Play Urgency (FPU) value as the average Q-value of the parent node
+  double fpu_val = 0.0;
+  if (node->total_visits > 0) {
+    double total_return_sum = 0.0;
+    for (const auto& child_pair : node->child_info) {
+      total_return_sum += child_pair.second.return_sum;
     }
+    fpu_val = total_return_sum / node->total_visits;
+  }
+
+  Action best_action = kInvalidAction;
+  double best_puct_val = -std::numeric_limits<double>::infinity();
+  double tie_tolerance = 1e-5;
+  std::vector<Action> best_actions;
+
+  double parent_visits_sqrt = std::sqrt(std::max(1, node->total_visits));
+
+  for (const auto& action_prob : normalized) {
+    Action a = action_prob.first;
+    double prior = action_prob.second;
+    auto& child = node->child_info[a];
     
-    if (!unvisited_candidates.empty()) {
-      // Prioritize unvisited, break ties by prior weight
-      Action best_action = unvisited_candidates[0].first;
-      double best_prior = unvisited_candidates[0].second;
-      for (const auto& candidate : unvisited_candidates) {
-        if (candidate.second > best_prior) {
-          best_prior = candidate.second;
-          best_action = candidate.first;
-        }
-      }
-      // Ensure child_info entry exists for visits tracking
-      if (node->child_info.find(best_action) == node->child_info.end()) {
-        node->child_info[best_action] = DuneChildInfo{0, 0.0, best_prior};
-      }
-      return best_action;
+    // Remember normalized prior for child visits tracking if not already set
+    if (child.prior == 0.0) {
+      child.prior = prior;
     }
-    
-    // Standard PUCT selection
-    Action best_action = kInvalidAction;
-    double best_puct_val = -std::numeric_limits<double>::infinity();
-    double tie_tolerance = 1e-5;
-    std::vector<Action> best_actions;
-    
-    double parent_visits_sqrt = std::sqrt(node->total_visits);
-    
-    for (const auto& action_prob : normalized) {
-      Action a = action_prob.first;
-      double prior = action_prob.second;
-      auto& child = node->child_info[a];
-      
-      double u = puct_c_ * prior * parent_visits_sqrt / (1.0 + child.visits);
-      double puct_val = child.value() + u;
-      
-      if (puct_val > best_puct_val + tie_tolerance) {
-        best_puct_val = puct_val;
-        best_actions = {a};
-      } else if (puct_val >= best_puct_val - tie_tolerance) {
-        best_actions.push_back(a);
-      }
+
+    double q_val = (child.visits > 0) ? child.value() : fpu_val;
+    double u = puct_c_ * prior * parent_visits_sqrt / (1.0 + child.visits);
+    double puct_val = q_val + u;
+
+    if (puct_val > best_puct_val + tie_tolerance) {
+      best_puct_val = puct_val;
+      best_actions = {a};
+    } else if (puct_val >= best_puct_val - tie_tolerance) {
+      best_actions.push_back(a);
     }
-    
-    SPIEL_CHECK_GE(best_actions.size(), 1);
-    if (best_actions.size() == 1) {
-      return best_actions[0];
-    } else {
-      return best_actions[absl::Uniform(rng_, 0u, best_actions.size())];
-    }
+  }
+
+  SPIEL_CHECK_GE(best_actions.size(), 1);
+  if (best_actions.size() == 1) {
+    return best_actions[0];
   } else {
-    // Inconsistent action sets not allowed
-    std::vector<std::pair<Action, double>> unvisited_candidates;
-    for (const auto& action_child : node->child_info) {
-      Action a = action_child.first;
-      const auto& child = action_child.second;
-      if (child.visits == 0) {
-        unvisited_candidates.push_back({a, child.prior});
-      }
-    }
-    
-    if (!unvisited_candidates.empty()) {
-      Action best_action = unvisited_candidates[0].first;
-      double best_prior = unvisited_candidates[0].second;
-      for (const auto& candidate : unvisited_candidates) {
-        if (candidate.second > best_prior) {
-          best_prior = candidate.second;
-          best_action = candidate.first;
-        }
-      }
-      return best_action;
-    }
-    
-    Action best_action = kInvalidAction;
-    double best_puct_val = -std::numeric_limits<double>::infinity();
-    std::vector<Action> best_actions;
-    double tie_tolerance = 1e-5;
-    double parent_visits_sqrt = std::sqrt(node->total_visits);
-    
-    for (const auto& action_child : node->child_info) {
-      Action a = action_child.first;
-      const auto& child = action_child.second;
-      double u = puct_c_ * child.prior * parent_visits_sqrt / (1.0 + child.visits);
-      double puct_val = child.value() + u;
-      
-      if (puct_val > best_puct_val + tie_tolerance) {
-        best_puct_val = puct_val;
-        best_actions = {a};
-      } else if (puct_val >= best_puct_val - tie_tolerance) {
-        best_actions.push_back(a);
-      }
-    }
-    
-    SPIEL_CHECK_GE(best_actions.size(), 1);
-    if (best_actions.size() == 1) {
-      return best_actions[0];
-    } else {
-      return best_actions[absl::Uniform(rng_, 0u, best_actions.size())];
-    }
+    return best_actions[absl::Uniform(rng_, 0u, best_actions.size())];
   }
 }
 

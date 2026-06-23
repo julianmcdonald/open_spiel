@@ -185,7 +185,7 @@ void WorkerThread(
     
     // Create thread-local, bot-specific evaluator wrapping the shared search model
     auto search_evaluator = std::make_shared<DuneNNEvaluator>(
-        search_model, device, absl::GetFlag(FLAGS_value_scale), 10.0f, /*active_player_only=*/false);
+        search_model, device, absl::GetFlag(FLAGS_value_scale), 10.0f);
 
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
@@ -201,7 +201,6 @@ void WorkerThread(
             absl::GetFlag(FLAGS_dirichlet_alpha),
             1.0,
             /*use_observation_string=*/true,
-            /*allow_inconsistent_action_sets=*/true,
             DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
             absl::GetFlag(FLAGS_use_opponent_model),
             absl::GetFlag(FLAGS_opponent_temperature),
@@ -210,7 +209,7 @@ void WorkerThread(
       } else {
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
-              opponent_model, device, 1.0, 10.0f, /*active_player_only=*/false);
+              opponent_model, device, 1.0, 10.0f);
           bots[p] = std::make_unique<DuneGreedyBot>(
               std::move(local_opp_eval), rng(),
               absl::GetFlag(FLAGS_opponent_temperature));

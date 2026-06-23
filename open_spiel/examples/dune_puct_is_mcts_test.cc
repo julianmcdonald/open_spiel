@@ -123,36 +123,32 @@ void TestDeterministicPUCT() {
   std::vector<double> mock_values = {1.0, 0.0, 0.0, 0.0};
 
   auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
-  DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 4.0);
+  DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 1.0);
 
   DuneISMCTSNode node;
   node.child_info[legal_actions[0]] = DuneChildInfo{0, 0.0, 0.9};
   node.child_info[legal_actions[1]] = DuneChildInfo{0, 0.0, 0.1};
   node.priors_initialized = true;
 
-  // Unvisited prioritization: SelectActionTreePolicy should return the unvisited action with the highest prior
+  // Initial selection: both unvisited, choose the one with the highest prior
   Action selected = TestBotAccessor::RunSelectTree(bot, &node, {legal_actions[0], legal_actions[1]});
   assert(selected == legal_actions[0]);
 
-  // Give a visit to legal_actions[0]
+  // Give a visit to legal_actions[0]. Under FPU, since legal_actions[1] has a very low prior (0.1)
+  // and legal_actions[0] has a high prior (0.9), it should continue to select legal_actions[0]
+  // if its value is decent.
   node.total_visits = 1;
   node.child_info[legal_actions[0]].visits = 1;
   node.child_info[legal_actions[0]].return_sum = 0.5;
 
-  // Now legal_actions[1] is unvisited (visits = 0), so it should be prioritized even though it has a lower prior than the visited one
-  selected = TestBotAccessor::RunSelectTree(bot, &node, {legal_actions[0], legal_actions[1]});
-  assert(selected == legal_actions[1]);
-
-  // Now visit both
-  node.total_visits = 2;
-  node.child_info[legal_actions[1]].visits = 1;
-  node.child_info[legal_actions[1]].return_sum = 0.1;
-
-  // Standard PUCT formula applies. Let's verify selection.
-  // value_0 = 0.5 / 1 = 0.5. PUCT_0 = 0.5 + 1.0 * 0.9 * sqrt(2) / (1 + 1) = 0.5 + 0.9 * 1.414 / 2 = 0.5 + 0.636 = 1.136
-  // value_1 = 0.1 / 1 = 0.1. PUCT_1 = 0.1 + 1.0 * 0.1 * sqrt(2) / (1 + 1) = 0.1 + 0.1 * 1.414 / 2 = 0.1 + 0.070 = 0.170
   selected = TestBotAccessor::RunSelectTree(bot, &node, {legal_actions[0], legal_actions[1]});
   assert(selected == legal_actions[0]);
+
+  // Now let's change priors so the unvisited action has a high prior.
+  node.child_info[legal_actions[0]].prior = 0.1;
+  node.child_info[legal_actions[1]].prior = 0.9;
+  selected = TestBotAccessor::RunSelectTree(bot, &node, {legal_actions[0], legal_actions[1]});
+  assert(selected == legal_actions[1]); // Chooses unvisited because of its high prior
 
   std::cout << "Test 2 Passed!\n\n";
 }
@@ -392,7 +388,6 @@ void TestOpponentModelPath() {
       /*dirichlet_alpha=*/0.3,
       /*value_scale=*/1.0,
       /*use_observation_string=*/true,
-      /*allow_inconsistent_action_sets=*/true,
       DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
       /*use_opponent_model=*/true,
       /*opponent_temperature=*/0.0,
@@ -435,6 +430,62 @@ void TestHundroCoherenceResampling() {
   std::cout << "Test 10 Passed!\n\n";
 }
 
+// Test 11: PUCT + FPU Action Pruning (Regression test)
+void TestPUCTFPUActionPruning() {
+  std::cout << "Running Test 11: PUCT + FPU Action Pruning...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() > 2);
+
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1e-5}); // default low prior
+  }
+  // Make action 0 and action 1 have custom priors
+  mock_priors[0] = {legal_actions[0], 0.2};
+  mock_priors[1] = {legal_actions[1], 0.8};
+  std::vector<double> mock_values = {0.0, 0.0, 0.0, 0.0};
+
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+  DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 1.0);
+
+  DuneISMCTSNode node;
+  node.priors_initialized = true;
+  for (Action a : legal_actions) {
+    node.child_info[a] = DuneChildInfo{0, 0.0, 1e-5};
+  }
+  node.child_info[legal_actions[0]] = DuneChildInfo{0, 0.0, 0.2};
+  node.child_info[legal_actions[1]] = DuneChildInfo{0, 0.0, 0.8};
+
+  // Step 1: Initial visit is done (node total visits is 0)
+  // Run SelectTree. It should select legal_actions[1] because it has the highest prior (0.8).
+  Action selected = TestBotAccessor::RunSelectTree(bot, &node, legal_actions);
+  assert(selected == legal_actions[1]);
+
+  // Step 2: Now we simulate that legal_actions[1] has been visited once and has return 1.0.
+  // Total visits is 1.
+  node.total_visits = 1;
+  node.child_info[legal_actions[1]].visits = 1;
+  node.child_info[legal_actions[1]].return_sum = 1.0;
+
+  // Under PUCT + FPU:
+  // fpu_val = 1.0 / 1 = 1.0.
+  // For unvisited actions: q_val = fpu_val = 1.0.
+  // For legal_actions[0] (unvisited, prior 0.2): puct = 1.0 + 1.0 * 0.2 * sqrt(1) / 1 = 1.2.
+  // For legal_actions[1] (visited once, prior 0.8, value 1.0): puct = 1.0 + 1.0 * 0.8 * sqrt(1) / 2 = 1.4.
+  // For other low-prior unvisited actions (prior 1e-5): puct = 1.0 + 1e-5.
+  // So legal_actions[1] should be selected again! The low-prior unvisited actions are pruned!
+  selected = TestBotAccessor::RunSelectTree(bot, &node, legal_actions);
+  assert(selected == legal_actions[1]);
+
+  std::cout << "Test 11 Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -449,6 +500,7 @@ int main() {
   open_spiel::TestCanonicalObservationSorting();
   open_spiel::TestOpponentModelPath();
   open_spiel::TestHundroCoherenceResampling();
+  open_spiel::TestPUCTFPUActionPruning();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

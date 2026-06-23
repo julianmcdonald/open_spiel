@@ -23,26 +23,16 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   DuneNNEvaluator(
       std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       torch::Device device,
-      double value_scale = 1.0,
-      float logit_cap = 10.0f,
-      bool active_player_only = false)
+      double value_scale = 4.0,
+      float logit_cap = 10.0f)
       : model_(model),
         device_(device),
         value_scale_(value_scale),
-        logit_cap_(logit_cap),
-        active_player_only_(active_player_only) {
+        logit_cap_(logit_cap) {
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
     // Dynamically retrieve the expected observation input size from the model
     obs_size_ = model_->input_layer->weight.size(1);
-
-    // Pre-allocate a persistent CPU tensor to reuse across evaluation steps.
-    // Use pinned memory if target is CUDA to accelerate H2D transfers.
-    auto options = torch::TensorOptions().dtype(torch::kFloat32);
-    if (device_.is_cuda()) {
-      options = options.pinned_memory(true);
-    }
-    input_tensor_ = torch::empty({1, obs_size_}, options);
   }
 
   std::vector<double> Evaluate(const State& state) override {
@@ -52,34 +42,25 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);
 
+    // Pre-allocate a CPU tensor locally to ensure thread-safety
+    auto options = torch::TensorOptions().dtype(torch::kFloat32);
+    if (device_.is_cuda()) {
+      options = options.pinned_memory(true);
+    }
+    torch::Tensor input_tensor = torch::zeros({1, obs_size_}, options);
+
     // Note: IS-MCTS normally handles chance states recursively without calling
     // Evaluate() on them. However, if defensively called on a chance node,
     // state.CurrentPlayer() will return kChancePlayerId (-1). The sequential
     // evaluation loop below safely processes player 0..3 observations, avoiding crashes.
-
-    if (active_player_only_) {
-      Player current_player = state.CurrentPlayer();
-      if (current_player >= 0 && current_player < num_players) {
-        std::vector<float> obs = state.InformationStateTensor(current_player);
-        CheckObsSize(obs.size());
-        
-        // Zero-allocation update: copy observation into the pre-allocated CPU buffer
-        std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
-        torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
-        
-        auto outputs = model_->forward(device_tensor);
-        values[current_player] = outputs.values.item<double>() * value_scale_;
-      }
-      return values;
-    }
 
     // Sequential evaluation for all 4 players
     for (int p = 0; p < num_players; ++p) {
       std::vector<float> obs = state.InformationStateTensor(p);
       CheckObsSize(obs.size());
       
-      std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
-      torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
+      std::memcpy(input_tensor.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+      torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
       
       auto outputs = model_->forward(device_tensor);
       values[p] = outputs.values.item<double>() * value_scale_;
@@ -101,8 +82,16 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
     std::vector<float> obs = state.InformationStateTensor(current_player);
     CheckObsSize(obs.size());
-    std::memcpy(input_tensor_.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
-    torch::Tensor device_tensor = device_.is_cuda() ? input_tensor_.to(device_, /*non_blocking=*/true) : input_tensor_;
+
+    // Pre-allocate a CPU tensor locally to ensure thread-safety
+    auto options = torch::TensorOptions().dtype(torch::kFloat32);
+    if (device_.is_cuda()) {
+      options = options.pinned_memory(true);
+    }
+    torch::Tensor input_tensor = torch::zeros({1, obs_size_}, options);
+
+    std::memcpy(input_tensor.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+    torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
 
     auto outputs = model_->forward(device_tensor);
 
@@ -151,21 +140,16 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
  private:
   void CheckObsSize(size_t size) const {
-    static std::atomic<bool> warned_mismatch{false};
-    if (size != static_cast<size_t>(obs_size_) && !warned_mismatch.exchange(true)) {
-      std::cerr << "[WARNING] DuneNNEvaluator: Observation size mismatch! Game state IST size = "
-                << size << ", but network expects input size = " << obs_size_
-                << ". Data will be truncated or padded.\n";
-    }
+    SPIEL_CHECK_TRUE(size == static_cast<size_t>(obs_size_) || 
+                     (size == 5580 && obs_size_ == 5584) ||
+                     (size == 5584 && obs_size_ == 5580));
   }
 
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
   torch::Device device_;
   double value_scale_;
   float logit_cap_;
-  bool active_player_only_;
   int64_t obs_size_;
-  torch::Tensor input_tensor_;
 };
 
 } // namespace open_spiel
