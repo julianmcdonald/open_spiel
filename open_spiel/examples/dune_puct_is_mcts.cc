@@ -1,0 +1,452 @@
+#include "dune_puct_is_mcts.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <utility>
+#include <vector>
+
+#include "open_spiel/abseil-cpp/absl/random/discrete_distribution.h"
+#include "open_spiel/abseil-cpp/absl/random/distributions.h"
+#include "open_spiel/spiel.h"
+#include "open_spiel/spiel_utils.h"
+
+namespace open_spiel {
+
+DunePUCTISMCTSBot::DunePUCTISMCTSBot(
+    int seed, std::shared_ptr<algorithms::Evaluator> evaluator, double puct_c,
+    int max_simulations, int max_world_samples, double temperature,
+    double dirichlet_epsilon, double dirichlet_alpha, double value_scale,
+    bool use_observation_string, bool allow_inconsistent_action_sets,
+    DuneISMCTSFinalPolicyType final_policy_type)
+    : rng_(seed),
+      evaluator_(evaluator),
+      puct_c_(puct_c),
+      max_simulations_(max_simulations),
+      max_world_samples_(max_world_samples),
+      temperature_(temperature),
+      dirichlet_epsilon_(dirichlet_epsilon),
+      dirichlet_alpha_(dirichlet_alpha),
+      value_scale_(value_scale),
+      use_observation_string_(use_observation_string),
+      allow_inconsistent_action_sets_(allow_inconsistent_action_sets),
+      final_policy_type_(final_policy_type),
+      root_node_(nullptr) {}
+
+double DunePUCTISMCTSBot::RandomNumber() {
+  return absl::Uniform(rng_, 0.0, 1.0);
+}
+
+void DunePUCTISMCTSBot::Reset() {
+  nodes_.clear();
+  node_pool_.clear();
+  root_samples_.clear();
+  root_node_ = nullptr;
+}
+
+std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state) const {
+  if (use_observation_string_) {
+    return {state.CurrentPlayer(), state.ObservationString()};
+  } else {
+    return {state.CurrentPlayer(), state.InformationStateString()};
+  }
+}
+
+std::unique_ptr<State> DunePUCTISMCTSBot::SampleRootState(const State& state) {
+  if (max_world_samples_ == -1) {
+    return ResampleFromInfostate(state);
+  } else if (root_samples_.size() < static_cast<size_t>(max_world_samples_)) {
+    root_samples_.push_back(ResampleFromInfostate(state));
+    return root_samples_.back()->Clone();
+  } else {
+    int idx = absl::Uniform(rng_, 0u, root_samples_.size());
+    return root_samples_[idx]->Clone();
+  }
+}
+
+std::unique_ptr<State> DunePUCTISMCTSBot::ResampleFromInfostate(const State& state) {
+  return state.ResampleFromInfostate(state.CurrentPlayer(),
+                                     [this]() { return RandomNumber(); });
+}
+
+DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
+  auto key = GetStateKey(state);
+  node_pool_.push_back(std::make_unique<DuneISMCTSNode>());
+  DuneISMCTSNode* node = node_pool_.back().get();
+  nodes_[key] = node;
+  return node;
+}
+
+DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
+  auto iter = nodes_.find(GetStateKey(state));
+  if (iter == nodes_.end()) {
+    return nullptr;
+  }
+  return iter->second;
+}
+
+DuneISMCTSNode* DunePUCTISMCTSBot::LookupOrCreateNode(const State& state) {
+  DuneISMCTSNode* node = LookupNode(state);
+  if (node != nullptr) {
+    return node;
+  }
+  return CreateNewNode(state);
+}
+
+void DunePUCTISMCTSBot::InitializePriors(DuneISMCTSNode* node, const State& state) {
+  if (node->priors_initialized) {
+    return;
+  }
+  ActionsAndProbs priors = evaluator_->Prior(state);
+  for (const auto& action_prob : priors) {
+    Action action = action_prob.first;
+    double prob = action_prob.second;
+    node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+  }
+  node->priors_initialized = true;
+}
+
+ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
+    DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const {
+  ActionsAndProbs result;
+  result.reserve(legal_actions.size());
+  double sum_prior = 0.0;
+  
+  for (Action action : legal_actions) {
+    double prior = 1e-5; // fallback prior
+    auto iter = node->child_info.find(action);
+    if (iter != node->child_info.end()) {
+      prior = iter->second.prior;
+    }
+    result.push_back({action, prior});
+    sum_prior += prior;
+  }
+  
+  if (sum_prior > 0.0) {
+    for (auto& action_prob : result) {
+      action_prob.second /= sum_prior;
+    }
+  } else {
+    double uniform_prob = 1.0 / legal_actions.size();
+    for (auto& action_prob : result) {
+      action_prob.second = uniform_prob;
+    }
+  }
+  return result;
+}
+
+Action DunePUCTISMCTSBot::SelectActionTreePolicy(
+    DuneISMCTSNode* node, const std::vector<Action>& legal_actions) {
+  if (allow_inconsistent_action_sets_) {
+    // Filter and normalize priors dynamically
+    ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
+    
+    // Check for unvisited legal actions
+    std::vector<std::pair<Action, double>> unvisited_candidates;
+    for (const auto& action_prob : normalized) {
+      Action a = action_prob.first;
+      double prior = action_prob.second;
+      auto iter = node->child_info.find(a);
+      if (iter == node->child_info.end() || iter->second.visits == 0) {
+        unvisited_candidates.push_back({a, prior});
+      }
+    }
+    
+    if (!unvisited_candidates.empty()) {
+      // Prioritize unvisited, break ties by prior weight
+      Action best_action = unvisited_candidates[0].first;
+      double best_prior = unvisited_candidates[0].second;
+      for (const auto& candidate : unvisited_candidates) {
+        if (candidate.second > best_prior) {
+          best_prior = candidate.second;
+          best_action = candidate.first;
+        }
+      }
+      // Ensure child_info entry exists for visits tracking
+      if (node->child_info.find(best_action) == node->child_info.end()) {
+        node->child_info[best_action] = DuneChildInfo{0, 0.0, best_prior};
+      }
+      return best_action;
+    }
+    
+    // Standard PUCT selection
+    Action best_action = kInvalidAction;
+    double best_puct_val = -std::numeric_limits<double>::infinity();
+    double tie_tolerance = 1e-5;
+    std::vector<Action> best_actions;
+    
+    double parent_visits_sqrt = std::sqrt(node->total_visits);
+    
+    for (const auto& action_prob : normalized) {
+      Action a = action_prob.first;
+      double prior = action_prob.second;
+      auto& child = node->child_info[a];
+      
+      double u = puct_c_ * prior * parent_visits_sqrt / (1.0 + child.visits);
+      double puct_val = child.value() + u;
+      
+      if (puct_val > best_puct_val + tie_tolerance) {
+        best_puct_val = puct_val;
+        best_actions = {a};
+      } else if (puct_val >= best_puct_val - tie_tolerance) {
+        best_actions.push_back(a);
+      }
+    }
+    
+    SPIEL_CHECK_GE(best_actions.size(), 1);
+    if (best_actions.size() == 1) {
+      return best_actions[0];
+    } else {
+      return best_actions[absl::Uniform(rng_, 0u, best_actions.size())];
+    }
+  } else {
+    // Inconsistent action sets not allowed
+    std::vector<std::pair<Action, double>> unvisited_candidates;
+    for (const auto& action_child : node->child_info) {
+      Action a = action_child.first;
+      const auto& child = action_child.second;
+      if (child.visits == 0) {
+        unvisited_candidates.push_back({a, child.prior});
+      }
+    }
+    
+    if (!unvisited_candidates.empty()) {
+      Action best_action = unvisited_candidates[0].first;
+      double best_prior = unvisited_candidates[0].second;
+      for (const auto& candidate : unvisited_candidates) {
+        if (candidate.second > best_prior) {
+          best_prior = candidate.second;
+          best_action = candidate.first;
+        }
+      }
+      return best_action;
+    }
+    
+    Action best_action = kInvalidAction;
+    double best_puct_val = -std::numeric_limits<double>::infinity();
+    std::vector<Action> best_actions;
+    double tie_tolerance = 1e-5;
+    double parent_visits_sqrt = std::sqrt(node->total_visits);
+    
+    for (const auto& action_child : node->child_info) {
+      Action a = action_child.first;
+      const auto& child = action_child.second;
+      double u = puct_c_ * child.prior * parent_visits_sqrt / (1.0 + child.visits);
+      double puct_val = child.value() + u;
+      
+      if (puct_val > best_puct_val + tie_tolerance) {
+        best_puct_val = puct_val;
+        best_actions = {a};
+      } else if (puct_val >= best_puct_val - tie_tolerance) {
+        best_actions.push_back(a);
+      }
+    }
+    
+    SPIEL_CHECK_GE(best_actions.size(), 1);
+    if (best_actions.size() == 1) {
+      return best_actions[0];
+    } else {
+      return best_actions[absl::Uniform(rng_, 0u, best_actions.size())];
+    }
+  }
+}
+
+std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state) {
+  if (state->IsTerminal()) {
+    std::vector<double> returns = state->Returns();
+    for (double& r : returns) {
+      r /= value_scale_;
+    }
+    return returns;
+  } else if (state->IsChanceNode()) {
+    Action chance_action = SampleAction(state->ChanceOutcomes(), RandomNumber()).first;
+    state->ApplyAction(chance_action);
+    return RunSimulation(state);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  Player cur_player = state->CurrentPlayer();
+  
+  DuneISMCTSNode* node = LookupOrCreateNode(*state);
+  SPIEL_CHECK_TRUE(node != nullptr);
+
+  InitializePriors(node, *state);
+
+  if (node->total_visits == -1) {
+    node->total_visits = 0;
+    return evaluator_->Evaluate(*state);
+  }
+
+  Action chosen_action = SelectActionTreePolicy(node, legal_actions);
+  SPIEL_CHECK_NE(chosen_action, kInvalidAction);
+
+  node->total_visits++;
+  node->child_info[chosen_action].visits++;
+
+  state->ApplyAction(chosen_action);
+  std::vector<double> returns = RunSimulation(state);
+  
+  // Multi-player Max-N backup
+  node->child_info[chosen_action].return_sum += returns[cur_player];
+  return returns;
+}
+
+ActionsAndProbs DunePUCTISMCTSBot::RunSearch(const State& state) {
+  Reset();
+  SPIEL_CHECK_EQ(state.GetGame()->GetType().dynamics, GameType::Dynamics::kSequential);
+
+  std::vector<Action> legal_actions = state.LegalActions();
+  if (legal_actions.size() == 1) {
+    return {{legal_actions[0], 1.0}};
+  }
+
+  root_node_ = CreateNewNode(state);
+  InitializePriors(root_node_, state);
+
+  // Apply Dirichlet noise exactly once at the root node's priors
+  if (dirichlet_epsilon_ > 0.0 && dirichlet_alpha_ > 0.0) {
+    if (legal_actions.size() > 1) {
+      std::gamma_distribution<double> gamma_dist(dirichlet_alpha_, 1.0);
+      std::vector<double> noise(legal_actions.size());
+      double sum_noise = 0.0;
+      for (size_t i = 0; i < legal_actions.size(); ++i) {
+        noise[i] = gamma_dist(rng_);
+        sum_noise += noise[i];
+      }
+      for (size_t i = 0; i < legal_actions.size(); ++i) {
+        Action action = legal_actions[i];
+        double d_noise = sum_noise > 0.0 ? (noise[i] / sum_noise) : (1.0 / legal_actions.size());
+        auto& child = root_node_->child_info[action];
+        child.prior = (1.0 - dirichlet_epsilon_) * child.prior + dirichlet_epsilon_ * d_noise;
+      }
+    }
+  }
+
+  auto root_key = GetStateKey(state);
+
+  for (int sim = 0; sim < max_simulations_; ++sim) {
+    std::unique_ptr<State> sampled_root_state = SampleRootState(state);
+    SPIEL_CHECK_TRUE(root_key == GetStateKey(*sampled_root_state));
+    RunSimulation(sampled_root_state.get());
+  }
+
+  return GetFinalPolicy(state, root_node_);
+}
+
+ActionsAndProbs DunePUCTISMCTSBot::GetFinalPolicy(const State& state, DuneISMCTSNode* node) const {
+  ActionsAndProbs policy;
+  SPIEL_CHECK_TRUE(node != nullptr);
+  std::vector<Action> legal_actions = state.LegalActions();
+
+  std::vector<std::pair<Action, double>> action_visits;
+  action_visits.reserve(legal_actions.size());
+  double total_legal_visits = 0.0;
+
+  for (Action action : legal_actions) {
+    double visits = 0.0;
+    auto iter = node->child_info.find(action);
+    if (iter != node->child_info.end()) {
+      visits = static_cast<double>(iter->second.visits);
+    }
+    action_visits.push_back({action, visits});
+    total_legal_visits += visits;
+  }
+
+  if (total_legal_visits == 0.0) {
+    double uniform_prob = 1.0 / legal_actions.size();
+    policy.reserve(legal_actions.size());
+    for (Action action : legal_actions) {
+      policy.push_back({action, uniform_prob});
+    }
+    return policy;
+  }
+
+  switch (final_policy_type_) {
+    case DuneISMCTSFinalPolicyType::kNormalizedVisitCount: {
+      policy.reserve(legal_actions.size());
+      if (temperature_ == 0.0) {
+        Action max_action = kInvalidAction;
+        double max_visits = -1.0;
+        for (const auto& av : action_visits) {
+          if (av.second > max_visits) {
+            max_visits = av.second;
+            max_action = av.first;
+          }
+        }
+        for (Action action : legal_actions) {
+          policy.push_back({action, (action == max_action) ? 1.0 : 0.0});
+        }
+      } else if (temperature_ == 1.0) {
+        for (const auto& av : action_visits) {
+          policy.push_back({av.first, av.second / total_legal_visits});
+        }
+      } else {
+        double sum_pow = 0.0;
+        std::vector<double> pow_visits(action_visits.size());
+        double inv_temp = 1.0 / temperature_;
+        for (size_t i = 0; i < action_visits.size(); ++i) {
+          pow_visits[i] = std::pow(action_visits[i].second, inv_temp);
+          sum_pow += pow_visits[i];
+        }
+        for (size_t i = 0; i < action_visits.size(); ++i) {
+          policy.push_back({action_visits[i].first, sum_pow > 0.0 ? (pow_visits[i] / sum_pow) : (1.0 / legal_actions.size())});
+        }
+      }
+    } break;
+
+    case DuneISMCTSFinalPolicyType::kMaxVisitCount: {
+      policy.reserve(legal_actions.size());
+      Action max_action = kInvalidAction;
+      double max_visits = -1.0;
+      for (const auto& av : action_visits) {
+        if (av.second > max_visits) {
+          max_visits = av.second;
+          max_action = av.first;
+        }
+      }
+      for (Action action : legal_actions) {
+        policy.push_back({action, (action == max_action) ? 1.0 : 0.0});
+      }
+    } break;
+
+    case DuneISMCTSFinalPolicyType::kMaxValue: {
+      policy.reserve(legal_actions.size());
+      Action max_action = kInvalidAction;
+      double max_val = -std::numeric_limits<double>::infinity();
+      for (Action action : legal_actions) {
+        double val = -std::numeric_limits<double>::infinity();
+        auto iter = node->child_info.find(action);
+        if (iter != node->child_info.end() && iter->second.visits > 0) {
+          val = iter->second.value();
+        }
+        if (val > max_val) {
+          max_val = val;
+          max_action = action;
+        }
+      }
+      for (Action action : legal_actions) {
+        policy.push_back({action, (action == max_action) ? 1.0 : 0.0});
+      }
+    } break;
+  }
+
+  return policy;
+}
+
+Action DunePUCTISMCTSBot::Step(const State& state) {
+  ActionsAndProbs policy = RunSearch(state);
+  return SampleAction(policy, RandomNumber()).first;
+}
+
+ActionsAndProbs DunePUCTISMCTSBot::GetPolicy(const State& state) {
+  return RunSearch(state);
+}
+
+std::pair<ActionsAndProbs, Action> DunePUCTISMCTSBot::StepWithPolicy(const State& state) {
+  ActionsAndProbs policy = GetPolicy(state);
+  Action sampled_action = SampleAction(policy, RandomNumber()).first;
+  return {policy, sampled_action};
+}
+
+}  // namespace open_spiel

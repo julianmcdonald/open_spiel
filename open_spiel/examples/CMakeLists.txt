@@ -14,6 +14,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_evaluator_test dune_evaluator_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator_test ${TORCH_LIBRARIES})
 
+  add_executable(dune_puct_is_mcts_test dune_puct_is_mcts_test.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_puct_is_mcts_test ${TORCH_LIBRARIES})
+
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 
