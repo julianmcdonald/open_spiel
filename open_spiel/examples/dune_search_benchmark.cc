@@ -152,6 +152,8 @@ struct GameStats {
   std::vector<int> rounds_played;
   double search_step_time_sum = 0.0;
   int search_steps_count = 0;
+  double abs_terminal_return_sum = 0.0;
+  int64_t terminal_returns_count = 0;
 };
 
 void WorkerThread(
@@ -259,6 +261,10 @@ void WorkerThread(
     }
 
     std::vector<double> returns = state->Returns();
+    for (double r : returns) {
+      thread_stats.abs_terminal_return_sum += std::abs(r);
+      thread_stats.terminal_returns_count++;
+    }
     int winner = -1;
     double max_return = -999.0;
     for (int p = 0; p < 4; ++p) {
@@ -323,6 +329,8 @@ void WorkerThread(
       global_stats.rounds_played.insert(global_stats.rounds_played.end(), thread_stats.rounds_played.begin(), thread_stats.rounds_played.end());
       global_stats.search_step_time_sum += thread_stats.search_step_time_sum;
       global_stats.search_steps_count += thread_stats.search_steps_count;
+      global_stats.abs_terminal_return_sum += thread_stats.abs_terminal_return_sum;
+      global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
 
       thread_stats = GameStats();
 
@@ -354,6 +362,8 @@ void WorkerThread(
     global_stats.rounds_played.insert(global_stats.rounds_played.end(), thread_stats.rounds_played.begin(), thread_stats.rounds_played.end());
     global_stats.search_step_time_sum += thread_stats.search_step_time_sum;
     global_stats.search_steps_count += thread_stats.search_steps_count;
+    global_stats.abs_terminal_return_sum += thread_stats.abs_terminal_return_sum;
+    global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
   }
 }
 
@@ -515,6 +525,17 @@ int main(int argc, char* argv[]) {
                              : 0.0;
   std::cout << absl::StrFormat("\nAverage Search Step Time: %.4fs (across %d steps)\n",
                                avg_step_time, global_stats.search_steps_count);
+
+  double mean_abs_leaf_value = open_spiel::DuneNNEvaluator::global_num_leaf_evaluations.load() > 0
+      ? (open_spiel::DuneNNEvaluator::global_abs_leaf_value_sum.load() / open_spiel::DuneNNEvaluator::global_num_leaf_evaluations.load())
+      : 0.0;
+  double mean_abs_terminal_return = global_stats.terminal_returns_count > 0
+      ? (global_stats.abs_terminal_return_sum / global_stats.terminal_returns_count)
+      : 0.0;
+  double value_scale_used = absl::GetFlag(FLAGS_value_scale);
+  double raw_mean_abs_leaf_value = value_scale_used > 0.0 ? (mean_abs_leaf_value / value_scale_used) : mean_abs_leaf_value;
+  std::cout << absl::StrFormat("Mean |leaf value|: %.4f (scaled) / %.4f (raw) vs Mean |terminal return|: %.4f (value_scale = %.1f)\n",
+                               mean_abs_leaf_value, raw_mean_abs_leaf_value, mean_abs_terminal_return, value_scale_used);
 
   return 0;
 }

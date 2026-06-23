@@ -20,6 +20,17 @@ namespace open_spiel {
 
 class DuneNNEvaluator : public algorithms::Evaluator {
  public:
+  inline static std::atomic<double> global_abs_leaf_value_sum{0.0};
+  inline static std::atomic<uint64_t> global_num_leaf_evaluations{0};
+
+  static void RecordLeafValue(double val) {
+    double current = global_abs_leaf_value_sum.load(std::memory_order_relaxed);
+    while (!global_abs_leaf_value_sum.compare_exchange_weak(
+        current, current + std::abs(val),
+        std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    global_num_leaf_evaluations.fetch_add(1, std::memory_order_relaxed);
+  }
+
   DuneNNEvaluator(
       std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       torch::Device device,
@@ -47,23 +58,30 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (device_.is_cuda()) {
       options = options.pinned_memory(true);
     }
-    torch::Tensor input_tensor = torch::zeros({1, obs_size_}, options);
+    torch::Tensor input_tensor = torch::zeros({num_players, obs_size_}, options);
 
     // Note: IS-MCTS normally handles chance states recursively without calling
     // Evaluate() on them. However, if defensively called on a chance node,
-    // state.CurrentPlayer() will return kChancePlayerId (-1). The sequential
-    // evaluation loop below safely processes player 0..3 observations, avoiding crashes.
+    // state.CurrentPlayer() will return kChancePlayerId (-1). The batched
+    // evaluation below safely processes player 0..3 observations, avoiding crashes.
 
-    // Sequential evaluation for all 4 players
+    // Stack all players' observations
     for (int p = 0; p < num_players; ++p) {
       std::vector<float> obs = state.InformationStateTensor(p);
       CheckObsSize(obs.size());
       
-      std::memcpy(input_tensor.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
-      torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
-      
-      auto outputs = model_->forward(device_tensor);
-      values[p] = outputs.values.item<double>() * value_scale_;
+      std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+    }
+    
+    torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
+    auto outputs = model_->forward(device_tensor);
+    
+    torch::Tensor values_cpu = outputs.values.to(torch::kCPU).to(torch::kDouble).contiguous();
+    const double* values_data = values_cpu.data_ptr<double>();
+    for (int p = 0; p < num_players; ++p) {
+      double val = values_data[p] * value_scale_;
+      values[p] = val;
+      RecordLeafValue(val);
     }
     return values;
   }
