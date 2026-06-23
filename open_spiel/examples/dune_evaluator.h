@@ -34,7 +34,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   DuneNNEvaluator(
       std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       torch::Device device,
-      double value_scale = 4.0,
+      double value_scale = 1.0,
       float logit_cap = 10.0f)
       : model_(model),
         device_(device),

@@ -26,6 +26,7 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
+#include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Path to load search agent model checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Path to load opponent model checkpoint. If empty, the search agent model is reused. If 'random', random opponents are used.");
@@ -36,9 +37,9 @@ ABSL_FLAG(int, num_blocks, 8, "Search agent model residual blocks count.");
 ABSL_FLAG(int, opp_hidden_dim, -1, "Opponent model hidden dimension. If -1, inherits hidden_dim.");
 ABSL_FLAG(int, opp_num_blocks, -1, "Opponent model block count. If -1, inherits num_blocks.");
 ABSL_FLAG(int, max_simulations, 50, "MCTS simulation budget per move.");
-ABSL_FLAG(double, puct_c, 1.0, "PUCT exploration constant.");
+ABSL_FLAG(double, puct_c, 0.3, "PUCT exploration constant.");
 ABSL_FLAG(int, max_world_samples, -1, "Number of cached world samples for determinization (-1 = fresh resampling).");
-ABSL_FLAG(double, value_scale, 4.0, "Scaling factor for leaf neural values (couples with PUCT bot's internal return scaling).");
+ABSL_FLAG(double, value_scale, 1.0, "Scaling factor for leaf neural values (couples with PUCT bot's internal return scaling).");
 ABSL_FLAG(double, temperature, 0.0, "Softmax temperature for final move choice (0.0 = greedy).");
 ABSL_FLAG(double, opponent_temperature, 0.0, "Softmax temperature for opponent action selection (0.0 = greedy).");
 ABSL_FLAG(double, dirichlet_epsilon, 0.0, "Dirichlet noise weight at root.");
@@ -49,6 +50,64 @@ ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth d
 
 namespace open_spiel {
 namespace {
+
+int GetTrueFinalVp(const dune_imperium::DuneImperiumState* dune_state, int p) {
+  int base_vp = dune_state->GetPlayerVpForTesting(p);
+  int endgame_vp = 0;
+
+  // 1. Endgame Intrigues
+  const auto& hand = dune_state->GetIntrigueHandForTesting(p);
+  for (int intrigue_id : hand) {
+    const auto* intrigue = dune_imperium::FindIntrigueCardById(intrigue_id);
+    if (intrigue && (intrigue->phase_mask & dune_imperium::kIntriguePhaseEndgameMask) != 0) {
+      endgame_vp += dune_state->EndgameIntrigueVpBonusForTesting(p, intrigue_id);
+    }
+  }
+
+  // 2. Tech tile 6: Holtzman Engine
+  const auto& tech_tiles = dune_state->GetPlayerTechTilesForTesting(p);
+  if (std::find(tech_tiles.begin(), tech_tiles.end(), 6) != tech_tiles.end()) {
+    int tsmf_count = 0;
+    auto count_tsmf = [&](const std::vector<int>& cards) {
+      for (int id : cards) {
+        if (id == dune_imperium::kCardTheSpiceMustFlow) tsmf_count++;
+      }
+    };
+    auto* mutable_state = const_cast<dune_imperium::DuneImperiumState*>(dune_state);
+    count_tsmf(mutable_state->GetPlayerDrawDeckForTesting(p));
+    count_tsmf(mutable_state->GetPlayerDiscardForTesting(p));
+    count_tsmf(mutable_state->GetPlayerHandForTesting(p));
+    count_tsmf(dune_state->GetPlayedAgentCardsForTesting(p));
+    count_tsmf(dune_state->GetRevealedCardsForTesting(p));
+    if (tsmf_count >= 2) {
+      endgame_vp += 1;
+    }
+  }
+
+  // 3. Faction Influence milestone (>=3 in all 4 factions)
+  bool all_3 = true;
+  for (int f = 0; f < 4; ++f) {
+    if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) < 3) {
+      all_3 = false;
+    }
+  }
+  if (all_3) {
+    endgame_vp += 1;
+  }
+
+  // 4. Tech tile 14: Spy Satellites
+  if (std::find(tech_tiles.begin(), tech_tiles.end(), 14) != tech_tiles.end()) {
+    int low_influence_factions = 0;
+    for (int f = 0; f < 4; ++f) {
+      if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) <= 1) {
+        low_influence_factions++;
+      }
+    }
+    endgame_vp += low_influence_factions;
+  }
+
+  return base_vp + endgame_vp;
+}
 
 class DuneGreedyBot : public Bot {
  public:
@@ -154,6 +213,8 @@ struct GameStats {
   int search_steps_count = 0;
   double abs_terminal_return_sum = 0.0;
   int64_t terminal_returns_count = 0;
+  double vp_margin_sum = 0.0;
+  int64_t vp_margin_count = 0;
 };
 
 void WorkerThread(
@@ -309,6 +370,16 @@ void WorkerThread(
         }
       }
       thread_stats.rounds_played.push_back(dune_state->GetCurrentRound());
+
+      double search_vp = GetTrueFinalVp(dune_state, search_seat);
+      double opp_vp_sum = 0.0;
+      for (int p = 0; p < 4; ++p) {
+        if (p != search_seat) {
+          opp_vp_sum += GetTrueFinalVp(dune_state, p);
+        }
+      }
+      thread_stats.vp_margin_sum += (search_vp - (opp_vp_sum / 3.0));
+      thread_stats.vp_margin_count++;
     }
 
     // Flush stats and perform intermediate logging
@@ -331,6 +402,8 @@ void WorkerThread(
       global_stats.search_steps_count += thread_stats.search_steps_count;
       global_stats.abs_terminal_return_sum += thread_stats.abs_terminal_return_sum;
       global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
+      global_stats.vp_margin_sum += thread_stats.vp_margin_sum;
+      global_stats.vp_margin_count += thread_stats.vp_margin_count;
 
       thread_stats = GameStats();
 
@@ -364,6 +437,8 @@ void WorkerThread(
     global_stats.search_steps_count += thread_stats.search_steps_count;
     global_stats.abs_terminal_return_sum += thread_stats.abs_terminal_return_sum;
     global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
+    global_stats.vp_margin_sum += thread_stats.vp_margin_sum;
+    global_stats.vp_margin_count += thread_stats.vp_margin_count;
   }
 }
 
@@ -495,6 +570,10 @@ int main(int argc, char* argv[]) {
 
   std::cout << "\nSearch Agent Placement:\n";
   std::cout << absl::StrFormat("  Mean Return: %.4f\n", (global_stats.search_return_sum / total_games));
+  double mean_vp_margin = global_stats.vp_margin_count > 0
+      ? (global_stats.vp_margin_sum / global_stats.vp_margin_count)
+      : 0.0;
+  std::cout << absl::StrFormat("  Mean VP Margin: %+.4f\n", mean_vp_margin);
   for (int r = 0; r < 4; ++r) {
     std::cout << absl::StrFormat("  Place %d: %.2f%% (%d/%d)\n",
                                  r + 1, (global_stats.search_placements[r] * 100.0 / total_games),
