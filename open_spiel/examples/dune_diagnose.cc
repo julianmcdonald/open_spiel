@@ -209,7 +209,12 @@ int main(int argc, char* argv[]) {
 
   int hidden_dim = 2048;
   int num_blocks = 8;
-  int num_games = 5;
+  int num_games = 100;
+  if (const char* env_games = std::getenv("NUM_GAMES")) {
+    try {
+      num_games = std::stoi(env_games);
+    } catch (...) {}
+  }
 
   std::cout << absl::StrFormat("%-35s | %8s | %9s | %9s | %8s | %10s | %10s | %8s | %10s",
                                "Checkpoint", "Decisions", "RawCtrMax", "RawOffset",

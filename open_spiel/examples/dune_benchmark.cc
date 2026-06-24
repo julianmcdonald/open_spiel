@@ -71,6 +71,7 @@ ABSL_FLAG(double, policy_weight_decay, 1e-2, "AdamW decoupled weight decay coeff
 ABSL_FLAG(double, mmd_importance_clip, 20.0, "Maximum 1 / behavior_prob multiplier for sampled MMD targets. Set <= 0 to disable clipping.");
 ABSL_FLAG(int, max_train_steps, 0, "Maximum local async SGD steps to execute before stopping collection. Set <= 0 to disable.");
 ABSL_FLAG(bool, save_final_checkpoint, true, "Whether to save model and optimizer checkpoints when the benchmark exits.");
+ABSL_FLAG(int, checkpoint_interval, 50000, "Interval of training steps between saving rotating checkpoints.");
 ABSL_FLAG(bool, train_amp, false, "Use CUDA BF16 autocast for the training forward/loss path.");
 ABSL_FLAG(int, loss_read_interval, 1, "Read CPU loss scalars every N local train steps. 1 preserves per-step NaN checks/log values.");
 ABSL_FLAG(int, train_diagnostic_interval, 1000, "Print expensive training diagnostics every N TrainStep calls. Set <= 0 to disable.");
@@ -575,7 +576,8 @@ void OptimizationWorker(
       }
 
       // Periodic checkpoint saving (runs in background, no sync_mutex needed)
-      if (step % 50000 == 0) {
+      int cp_interval = absl::GetFlag(FLAGS_checkpoint_interval);
+      if (cp_interval > 0 && step % cp_interval == 0) {
         // ROTATING CHECKPOINTS: Enforce saving to a new numbered file every time
         std::string run_prefix = absl::GetFlag(FLAGS_run_prefix);
         std::string step_model_path = absl::StrCat(run_prefix, "_model_step_", step, ".pt");
