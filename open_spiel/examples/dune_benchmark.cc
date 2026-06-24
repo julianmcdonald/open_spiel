@@ -672,7 +672,7 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   torch::Tensor masked_target_logits, target_probs, policy_loss, probs;
   torch::Tensor entropy_per_sample, mean_entropy, total_loss;
   torch::Tensor raw_legal_mean, centered_prev_logits, reference_logits;
-  torch::Tensor centered_reference_logits;
+  torch::Tensor centered_reference_logits, target_q;
   float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
   float eta = static_cast<float>(absl::GetFlag(FLAGS_mmd_eta));
   float alpha = static_cast<float>(absl::GetFlag(FLAGS_mmd_alpha));
@@ -704,9 +704,22 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
 
     centered_prev_logits = CenterLegalLogitsTensor(prev_logits, masks);
     if (use_mmd) {
+      torch::Tensor centered_advantages = advantages - advantages.mean();
+      torch::Tensor advantage_std =
+          centered_advantages.pow(2).mean().sqrt().clamp_min(1e-6);
+      torch::Tensor normalized_advantages = centered_advantages / advantage_std;
+
+      torch::Tensor importance = 1.0f / behavior_probs_tensor.clamp_min(1e-6f);
+      float mmd_importance_clip = static_cast<float>(absl::GetFlag(FLAGS_mmd_importance_clip));
+      if (mmd_importance_clip > 0.0f) {
+        importance = importance.clamp_max(mmd_importance_clip);
+      }
+
+      target_q = (normalized_advantages * importance).detach();
+
       q_vector = torch::zeros({(int64_t)batch_size, action_dim},
                               torch::TensorOptions().device(device));
-      q_vector.scatter_(1, actions_taken, q_values);
+      q_vector.scatter_(1, actions_taken, target_q);
 
       target_logits = centered_prev_logits + eta * q_vector;
       if (use_reference) {
@@ -781,8 +794,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
   int diagnostic_interval = absl::GetFlag(FLAGS_train_diagnostic_interval);
   if (diagnostic_interval > 0 && diagnostic_step % diagnostic_interval == 0) {
       read_loss_values();
-      float mean_abs_policy_signal = q_values.abs().mean().item<float>();
-      float std_policy_signal = q_values.std().item<float>();
+      float mean_abs_policy_signal = use_mmd ? target_q.abs().mean().item<float>() : q_values.abs().mean().item<float>();
+      float std_policy_signal = use_mmd ? target_q.std().item<float>() : q_values.std().item<float>();
       float raw_all_max_abs_logit = raw_pred_logits.abs().max().item<float>();
       float raw_legal_offset_abs = raw_legal_mean.abs().mean().item<float>();
       float raw_centered_legal_max_abs = LegalMaskedMaxAbs(centered_raw_logits, masks);
@@ -911,6 +924,8 @@ std::pair<float, float> TrainStep(std::shared_ptr<SharedDunePolicyValueNetImpl> 
     std::cerr << "\nLOSS MATH INTERMEDIATES:\n";
     check_nan(log_probs, "log_probs");
     check_nan(target_probs, "target_probs");
+    check_nan(target_q, "target_q");
+    check_nan(q_vector, "q_vector");
     
     std::cerr << "\nMODEL WEIGHTS:\n";
     bool weights_bad = false;
