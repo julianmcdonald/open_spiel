@@ -153,15 +153,7 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
   // Filter and normalize priors dynamically
   ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
 
-  // Calculate First Play Urgency (FPU) value as the average Q-value of the parent node
-  double fpu_val = 0.0;
-  if (node->total_visits > 0) {
-    double total_return_sum = 0.0;
-    for (const auto& child_pair : node->child_info) {
-      total_return_sum += child_pair.second.return_sum;
-    }
-    fpu_val = total_return_sum / node->total_visits;
-  }
+  double fpu_val = node->cached_value;
 
   Action best_action = kInvalidAction;
   double best_puct_val = -std::numeric_limits<double>::infinity();
@@ -218,6 +210,10 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth) {
   }
 
   std::vector<Action> legal_actions = state->LegalActions();
+  if (legal_actions.size() == 1) {
+    state->ApplyAction(legal_actions[0]);
+    return RunSimulation(state, depth + 1);
+  }
   Player cur_player = state->CurrentPlayer();
 
   if (use_opponent_model_ && cur_player != searching_player_) {
@@ -278,7 +274,9 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth) {
     node->total_visits = 0;
     sum_depth_this_search_ += depth;
     num_sims_this_search_++;
-    return evaluator_->Evaluate(*state);
+    std::vector<double> values = evaluator_->Evaluate(*state);
+    node->cached_value = values[state->CurrentPlayer()];
+    return values;
   }
 
   Action chosen_action = SelectActionTreePolicy(node, legal_actions);
@@ -463,6 +461,78 @@ std::pair<ActionsAndProbs, Action> DunePUCTISMCTSBot::StepWithPolicy(const State
   ActionsAndProbs policy = GetPolicy(state);
   Action sampled_action = SampleAction(policy, RandomNumber()).first;
   return {policy, sampled_action};
+}
+
+SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int min_visit_threshold) const {
+  SearchDiagnostics diag;
+  diag.root_value = 0.0;
+  diag.total_root_visits = 0;
+  diag.num_covered_actions = 0;
+  diag.covered_prior_mass = 0.0;
+
+  auto key = GetStateKey(state);
+  auto iter = nodes_.find(key);
+  
+  std::vector<Action> legal_actions = state.LegalActions();
+  diag.actions = legal_actions;
+  diag.visit_counts.reserve(legal_actions.size());
+  diag.q_values.reserve(legal_actions.size());
+  diag.priors.reserve(legal_actions.size());
+
+  if (iter != nodes_.end()) {
+    DuneISMCTSNode* node = iter->second;
+    diag.root_value = node->cached_value;
+    diag.total_root_visits = node->total_visits;
+
+    ActionsAndProbs normalized_priors = FilterAndNormalizePriors(node, legal_actions);
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      Action action = legal_actions[i];
+      double prior = normalized_priors[i].second;
+      diag.priors.push_back(prior);
+
+      int visits = 0;
+      double return_sum = 0.0;
+      auto child_iter = node->child_info.find(action);
+      if (child_iter != node->child_info.end()) {
+        visits = child_iter->second.visits;
+        return_sum = child_iter->second.return_sum;
+      }
+      diag.visit_counts.push_back(visits);
+
+      double q_value = diag.root_value;
+      if (visits >= min_visit_threshold) {
+        q_value = return_sum / visits;
+        diag.num_covered_actions++;
+        diag.covered_prior_mass += prior;
+      }
+      diag.q_values.push_back(q_value);
+    }
+  } else {
+    ActionsAndProbs raw_priors = evaluator_->Prior(state);
+    absl::flat_hash_map<Action, double> prior_map;
+    for (const auto& ap : raw_priors) {
+      prior_map[ap.first] = ap.second;
+    }
+    double sum = 0.0;
+    for (Action action : legal_actions) {
+      double p = 1e-5;
+      auto p_iter = prior_map.find(action);
+      if (p_iter != prior_map.end()) {
+        p = p_iter->second;
+      }
+      diag.priors.push_back(p);
+      sum += p;
+    }
+    if (sum > 0.0) {
+      for (double& p : diag.priors) p /= sum;
+    } else {
+      for (double& p : diag.priors) p = 1.0 / legal_actions.size();
+    }
+    
+    diag.visit_counts.assign(legal_actions.size(), 0);
+    diag.q_values.assign(legal_actions.size(), 0.0);
+  }
+  return diag;
 }
 
 }  // namespace open_spiel

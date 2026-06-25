@@ -486,6 +486,65 @@ void TestPUCTFPUActionPruning() {
   std::cout << "Test 11 Passed!\n\n";
 }
 
+void TestFPUCaching() {
+  std::cout << "Running Test 12: FPU Value Caching...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values(state->NumPlayers(), 0.5);
+  mock_values[state->CurrentPlayer()] = 0.75;
+
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+  DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 1.0);
+
+  bot.RunSearch(*state);
+  
+  DuneISMCTSNode* root_node = TestBotAccessor::GetRootNode(bot);
+  assert(root_node != nullptr);
+  AssertAlmostEqual(root_node->cached_value, 0.75);
+
+  std::cout << "Test 12 Passed!\n\n";
+}
+
+void TestSearchDiagnostics() {
+  std::cout << "Running Test 13: Search Diagnostics...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values(state->NumPlayers(), 0.5);
+
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+  DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 1.0);
+
+  bot.RunSearch(*state);
+  SearchDiagnostics diag = bot.GetRootDiagnostics(*state, 2);
+
+  assert(diag.actions.size() == legal_actions.size());
+  assert(diag.visit_counts.size() == legal_actions.size());
+  assert(diag.q_values.size() == legal_actions.size());
+  assert(diag.priors.size() == legal_actions.size());
+  AssertAlmostEqual(diag.root_value, 0.5);
+
+  std::cout << "Test 13 Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -501,6 +560,8 @@ int main() {
   open_spiel::TestOpponentModelPath();
   open_spiel::TestHundroCoherenceResampling();
   open_spiel::TestPUCTFPUActionPruning();
+  open_spiel::TestFPUCaching();
+  open_spiel::TestSearchDiagnostics();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

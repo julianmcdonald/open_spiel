@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -98,6 +99,15 @@ ABSL_FLAG(bool, pipeline, false,
           "Beneficial with separate inference/training GPUs. On a single GPU, "
           "both workloads compete for compute and pipelining may be slower.");
 
+ABSL_FLAG(std::string, search_label_dir, "",
+          "Directory containing search teacher labels. Empty disables.");
+ABSL_FLAG(double, search_lambda, 0.5,
+          "Weight for search teacher KL distillation loss.");
+ABSL_FLAG(int, search_minibatches_per_update, 2,
+          "Search distillation minibatches per PPO update.");
+ABSL_FLAG(int, search_minibatch_size, 512,
+          "Size of each search distillation minibatch.");
+
 namespace open_spiel {
 namespace {
 
@@ -142,6 +152,180 @@ class PpoRolloutBuffer {
   std::vector<PpoTransition> transitions_;
 };
 
+struct SearchLabel {
+  std::vector<float> state;
+  int32_t num_legal_actions;
+  std::vector<std::pair<int64_t, float>> teacher_probs;
+  std::vector<std::pair<int64_t, float>> ppo_probs;
+  float teacher_kl;
+  int32_t num_covered_actions;
+  float eta;
+  uint8_t eta_capped;
+};
+
+class SearchLabelBuffer {
+ public:
+  void SetExpectedDimensions(int64_t obs_size, int64_t action_dim) {
+    expected_obs_size_ = obs_size;
+    expected_action_dim_ = action_dim;
+  }
+
+  void LoadFromDirectory(const std::string& dir) {
+    if (dir.empty() || !std::filesystem::exists(dir)) return;
+    LoadNewFiles(dir);
+  }
+
+  void LoadNewFiles(const std::string& dir) {
+    if (dir.empty() || !std::filesystem::exists(dir)) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+      if (entry.path().extension() == ".bin") {
+        std::string path_str = entry.path().string();
+        if (loaded_files_.find(path_str) == loaded_files_.end()) {
+          LoadFile(path_str);
+          loaded_files_.insert(path_str);
+        }
+      }
+    }
+  }
+
+  std::vector<SearchLabel> Sample(int n, std::mt19937* rng) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<SearchLabel> batch;
+    if (labels_.empty()) return batch;
+    batch.reserve(n);
+    std::uniform_int_distribution<size_t> dist(0, labels_.size() - 1);
+    for (int i = 0; i < n; ++i) {
+      batch.push_back(labels_[dist(*rng)]);
+    }
+    return batch;
+  }
+
+  size_t Size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return labels_.size();
+  }
+
+ private:
+  void LoadFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      std::cerr << "SearchLabelBuffer: Failed to open file: " << path << "\n";
+      return;
+    }
+
+    uint32_t magic = 0;
+    uint32_t schema = 0;
+    int32_t obs_size = 0;
+    int32_t action_dim = 0;
+    int32_t max_simulations = 0;
+    float value_scale = 0;
+    float puct_c = 0;
+    float target_teacher_kl = 0;
+    int32_t min_visits = 0;
+    int32_t min_coverage = 0;
+    float blueprint_temp = 0;
+    uint64_t fingerprint = 0;
+    uint32_t reserved = 0;
+
+    in.read(reinterpret_cast<char*>(&magic), 4);
+    if (magic != 0x4c545344) {
+      std::cerr << "SearchLabelBuffer: Invalid magic in " << path << "\n";
+      return;
+    }
+    in.read(reinterpret_cast<char*>(&schema), 4);
+    if (schema != 1) {
+      std::cerr << "SearchLabelBuffer: Unsupported schema version " << schema
+                << " in " << path << " (expected 1)\n";
+      return;
+    }
+    in.read(reinterpret_cast<char*>(&obs_size), 4);
+    in.read(reinterpret_cast<char*>(&action_dim), 4);
+    if (expected_obs_size_ > 0 && obs_size != expected_obs_size_) {
+      std::cerr << "SearchLabelBuffer: obs_size mismatch in " << path
+                << ": file=" << obs_size << " expected=" << expected_obs_size_ << "\n";
+      return;
+    }
+    if (expected_action_dim_ > 0 && action_dim != expected_action_dim_) {
+      std::cerr << "SearchLabelBuffer: action_dim mismatch in " << path
+                << ": file=" << action_dim << " expected=" << expected_action_dim_ << "\n";
+      return;
+    }
+    in.read(reinterpret_cast<char*>(&max_simulations), 4);
+    in.read(reinterpret_cast<char*>(&value_scale), 4);
+    in.read(reinterpret_cast<char*>(&puct_c), 4);
+    in.read(reinterpret_cast<char*>(&target_teacher_kl), 4);
+    in.read(reinterpret_cast<char*>(&min_visits), 4);
+    in.read(reinterpret_cast<char*>(&min_coverage), 4);
+    in.read(reinterpret_cast<char*>(&blueprint_temp), 4);
+    in.read(reinterpret_cast<char*>(&fingerprint), 8);
+    if (!has_fingerprint_) {
+      expected_fingerprint_ = fingerprint;
+      has_fingerprint_ = true;
+    } else if (fingerprint != expected_fingerprint_) {
+      std::cerr << "Warning: mixed label fingerprints in " << path
+                << ": file fingerprint=0x" << std::hex << fingerprint
+                << " expected=0x" << expected_fingerprint_ << std::dec << "\n";
+    }
+    in.read(reinterpret_cast<char*>(&reserved), 4);
+
+    int labels_before = labels_.size();
+    while (in.peek() != EOF) {
+      SearchLabel label;
+      label.state.resize(obs_size);
+      in.read(reinterpret_cast<char*>(label.state.data()), obs_size * sizeof(float));
+      if (!in) break;
+
+      in.read(reinterpret_cast<char*>(&label.num_legal_actions), sizeof(int32_t));
+      if (label.num_legal_actions <= 0 || label.num_legal_actions > action_dim) {
+        std::cerr << "SearchLabelBuffer: Invalid num_legal_actions " << label.num_legal_actions
+                  << " in " << path << "\n";
+        break;
+      }
+      label.teacher_probs.resize(label.num_legal_actions);
+      label.ppo_probs.resize(label.num_legal_actions);
+
+      bool valid = true;
+      for (int32_t i = 0; i < label.num_legal_actions; ++i) {
+        int32_t action_id = 0;
+        float t_prob = 0.0f;
+        float p_prob = 0.0f;
+        in.read(reinterpret_cast<char*>(&action_id), sizeof(int32_t));
+        in.read(reinterpret_cast<char*>(&t_prob), sizeof(float));
+        in.read(reinterpret_cast<char*>(&p_prob), sizeof(float));
+        if (action_id < 0 || action_id >= action_dim ||
+            !std::isfinite(t_prob) || !std::isfinite(p_prob)) {
+          valid = false;
+          break;
+        }
+        label.teacher_probs[i] = {action_id, t_prob};
+        label.ppo_probs[i] = {action_id, p_prob};
+      }
+      if (!valid || !in) break;
+      in.read(reinterpret_cast<char*>(&label.teacher_kl), sizeof(float));
+      in.read(reinterpret_cast<char*>(&label.num_covered_actions), sizeof(int32_t));
+      in.read(reinterpret_cast<char*>(&label.eta), sizeof(float));
+      in.read(reinterpret_cast<char*>(&label.eta_capped), sizeof(uint8_t));
+      uint8_t padding[3];
+      in.read(reinterpret_cast<char*>(padding), 3);
+      if (!in) break;
+
+      labels_.push_back(std::move(label));
+    }
+    int labels_loaded = labels_.size() - labels_before;
+    std::cout << "SearchLabelBuffer: Loaded " << labels_loaded
+              << " labels from " << path << "\n";
+  }
+
+  int64_t expected_obs_size_ = 0;
+  int64_t expected_action_dim_ = 0;
+  uint64_t expected_fingerprint_ = 0;
+  bool has_fingerprint_ = false;
+  std::vector<SearchLabel> labels_;
+  std::set<std::string> loaded_files_;
+  mutable std::mutex mu_;
+};
+
 struct WorkerStats {
   uint64_t games = 0;
   uint64_t moves = 0;
@@ -156,6 +340,8 @@ struct PpoUpdateStats {
   double explained_variance = 0.0;
   int minibatches = 0;
   bool early_stopped = false;
+  double grad_norm_sum = 0.0;
+  int grad_norm_count = 0;
 };
 
 torch::Tensor LegalLogitMean(const torch::Tensor& logits,
@@ -845,6 +1031,8 @@ PpoUpdateStats TrainPpoUpdate(
         std::cerr << "Fatal PPO gradient norm: " << grad_norm << "\n";
         std::exit(EXIT_FAILURE);
       }
+      stats.grad_norm_sum += grad_norm;
+      stats.grad_norm_count += 1;
       optimizer.step();
 
       double kl = approx_kl.item<double>();
@@ -894,6 +1082,7 @@ PpoUpdateStats TrainPpoUpdate(
 
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
+  using namespace open_spiel;
 
 #ifndef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   std::cerr << "dune_ppo_train requires OPEN_SPIEL_BUILD_WITH_LIBTORCH.\n";
@@ -968,6 +1157,14 @@ int main(int argc, char** argv) {
   bool pipeline = absl::GetFlag(FLAGS_pipeline);
   int num_threads = absl::GetFlag(FLAGS_threads);
 
+  std::mt19937 rng(absl::GetFlag(FLAGS_seed));
+  open_spiel::SearchLabelBuffer search_buffer;
+  search_buffer.SetExpectedDimensions(obs_size, action_size);
+  std::string search_label_dir = absl::GetFlag(FLAGS_search_label_dir);
+  if (!search_label_dir.empty()) {
+    search_buffer.LoadFromDirectory(search_label_dir);
+  }
+
   // Collect first rollout synchronously.
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads);
@@ -1004,6 +1201,93 @@ int main(int argc, char** argv) {
                                    action_size, device);
     auto ppo_end = std::chrono::high_resolution_clock::now();
 
+    // --- Search auxiliary distillation steps ---
+    double search_kl_sum = 0.0;
+    double search_grad_sum = 0.0;
+    double search_lambda = absl::GetFlag(FLAGS_search_lambda);
+    int search_minibatches_per_update = absl::GetFlag(FLAGS_search_minibatches_per_update);
+    int search_minibatch_size = absl::GetFlag(FLAGS_search_minibatch_size);
+    float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+
+    if (!search_label_dir.empty()) {
+      search_buffer.LoadNewFiles(search_label_dir);
+    }
+
+    if (search_lambda > 0.0 && search_buffer.Size() > 0) {
+      auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+      auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+
+      for (int aux = 0; aux < search_minibatches_per_update; ++aux) {
+        std::vector<SearchLabel> search_batch = search_buffer.Sample(search_minibatch_size, &rng);
+        if (search_batch.empty()) continue;
+
+        int64_t sb_size = search_batch.size();
+        torch::Tensor search_states_cpu = torch::empty({sb_size, obs_size}, cpu_float);
+        torch::Tensor search_masks_cpu = torch::zeros({sb_size, action_size}, cpu_bool);
+        torch::Tensor search_teacher_probs_cpu = torch::zeros({sb_size, action_size}, cpu_float);
+
+        float* states_ptr = search_states_cpu.data_ptr<float>();
+        bool* masks_ptr = search_masks_cpu.data_ptr<bool>();
+        float* teacher_ptr = search_teacher_probs_cpu.data_ptr<float>();
+
+        for (int64_t i = 0; i < sb_size; ++i) {
+          const auto& label = search_batch[i];
+          std::memcpy(states_ptr + i * obs_size, label.state.data(), obs_size * sizeof(float));
+          for (const auto& ap : label.teacher_probs) {
+            int64_t action_id = ap.first;
+            float prob = ap.second;
+            if (action_id >= 0 && action_id < action_size) {
+              masks_ptr[i * action_size + action_id] = true;
+              teacher_ptr[i * action_size + action_id] = prob;
+            }
+          }
+        }
+
+        torch::Tensor search_states = search_states_cpu.to(device);
+        torch::Tensor search_masks = search_masks_cpu.to(device);
+        torch::Tensor search_teacher_probs = search_teacher_probs_cpu.to(device);
+
+        optimizer->zero_grad();
+
+        torch::Tensor mean_kl;
+        auto compute_distill_loss = [&]() {
+          auto outputs = training_model->forward(search_states);
+          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, search_masks, logit_cap);
+          torch::Tensor masked_logits = logits.masked_fill(search_masks.logical_not(), -1e9f);
+          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+
+          torch::Tensor log_teacher = torch::log(search_teacher_probs.clamp_min(1e-12f));
+          torch::Tensor kl_loss = search_teacher_probs * (log_teacher - log_probs);
+          mean_kl = kl_loss.sum(-1).mean();
+        };
+
+        if (device.is_cuda() && absl::GetFlag(FLAGS_train_amp)) {
+          AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+          compute_distill_loss();
+        } else {
+          compute_distill_loss();
+        }
+
+        torch::Tensor search_loss = search_lambda * mean_kl;
+        search_loss.backward();
+
+        double search_grad_norm = torch::nn::utils::clip_grad_norm_(
+            training_model->parameters(), std::numeric_limits<double>::infinity());
+        if (!std::isfinite(search_grad_norm) || !std::isfinite(mean_kl.item<double>())) {
+          std::cerr << "Warning: Non-finite search distillation gradient (" << search_grad_norm
+                    << ") or loss. Skipping optimizer step.\n";
+          optimizer->zero_grad();
+          continue;
+        }
+        torch::nn::utils::clip_grad_norm_(
+            training_model->parameters(), absl::GetFlag(FLAGS_grad_clip_norm));
+        optimizer->step();
+
+        search_kl_sum += mean_kl.item<double>();
+        search_grad_sum += search_grad_norm;
+      }
+    }
+
     // Join background collection before syncing models.
     if (have_bg) {
       bg_collect_thread.join();
@@ -1035,6 +1319,16 @@ int main(int argc, char** argv) {
         stats.policy_loss, stats.value_loss, stats.entropy, stats.approx_kl,
         stats.clip_fraction, stats.explained_variance,
         stats.early_stopped ? " | early-stop" : "");
+
+    if (search_lambda > 0.0 && search_buffer.Size() > 0) {
+      double avg_search_kl = (search_minibatches_per_update > 0) ? (search_kl_sum / search_minibatches_per_update) : 0.0;
+      double avg_search_grad = (search_minibatches_per_update > 0) ? (search_grad_sum / search_minibatches_per_update) : 0.0;
+      double avg_ppo_grad = (stats.grad_norm_count > 0) ? (stats.grad_norm_sum / stats.grad_norm_count) : 0.0;
+      double ratio = (avg_ppo_grad > 0.0) ? (avg_search_grad / avg_ppo_grad) : 0.0;
+      std::cout << absl::StrFormat(
+          "SearchKL: %.3f | SearchGrad: %.3f | PPOGrad: %.3f | Ratio: %.2f | EV: %.3f\n",
+          avg_search_kl, avg_search_grad, avg_ppo_grad, ratio, stats.explained_variance);
+    }
 
     int checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
     if (checkpoint_interval > 0 && update % checkpoint_interval == 0) {

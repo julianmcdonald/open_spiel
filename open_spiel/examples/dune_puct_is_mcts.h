@@ -25,6 +25,7 @@ struct DuneISMCTSNode {
   absl::flat_hash_map<Action, DuneChildInfo> child_info;
   int total_visits = -1;
   bool priors_initialized = false;
+  double cached_value = 0.0;  // Neural V(s) for this node's current player
 };
 
 enum class DuneISMCTSFinalPolicyType {
@@ -34,6 +35,17 @@ enum class DuneISMCTSFinalPolicyType {
 };
 
 struct TestBotAccessor;
+
+struct SearchDiagnostics {
+  std::vector<Action> actions;       // All legal actions at root
+  std::vector<int> visit_counts;     // N(a) per action
+  std::vector<double> q_values;      // Empirical Q for covered, root_value for unsupported
+  std::vector<double> priors;        // Neural prior π(a)
+  double root_value;                 // Cached V(s) at root
+  int total_root_visits;
+  int num_covered_actions;           // Actions with visits >= min_visit_threshold
+  double covered_prior_mass;         // Sum of π(a) for covered actions
+};
 
 class DunePUCTISMCTSBot : public Bot {
   friend struct TestBotAccessor;
@@ -57,6 +69,7 @@ class DunePUCTISMCTSBot : public Bot {
   std::pair<ActionsAndProbs, Action> StepWithPolicy(const State& state) override;
 
   ActionsAndProbs RunSearch(const State& state);
+  SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold = 2) const;
 
   // Bot maintains no history, so these are empty.
   void Restart() override {}
