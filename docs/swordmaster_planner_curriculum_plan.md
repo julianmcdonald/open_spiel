@@ -33,6 +33,8 @@ No free Swordmaster. No fake Solari. No raw Solari breadcrumbs.
 
 Build a small goal-seeking planner that runs inside training/evaluation code and chooses legal actions that maximize the chance of the chosen player owning Swordmaster before a deadline.
 
+Important implementation refinement: **the full rollout planner is not required for Stage 10A**. Stage 10A discards the acquisition prefix, so the route does not need to be strategically optimal. It only needs to be legal and to reach `HasSwordmaster(owner)`. The expensive planner/scoring machinery is for later acquisition training and diverse state generation, not for the first usage-practice MVP.
+
 The planner should not know "Smuggling twice" as a hardcoded route. It should know:
 
 - success predicate: `dune_state->HasSwordmaster(owner)`;
@@ -45,6 +47,18 @@ The planner should not know "Smuggling twice" as a hardcoded route. It should kn
   - `kActionSelectAgentCard0 = 1800`.
 
 Everything else should be discovered by cloning states and applying legal actions.
+
+### MVP decomposition
+
+Build the pieces in this order:
+
+1. **Navigation helper**: `FindActionOrCardPathToSpace(state, owner, target_space)`. This is needed immediately because even scripted warm-starts must choose a legal access card before placing on Smuggling/Swordmaster.
+2. **Scripted legal warm-starts**: Beast/Leto lines that legally acquire early Swordmaster, aborting if any required step is illegal.
+3. **Post-Swordmaster state generator**: stores or feeds legal post-SM states into PPO/search-label generation.
+4. **Targeted post-SM search labels**: run IS-MCTS at those generated states and distill.
+5. **Full acquisition planner**: only then build `ChooseSwordmasterPlannerAction` / `RolloutSwordmasterRace` for arbitrary leaders/states.
+
+This keeps the first implementation small and validates the highest-value hypothesis quickly: whether the model can learn to use Swordmaster once it sees enough legal post-Swordmaster states.
 
 ### Planner API sketch
 
@@ -177,11 +191,29 @@ This matters because human play treats the Swordmaster queue as strategic. The p
 
 The training should happen in phases. The phases are deliberately separated so bad post-Swordmaster play does not poison acquisition learning.
 
+Revised ordering:
+
+1. **10A**: scripted legal warm-start generator + post-Swordmaster continuation practice.
+2. **10B**: targeted post-Swordmaster search labels and distillation. This should be treated as co-core with 10A, not a late optional add-on.
+3. **10C**: generic acquisition planner/coach across all seats and leaders.
+4. **10D**: consolidation with scaffolding removed.
+
+The reason search labels move earlier is that Stage 9 already proved search distillation is the strongest improvement mechanism in this stack. Pre-Swordmaster search will likely undervalue the purchase while the value net thinks post-Swordmaster states are bad. So usage/value learning must come first: generate legal post-SM states, run IS-MCTS there, distill the resulting policy/value improvements, then attempt broad acquisition learning.
+
 ## Stage 10A: legal post-Swordmaster continuation gym
 
 Purpose: teach the model how to play after early Swordmaster.
 
 This stage uses legal warm-starts.
+
+Stage 10A should **not** build or depend on the full rollout planner. Because the prefix is discarded, route quality is secondary. The implementation can use a small set of legal scripted warm-starts plus the card-to-space navigation helper:
+
+- Beast/Leto R2 line: `Smuggling -> Smuggling -> ShippingRecall -> ShippingLevel1Dividends -> Swordmaster`.
+- Abort if any script step is illegal or blocked.
+- Prefer the policy-best compatible card when a script step requires `SelectAgentCard`.
+- Start recording only after `HasSwordmaster(owner)` becomes true.
+
+This deliberately avoids overbuilding the hardest part before validating the continuation-training hypothesis.
 
 ### Rollout flow
 
@@ -190,7 +222,7 @@ For a fraction of games:
 1. Start a normal game.
 2. Pick a curriculum owner with seat rotation across P0/P1/P2/P3.
 3. Prefer Beast/Leto at first because they reliably generate legal R2 Swordmaster states.
-4. Use the Swordmaster planner/fast path to legally acquire Swordmaster.
+4. Use the scripted legal warm-start line, plus `FindActionOrCardPathToSpace`, to acquire Swordmaster.
 5. If blocked or failed before deadline, discard the warm-start attempt or fall back to normal rollout.
 6. Once `HasSwordmaster(owner)` is true, clear the temporary prefix trajectory and start recording PPO transitions from that state.
 7. Finish the game normally with the current policy.
@@ -212,7 +244,20 @@ The first option generates more post-Swordmaster practice quickly. It is still a
 
 The owner seat must still rotate. Do not hardcode P2.
 
-Stage 10B removes this leader restriction by using the generic acquisition coach from normal starts across all leaders.
+Stage 10C removes this leader restriction by using the generic acquisition coach from normal starts across all leaders.
+
+### Warm-start route diversity
+
+Seat rotation alone is not enough. If every warm-start is the same Beast-Smuggling board texture, the continuation policy may not transfer cleanly to Swordmaster states reached by other leaders, different hands, combat Solari, Arrakeen lines, or R3 purchases.
+
+Use an incremental route mix:
+
+1. **MVP route**: Beast/Leto R2 Smuggling line.
+2. **R2-R3 script window**: allow deadline round 3 so blocked or slower legal lines can still generate useful post-SM states.
+3. **Natural opportunistic capture**: during normal rollouts, whenever any player legally buys Swordmaster by R3/R4, oversample or save the post-purchase continuation.
+4. **Planner-assisted diversity**: once the full planner exists, add all-leader routes discovered by search.
+
+The first route gets the gym working. The later routes broaden the post-SM distribution before acquisition training depends on it.
 
 ### Suggested flags
 
@@ -221,10 +266,10 @@ SM_WARMSTART_PROB=0.15
 SM_WARMSTART_RECORD_PREFIX=false
 SM_WARMSTART_OWNER_MODE=rotate
 SM_WARMSTART_LEADERS=beast,leto
-SM_WARMSTART_DEADLINE_ROUND=2
+SM_WARMSTART_DEADLINE_ROUNDS=2,3
+SM_WARMSTART_ROUTE_MIX=beast_leto_r2_script,natural_r3_capture
 SM_WARMSTART_MAX_STEPS=250
-SM_PLANNER_ROLLOUTS_PER_ACTION=4
-SM_PLANNER_MAX_DEPTH=20
+SM_WARMSTART_SCRIPT_ONLY=true
 ```
 
 ### Stage 10A training command sketch
@@ -246,7 +291,7 @@ SM_WARMSTART_PROB=0.15 \
 SM_WARMSTART_RECORD_PREFIX=false \
 SM_WARMSTART_OWNER_MODE=rotate \
 SM_WARMSTART_LEADERS=beast,leto \
-SM_WARMSTART_DEADLINE_ROUND=2 \
+SM_WARMSTART_DEADLINE_ROUNDS=2,3 \
 CHECKPOINT_INTERVAL=100 \
 SEED=10 \
 RUN_PREFIX=dune_ppo_stage_10a_sm_usage \
@@ -258,20 +303,70 @@ stdbuf -oL -eL scripts/run_ppo_train.sh \
 
 ### Stage 10A success criteria
 
-- Forced Beast/Leto early-Swordmaster continuation improves materially from the current 13% Beast result.
+- Conditional forced/warm-start Beast/Leto early-Swordmaster continuation improves materially from the current 13% Beast result.
 - Third-agent utilization improves:
   - fewer reveal/end-turn decisions with agents remaining;
   - more useful third placements;
   - better VP/return after legal early Swordmaster.
-- Normal Stage 9 head-to-head does not collapse.
+- Normal Stage 9 head-to-head does not collapse, but it is not expected to move much yet.
 
-Natural Swordmaster acquisition is not the main gate for this stage.
+Natural Swordmaster acquisition and headline winrate are not the main gates for this stage. Stage 10A trains states the current policy rarely reaches on its own, so a flat headline metric is not failure. The correct gate is conditional performance from legal post-Swordmaster states.
 
-## Stage 10B: generic Swordmaster acquisition coach
+## Stage 10B: targeted post-Swordmaster search-label distillation
+
+Purpose: bake good Swordmaster continuation decisions into the policy/value heads using the mechanism that already produced the Stage 9 champion.
+
+This should be built as soon as the Stage 10A warm-start generator exists.
+
+### Label-generation approach
+
+Use the warm-start generator to produce legal post-Swordmaster roots:
+
+1. Start normal games.
+2. Use scripted legal warm-starts to reach `HasSwordmaster(owner)`.
+3. At the immediate post-purchase state and subsequent third-agent decision states, run IS-MCTS.
+4. Write labels only for target states:
+   - immediately after Swordmaster purchase;
+   - third-agent decisions after early Swordmaster;
+   - reveal/end-turn decisions where agents remain;
+   - high-leverage R3-R5 placement decisions with three agents.
+
+Use a higher search budget than broad Stage 9 labels for this sparse branch.
+
+Suggested first pass:
+
+```bash
+--target_labels=8192
+--max_simulations=200
+--target_teacher_kl=0.05
+--search_fraction=0.30
+--sm_label_mode=post_purchase_usage
+--sm_warmstart_generator=beast_leto_script
+```
+
+Then distill conservatively:
+
+```bash
+SEARCH_LABEL_DIR=search_labels/stage10_sm_usage_s200_kl005
+SEARCH_LAMBDA=0.05
+SEARCH_MINIBATCHES_PER_UPDATE=1
+SEARCH_MINIBATCH_SIZE=512
+```
+
+### Stage 10B success criteria
+
+- Conditional post-Swordmaster return improves.
+- Third-agent utilization improves under search-distilled policy.
+- The value head no longer catastrophically undervalues legal post-SM states.
+- Normal head-to-head remains stable.
+
+## Stage 10C: generic Swordmaster acquisition coach
 
 Purpose: teach the model to solve the Swordmaster race from normal starts across all seats and leaders.
 
 This stage uses action influence, not hard forcing.
+
+This is optional/skippable until 10A/10B have improved post-Swordmaster value. If the value net still thinks post-SM states are bad, a pre-SM planner/search coach will often fail to value the acquisition because the long-horizon payoff is bootstrapped through a bad leaf evaluation.
 
 ### Behavior policy
 
@@ -309,11 +404,11 @@ SM_PLANNER_BLOCK_AWARE_OPPONENTS=false
 
 Start with modest `beta`. Increase only if the model still never reaches early-Swordmaster states.
 
-### Stage 10B training command sketch
+### Stage 10C training command sketch
 
 ```bash
-cp dune_ppo_stage_10a_sm_usage_model.pt dune_ppo_stage_10b_sm_acquire_model.pt
-cp dune_ppo_stage_10a_sm_usage_optimizer.pt dune_ppo_stage_10b_sm_acquire_optimizer.pt
+cp dune_ppo_stage_10b_sm_usage_distill_model.pt dune_ppo_stage_10c_sm_acquire_model.pt
+cp dune_ppo_stage_10b_sm_usage_distill_optimizer.pt dune_ppo_stage_10c_sm_acquire_optimizer.pt
 
 TOTAL_UPDATES=1000 \
 LEARNING_RATE=0.00001 \
@@ -329,14 +424,14 @@ SM_COACH_BETA=1.5 \
 SM_COACH_DEADLINE_ROUND=4 \
 CHECKPOINT_INTERVAL=100 \
 SEED=11 \
-RUN_PREFIX=dune_ppo_stage_10b_sm_acquire \
-MODEL_CHECKPOINT=dune_ppo_stage_10b_sm_acquire_model.pt \
-OPTIM_CHECKPOINT=dune_ppo_stage_10b_sm_acquire_optimizer.pt \
+RUN_PREFIX=dune_ppo_stage_10c_sm_acquire \
+MODEL_CHECKPOINT=dune_ppo_stage_10c_sm_acquire_model.pt \
+OPTIM_CHECKPOINT=dune_ppo_stage_10c_sm_acquire_optimizer.pt \
 stdbuf -oL -eL scripts/run_ppo_train.sh \
-  2>&1 | tee training_log_ppo_stage_10b_sm_acquire.txt
+  2>&1 | tee training_log_ppo_stage_10c_sm_acquire.txt
 ```
 
-### Stage 10B success criteria
+### Stage 10C success criteria
 
 - Natural Swordmaster acquisition rate rises in self-play.
 - Acquisition is not seat-2 concentrated.
@@ -344,17 +439,15 @@ stdbuf -oL -eL scripts/run_ppo_train.sh \
 - Forced early-Swordmaster continuation remains improved.
 - Normal head-to-head versus Stage 9 stays competitive or improves.
 
-## Stage 10C: targeted search-label distillation
+## Stage 10C extension: targeted acquisition search-label distillation
 
-Purpose: bake good Swordmaster decisions into the policy head using search labels in the sparse subgame.
+Purpose: bake good Swordmaster race decisions into the policy head using search labels in the sparse pre-purchase subgame.
 
-Stage 9 generated broad search labels and improved strength, but the label distribution barely covered Swordmaster states. Stage 10C should generate labels specifically around:
+Do this only after post-Swordmaster usage/value has improved. Stage 9 generated broad search labels and improved strength, but the label distribution barely covered Swordmaster states. Acquisition labels should target:
 
 - Smuggling-contested states;
 - states where owner is close to 8/7 Solari;
 - states where Swordmaster is legal or one action away;
-- immediately after Swordmaster purchase;
-- third-agent decisions after early Swordmaster;
 - opponent decisions where blocking Smuggling/Swordmaster is relevant.
 
 ### Label-generation approach
@@ -375,13 +468,13 @@ Suggested first pass:
 --max_simulations=200
 --target_teacher_kl=0.05
 --search_fraction=0.30
---sm_label_mode=race_and_post_purchase
+--sm_label_mode=race_and_blocking
 ```
 
 Then distill conservatively:
 
 ```bash
-SEARCH_LABEL_DIR=search_labels/stage10_sm_targeted_s200_kl005
+SEARCH_LABEL_DIR=search_labels/stage10_sm_acquisition_s200_kl005
 SEARCH_LAMBDA=0.05
 SEARCH_MINIBATCHES_PER_UPDATE=1
 SEARCH_MINIBATCH_SIZE=512
@@ -434,7 +527,7 @@ Add optional early-round coach influence:
 - sample action;
 - store old log-prob from the coached behavior distribution.
 
-This is more invasive than warm-starts and should come after Stage 10A.
+This is more invasive than warm-starts and should come after Stage 10A/10B.
 
 ### 4. Script passthroughs
 
@@ -444,7 +537,9 @@ Add environment variable passthroughs in `scripts/run_ppo_train.sh` for:
 - `SM_WARMSTART_RECORD_PREFIX`;
 - `SM_WARMSTART_OWNER_MODE`;
 - `SM_WARMSTART_LEADERS`;
-- `SM_WARMSTART_DEADLINE_ROUND`;
+- `SM_WARMSTART_DEADLINE_ROUNDS`;
+- `SM_WARMSTART_ROUTE_MIX`;
+- `SM_WARMSTART_SCRIPT_ONLY`;
 - `SM_COACH_PROB`;
 - `SM_COACH_BETA`;
 - `SM_COACH_DEADLINE_ROUND`;
@@ -503,6 +598,12 @@ Early Stage 10A:
 
 Stage 10B:
 
+- conditional post-Swordmaster return/value improves further after search distillation;
+- third-agent utilization improves further;
+- normal winrate remains stable even if acquisition has not yet increased.
+
+Stage 10C:
+
 - natural Swordmaster acquisition rises above Stage 9's 0.02/game;
 - not concentrated only in one seat;
 - not exclusively Beast/Leto;
@@ -521,7 +622,7 @@ Mitigation:
 
 - rotate owner seats in Stage 10A;
 - do not record forced prefix;
-- quickly add generic all-leader coach in Stage 10B;
+- add generic all-leader coach in Stage 10C after usage/value improves;
 - log completion distribution.
 
 ### Risk: planner finds unrealistic routes because opponents do not block
