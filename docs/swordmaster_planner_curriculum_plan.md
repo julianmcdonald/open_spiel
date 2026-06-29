@@ -668,5 +668,54 @@ Instead:
 2. Run Stage 10A PPO from legal post-Swordmaster states, rotating seats and not recording the forced prefix. This is the value-head correction stage.
 3. After 10A improves conditional post-SM value/returns, generate targeted post-SM IS-MCTS labels and distill policy improvements in Stage 10B.
 4. Only then build the generic engine-backed acquisition planner/coach for all seats/leaders in Stage 10C.
-5. Optionally add targeted acquisition search labels once post-SM value is trustworthy.
-6. Remove scaffolding and verify the behavior persists in normal self-play.
+5.  - Optionally add targeted acquisition search labels once post-SM value is trustworthy.
+  - Remove scaffolding and verify the behavior persists in normal self-play.
+
+## Execution History & Results (Stages 10A to 10D Probe)
+
+### Stage 10A: Legal Swordmaster Warm-Start Value Correction
+- **Objective**: Correct the value head of the PPO model in legal post-Swordmaster states using seat-rotating warm-starts (Beast and Leto).
+- **Configuration**:
+  - `TOTAL_UPDATES=600`
+  - `SM_WARMSTART_PROB=0.15`
+  - `SM_WARMSTART_RECORD_PREFIX=false`
+  - `SM_WARMSTART_OWNER_MODE=rotate`
+  - `SM_WARMSTART_LEADERS=beast,leto`
+  - `LEARNING_RATE=0.00001`, `ENTROPY_COEF=0.015`, `GAE_LAMBDA=1.0`
+- **Outcomes**:
+  - Forced Beast early-SM P2 winrate improved from **13.52%** to **13.94%** (Average VP increased from 7.65 to 8.03; average return improved from -0.61 to -0.52).
+  - Wasted reveals (revealing with 1+ unused agents after SM) dropped from **5.4%** to **2.4%**.
+  - Normal-play stability was maintained with balanced seat win rates.
+
+### Stage 10B: Targeted Post-Swordmaster Search-Label Distillation
+- **Objective**: Use IS-MCTS at post-Swordmaster states to generate search labels and distill them into the policy head via KL divergence.
+- **Outcomes**:
+  - Sharpened the policy's action distribution in post-SM states (such as third-agent placement and reveal decisions).
+  - Maintained baseline win rates in unconstrained play.
+
+### Stage 10C: Generic Swordmaster Acquisition Planner/Coach
+- **Objective**: Teach the policy to solve the pre-SM race from normal starts across all seats and leaders using behavior policy logit-coercion.
+- **Configuration**:
+  - `TOTAL_UPDATES=1000`
+  - `SM_COACH_PROB=0.20`, `SM_COACH_BETA=1.5`
+  - `SM_COACH_DEADLINE_ROUND=4`
+  - `SWORDMASTER_BREADCRUMB_WEIGHT=0.0`, `SM_WARMSTART_PROB=0.0`
+- **Outcomes (Stage 10C-3 Model)**:
+  - **Natural SM rate** rose dramatically to **0.81 acquisitions/game** in unconstrained self-play (compared to ~0.02 in Stage 9 baseline).
+  - Wasted reveals in unconstrained play remained low (96.5% fully utilized).
+  - Forced Beast early-SM winrate stabilized at **13.02%** (VP = 7.97, return = -0.7969).
+  - Unconstrained play headline win shares were stable and balanced (P0: 23.5%, P1: 32.0%, P2: 26.5%, P3: 18.0%).
+
+### Stage 10D Probe: Scaffold-Off Consolidation Probe (Full Stage 10D Gated Out)
+- **Objective**: Test if the learned Swordmaster acquisition and usage behaviors persist in pure self-play when all training scaffolding is removed. This probe gates whether we proceed to the full Stage 10D consolidation stage.
+- **Configuration**:
+  - Initialized from Stage 10C-3 coached model.
+  - `TOTAL_UPDATES=100` (terminated early at Update 137).
+  - `SM_WARMSTART_PROB=0.0`, `SM_COACH_PROB=0.0`, `SWORDMASTER_BREADCRUMB_WEIGHT=0.0`, `SEARCH_LAMBDA=0.0`.
+- **Outcomes (At Update 100 Checkpoint)**:
+  - **SM/game collapsed completely** from `0.81` down to **0.0667** acquisitions/game (Total of 20 acquisitions across 300 evaluated games). In self-play stochastic rollouts, the acquisition rate decayed to `~1% to 3%` by Update 137.
+  - Forced Beast early-SM P2 winrate dropped to **9.32%** (below the `>= 13.0%` gate).
+  - General gameplay win shares and VP remained stable, but the tactical acquisition behavior was completely scaffold-dependent.
+- **Decision**: The consolidation probe failed. The full Stage 10D consolidation run was gated out and not executed. Training was terminated early.
+- **Next Steps Recommendation**: Go back to a coaching or curriculum pass that explicitly addresses early round (R3-R5) Solari conversion values and increases the post-purchase usage advantage, ensuring the model internally values the extra agent.
+

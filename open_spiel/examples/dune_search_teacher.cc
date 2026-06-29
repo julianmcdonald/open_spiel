@@ -22,6 +22,8 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_evaluator.h"
+#include "dune_warmstart_helpers.h"
+
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen PPO checkpoint");
 ABSL_FLAG(std::string, output_dir, "", "Label output directory");
@@ -47,6 +49,16 @@ ABSL_FLAG(double, search_opponent_temperature, 0.0,
 ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension");
 ABSL_FLAG(int, num_blocks, 8, "Network residual block count");
 ABSL_FLAG(int, seed, 42, "Seed for rng");
+ABSL_FLAG(bool, sm_warmstart_enable, false, "Force all self-play games to use post-SM warm-starts");
+ABSL_FLAG(int, sm_warmstart_max_steps, 250, "Hard step limit before aborting a blocked warm-start");
+ABSL_FLAG(std::string, sm_warmstart_leaders, "beast,leto", "Allowed leaders for the warm-start owner");
+
+ABSL_FLAG(bool, sm_coach_labels_enable, false, "Enable the rollout coach/planner during search teacher play");
+ABSL_FLAG(double, sm_coach_labels_prob, 0.20, "Probability of activating the coach for any given game");
+ABSL_FLAG(double, sm_coach_labels_beta, 1.5, "Scale factor for the planner's prior reweighting");
+ABSL_FLAG(int, sm_coach_labels_deadline_round, 5, "Target round limit for the coach");
+ABSL_FLAG(std::string, sm_label_mode, "all", "Set to race_and_blocking to enable filtering");
+
 
 namespace open_spiel {
 namespace {
@@ -329,11 +341,69 @@ Action SampleBlueprintAction(const ActionsAndProbs& prior, double temp, std::mt1
   }
 }
 
+bool MatchesStage10C2Filters(const State& state, Player searched_player, Player coached_owner,
+                             const ActionsAndProbs& ppo_prior, std::string* matched_category) {
+  const dune_imperium::DuneImperiumState* dune_state =
+      dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  if (dune_state == nullptr || coached_owner < 0) return false;
+
+  int round = dune_state->GetCurrentRound();
+  if (round > 5) return false;
+
+  if (searched_player == coached_owner) {
+    if (dune_state->HasSwordmaster(coached_owner)) return false;
+
+    // A. Contested Smuggling
+    const auto* smuggling_space = dune_state->AgentSpaceForActionForTesting(dune_imperium::kActionAgentSpaceSmuggling);
+    if (smuggling_space != nullptr) {
+      uint8_t occupancy = dune_state->GetAgentSpaceOwnerForTesting(smuggling_space->board_index);
+      uint8_t owner_bit = dune_imperium::PlayerSpaceBit(searched_player);
+      if (occupancy != 0 && (occupancy & ~owner_bit) != 0) {
+        *matched_category = "contested_smuggling";
+        return true;
+      }
+    }
+
+    // B. Swordmaster Access
+    if (FindActionOrCardPathToSpace(state, searched_player, dune_imperium::kActionAgentSpaceSwordmaster, ppo_prior) != kInvalidAction) {
+      *matched_category = "sm_access";
+      return true;
+    }
+
+    // C. Solari Deficit Progress
+    int solari = dune_state->GetPlayerSolari(searched_player);
+    bool is_leto = (dune_state->PlayerLeader(searched_player) == 4);
+    int needed_solari = is_leto ? 5 : 6;
+    if (solari >= needed_solari) {
+      *matched_category = "close_solari";
+      return true;
+    }
+  } else {
+    // Opponent Blocking Decisions
+    int owner_solari = dune_state->GetPlayerSolari(coached_owner);
+    bool owner_is_leto = (dune_state->PlayerLeader(coached_owner) == 4);
+    int owner_needed_solari = owner_is_leto ? 5 : 6;
+    if (owner_solari >= owner_needed_solari && !dune_state->HasSwordmaster(coached_owner)) {
+      bool can_smuggling = (FindActionOrCardPathToSpace(state, searched_player, dune_imperium::kActionAgentSpaceSmuggling, ppo_prior) != kInvalidAction);
+      bool can_swordmaster = (FindActionOrCardPathToSpace(state, searched_player, dune_imperium::kActionAgentSpaceSwordmaster, ppo_prior) != kInvalidAction);
+      if (can_smuggling || can_swordmaster) {
+        *matched_category = "opponent_blocking";
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 } // namespace
 } // namespace open_spiel
 
 int main(int argc, char** argv) {
+  using namespace open_spiel;
+  using namespace open_spiel::dune_imperium;
   absl::ParseCommandLine(argc, argv);
+
 
   std::string model_checkpoint = absl::GetFlag(FLAGS_model_checkpoint);
   std::string output_dir = absl::GetFlag(FLAGS_output_dir);
@@ -379,6 +449,26 @@ int main(int argc, char** argv) {
   std::atomic<double> total_actual_kl{0.0};
   std::mutex writer_mutex;
 
+  std::atomic<int> ws_attempts{0};
+  std::atomic<int> ws_successes{0};
+  std::atomic<int> fail_no_leader{0};
+  std::atomic<int> fail_blocked{0};
+  std::atomic<int> fail_max_steps{0};
+
+  std::atomic<int> states_contested_smuggling{0};
+  std::atomic<int> searches_contested_smuggling{0};
+  std::atomic<int> labels_contested_smuggling{0};
+  std::atomic<int> states_close_solari{0};
+  std::atomic<int> searches_close_solari{0};
+  std::atomic<int> labels_close_solari{0};
+  std::atomic<int> states_sm_access{0};
+  std::atomic<int> searches_sm_access{0};
+  std::atomic<int> labels_sm_access{0};
+  std::atomic<int> states_opponent_blocking{0};
+  std::atomic<int> searches_opponent_blocking{0};
+  std::atomic<int> labels_opponent_blocking{0};
+
+
   open_spiel::LabelWriter writer(
       output_dir, obs_size, action_size, absl::GetFlag(FLAGS_max_simulations),
       absl::GetFlag(FLAGS_value_scale), absl::GetFlag(FLAGS_puct_c),
@@ -404,11 +494,232 @@ int main(int argc, char** argv) {
         true, absl::GetFlag(FLAGS_search_opponent_temperature));
 
     while (labels_emitted < target_labels && games_started < max_games) {
-      int game_id = games_started.fetch_add(1);
-      if (game_id >= max_games) break;
+      bool ws_success = false;
+      std::unique_ptr<open_spiel::State> state;
+      open_spiel::Player searched_player = -1;
+      open_spiel::Player owner = -1;
 
-      std::unique_ptr<open_spiel::State> state = game->NewInitialState();
-      open_spiel::Player searched_player = game_id % state->NumPlayers();
+      if (absl::GetFlag(FLAGS_sm_warmstart_enable)) {
+        while (!ws_success && labels_emitted < target_labels && games_started < max_games) {
+          int game_id = games_started.fetch_add(1);
+          if (game_id >= max_games) break;
+
+          state = game->NewInitialState();
+          searched_player = game_id % state->NumPlayers();
+          owner = searched_player;
+
+          ws_attempts++;
+
+          int ws_step = 0;
+          int ws_total_steps = 0;
+          bool ws_failed = false;
+          std::string ws_fail_reason = "";
+
+          const dune_imperium::DuneImperiumState* dune_state =
+              dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+
+          while (!state->IsTerminal()) {
+            ws_total_steps++;
+            if (ws_total_steps > absl::GetFlag(FLAGS_sm_warmstart_max_steps)) {
+              ws_failed = true;
+              ws_fail_reason = "max_steps_exceeded";
+              break;
+            }
+
+            if (state->IsChanceNode()) {
+              auto outcomes = state->ChanceOutcomes();
+              Action action = outcomes.front().first;
+
+              // Force Rabban (6) or Leto (4) in the leader offer chance (Option 1)
+              if (dune_state != nullptr && dune_state->phase() == dune_imperium::GamePhase::kLeaderOfferChance) {
+                Action forced_action = kInvalidAction;
+                for (const auto& outcome : outcomes) {
+                  Action act = outcome.first;
+                  if (act == 6) { // Rabban
+                    forced_action = act;
+                    break;
+                  }
+                  if (act == 4 && forced_action == kInvalidAction) { // Leto
+                    forced_action = act;
+                  }
+                }
+                if (forced_action != kInvalidAction) {
+                  action = forced_action;
+                } else {
+                  action = game->GetType().chance_mode == GameType::ChanceMode::kSampledStochastic
+                              ? outcomes.front().first
+                              : SampleAction(outcomes, absl::Uniform(rng, 0.0, 1.0)).first;
+                }
+              } else {
+                action = game->GetType().chance_mode == GameType::ChanceMode::kSampledStochastic
+                            ? outcomes.front().first
+                            : SampleAction(outcomes, absl::Uniform(rng, 0.0, 1.0)).first;
+              }
+              state->ApplyAction(action);
+              continue;
+            }
+
+            if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+              std::vector<Action> joint_action;
+              for (int p = 0; p < game->NumPlayers(); ++p) {
+                std::vector<Action> actions = state->LegalActions(p);
+                if (actions.empty()) {
+                  joint_action.push_back(0);
+                } else {
+                  std::uniform_int_distribution<int> dis(0, actions.size() - 1);
+                  joint_action.push_back(actions[dis(rng)]);
+                }
+              }
+              state->ApplyActions(joint_action);
+              continue;
+            }
+
+            Player current_player = state->CurrentPlayer();
+            std::vector<Action> actions = state->LegalActions();
+            if (actions.empty()) {
+              ws_failed = true;
+              ws_fail_reason = "no_actions";
+              break;
+            }
+
+            ActionsAndProbs ppo_prior = evaluator->Prior(*state);
+
+            // Coerce behavior for the owner
+            Action action = kInvalidAction;
+            bool action_forced = false;
+
+            if (dune_state != nullptr && dune_state->phase() == dune_imperium::GamePhase::kLeaderDraft) {
+              if (current_player == owner) {
+                if (std::find(actions.begin(), actions.end(), dune_imperium::kActionLeaderPick0 + 6) != actions.end()) {
+                  action = dune_imperium::kActionLeaderPick0 + 6;
+                  action_forced = true;
+                } else if (std::find(actions.begin(), actions.end(), dune_imperium::kActionLeaderPick0 + 4) != actions.end()) {
+                  action = dune_imperium::kActionLeaderPick0 + 4;
+                  action_forced = true;
+                } else {
+                  ws_failed = true;
+                  ws_fail_reason = "no_leader";
+                  break;
+                }
+              }
+            } else if (dune_state != nullptr && dune_state->phase() == dune_imperium::GamePhase::kAgentTurns) {
+              if (current_player == owner) {
+                Action target_space = kInvalidAction;
+                int round = dune_state->GetCurrentRound();
+                if (ws_step == 0 && round == 1) {
+                  target_space = dune_imperium::kActionAgentSpaceSmuggling;
+                } else if (ws_step == 1 && round == 2) {
+                  target_space = dune_imperium::kActionAgentSpaceSmuggling;
+                } else if (ws_step == 2 && round == 2) {
+                  target_space = dune_imperium::kActionAgentSpaceSwordmaster;
+                }
+
+                if (target_space != kInvalidAction) {
+                  bool is_main_agent_choice = false;
+                  for (Action a : actions) {
+                    if ((a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256) ||
+                        a == target_space) {
+                      is_main_agent_choice = true;
+                      break;
+                    }
+                  }
+
+                  if (is_main_agent_choice) {
+                    Action chosen = FindActionOrCardPathToSpace(*state, owner, target_space, ppo_prior);
+                    if (chosen == kInvalidAction) {
+                      ws_failed = true;
+                      ws_fail_reason = (ws_step == 2) ? "blocked_swordmaster" : "no_access";
+                      break;
+                    }
+                    action = chosen;
+                    action_forced = true;
+                  }
+                }
+              }
+            }
+
+            if (!action_forced && current_player == owner) {
+              if (std::find(actions.begin(), actions.end(), dune_imperium::kActionAgentRewardShipping) != actions.end()) {
+                action = dune_imperium::kActionAgentRewardShipping;
+                action_forced = true;
+              } else if (ws_step == 1) {
+                if (std::find(actions.begin(), actions.end(), dune_imperium::kActionShippingAdvance) != actions.end()) {
+                  action = dune_imperium::kActionShippingAdvance;
+                  action_forced = true;
+                }
+              } else if (ws_step == 2) {
+                if (std::find(actions.begin(), actions.end(), dune_imperium::kActionShippingRecall) != actions.end()) {
+                  action = dune_imperium::kActionShippingRecall;
+                  action_forced = true;
+                } else if (std::find(actions.begin(), actions.end(), dune_imperium::kActionShippingLevel1Dividends) != actions.end()) {
+                  action = dune_imperium::kActionShippingLevel1Dividends;
+                  action_forced = true;
+                }
+              }
+            }
+
+            if (!action_forced) {
+              action = open_spiel::SampleBlueprintAction(ppo_prior, absl::GetFlag(FLAGS_blueprint_temperature), rng);
+            }
+
+            state->ApplyAction(action);
+
+            if (current_player == owner && dune_state != nullptr) {
+              int round = dune_state->GetCurrentRound();
+              if (action == dune_imperium::kActionAgentSpaceSmuggling && ws_step == 0 && round == 1) {
+                ws_step++;
+              } else if (action == dune_imperium::kActionAgentSpaceSmuggling && ws_step == 1 && round == 2) {
+                ws_step++;
+              } else if (action == dune_imperium::kActionAgentSpaceSwordmaster && ws_step == 2 && round == 2) {
+                ws_step++;
+              }
+            }
+
+            if (dune_state != nullptr && dune_state->HasSwordmaster(owner)) {
+              ws_success = true;
+              ws_successes++;
+              break;
+            }
+          }
+
+          if (ws_failed) {
+            if (ws_fail_reason == "no_leader") {
+              fail_no_leader++;
+            } else if (ws_fail_reason == "blocked_swordmaster" || ws_fail_reason == "no_access") {
+              fail_blocked++;
+            } else if (ws_fail_reason == "max_steps_exceeded") {
+              fail_max_steps++;
+            }
+          }
+        }
+        if (games_started >= max_games && !ws_success) {
+          break;
+        }
+      } else {
+        int game_id = games_started.fetch_add(1);
+        if (game_id >= max_games) break;
+        state = game->NewInitialState();
+        searched_player = game_id % state->NumPlayers();
+        ws_success = true;
+      }
+
+      const dune_imperium::DuneImperiumState* dune_state =
+          dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+
+      Player coached_owner = -1;
+      bool coach_enabled_for_game = false;
+      if (absl::GetFlag(FLAGS_sm_coach_labels_enable)) {
+        std::uniform_real_distribution<double> dist_coach(0.0, 1.0);
+        if (dist_coach(rng) < absl::GetFlag(FLAGS_sm_coach_labels_prob)) {
+          coach_enabled_for_game = true;
+          if (absl::GetFlag(FLAGS_sm_warmstart_enable)) {
+            coached_owner = owner;
+          } else {
+            std::uniform_int_distribution<int> dist_owner(0, state->NumPlayers() - 1);
+            coached_owner = dist_owner(rng);
+          }
+        }
+      }
 
       while (!state->IsTerminal()) {
         if (labels_emitted >= target_labels) break;
@@ -422,9 +733,112 @@ int main(int argc, char** argv) {
 
         open_spiel::Player cur_player = state->CurrentPlayer();
         open_spiel::ActionsAndProbs ppo_prior = evaluator->Prior(*state);
-        open_spiel::Action blueprint_action = open_spiel::SampleBlueprintAction(ppo_prior, absl::GetFlag(FLAGS_blueprint_temperature), rng);
 
-        if (open_spiel::IsStrategicState(*state, searched_player)) {
+        bool apply_coach = false;
+        if (coach_enabled_for_game && dune_state != nullptr && cur_player == coached_owner) {
+          if (!dune_state->HasSwordmaster(cur_player)) {
+            int round = dune_state->GetCurrentRound();
+            if (round <= absl::GetFlag(FLAGS_sm_coach_labels_deadline_round)) {
+              if (ppo_prior.size() > 1) {
+                apply_coach = true;
+              }
+            }
+          }
+        }
+
+        open_spiel::ActionsAndProbs behavior_prior = ppo_prior;
+        if (apply_coach) {
+          SwordmasterPlannerConfig cfg;
+          cfg.deadline_round = absl::GetFlag(FLAGS_sm_coach_labels_deadline_round);
+          cfg.max_depth = 64;
+          cfg.rollouts_per_action = 2;
+          cfg.use_policy_for_opponents = false;
+          cfg.use_policy_for_owner = false;
+          cfg.block_aware_opponents = false;
+
+          std::vector<double> action_scores(behavior_prior.size(), 0.0);
+          double max_score = -std::numeric_limits<double>::infinity();
+          double min_score = std::numeric_limits<double>::infinity();
+
+          for (size_t i = 0; i < behavior_prior.size(); ++i) {
+            Action a = behavior_prior[i].first;
+            double sum_score = 0.0;
+            for (int r = 0; r < cfg.rollouts_per_action; ++r) {
+              std::unique_ptr<State> clone = state->Clone();
+              clone->ApplyAction(a);
+              DrainForcedNodesForRollout(clone.get(), &rng); // Use DrainForcedNodesForRollout to avoid deterministic bias
+              uint64_t roll_evals = 0;
+              double r_score = RolloutSwordmasterRace(*clone, cur_player, cfg, &rng, nullptr, &roll_evals);
+              sum_score += r_score;
+            }
+            action_scores[i] = sum_score / cfg.rollouts_per_action;
+            max_score = std::max(max_score, action_scores[i]);
+            min_score = std::min(min_score, action_scores[i]);
+          }
+
+          double range = max_score - min_score;
+          double beta = absl::GetFlag(FLAGS_sm_coach_labels_beta);
+          if (range >= 1e-5) {
+            double sum_exp = 0.0;
+            for (size_t i = 0; i < behavior_prior.size(); ++i) {
+              double norm_score = (action_scores[i] - min_score) / range;
+              behavior_prior[i].second = ppo_prior[i].second * std::exp(beta * norm_score);
+              sum_exp += behavior_prior[i].second;
+            }
+            if (sum_exp > 0.0) {
+              for (auto& ap : behavior_prior) {
+                ap.second /= sum_exp;
+              }
+            }
+          }
+        }
+
+        open_spiel::Action blueprint_action = open_spiel::SampleBlueprintAction(behavior_prior, absl::GetFlag(FLAGS_blueprint_temperature), rng);
+
+        open_spiel::Player label_player = cur_player;
+        bool should_search = false;
+        bool filter_matched = false;
+        std::string matched_category = "";
+
+        if (absl::GetFlag(FLAGS_sm_coach_labels_enable)) {
+          if (open_spiel::IsStrategicState(*state, label_player)) {
+            std::string label_mode = absl::GetFlag(FLAGS_sm_label_mode);
+            if (label_mode == "race_and_blocking") {
+              if (coach_enabled_for_game && coached_owner >= 0) {
+                filter_matched = MatchesStage10C2Filters(*state, label_player, coached_owner, ppo_prior, &matched_category);
+                should_search = filter_matched;
+              } else {
+                should_search = false;
+              }
+            } else {
+              should_search = true;
+            }
+          }
+        } else {
+          if (label_player == searched_player && open_spiel::IsStrategicState(*state, searched_player)) {
+            if (!absl::GetFlag(FLAGS_sm_warmstart_enable)) {
+              should_search = true;
+            } else {
+              if (dune_state != nullptr && dune_state->HasSwordmaster(searched_player)) {
+                should_search = true;
+              }
+            }
+          }
+        }
+
+        if (should_search) {
+          if (filter_matched) {
+            if (matched_category == "contested_smuggling") {
+              states_contested_smuggling++;
+            } else if (matched_category == "close_solari") {
+              states_close_solari++;
+            } else if (matched_category == "sm_access") {
+              states_sm_access++;
+            } else if (matched_category == "opponent_blocking") {
+              states_opponent_blocking++;
+            }
+          }
+
           double entropy = open_spiel::ComputeEntropy(ppo_prior);
           double max_entropy = std::log(state->LegalActions().size());
           double entropy_ratio = max_entropy > 0.0 ? (entropy / max_entropy) : 0.0;
@@ -434,6 +848,18 @@ int main(int argc, char** argv) {
           }
 
           if (absl::Uniform(rng, 0.0, 1.0) < search_prob) {
+            if (filter_matched) {
+              if (matched_category == "contested_smuggling") {
+                searches_contested_smuggling++;
+              } else if (matched_category == "close_solari") {
+                searches_close_solari++;
+              } else if (matched_category == "sm_access") {
+                searches_sm_access++;
+              } else if (matched_category == "opponent_blocking") {
+                searches_opponent_blocking++;
+              }
+            }
+
             total_search_attempted++;
             bot.RunSearch(*state);
             open_spiel::SearchDiagnostics diag = bot.GetRootDiagnostics(*state, absl::GetFlag(FLAGS_min_visits_per_action));
@@ -487,7 +913,13 @@ int main(int argc, char** argv) {
                 }
               }
 
-              std::vector<float> obs = state->InformationStateTensor(searched_player);
+              std::vector<float> obs;
+              if (game->GetType().provides_information_state_tensor) {
+                obs = state->InformationStateTensor(label_player);
+              } else {
+                obs.resize(obs_size);
+                state->ObservationTensor(label_player, absl::MakeSpan(obs));
+              }
 
               {
                 std::lock_guard<std::mutex> lock(writer_mutex);
@@ -500,6 +932,18 @@ int main(int argc, char** argv) {
                   while (!total_actual_kl.compare_exchange_weak(
                       prev, prev + kl,
                       std::memory_order_relaxed, std::memory_order_relaxed)) {}
+
+                  if (filter_matched) {
+                    if (matched_category == "contested_smuggling") {
+                      labels_contested_smuggling++;
+                    } else if (matched_category == "close_solari") {
+                      labels_close_solari++;
+                    } else if (matched_category == "sm_access") {
+                      labels_sm_access++;
+                    } else if (matched_category == "opponent_blocking") {
+                      labels_opponent_blocking++;
+                    }
+                  }
                 }
               }
             }
@@ -542,6 +986,26 @@ int main(int argc, char** argv) {
   if (games_started.load() > 0) {
     double labels_per_game = static_cast<double>(writer.TotalLabelsWritten()) / games_started.load();
     std::cout << absl::StrFormat("Labels per game: %.1f\n", labels_per_game);
+  }
+
+  if (absl::GetFlag(FLAGS_sm_warmstart_enable)) {
+    std::cout << absl::StrFormat("Warm-start attempts: %d\n", ws_attempts.load());
+    std::cout << absl::StrFormat("Warm-start successes: %d\n", ws_successes.load());
+    std::cout << absl::StrFormat("Warm-start failures (no leader): %d\n", fail_no_leader.load());
+    std::cout << absl::StrFormat("Warm-start failures (blocked/no access): %d\n", fail_blocked.load());
+    std::cout << absl::StrFormat("Warm-start failures (max steps): %d\n", fail_max_steps.load());
+  }
+
+  if (absl::GetFlag(FLAGS_sm_coach_labels_enable)) {
+    std::cout << "\n=== Stage 10C-2 Telemetry ===\n";
+    std::cout << absl::StrFormat("Contested Smuggling: Matched=%d, Searched=%d, Labels=%d\n",
+                                 states_contested_smuggling.load(), searches_contested_smuggling.load(), labels_contested_smuggling.load());
+    std::cout << absl::StrFormat("Solari Deficit Progress: Matched=%d, Searched=%d, Labels=%d\n",
+                                 states_close_solari.load(), searches_close_solari.load(), labels_close_solari.load());
+    std::cout << absl::StrFormat("Swordmaster Access: Matched=%d, Searched=%d, Labels=%d\n",
+                                 states_sm_access.load(), searches_sm_access.load(), labels_sm_access.load());
+    std::cout << absl::StrFormat("Opponent Blocking: Matched=%d, Searched=%d, Labels=%d\n",
+                                 states_opponent_blocking.load(), searches_opponent_blocking.load(), labels_opponent_blocking.load());
   }
 
   return 0;
