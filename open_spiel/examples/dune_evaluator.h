@@ -8,7 +8,6 @@
 #include <limits>
 
 #include <atomic>
-#include <iostream>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/algorithms/mcts.h"

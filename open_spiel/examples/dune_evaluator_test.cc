@@ -4,10 +4,8 @@
 #include <memory>
 #include <cmath>
 #include <cassert>
-#include <filesystem>
 
 #include "open_spiel/spiel.h"
-#include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include <torch/torch.h>
 
 #include "dune_network.h"
