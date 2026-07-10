@@ -43,6 +43,9 @@ ABSL_FLAG(int, threads, 64, "Rollout worker threads.");
 ABSL_FLAG(int, total_updates, 1000, "Number of PPO collect/update cycles.");
 ABSL_FLAG(int, rollout_transitions, 32768,
           "Minimum on-policy transitions collected before each PPO update.");
+ABSL_FLAG(int, rollout_games, 0,
+          "Exact complete games collected per PPO update rollout batch. "
+          "If > 0, overrides transition-threshold mode.");
 ABSL_FLAG(int, ppo_minibatch_size, 2048, "PPO minibatch size.");
 ABSL_FLAG(int, ppo_update_epochs, 4, "PPO epochs per rollout batch.");
 ABSL_FLAG(double, learning_rate, 2.5e-4, "AdamW learning rate.");
@@ -123,33 +126,49 @@ struct PpoTransition {
   float advantage;
   float return_value;
   int player_id;
+  uint64_t episode_id;
 };
 
 class PpoRolloutBuffer {
  public:
   size_t PushTrajectory(std::vector<PpoTransition>&& trajectory) {
     std::lock_guard<std::mutex> lock(mu_);
-    for (auto& transition : trajectory) {
-      transitions_.push_back(std::move(transition));
-    }
-    return transitions_.size();
+    size_t size = trajectory.size();
+    trajectories_.push_back(std::move(trajectory));
+    num_transitions_ += size;
+    return num_transitions_;
   }
 
   size_t Size() const {
     std::lock_guard<std::mutex> lock(mu_);
-    return transitions_.size();
+    return num_transitions_;
   }
 
   std::vector<PpoTransition> TakeAll() {
     std::lock_guard<std::mutex> lock(mu_);
+    std::sort(trajectories_.begin(), trajectories_.end(),
+              [](const std::vector<PpoTransition>& a,
+                 const std::vector<PpoTransition>& b) {
+                uint64_t id_a = a.empty() ? 0 : a[0].episode_id;
+                uint64_t id_b = b.empty() ? 0 : b[0].episode_id;
+                return id_a < id_b;
+              });
     std::vector<PpoTransition> out;
-    out.swap(transitions_);
+    out.reserve(num_transitions_);
+    for (auto& traj : trajectories_) {
+      for (auto& transition : traj) {
+        out.push_back(std::move(transition));
+      }
+    }
+    trajectories_.clear();
+    num_transitions_ = 0;
     return out;
   }
 
  private:
   mutable std::mutex mu_;
-  std::vector<PpoTransition> transitions_;
+  std::vector<std::vector<PpoTransition>> trajectories_;
+  size_t num_transitions_ = 0;
 };
 
 struct SearchLabel {
@@ -767,6 +786,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       transition.advantage = 0.0f;
       transition.return_value = 0.0f;
       transition.player_id = current_player;
+      transition.episode_id = episode_id;
       trajectory->push_back(std::move(transition));
 
       if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -841,19 +861,29 @@ void RolloutWorker(int thread_id, const Game* game,
                    std::atomic<bool>* stop_collection,
                    std::atomic<uint64_t>* total_env_steps,
                    std::vector<WorkerStats>* worker_stats,
-                   std::atomic<uint64_t>* next_episode_id) {
+                   std::atomic<uint64_t>* next_episode_id,
+                   uint64_t start_episode_id,
+                   int rollout_games) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
-  while (!stop_collection->load(std::memory_order_relaxed)) {
+  while (true) {
+    if (rollout_games == 0 && stop_collection->load(std::memory_order_relaxed)) {
+      break;
+    }
     uint64_t episode_id = next_episode_id->fetch_add(1, std::memory_order_relaxed);
+    if (rollout_games > 0 && episode_id >= start_episode_id + rollout_games) {
+      break;
+    }
     std::vector<PpoTransition> trajectory;
     int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
                               total_env_steps, &local_stats);
     local_stats.games += 1;
     local_stats.moves += moves;
     size_t size = rollout_buffer->PushTrajectory(std::move(trajectory));
-    if (size >= static_cast<size_t>(absl::GetFlag(FLAGS_rollout_transitions))) {
-      stop_collection->store(true, std::memory_order_relaxed);
+    if (rollout_games == 0) {
+      if (size >= static_cast<size_t>(absl::GetFlag(FLAGS_rollout_transitions))) {
+        stop_collection->store(true, std::memory_order_relaxed);
+      }
     }
   }
   (*worker_stats)[thread_id] = local_stats;
@@ -875,7 +905,9 @@ CollectResult CollectRollout(const Game* game,
                              int64_t obs_size,
                              std::atomic<uint64_t>* total_env_steps,
                              int num_threads,
-                             std::atomic<uint64_t>* next_episode_id) {
+                             std::atomic<uint64_t>* next_episode_id,
+                             uint64_t start_episode_id,
+                             int rollout_games) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
@@ -883,11 +915,14 @@ CollectResult CollectRollout(const Game* game,
   std::vector<std::thread> workers;
   workers.reserve(num_threads);
 
+  std::atomic<uint64_t> local_episode_id{start_episode_id};
+  std::atomic<uint64_t>* ep_id_ptr = (rollout_games > 0) ? &local_episode_id : next_episode_id;
+
   auto start = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < num_threads; ++i) {
     workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
                          &rollout_buffer, &stop_collection, total_env_steps,
-                         &worker_stats, next_episode_id);
+                         &worker_stats, ep_id_ptr, start_episode_id, rollout_games);
   }
   for (auto& worker : workers) worker.join();
   auto end = std::chrono::high_resolution_clock::now();
@@ -1168,11 +1203,12 @@ int main(int argc, char** argv) {
 
   std::cout << absl::StrFormat(
       "Initialized dune_ppo_train | obs=%d actions=%d hidden=%d blocks=%d "
-      "rollout_transitions=%d minibatch=%d epochs=%d clip=%.3f vf_coef=%.3f "
+      "rollout_transitions=%d rollout_games=%d minibatch=%d epochs=%d clip=%.3f vf_coef=%.3f "
       "ent_coef=%.4f gamma=%.3f gae_lambda=%.3f\n",
       obs_size, action_size, absl::GetFlag(FLAGS_hidden_dim),
       absl::GetFlag(FLAGS_num_blocks),
       absl::GetFlag(FLAGS_rollout_transitions),
+      absl::GetFlag(FLAGS_rollout_games),
       absl::GetFlag(FLAGS_ppo_minibatch_size),
       absl::GetFlag(FLAGS_ppo_update_epochs),
       absl::GetFlag(FLAGS_ppo_clip_epsilon),
@@ -1197,9 +1233,14 @@ int main(int argc, char** argv) {
     search_buffer.LoadFromDirectory(search_label_dir);
   }
 
+  int start_update = 1;
+  int rollout_games = absl::GetFlag(FLAGS_rollout_games);
+  uint64_t start_episode_id = (rollout_games > 0) ? (start_update - 1) * rollout_games : 0;
+
   // Collect first rollout synchronously.
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
-      game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
+      game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
+      start_episode_id, rollout_games);
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
@@ -1220,9 +1261,11 @@ int main(int argc, char** argv) {
     std::thread bg_collect_thread;
     bool have_bg = pipeline && update < total_updates;
     if (have_bg) {
-      bg_collect_thread = std::thread([&]() {
+      uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
+      bg_collect_thread = std::thread([&, next_start_episode_id]() {
         next_collect = open_spiel::CollectRollout(
-            game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
+            game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
+            next_start_episode_id, rollout_games);
       });
     }
 
@@ -1406,8 +1449,10 @@ int main(int argc, char** argv) {
     if (have_bg) {
       current_collect = std::move(next_collect);
     } else if (update < total_updates) {
+      uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
       current_collect = open_spiel::CollectRollout(
-          game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
+          game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
+          next_start_episode_id, rollout_games);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
     }
