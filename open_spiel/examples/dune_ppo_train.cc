@@ -37,6 +37,7 @@
 #include "dune_network.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_ppo_training_utils.h"
 #include "open_spiel/utils/json.h"
 #endif
 
@@ -129,19 +130,6 @@ namespace open_spiel {
 namespace {
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
-
-struct PpoTransition {
-  std::vector<float> state;
-  std::vector<Action> legal_actions;
-  int64_t action;
-  float old_log_prob;
-  float reward;
-  float value;
-  float advantage;
-  float return_value;
-  int player_id;
-  uint64_t episode_id;
-};
 
 class PpoRolloutBuffer {
  public:
@@ -367,6 +355,10 @@ struct WorkerStats {
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
   uint64_t sm_acquisitions_by_round[11] = {0};
+
+  double conflict_vp_generated = 0.0;
+  double conflict_vp_attributed = 0.0;
+  double conflict_vp_unattributed = 0.0;
 };
 
 struct PpoUpdateStats {
@@ -689,24 +681,21 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     const auto* dune_state =
         dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
 
-    std::vector<int> current_vps(game.NumPlayers(), 0);
     std::vector<int> current_tleilaxu(game.NumPlayers(), 0);
     std::vector<bool> had_swordmaster(game.NumPlayers(), false);
+    std::vector<int> prev_conflict_vp(game.NumPlayers(), 0);
+    std::vector<int> prev_total_vp(game.NumPlayers(), 0);
     if (dune_state != nullptr) {
       for (int p = 0; p < game.NumPlayers(); ++p) {
-        current_vps[p] = dune_state->GetPlayerVpForTesting(p);
         current_tleilaxu[p] = dune_state->GetTleilaxuTrackForTesting(p);
         had_swordmaster[p] = dune_state->HasSwordmaster(p);
+        prev_conflict_vp[p] = dune_state->ConflictVpDelta(p);
+        prev_total_vp[p] = dune_state->GetPlayerVp(p);
       }
     }
 
-    struct CombatCreditEvent {
-      int transition_index;
-      int strength_delta;
-    };
+    CombatCreditAccumulator combat_accumulator;
     std::vector<int> last_transition_index(game.NumPlayers(), -1);
-    std::vector<float> shaped_bonus_by_player(game.NumPlayers(), 0.0f);
-    std::vector<std::vector<CombatCreditEvent>> combat_credit(game.NumPlayers());
     std::vector<int> pre_combat_strength(game.NumPlayers(), 0);
     dune_imperium::GamePhase pre_action_phase = dune_imperium::GamePhase::kDeal;
 
@@ -774,8 +763,6 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       Action action = policy_sample.first;
       float old_log_prob = policy_sample.second;
 
-      size_t transition_index = trajectory->size();
-
       if (dune_state != nullptr) {
         pre_action_phase = dune_state->phase();
         if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -804,92 +791,12 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      std::fill(shaped_bonus_by_player.begin(), shaped_bonus_by_player.end(),
-                0.0f);
-      if (dune_state != nullptr) {
-        for (int p = 0; p < game.NumPlayers(); ++p) {
-          int new_vp = dune_state->GetPlayerVpForTesting(p);
-          int vp_delta = new_vp - current_vps[p];
-          current_vps[p] = new_vp;
-          if (vp_delta != 0) {
-            shaped_bonus_by_player[p] +=
-                vp_delta * static_cast<float>(shaped_weight) * reward_lambda;
-          }
-
-          int new_tleilaxu = dune_state->GetTleilaxuTrackForTesting(p);
-          int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
-          current_tleilaxu[p] = new_tleilaxu;
-          if (tleilaxu_delta > 0 &&
-              (tleilaxu_breadcrumb_weight > 0.0 ||
-               tleilaxu_level7_breadcrumb_weight > 0.0)) {
-            int start_l = new_tleilaxu - tleilaxu_delta;
-            for (int l = start_l + 1; l <= new_tleilaxu; ++l) {
-              if (l >= 1 && l <= 6) {
-                shaped_bonus_by_player[p] +=
-                    static_cast<float>(tleilaxu_breadcrumb_weight) *
-                    reward_lambda;
-              } else if (l == 7) {
-                shaped_bonus_by_player[p] +=
-                    static_cast<float>(tleilaxu_level7_breadcrumb_weight) *
-                    reward_lambda;
-              }
-            }
-          }
-        }
-      }
-
-      if (dune_state != nullptr &&
-          pre_action_phase != dune_imperium::GamePhase::kCombat &&
-          dune_state->phase() == dune_imperium::GamePhase::kCombat) {
-        for (auto& events : combat_credit) events.clear();
-      }
-
-      if (dune_state != nullptr && current_player >= 0 &&
-          current_player < game.NumPlayers() &&
-          action != dune_imperium::kActionCombatPass) {
-        int post_strength =
-            dune_imperium::CombatStrength(*dune_state, current_player);
-        int delta = post_strength - pre_combat_strength[current_player];
-        if (delta > 0) {
-          combat_credit[current_player].push_back(
-              {static_cast<int>(transition_index), delta});
-        }
-      }
-
-      float own_reward =
-          current_player >= 0 &&
-                  current_player < static_cast<int>(shaped_bonus_by_player.size())
-              ? shaped_bonus_by_player[current_player]
-              : 0.0f;
-
-      if (dune_state != nullptr &&
-          action == dune_imperium::kActionCombatPass && own_reward != 0.0f &&
-          current_player >= 0 && current_player < game.NumPlayers()) {
-        if (own_reward > 0.0f && !combat_credit[current_player].empty()) {
-          int total_delta = 0;
-          for (const auto& ev : combat_credit[current_player]) {
-            total_delta += ev.strength_delta;
-          }
-          if (total_delta > 0) {
-            for (const auto& ev : combat_credit[current_player]) {
-              if (ev.transition_index >= 0 &&
-                  ev.transition_index < static_cast<int>(trajectory->size())) {
-                (*trajectory)[ev.transition_index].reward +=
-                    own_reward * static_cast<float>(ev.strength_delta) /
-                    static_cast<float>(total_delta);
-              }
-            }
-          }
-        }
-        own_reward = 0.0f;
-      }
-
       PpoTransition transition;
       transition.state = std::move(obs);
       transition.legal_actions = std::move(actions);
       transition.action = action;
       transition.old_log_prob = old_log_prob;
-      transition.reward = own_reward;
+      transition.reward = 0.0f;
       transition.value = result.value;
       transition.advantage = 0.0f;
       transition.return_value = 0.0f;
@@ -898,34 +805,84 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       trajectory->push_back(std::move(transition));
 
       if (current_player >= 0 && current_player < game.NumPlayers()) {
-        last_transition_index[current_player] = static_cast<int>(transition_index);
+        last_transition_index[current_player] = static_cast<int>(trajectory->size() - 1);
       }
 
-      for (int p = 0; p < game.NumPlayers(); ++p) {
-        if (p == current_player || shaped_bonus_by_player[p] == 0.0f) continue;
+      if (dune_state != nullptr) {
+        if (current_player >= 0 && current_player < game.NumPlayers() &&
+            action != dune_imperium::kActionCombatPass) {
+          int post_strength = dune_imperium::CombatStrength(*dune_state, current_player);
+          int strength_delta = post_strength - pre_combat_strength[current_player];
+          if (strength_delta > 0) {
+            combat_accumulator.RecordDeployment(current_player, trajectory->size() - 1, strength_delta);
+          }
+        }
 
-        if (dune_state != nullptr &&
-            action == dune_imperium::kActionCombatPass) {
-          if (shaped_bonus_by_player[p] > 0.0f && !combat_credit[p].empty()) {
-            int total_delta = 0;
-            for (const auto& ev : combat_credit[p]) total_delta += ev.strength_delta;
-            if (total_delta > 0) {
-              for (const auto& ev : combat_credit[p]) {
-                if (ev.transition_index >= 0 &&
-                    ev.transition_index < static_cast<int>(trajectory->size())) {
-                  (*trajectory)[ev.transition_index].reward +=
-                      shaped_bonus_by_player[p] *
-                      static_cast<float>(ev.strength_delta) /
-                      static_cast<float>(total_delta);
-                }
+        for (int p = 0; p < game.NumPlayers(); ++p) {
+          int new_tleilaxu = dune_state->GetTleilaxuTrackForTesting(p);
+          int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
+          current_tleilaxu[p] = new_tleilaxu;
+          if (tleilaxu_delta > 0 &&
+              (tleilaxu_breadcrumb_weight > 0.0 ||
+               tleilaxu_level7_breadcrumb_weight > 0.0)) {
+            float tleilaxu_reward = 0.0f;
+            int start_l = new_tleilaxu - tleilaxu_delta;
+            for (int l = start_l + 1; l <= new_tleilaxu; ++l) {
+              if (l >= 1 && l <= 6) {
+                tleilaxu_reward += static_cast<float>(tleilaxu_breadcrumb_weight) * reward_lambda;
+              } else if (l == 7) {
+                tleilaxu_reward += static_cast<float>(tleilaxu_level7_breadcrumb_weight) * reward_lambda;
               }
             }
+            int idx = last_transition_index[p];
+            if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+              (*trajectory)[idx].reward += tleilaxu_reward;
+            }
           }
-        } else {
-          int idx = last_transition_index[p];
-          if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-            (*trajectory)[idx].reward += shaped_bonus_by_player[p];
+        }
+
+        for (int p = 0; p < game.NumPlayers(); ++p) {
+          int raw_conflict_vp_delta = dune_state->ConflictVpDelta(p) - prev_conflict_vp[p];
+          prev_conflict_vp[p] = dune_state->ConflictVpDelta(p);
+
+          int raw_total_vp_delta = dune_state->GetPlayerVp(p) - prev_total_vp[p];
+          prev_total_vp[p] = dune_state->GetPlayerVp(p);
+
+          int raw_noncombat = raw_total_vp_delta - raw_conflict_vp_delta;
+
+          float combat_shape = std::max(raw_conflict_vp_delta, 0)
+                                * static_cast<float>(shaped_weight) * reward_lambda;
+          float noncombat_shape = raw_noncombat
+                                  * static_cast<float>(shaped_weight) * reward_lambda;
+
+          if (noncombat_shape != 0.0f) {
+            int idx = last_transition_index[p];
+            if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+              (*trajectory)[idx].reward += noncombat_shape;
+            }
           }
+
+          if (combat_shape > 0.0f) {
+            local_stats->conflict_vp_generated += combat_shape;
+            int total_investment = combat_accumulator.GetTotalInvestment(p);
+            if (total_investment > 0) {
+              for (const auto& ev : combat_accumulator.GetEvents(p)) {
+                if (ev.transition_index >= 0 && ev.transition_index < static_cast<int>(trajectory->size())) {
+                  float attributed_portion = combat_shape * static_cast<float>(ev.strength_delta) /
+                                             static_cast<float>(total_investment);
+                  (*trajectory)[ev.transition_index].reward += attributed_portion;
+                  local_stats->conflict_vp_attributed += attributed_portion;
+                }
+              }
+            } else {
+              local_stats->conflict_vp_unattributed += combat_shape;
+            }
+          }
+        }
+
+        if (pre_action_phase == dune_imperium::GamePhase::kCombat &&
+            dune_state->phase() != dune_imperium::GamePhase::kCombat) {
+          combat_accumulator.ClearAll();
         }
       }
     }
@@ -1006,6 +963,10 @@ struct CollectResult {
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
   uint64_t sm_acquisitions_by_round[11] = {0};
+
+  double conflict_vp_generated = 0.0;
+  double conflict_vp_attributed = 0.0;
+  double conflict_vp_unattributed = 0.0;
 };
 
 CollectResult CollectRollout(const Game* game,
@@ -1043,6 +1004,10 @@ CollectResult CollectRollout(const Game* game,
     for (int i = 0; i < 4; ++i) result.sm_acquisitions_by_seat[i] += stats.sm_acquisitions_by_seat[i];
     for (int i = 0; i < 14; ++i) result.sm_acquisitions_by_leader[i] += stats.sm_acquisitions_by_leader[i];
     for (int i = 0; i < 11; ++i) result.sm_acquisitions_by_round[i] += stats.sm_acquisitions_by_round[i];
+
+    result.conflict_vp_generated += stats.conflict_vp_generated;
+    result.conflict_vp_attributed += stats.conflict_vp_attributed;
+    result.conflict_vp_unattributed += stats.conflict_vp_unattributed;
   }
   result.elapsed_seconds =
       std::chrono::duration<double>(end - start).count();
@@ -1332,118 +1297,28 @@ int main(int argc, char** argv) {
     m_path.replace_extension(".json");
     std::string manifest_path = m_path.string();
 
-    if (!std::filesystem::exists(manifest_path)) {
-      SpielFatalError("init_mode=checkpoint but manifest file not found at: " + manifest_path);
+    CheckpointManifest manifest;
+    std::string err;
+    if (!ParseAndValidateManifest(manifest_path, model_path, optim_path,
+                                  master, target_end_update,
+                                  absl::GetFlag(FLAGS_seed_scheme_version),
+                                  config_fingerprint, search_label_fingerprint,
+                                  absl::GetFlag(FLAGS_hidden_dim),
+                                  absl::GetFlag(FLAGS_num_blocks),
+                                  manifest, err)) {
+      SpielFatalError(err);
     }
 
-    std::ifstream ifs(manifest_path);
-    if (!ifs) {
-      SpielFatalError("Could not open manifest file at: " + manifest_path);
-    }
-    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    auto val_opt = open_spiel::json::FromString(content);
-    if (!val_opt.has_value() || !val_opt->IsObject()) {
-      SpielFatalError("Manifest file is malformed JSON at: " + manifest_path);
-    }
-    const auto& manifest_obj = val_opt->GetObject();
-
-    auto get_string_field = [&](const std::string& key) -> std::string {
-      auto it = manifest_obj.find(key);
-      if (it == manifest_obj.end() || !it->second.IsString()) {
-        SpielFatalError("Manifest missing required string field: " + key);
-      }
-      return it->second.GetString();
-    };
-
-    auto get_int_field = [&](const std::string& key) -> int64_t {
-      auto it = manifest_obj.find(key);
-      if (it == manifest_obj.end() || !it->second.IsInt()) {
-        SpielFatalError("Manifest missing required int field: " + key);
-      }
-      return it->second.GetInt();
-    };
-
-    int global_update = get_int_field("global_update");
-    int manifest_target_end_update = get_int_field("target_end_update");
-    uint64_t manifest_env_steps = get_int_field("total_env_steps");
-    uint64_t manifest_episode_id = get_int_field("next_episode_id");
-    uint64_t manifest_base_seed = get_int_field("base_seed");
-    int manifest_seed_scheme_version = get_int_field("seed_scheme_version");
-    std::string manifest_config_fingerprint = get_string_field("config_fingerprint");
-    std::string manifest_search_label_fingerprint = get_string_field("search_label_fingerprint");
-    std::string manifest_run_uuid = get_string_field("run_uuid");
-    std::string manifest_model_filename = get_string_field("model_filename");
-    size_t manifest_model_file_size = get_int_field("model_file_size");
-    std::string manifest_model_sha256 = get_string_field("model_sha256");
-    std::string manifest_optimizer_filename = get_string_field("optimizer_filename");
-    size_t manifest_optimizer_file_size = get_int_field("optimizer_file_size");
-    std::string manifest_optimizer_sha256 = get_string_field("optimizer_sha256");
-    int manifest_hidden_dim = get_int_field("hidden_dim");
-    int manifest_num_blocks = get_int_field("num_blocks");
-
-    if (!std::filesystem::exists(model_path)) {
-      SpielFatalError("Model file not found: " + model_path);
-    }
-    if (!std::filesystem::exists(optim_path)) {
-      SpielFatalError("Optimizer file not found: " + optim_path);
-    }
-
-    if (std::filesystem::path(model_path).filename().string() != manifest_model_filename) {
-      SpielFatalError("Model filename mismatch. Manifest: " + manifest_model_filename + ", Current: " + std::filesystem::path(model_path).filename().string());
-    }
-    if (std::filesystem::path(optim_path).filename().string() != manifest_optimizer_filename) {
-      SpielFatalError("Optimizer filename mismatch. Manifest: " + manifest_optimizer_filename + ", Current: " + std::filesystem::path(optim_path).filename().string());
-    }
-
-    size_t actual_model_size = 0;
-    std::string actual_model_hash = open_spiel::ComputeFileSHA256(model_path, &actual_model_size);
-    if (actual_model_size != manifest_model_file_size) {
-      SpielFatalError(absl::StrFormat("Model file size mismatch. Manifest: %d, Actual: %d", manifest_model_file_size, actual_model_size));
-    }
-    if (actual_model_hash != manifest_model_sha256) {
-      SpielFatalError("Model SHA-256 hash mismatch. Manifest: " + manifest_model_sha256 + ", Actual: " + actual_model_hash);
-    }
-
-    size_t actual_optim_size = 0;
-    std::string actual_optim_hash = open_spiel::ComputeFileSHA256(optim_path, &actual_optim_size);
-    if (actual_optim_size != manifest_optimizer_file_size) {
-      SpielFatalError(absl::StrFormat("Optimizer file size mismatch. Manifest: %d, Actual: %d", manifest_optimizer_file_size, actual_optim_size));
-    }
-    if (actual_optim_hash != manifest_optimizer_sha256) {
-      SpielFatalError("Optimizer SHA-256 hash mismatch. Manifest: " + manifest_optimizer_sha256 + ", Actual: " + actual_optim_hash);
-    }
-
-    if (master != manifest_base_seed) {
-      SpielFatalError(absl::StrFormat("Base seed mismatch. Current: %d, Manifest: %d", master, manifest_base_seed));
-    }
-    if (target_end_update != manifest_target_end_update) {
-      SpielFatalError(absl::StrFormat("Target end update mismatch. Current: %d, Manifest: %d", target_end_update, manifest_target_end_update));
-    }
-    if (absl::GetFlag(FLAGS_seed_scheme_version) != manifest_seed_scheme_version) {
-      SpielFatalError(absl::StrFormat("Seed scheme version mismatch. Current: %d, Manifest: %d", absl::GetFlag(FLAGS_seed_scheme_version), manifest_seed_scheme_version));
-    }
-
-    if (config_fingerprint != manifest_config_fingerprint) {
-      SpielFatalError("Configuration fingerprint mismatch. Effective hyperparameters changed.\n"
-                      "  Expected: " + manifest_config_fingerprint + "\n"
-                      "  Got:      " + config_fingerprint);
-    }
-    if (search_label_fingerprint != manifest_search_label_fingerprint) {
-      SpielFatalError("Search label fingerprint mismatch.\n"
-                      "  Expected: " + manifest_search_label_fingerprint + "\n"
-                      "  Got:      " + search_label_fingerprint);
-    }
-
-    if (absl::GetFlag(FLAGS_hidden_dim) != manifest_hidden_dim) {
-      SpielFatalError(absl::StrFormat("hidden_dim mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_hidden_dim), manifest_hidden_dim));
-    }
-    if (absl::GetFlag(FLAGS_num_blocks) != manifest_num_blocks) {
-      SpielFatalError(absl::StrFormat("num_blocks mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_num_blocks), manifest_num_blocks));
-    }
-
+    int global_update = manifest.global_update;
     if (global_update >= target_end_update) {
-      SpielFatalError(absl::StrFormat("global_update (%d) >= target_end_update (%d). Resuming is not possible as training is already finished.", global_update, target_end_update));
+      SpielFatalError(absl::StrFormat(
+          "global_update (%d) >= target_end_update (%d). "
+          "Resuming is not possible as training is already finished.",
+          global_update, target_end_update));
     }
+    uint64_t manifest_env_steps = manifest.total_env_steps;
+    uint64_t manifest_episode_id = manifest.next_episode_id;
+    std::string manifest_run_uuid = manifest.run_uuid;
 
     try {
       torch::load(training_model, model_path, device);
@@ -1870,6 +1745,12 @@ int main(int argc, char** argv) {
         stats.early_stopped ? " | early-stop" : "");
 
 
+
+    std::cout << absl::StrFormat(
+        "  [Conflict VP Stats] Generated: %.2f | Attributed: %.2f | Unattributed: %.2f\n",
+        current_collect.conflict_vp_generated,
+        current_collect.conflict_vp_attributed,
+        current_collect.conflict_vp_unattributed);
 
     {
       uint64_t total_acquisitions = 0;
