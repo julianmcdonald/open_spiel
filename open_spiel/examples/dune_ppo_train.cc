@@ -36,6 +36,8 @@
 
 #include "dune_network.h"
 #include "dune_seed_utils.h"
+#include "dune_sha256.h"
+#include "open_spiel/utils/json.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The OpenSpiel game to train.");
@@ -110,6 +112,18 @@ ABSL_FLAG(int, search_minibatches_per_update, 2,
           "Search distillation minibatches per PPO update.");
 ABSL_FLAG(int, search_minibatch_size, 512,
           "Size of each search distillation minibatch.");
+
+ABSL_FLAG(std::string, init_mode, "",
+          "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
+ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
+          "Environment steps at which shaped reward decay starts.");
+ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
+          "Environment steps duration for shaped reward decay (0 means no decay).");
+ABSL_FLAG(int, seed_scheme_version, 2, "Seed scheme version.");
+ABSL_FLAG(int, target_end_update, 2450, "Absolute target update number to train until.");
+ABSL_FLAG(int, start_update, 1, "Fallback start update for bootstrap mode.");
+ABSL_FLAG(uint64_t, start_env_steps, 0, "Fallback start environment steps for bootstrap mode.");
+ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstrap mode.");
 
 namespace open_spiel {
 namespace {
@@ -452,65 +466,157 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
   return optimizer;
 }
 
-void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
-                    torch::optim::AdamW& optimizer,
-                    const std::string& model_path,
-                    const std::string& optim_path,
-                    torch::Device device) {
-  if (std::filesystem::exists(model_path)) {
-    try {
-      torch::load(model, model_path, device);
-      std::cout << "Loaded PPO model checkpoint: " << model_path << "\n";
-    } catch (const c10::Error& e) {
-      std::cerr << "Error loading model checkpoint: " << e.msg() << "\n";
-    }
-  } else {
-    std::cout << "No model checkpoint at " << model_path
-              << ". Starting PPO model from scratch.\n";
-  }
-  model->to(device);
+std::string GenerateUUID() {
+  std::random_device rd;
+  std::mt19937_64 generator(rd());
+  uint64_t r1 = generator();
+  uint64_t r2 = generator();
+  // Set version 4 (random) and variant (RFC 4122)
+  uint32_t a = (r1 >> 32);
+  uint16_t b = (r1 >> 16) & 0xFFFF;
+  uint16_t c = (r1 & 0x0FFF) | 0x4000;
+  uint16_t d = ((r2 >> 48) & 0x3FFF) | 0x8000;
+  uint64_t e = r2 & 0xFFFFFFFFFFFFULL;
+  return absl::StrFormat("%08x-%04x-%04x-%04x-%012llx", a, b, c, d, e);
+}
 
-  if (std::filesystem::exists(optim_path)) {
-    try {
-      torch::load(optimizer, optim_path, device);
-      std::cout << "Loaded PPO optimizer checkpoint: " << optim_path << "\n";
-      SetOptimizerLearningRate(optimizer, absl::GetFlag(FLAGS_learning_rate));
-      for (size_t g = 0; g < optimizer.param_groups().size(); ++g) {
-        auto& options =
-            static_cast<torch::optim::AdamWOptions&>(
-                optimizer.param_groups()[g].options());
-        options.weight_decay(g == 0 ? absl::GetFlag(FLAGS_policy_weight_decay)
-                                    : absl::GetFlag(FLAGS_weight_decay));
-      }
-      for (auto& pair : optimizer.state()) {
-        if (auto* state =
-                dynamic_cast<torch::optim::AdamWParamState*>(pair.second.get())) {
-          if (state->exp_avg().defined()) state->exp_avg() = state->exp_avg().to(device);
-          if (state->exp_avg_sq().defined()) state->exp_avg_sq() = state->exp_avg_sq().to(device);
-          if (state->max_exp_avg_sq().defined()) {
-            state->max_exp_avg_sq() = state->max_exp_avg_sq().to(device);
-          }
-        }
-      }
-    } catch (const c10::Error& e) {
-      std::cerr << "Error loading optimizer checkpoint: " << e.msg() << "\n";
-    }
-  } else {
-    std::cout << "No optimizer checkpoint at " << optim_path
-              << ". Starting PPO optimizer from scratch.\n";
+std::string ComputeConfigFingerprint() {
+  open_spiel::json::Object config_obj;
+  config_obj["game"] = absl::GetFlag(FLAGS_game);
+  config_obj["ppo_minibatch_size"] = absl::GetFlag(FLAGS_ppo_minibatch_size);
+  config_obj["ppo_update_epochs"] = absl::GetFlag(FLAGS_ppo_update_epochs);
+  config_obj["learning_rate"] = absl::GetFlag(FLAGS_learning_rate);
+  config_obj["anneal_lr"] = absl::GetFlag(FLAGS_anneal_lr);
+  config_obj["gamma"] = absl::GetFlag(FLAGS_gamma);
+  config_obj["gae_lambda"] = absl::GetFlag(FLAGS_gae_lambda);
+  config_obj["normalize_advantages"] = absl::GetFlag(FLAGS_normalize_advantages);
+  config_obj["ppo_clip_epsilon"] = absl::GetFlag(FLAGS_ppo_clip_epsilon);
+  config_obj["ppo_clip_value_loss"] = absl::GetFlag(FLAGS_ppo_clip_value_loss);
+  config_obj["entropy_coef"] = absl::GetFlag(FLAGS_entropy_coef);
+  config_obj["value_coef"] = absl::GetFlag(FLAGS_value_coef);
+  config_obj["grad_clip_norm"] = absl::GetFlag(FLAGS_grad_clip_norm);
+  config_obj["target_kl"] = absl::GetFlag(FLAGS_target_kl);
+  config_obj["weight_decay"] = absl::GetFlag(FLAGS_weight_decay);
+  config_obj["policy_weight_decay"] = absl::GetFlag(FLAGS_policy_weight_decay);
+  config_obj["hidden_dim"] = absl::GetFlag(FLAGS_hidden_dim);
+  config_obj["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
+  config_obj["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
+  config_obj["shaped_reward_weight"] = absl::GetFlag(FLAGS_shaped_reward_weight);
+  config_obj["tleilaxu_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+  config_obj["tleilaxu_level7_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  config_obj["decay_horizon"] = absl::GetFlag(FLAGS_decay_horizon);
+  config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
+  config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
+  config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  config_obj["pipeline"] = absl::GetFlag(FLAGS_pipeline);
+  config_obj["rollout_games"] = absl::GetFlag(FLAGS_rollout_games);
+  config_obj["rollout_transitions"] = absl::GetFlag(FLAGS_rollout_transitions);
+  config_obj["search_lambda"] = absl::GetFlag(FLAGS_search_lambda);
+  config_obj["search_minibatches_per_update"] = absl::GetFlag(FLAGS_search_minibatches_per_update);
+  config_obj["search_minibatch_size"] = absl::GetFlag(FLAGS_search_minibatch_size);
+
+  std::string json_str = open_spiel::json::ToString(config_obj);
+  return open_spiel::ComputeStringSHA256(json_str);
+}
+
+std::string GetSearchLabelFingerprint(const std::string& search_label_dir) {
+  if (search_label_dir.empty()) {
+    return "";
   }
+  std::filesystem::path manifest_path = std::filesystem::path(search_label_dir) / "manifest.json";
+  if (!std::filesystem::exists(manifest_path)) {
+    std::cout << "Warning: search_label_dir is specified but manifest.json not found at " << manifest_path << "\n";
+    return "";
+  }
+  try {
+    std::ifstream ifs(manifest_path);
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    auto val_opt = open_spiel::json::FromString(content);
+    if (val_opt.has_value() && val_opt->IsObject()) {
+      const auto& obj = val_opt->GetObject();
+      auto it = obj.find("search_label_fingerprint");
+      if (it != obj.end() && it->second.IsString()) {
+        return it->second.GetString();
+      }
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Error reading search label manifest at " << manifest_path << ": " << e.what() << "\n";
+  }
+  return "";
 }
 
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     torch::optim::AdamW& optimizer,
                     const std::string& model_path,
-                    const std::string& optim_path) {
+                    const std::string& optim_path,
+                    int global_update,
+                    int target_end_update,
+                    uint64_t total_env_steps,
+                    uint64_t next_episode_id,
+                    uint64_t base_seed,
+                    int seed_scheme_version,
+                    const std::string& config_fingerprint,
+                    const std::string& search_label_fingerprint,
+                    const std::string& run_uuid) {
+  std::string model_tmp = model_path + ".tmp";
+  std::string optim_tmp = optim_path + ".tmp";
+  
+  std::filesystem::path manifest_path = model_path;
+  manifest_path.replace_extension(".json");
+  std::string manifest_path_str = manifest_path.string();
+  std::string manifest_tmp = manifest_path_str + ".tmp";
+
   try {
-    torch::save(model, model_path);
-    torch::save(optimizer, optim_path);
-    std::cout << "Saved checkpoint: " << model_path << "\n";
-  } catch (const c10::Error& e) {
-    std::cerr << "Error saving checkpoint: " << e.msg() << "\n";
+    torch::save(model, model_tmp);
+    torch::save(optimizer, optim_tmp);
+
+    size_t model_size = 0;
+    std::string model_hash = ComputeFileSHA256(model_tmp, &model_size);
+
+    size_t optim_size = 0;
+    std::string optim_hash = ComputeFileSHA256(optim_tmp, &optim_size);
+
+    std::string checkpoint_uuid = GenerateUUID();
+    json::Object manifest_obj;
+    manifest_obj["global_update"] = static_cast<int64_t>(global_update);
+    manifest_obj["target_end_update"] = static_cast<int64_t>(target_end_update);
+    manifest_obj["total_env_steps"] = static_cast<int64_t>(total_env_steps);
+    manifest_obj["next_episode_id"] = static_cast<int64_t>(next_episode_id);
+    manifest_obj["base_seed"] = static_cast<int64_t>(base_seed);
+    manifest_obj["seed_scheme_version"] = static_cast<int64_t>(seed_scheme_version);
+    manifest_obj["config_fingerprint"] = config_fingerprint;
+    manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
+    manifest_obj["run_uuid"] = run_uuid;
+    manifest_obj["checkpoint_uuid"] = checkpoint_uuid;
+    manifest_obj["model_filename"] = std::filesystem::path(model_path).filename().string();
+    manifest_obj["model_file_size"] = static_cast<int64_t>(model_size);
+    manifest_obj["model_sha256"] = model_hash;
+    manifest_obj["optimizer_filename"] = std::filesystem::path(optim_path).filename().string();
+    manifest_obj["optimizer_file_size"] = static_cast<int64_t>(optim_size);
+    manifest_obj["optimizer_sha256"] = optim_hash;
+
+    {
+      std::ofstream ofs(manifest_tmp);
+      if (!ofs) {
+        throw std::runtime_error("Could not open manifest temp file for writing: " + manifest_tmp);
+      }
+      ofs << json::ToString(manifest_obj, true);
+    }
+
+    std::filesystem::rename(model_tmp, model_path);
+    std::filesystem::rename(optim_tmp, optim_path);
+    std::filesystem::rename(manifest_tmp, manifest_path);
+
+    std::cout << "Saved checkpoint successfully:\n"
+              << "  Model: " << model_path << " (" << model_size << " bytes, sha256=" << model_hash << ")\n"
+              << "  Optimizer: " << optim_path << " (" << optim_size << " bytes, sha256=" << optim_hash << ")\n"
+              << "  Manifest: " << manifest_path << "\n";
+  } catch (const std::exception& e) {
+    std::cerr << "CRITICAL ERROR: SaveCheckpoint failed: " << e.what() << "\n";
+    if (std::filesystem::exists(model_tmp)) std::filesystem::remove(model_tmp);
+    if (std::filesystem::exists(optim_tmp)) std::filesystem::remove(optim_tmp);
+    if (std::filesystem::exists(manifest_tmp)) std::filesystem::remove(manifest_tmp);
+    SpielFatalError("SaveCheckpoint failed, aborting training to prevent corrupted states.");
   }
 }
 
@@ -1189,9 +1295,171 @@ int main(int argc, char** argv) {
   inference_model->eval();
 
   auto optimizer = open_spiel::MakeOptimizer(training_model);
-  open_spiel::LoadCheckpoint(training_model, *optimizer,
-                             absl::GetFlag(FLAGS_model_checkpoint),
-                             absl::GetFlag(FLAGS_optim_checkpoint), device);
+
+  std::string init_mode = absl::GetFlag(FLAGS_init_mode);
+  if (init_mode.empty()) {
+    SpielFatalError("Required flag --init_mode is missing. Must be 'random' or 'checkpoint'.");
+  }
+
+  std::string config_fingerprint = open_spiel::ComputeConfigFingerprint();
+  std::string search_label_fingerprint = open_spiel::GetSearchLabelFingerprint(absl::GetFlag(FLAGS_search_label_dir));
+  std::string run_uuid = open_spiel::GenerateUUID();
+
+  std::atomic<uint64_t> total_env_steps{0};
+  std::atomic<uint64_t> next_episode_id{0};
+  int start_update = 1;
+  int target_end_update = absl::GetFlag(FLAGS_target_end_update);
+
+  if (init_mode == "random") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+    if (std::filesystem::exists(model_path) || std::filesystem::exists(optim_path)) {
+      SpielFatalError("init_mode=random but checkpoint file already exists. Refusing to overwrite.");
+    }
+    std::cout << "Starting fresh training run (init_mode=random).\n";
+  } else if (init_mode == "checkpoint") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    std::string manifest_path = m_path.string();
+
+    if (!std::filesystem::exists(manifest_path)) {
+      SpielFatalError("init_mode=checkpoint but manifest file not found at: " + manifest_path);
+    }
+
+    std::ifstream ifs(manifest_path);
+    if (!ifs) {
+      SpielFatalError("Could not open manifest file at: " + manifest_path);
+    }
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    auto val_opt = open_spiel::json::FromString(content);
+    if (!val_opt.has_value() || !val_opt->IsObject()) {
+      SpielFatalError("Manifest file is malformed JSON at: " + manifest_path);
+    }
+    const auto& manifest_obj = val_opt->GetObject();
+
+    auto get_string_field = [&](const std::string& key) -> std::string {
+      auto it = manifest_obj.find(key);
+      if (it == manifest_obj.end() || !it->second.IsString()) {
+        SpielFatalError("Manifest missing required string field: " + key);
+      }
+      return it->second.GetString();
+    };
+
+    auto get_int_field = [&](const std::string& key) -> int64_t {
+      auto it = manifest_obj.find(key);
+      if (it == manifest_obj.end() || !it->second.IsInt()) {
+        SpielFatalError("Manifest missing required int field: " + key);
+      }
+      return it->second.GetInt();
+    };
+
+    int global_update = get_int_field("global_update");
+    int manifest_target_end_update = get_int_field("target_end_update");
+    uint64_t manifest_env_steps = get_int_field("total_env_steps");
+    uint64_t manifest_episode_id = get_int_field("next_episode_id");
+    uint64_t manifest_base_seed = get_int_field("base_seed");
+    int manifest_seed_scheme_version = get_int_field("seed_scheme_version");
+    std::string manifest_config_fingerprint = get_string_field("config_fingerprint");
+    std::string manifest_search_label_fingerprint = get_string_field("search_label_fingerprint");
+    std::string manifest_run_uuid = get_string_field("run_uuid");
+    std::string manifest_model_filename = get_string_field("model_filename");
+    size_t manifest_model_file_size = get_int_field("model_file_size");
+    std::string manifest_model_sha256 = get_string_field("model_sha256");
+    std::string manifest_optimizer_filename = get_string_field("optimizer_filename");
+    size_t manifest_optimizer_file_size = get_int_field("optimizer_file_size");
+    std::string manifest_optimizer_sha256 = get_string_field("optimizer_sha256");
+
+    if (!std::filesystem::exists(model_path)) {
+      SpielFatalError("Model file not found: " + model_path);
+    }
+    if (!std::filesystem::exists(optim_path)) {
+      SpielFatalError("Optimizer file not found: " + optim_path);
+    }
+
+    if (std::filesystem::path(model_path).filename().string() != manifest_model_filename) {
+      SpielFatalError("Model filename mismatch. Manifest: " + manifest_model_filename + ", Current: " + std::filesystem::path(model_path).filename().string());
+    }
+    if (std::filesystem::path(optim_path).filename().string() != manifest_optimizer_filename) {
+      SpielFatalError("Optimizer filename mismatch. Manifest: " + manifest_optimizer_filename + ", Current: " + std::filesystem::path(optim_path).filename().string());
+    }
+
+    size_t actual_model_size = 0;
+    std::string actual_model_hash = open_spiel::ComputeFileSHA256(model_path, &actual_model_size);
+    if (actual_model_size != manifest_model_file_size) {
+      SpielFatalError(absl::StrFormat("Model file size mismatch. Manifest: %d, Actual: %d", manifest_model_file_size, actual_model_size));
+    }
+    if (actual_model_hash != manifest_model_sha256) {
+      SpielFatalError("Model SHA-256 hash mismatch. Manifest: " + manifest_model_sha256 + ", Actual: " + actual_model_hash);
+    }
+
+    size_t actual_optim_size = 0;
+    std::string actual_optim_hash = open_spiel::ComputeFileSHA256(optim_path, &actual_optim_size);
+    if (actual_optim_size != manifest_optimizer_file_size) {
+      SpielFatalError(absl::StrFormat("Optimizer file size mismatch. Manifest: %d, Actual: %d", manifest_optimizer_file_size, actual_optim_size));
+    }
+    if (actual_optim_hash != manifest_optimizer_sha256) {
+      SpielFatalError("Optimizer SHA-256 hash mismatch. Manifest: " + manifest_optimizer_sha256 + ", Actual: " + actual_optim_hash);
+    }
+
+    if (master != manifest_base_seed) {
+      SpielFatalError(absl::StrFormat("Base seed mismatch. Current: %d, Manifest: %d", master, manifest_base_seed));
+    }
+    if (target_end_update != manifest_target_end_update) {
+      SpielFatalError(absl::StrFormat("Target end update mismatch. Current: %d, Manifest: %d", target_end_update, manifest_target_end_update));
+    }
+    if (absl::GetFlag(FLAGS_seed_scheme_version) != manifest_seed_scheme_version) {
+      SpielFatalError(absl::StrFormat("Seed scheme version mismatch. Current: %d, Manifest: %d", absl::GetFlag(FLAGS_seed_scheme_version), manifest_seed_scheme_version));
+    }
+
+    if (config_fingerprint != manifest_config_fingerprint) {
+      SpielFatalError("Configuration fingerprint mismatch. Effective hyperparameters changed.\n"
+                      "  Expected: " + manifest_config_fingerprint + "\n"
+                      "  Got:      " + config_fingerprint);
+    }
+    if (search_label_fingerprint != manifest_search_label_fingerprint) {
+      SpielFatalError("Search label fingerprint mismatch.\n"
+                      "  Expected: " + manifest_search_label_fingerprint + "\n"
+                      "  Got:      " + search_label_fingerprint);
+    }
+
+    try {
+      torch::load(training_model, model_path, device);
+      torch::load(*optimizer, optim_path, device);
+    } catch (const c10::Error& e) {
+      SpielFatalError("LibTorch load failed: " + std::string(e.msg()));
+    }
+
+    open_spiel::SetOptimizerLearningRate(*optimizer, absl::GetFlag(FLAGS_learning_rate));
+    for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+      auto& options =
+          static_cast<torch::optim::AdamWOptions&>(
+              optimizer->param_groups()[g].options());
+      options.weight_decay(g == 0 ? absl::GetFlag(FLAGS_policy_weight_decay)
+                                  : absl::GetFlag(FLAGS_weight_decay));
+    }
+    for (auto& pair : optimizer->state()) {
+      if (auto* state =
+              dynamic_cast<torch::optim::AdamWParamState*>(pair.second.get())) {
+        if (state->exp_avg().defined()) state->exp_avg() = state->exp_avg().to(device);
+        if (state->exp_avg_sq().defined()) state->exp_avg_sq() = state->exp_avg_sq().to(device);
+        if (state->max_exp_avg_sq().defined()) {
+          state->max_exp_avg_sq() = state->max_exp_avg_sq().to(device);
+        }
+      }
+    }
+
+    start_update = global_update + 1;
+    total_env_steps.store(manifest_env_steps);
+    next_episode_id.store(manifest_episode_id);
+    run_uuid = manifest_run_uuid;
+
+    std::cout << "Successfully verified and loaded checkpoint manifest. Resuming from update "
+              << start_update << " to " << target_end_update << ".\n";
+  } else {
+    SpielFatalError("Unsupported init_mode: " + init_mode);
+  }
 
   std::shared_mutex sync_mutex;
   open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
@@ -1215,13 +1483,10 @@ int main(int argc, char** argv) {
       absl::GetFlag(FLAGS_value_coef), absl::GetFlag(FLAGS_entropy_coef),
       absl::GetFlag(FLAGS_gamma), absl::GetFlag(FLAGS_gae_lambda));
 
-  std::atomic<uint64_t> total_env_steps{0};
-  std::atomic<uint64_t> next_episode_id{0};
   uint64_t total_games = 0;
   uint64_t total_moves = 0;
   auto training_start = std::chrono::high_resolution_clock::now();
 
-  int total_updates = absl::GetFlag(FLAGS_total_updates);
   double base_lr = absl::GetFlag(FLAGS_learning_rate);
   bool pipeline = absl::GetFlag(FLAGS_pipeline);
   int num_threads = absl::GetFlag(FLAGS_threads);
@@ -1233,7 +1498,6 @@ int main(int argc, char** argv) {
     search_buffer.LoadFromDirectory(search_label_dir);
   }
 
-  int start_update = 1;
   int rollout_games = absl::GetFlag(FLAGS_rollout_games);
   uint64_t start_episode_id = (rollout_games > 0) ? (start_update - 1) * rollout_games : 0;
 
@@ -1244,10 +1508,10 @@ int main(int argc, char** argv) {
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
-  for (int update = 1; update <= total_updates; ++update) {
+  for (int update = start_update; update <= target_end_update; ++update) {
     if (absl::GetFlag(FLAGS_anneal_lr)) {
       double frac = 1.0 - static_cast<double>(update - 1) /
-                              std::max(1, total_updates);
+                              std::max(1, target_end_update);
       open_spiel::SetOptimizerLearningRate(*optimizer,
                                            std::max(1e-8, frac * base_lr));
     }
@@ -1259,7 +1523,7 @@ int main(int argc, char** argv) {
     // collection safely uses the current policy snapshot.
     open_spiel::CollectResult next_collect;
     std::thread bg_collect_thread;
-    bool have_bg = pipeline && update < total_updates;
+    bool have_bg = pipeline && update < target_end_update;
     if (have_bg) {
       uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
       bg_collect_thread = std::thread([&, next_start_episode_id]() {
@@ -1391,7 +1655,7 @@ int main(int argc, char** argv) {
         "Collect: %.2fs (%.0f t/s) | PPO: %.2fs | Wall: %.2fs | "
         "PolicyLoss: %.6f | ValueLoss: %.6f | Entropy: %.4f | "
         "ApproxKL: %.6f | ClipFrac: %.3f | ExplVar: %.3f%s\n",
-        update, total_updates, current_collect.rollout.size(),
+        update, target_end_update, current_collect.rollout.size(),
         static_cast<unsigned long long>(total_games),
         collect_elapsed, sps, ppo_elapsed, wall_elapsed,
         stats.policy_loss, stats.value_loss, stats.entropy, stats.approx_kl,
@@ -1442,13 +1706,17 @@ int main(int argc, char** argv) {
       std::string optim_path =
           absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
       open_spiel::SaveCheckpoint(training_model, *optimizer, model_path,
-                                 optim_path);
+                                 optim_path, update, target_end_update,
+                                 total_env_steps.load(), next_episode_id.load(),
+                                 master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                 config_fingerprint, search_label_fingerprint,
+                                 run_uuid);
     }
 
     // Advance to next rollout.
     if (have_bg) {
       current_collect = std::move(next_collect);
-    } else if (update < total_updates) {
+    } else if (update < target_end_update) {
       uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
       current_collect = open_spiel::CollectRollout(
           game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
@@ -1474,12 +1742,15 @@ int main(int argc, char** argv) {
       eval_stats.avg_batch_size,
       static_cast<unsigned long long>(eval_stats.max_batch_size));
 
-
-
   if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
     open_spiel::SaveCheckpoint(training_model, *optimizer,
                                absl::GetFlag(FLAGS_model_checkpoint),
-                               absl::GetFlag(FLAGS_optim_checkpoint));
+                               absl::GetFlag(FLAGS_optim_checkpoint),
+                               target_end_update, target_end_update,
+                               total_env_steps.load(), next_episode_id.load(),
+                               master, absl::GetFlag(FLAGS_seed_scheme_version),
+                               config_fingerprint, search_label_fingerprint,
+                               run_uuid);
   }
   return 0;
 #endif
