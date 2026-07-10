@@ -20,6 +20,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 
+  add_executable(dune_population_eval dune_population_eval.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_population_eval ${TORCH_LIBRARIES})
+
   add_executable(dune_search_benchmark dune_search_benchmark.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_benchmark ${TORCH_LIBRARIES})
 
