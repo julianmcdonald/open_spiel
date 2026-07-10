@@ -26,6 +26,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_teacher dune_search_teacher.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_teacher ${TORCH_LIBRARIES})
 
+  add_executable(dune_sm_value_probe dune_sm_value_probe.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_sm_value_probe ${TORCH_LIBRARIES})
+
   add_executable(dune_diagnose dune_diagnose.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_diagnose ${TORCH_LIBRARIES})
 else()
