@@ -50,7 +50,7 @@ struct SearchDiagnostics {
 class DunePUCTISMCTSBot : public Bot {
   friend struct TestBotAccessor;
  public:
-  DunePUCTISMCTSBot(int seed, std::shared_ptr<algorithms::Evaluator> evaluator,
+  DunePUCTISMCTSBot(uint64_t seed, std::shared_ptr<algorithms::Evaluator> evaluator,
                     double puct_c, int max_simulations,
                     int max_world_samples = -1,
                     double temperature = 1.0,

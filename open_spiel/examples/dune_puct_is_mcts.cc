@@ -11,18 +11,19 @@
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
+#include "dune_seed_utils.h"
 
 namespace open_spiel {
 
 DunePUCTISMCTSBot::DunePUCTISMCTSBot(
-    int seed, std::shared_ptr<algorithms::Evaluator> evaluator, double puct_c,
+    uint64_t seed, std::shared_ptr<algorithms::Evaluator> evaluator, double puct_c,
     int max_simulations, int max_world_samples, double temperature,
     double dirichlet_epsilon, double dirichlet_alpha, double value_scale,
     bool use_observation_string,
     DuneISMCTSFinalPolicyType final_policy_type,
     bool use_opponent_model, double opponent_temperature,
     bool verbose_diagnostics)
-    : rng_(seed),
+    : rng_(dune_seed::MakeRng32(seed)),
       evaluator_(evaluator),
       puct_c_(puct_c),
       max_simulations_(max_simulations),

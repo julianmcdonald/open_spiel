@@ -35,6 +35,7 @@
 #include <torch/torch.h>
 
 #include "dune_network.h"
+#include "dune_seed_utils.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The OpenSpiel game to train.");
@@ -494,8 +495,9 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   }
 }
 
+template <typename RngType>
 std::pair<Action, float> SamplePolicyAction(
-    std::mt19937* rng, const std::vector<float>& logits,
+    RngType* rng, const std::vector<float>& logits,
     const std::vector<Action>& legal_actions) {
   Action action = legal_actions.front();
   float max_logit = -std::numeric_limits<float>::infinity();
@@ -531,11 +533,25 @@ std::pair<Action, float> SamplePolicyAction(
 
 
 
-int PpoSimulation(std::mt19937* rng, const Game& game,
+int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size,
                   std::vector<PpoTransition>* trajectory,
                   std::atomic<uint64_t>* total_env_steps,
                   WorkerStats* local_stats) {
+  uint64_t env_steps_at_start = total_env_steps->load(std::memory_order_relaxed);
+  int decay_horizon = std::max(1, absl::GetFlag(FLAGS_decay_horizon));
+  float reward_lambda =
+      env_steps_at_start < static_cast<uint64_t>(decay_horizon)
+          ? 1.0f - static_cast<float>(env_steps_at_start) / decay_horizon
+          : 0.0f;
+
+  auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
+  std::mt19937_64 policy_rng[4];
+  for (int p = 0; p < 4; ++p) {
+    uint64_t seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamPolicyPlayer0 + p);
+    policy_rng[p] = dune_seed::MakeRng64(seed);
+  }
+
   while (true) {
     std::unique_ptr<State> state = game.NewInitialState();
     bool provides_info_state_tensor =
@@ -573,7 +589,6 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
         absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
     double tleilaxu_level7_breadcrumb_weight =
         absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
-    int decay_horizon = std::max(1, absl::GetFlag(FLAGS_decay_horizon));
 
     torch::NoGradGuard no_grad;
     int game_length = 0;
@@ -589,7 +604,7 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
         std::vector<std::pair<Action, double>> outcomes = state->ChanceOutcomes();
         Action action = game.GetType().chance_mode == GameType::ChanceMode::kSampledStochastic
                     ? outcomes.front().first
-                    : SampleAction(outcomes, *rng).first;
+                    : SampleAction(outcomes, chance_rng).first;
         state->ApplyAction(action);
         continue;
       }
@@ -602,7 +617,7 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
             joint_action.push_back(0);
           } else {
             std::uniform_int_distribution<int> dis(0, actions.size() - 1);
-            joint_action.push_back(actions[dis(*rng)]);
+            joint_action.push_back(actions[dis(policy_rng[p])]);
           }
         }
         state->ApplyActions(joint_action);
@@ -628,7 +643,7 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
       std::vector<float> logits = std::move(result.logits);
       CenterAndCapLegalLogits(logits, actions, logit_cap);
 
-      auto policy_sample = SamplePolicyAction(rng, logits, actions);
+      auto policy_sample = SamplePolicyAction(&policy_rng[current_player], logits, actions);
       Action action = policy_sample.first;
       float old_log_prob = policy_sample.second;
 
@@ -665,12 +680,6 @@ int PpoSimulation(std::mt19937* rng, const Game& game,
       std::fill(shaped_bonus_by_player.begin(), shaped_bonus_by_player.end(),
                 0.0f);
       if (dune_state != nullptr) {
-        uint64_t env_steps = total_env_steps->load(std::memory_order_relaxed);
-        float reward_lambda =
-            env_steps < static_cast<uint64_t>(decay_horizon)
-                ? 1.0f - static_cast<float>(env_steps) / decay_horizon
-                : 0.0f;
-
         for (int p = 0; p < game.NumPlayers(); ++p) {
           int new_vp = dune_state->GetPlayerVpForTesting(p);
           int vp_delta = new_vp - current_vps[p];
@@ -831,12 +840,14 @@ void RolloutWorker(int thread_id, const Game* game,
                    PpoRolloutBuffer* rollout_buffer,
                    std::atomic<bool>* stop_collection,
                    std::atomic<uint64_t>* total_env_steps,
-                   std::vector<WorkerStats>* worker_stats) {
-  std::mt19937 rng(absl::GetFlag(FLAGS_seed) + 9973 * thread_id);
+                   std::vector<WorkerStats>* worker_stats,
+                   std::atomic<uint64_t>* next_episode_id) {
+  uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
   while (!stop_collection->load(std::memory_order_relaxed)) {
+    uint64_t episode_id = next_episode_id->fetch_add(1, std::memory_order_relaxed);
     std::vector<PpoTransition> trajectory;
-    int moves = PpoSimulation(&rng, *game, evaluator, obs_size, &trajectory,
+    int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
                               total_env_steps, &local_stats);
     local_stats.games += 1;
     local_stats.moves += moves;
@@ -863,7 +874,8 @@ CollectResult CollectRollout(const Game* game,
                              std::shared_ptr<BatchedEvaluator> evaluator,
                              int64_t obs_size,
                              std::atomic<uint64_t>* total_env_steps,
-                             int num_threads) {
+                             int num_threads,
+                             std::atomic<uint64_t>* next_episode_id) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
@@ -875,7 +887,7 @@ CollectResult CollectRollout(const Game* game,
   for (int i = 0; i < num_threads; ++i) {
     workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
                          &rollout_buffer, &stop_collection, total_env_steps,
-                         &worker_stats);
+                         &worker_stats, next_episode_id);
   }
   for (auto& worker : workers) worker.join();
   auto end = std::chrono::high_resolution_clock::now();
@@ -897,7 +909,8 @@ CollectResult CollectRollout(const Game* game,
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
-    int64_t obs_size, int64_t action_dim, torch::Device device) {
+    int64_t obs_size, int64_t action_dim, torch::Device device,
+    uint64_t master, int global_update) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
 
@@ -964,8 +977,10 @@ PpoUpdateStats TrainPpoUpdate(
   double clip_fraction_sum = 0.0;
 
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
+    uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
+    at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
     torch::Tensor permutation =
-        torch::randperm(n, torch::TensorOptions().device(device).dtype(torch::kInt64));
+        torch::randperm(n, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64)).to(device);
     for (int64_t start = 0; start < n; start += minibatch_size) {
       int64_t end = std::min(start + minibatch_size, n);
       torch::Tensor mb_idx = permutation.narrow(0, start, end - start);
@@ -1107,7 +1122,8 @@ int main(int argc, char** argv) {
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
 
-  torch::manual_seed(absl::GetFlag(FLAGS_seed));
+  uint64_t master = static_cast<uint64_t>(absl::GetFlag(FLAGS_seed));
+  torch::manual_seed(dune_seed::DeriveSeed(master, dune_seed::kStreamModelInit));
 
   auto game = open_spiel::LoadGame(absl::GetFlag(FLAGS_game));
   int64_t obs_size = game->GetType().provides_information_state_tensor
@@ -1164,6 +1180,7 @@ int main(int argc, char** argv) {
       absl::GetFlag(FLAGS_gamma), absl::GetFlag(FLAGS_gae_lambda));
 
   std::atomic<uint64_t> total_env_steps{0};
+  std::atomic<uint64_t> next_episode_id{0};
   uint64_t total_games = 0;
   uint64_t total_moves = 0;
   auto training_start = std::chrono::high_resolution_clock::now();
@@ -1173,7 +1190,6 @@ int main(int argc, char** argv) {
   bool pipeline = absl::GetFlag(FLAGS_pipeline);
   int num_threads = absl::GetFlag(FLAGS_threads);
 
-  std::mt19937 rng(absl::GetFlag(FLAGS_seed));
   open_spiel::SearchLabelBuffer search_buffer;
   search_buffer.SetExpectedDimensions(obs_size, action_size);
   std::string search_label_dir = absl::GetFlag(FLAGS_search_label_dir);
@@ -1183,7 +1199,7 @@ int main(int argc, char** argv) {
 
   // Collect first rollout synchronously.
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
-      game.get(), evaluator, obs_size, &total_env_steps, num_threads);
+      game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
@@ -1206,7 +1222,7 @@ int main(int argc, char** argv) {
     if (have_bg) {
       bg_collect_thread = std::thread([&]() {
         next_collect = open_spiel::CollectRollout(
-            game.get(), evaluator, obs_size, &total_env_steps, num_threads);
+            game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
       });
     }
 
@@ -1214,7 +1230,8 @@ int main(int argc, char** argv) {
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer,
                                    current_collect.rollout, obs_size,
-                                   action_size, device);
+                                   action_size, device,
+                                   master, update);
     auto ppo_end = std::chrono::high_resolution_clock::now();
 
     // --- Search auxiliary distillation steps ---
@@ -1234,7 +1251,9 @@ int main(int argc, char** argv) {
       auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
 
       for (int aux = 0; aux < search_minibatches_per_update; ++aux) {
-        std::vector<SearchLabel> search_batch = search_buffer.Sample(search_minibatch_size, &rng);
+        uint64_t aux_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, update, aux, dune_seed::kStreamSearchSampling);
+        std::mt19937 aux_rng = dune_seed::MakeRng32(aux_seed);
+        std::vector<SearchLabel> search_batch = search_buffer.Sample(search_minibatch_size, &aux_rng);
         if (search_batch.empty()) continue;
 
         int64_t sb_size = search_batch.size();
@@ -1388,7 +1407,7 @@ int main(int argc, char** argv) {
       current_collect = std::move(next_collect);
     } else if (update < total_updates) {
       current_collect = open_spiel::CollectRollout(
-          game.get(), evaluator, obs_size, &total_env_steps, num_threads);
+          game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
     }

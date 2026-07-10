@@ -22,6 +22,7 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_evaluator.h"
+#include "dune_seed_utils.h"
 
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen PPO checkpoint");
@@ -399,30 +400,27 @@ int main(int argc, char** argv) {
   int num_threads = absl::GetFlag(FLAGS_threads);
 
   auto worker_fn = [&](int thread_id) {
-    std::mt19937 rng(absl::GetFlag(FLAGS_seed) + 100 + thread_id);
     auto evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
         model, device, absl::GetFlag(FLAGS_value_scale));
-
-    // Bot value_scale=1.0: the evaluator already scales neural leaves.
-    // Passing value_scale to both would create a VS² mismatch.
-    open_spiel::DunePUCTISMCTSBot bot(
-        rng(), evaluator, absl::GetFlag(FLAGS_puct_c), absl::GetFlag(FLAGS_max_simulations),
-        -1, 1.0, 0.0, 0.3, 1.0, true,
-        open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
-        true, absl::GetFlag(FLAGS_search_opponent_temperature));
 
     while (labels_emitted < target_labels && games_started < max_games) {
       int game_id = games_started.fetch_add(1);
       if (game_id >= max_games) break;
       std::unique_ptr<open_spiel::State> state = game->NewInitialState();
       open_spiel::Player searched_player = game_id % state->NumPlayers();
+      int chance_index = 0;
+      int decision_index = 0;
+      uint64_t master = absl::GetFlag(FLAGS_seed);
 
       while (!state->IsTerminal()) {
         if (labels_emitted >= target_labels) break;
 
         if (state->IsChanceNode()) {
           auto outcomes = state->ChanceOutcomes();
-          open_spiel::Action choice = open_spiel::SampleAction(outcomes, absl::Uniform(rng, 0.0, 1.0)).first;
+          uint64_t chance_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, chance_index, dune_seed::kStreamChance);
+          chance_index++;
+          auto chance_rng = dune_seed::MakeRng64(chance_seed);
+          open_spiel::Action choice = open_spiel::SampleAction(outcomes, absl::Uniform(chance_rng, 0.0, 1.0)).first;
           state->ApplyAction(choice);
           continue;
         }
@@ -430,7 +428,9 @@ int main(int argc, char** argv) {
         open_spiel::Player cur_player = state->CurrentPlayer();
         open_spiel::ActionsAndProbs ppo_prior = evaluator->Prior(*state);
 
-        open_spiel::Action blueprint_action = open_spiel::SampleBlueprintAction(ppo_prior, absl::GetFlag(FLAGS_blueprint_temperature), rng);
+        uint64_t blueprint_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamBlueprint);
+        auto blueprint_rng = dune_seed::MakeRng32(blueprint_seed);
+        open_spiel::Action blueprint_action = open_spiel::SampleBlueprintAction(ppo_prior, absl::GetFlag(FLAGS_blueprint_temperature), blueprint_rng);
 
         bool should_search = (cur_player == searched_player && open_spiel::IsStrategicState(*state, searched_player));
 
@@ -443,8 +443,16 @@ int main(int argc, char** argv) {
             search_prob = absl::GetFlag(FLAGS_search_fraction) * absl::GetFlag(FLAGS_uniform_ratio);
           }
 
-          if (absl::Uniform(rng, 0.0, 1.0) < search_prob) {
+          uint64_t search_gate_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamSearchGate);
+          auto search_gate_rng = dune_seed::MakeRng64(search_gate_seed);
+          if (absl::Uniform(search_gate_rng, 0.0, 1.0) < search_prob) {
             total_search_attempted++;
+            uint64_t mcts_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamMCTS);
+            open_spiel::DunePUCTISMCTSBot bot(
+                mcts_seed, evaluator, absl::GetFlag(FLAGS_puct_c), absl::GetFlag(FLAGS_max_simulations),
+                -1, 1.0, 0.0, 0.3, 1.0, true,
+                open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
+                true, absl::GetFlag(FLAGS_search_opponent_temperature));
             bot.RunSearch(*state);
             open_spiel::SearchDiagnostics diag = bot.GetRootDiagnostics(*state, absl::GetFlag(FLAGS_min_visits_per_action));
 
@@ -522,6 +530,7 @@ int main(int argc, char** argv) {
           }
         }
 
+        decision_index++;
         state->ApplyAction(blueprint_action);
       }
     }
