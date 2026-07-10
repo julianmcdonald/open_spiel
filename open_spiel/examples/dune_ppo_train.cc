@@ -594,6 +594,8 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["optimizer_filename"] = std::filesystem::path(optim_path).filename().string();
     manifest_obj["optimizer_file_size"] = static_cast<int64_t>(optim_size);
     manifest_obj["optimizer_sha256"] = optim_hash;
+    manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
+    manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
 
     {
       std::ofstream ofs(manifest_tmp);
@@ -1298,7 +1300,7 @@ int main(int argc, char** argv) {
 
   std::string init_mode = absl::GetFlag(FLAGS_init_mode);
   if (init_mode.empty()) {
-    SpielFatalError("Required flag --init_mode is missing. Must be 'random' or 'checkpoint'.");
+    SpielFatalError("Required flag --init_mode is missing. Must be 'random', 'checkpoint', 'bootstrap', or 'validate_legacy'.");
   }
 
   std::string config_fingerprint = open_spiel::ComputeConfigFingerprint();
@@ -1313,11 +1315,17 @@ int main(int argc, char** argv) {
   if (init_mode == "random") {
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
-    if (std::filesystem::exists(model_path) || std::filesystem::exists(optim_path)) {
-      SpielFatalError("init_mode=random but checkpoint file already exists. Refusing to overwrite.");
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    std::string manifest_path = m_path.string();
+    if (std::filesystem::exists(model_path) || std::filesystem::exists(optim_path) || std::filesystem::exists(manifest_path)) {
+      SpielFatalError("init_mode=random but checkpoint or manifest file already exists. Refusing to overwrite.");
     }
     std::cout << "Starting fresh training run (init_mode=random).\n";
   } else if (init_mode == "checkpoint") {
+    if (absl::GetFlag(FLAGS_pipeline)) {
+      SpielFatalError("init_mode=checkpoint with pipeline=true is rejected because prefetched rollout is not persisted.");
+    }
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
     std::filesystem::path m_path = model_path;
@@ -1370,6 +1378,8 @@ int main(int argc, char** argv) {
     std::string manifest_optimizer_filename = get_string_field("optimizer_filename");
     size_t manifest_optimizer_file_size = get_int_field("optimizer_file_size");
     std::string manifest_optimizer_sha256 = get_string_field("optimizer_sha256");
+    int manifest_hidden_dim = get_int_field("hidden_dim");
+    int manifest_num_blocks = get_int_field("num_blocks");
 
     if (!std::filesystem::exists(model_path)) {
       SpielFatalError("Model file not found: " + model_path);
@@ -1424,6 +1434,17 @@ int main(int argc, char** argv) {
                       "  Got:      " + search_label_fingerprint);
     }
 
+    if (absl::GetFlag(FLAGS_hidden_dim) != manifest_hidden_dim) {
+      SpielFatalError(absl::StrFormat("hidden_dim mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_hidden_dim), manifest_hidden_dim));
+    }
+    if (absl::GetFlag(FLAGS_num_blocks) != manifest_num_blocks) {
+      SpielFatalError(absl::StrFormat("num_blocks mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_num_blocks), manifest_num_blocks));
+    }
+
+    if (global_update >= target_end_update) {
+      SpielFatalError(absl::StrFormat("global_update (%d) >= target_end_update (%d). Resuming is not possible as training is already finished.", global_update, target_end_update));
+    }
+
     try {
       torch::load(training_model, model_path, device);
       torch::load(*optimizer, optim_path, device);
@@ -1457,6 +1478,192 @@ int main(int argc, char** argv) {
 
     std::cout << "Successfully verified and loaded checkpoint manifest. Resuming from update "
               << start_update << " to " << target_end_update << ".\n";
+  } else if (init_mode == "bootstrap") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+    if (model_path.find("artifacts/baselines") != std::string::npos) {
+      SpielFatalError("Refusing to bootstrap directly inside the frozen baseline directory: " + model_path + 
+                      "\nRun bootstrap beside a BRANCH COPY in a separate output directory.");
+    }
+    if (!std::filesystem::exists(model_path)) {
+      SpielFatalError("Model file not found for bootstrap: " + model_path);
+    }
+    if (!std::filesystem::exists(optim_path)) {
+      SpielFatalError("Optimizer file not found for bootstrap: " + optim_path);
+    }
+
+    try {
+      torch::load(training_model, model_path, device);
+      torch::load(*optimizer, optim_path, device);
+    } catch (const c10::Error& e) {
+      SpielFatalError("LibTorch load failed during bootstrap: " + std::string(e.msg()));
+    }
+
+    size_t model_size = 0;
+    std::string model_hash = open_spiel::ComputeFileSHA256(model_path, &model_size);
+    size_t optim_size = 0;
+    std::string optim_hash = open_spiel::ComputeFileSHA256(optim_path, &optim_size);
+
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    std::string manifest_path = m_path.string();
+    std::string manifest_tmp = manifest_path + ".tmp";
+
+    json::Object manifest_obj;
+    manifest_obj["global_update"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_update));
+    manifest_obj["target_end_update"] = static_cast<int64_t>(absl::GetFlag(FLAGS_target_end_update));
+    manifest_obj["total_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_env_steps));
+    manifest_obj["next_episode_id"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id));
+    manifest_obj["base_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+    manifest_obj["seed_scheme_version"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed_scheme_version));
+    manifest_obj["config_fingerprint"] = config_fingerprint;
+    manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
+    manifest_obj["run_uuid"] = open_spiel::GenerateUUID();
+    manifest_obj["checkpoint_uuid"] = open_spiel::GenerateUUID();
+    manifest_obj["model_filename"] = std::filesystem::path(model_path).filename().string();
+    manifest_obj["model_file_size"] = static_cast<int64_t>(model_size);
+    manifest_obj["model_sha256"] = model_hash;
+    manifest_obj["optimizer_filename"] = std::filesystem::path(optim_path).filename().string();
+    manifest_obj["optimizer_file_size"] = static_cast<int64_t>(optim_size);
+    manifest_obj["optimizer_sha256"] = optim_hash;
+    manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
+    manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
+    manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
+
+    {
+      std::ofstream ofs(manifest_tmp);
+      if (!ofs) {
+        SpielFatalError("Could not open manifest temp file for writing: " + manifest_tmp);
+      }
+      ofs << json::ToString(manifest_obj, true);
+    }
+    std::filesystem::rename(manifest_tmp, manifest_path);
+    std::cout << "Successfully bootstrapped manifest at " << manifest_path << "\n";
+    exit(0);
+  } else if (init_mode == "validate_legacy") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+    std::filesystem::path manifest_path = std::filesystem::path(model_path).parent_path() / "manifest.json";
+
+    if (!std::filesystem::exists(manifest_path)) {
+      SpielFatalError("init_mode=validate_legacy but Phase 1 manifest file not found at: " + manifest_path.string());
+    }
+
+    std::ifstream ifs(manifest_path.string());
+    if (!ifs) {
+      SpielFatalError("Could not open manifest file at: " + manifest_path.string());
+    }
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    auto val_opt = open_spiel::json::FromString(content);
+    if (!val_opt.has_value() || !val_opt->IsObject()) {
+      SpielFatalError("Manifest file is malformed JSON at: " + manifest_path.string());
+    }
+    const auto& manifest_obj = val_opt->GetObject();
+
+    auto get_object_field = [&](const std::string& key) -> const json::Object& {
+      auto it = manifest_obj.find(key);
+      if (it == manifest_obj.end() || !it->second.IsObject()) {
+        SpielFatalError("Manifest missing required object field: " + key);
+      }
+      return it->second.GetObject();
+    };
+
+    auto get_nested_string = [](const json::Object& obj, const std::string& key) -> std::string {
+      auto it = obj.find(key);
+      if (it == obj.end() || !it->second.IsString()) {
+        SpielFatalError("Nested object missing required string field: " + key);
+      }
+      return it->second.GetString();
+    };
+
+    auto get_nested_int = [](const json::Object& obj, const std::string& key) -> int64_t {
+      auto it = obj.find(key);
+      if (it == obj.end() || !it->second.IsInt()) {
+        SpielFatalError("Nested object missing required int field: " + key);
+      }
+      return it->second.GetInt();
+    };
+
+    const auto& model_obj = get_object_field("model");
+    const auto& optim_obj = get_object_field("optimizer");
+    const auto& arch_obj = get_object_field("architecture");
+
+    std::string expected_model_sha256 = get_nested_string(model_obj, "sha256");
+    size_t expected_model_size = get_nested_int(model_obj, "size_bytes");
+
+    std::string expected_optim_sha256 = get_nested_string(optim_obj, "sha256");
+    size_t expected_optim_size = get_nested_int(optim_obj, "size_bytes");
+
+    int64_t manifest_hidden_dim = get_nested_int(arch_obj, "hidden_dim");
+    int64_t manifest_num_blocks = get_nested_int(arch_obj, "num_blocks");
+    int64_t manifest_obs_size = get_nested_int(arch_obj, "observation_size");
+    int64_t manifest_action_size = get_nested_int(arch_obj, "action_size");
+
+    if (!std::filesystem::exists(model_path)) {
+      SpielFatalError("Model file not found: " + model_path);
+    }
+    if (!std::filesystem::exists(optim_path)) {
+      SpielFatalError("Optimizer file not found: " + optim_path);
+    }
+
+    size_t actual_model_size = 0;
+    std::string actual_model_hash = open_spiel::ComputeFileSHA256(model_path, &actual_model_size);
+    if (actual_model_size != expected_model_size) {
+      SpielFatalError(absl::StrFormat("Model file size mismatch. Manifest: %d, Actual: %d", expected_model_size, actual_model_size));
+    }
+    if (actual_model_hash != expected_model_sha256) {
+      SpielFatalError("Model SHA-256 hash mismatch. Manifest: " + expected_model_sha256 + ", Actual: " + actual_model_hash);
+    }
+
+    size_t actual_optim_size = 0;
+    std::string actual_optim_hash = open_spiel::ComputeFileSHA256(optim_path, &actual_optim_size);
+    if (actual_optim_size != expected_optim_size) {
+      SpielFatalError(absl::StrFormat("Optimizer file size mismatch. Manifest: %d, Actual: %d", expected_optim_size, actual_optim_size));
+    }
+    if (actual_optim_hash != expected_optim_sha256) {
+      SpielFatalError("Optimizer SHA-256 hash mismatch. Manifest: " + expected_optim_sha256 + ", Actual: " + actual_optim_hash);
+    }
+
+    if (absl::GetFlag(FLAGS_hidden_dim) != manifest_hidden_dim) {
+      SpielFatalError(absl::StrFormat("hidden_dim mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_hidden_dim), manifest_hidden_dim));
+    }
+    if (absl::GetFlag(FLAGS_num_blocks) != manifest_num_blocks) {
+      SpielFatalError(absl::StrFormat("num_blocks mismatch. Flags: %d, Manifest: %d", absl::GetFlag(FLAGS_num_blocks), manifest_num_blocks));
+    }
+    if (obs_size != manifest_obs_size) {
+      SpielFatalError(absl::StrFormat("observation_size mismatch. Game: %d, Manifest: %d", obs_size, manifest_obs_size));
+    }
+    if (action_size != manifest_action_size) {
+      SpielFatalError(absl::StrFormat("action_size mismatch. Game: %d, Manifest: %d", action_size, manifest_action_size));
+    }
+
+    try {
+      torch::load(training_model, model_path, device);
+    } catch (const c10::Error& e) {
+      SpielFatalError("LibTorch load failed: " + std::string(e.msg()));
+    }
+
+    int64_t actual_param_count = 0;
+    for (const auto& param : training_model->parameters()) {
+      actual_param_count += param.numel();
+    }
+
+    auto dummy_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        manifest_obs_size, manifest_hidden_dim, manifest_action_size, manifest_num_blocks);
+    int64_t expected_param_count = 0;
+    for (const auto& param : dummy_model->parameters()) {
+      expected_param_count += param.numel();
+    }
+
+    if (actual_param_count != expected_param_count) {
+      SpielFatalError(absl::StrFormat("Parameter count mismatch. Expected: %d (calculated from architecture), Actual: %d", expected_param_count, actual_param_count));
+    }
+
+    std::cout << absl::StrFormat("Legacy checkpoint validation successful!\n"
+                                 "  Model parameter count: %d\n"
+                                 "  Model size and hash match Phase 1 manifest.\n"
+                                 "  Optimizer size and hash match Phase 1 manifest.\n", actual_param_count);
+    exit(0);
   } else {
     SpielFatalError("Unsupported init_mode: " + init_mode);
   }
