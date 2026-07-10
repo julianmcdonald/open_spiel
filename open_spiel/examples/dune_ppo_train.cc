@@ -53,7 +53,7 @@ ABSL_FLAG(int, ppo_update_epochs, 4, "PPO epochs per rollout batch.");
 ABSL_FLAG(double, learning_rate, 2.5e-4, "AdamW learning rate.");
 ABSL_FLAG(bool, anneal_lr, true, "Linearly anneal learning rate over updates.");
 ABSL_FLAG(double, gamma, 1.0, "Discount factor.");
-ABSL_FLAG(double, gae_lambda, 0.95, "GAE lambda.");
+ABSL_FLAG(double, gae_lambda, 1.0, "GAE lambda.");
 ABSL_FLAG(bool, normalize_advantages, true,
           "Normalize advantages within each PPO minibatch.");
 ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "PPO surrogate/value clip epsilon.");
