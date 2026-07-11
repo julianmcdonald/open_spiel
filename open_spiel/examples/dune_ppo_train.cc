@@ -78,6 +78,7 @@ ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
 ABSL_FLAG(bool, evaluator_device_synchronize, true,
           "Use whole-device CUDA synchronize after evaluator D2H copies.");
 ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
+ABSL_FLAG(bool, deterministic_rollout_eval, false, "Use deterministic batch-1 rollout evaluation.");
 ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.2,
@@ -538,6 +539,7 @@ std::string ComputeConfigFingerprint() {
 
   // New flags added for complete config fingerprint validation
   config_obj["deterministic"] = absl::GetFlag(FLAGS_deterministic);
+  config_obj["deterministic_rollout_eval"] = absl::GetFlag(FLAGS_deterministic_rollout_eval);
 
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
@@ -1426,7 +1428,7 @@ int main(int argc, char** argv) {
   open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
   std::shared_ptr<open_spiel::IGameEvaluator> evaluator;
-  if (absl::GetFlag(FLAGS_deterministic)) {
+  if (absl::GetFlag(FLAGS_deterministic_rollout_eval)) {
     evaluator = std::make_shared<open_spiel::DeterministicEvaluator>(
         inference_model, device, &eval_mutex, &sync_mutex);
   } else {
