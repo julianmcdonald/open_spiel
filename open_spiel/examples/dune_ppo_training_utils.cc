@@ -639,7 +639,8 @@ PpoUpdateStats TrainPpoUpdate(
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
-                      double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp) {
+                      double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp,
+                      double validation_kl) {
   if (filepath.empty()) return;
   bool is_csv = (filepath.size() >= 4 && filepath.substr(filepath.size() - 4) == ".csv");
 
@@ -654,7 +655,7 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
              "return_p95,return_p99,abs_return_p99,fraction_targets_outside_1,fraction_critic_near_1,"
              "total_transitions,nontrivial_transitions,forced_transitions,epoch_kls,"
              "conflict_vp_generated,conflict_vp_attributed,conflict_vp_unattributed,"
-             "raw_conflict_vp,raw_noncombat_vp,raw_total_vp\n";
+             "raw_conflict_vp,raw_noncombat_vp,raw_total_vp,validation_kl\n";
     }
     std::string epoch_kls_str;
     for (size_t i = 0; i < stats.epoch_kls.size(); ++i) {
@@ -686,7 +687,8 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
         << conflict_vp_unattributed << ","
         << raw_conflict_vp << ","
         << raw_noncombat_vp << ","
-        << raw_total_vp << "\n";
+        << raw_total_vp << ","
+        << validation_kl << "\n";
     ofs.flush();
     if (!ofs) {
       SpielFatalError("Failed to write diagnostics CSV data to: " + filepath);
@@ -732,6 +734,7 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     obj["raw_conflict_vp"] = raw_conflict_vp;
     obj["raw_noncombat_vp"] = raw_noncombat_vp;
     obj["raw_total_vp"] = raw_total_vp;
+    obj["validation_kl"] = validation_kl;
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";
     ofs.flush();

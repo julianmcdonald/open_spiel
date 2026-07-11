@@ -447,7 +447,12 @@ void WorkerThread(
 
     gr.placement = placement;
     gr.game_return = returns[model_player];
-    gr.ending_round = dune_state ? dune_state->GetCurrentRound() : -1;
+    if (dune_state) {
+      gr.ending_round = dune_state->IsTerminal() ? (dune_state->GetCurrentRound() - 1)
+                                                 : dune_state->GetCurrentRound();
+    } else {
+      gr.ending_round = -1;
+    }
     gr.current_vp = dune_state
                     ? dune_state->GetPlayerVpForTesting(model_player)
                     : -1;

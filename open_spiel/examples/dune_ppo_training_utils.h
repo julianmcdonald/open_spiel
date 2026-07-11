@@ -84,7 +84,8 @@ PpoUpdateStats TrainPpoUpdate(
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
-                      double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp);
+                      double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp,
+                      double validation_kl = -1.0);
 #endif
 
 class CombatCreditAccumulator {

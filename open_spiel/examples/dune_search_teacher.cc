@@ -23,11 +23,101 @@
 #include "dune_puct_is_mcts.h"
 #include "dune_evaluator.h"
 #include "dune_seed_utils.h"
+#include "dune_sha256.h"
+#include "dune_ppo_training_utils.h"
+#include "open_spiel/utils/json.h"
+
+namespace open_spiel {
+
+class BatchedNNEvaluator : public algorithms::Evaluator {
+ public:
+  BatchedNNEvaluator(
+      std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval,
+      double value_scale = 1.0,
+      float logit_cap = 10.0f)
+      : batched_eval_(batched_eval),
+        value_scale_(value_scale),
+        logit_cap_(logit_cap) {
+    obs_size_ = 5580;
+  }
+
+  std::vector<double> Evaluate(const State& state) override {
+    int num_players = state.NumPlayers();
+    std::vector<double> values(num_players, 0.0);
+    for (int p = 0; p < num_players; ++p) {
+      std::vector<float> obs = state.InformationStateTensor(p);
+      open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
+      double val = result.value * value_scale_;
+      values[p] = val;
+      DuneNNEvaluator::RecordLeafValue(val);
+    }
+    return values;
+  }
+
+  ActionsAndProbs Prior(const State& state) override {
+    if (state.IsTerminal()) {
+      return {};
+    }
+    Player current_player = state.CurrentPlayer();
+    if (current_player < 0 || current_player >= state.NumPlayers()) {
+      return {};
+    }
+    std::vector<float> obs = state.InformationStateTensor(current_player);
+    open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
+
+    std::vector<Action> legal_actions = state.LegalActions();
+    if (legal_actions.empty()) {
+      return {};
+    }
+
+    std::vector<float> logits(result.logits.begin(), result.logits.end());
+    open_spiel::CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (Action action : legal_actions) {
+      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+        max_logit = std::max(max_logit, static_cast<double>(logits[action]));
+      }
+    }
+
+    double sum_exp = 0.0;
+    std::vector<double> exps(legal_actions.size());
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      Action action = legal_actions[i];
+      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+        exps[i] = std::exp(logits[action] - max_logit);
+        sum_exp += exps[i];
+      } else {
+        exps[i] = 0.0;
+      }
+    }
+
+    ActionsAndProbs policy;
+    policy.reserve(legal_actions.size());
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
+      policy.push_back({legal_actions[i], prob});
+    }
+
+    return policy;
+  }
+
+ private:
+  std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval_;
+  double value_scale_;
+  float logit_cap_;
+  int64_t obs_size_;
+};
+
+} // namespace open_spiel
+
 
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen PPO checkpoint");
 ABSL_FLAG(std::string, output_dir, "", "Label output directory");
 ABSL_FLAG(int, target_labels, 10000, "Stop after this many accepted labels");
+ABSL_FLAG(int, target_training_labels, 8192, "Target count for training labels");
+ABSL_FLAG(int, target_validation_labels, 1024, "Target count for validation labels");
 ABSL_FLAG(int, max_games, 5000, "Hard game cap");
 ABSL_FLAG(int, max_simulations, 50, "MCTS budget");
 ABSL_FLAG(double, puct_c, 1.0, "Exploration constant");
@@ -53,6 +143,16 @@ ABSL_FLAG(int, seed, 42, "Seed for rng");
 
 namespace open_spiel {
 namespace {
+
+struct LabelData {
+  std::vector<float> obs;
+  open_spiel::ActionsAndProbs ppo_prior;
+  open_spiel::ActionsAndProbs teacher_prior;
+  float kl;
+  int num_covered_actions;
+  float eta;
+  bool eta_capped;
+};
 
 uint64_t ComputeFileHash(const std::string& filepath) {
   std::ifstream file(filepath, std::ios::binary);
@@ -196,7 +296,7 @@ class LabelWriter {
 
   void WriteLabel(const std::vector<float>& obs, const ActionsAndProbs& ppo_prior,
                   const ActionsAndProbs& teacher_prior, float kl, int num_covered_actions,
-                  float eta, bool eta_capped) {
+                  float eta, bool eta_capped, int player_id) {
     if (!out_.is_open()) {
       StartNewFile();
     }
@@ -218,8 +318,10 @@ class LabelWriter {
     out_.write(reinterpret_cast<const char*>(&eta), sizeof(float));
     uint8_t capped = eta_capped ? 1 : 0;
     out_.write(reinterpret_cast<const char*>(&capped), sizeof(uint8_t));
-    uint8_t padding[3] = {0, 0, 0};
-    out_.write(reinterpret_cast<const char*>(padding), 3);
+    uint8_t pid = static_cast<uint8_t>(player_id);
+    uint8_t padding[2] = {0, 0};
+    out_.write(reinterpret_cast<const char*>(&pid), sizeof(uint8_t));
+    out_.write(reinterpret_cast<const char*>(padding), 2);
 
     labels_in_current_file_++;
     total_labels_written_++;
@@ -239,7 +341,7 @@ class LabelWriter {
 
  private:
   void StartNewFile() {
-    std::string filename = absl::StrFormat("labels_%d_%lld", getpid(), std::chrono::steady_clock::now().time_since_epoch().count());
+    std::string filename = absl::StrFormat("labels_%04d", file_counter_++);
     current_bin_path_ = (std::filesystem::path(dir_) / (filename + ".bin")).string();
     current_tmp_path_ = (std::filesystem::path(dir_) / (filename + ".tmp")).string();
 
@@ -306,6 +408,7 @@ class LabelWriter {
   std::string current_bin_path_;
   int labels_in_current_file_ = 0;
   int total_labels_written_ = 0;
+  int file_counter_ = 0;
 };
 
 Action SampleBlueprintAction(const ActionsAndProbs& prior, double temp, std::mt19937& rng) {
@@ -381,12 +484,25 @@ int main(int argc, char** argv) {
 
   std::atomic<int> games_started{0};
   std::atomic<int> labels_emitted{0};
+  std::atomic<int> training_labels_emitted{0};
+  std::atomic<int> validation_labels_emitted{0};
   std::atomic<int> total_eta_capped_count{0};
   std::atomic<int> total_search_count{0};
   std::atomic<int> total_search_attempted{0};
   std::atomic<double> total_actual_kl{0.0};
   std::mutex writer_mutex;
 
+  std::map<int, std::vector<LabelData>> stashed_games;
+  int next_game_id_to_write = 0;
+
+  // Clean old label files and manifest to avoid stale data
+  if (std::filesystem::exists(output_dir)) {
+    for (const auto& entry : std::filesystem::directory_iterator(output_dir)) {
+      if (entry.path().extension() == ".bin" || entry.path().filename() == "manifest.json") {
+        std::filesystem::remove(entry.path());
+      }
+    }
+  }
 
   open_spiel::LabelWriter writer(
       output_dir, obs_size, action_size, absl::GetFlag(FLAGS_max_simulations),
@@ -396,14 +512,32 @@ int main(int argc, char** argv) {
       fingerprint, absl::GetFlag(FLAGS_labels_per_file));
 
   int target_labels = absl::GetFlag(FLAGS_target_labels);
+  int target_training_labels = absl::GetFlag(FLAGS_target_training_labels);
+  int target_validation_labels = absl::GetFlag(FLAGS_target_validation_labels);
   int max_games = absl::GetFlag(FLAGS_max_games);
   int num_threads = absl::GetFlag(FLAGS_threads);
 
-  auto worker_fn = [&](int thread_id) {
-    auto evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
-        model, device, absl::GetFlag(FLAGS_value_scale));
+  std::shared_mutex sync_mutex;
+  auto batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
+      model,
+      num_threads,
+      5, // 5ms timeout
+      device,
+      &sync_mutex,
+      10.0f, // Default logit cap
+      true  // Device synchronize
+  );
 
-    while (labels_emitted < target_labels && games_started < max_games) {
+  auto worker_fn = [&](int thread_id) {
+    auto evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(
+        batched_eval,
+        absl::GetFlag(FLAGS_value_scale),
+        10.0f
+    );
+
+    while ((training_labels_emitted < target_training_labels ||
+            validation_labels_emitted < target_validation_labels) &&
+           games_started < max_games) {
       int game_id = games_started.fetch_add(1);
       if (game_id >= max_games) break;
       std::unique_ptr<open_spiel::State> state = game->NewInitialState();
@@ -412,8 +546,11 @@ int main(int argc, char** argv) {
       int decision_index = 0;
       uint64_t master = absl::GetFlag(FLAGS_seed);
 
+      std::vector<LabelData> game_labels;
+
       while (!state->IsTerminal()) {
-        if (labels_emitted >= target_labels) break;
+        if (training_labels_emitted >= target_training_labels &&
+            validation_labels_emitted >= target_validation_labels) break;
 
         if (state->IsChanceNode()) {
           auto outcomes = state->ChanceOutcomes();
@@ -514,17 +651,15 @@ int main(int argc, char** argv) {
               }
 
               {
-                std::lock_guard<std::mutex> lock(writer_mutex);
-                if (labels_emitted < target_labels) {
-                  writer.WriteLabel(obs, ppo_prior, teacher_prior, kl, diag.num_covered_actions, eta, eta_capped);
-                  labels_emitted++;
-                  if (eta_capped) total_eta_capped_count++;
-                  total_search_count++;
-                  double prev = total_actual_kl.load(std::memory_order_relaxed);
-                  while (!total_actual_kl.compare_exchange_weak(
-                      prev, prev + kl,
-                      std::memory_order_relaxed, std::memory_order_relaxed)) {}
-                }
+                LabelData lbl;
+                lbl.obs = std::move(obs);
+                lbl.ppo_prior = std::move(ppo_prior);
+                lbl.teacher_prior = std::move(teacher_prior);
+                lbl.kl = kl;
+                lbl.num_covered_actions = diag.num_covered_actions;
+                lbl.eta = eta;
+                lbl.eta_capped = eta_capped;
+                game_labels.push_back(std::move(lbl));
               }
             }
           }
@@ -532,6 +667,52 @@ int main(int argc, char** argv) {
 
         decision_index++;
         state->ApplyAction(blueprint_action);
+      } // end while (!state->IsTerminal())
+
+      {
+        std::lock_guard<std::mutex> lock(writer_mutex);
+        stashed_games[game_id] = std::move(game_labels);
+
+        while (stashed_games.count(next_game_id_to_write)) {
+          auto& labels = stashed_games[next_game_id_to_write];
+          for (const auto& lbl : labels) {
+            std::vector<int32_t> legal_actions;
+            for (const auto& ap : lbl.ppo_prior) {
+              legal_actions.push_back(static_cast<int32_t>(ap.first));
+            }
+            bool is_val = IsValidationLabel(lbl.obs, legal_actions, next_game_id_to_write % 4);
+
+            if (is_val) {
+              if (validation_labels_emitted < target_validation_labels) {
+                writer.WriteLabel(lbl.obs, lbl.ppo_prior, lbl.teacher_prior, lbl.kl, lbl.num_covered_actions, lbl.eta, lbl.eta_capped, next_game_id_to_write % 4);
+                validation_labels_emitted++;
+                labels_emitted++;
+
+                if (lbl.eta_capped) total_eta_capped_count++;
+                total_search_count++;
+                double prev = total_actual_kl.load(std::memory_order_relaxed);
+                while (!total_actual_kl.compare_exchange_weak(
+                    prev, prev + lbl.kl,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {}
+              }
+            } else {
+              if (training_labels_emitted < target_training_labels) {
+                writer.WriteLabel(lbl.obs, lbl.ppo_prior, lbl.teacher_prior, lbl.kl, lbl.num_covered_actions, lbl.eta, lbl.eta_capped, next_game_id_to_write % 4);
+                training_labels_emitted++;
+                labels_emitted++;
+
+                if (lbl.eta_capped) total_eta_capped_count++;
+                total_search_count++;
+                double prev = total_actual_kl.load(std::memory_order_relaxed);
+                while (!total_actual_kl.compare_exchange_weak(
+                    prev, prev + lbl.kl,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {}
+              }
+            }
+          }
+          stashed_games.erase(next_game_id_to_write);
+          next_game_id_to_write++;
+        }
       }
     }
   };
@@ -546,6 +727,95 @@ int main(int argc, char** argv) {
   }
 
   writer.Close();
+
+  if (training_labels_emitted.load() < target_training_labels ||
+      validation_labels_emitted.load() < target_validation_labels) {
+    std::cerr << "Error: reached max_games=" << max_games 
+              << " without satisfying targets (training=" << training_labels_emitted.load() 
+              << "/" << target_training_labels 
+              << ", validation=" << validation_labels_emitted.load() 
+              << "/" << target_validation_labels << ").\n";
+    return 1;
+  }
+
+  // Write manifest.json
+  try {
+    std::filesystem::path dir_path(output_dir);
+    std::filesystem::create_directories(dir_path);
+    
+    open_spiel::json::Object manifest_obj;
+    manifest_obj["schema_version"] = 2;
+    manifest_obj["base_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+    manifest_obj["model_checkpoint_sha256"] = open_spiel::ComputeFileSHA256(model_checkpoint);
+    
+    open_spiel::json::Object config_obj;
+    config_obj["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
+    config_obj["value_scale"] = absl::GetFlag(FLAGS_value_scale);
+    config_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
+    config_obj["target_teacher_kl"] = absl::GetFlag(FLAGS_target_teacher_kl);
+    config_obj["eta_max"] = absl::GetFlag(FLAGS_eta_max);
+    config_obj["min_coverage"] = absl::GetFlag(FLAGS_min_coverage);
+    config_obj["min_visits_per_action"] = absl::GetFlag(FLAGS_min_visits_per_action);
+    config_obj["min_prior_mass"] = absl::GetFlag(FLAGS_min_prior_mass);
+    config_obj["min_entropy_ratio"] = absl::GetFlag(FLAGS_min_entropy_ratio);
+    config_obj["blueprint_temperature"] = absl::GetFlag(FLAGS_blueprint_temperature);
+    config_obj["search_fraction"] = absl::GetFlag(FLAGS_search_fraction);
+    config_obj["uniform_ratio"] = absl::GetFlag(FLAGS_uniform_ratio);
+    config_obj["search_opponent_temperature"] = absl::GetFlag(FLAGS_search_opponent_temperature);
+    
+    manifest_obj["effective_search_config"] = config_obj;
+    
+    open_spiel::json::Object arch_obj;
+    arch_obj["hidden_dim"] = absl::GetFlag(FLAGS_hidden_dim);
+    arch_obj["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
+    manifest_obj["architecture"] = arch_obj;
+    
+    manifest_obj["training_label_count"] = static_cast<int64_t>(training_labels_emitted.load());
+    manifest_obj["validation_label_count"] = static_cast<int64_t>(validation_labels_emitted.load());
+    
+    open_spiel::json::Array files_arr;
+    std::vector<std::string> bin_files;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_path)) {
+      if (entry.path().extension() == ".bin") {
+        bin_files.push_back(entry.path().filename().string());
+      }
+    }
+    std::sort(bin_files.begin(), bin_files.end());
+    
+    for (const auto& bin_fn : bin_files) {
+      std::filesystem::path bin_path = dir_path / bin_fn;
+      open_spiel::json::Object f_obj;
+      f_obj["filename"] = bin_fn;
+      f_obj["sha256"] = open_spiel::ComputeFileSHA256(bin_path.string());
+      files_arr.push_back(f_obj);
+    }
+    manifest_obj["files"] = files_arr;
+    
+    // Semantic identity hash (excluding operational files list for fingerprint)
+    open_spiel::json::Object semantic_obj;
+    semantic_obj["schema_version"] = manifest_obj["schema_version"];
+    semantic_obj["base_seed"] = manifest_obj["base_seed"];
+    semantic_obj["model_checkpoint_sha256"] = manifest_obj["model_checkpoint_sha256"];
+    semantic_obj["effective_search_config"] = manifest_obj["effective_search_config"];
+    semantic_obj["architecture"] = manifest_obj["architecture"];
+    semantic_obj["training_label_count"] = manifest_obj["training_label_count"];
+    semantic_obj["validation_label_count"] = manifest_obj["validation_label_count"];
+    
+    std::string semantic_json = open_spiel::json::ToString(semantic_obj);
+    manifest_obj["search_label_fingerprint"] = open_spiel::ComputeStringSHA256(semantic_json);
+    
+    std::ofstream out_manifest(dir_path / "manifest.json");
+    if (!out_manifest) {
+      std::cerr << "Failed to write manifest.json\n";
+      return 1;
+    }
+    out_manifest << open_spiel::json::ToString(manifest_obj, true);
+    out_manifest.close();
+    std::cout << "Successfully wrote manifest.json\n";
+  } catch (const std::exception& e) {
+    std::cerr << "Error writing manifest: " << e.what() << "\n";
+    return 1;
+  }
 
   std::cout << "\n=== Generator Finished ===\n";
   std::cout << absl::StrFormat("Total games played: %d\n", games_started.load());

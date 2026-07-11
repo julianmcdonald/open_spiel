@@ -200,6 +200,7 @@ struct SearchLabel {
   int32_t num_covered_actions;
   float eta;
   uint8_t eta_capped;
+  uint8_t player_id;
 };
 
 class SearchLabelBuffer {
@@ -211,19 +212,113 @@ class SearchLabelBuffer {
 
   void LoadFromDirectory(const std::string& dir) {
     if (dir.empty() || !std::filesystem::exists(dir)) return;
+    
+    // Verify manifest.json
+    std::filesystem::path manifest_path = std::filesystem::path(dir) / "manifest.json";
+    if (!std::filesystem::exists(manifest_path)) {
+      SpielFatalError("SearchLabelBuffer: manifest.json not found in " + dir);
+    }
+    
+    std::ifstream ifs(manifest_path.string());
+    if (!ifs) {
+      SpielFatalError("SearchLabelBuffer: Failed to open manifest.json in " + dir);
+    }
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    ifs.close();
+    
+    auto val_opt = open_spiel::json::FromString(content);
+    if (!val_opt) {
+      SpielFatalError("SearchLabelBuffer: Failed to parse manifest.json in " + dir);
+    }
+    
+    const auto& manifest_obj = val_opt->GetObject();
+    
+    // Verify schema_version
+    auto schema_it = manifest_obj.find("schema_version");
+    if (schema_it == manifest_obj.end() || static_cast<int>(schema_it->second.GetInt()) != 2) {
+      SpielFatalError("SearchLabelBuffer: Unsupported manifest schema version in " + dir + " (expected 2)");
+    }
+    
+    // Verify training_label_count & validation_label_count
+    auto train_cnt_it = manifest_obj.find("training_label_count");
+    auto val_cnt_it = manifest_obj.find("validation_label_count");
+    if (train_cnt_it == manifest_obj.end() || val_cnt_it == manifest_obj.end()) {
+      SpielFatalError("SearchLabelBuffer: Missing training/validation counts in manifest.json");
+    }
+    
+    int64_t training_count = train_cnt_it->second.GetInt();
+    int64_t validation_count = val_cnt_it->second.GetInt();
+    if (training_count < 8192 || validation_count < 1024) {
+      SpielFatalError("SearchLabelBuffer: Manifest training count (" + std::to_string(training_count) + 
+                     ") or validation count (" + std::to_string(validation_count) + ") is insufficient.");
+    }
+    
+    // Verify files & SHA-256 hashes
+    auto files_it = manifest_obj.find("files");
+    if (files_it == manifest_obj.end()) {
+      SpielFatalError("SearchLabelBuffer: Missing 'files' list in manifest.json");
+    }
+    const auto& files_arr = files_it->second.GetArray();
+    for (const auto& f_val : files_arr) {
+      const auto& f_obj = f_val.GetObject();
+      auto fn_it = f_obj.find("filename");
+      auto hash_it = f_obj.find("sha256");
+      if (fn_it == f_obj.end() || hash_it == f_obj.end()) {
+        SpielFatalError("SearchLabelBuffer: Missing filename or sha256 in file entry");
+      }
+      
+      std::string filename = fn_it->second.GetString();
+      std::string expected_sha256 = hash_it->second.GetString();
+      std::filesystem::path bin_path = std::filesystem::path(dir) / filename;
+      if (!std::filesystem::exists(bin_path)) {
+        SpielFatalError("SearchLabelBuffer: Label file " + filename + " listed in manifest does not exist.");
+      }
+      
+      std::string actual_sha256 = open_spiel::ComputeFileSHA256(bin_path.string());
+      if (actual_sha256 != expected_sha256) {
+        SpielFatalError("SearchLabelBuffer: Hash mismatch for file " + filename + 
+                       ": expected=" + expected_sha256 + " actual=" + actual_sha256);
+      }
+    }
+    
+    // Reconstruct semantic object for fingerprint verification
+    open_spiel::json::Object semantic_obj;
+    semantic_obj["schema_version"] = manifest_obj.at("schema_version");
+    semantic_obj["base_seed"] = manifest_obj.at("base_seed");
+    semantic_obj["model_checkpoint_sha256"] = manifest_obj.at("model_checkpoint_sha256");
+    semantic_obj["effective_search_config"] = manifest_obj.at("effective_search_config");
+    semantic_obj["architecture"] = manifest_obj.at("architecture");
+    semantic_obj["training_label_count"] = manifest_obj.at("training_label_count");
+    semantic_obj["validation_label_count"] = manifest_obj.at("validation_label_count");
+    
+    std::string semantic_json = open_spiel::json::ToString(semantic_obj);
+    std::string expected_fingerprint = open_spiel::ComputeStringSHA256(semantic_json);
+    
+    auto fp_it = manifest_obj.find("search_label_fingerprint");
+    if (fp_it == manifest_obj.end() || fp_it->second.GetString() != expected_fingerprint) {
+      SpielFatalError("SearchLabelBuffer: Manifest search_label_fingerprint mismatch!");
+    }
+    
+    std::cout << "SearchLabelBuffer: manifest.json verified successfully. Fingerprint: " 
+              << expected_fingerprint << "\n";
+              
     LoadNewFiles(dir);
   }
 
   void LoadNewFiles(const std::string& dir) {
     if (dir.empty() || !std::filesystem::exists(dir)) return;
     std::lock_guard<std::mutex> lock(mu_);
+    std::vector<std::string> paths;
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
       if (entry.path().extension() == ".bin") {
-        std::string path_str = entry.path().string();
-        if (loaded_files_.find(path_str) == loaded_files_.end()) {
-          LoadFile(path_str);
-          loaded_files_.insert(path_str);
-        }
+        paths.push_back(entry.path().string());
+      }
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const auto& path_str : paths) {
+      if (loaded_files_.find(path_str) == loaded_files_.end()) {
+        LoadFile(path_str);
+        loaded_files_.insert(path_str);
       }
     }
   }
@@ -243,6 +338,63 @@ class SearchLabelBuffer {
   size_t Size() const {
     std::lock_guard<std::mutex> lock(mu_);
     return labels_.size();
+  }
+
+  double ComputeValidationKL(const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model, 
+                             const torch::Device& device, float logit_cap) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (validation_labels_.empty()) return 0.0;
+    
+    torch::NoGradGuard no_grad;
+    const size_t batch_size = 512;
+    double kl_sum = 0.0;
+    size_t total_count = 0;
+    
+    for (size_t i = 0; i < validation_labels_.size(); i += batch_size) {
+      size_t current_batch_size = std::min(batch_size, validation_labels_.size() - i);
+      
+      torch::Tensor states_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_obs_size_}, torch::kFloat);
+      torch::Tensor masks_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kBool);
+      torch::Tensor teacher_probs_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kFloat);
+      
+      float* states_ptr = states_cpu.data_ptr<float>();
+      bool* masks_ptr = masks_cpu.data_ptr<bool>();
+      float* teacher_ptr = teacher_probs_cpu.data_ptr<float>();
+      
+      for (size_t j = 0; j < current_batch_size; ++j) {
+        const auto& label = validation_labels_[i + j];
+        std::copy(label.state.begin(), label.state.end(), states_ptr + j * expected_obs_size_);
+        for (const auto& ap : label.teacher_probs) {
+          int action_id = ap.first;
+          float prob = ap.second;
+          masks_ptr[j * expected_action_dim_ + action_id] = true;
+          teacher_ptr[j * expected_action_dim_ + action_id] = prob;
+        }
+      }
+      
+      torch::Tensor states = states_cpu.to(device);
+      torch::Tensor masks = masks_cpu.to(device);
+      torch::Tensor teacher_probs = teacher_probs_cpu.to(device);
+      
+      auto outputs = model->forward(states);
+      torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
+      torch::Tensor masked_logits = logits.masked_fill(masks.logical_not(), -1e9f);
+      torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+      
+      torch::Tensor log_teacher = torch::log(teacher_probs.clamp_min(1e-12f));
+      torch::Tensor kl_loss = teacher_probs * (log_teacher - log_probs);
+      torch::Tensor mean_kl = kl_loss.sum(-1);
+      
+      kl_sum += mean_kl.sum().item<double>();
+      total_count += current_batch_size;
+    }
+    
+    return total_count > 0 ? (kl_sum / total_count) : 0.0;
+  }
+
+  size_t ValidationSize() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return validation_labels_.size();
   }
 
  private:
@@ -273,9 +425,9 @@ class SearchLabelBuffer {
       return;
     }
     in.read(reinterpret_cast<char*>(&schema), 4);
-    if (schema != 1) {
+    if (schema != 1 && schema != 2) {
       std::cerr << "SearchLabelBuffer: Unsupported schema version " << schema
-                << " in " << path << " (expected 1)\n";
+                << " in " << path << " (expected 1 or 2)\n";
       return;
     }
     in.read(reinterpret_cast<char*>(&obs_size), 4);
@@ -309,6 +461,7 @@ class SearchLabelBuffer {
     in.read(reinterpret_cast<char*>(&reserved), 4);
 
     int labels_before = labels_.size();
+    int val_before = validation_labels_.size();
     while (in.peek() != EOF) {
       SearchLabel label;
       label.state.resize(obs_size);
@@ -345,15 +498,29 @@ class SearchLabelBuffer {
       in.read(reinterpret_cast<char*>(&label.num_covered_actions), sizeof(int32_t));
       in.read(reinterpret_cast<char*>(&label.eta), sizeof(float));
       in.read(reinterpret_cast<char*>(&label.eta_capped), sizeof(uint8_t));
-      uint8_t padding[3];
-      in.read(reinterpret_cast<char*>(padding), 3);
+      
+      uint8_t pid = 0;
+      uint8_t padding[2];
+      in.read(reinterpret_cast<char*>(&pid), sizeof(uint8_t));
+      in.read(reinterpret_cast<char*>(padding), 2);
       if (!in) break;
+      label.player_id = pid;
 
-      labels_.push_back(std::move(label));
+      std::vector<int32_t> legal_actions;
+      for (const auto& ap : label.teacher_probs) {
+        legal_actions.push_back(static_cast<int32_t>(ap.first));
+      }
+
+      if (IsValidationLabel(label.state, legal_actions, label.player_id)) {
+        validation_labels_.push_back(std::move(label));
+      } else {
+        labels_.push_back(std::move(label));
+      }
     }
     int labels_loaded = labels_.size() - labels_before;
+    int val_loaded = validation_labels_.size() - val_before;
     std::cout << "SearchLabelBuffer: Loaded " << labels_loaded
-              << " labels from " << path << "\n";
+              << " train, " << val_loaded << " val labels from " << path << "\n";
   }
 
   int64_t expected_obs_size_ = 0;
@@ -361,6 +528,7 @@ class SearchLabelBuffer {
   uint64_t expected_fingerprint_ = 0;
   bool has_fingerprint_ = false;
   std::vector<SearchLabel> labels_;
+  std::vector<SearchLabel> validation_labels_;
   std::set<std::string> loaded_files_;
   mutable std::mutex mu_;
 };
@@ -1483,6 +1651,7 @@ int main(int argc, char** argv) {
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
+      double val_kl = search_buffer.ComputeValidationKL(training_model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
       open_spiel::WriteDiagnostics(diagnostics_path, start_update, stats,
                                    current_collect.conflict_vp_generated,
                                    current_collect.conflict_vp_attributed,
@@ -1490,7 +1659,8 @@ int main(int argc, char** argv) {
                                    master, run_uuid, absl::GetFlag(FLAGS_run_prefix), config_fingerprint,
                                    current_collect.raw_conflict_vp,
                                    current_collect.raw_noncombat_vp,
-                                   current_collect.raw_total_vp);
+                                   current_collect.raw_total_vp,
+                                   val_kl);
     }
     std::cout << "Diagnostics-only run complete. Exiting.\n";
     exit(0);
@@ -1538,6 +1708,7 @@ int main(int argc, char** argv) {
     // Log PPO updates to diagnostics CSV
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
+      double val_kl = search_buffer.ComputeValidationKL(training_model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
       open_spiel::WriteDiagnostics(diagnostics_path, update, stats,
                                    current_collect.conflict_vp_generated,
                                    current_collect.conflict_vp_attributed,
@@ -1545,7 +1716,8 @@ int main(int argc, char** argv) {
                                    master, run_uuid, absl::GetFlag(FLAGS_run_prefix), config_fingerprint,
                                    current_collect.raw_conflict_vp,
                                    current_collect.raw_noncombat_vp,
-                                   current_collect.raw_total_vp);
+                                   current_collect.raw_total_vp,
+                                   val_kl);
     }
 
     // --- Search auxiliary distillation steps ---
