@@ -5,17 +5,14 @@
 #include <string>
 #include <memory>
 #include <cstring>
-#include <algorithm>
-#include <iostream>
-#include <fstream>
-#include <filesystem>
 #include <cstdint>
 
-#include "open_spiel/spiel.h"
-#include "open_spiel/games/dune_imperium/dune_imperium.h"
-#include "open_spiel/games/dune_imperium/dune_imperium_util.h"
-#include "open_spiel/games/dune_imperium/dune_imperium_content.h"
-#include "open_spiel/utils/json.h"
+
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include <torch/torch.h>
+#include "dune_network.h"
+#endif
 
 namespace open_spiel {
 
@@ -32,6 +29,63 @@ struct PpoTransition {
   int player_id;
   uint64_t episode_id;
 };
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+struct PpoUpdateStats {
+  double policy_loss = 0.0;
+  double value_loss = 0.0;
+  double entropy = 0.0;
+  double approx_kl = 0.0;
+  double clip_fraction = 0.0;
+  double explained_variance = 0.0;
+  int minibatches = 0;
+  bool early_stopped = false;
+  double grad_norm_sum = 0.0;
+  int grad_norm_count = 0;
+
+  // Diagnostics (Phase 5)
+  bool episode_ids_unique = true;
+  double policy_kl_before = 0.0;
+  double return_min = 0.0;
+  double return_max = 0.0;
+  double return_p50 = 0.0;
+  double return_p95 = 0.0;
+  double return_p99 = 0.0;
+  double abs_return_p99 = 0.0;
+  double fraction_targets_outside_1 = 0.0;
+  double fraction_critic_near_1 = 0.0;
+  int64_t total_transitions = 0;
+  int64_t nontrivial_transitions = 0;
+  int64_t forced_transitions = 0;
+  std::vector<double> epoch_kls;
+  std::string rollout_hash;
+};
+
+std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch);
+
+torch::Tensor LegalLogitMean(const torch::Tensor& logits,
+                             const torch::Tensor& legal_mask);
+
+torch::Tensor ApplyLogitCapTensor(const torch::Tensor& logits,
+                                  float logit_cap);
+
+torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
+                                       const torch::Tensor& legal_mask,
+                                       float logit_cap);
+
+float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps);
+
+PpoUpdateStats TrainPpoUpdate(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
+    int64_t obs_size, int64_t action_dim, torch::Device device,
+    uint64_t master, int global_update);
+
+void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
+                      double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
+                      uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
+                      double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp);
+#endif
 
 class CombatCreditAccumulator {
 public:
@@ -73,6 +127,8 @@ private:
 };
 
 struct CheckpointManifest {
+  int schema_version;
+  std::string checkpoint_uuid;
   int global_update;
   int target_end_update;
   uint64_t total_env_steps;
@@ -105,7 +161,8 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               int current_hidden_dim,
                               int current_num_blocks,
                               CheckpointManifest& out_manifest,
-                              std::string& error_msg);
+                              std::string& error_msg,
+                              const std::string& current_legacy_config_fingerprint = "");
 
 inline uint32_t Fnv1a(const uint8_t* data, size_t size) {
   uint32_t hash = 2166136261U;

@@ -145,15 +145,108 @@ inline void CenterAndCapLegalLogits(std::vector<float>& logits,
     }
 }
 
-class BatchedEvaluator {
-public:
-    struct Stats {
-        uint64_t batches;
-        uint64_t requests;
-        uint64_t max_batch_size;
-        double avg_batch_size;
-    };
+struct EvaluatorStats {
+    uint64_t batches = 0;
+    uint64_t requests = 0;
+    uint64_t max_batch_size = 0;
+    double avg_batch_size = 0.0;
+};
 
+class IGameEvaluator {
+public:
+    virtual ~IGameEvaluator() = default;
+    virtual EvalResult Evaluate(const std::vector<float>& obs) = 0;
+    virtual EvaluatorStats GetStats() const = 0;
+};
+
+class DeterministicEvaluator : public IGameEvaluator {
+public:
+    DeterministicEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+                           torch::Device device,
+                           std::mutex* mutex,
+                           std::shared_mutex* sync_mutex = nullptr)
+        : model_(model), device_(device), mutex_(mutex), sync_mutex_(sync_mutex) {
+        model_input_dim_ = model_->input_layer->weight.size(1);
+        action_dim_ = model_->policy_head->weight.size(0);
+    }
+
+    EvalResult Evaluate(const std::vector<float>& obs) override {
+        torch::NoGradGuard no_grad;
+        EvalResult result;
+        result.logits.resize(action_dim_);
+
+        struct ThreadLocalBuffers {
+            torch::Tensor input_tensor;
+            torch::Tensor device_tensor;
+        };
+        thread_local std::unordered_map<const DeterministicEvaluator*, ThreadLocalBuffers> tl_buffers;
+
+        auto& buffers = tl_buffers[this];
+        if (!buffers.input_tensor.defined()) {
+            auto options = torch::TensorOptions().dtype(torch::kFloat32);
+            if (device_.is_cuda()) {
+                options = options.pinned_memory(true);
+            }
+            buffers.input_tensor = torch::empty({1, model_input_dim_}, options);
+            if (device_.is_cuda()) {
+                buffers.device_tensor = torch::empty({1, model_input_dim_}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+            }
+        }
+
+        float* data_ptr = buffers.input_tensor.data_ptr<float>();
+        int64_t copy_size = std::min<int64_t>(model_input_dim_, obs.size());
+        std::memcpy(data_ptr, obs.data(), copy_size * sizeof(float));
+        if (copy_size < model_input_dim_) {
+            std::memset(data_ptr + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
+        }
+
+        SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+        {
+            std::shared_lock<std::shared_mutex> sync_lock;
+            if (sync_mutex_ != nullptr) {
+                sync_lock = std::shared_lock<std::shared_mutex>(*sync_mutex_);
+            }
+            std::lock_guard<std::mutex> lock(*mutex_);
+            if (device_.is_cuda()) {
+                buffers.device_tensor.copy_(buffers.input_tensor, /*non_blocking=*/true);
+                AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                outputs = model_->forward(buffers.device_tensor);
+            } else {
+                outputs = model_->forward(buffers.input_tensor);
+            }
+        }
+
+        torch::Tensor pred_logits = outputs.logits.to(torch::kCPU).to(torch::kFloat32);
+        torch::Tensor pred_values = outputs.values.to(torch::kCPU).to(torch::kFloat32);
+
+        std::memcpy(result.logits.data(), pred_logits.data_ptr<float>(), action_dim_ * sizeof(float));
+        result.value = pred_values.data_ptr<float>()[0];
+
+        requests_.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+
+    EvaluatorStats GetStats() const override {
+        EvaluatorStats s;
+        s.requests = requests_.load(std::memory_order_relaxed);
+        s.batches = s.requests;
+        s.max_batch_size = 1;
+        s.avg_batch_size = 1.0;
+        return s;
+    }
+
+private:
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
+    torch::Device device_;
+    std::mutex* mutex_;
+    std::shared_mutex* sync_mutex_;
+    int64_t model_input_dim_;
+    int64_t action_dim_;
+    mutable std::atomic<uint64_t> requests_{0};
+};
+
+class BatchedEvaluator : public IGameEvaluator {
+public:
     BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
                      int target_batch_size, 
                      int timeout_ms, 
@@ -189,7 +282,7 @@ public:
     }
 
     // Called by the actor threads
-    EvalResult Evaluate(const std::vector<float>& obs) {
+    EvalResult Evaluate(const std::vector<float>& obs) override {
         EvalResult result; // Stack allocated!
         std::atomic<bool> ready{false};
 
@@ -228,12 +321,17 @@ public:
         return result; // Move semantics
     }
 
-    Stats GetStats() const {
+    EvaluatorStats GetStats() const override {
         uint64_t batches = total_batches_.load(std::memory_order_relaxed);
         uint64_t requests = total_requests_.load(std::memory_order_relaxed);
         uint64_t max_batch = max_batch_size_seen_.load(std::memory_order_relaxed);
         double avg_batch = batches > 0 ? static_cast<double>(requests) / batches : 0.0;
-        return {batches, requests, max_batch, avg_batch};
+        EvaluatorStats s;
+        s.batches = batches;
+        s.requests = requests;
+        s.max_batch_size = max_batch;
+        s.avg_batch_size = avg_batch;
+        return s;
     }
 
 private:

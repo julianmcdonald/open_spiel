@@ -16,7 +16,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <numeric>
+
 #include <random>
 #include <shared_mutex>
 #include <string>
@@ -27,7 +27,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
-#include "open_spiel/games/dune_imperium/dune_imperium_board.h"
+
 #include "open_spiel/games/dune_imperium/dune_imperium_util.h"
 #include "open_spiel/spiel.h"
 
@@ -77,6 +77,8 @@ ABSL_FLAG(double, logit_cap, 10.0,
 ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
 ABSL_FLAG(bool, evaluator_device_synchronize, true,
           "Use whole-device CUDA synchronize after evaluator D2H copies.");
+ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
+ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.2,
           "Weight for intermediate VP shaped rewards.");
@@ -84,8 +86,6 @@ ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu levels 5/6 breadcrumbs.");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
-ABSL_FLAG(int, decay_horizon, 12000000,
-          "Transitions over which shaped reward lambda decays.");
 ABSL_FLAG(double, reward_scale, 4.0,
           "Divide shaped plus terminal rewards by this value.");
 
@@ -93,6 +93,8 @@ ABSL_FLAG(std::string, model_checkpoint, "dune_ppo_model.pt",
           "Model checkpoint to load/save.");
 ABSL_FLAG(std::string, optim_checkpoint, "dune_ppo_optimizer.pt",
           "Optimizer checkpoint to load/save.");
+ABSL_FLAG(std::string, artifact_manifest, "",
+          "Path to the Phase 1 baseline artifact manifest.json for validation.");
 ABSL_FLAG(std::string, run_prefix, "dune_ppo",
           "Prefix for rotating checkpoints.");
 ABSL_FLAG(int, checkpoint_interval, 10,
@@ -125,6 +127,8 @@ ABSL_FLAG(int, target_end_update, 2450, "Absolute target update number to train 
 ABSL_FLAG(int, start_update, 1, "Fallback start update for bootstrap mode.");
 ABSL_FLAG(uint64_t, start_env_steps, 0, "Fallback start environment steps for bootstrap mode.");
 ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstrap mode.");
+ABSL_FLAG(std::string, diagnostics_path, "",
+          "Path to write structured diagnostics JSON/CSV. Extension determines format.");
 
 namespace open_spiel {
 namespace {
@@ -146,8 +150,21 @@ class PpoRolloutBuffer {
     return num_transitions_;
   }
 
-  std::vector<PpoTransition> TakeAll() {
+  std::vector<PpoTransition> TakeAll(bool* out_episode_ids_unique = nullptr) {
     std::lock_guard<std::mutex> lock(mu_);
+    if (out_episode_ids_unique) {
+      *out_episode_ids_unique = true;
+      std::unordered_set<uint64_t> seen_ids;
+      for (const auto& traj : trajectories_) {
+        if (!traj.empty()) {
+          uint64_t ep_id = traj[0].episode_id;
+          if (seen_ids.count(ep_id)) {
+            *out_episode_ids_unique = false;
+          }
+          seen_ids.insert(ep_id);
+        }
+      }
+    }
     std::sort(trajectories_.begin(), trajectories_.end(),
               [](const std::vector<PpoTransition>& a,
                  const std::vector<PpoTransition>& b) {
@@ -359,40 +376,13 @@ struct WorkerStats {
   double conflict_vp_generated = 0.0;
   double conflict_vp_attributed = 0.0;
   double conflict_vp_unattributed = 0.0;
+
+  // Raw VPs for conservation checks
+  double raw_conflict_vp = 0.0;
+  double raw_noncombat_vp = 0.0;
+  double raw_total_vp = 0.0;
 };
 
-struct PpoUpdateStats {
-  double policy_loss = 0.0;
-  double value_loss = 0.0;
-  double entropy = 0.0;
-  double approx_kl = 0.0;
-  double clip_fraction = 0.0;
-  double explained_variance = 0.0;
-  int minibatches = 0;
-  bool early_stopped = false;
-  double grad_norm_sum = 0.0;
-  int grad_norm_count = 0;
-};
-
-torch::Tensor LegalLogitMean(const torch::Tensor& logits,
-                             const torch::Tensor& legal_mask) {
-  torch::Tensor mask_f = legal_mask.to(logits.dtype());
-  torch::Tensor legal_counts = mask_f.sum(1, true).clamp_min(1.0);
-  return (logits * mask_f).sum(1, true) / legal_counts;
-}
-
-torch::Tensor ApplyLogitCapTensor(const torch::Tensor& logits,
-                                  float logit_cap) {
-  if (logit_cap <= 0.0f) return logits;
-  return logit_cap * torch::tanh(logits / logit_cap);
-}
-
-torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
-                                       const torch::Tensor& legal_mask,
-                                       float logit_cap) {
-  return ApplyLogitCapTensor(logits - LegalLogitMean(logits, legal_mask),
-                             logit_cap);
-}
 
 void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
                       std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
@@ -472,6 +462,45 @@ std::string GenerateUUID() {
   return absl::StrFormat("%08x-%04x-%04x-%04x-%012llx", a, b, c, d, e);
 }
 
+std::string ComputeLegacyConfigFingerprint() {
+  open_spiel::json::Object config_obj;
+  config_obj["game"] = absl::GetFlag(FLAGS_game);
+  config_obj["ppo_minibatch_size"] = absl::GetFlag(FLAGS_ppo_minibatch_size);
+  config_obj["ppo_update_epochs"] = absl::GetFlag(FLAGS_ppo_update_epochs);
+  config_obj["learning_rate"] = absl::GetFlag(FLAGS_learning_rate);
+  config_obj["anneal_lr"] = absl::GetFlag(FLAGS_anneal_lr);
+  config_obj["gamma"] = absl::GetFlag(FLAGS_gamma);
+  config_obj["gae_lambda"] = absl::GetFlag(FLAGS_gae_lambda);
+  config_obj["normalize_advantages"] = absl::GetFlag(FLAGS_normalize_advantages);
+  config_obj["ppo_clip_epsilon"] = absl::GetFlag(FLAGS_ppo_clip_epsilon);
+  config_obj["ppo_clip_value_loss"] = absl::GetFlag(FLAGS_ppo_clip_value_loss);
+  config_obj["entropy_coef"] = absl::GetFlag(FLAGS_entropy_coef);
+  config_obj["value_coef"] = absl::GetFlag(FLAGS_value_coef);
+  config_obj["grad_clip_norm"] = absl::GetFlag(FLAGS_grad_clip_norm);
+  config_obj["target_kl"] = absl::GetFlag(FLAGS_target_kl);
+  config_obj["weight_decay"] = absl::GetFlag(FLAGS_weight_decay);
+  config_obj["policy_weight_decay"] = absl::GetFlag(FLAGS_policy_weight_decay);
+  config_obj["hidden_dim"] = absl::GetFlag(FLAGS_hidden_dim);
+  config_obj["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
+  config_obj["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
+  config_obj["shaped_reward_weight"] = absl::GetFlag(FLAGS_shaped_reward_weight);
+  config_obj["tleilaxu_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+  config_obj["tleilaxu_level7_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
+  config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
+  config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  config_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  config_obj["pipeline"] = absl::GetFlag(FLAGS_pipeline);
+  config_obj["rollout_games"] = absl::GetFlag(FLAGS_rollout_games);
+  config_obj["rollout_transitions"] = absl::GetFlag(FLAGS_rollout_transitions);
+  config_obj["search_lambda"] = absl::GetFlag(FLAGS_search_lambda);
+  config_obj["search_minibatches_per_update"] = absl::GetFlag(FLAGS_search_minibatches_per_update);
+  config_obj["search_minibatch_size"] = absl::GetFlag(FLAGS_search_minibatch_size);
+
+  std::string json_str = open_spiel::json::ToString(config_obj);
+  return open_spiel::ComputeStringSHA256(json_str);
+}
+
 std::string ComputeConfigFingerprint() {
   open_spiel::json::Object config_obj;
   config_obj["game"] = absl::GetFlag(FLAGS_game);
@@ -496,16 +525,19 @@ std::string ComputeConfigFingerprint() {
   config_obj["shaped_reward_weight"] = absl::GetFlag(FLAGS_shaped_reward_weight);
   config_obj["tleilaxu_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   config_obj["tleilaxu_level7_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
-  config_obj["decay_horizon"] = absl::GetFlag(FLAGS_decay_horizon);
   config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
   config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
   config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  config_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
   config_obj["pipeline"] = absl::GetFlag(FLAGS_pipeline);
   config_obj["rollout_games"] = absl::GetFlag(FLAGS_rollout_games);
   config_obj["rollout_transitions"] = absl::GetFlag(FLAGS_rollout_transitions);
   config_obj["search_lambda"] = absl::GetFlag(FLAGS_search_lambda);
   config_obj["search_minibatches_per_update"] = absl::GetFlag(FLAGS_search_minibatches_per_update);
   config_obj["search_minibatch_size"] = absl::GetFlag(FLAGS_search_minibatch_size);
+
+  // New flags added for complete config fingerprint validation
+  config_obj["deterministic"] = absl::GetFlag(FLAGS_deterministic);
 
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
@@ -570,6 +602,8 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
 
     std::string checkpoint_uuid = GenerateUUID();
     json::Object manifest_obj;
+    manifest_obj["schema_version"] = static_cast<int64_t>(2);
+    manifest_obj["checkpoint_uuid"] = checkpoint_uuid;
     manifest_obj["global_update"] = static_cast<int64_t>(global_update);
     manifest_obj["target_end_update"] = static_cast<int64_t>(target_end_update);
     manifest_obj["total_env_steps"] = static_cast<int64_t>(total_env_steps);
@@ -579,7 +613,6 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["config_fingerprint"] = config_fingerprint;
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = run_uuid;
-    manifest_obj["checkpoint_uuid"] = checkpoint_uuid;
     manifest_obj["model_filename"] = std::filesystem::path(model_path).filename().string();
     manifest_obj["model_file_size"] = static_cast<int64_t>(model_size);
     manifest_obj["model_sha256"] = model_hash;
@@ -653,16 +686,11 @@ std::pair<Action, float> SamplePolicyAction(
 
 
 int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
-                  std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size,
+                  std::shared_ptr<IGameEvaluator> evaluator, int64_t obs_size,
                   std::vector<PpoTransition>* trajectory,
                   std::atomic<uint64_t>* total_env_steps,
+                  float reward_lambda,
                   WorkerStats* local_stats) {
-  uint64_t env_steps_at_start = total_env_steps->load(std::memory_order_relaxed);
-  int decay_horizon = std::max(1, absl::GetFlag(FLAGS_decay_horizon));
-  float reward_lambda =
-      env_steps_at_start < static_cast<uint64_t>(decay_horizon)
-          ? 1.0f - static_cast<float>(env_steps_at_start) / decay_horizon
-          : 0.0f;
 
   auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
   std::mt19937_64 policy_rng[4];
@@ -850,6 +878,10 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
           int raw_noncombat = raw_total_vp_delta - raw_conflict_vp_delta;
 
+          local_stats->raw_conflict_vp += raw_conflict_vp_delta;
+          local_stats->raw_noncombat_vp += raw_noncombat;
+          local_stats->raw_total_vp += raw_total_vp_delta;
+
           float combat_shape = std::max(raw_conflict_vp_delta, 0)
                                 * static_cast<float>(shaped_weight) * reward_lambda;
           float noncombat_shape = raw_noncombat
@@ -921,27 +953,28 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 }
 
 void RolloutWorker(int thread_id, const Game* game,
-                   std::shared_ptr<BatchedEvaluator> evaluator, int64_t obs_size,
-                   PpoRolloutBuffer* rollout_buffer,
-                   std::atomic<bool>* stop_collection,
-                   std::atomic<uint64_t>* total_env_steps,
-                   std::vector<WorkerStats>* worker_stats,
-                   std::atomic<uint64_t>* next_episode_id,
-                   uint64_t start_episode_id,
-                   int rollout_games) {
+                    std::shared_ptr<IGameEvaluator> evaluator, int64_t obs_size,
+                    PpoRolloutBuffer* rollout_buffer,
+                    std::atomic<bool>* stop_collection,
+                    std::atomic<uint64_t>* total_env_steps,
+                    std::vector<WorkerStats>* worker_stats,
+                    std::atomic<uint64_t>* local_episode_id,
+                    uint64_t start_episode_id,
+                    int rollout_games,
+                    float reward_lambda) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
   while (true) {
     if (rollout_games == 0 && stop_collection->load(std::memory_order_relaxed)) {
       break;
     }
-    uint64_t episode_id = next_episode_id->fetch_add(1, std::memory_order_relaxed);
+    uint64_t episode_id = local_episode_id->fetch_add(1, std::memory_order_relaxed);
     if (rollout_games > 0 && episode_id >= start_episode_id + rollout_games) {
       break;
     }
     std::vector<PpoTransition> trajectory;
     int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
-                              total_env_steps, &local_stats);
+                              total_env_steps, reward_lambda, &local_stats);
     local_stats.games += 1;
     local_stats.moves += moves;
     size_t size = rollout_buffer->PushTrajectory(std::move(trajectory));
@@ -967,16 +1000,23 @@ struct CollectResult {
   double conflict_vp_generated = 0.0;
   double conflict_vp_attributed = 0.0;
   double conflict_vp_unattributed = 0.0;
+
+  bool episode_ids_unique = true;
+  double raw_conflict_vp = 0.0;
+  double raw_noncombat_vp = 0.0;
+  double raw_total_vp = 0.0;
 };
 
+
+
 CollectResult CollectRollout(const Game* game,
-                             std::shared_ptr<BatchedEvaluator> evaluator,
+                             std::shared_ptr<IGameEvaluator> evaluator,
                              int64_t obs_size,
                              std::atomic<uint64_t>* total_env_steps,
                              int num_threads,
                              std::atomic<uint64_t>* next_episode_id,
-                             uint64_t start_episode_id,
-                             int rollout_games) {
+                             int rollout_games,
+                             float reward_lambda) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
@@ -984,19 +1024,28 @@ CollectResult CollectRollout(const Game* game,
   std::vector<std::thread> workers;
   workers.reserve(num_threads);
 
-  std::atomic<uint64_t> local_episode_id{start_episode_id};
-  std::atomic<uint64_t>* ep_id_ptr = (rollout_games > 0) ? &local_episode_id : next_episode_id;
+  uint64_t actual_start_ep = next_episode_id->load();
+  std::atomic<uint64_t> local_episode_id{actual_start_ep};
 
   auto start = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < num_threads; ++i) {
     workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
                          &rollout_buffer, &stop_collection, total_env_steps,
-                         &worker_stats, ep_id_ptr, start_episode_id, rollout_games);
+                         &worker_stats, &local_episode_id, actual_start_ep, rollout_games, reward_lambda);
   }
   for (auto& worker : workers) worker.join();
+  
+  if (rollout_games > 0) {
+    next_episode_id->store(actual_start_ep + rollout_games);
+  } else {
+    next_episode_id->store(local_episode_id.load());
+  }
   auto end = std::chrono::high_resolution_clock::now();
 
-  result.rollout = rollout_buffer.TakeAll();
+  bool episode_ids_unique = true;
+  result.rollout = rollout_buffer.TakeAll(&episode_ids_unique);
+  result.episode_ids_unique = episode_ids_unique;
+
   for (const auto& stats : worker_stats) {
     result.games += stats.games;
     result.moves += stats.moves;
@@ -1008,211 +1057,28 @@ CollectResult CollectRollout(const Game* game,
     result.conflict_vp_generated += stats.conflict_vp_generated;
     result.conflict_vp_attributed += stats.conflict_vp_attributed;
     result.conflict_vp_unattributed += stats.conflict_vp_unattributed;
+
+    result.raw_conflict_vp += stats.raw_conflict_vp;
+    result.raw_noncombat_vp += stats.raw_noncombat_vp;
+    result.raw_total_vp += stats.raw_total_vp;
+  }
+
+  // Verify shaped reward conservation invariant
+  if (std::abs(result.conflict_vp_generated - (result.conflict_vp_attributed + result.conflict_vp_unattributed)) > 1e-4) {
+    open_spiel::SpielFatalError(absl::StrFormat("Shaped reward conservation violated: generated = %f, attributed = %f, unattributed = %f",
+                                                result.conflict_vp_generated, result.conflict_vp_attributed, result.conflict_vp_unattributed));
+  }
+
+  // Verify signed raw VP conservation invariant
+  if (std::abs(result.raw_conflict_vp + result.raw_noncombat_vp - result.raw_total_vp) > 1e-4) {
+    open_spiel::SpielFatalError(absl::StrFormat("Signed raw VP conservation violated: raw_conflict = %f, raw_noncombat = %f, raw_total = %f",
+                                                result.raw_conflict_vp, result.raw_noncombat_vp, result.raw_total_vp));
   }
   result.elapsed_seconds =
       std::chrono::duration<double>(end - start).count();
   return result;
 }
 
-PpoUpdateStats TrainPpoUpdate(
-    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
-    torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
-    int64_t obs_size, int64_t action_dim, torch::Device device,
-    uint64_t master, int global_update) {
-  PpoUpdateStats stats;
-  if (batch.empty()) return stats;
-
-  int64_t n = static_cast<int64_t>(batch.size());
-  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
-  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
-  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
-
-  torch::Tensor states_cpu = torch::empty({n, obs_size}, cpu_float);
-  torch::Tensor masks_cpu = torch::zeros({n, action_dim}, cpu_bool);
-  torch::Tensor actions_cpu = torch::empty({n}, cpu_long);
-  torch::Tensor old_log_probs_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor advantages_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor returns_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor old_values_cpu = torch::empty({n}, cpu_float);
-
-  float* states_ptr = states_cpu.data_ptr<float>();
-  bool* masks_ptr = masks_cpu.data_ptr<bool>();
-  int64_t* actions_ptr = actions_cpu.data_ptr<int64_t>();
-  float* old_log_probs_ptr = old_log_probs_cpu.data_ptr<float>();
-  float* advantages_ptr = advantages_cpu.data_ptr<float>();
-  float* returns_ptr = returns_cpu.data_ptr<float>();
-  float* old_values_ptr = old_values_cpu.data_ptr<float>();
-
-  for (int64_t i = 0; i < n; ++i) {
-    const PpoTransition& transition = batch[i];
-    std::memcpy(states_ptr + i * obs_size, transition.state.data(),
-                obs_size * sizeof(float));
-    for (Action action : transition.legal_actions) {
-      if (action >= 0 && action < action_dim) {
-        masks_ptr[i * action_dim + action] = true;
-      }
-    }
-    actions_ptr[i] = transition.action;
-    old_log_probs_ptr[i] = transition.old_log_prob;
-    advantages_ptr[i] = transition.advantage;
-    returns_ptr[i] = transition.return_value;
-    old_values_ptr[i] = transition.value;
-  }
-
-  torch::Tensor states = states_cpu.to(device);
-  torch::Tensor masks = masks_cpu.to(device);
-  torch::Tensor actions = actions_cpu.to(device);
-  torch::Tensor old_log_probs = old_log_probs_cpu.to(device);
-  torch::Tensor advantages = advantages_cpu.to(device);
-  torch::Tensor returns = returns_cpu.to(device);
-  torch::Tensor old_values = old_values_cpu.to(device);
-
-  int64_t minibatch_size =
-      std::min<int64_t>(absl::GetFlag(FLAGS_ppo_minibatch_size), n);
-  int update_epochs = std::max(1, absl::GetFlag(FLAGS_ppo_update_epochs));
-  float clip_epsilon = static_cast<float>(absl::GetFlag(FLAGS_ppo_clip_epsilon));
-  bool normalize_advantages = absl::GetFlag(FLAGS_normalize_advantages);
-  bool clip_value_loss = absl::GetFlag(FLAGS_ppo_clip_value_loss);
-  float entropy_coef = static_cast<float>(absl::GetFlag(FLAGS_entropy_coef));
-  float value_coef = static_cast<float>(absl::GetFlag(FLAGS_value_coef));
-  float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
-  double target_kl = absl::GetFlag(FLAGS_target_kl);
-
-  double policy_loss_sum = 0.0;
-  double value_loss_sum = 0.0;
-  double entropy_sum = 0.0;
-  double kl_sum = 0.0;
-  double clip_fraction_sum = 0.0;
-
-  for (int epoch = 0; epoch < update_epochs; ++epoch) {
-    uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
-    at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
-    torch::Tensor permutation =
-        torch::randperm(n, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64)).to(device);
-    for (int64_t start = 0; start < n; start += minibatch_size) {
-      int64_t end = std::min(start + minibatch_size, n);
-      torch::Tensor mb_idx = permutation.narrow(0, start, end - start);
-
-      torch::Tensor mb_states = states.index_select(0, mb_idx);
-      torch::Tensor mb_masks = masks.index_select(0, mb_idx);
-      torch::Tensor mb_actions = actions.index_select(0, mb_idx);
-      torch::Tensor mb_old_log_probs = old_log_probs.index_select(0, mb_idx);
-      torch::Tensor mb_advantages = advantages.index_select(0, mb_idx);
-      torch::Tensor mb_returns = returns.index_select(0, mb_idx);
-      torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
-
-      optimizer.zero_grad();
-      torch::Tensor policy_loss, value_loss, entropy, approx_kl, clip_fraction;
-      torch::Tensor total_loss;
-
-      auto compute_loss = [&]() {
-        auto outputs = model->forward(mb_states);
-        torch::Tensor logits =
-            CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-        torch::Tensor masked_logits =
-            logits.masked_fill(mb_masks.logical_not(), -1e9f);
-        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-        torch::Tensor probs = torch::softmax(masked_logits, -1);
-        torch::Tensor selected_log_probs =
-            log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
-
-        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-        torch::Tensor ratio = torch::exp(log_ratio);
-        torch::Tensor mb_adv = mb_advantages;
-        if (normalize_advantages && mb_adv.numel() > 1) {
-          mb_adv = (mb_adv - mb_adv.mean()) /
-                   (mb_adv.std(/*unbiased=*/false) + 1e-8);
-        }
-        mb_adv = mb_adv.detach();
-
-        torch::Tensor pg_loss1 = -mb_adv * ratio;
-        torch::Tensor pg_loss2 =
-            -mb_adv * ratio.clamp(1.0f - clip_epsilon,
-                                  1.0f + clip_epsilon);
-        policy_loss = torch::max(pg_loss1, pg_loss2).mean();
-
-        torch::Tensor new_values = outputs.values.squeeze(1);
-        if (clip_value_loss) {
-          torch::Tensor value_loss_unclipped =
-              (new_values - mb_returns).pow(2);
-          torch::Tensor value_clipped =
-              mb_old_values +
-              (new_values - mb_old_values)
-                  .clamp(-clip_epsilon, clip_epsilon);
-          torch::Tensor value_loss_clipped =
-              (value_clipped - mb_returns).pow(2);
-          value_loss =
-              0.5f * torch::max(value_loss_unclipped, value_loss_clipped).mean();
-        } else {
-          value_loss = 0.5f * (new_values - mb_returns).pow(2).mean();
-        }
-
-        entropy = -(probs * log_probs).sum(-1).mean();
-        approx_kl = ((ratio - 1.0f) - log_ratio).mean();
-        clip_fraction =
-            ((ratio - 1.0f).abs() > clip_epsilon).to(torch::kFloat32).mean();
-        total_loss = policy_loss + value_coef * value_loss -
-                     entropy_coef * entropy;
-      };
-
-      if (device.is_cuda() && absl::GetFlag(FLAGS_train_amp)) {
-        AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
-        compute_loss();
-      } else {
-        compute_loss();
-      }
-
-      total_loss.backward();
-      double grad_norm =
-          torch::nn::utils::clip_grad_norm_(
-              model->parameters(), absl::GetFlag(FLAGS_grad_clip_norm));
-      if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
-        std::cerr << "Fatal PPO gradient norm: " << grad_norm << "\n";
-        std::exit(EXIT_FAILURE);
-      }
-      stats.grad_norm_sum += grad_norm;
-      stats.grad_norm_count += 1;
-      optimizer.step();
-
-      double kl = approx_kl.item<double>();
-      policy_loss_sum += policy_loss.item<double>();
-      value_loss_sum += value_loss.item<double>();
-      entropy_sum += entropy.item<double>();
-      kl_sum += kl;
-      clip_fraction_sum += clip_fraction.item<double>();
-      stats.minibatches += 1;
-
-      if (target_kl > 0.0 && kl > target_kl) {
-        stats.early_stopped = true;
-        break;
-      }
-    }
-    if (stats.early_stopped) break;
-  }
-
-  if (stats.minibatches > 0) {
-    stats.policy_loss = policy_loss_sum / stats.minibatches;
-    stats.value_loss = value_loss_sum / stats.minibatches;
-    stats.entropy = entropy_sum / stats.minibatches;
-    stats.approx_kl = kl_sum / stats.minibatches;
-    stats.clip_fraction = clip_fraction_sum / stats.minibatches;
-  }
-
-  torch::Tensor returns_cpu_flat = returns_cpu;
-  torch::Tensor old_values_cpu_flat = old_values_cpu;
-  double return_var = returns_cpu_flat.var(/*unbiased=*/false).item<double>();
-  if (return_var > 1e-12) {
-    double residual_var =
-        (returns_cpu_flat - old_values_cpu_flat)
-            .var(/*unbiased=*/false)
-            .item<double>();
-    stats.explained_variance = 1.0 - residual_var / return_var;
-  } else {
-    stats.explained_variance = 0.0;
-  }
-
-  return stats;
-}
 
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -1220,7 +1086,11 @@ PpoUpdateStats TrainPpoUpdate(
 }  // namespace open_spiel
 
 int main(int argc, char** argv) {
+  setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
+  if (absl::GetFlag(FLAGS_deterministic)) {
+    at::globalContext().setDeterministicAlgorithms(true, /*silent=*/true);
+  }
   using namespace open_spiel;
 
 #ifndef OPEN_SPIEL_BUILD_WITH_LIBTORCH
@@ -1299,13 +1169,14 @@ int main(int argc, char** argv) {
 
     CheckpointManifest manifest;
     std::string err;
+    std::string legacy_fingerprint = ComputeLegacyConfigFingerprint();
     if (!ParseAndValidateManifest(manifest_path, model_path, optim_path,
                                   master, target_end_update,
                                   absl::GetFlag(FLAGS_seed_scheme_version),
                                   config_fingerprint, search_label_fingerprint,
                                   absl::GetFlag(FLAGS_hidden_dim),
                                   absl::GetFlag(FLAGS_num_blocks),
-                                  manifest, err)) {
+                                  manifest, err, legacy_fingerprint)) {
       SpielFatalError(err);
     }
 
@@ -1385,6 +1256,7 @@ int main(int argc, char** argv) {
     std::string manifest_tmp = manifest_path + ".tmp";
 
     json::Object manifest_obj;
+    manifest_obj["schema_version"] = static_cast<int64_t>(2);
     manifest_obj["global_update"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_update));
     manifest_obj["target_end_update"] = static_cast<int64_t>(absl::GetFlag(FLAGS_target_end_update));
     manifest_obj["total_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_env_steps));
@@ -1418,7 +1290,13 @@ int main(int argc, char** argv) {
   } else if (init_mode == "validate_legacy") {
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
-    std::filesystem::path manifest_path = std::filesystem::path(model_path).parent_path() / "manifest.json";
+    std::filesystem::path manifest_path;
+    std::string artifact_manifest_flag = absl::GetFlag(FLAGS_artifact_manifest);
+    if (!artifact_manifest_flag.empty()) {
+      manifest_path = artifact_manifest_flag;
+    } else {
+      manifest_path = std::filesystem::path(model_path).parent_path() / "manifest.json";
+    }
 
     if (!std::filesystem::exists(manifest_path)) {
       SpielFatalError("init_mode=validate_legacy but Phase 1 manifest file not found at: " + manifest_path.string());
@@ -1544,12 +1422,19 @@ int main(int argc, char** argv) {
   }
 
   std::shared_mutex sync_mutex;
+  std::mutex eval_mutex;
   open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
 
-  auto evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
-      inference_model, absl::GetFlag(FLAGS_eval_batch_size),
-      absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
-      absl::GetFlag(FLAGS_evaluator_device_synchronize));
+  std::shared_ptr<open_spiel::IGameEvaluator> evaluator;
+  if (absl::GetFlag(FLAGS_deterministic)) {
+    evaluator = std::make_shared<open_spiel::DeterministicEvaluator>(
+        inference_model, device, &eval_mutex, &sync_mutex);
+  } else {
+    evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
+        inference_model, absl::GetFlag(FLAGS_eval_batch_size),
+        absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
+        absl::GetFlag(FLAGS_evaluator_device_synchronize));
+  }
 
   std::cout << absl::StrFormat(
       "Initialized dune_ppo_train | obs=%d actions=%d hidden=%d blocks=%d "
@@ -1581,12 +1466,34 @@ int main(int argc, char** argv) {
   }
 
   int rollout_games = absl::GetFlag(FLAGS_rollout_games);
-  uint64_t start_episode_id = (rollout_games > 0) ? (start_update - 1) * rollout_games : 0;
 
   // Collect first rollout synchronously.
+  float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
+                                            absl::GetFlag(FLAGS_shaping_start_env_steps),
+                                            absl::GetFlag(FLAGS_shaping_decay_env_steps));
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-      start_episode_id, rollout_games);
+      rollout_games, reward_lambda);
+  if (absl::GetFlag(FLAGS_diagnostics_only)) {
+    open_spiel::PpoUpdateStats stats =
+        open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
+                                   obs_size, action_size, device, master, start_update);
+    stats.episode_ids_unique = current_collect.episode_ids_unique;
+    std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
+    if (!diagnostics_path.empty()) {
+      open_spiel::WriteDiagnostics(diagnostics_path, start_update, stats,
+                                   current_collect.conflict_vp_generated,
+                                   current_collect.conflict_vp_attributed,
+                                   current_collect.conflict_vp_unattributed,
+                                   master, run_uuid, absl::GetFlag(FLAGS_run_prefix), config_fingerprint,
+                                   current_collect.raw_conflict_vp,
+                                   current_collect.raw_noncombat_vp,
+                                   current_collect.raw_total_vp);
+    }
+    std::cout << "Diagnostics-only run complete. Exiting.\n";
+    exit(0);
+  }
+
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
@@ -1607,21 +1514,37 @@ int main(int argc, char** argv) {
     std::thread bg_collect_thread;
     bool have_bg = pipeline && update < target_end_update;
     if (have_bg) {
-      uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
-      bg_collect_thread = std::thread([&, next_start_episode_id]() {
+      float next_reward_lambda = ComputeRewardLambda(total_env_steps.load(),
+                                                     absl::GetFlag(FLAGS_shaping_start_env_steps),
+                                                     absl::GetFlag(FLAGS_shaping_decay_env_steps));
+      bg_collect_thread = std::thread([&, next_reward_lambda]() {
         next_collect = open_spiel::CollectRollout(
             game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-            next_start_episode_id, rollout_games);
+            rollout_games, next_reward_lambda);
       });
     }
 
     auto ppo_start = std::chrono::high_resolution_clock::now();
     open_spiel::PpoUpdateStats stats =
-        open_spiel::TrainPpoUpdate(training_model, *optimizer,
-                                   current_collect.rollout, obs_size,
-                                   action_size, device,
-                                   master, update);
-    auto ppo_end = std::chrono::high_resolution_clock::now();
+        open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
+                                   obs_size, action_size, device, master, update);
+    stats.episode_ids_unique = current_collect.episode_ids_unique;
+
+    double ppo_elapsed = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - ppo_start).count();
+
+    // Log PPO updates to diagnostics CSV
+    std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
+    if (!diagnostics_path.empty()) {
+      open_spiel::WriteDiagnostics(diagnostics_path, update, stats,
+                                   current_collect.conflict_vp_generated,
+                                   current_collect.conflict_vp_attributed,
+                                   current_collect.conflict_vp_unattributed,
+                                   master, run_uuid, absl::GetFlag(FLAGS_run_prefix), config_fingerprint,
+                                   current_collect.raw_conflict_vp,
+                                   current_collect.raw_noncombat_vp,
+                                   current_collect.raw_total_vp);
+    }
 
     // --- Search auxiliary distillation steps ---
     double search_kl_sum = 0.0;
@@ -1724,8 +1647,6 @@ int main(int argc, char** argv) {
     auto wall_end = std::chrono::high_resolution_clock::now();
 
     double collect_elapsed = current_collect.elapsed_seconds;
-    double ppo_elapsed =
-        std::chrono::duration<double>(ppo_end - ppo_start).count();
     double wall_elapsed =
         std::chrono::duration<double>(wall_end - wall_start).count();
     double sps = collect_elapsed > 0.0
@@ -1805,10 +1726,12 @@ int main(int argc, char** argv) {
     if (have_bg) {
       current_collect = std::move(next_collect);
     } else if (update < target_end_update) {
-      uint64_t next_start_episode_id = (rollout_games > 0) ? update * rollout_games : 0;
+      float next_reward_lambda = ComputeRewardLambda(total_env_steps.load(),
+                                                     absl::GetFlag(FLAGS_shaping_start_env_steps),
+                                                     absl::GetFlag(FLAGS_shaping_decay_env_steps));
       current_collect = open_spiel::CollectRollout(
           game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-          next_start_episode_id, rollout_games);
+          rollout_games, next_reward_lambda);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
     }

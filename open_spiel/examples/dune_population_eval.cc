@@ -22,13 +22,13 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <random>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -39,6 +39,7 @@
 
 #include "dune_network.h"
 #include "dune_seed_utils.h"
+#include "open_spiel/utils/json.h"
 
 // ---------------------------------------------------------------------------
 // Flags
@@ -71,6 +72,9 @@ ABSL_FLAG(std::string, output_dir, "",
           "Empty = stdout only.");
 ABSL_FLAG(float, temperature, 1.0f,
           "Softmax temperature for stochastic policy (--greedy=false).");
+ABSL_FLAG(bool, deterministic_eval, true,
+          "If true, use batch-1 mutex-serialized inference for strict bitwise "
+          "thread-count reproducibility. Much slower than batched mode.");
 
 namespace open_spiel {
 namespace {
@@ -124,7 +128,7 @@ struct GameResult {
   int placement;                       // 1-based (mapped directly from returns)
   double game_return;
   int ending_round;
-  int track_vp;
+  int current_vp;
   int final_scored_vp;
 };
 
@@ -147,6 +151,97 @@ std::vector<std::string> SplitCommaSeparated(const std::string& value) {
   return items;
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Auto-detect model hidden_dim and num_blocks from JSON manifest or weight keys
+// ---------------------------------------------------------------------------
+bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* num_blocks) {
+  // 1. Try to find a JSON file
+  std::string json_path = "";
+  std::filesystem::path p(model_path);
+  std::filesystem::path p_json = p;
+  p_json.replace_extension(".json");
+  if (std::filesystem::exists(p_json)) {
+    json_path = p_json.string();
+  } else {
+    std::filesystem::path p_parent_manifest = p.parent_path() / "manifest.json";
+    if (std::filesystem::exists(p_parent_manifest)) {
+      json_path = p_parent_manifest.string();
+    }
+  }
+
+  if (!json_path.empty()) {
+    try {
+      std::ifstream f(json_path);
+      if (f) {
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        auto val_opt = json::FromString(content);
+        if (val_opt.has_value() && val_opt->IsObject()) {
+          const auto& obj = val_opt->GetObject();
+          auto it_hd = obj.find("hidden_dim");
+          auto it_nb = obj.find("num_blocks");
+          if (it_hd != obj.end() && it_hd->second.IsInt() &&
+              it_nb != obj.end() && it_nb->second.IsInt()) {
+            *hidden_dim = it_hd->second.GetInt();
+            *num_blocks = it_nb->second.GetInt();
+            return true;
+          }
+          auto it_arch = obj.find("architecture");
+          if (it_arch != obj.end() && it_arch->second.IsObject()) {
+            const auto& arch_obj = it_arch->second.GetObject();
+            auto it_arch_hd = arch_obj.find("hidden_dim");
+            auto it_arch_nb = arch_obj.find("num_blocks");
+            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
+                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
+              *hidden_dim = it_arch_hd->second.GetInt();
+              *num_blocks = it_arch_nb->second.GetInt();
+              return true;
+            }
+          }
+        }
+      }
+    } catch (...) {
+      // Fallback
+    }
+  }
+
+  // 2. Fall back to weights key-based inspection
+  try {
+    torch::serialize::InputArchive archive;
+    archive.load_from(model_path, torch::kCPU);
+    
+    torch::serialize::InputArchive input_layer_archive;
+    archive.read("input_layer", input_layer_archive);
+    torch::Tensor weight;
+    input_layer_archive.read("weight", weight);
+    *hidden_dim = weight.size(0);
+
+    int blocks = 0;
+    while (true) {
+      torch::serialize::InputArchive res_archive;
+      std::string block_name = "res" + std::to_string(blocks + 1);
+      try {
+        archive.read(block_name, res_archive);
+        blocks++;
+      } catch (...) {
+        break;
+      }
+    }
+    *num_blocks = blocks;
+    
+    std::cerr << "WARNING: Manifest JSON not found for model checkpoint " << model_path 
+              << ". Auto-detected architecture (hidden_dim=" << *hidden_dim 
+              << ", num_blocks=" << *num_blocks << ") from weight keys. "
+              << "Note: this inspection logic is coupled to the SharedDunePolicyValueNetImpl class architecture.\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "ERROR: Failed to detect model dimensions or load archive from " << model_path 
+              << ": " << e.what() << "\n";
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Worker thread: plays games with deterministic per-game seeds.
 // Results are stored in a pre-allocated vector indexed by episode_id,
@@ -155,8 +250,8 @@ std::vector<std::string> SplitCommaSeparated(const std::string& value) {
 void WorkerThread(
     int /*thread_id*/,
     std::shared_ptr<const Game> game,
-    std::shared_ptr<BatchedEvaluator> model_evaluator,
-    const std::vector<std::shared_ptr<BatchedEvaluator>>& opponent_evaluators,
+    std::shared_ptr<IGameEvaluator> model_evaluator,
+    const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
     const std::vector<std::string>& opponent_names,
     int64_t obs_size,
     bool provides_info_state_tensor,
@@ -176,11 +271,8 @@ void WorkerThread(
     int episode_id = next_game_id++;
     if (episode_id >= total_games) break;
 
-    // --- Deterministic seat assignment from opponent-assign stream ---
-    uint64_t opp_seed = dune_seed::DeriveSeed(
-        base_seed, domain, static_cast<uint64_t>(episode_id),
-        dune_seed::kStreamOpponentAssign);
-    int model_player = static_cast<int>(opp_seed % kNumPlayers);
+    // --- Round-robin seat assignment for exact balance ---
+    int model_player = episode_id % kNumPlayers;
 
     // --- Per-game chance RNG ---
     uint64_t chance_seed = dune_seed::DeriveSeed(
@@ -197,6 +289,21 @@ void WorkerThread(
           base_seed, domain, static_cast<uint64_t>(episode_id),
           policy_stream);
       policy_rngs[p] = dune_seed::MakeRng64(pseed);
+    }
+
+    // --- Per-game opponent assignment RNG ---
+    std::vector<size_t> player_opp_idx(kNumPlayers, 0);
+    if (!opponent_evaluators.empty()) {
+      uint64_t opp_assign_seed = dune_seed::DeriveSeed(
+          base_seed, domain, static_cast<uint64_t>(episode_id),
+          dune_seed::kStreamOpponentAssign);
+      std::mt19937_64 opp_rng = dune_seed::MakeRng64(opp_assign_seed);
+      std::uniform_int_distribution<size_t> opp_dist(0, opponent_evaluators.size() - 1);
+
+      for (int p = 0; p < kNumPlayers; ++p) {
+        if (p == model_player) continue;
+        player_opp_idx[p] = opp_dist(opp_rng);
+      }
     }
 
     std::unique_ptr<State> state = game->NewInitialState();
@@ -245,12 +352,9 @@ void WorkerThread(
         }
 
         // Select evaluator
-        std::shared_ptr<BatchedEvaluator> evaluator = model_evaluator;
+        std::shared_ptr<IGameEvaluator> evaluator = model_evaluator;
         if (!use_model) {
-          // Deterministic opponent assignment: use episode_id + player
-          // to select which opponent evaluator, matching the old behavior
-          size_t idx = static_cast<size_t>(episode_id + current_player) %
-                       opponent_evaluators.size();
+          size_t idx = player_opp_idx[current_player];
           evaluator = opponent_evaluators[idx];
         }
 
@@ -336,17 +440,17 @@ void WorkerThread(
       if (opponent_names.empty()) {
         gr.opponents.push_back("random");
       } else {
-        size_t idx = static_cast<size_t>(episode_id + p) % opponent_names.size();
-        gr.opponents.push_back(opponent_names[idx]);
+        size_t opp_idx = player_opp_idx[p];
+        gr.opponents.push_back(opponent_names[opp_idx]);
       }
     }
 
     gr.placement = placement;
     gr.game_return = returns[model_player];
     gr.ending_round = dune_state ? dune_state->GetCurrentRound() : -1;
-    gr.track_vp = dune_state
-                  ? dune_state->GetPlayerVpForTesting(model_player)
-                  : -1;
+    gr.current_vp = dune_state
+                    ? dune_state->GetPlayerVpForTesting(model_player)
+                    : -1;
     gr.final_scored_vp = dune_state
                          ? dune_state->FinalScoredVp(model_player)
                          : -1;
@@ -441,13 +545,24 @@ void RunEvaluation() {
   }
 
   std::string device_name = device.is_cuda() ? "CUDA (GPU)" : "CPU";
+  bool deterministic = absl::GetFlag(FLAGS_deterministic_eval);
+  if (deterministic) {
+    std::cout << "INFO: Running in deterministic mode (default). Use --deterministic_eval=false for faster batched evaluation.\n";
+  }
 
-  // Use stack-allocated shared_mutex instead of std::shared_ptr to fix Nit 3
-  std::shared_mutex sync_mutex;
+  // Synchronization primitives (only used for the active evaluator mode)
+  std::shared_mutex sync_mutex;  // For BatchedEvaluator (shared read lock)
+  std::mutex eval_mutex;         // For DeterministicEvaluator (exclusive lock)
 
-  // Load eval model
+  // Load eval model with auto-detected dimensions
+  int main_hidden_dim = hidden_dim;
+  int main_num_blocks = num_blocks;
+  if (!DetectModelDimensions(model_checkpoint, &main_hidden_dim, &main_num_blocks)) {
+    SpielFatalError("Failed to detect model dimensions for main checkpoint: " + model_checkpoint);
+  }
+
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      obs_size, hidden_dim, action_size, num_blocks);
+      obs_size, main_hidden_dim, action_size, main_num_blocks);
   model->eval();
   {
     torch::serialize::InputArchive archive;
@@ -455,15 +570,35 @@ void RunEvaluation() {
     model->load(archive);
   }
   model->to(device);
-  auto model_evaluator = std::make_shared<BatchedEvaluator>(
-      model, eval_batch_size, eval_timeout_ms, device,
-      &sync_mutex, 0.0f);
 
-  // Load opponent models
-  std::vector<std::shared_ptr<BatchedEvaluator>> opponent_evaluators;
+  std::shared_ptr<IGameEvaluator> model_evaluator;
+  if (deterministic) {
+    model_evaluator = std::make_shared<DeterministicEvaluator>(
+        model, device, &eval_mutex);
+  } else {
+    model_evaluator = std::make_shared<BatchedEvaluator>(
+        model, eval_batch_size, eval_timeout_ms, device,
+        &sync_mutex, 0.0f);
+  }
+
+  // Load opponent models with auto-detected dimensions
+  struct OpponentMetadata {
+    std::string path;
+    int hidden_dim;
+    int num_blocks;
+  };
+  std::vector<OpponentMetadata> opp_metadata;
+  std::vector<std::shared_ptr<IGameEvaluator>> opponent_evaluators;
   for (const std::string& opp_path : opponent_paths) {
+    int opp_detected_hidden = opp_hidden_dim;
+    int opp_detected_blocks = opp_num_blocks;
+    if (!DetectModelDimensions(opp_path, &opp_detected_hidden, &opp_detected_blocks)) {
+      SpielFatalError("Failed to detect model dimensions for opponent checkpoint: " + opp_path);
+    }
+    opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks});
+
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-        obs_size, opp_hidden_dim, action_size, opp_num_blocks);
+        obs_size, opp_detected_hidden, action_size, opp_detected_blocks);
     opp_model->eval();
     {
       torch::serialize::InputArchive archive;
@@ -471,9 +606,15 @@ void RunEvaluation() {
       opp_model->load(archive);
     }
     opp_model->to(device);
-    opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
-        opp_model, eval_batch_size, eval_timeout_ms, device,
-        &sync_mutex, 0.0f));
+
+    if (deterministic) {
+      opponent_evaluators.push_back(std::make_shared<DeterministicEvaluator>(
+          opp_model, device, &eval_mutex));
+    } else {
+      opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
+          opp_model, eval_batch_size, eval_timeout_ms, device,
+          &sync_mutex, 0.0f));
+    }
   }
 
   // --- Print configuration ---
@@ -487,6 +628,7 @@ void RunEvaluation() {
             << "Greedy:     " << (greedy ? "true" : "false") << "\n"
             << "Temperature:" << temperature << "\n"
             << "Threads:    " << num_threads << "\n"
+            << "Eval mode:  " << (deterministic ? "Deterministic (batch-1)" : "Batched") << "\n"
             << "Batch size: " << eval_batch_size << "\n"
             << "Device:     " << device_name << "\n"
             << "Hidden dim: " << hidden_dim << " / Blocks: " << num_blocks
@@ -576,7 +718,7 @@ void RunEvaluation() {
                 << ",\"placement\":" << gr.placement
                 << ",\"return\":" << absl::StrFormat("%.4f", gr.game_return)
                 << ",\"ending_round\":" << gr.ending_round
-                << ",\"track_vp\":" << gr.track_vp
+                << ",\"track_vp\":" << gr.current_vp
                 << ",\"final_scored_vp\":" << gr.final_scored_vp
                 << "}\n";
     }
@@ -682,10 +824,21 @@ void RunEvaluation() {
               << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n"
               << "  \"temperature\": "
               << absl::StrFormat("%.2f", temperature) << ",\n"
-              << "  \"hidden_dim\": " << hidden_dim << ",\n"
-              << "  \"num_blocks\": " << num_blocks << ",\n"
-              << "  \"opp_hidden_dim\": " << opp_hidden_dim << ",\n"
-              << "  \"opp_num_blocks\": " << opp_num_blocks << ",\n"
+              << "  \"hidden_dim\": " << main_hidden_dim << ",\n"
+              << "  \"num_blocks\": " << main_num_blocks << ",\n"
+              << "  \"opp_hidden_dim\": " << (opp_metadata.empty() ? -1 : opp_metadata[0].hidden_dim) << ",\n"
+              << "  \"opp_num_blocks\": " << (opp_metadata.empty() ? -1 : opp_metadata[0].num_blocks) << ",\n"
+              << "  \"execution_mode\": \"" << (deterministic ? "deterministic" : "batched") << "\",\n"
+              << "  \"threads\": " << num_threads << ",\n"
+              << "  \"detected_opponent_architectures\": [\n";
+      for (size_t i = 0; i < opp_metadata.size(); ++i) {
+        agg_out << "    {\n"
+                << "      \"checkpoint\": \"" << opp_metadata[i].path << "\",\n"
+                << "      \"hidden_dim\": " << opp_metadata[i].hidden_dim << ",\n"
+                << "      \"num_blocks\": " << opp_metadata[i].num_blocks << "\n"
+                << "    }" << (i + 1 < opp_metadata.size() ? "," : "") << "\n";
+      }
+      agg_out << "  ],\n"
               << "  \"elapsed_seconds\": "
               << absl::StrFormat("%.1f", elapsed_secs) << ",\n"
               << "  \"first_place_rate\": "
@@ -743,7 +896,11 @@ void RunEvaluation() {
 }  // namespace open_spiel
 
 int main(int argc, char* argv[]) {
+  setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
+
+  // Set PyTorch to use deterministic algorithms globally
+  at::globalContext().setDeterministicAlgorithms(true, /*silent=*/true);
 
   // On GPU: game threads only do engine work. On CPU: Runner needs all cores.
   if (torch::cuda::is_available()) {
