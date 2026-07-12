@@ -271,6 +271,18 @@ void WorkerThread(
     int episode_id = next_game_id++;
     if (episode_id >= total_games) break;
 
+    // Log progress every 100 completed games
+    int completed = next_game_id.load();
+    if (completed % 100 == 0) {
+      static std::mutex progress_mutex;
+      static int last_printed = -1;
+      std::lock_guard<std::mutex> lock(progress_mutex);
+      if (completed > last_printed) {
+        std::cout << "Progress: " << completed << " / " << total_games << " games completed..." << std::endl;
+        last_printed = completed;
+      }
+    }
+
     // --- Round-robin seat assignment for exact balance ---
     int model_player = episode_id % kNumPlayers;
 
