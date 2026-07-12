@@ -96,11 +96,9 @@ int main(int argc, char* argv[]) {
   // Test 1: Instantiation and Value Evaluation
   {
     std::cout << "=== Test 1: Value Evaluation & Scaling ===\n";
-    double scale1 = 1.0;
-    double scale2 = 4.0;
     
-    DuneNNEvaluator eval1(model, device, scale1);
-    DuneNNEvaluator eval2(model, device, scale2);
+    DuneNNEvaluator eval1(model, device);
+    DuneNNEvaluator eval2(model, device);
 
     auto values1 = eval1.Evaluate(*state);
     auto values2 = eval2.Evaluate(*state);
@@ -117,8 +115,8 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
 
     for (int p = 0; p < 4; ++p) {
-      // Check that scaling is applied linearly
-      AssertAlmostEqual(values2[p], values1[p] * scale2, 1e-4);
+      // Check that values are unscaled by divisor
+      AssertAlmostEqual(values2[p], values1[p], 1e-4);
       // Check that values are reasonable and not NaN
       assert(!std::isnan(values1[p]));
       assert(!std::isinf(values1[p]));
@@ -129,7 +127,7 @@ int main(int argc, char* argv[]) {
   // Test 2: Policy Prior Correctness
   {
     std::cout << "=== Test 2: Policy Prior Correctness ===\n";
-    DuneNNEvaluator evaluator(model, device, 1.0);
+    DuneNNEvaluator evaluator(model, device);
     
     auto prior = evaluator.Prior(*state);
     auto legal_actions = state->LegalActions();
@@ -162,7 +160,7 @@ int main(int argc, char* argv[]) {
   // Test 3: Sequential Evaluation Verification
   {
     std::cout << "=== Test 3: Sequential Evaluation Verification ===\n";
-    DuneNNEvaluator evaluator(model, device, 1.0, 10.0f);
+    DuneNNEvaluator evaluator(model, device, 10.0f);
 
     auto values = evaluator.Evaluate(*state);
 
@@ -184,7 +182,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<State> chance_state = game->NewInitialState();
     assert(chance_state->IsChanceNode());
 
-    DuneNNEvaluator evaluator(model, device, 1.0);
+    DuneNNEvaluator evaluator(model, device);
     
     // Evaluate on a chance state should run safely and return 4 values
     auto values = evaluator.Evaluate(*chance_state);
@@ -199,6 +197,32 @@ int main(int argc, char* argv[]) {
     assert(prior.empty());
 
     std::cout << "Test 4 Passed!\n\n";
+  }
+
+  // Test 5: Combined Evaluation Parity
+  {
+    std::cout << "=== Test 5: Combined Evaluation Parity ===\n";
+    DuneNNEvaluator evaluator(model, device, 10.0f);
+
+    auto prior_seq = evaluator.Prior(*state);
+    auto values_seq = evaluator.Evaluate(*state);
+
+    auto combined = evaluator.PriorAndEvaluate(*state);
+    auto prior_comb = combined.first;
+    auto values_comb = combined.second;
+
+    assert(values_comb.size() == values_seq.size());
+    for (size_t i = 0; i < values_seq.size(); ++i) {
+      AssertAlmostEqual(values_comb[i], values_seq[i], 1e-2);
+    }
+
+    assert(prior_comb.size() == prior_seq.size());
+    for (size_t i = 0; i < prior_seq.size(); ++i) {
+      assert(prior_comb[i].first == prior_seq[i].first);
+      AssertAlmostEqual(prior_comb[i].second, prior_seq[i].second, 1e-2);
+    }
+
+    std::cout << "Test 5 Passed!\n\n";
   }
 
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";

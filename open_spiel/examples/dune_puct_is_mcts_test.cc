@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cassert>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -28,13 +30,22 @@ struct TestBotAccessor {
     return b.root_node_;
   }
   static std::vector<double> Simulate(DunePUCTISMCTSBot& b, State* s) {
-    return b.RunSimulation(s);
+    return b.RunSimulation(s, 0, 0);
   }
   static double CallRandomNumber(DunePUCTISMCTSBot& b) {
     return b.RandomNumber();
   }
   static std::mt19937& GetRng(DunePUCTISMCTSBot& b) {
     return b.rng_;
+  }
+  static DuneSearchConfig& GetConfig(DunePUCTISMCTSBot& b) {
+    return b.config_;
+  }
+  static void RunInitialize(DunePUCTISMCTSBot& b, DuneISMCTSNode* n, const State& s) {
+    b.InitializePriorsAndValue(n, s);
+  }
+  static int GetOpponentPriorCacheSize(DunePUCTISMCTSBot& b) {
+    return b.opponent_prior_cache_.size();
   }
 };
 
@@ -49,12 +60,16 @@ void AssertAlmostEqual(double a, double b, double tol = 1e-5) {
 
 class MockEvaluator : public algorithms::Evaluator {
  public:
-  MockEvaluator(const ActionsAndProbs& priors, const std::vector<double>& values)
-      : priors_(priors), values_(values) {}
+  MockEvaluator(const ActionsAndProbs& priors, const std::vector<double>& values, int sleep_ms = 0)
+      : priors_(priors), values_(values), sleep_ms_(sleep_ms) {}
   
   std::vector<double> Evaluate(const State& state) override {
+    if (sleep_ms_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms_));
+    }
     return values_;
   }
+
   
   ActionsAndProbs Prior(const State& state) override {
     ActionsAndProbs filtered_priors;
@@ -74,6 +89,7 @@ class MockEvaluator : public algorithms::Evaluator {
  private:
   ActionsAndProbs priors_;
   std::vector<double> values_;
+  int sleep_ms_;
 };
 
 // Test 1: Key Uniqueness and history size presence
@@ -216,7 +232,7 @@ void TestValueBackpropagation() {
   auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
   DunePUCTISMCTSBot bot(42, evaluator, 1.0, 10, -1, 1.0, 0.0, 0.3, 1.0);
 
-  ActionsAndProbs policy = bot.RunSearch(*state);
+  ActionsAndProbs policy = bot.RunSearch(*state).policy;
   assert(!policy.empty());
 
   DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
@@ -386,7 +402,7 @@ void TestOpponentModelPath() {
       /*temperature=*/1.0,
       /*dirichlet_epsilon=*/0.0,
       /*dirichlet_alpha=*/0.3,
-      /*value_scale=*/1.0,
+      /*utility_divisor=*/1.0,
       /*use_observation_string=*/true,
       DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
       /*use_opponent_model=*/true,
@@ -394,7 +410,7 @@ void TestOpponentModelPath() {
       /*verbose_diagnostics=*/false
   );
 
-  ActionsAndProbs policy = bot.RunSearch(*state);
+  ActionsAndProbs policy = bot.RunSearch(*state).policy;
   assert(!policy.empty());
 
   std::cout << "Test 9 Passed!\n\n";
@@ -545,6 +561,340 @@ void TestSearchDiagnostics() {
   std::cout << "Test 13 Passed!\n\n";
 }
 
+void TestHiddenInformationInvariance() {
+  std::cout << "Running Test 14: Hidden Information Invariance...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state1 = game->NewInitialState();
+  while (state1->IsChanceNode()) {
+    state1->ApplyAction(state1->ChanceOutcomes().front().first);
+  }
+  std::unique_ptr<State> state2 = state1->Clone();
+
+  auto* dstate1 = static_cast<dune_imperium::DuneImperiumState*>(state1.get());
+  auto* dstate2 = static_cast<dune_imperium::DuneImperiumState*>(state2.get());
+
+  // Player 0 (searcher) has same state
+  dstate1->SetPlayerHandForTesting(0, {1, 2, 3});
+  dstate2->SetPlayerHandForTesting(0, {1, 2, 3});
+
+  // Opponents have different private information
+  dstate1->SetPlayerHandForTesting(1, {4, 5});
+  dstate2->SetPlayerHandForTesting(1, {6, 7});
+
+  dstate1->SetPlayerIntriguesForTesting(2, {10});
+  dstate2->SetPlayerIntriguesForTesting(2, {20});
+
+  // Assert that player 0 information states are identical
+  assert(dstate1->InformationStateString(0) == dstate2->InformationStateString(0));
+
+  std::vector<Action> legal_actions = state1->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  // Set up bots with the same config seed
+  DuneSearchConfig config;
+  config.seed = 999;
+  config.max_simulations = 20;
+
+  DunePUCTISMCTSBot bot1(config, evaluator);
+  DunePUCTISMCTSBot bot2(config, evaluator);
+
+  DuneSearchResult res1 = bot1.RunSearch(*state1);
+  DuneSearchResult res2 = bot2.RunSearch(*state2);
+
+  // Assert that the resulting policy and visits are exactly identical!
+  assert(res1.policy.size() == res2.policy.size());
+  for (size_t i = 0; i < res1.policy.size(); ++i) {
+    assert(res1.policy[i].first == res2.policy[i].first);
+    AssertAlmostEqual(res1.policy[i].second, res2.policy[i].second);
+  }
+
+  assert(res1.diagnostics.visit_counts == res2.diagnostics.visit_counts);
+  assert(res1.diagnostics.q_values == res2.diagnostics.q_values);
+  assert(res1.diagnostics.root_value == res2.diagnostics.root_value);
+
+  std::cout << "Test 14 Passed!\n\n";
+}
+
+void TestCoverageFallback() {
+  std::cout << "Running Test 15: Coverage Fallback...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  DuneSearchConfig config;
+  config.max_simulations = 2; // Very few simulations, won't cover min(3, legal_actions) actions with visits >= 2
+  config.min_visit_threshold = 2;
+  config.covered_prior_threshold = 0.5;
+
+  DunePUCTISMCTSBot bot(config, evaluator);
+  DuneSearchResult res = bot.RunSearch(*state);
+
+  // Verify that fallback is triggered
+  assert(res.fallback_reason == "low_coverage");
+  // Policy should be the fallback prior policy (equal to mock_priors here)
+  assert(res.policy.size() == legal_actions.size());
+  for (size_t i = 0; i < res.policy.size(); ++i) {
+    AssertAlmostEqual(res.policy[i].second, mock_priors[i].second);
+  }
+
+  std::cout << "Test 15 Passed!\n\n";
+}
+
+void TestTimeoutNodeLimits() {
+  std::cout << "Running Test 16: Timeout and Node Limits...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  // 1. Timeout Check
+  DuneSearchConfig config_timeout;
+  config_timeout.max_simulations = 1000;
+  config_timeout.relative_time_budget_ms = 0.0; // Instant timeout!
+
+  DunePUCTISMCTSBot bot_timeout(config_timeout, evaluator);
+  DuneSearchResult res_timeout = bot_timeout.RunSearch(*state);
+  assert(res_timeout.timeout_status == true);
+  assert(res_timeout.fallback_reason == "timeout" || res_timeout.fallback_reason == "low_coverage");
+
+  // 2. Node Limit Check
+  DuneSearchConfig config_nodes;
+  config_nodes.max_simulations = 1000;
+  config_nodes.max_nodes = 1; // Limit pool size to 1 node
+
+  DunePUCTISMCTSBot bot_nodes(config_nodes, evaluator);
+  DuneSearchResult res_nodes = bot_nodes.RunSearch(*state);
+  assert(res_nodes.fallback_reason == "max_nodes" || res_nodes.fallback_reason == "low_coverage");
+
+  std::cout << "Test 16 Passed!\n\n";
+}
+
+void TestLeafTerminalScaleEquivalence() {
+  std::cout << "Running Test 17: Leaf and Terminal Scale Equivalence...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {-0.5, 0.2, 0.8, -0.1};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  DuneSearchConfig config;
+  config.max_simulations = 10;
+  config.utility_divisor = 4.0;
+
+  DunePUCTISMCTSBot bot(config, evaluator);
+
+  // 1. Verify Leaf evaluations are unscaled (remain in [-1, 1] range as evaluated by network)
+  DuneISMCTSNode node;
+  TestBotAccessor::RunInitialize(bot, &node, *state);
+  for (int p = 0; p < 4; ++p) {
+    AssertAlmostEqual(node.cached_values[p], mock_values[p]);
+  }
+
+  // 2. Verify Terminal returns are scaled (divided by utility_divisor)
+  std::unique_ptr<State> term_state = game->NewInitialState();
+  std::mt19937 rng(42);
+  while (!term_state->IsTerminal()) {
+    if (term_state->IsChanceNode()) {
+      term_state->ApplyAction(term_state->ChanceOutcomes().front().first);
+    } else {
+      std::vector<Action> actions = term_state->LegalActions();
+      term_state->ApplyAction(actions[absl::Uniform(rng, 0u, actions.size())]);
+    }
+  }
+
+  std::vector<double> sim_returns = TestBotAccessor::Simulate(bot, term_state.get());
+  std::vector<double> real_returns = term_state->Returns();
+  for (size_t i = 0; i < real_returns.size(); ++i) {
+    AssertAlmostEqual(sim_returns[i], real_returns[i] / config.utility_divisor);
+  }
+
+  std::cout << "Test 17 Passed!\n\n";
+}
+
+class RoutingMockEvaluator : public MockEvaluator {
+ public:
+  using MockEvaluator::MockEvaluator;
+
+  std::pair<ActionsAndProbs, std::vector<double>> PriorAndEvaluate(const State& state) override {
+    std::vector<double> prior_vals = Evaluate(state);
+    for (double& v : prior_vals) {
+      if (v != 0.0) v += 100.0;
+    }
+    return {Prior(state), prior_vals};
+  }
+};
+
+void TestPerSeatEvaluatorRouting() {
+  std::cout << "Running Test 18: Per-Seat Evaluator Routing...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+
+  std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators(4);
+  for (int p = 0; p < 4; ++p) {
+    std::vector<double> vals(4, 0.0);
+    vals[p] = 10.0 + p;
+    evaluators[p] = std::make_shared<RoutingMockEvaluator>(mock_priors, vals);
+  }
+
+  DuneSearchConfig config;
+  config.max_simulations = 10;
+  DunePUCTISMCTSBot bot(config, evaluators);
+
+  DuneISMCTSNode node;
+  TestBotAccessor::RunInitialize(bot, &node, *state);
+
+  Player cur_player = state->CurrentPlayer();
+  for (int p = 0; p < 4; ++p) {
+    if (p == cur_player) {
+      AssertAlmostEqual(node.cached_values[p], 110.0 + p);
+    } else {
+      AssertAlmostEqual(node.cached_values[p], 10.0 + p);
+    }
+  }
+
+  std::cout << "Test 18 Passed!\n\n";
+}
+
+class CachingTestMockEvaluator : public MockEvaluator {
+ public:
+  mutable int prior_calls = 0;
+  CachingTestMockEvaluator(const ActionsAndProbs& priors, const std::vector<double>& values)
+      : MockEvaluator(priors, values) {}
+
+  ActionsAndProbs Prior(const State& state) override {
+    prior_calls++;
+    return MockEvaluator::Prior(state);
+  }
+};
+
+void TestOpponentPriorCache() {
+  std::cout << "Running Test 19: Opponent Prior Cache...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.1, 0.2, 0.3, 0.4};
+
+  auto evaluator = std::make_shared<CachingTestMockEvaluator>(mock_priors, mock_values);
+
+  DuneSearchConfig config;
+  config.max_simulations = 50;
+  config.opponent_mode = SearchOpponentMode::kPolicy;
+  config.opponent_temperature = 1.0;
+  config.check_strategic_state = false; // Force search
+
+  DunePUCTISMCTSBot bot(config, evaluator);
+
+  // Run search
+  bot.RunSearch(*state);
+
+  // Verify that the evaluator's Prior was called
+  int initial_calls = evaluator->prior_calls;
+  assert(initial_calls > 0);
+
+  // The cache size should match the number of unique opponent state-player pairs encountered
+  int cache_size = TestBotAccessor::GetOpponentPriorCacheSize(bot);
+  assert(cache_size > 0);
+
+  // Since MCTS did 50 simulations, some opponent states would be encountered repeatedly.
+  // The cache should have prevented redundant neural network Prior evaluations, so:
+  // prior_calls should equal the number of cache entries.
+  assert(evaluator->prior_calls == cache_size);
+
+  // Now, run search again on the same state.
+  // The cache should be cleared at the start of RunSearch() to prevent stale information.
+  bot.RunSearch(*state);
+
+  // The cache should have been cleared and repopulated, so:
+  int new_cache_size = TestBotAccessor::GetOpponentPriorCacheSize(bot);
+  assert(new_cache_size > 0);
+
+  std::cout << "Test 19 Passed!\n\n";
+}
+
+void TestTimeoutWithAdequateCoverage() {
+  std::cout << "Running Test 20: Timeout with Adequate Coverage...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+
+  // Set up evaluator that sleeps for 20 ms per inference query
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values, 20);
+
+  DuneSearchConfig config;
+  config.max_simulations = 100;
+  config.relative_time_budget_ms = 50.0; // allows time for about 2 simulations
+  config.min_visit_threshold = 1;
+  config.covered_prior_threshold = 0.1; // very easy to cover
+
+  DunePUCTISMCTSBot bot(config, evaluator);
+  DuneSearchResult res = bot.RunSearch(*state);
+
+  assert(res.timeout_status == true);
+  assert(res.fallback_reason == "timeout");
+  assert(res.used_fallback == false); // coverage passed, so we did NOT fall back to prior!
+  assert(res.policy.size() == legal_actions.size());
+
+  std::cout << "Test 20 Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -562,6 +912,13 @@ int main() {
   open_spiel::TestPUCTFPUActionPruning();
   open_spiel::TestFPUCaching();
   open_spiel::TestSearchDiagnostics();
+  open_spiel::TestHiddenInformationInvariance();
+  open_spiel::TestCoverageFallback();
+  open_spiel::TestTimeoutNodeLimits();
+  open_spiel::TestLeafTerminalScaleEquivalence();
+  open_spiel::TestPerSeatEvaluatorRouting();
+  open_spiel::TestOpponentPriorCache();
+  open_spiel::TestTimeoutWithAdequateCoverage();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

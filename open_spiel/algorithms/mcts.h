@@ -89,6 +89,12 @@ class Evaluator {
 
   // Return a policy: the probability of the current player playing each action.
   virtual ActionsAndProbs Prior(const State& state) = 0;
+
+  // Return both prior policy and player values in one go.
+  // Default implementation calls Prior() and Evaluate() sequentially.
+  virtual std::pair<ActionsAndProbs, std::vector<double>> PriorAndEvaluate(const State& state) {
+    return {Prior(state), Evaluate(state)};
+  }
 };
 
 // A simple evaluator that returns the average outcome of playing random actions

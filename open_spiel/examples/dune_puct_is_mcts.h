@@ -14,6 +14,87 @@
 
 namespace open_spiel {
 
+enum class DuneISMCTSFinalPolicyType {
+  kNormalizedVisitCount,
+  kMaxVisitCount,
+  kMaxValue,
+};
+
+// ---------------------------------------------------------------------------
+// Reusable Types outside example binaries
+// ---------------------------------------------------------------------------
+
+enum class SearchOpponentMode {
+  kMaxN = 0,
+  kPolicy = 1
+};
+
+struct DuneSearchConfig {
+  int max_simulations = 64;
+  double relative_time_budget_ms = 10000.0; // relative search budget per move in ms
+  int max_nodes = 50000;
+  double puct_c = 0.15;
+  SearchOpponentMode opponent_mode = SearchOpponentMode::kMaxN;
+  double temperature = 1.0;
+  double opponent_temperature = 1.0;
+  int max_world_samples = -1;
+  double utility_divisor = 4.0;
+  int min_visit_threshold = 2;
+  double covered_prior_threshold = 0.50;
+  uint64_t seed = 42;
+  DuneISMCTSFinalPolicyType final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+
+  // Dirichlet noise parameters (legacy/optional)
+  double dirichlet_epsilon = 0.0;
+  double dirichlet_alpha = 0.3;
+  bool use_observation_string = true;
+  bool verbose_diagnostics = false;
+  bool check_strategic_state = false;
+};
+
+struct SearchDiagnostics {
+  std::vector<Action> actions;       // All legal actions at root
+  std::vector<int> visit_counts;     // N(a) per action
+  std::vector<double> q_values;      // Empirical Q for covered, root_value for unsupported
+  std::vector<double> priors;        // Neural prior π(a)
+  double root_value = 0.0;           // Cached V(s) at root
+  int total_root_visits = 0;
+  int num_covered_actions = 0;       // Actions with visits >= min_visit_threshold
+  double covered_prior_mass = 0.0;   // Sum of π(a) for covered actions
+};
+
+struct DuneSearchResult {
+  ActionsAndProbs policy;
+  SearchDiagnostics diagnostics;
+  int simulations_completed = 0;
+  double elapsed_time_ms = 0.0;
+  bool timeout_status = false;
+  bool used_fallback = false;
+  std::string fallback_reason = "none"; // "none", "timeout", "low_coverage", "max_nodes"
+  int inference_count = 0; // Track NN evaluator inferences
+};
+
+struct SearchTrainingExample {
+  std::vector<float> observation;
+  Player player = kInvalidPlayer;
+  std::vector<Action> legal_actions;
+  std::vector<double> normalized_visit_target;
+  double normalized_terminal_target = 0.0;
+  std::string checkpoint_hash;
+  int64_t update_id = 0;
+  int64_t episode_id = 0;
+  int64_t decision_id = 0;
+  SearchDiagnostics diagnostics;
+};
+
+// Strategic-state classification function declarations
+bool IsStrategicAction(const std::string& action_str);
+bool IsStrategicState(const State& state, Player searched_player);
+
+// ---------------------------------------------------------------------------
+// Bot structures
+// ---------------------------------------------------------------------------
+
 struct DuneChildInfo {
   int visits = 0;
   double return_sum = 0.0;
@@ -26,37 +107,32 @@ struct DuneISMCTSNode {
   int total_visits = -1;
   bool priors_initialized = false;
   double cached_value = 0.0;  // Neural V(s) for this node's current player
-};
-
-enum class DuneISMCTSFinalPolicyType {
-  kNormalizedVisitCount,
-  kMaxVisitCount,
-  kMaxValue,
+  std::vector<double> cached_values; // Neural V(s) for all players
 };
 
 struct TestBotAccessor;
 
-struct SearchDiagnostics {
-  std::vector<Action> actions;       // All legal actions at root
-  std::vector<int> visit_counts;     // N(a) per action
-  std::vector<double> q_values;      // Empirical Q for covered, root_value for unsupported
-  std::vector<double> priors;        // Neural prior π(a)
-  double root_value;                 // Cached V(s) at root
-  int total_root_visits;
-  int num_covered_actions;           // Actions with visits >= min_visit_threshold
-  double covered_prior_mass;         // Sum of π(a) for covered actions
-};
-
 class DunePUCTISMCTSBot : public Bot {
   friend struct TestBotAccessor;
  public:
+  DunePUCTISMCTSBot(
+      const DuneSearchConfig& config,
+      const std::vector<std::shared_ptr<algorithms::Evaluator>>& evaluators);
+
+  DunePUCTISMCTSBot(
+      const DuneSearchConfig& config,
+      std::shared_ptr<algorithms::Evaluator> evaluator)
+      : DunePUCTISMCTSBot(config, std::vector<std::shared_ptr<algorithms::Evaluator>>(4, evaluator)) {}
+
+
+
   DunePUCTISMCTSBot(uint64_t seed, std::shared_ptr<algorithms::Evaluator> evaluator,
                     double puct_c, int max_simulations,
                     int max_world_samples = -1,
                     double temperature = 1.0,
                     double dirichlet_epsilon = 0.0,
                     double dirichlet_alpha = 0.3,
-                    double value_scale = 1.0,
+                    double utility_divisor = 4.0,
                     bool use_observation_string = true,
                     DuneISMCTSFinalPolicyType final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
                     bool use_opponent_model = false,
@@ -68,45 +144,33 @@ class DunePUCTISMCTSBot : public Bot {
   ActionsAndProbs GetPolicy(const State& state) override;
   std::pair<ActionsAndProbs, Action> StepWithPolicy(const State& state) override;
 
-  ActionsAndProbs RunSearch(const State& state);
+  DuneSearchResult RunSearch(const State& state);
   SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold = 2) const;
+  const DuneSearchResult& GetLastSearchResult() const;
 
-  // Bot maintains no history, so these are empty.
-  void Restart() override {}
-  void RestartAt(const State& state) override {}
+  void Restart() override { Reset(); }
+  void RestartAt(const State& state) override { Reset(); }
 
  private:
   void Reset();
   double RandomNumber();
   std::pair<Player, std::string> GetStateKey(const State& state) const;
-  std::unique_ptr<State> SampleRootState(const State& state);
-  std::unique_ptr<State> ResampleFromInfostate(const State& state);
+  std::unique_ptr<State> SampleRootState(const State& state, int sim_index);
+  std::unique_ptr<State> ResampleFromInfostate(const State& state, int sim_index);
   DuneISMCTSNode* LookupOrCreateNode(const State& state);
   DuneISMCTSNode* CreateNewNode(const State& state);
   DuneISMCTSNode* LookupNode(const State& state);
 
   // Core search procedures
-  std::vector<double> RunSimulation(State* state, int depth = 0);
+  std::vector<double> RunSimulation(State* state, int depth, int sim_index);
   Action SelectActionTreePolicy(DuneISMCTSNode* node, const std::vector<Action>& legal_actions);
-  Action SelectActionPUCT(DuneISMCTSNode* node);
-  void InitializePriors(DuneISMCTSNode* node, const State& state);
+  void InitializePriorsAndValue(DuneISMCTSNode* node, const State& state);
   ActionsAndProbs FilterAndNormalizePriors(DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const;
   ActionsAndProbs GetFinalPolicy(const State& state, DuneISMCTSNode* node) const;
 
   std::mt19937 rng_;
-  std::shared_ptr<algorithms::Evaluator> evaluator_;
-  double puct_c_;
-  int max_simulations_;
-  int max_world_samples_;
-  double temperature_;
-  double dirichlet_epsilon_;
-  double dirichlet_alpha_;
-  double value_scale_;
-  bool use_observation_string_;
-  DuneISMCTSFinalPolicyType final_policy_type_;
-  bool use_opponent_model_;
-  double opponent_temperature_;
-  bool verbose_diagnostics_;
+  DuneSearchConfig config_;
+  std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators_;
 
   Player searching_player_ = kInvalidPlayer;
   int max_depth_this_search_ = 0;
@@ -120,6 +184,14 @@ class DunePUCTISMCTSBot : public Bot {
   std::vector<std::unique_ptr<DuneISMCTSNode>> node_pool_;
   std::vector<std::unique_ptr<State>> root_samples_;
   DuneISMCTSNode* root_node_;
+
+  // Reusable Tree Session fields
+  Player last_searching_player_ = kInvalidPlayer;
+  std::vector<std::shared_ptr<algorithms::Evaluator>> last_evaluators_;
+
+  DuneSearchResult last_search_result_;
+  int inference_count_this_search_ = 0;
+  absl::flat_hash_map<std::pair<Player, std::string>, ActionsAndProbs> opponent_prior_cache_;
 };
 
 }  // namespace open_spiel

@@ -81,12 +81,14 @@ ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch determinist
 ABSL_FLAG(bool, deterministic_rollout_eval, false, "Use deterministic batch-1 rollout evaluation.");
 ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
 
-ABSL_FLAG(double, shaped_reward_weight, 0.2,
+ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
 ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu levels 5/6 breadcrumbs.");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
+ABSL_FLAG(bool, allow_shaping, false,
+          "Allow experimental reward shaping flags to be non-zero.");
 ABSL_FLAG(double, reward_scale, 4.0,
           "Divide shaped plus terminal rewards by this value.");
 
@@ -410,7 +412,7 @@ class SearchLabelBuffer {
     int32_t obs_size = 0;
     int32_t action_dim = 0;
     int32_t max_simulations = 0;
-    float value_scale = 0;
+    float utility_divisor = 0;
     float puct_c = 0;
     float target_teacher_kl = 0;
     int32_t min_visits = 0;
@@ -443,7 +445,12 @@ class SearchLabelBuffer {
       return;
     }
     in.read(reinterpret_cast<char*>(&max_simulations), 4);
-    in.read(reinterpret_cast<char*>(&value_scale), 4);
+    in.read(reinterpret_cast<char*>(&utility_divisor), 4);
+    if (utility_divisor != 4.0f) {
+      std::cerr << "SearchLabelBuffer: utility_divisor mismatch in " << path
+                << ": file=" << utility_divisor << " expected=4.0\n";
+      return;
+    }
     in.read(reinterpret_cast<char*>(&puct_c), 4);
     in.read(reinterpret_cast<char*>(&target_teacher_kl), 4);
     in.read(reinterpret_cast<char*>(&min_visits), 4);
@@ -1258,6 +1265,17 @@ CollectResult CollectRollout(const Game* game,
 int main(int argc, char** argv) {
   setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
+  if (absl::GetFlag(FLAGS_shaped_reward_weight) != 0.0 ||
+      absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight) != 0.0 ||
+      absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight) != 0.0) {
+    if (!absl::GetFlag(FLAGS_allow_shaping)) {
+      std::cerr << "Fatal: Reward shaping weights are non-zero but --allow_shaping is not set. "
+                << "To run with reward shaping, pass --allow_shaping=true." << std::endl;
+      return -1;
+    } else {
+      std::cout << "Warning: Running with non-zero experimental reward shaping weights!" << std::endl;
+    }
+  }
   if (absl::GetFlag(FLAGS_deterministic)) {
     at::globalContext().setDeterministicAlgorithms(true, /*silent=*/true);
   }

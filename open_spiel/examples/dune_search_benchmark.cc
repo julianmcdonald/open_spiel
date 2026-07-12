@@ -26,10 +26,12 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_seed_utils.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Path to load search agent model checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Path to load opponent model checkpoint. If empty, the search agent model is reused. If 'random', random opponents are used.");
+ABSL_FLAG(int, seed, 42, "Seed for deterministic RNG.");
 ABSL_FLAG(int, games, 1000, "How many games to play in total.");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
 ABSL_FLAG(int, hidden_dim, 2048, "Search agent model hidden dimension.");
@@ -39,14 +41,17 @@ ABSL_FLAG(int, opp_num_blocks, -1, "Opponent model block count. If -1, inherits 
 ABSL_FLAG(int, max_simulations, 50, "MCTS simulation budget per move.");
 ABSL_FLAG(double, puct_c, 0.3, "PUCT exploration constant.");
 ABSL_FLAG(int, max_world_samples, -1, "Number of cached world samples for determinization (-1 = fresh resampling).");
-ABSL_FLAG(double, value_scale, 1.0, "Scaling factor for leaf neural values (couples with PUCT bot's internal return scaling).");
+ABSL_FLAG(double, utility_divisor, 4.0, "Terminal utility divisor (couples with search value normalization).");
 ABSL_FLAG(double, temperature, 0.0, "Softmax temperature for final move choice (0.0 = greedy).");
-ABSL_FLAG(double, opponent_temperature, 0.0, "Softmax temperature for opponent action selection (0.0 = greedy).");
+ABSL_FLAG(double, simulated_opponent_temperature, 1.0, "Softmax temperature for simulated opponent action selection inside search (default 1.0).");
+ABSL_FLAG(double, external_opponent_temperature, 0.0, "Softmax temperature for external benchmark opponent action selection (default 0.0).");
 ABSL_FLAG(double, dirichlet_epsilon, 0.0, "Dirichlet noise weight at root.");
 ABSL_FLAG(double, dirichlet_alpha, 0.3, "Dirichlet noise alpha.");
 ABSL_FLAG(bool, rotate_seat, true, "Rotate the seat of the search agent across games.");
 ABSL_FLAG(bool, use_opponent_model, false, "Whether non-search players in simulation follow the PPO prior policy instead of PUCT.");
 ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth diagnostics periodically.");
+ABSL_FLAG(bool, check_strategic_state, false, "Whether to bypass MCTS search at non-strategic states.");
+ABSL_FLAG(bool, disable_time_limit, false, "Disable the time limit per move for fixed-simulation evaluation.");
 
 namespace open_spiel {
 namespace {
@@ -215,7 +220,16 @@ struct GameStats {
   int64_t terminal_returns_count = 0;
   double vp_margin_sum = 0.0;
   int64_t vp_margin_count = 0;
+  std::vector<double> vp_margins;
+  int search_mcts_steps_count = 0;
+  double search_mcts_step_time_sum = 0.0;
+  int64_t total_simulations_completed = 0;
+  int64_t total_timeouts = 0;
+  int64_t total_fallbacks = 0;
+  int64_t total_inferences = 0;
+  std::map<std::string, int64_t> fallback_reason_counts;
 };
+
 
 void WorkerThread(
     int thread_id,
@@ -229,8 +243,6 @@ void WorkerThread(
     GameStats& global_stats,
     std::mutex& stats_mutex) {
   
-  std::random_device rd;
-  std::mt19937 rng(rd() ^ thread_id);
   torch::InferenceMode inference_guard;
 
   // Local thread stats accumulation to reduce lock contention
@@ -240,6 +252,9 @@ void WorkerThread(
     int g = next_game_id++;
     if (g >= total_games) break;
 
+    uint64_t game_seed = dune_seed::DeriveSeed(absl::GetFlag(FLAGS_seed), dune_seed::kStreamBlueprint, g);
+    std::mt19937 game_rng(game_seed);
+
     bool rotate_seat = absl::GetFlag(FLAGS_rotate_seat);
     int search_seat = rotate_seat ? (g % 4) : 0;
     thread_stats.games_by_seat[search_seat]++;
@@ -248,36 +263,41 @@ void WorkerThread(
     
     // Create thread-local, bot-specific evaluator wrapping the shared search model
     auto search_evaluator = std::make_shared<DuneNNEvaluator>(
-        search_model, device, absl::GetFlag(FLAGS_value_scale), 10.0f);
+        search_model, device, 10.0f);
 
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
       if (p == search_seat) {
-        bots[p] = std::make_unique<DunePUCTISMCTSBot>(
-            /*seed=*/rng(),
-            search_evaluator,
-            absl::GetFlag(FLAGS_puct_c),
+        DuneSearchConfig config{
             absl::GetFlag(FLAGS_max_simulations),
-            absl::GetFlag(FLAGS_max_world_samples),
+            absl::GetFlag(FLAGS_disable_time_limit) ? std::numeric_limits<double>::infinity() : 10000.0, // relative_time_budget_ms
+            50000,   // max_nodes
+            absl::GetFlag(FLAGS_puct_c),
+            absl::GetFlag(FLAGS_use_opponent_model) ? SearchOpponentMode::kPolicy : SearchOpponentMode::kMaxN,
             absl::GetFlag(FLAGS_temperature),
+            absl::GetFlag(FLAGS_simulated_opponent_temperature),
+            absl::GetFlag(FLAGS_max_world_samples),
+            absl::GetFlag(FLAGS_utility_divisor),
+            2,     // min_visit_threshold
+            0.50,  // covered_prior_threshold
+            game_rng(), // seed
+            DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
             absl::GetFlag(FLAGS_dirichlet_epsilon),
             absl::GetFlag(FLAGS_dirichlet_alpha),
-            1.0,
-            /*use_observation_string=*/true,
-            DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
-            absl::GetFlag(FLAGS_use_opponent_model),
-            absl::GetFlag(FLAGS_opponent_temperature),
-            absl::GetFlag(FLAGS_verbose_diagnostics)
-        );
+            true,  // use_observation_string
+            absl::GetFlag(FLAGS_verbose_diagnostics),
+            absl::GetFlag(FLAGS_check_strategic_state)
+        };
+        bots[p] = std::make_unique<DunePUCTISMCTSBot>(config, search_evaluator);
       } else {
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
-              opponent_model, device, 1.0, 10.0f);
+              opponent_model, device, 10.0f);
           bots[p] = std::make_unique<DuneGreedyBot>(
-              std::move(local_opp_eval), rng(),
-              absl::GetFlag(FLAGS_opponent_temperature));
+              std::move(local_opp_eval), game_rng(),
+              absl::GetFlag(FLAGS_external_opponent_temperature));
         } else {
-          bots[p] = std::make_unique<DuneRandomBot>(rng());
+          bots[p] = std::make_unique<DuneRandomBot>(game_rng());
         }
       }
     }
@@ -298,7 +318,7 @@ void WorkerThread(
         if (game->GetType().chance_mode == GameType::ChanceMode::kSampledStochastic) {
           action = outcomes.front().first;
         } else {
-          action = SampleAction(outcomes, rng).first;
+          action = SampleAction(outcomes, game_rng).first;
         }
         state->ApplyAction(action);
         continue;
@@ -308,12 +328,30 @@ void WorkerThread(
       Action chosen_action = -1;
 
       if (current_player == search_seat) {
+        bool is_strategic = IsStrategicState(*state, current_player);
         auto step_start = std::chrono::steady_clock::now();
         chosen_action = bots[current_player]->Step(*state);
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
         thread_stats.search_step_time_sum += step_duration;
         thread_stats.search_steps_count++;
+        if (is_strategic) {
+          thread_stats.search_mcts_step_time_sum += step_duration;
+          thread_stats.search_mcts_steps_count++;
+          auto* mcts_bot = dynamic_cast<DunePUCTISMCTSBot*>(bots[current_player].get());
+          if (mcts_bot != nullptr) {
+            const DuneSearchResult& last_res = mcts_bot->GetLastSearchResult();
+            thread_stats.total_simulations_completed += last_res.simulations_completed;
+            thread_stats.total_inferences += last_res.inference_count;
+            if (last_res.timeout_status) {
+              thread_stats.total_timeouts++;
+            }
+            if (last_res.used_fallback) {
+              thread_stats.total_fallbacks++;
+              thread_stats.fallback_reason_counts[last_res.fallback_reason]++;
+            }
+          }
+        }
       } else {
         chosen_action = bots[current_player]->Step(*state);
       }
@@ -378,13 +416,14 @@ void WorkerThread(
           opp_vp_sum += GetTrueFinalVp(dune_state, p);
         }
       }
-      thread_stats.vp_margin_sum += (search_vp - (opp_vp_sum / 3.0));
+      double margin = search_vp - (opp_vp_sum / 3.0);
+      thread_stats.vp_margin_sum += margin;
       thread_stats.vp_margin_count++;
+      thread_stats.vp_margins.push_back(margin);
     }
 
-    // Flush stats and perform intermediate logging
-    int comp = ++completed_games;
-    if (comp % 25 == 0 || comp == total_games) {
+    // Flush stats and perform intermediate logging under a single lock
+    {
       std::lock_guard<std::mutex> stats_lock(stats_mutex);
       global_stats.search_wins += thread_stats.search_wins;
       for (int p = 0; p < 3; ++p) global_stats.opponent_wins[p] += thread_stats.opponent_wins[p];
@@ -404,18 +443,30 @@ void WorkerThread(
       global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
       global_stats.vp_margin_sum += thread_stats.vp_margin_sum;
       global_stats.vp_margin_count += thread_stats.vp_margin_count;
+      global_stats.vp_margins.insert(global_stats.vp_margins.end(), thread_stats.vp_margins.begin(), thread_stats.vp_margins.end());
+      global_stats.search_mcts_steps_count += thread_stats.search_mcts_steps_count;
+      global_stats.search_mcts_step_time_sum += thread_stats.search_mcts_step_time_sum;
+      global_stats.total_simulations_completed += thread_stats.total_simulations_completed;
+      global_stats.total_timeouts += thread_stats.total_timeouts;
+      global_stats.total_fallbacks += thread_stats.total_fallbacks;
+      global_stats.total_inferences += thread_stats.total_inferences;
+      for (const auto& pair : thread_stats.fallback_reason_counts) {
+        global_stats.fallback_reason_counts[pair.first] += pair.second;
+      }
 
-      thread_stats = GameStats();
+      int comp = ++completed_games;
+      if (comp % 25 == 0 || comp == total_games) {
+        std::lock_guard<std::mutex> log_lock(log_mutex);
+        double avg_step_time = global_stats.search_steps_count > 0 ? (global_stats.search_step_time_sum / global_stats.search_steps_count) : 0.0;
+        double winrate = (global_stats.search_wins * 100.0) / comp;
+        double search_sm_rate = (global_stats.search_swordmasters * 100.0) / comp;
+        double opp_sm_rate = (global_stats.opponent_swordmasters * 100.0) / (3.0 * comp);
 
-      std::lock_guard<std::mutex> log_lock(log_mutex);
-      double avg_step_time = global_stats.search_steps_count > 0 ? (global_stats.search_step_time_sum / global_stats.search_steps_count) : 0.0;
-      double winrate = (global_stats.search_wins * 100.0) / comp;
-      double search_sm_rate = (global_stats.search_swordmasters * 100.0) / comp;
-      double opp_sm_rate = (global_stats.opponent_swordmasters * 100.0) / (3.0 * comp);
-
-      std::cout << absl::StrFormat("[Progress] Games: %d/%d | Search Winrate: %.2f%% | Search SM Rate: %.2f%% | Opp SM Rate: %.2f%% | Avg Search Step Time: %.4fs\n",
-                                   comp, total_games, winrate, search_sm_rate, opp_sm_rate, avg_step_time) << std::flush;
+        std::cout << absl::StrFormat("[Progress] Games: %d/%d | Search Winrate: %.2f%% | Search SM Rate: %.2f%% | Opp SM Rate: %.2f%% | Avg Search Step Time: %.4fs\n",
+                                     comp, total_games, winrate, search_sm_rate, opp_sm_rate, avg_step_time) << std::flush;
+      }
     }
+    thread_stats = GameStats();
   }
 
   // Merge remaining stats on completion
@@ -439,11 +490,60 @@ void WorkerThread(
     global_stats.terminal_returns_count += thread_stats.terminal_returns_count;
     global_stats.vp_margin_sum += thread_stats.vp_margin_sum;
     global_stats.vp_margin_count += thread_stats.vp_margin_count;
+    global_stats.vp_margins.insert(global_stats.vp_margins.end(), thread_stats.vp_margins.begin(), thread_stats.vp_margins.end());
+    global_stats.search_mcts_steps_count += thread_stats.search_mcts_steps_count;
+    global_stats.search_mcts_step_time_sum += thread_stats.search_mcts_step_time_sum;
+    global_stats.total_simulations_completed += thread_stats.total_simulations_completed;
+    global_stats.total_timeouts += thread_stats.total_timeouts;
+    global_stats.total_fallbacks += thread_stats.total_fallbacks;
+    global_stats.total_inferences += thread_stats.total_inferences;
+    for (const auto& pair : thread_stats.fallback_reason_counts) {
+      global_stats.fallback_reason_counts[pair.first] += pair.second;
+    }
   }
 }
 
 } // namespace
 } // namespace open_spiel
+
+void ComputeWilsonWinrateCI(int wins, int total, double* lcb, double* ucb) {
+  if (total == 0) {
+    *lcb = 0.0;
+    *ucb = 0.0;
+    return;
+  }
+  double p = static_cast<double>(wins) / total;
+  double z = 1.96;
+  double denom = 1.0 + z * z / total;
+  double center = p + z * z / (2.0 * total);
+  double spread = z * std::sqrt((p * (1.0 - p) / total) + (z * z / (4.0 * total * total)));
+  *lcb = (center - spread) / denom * 100.0;
+  *ucb = (center + spread) / denom * 100.0;
+}
+
+void ComputeVpMarginCI(const std::vector<double>& margins, double* mean, double* lcb, double* ucb) {
+  int n = margins.size();
+  if (n <= 1) {
+    *mean = 0.0;
+    *lcb = 0.0;
+    *ucb = 0.0;
+    return;
+  }
+  double sum = 0.0;
+  for (double x : margins) {
+    sum += x;
+  }
+  *mean = sum / n;
+  double sum_sq_diff = 0.0;
+  for (double x : margins) {
+    sum_sq_diff += (x - *mean) * (x - *mean);
+  }
+  double variance = sum_sq_diff / (n - 1);
+  double std_dev = std::sqrt(variance);
+  double margin_of_error = 1.96 * std_dev / std::sqrt(n);
+  *lcb = *mean - margin_of_error;
+  *ucb = *mean + margin_of_error;
+}
 
 int main(int argc, char* argv[]) {
   absl::ParseCommandLine(argc, argv);
@@ -542,9 +642,11 @@ int main(int argc, char* argv[]) {
   std::cout << "======================================================================\n\n";
 
   std::cout << "Overall Winrates:\n";
-  std::cout << absl::StrFormat("  Search Agent:  %.2f%% (%d/%d wins)\n",
+  double lcb_winrate = 0.0, ucb_winrate = 0.0;
+  ComputeWilsonWinrateCI(global_stats.search_wins, total_games, &lcb_winrate, &ucb_winrate);
+  std::cout << absl::StrFormat("  Search Agent:  %.2f%% (%d/%d wins), 95%% Wilson CI: [%.2f%%, %.2f%%]\n",
                                (global_stats.search_wins * 100.0 / total_games),
-                               global_stats.search_wins, total_games);
+                               global_stats.search_wins, total_games, lcb_winrate, ucb_winrate);
   std::cout << absl::StrFormat("  Opponent 1:    %.2f%% (%d/%d wins)\n",
                                (global_stats.opponent_wins[0] * 100.0 / total_games),
                                global_stats.opponent_wins[0], total_games);
@@ -570,10 +672,9 @@ int main(int argc, char* argv[]) {
 
   std::cout << "\nSearch Agent Placement:\n";
   std::cout << absl::StrFormat("  Mean Return: %.4f\n", (global_stats.search_return_sum / total_games));
-  double mean_vp_margin = global_stats.vp_margin_count > 0
-      ? (global_stats.vp_margin_sum / global_stats.vp_margin_count)
-      : 0.0;
-  std::cout << absl::StrFormat("  Mean VP Margin: %+.4f\n", mean_vp_margin);
+  double mean_vp_margin = 0.0, lcb_vp_margin = 0.0, ucb_vp_margin = 0.0;
+  ComputeVpMarginCI(global_stats.vp_margins, &mean_vp_margin, &lcb_vp_margin, &ucb_vp_margin);
+  std::cout << absl::StrFormat("  Mean VP Margin: %+.4f (95%% CI: [%.4f, %.4f])\n", mean_vp_margin, lcb_vp_margin, ucb_vp_margin);
   for (int r = 0; r < 4; ++r) {
     std::cout << absl::StrFormat("  Place %d: %.2f%% (%d/%d)\n",
                                  r + 1, (global_stats.search_placements[r] * 100.0 / total_games),
@@ -604,6 +705,11 @@ int main(int argc, char* argv[]) {
                              : 0.0;
   std::cout << absl::StrFormat("\nAverage Search Step Time: %.4fs (across %d steps)\n",
                                avg_step_time, global_stats.search_steps_count);
+  double avg_mcts_step_time = global_stats.search_mcts_steps_count > 0
+                                  ? (global_stats.search_mcts_step_time_sum / global_stats.search_mcts_steps_count)
+                                  : 0.0;
+  std::cout << absl::StrFormat("Average MCTS Step Time: %.4fs (across %d strategic steps)\n",
+                               avg_mcts_step_time, global_stats.search_mcts_steps_count);
 
   double mean_abs_leaf_value = open_spiel::DuneNNEvaluator::global_num_leaf_evaluations.load() > 0
       ? (open_spiel::DuneNNEvaluator::global_abs_leaf_value_sum.load() / open_spiel::DuneNNEvaluator::global_num_leaf_evaluations.load())
@@ -611,10 +717,31 @@ int main(int argc, char* argv[]) {
   double mean_abs_terminal_return = global_stats.terminal_returns_count > 0
       ? (global_stats.abs_terminal_return_sum / global_stats.terminal_returns_count)
       : 0.0;
-  double value_scale_used = absl::GetFlag(FLAGS_value_scale);
-  double raw_mean_abs_leaf_value = value_scale_used > 0.0 ? (mean_abs_leaf_value / value_scale_used) : mean_abs_leaf_value;
-  std::cout << absl::StrFormat("Mean |leaf value|: %.4f (scaled) / %.4f (raw) vs Mean |terminal return|: %.4f (value_scale = %.1f)\n",
-                               mean_abs_leaf_value, raw_mean_abs_leaf_value, mean_abs_terminal_return, value_scale_used);
+  double utility_divisor_used = absl::GetFlag(FLAGS_utility_divisor);
+  double raw_mean_abs_leaf_value = mean_abs_leaf_value * utility_divisor_used;
+  std::cout << absl::StrFormat("Mean |leaf value|: %.4f (normalized/NN) / %.4f (raw equivalent) vs Mean |terminal return|: %.4f (raw) (utility_divisor = %.1f)\n",
+                               mean_abs_leaf_value, raw_mean_abs_leaf_value, mean_abs_terminal_return, utility_divisor_used);
+
+  std::cout << "\nIS-MCTS MCTS Search Diagnostics:\n";
+  std::cout << absl::StrFormat("  Total Strategic MCTS Steps: %d\n", global_stats.search_mcts_steps_count);
+  if (global_stats.search_mcts_steps_count > 0) {
+    double avg_sims = static_cast<double>(global_stats.total_simulations_completed) / global_stats.search_mcts_steps_count;
+    double avg_inf = static_cast<double>(global_stats.total_inferences) / global_stats.search_mcts_steps_count;
+    double timeout_rate = (global_stats.total_timeouts * 100.0) / global_stats.search_mcts_steps_count;
+    double fallback_rate = (global_stats.total_fallbacks * 100.0) / global_stats.search_mcts_steps_count;
+    std::cout << absl::StrFormat("  Average simulations completed:  %.2f\n", avg_sims);
+    std::cout << absl::StrFormat("  Average NN inferences per step: %.2f\n", avg_inf);
+    std::cout << absl::StrFormat("  Timeout rate:                   %.2f%% (%d/%d steps)\n", timeout_rate, global_stats.total_timeouts, global_stats.search_mcts_steps_count);
+    std::cout << absl::StrFormat("  Fallback rate:                  %.2f%% (%d/%d steps)\n", fallback_rate, global_stats.total_fallbacks, global_stats.search_mcts_steps_count);
+    if (!global_stats.fallback_reason_counts.empty()) {
+      std::cout << "  Fallback reasons break down:\n";
+      for (const auto& pair : global_stats.fallback_reason_counts) {
+        std::cout << absl::StrFormat("    - %s: %d\n", pair.first, pair.second);
+      }
+    }
+  } else {
+    std::cout << "  No strategic steps were evaluated by MCTS.\n";
+  }
 
   return 0;
 }

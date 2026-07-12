@@ -17,6 +17,10 @@
 #include <vector>
 
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include "dune_puct_is_mcts.h"
+#include "dune_evaluator.h"
+#endif
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_content.h"
@@ -516,4 +520,68 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
             return open_spiel::dune_imperium::CombatStrength(s, player);
           },
           py::arg("player"));
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  py::enum_<open_spiel::SearchOpponentMode>(di, "SearchOpponentMode")
+      .value("MAX_N", open_spiel::SearchOpponentMode::kMaxN)
+      .value("POLICY", open_spiel::SearchOpponentMode::kPolicy)
+      .export_values();
+
+  py::enum_<open_spiel::DuneISMCTSFinalPolicyType>(di, "DuneISMCTSFinalPolicyType")
+      .value("NORMALIZED_VISIT_COUNT", open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount)
+      .value("MAX_VISIT_COUNT", open_spiel::DuneISMCTSFinalPolicyType::kMaxVisitCount)
+      .value("MAX_VALUE", open_spiel::DuneISMCTSFinalPolicyType::kMaxValue)
+      .export_values();
+
+  py::class_<open_spiel::DuneSearchConfig>(di, "DuneSearchConfig")
+      .def(py::init<>())
+      .def_readwrite("max_simulations", &open_spiel::DuneSearchConfig::max_simulations)
+      .def_readwrite("relative_time_budget_ms", &open_spiel::DuneSearchConfig::relative_time_budget_ms)
+      .def_readwrite("max_nodes", &open_spiel::DuneSearchConfig::max_nodes)
+      .def_readwrite("puct_c", &open_spiel::DuneSearchConfig::puct_c)
+      .def_readwrite("opponent_mode", &open_spiel::DuneSearchConfig::opponent_mode)
+      .def_readwrite("temperature", &open_spiel::DuneSearchConfig::temperature)
+      .def_readwrite("opponent_temperature", &open_spiel::DuneSearchConfig::opponent_temperature)
+      .def_readwrite("max_world_samples", &open_spiel::DuneSearchConfig::max_world_samples)
+      .def_readwrite("utility_divisor", &open_spiel::DuneSearchConfig::utility_divisor)
+      .def_readwrite("min_visit_threshold", &open_spiel::DuneSearchConfig::min_visit_threshold)
+      .def_readwrite("covered_prior_threshold", &open_spiel::DuneSearchConfig::covered_prior_threshold)
+      .def_readwrite("seed", &open_spiel::DuneSearchConfig::seed)
+      .def_readwrite("final_policy_type", &open_spiel::DuneSearchConfig::final_policy_type)
+      .def_readwrite("dirichlet_epsilon", &open_spiel::DuneSearchConfig::dirichlet_epsilon)
+      .def_readwrite("dirichlet_alpha", &open_spiel::DuneSearchConfig::dirichlet_alpha)
+      .def_readwrite("use_observation_string", &open_spiel::DuneSearchConfig::use_observation_string)
+      .def_readwrite("verbose_diagnostics", &open_spiel::DuneSearchConfig::verbose_diagnostics)
+      .def_readwrite("check_strategic_state", &open_spiel::DuneSearchConfig::check_strategic_state);
+
+  py::class_<open_spiel::SearchDiagnostics>(di, "SearchDiagnostics")
+      .def_readonly("actions", &open_spiel::SearchDiagnostics::actions)
+      .def_readonly("visit_counts", &open_spiel::SearchDiagnostics::visit_counts)
+      .def_readonly("q_values", &open_spiel::SearchDiagnostics::q_values)
+      .def_readonly("priors", &open_spiel::SearchDiagnostics::priors)
+      .def_readonly("root_value", &open_spiel::SearchDiagnostics::root_value)
+      .def_readonly("total_root_visits", &open_spiel::SearchDiagnostics::total_root_visits)
+      .def_readonly("num_covered_actions", &open_spiel::SearchDiagnostics::num_covered_actions)
+      .def_readonly("covered_prior_mass", &open_spiel::SearchDiagnostics::covered_prior_mass);
+
+  py::class_<open_spiel::DuneSearchResult>(di, "DuneSearchResult")
+      .def_readonly("policy", &open_spiel::DuneSearchResult::policy)
+      .def_readonly("diagnostics", &open_spiel::DuneSearchResult::diagnostics)
+      .def_readonly("simulations_completed", &open_spiel::DuneSearchResult::simulations_completed)
+      .def_readonly("elapsed_time_ms", &open_spiel::DuneSearchResult::elapsed_time_ms)
+      .def_readonly("timeout_status", &open_spiel::DuneSearchResult::timeout_status)
+      .def_readonly("used_fallback", &open_spiel::DuneSearchResult::used_fallback)
+      .def_readonly("fallback_reason", &open_spiel::DuneSearchResult::fallback_reason)
+      .def_readonly("inference_count", &open_spiel::DuneSearchResult::inference_count);
+
+  py::classh<open_spiel::DunePUCTISMCTSBot, open_spiel::Bot>(di, "DunePUCTISMCTSBot")
+      .def(py::init<const open_spiel::DuneSearchConfig&, std::shared_ptr<open_spiel::algorithms::Evaluator>>(),
+           py::arg("config"), py::arg("evaluator"))
+      .def(py::init<const open_spiel::DuneSearchConfig&, const std::vector<std::shared_ptr<open_spiel::algorithms::Evaluator>>&>(),
+           py::arg("config"), py::arg("evaluators"))
+      .def("run_search", &open_spiel::DunePUCTISMCTSBot::RunSearch, py::arg("state"))
+      .def("get_root_diagnostics", &open_spiel::DunePUCTISMCTSBot::GetRootDiagnostics,
+           py::arg("state"), py::arg("min_visit_threshold") = 2)
+      .def("get_last_search_result", &open_spiel::DunePUCTISMCTSBot::GetLastSearchResult);
+#endif
 }

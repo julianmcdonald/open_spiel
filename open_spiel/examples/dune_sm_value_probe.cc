@@ -31,7 +31,7 @@ ABSL_FLAG(int, games, 40, "Total number of games to simulate");
 ABSL_FLAG(int, threads, 20, "Number of parallel worker threads");
 ABSL_FLAG(int, search_simulations, 400, "MCTS simulation budget for search players");
 ABSL_FLAG(double, puct_c, 1.0, "Exploration constant");
-ABSL_FLAG(double, value_scale, 1.0, "Leaf value scaling");
+ABSL_FLAG(double, utility_divisor, 4.0, "Terminal utility divisor");
 ABSL_FLAG(double, search_opponent_temperature, 0.0, "Opponent temperature");
 ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension");
 ABSL_FLAG(int, num_blocks, 8, "Network residual block count");
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
   int num_threads = absl::GetFlag(FLAGS_threads);
   int probe_simulations = absl::GetFlag(FLAGS_search_simulations);
   double puct_c = absl::GetFlag(FLAGS_puct_c);
-  double value_scale = absl::GetFlag(FLAGS_value_scale);
+  double utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
   double search_opponent_temperature = absl::GetFlag(FLAGS_search_opponent_temperature);
   int seed = absl::GetFlag(FLAGS_seed);
   
@@ -128,13 +128,13 @@ int main(int argc, char** argv) {
     
     // Create evaluator and bots for this thread
     auto thread_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
-        model, device, value_scale);
+        model, device);
         
     std::vector<std::unique_ptr<open_spiel::DunePUCTISMCTSBot>> thread_bots;
     for (int p = 0; p < 4; ++p) {
       thread_bots.push_back(std::make_unique<open_spiel::DunePUCTISMCTSBot>(
           rng(), thread_evaluator, puct_c, probe_simulations,
-          -1, 1.0, 0.0, 0.3, 1.0, true,
+          -1, 1.0, 0.0, 0.3, utility_divisor, true,
           open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
           true, search_opponent_temperature));
     }

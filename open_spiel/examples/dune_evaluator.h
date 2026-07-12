@@ -33,11 +33,9 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   DuneNNEvaluator(
       std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       torch::Device device,
-      double value_scale = 1.0,
       float logit_cap = 10.0f)
       : model_(model),
         device_(device),
-        value_scale_(value_scale),
         logit_cap_(logit_cap) {
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
@@ -78,7 +76,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     torch::Tensor values_cpu = outputs.values.to(torch::kCPU).to(torch::kDouble).contiguous();
     const double* values_data = values_cpu.data_ptr<double>();
     for (int p = 0; p < num_players; ++p) {
-      double val = values_data[p] * value_scale_;
+      double val = values_data[p];
       values[p] = val;
       RecordLeafValue(val);
     }
@@ -155,6 +153,86 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     return policy;
   }
 
+  std::pair<ActionsAndProbs, std::vector<double>> PriorAndEvaluate(const State& state) override {
+    torch::InferenceMode guard;
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda());
+
+    int num_players = state.NumPlayers();
+    std::vector<double> values(num_players, 0.0);
+    ActionsAndProbs policy;
+
+    if (state.IsTerminal()) {
+      return {policy, values};
+    }
+    Player current_player = state.CurrentPlayer();
+
+    // Pre-allocate a CPU tensor locally to ensure thread-safety
+    auto options = torch::TensorOptions().dtype(torch::kFloat32);
+    if (device_.is_cuda()) {
+      options = options.pinned_memory(true);
+    }
+    torch::Tensor input_tensor = torch::zeros({num_players, obs_size_}, options);
+
+    // Stack all players' observations
+    for (int p = 0; p < num_players; ++p) {
+      std::vector<float> obs = state.InformationStateTensor(p);
+      CheckObsSize(obs.size());
+      std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+    }
+
+    torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
+    auto outputs = model_->forward(device_tensor);
+
+    // 1. Process Values
+    torch::Tensor values_cpu = outputs.values.to(torch::kCPU).to(torch::kDouble).contiguous();
+    const double* values_data = values_cpu.data_ptr<double>();
+    for (int p = 0; p < num_players; ++p) {
+      double val = values_data[p];
+      values[p] = val;
+      RecordLeafValue(val);
+    }
+
+    // 2. Process Current Player Policy Priors
+    if (current_player >= 0 && current_player < num_players) {
+      std::vector<Action> legal_actions = state.LegalActions();
+      if (!legal_actions.empty()) {
+        torch::Tensor player_logits = outputs.logits.index({current_player}).to(torch::kFloat32).to(torch::kCPU);
+        float* logits_ptr = player_logits.data_ptr<float>();
+        int64_t action_dim = player_logits.size(0);
+        std::vector<float> logits(logits_ptr, logits_ptr + action_dim);
+
+        CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+
+        double max_logit = -std::numeric_limits<double>::infinity();
+        for (Action action : legal_actions) {
+          if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+            max_logit = std::max(max_logit, static_cast<double>(logits[action]));
+          }
+        }
+
+        double sum_exp = 0.0;
+        std::vector<double> exps(legal_actions.size());
+        for (size_t i = 0; i < legal_actions.size(); ++i) {
+          Action action = legal_actions[i];
+          if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+            exps[i] = std::exp(logits[action] - max_logit);
+            sum_exp += exps[i];
+          } else {
+            exps[i] = 0.0;
+          }
+        }
+
+        policy.reserve(legal_actions.size());
+        for (size_t i = 0; i < legal_actions.size(); ++i) {
+          double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
+          policy.push_back({legal_actions[i], prob});
+        }
+      }
+    }
+
+    return {policy, values};
+  }
+
  private:
   void CheckObsSize(size_t size) const {
     SPIEL_CHECK_TRUE(size == static_cast<size_t>(obs_size_) || 
@@ -164,7 +242,6 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
   torch::Device device_;
-  double value_scale_;
   float logit_cap_;
   int64_t obs_size_;
 };

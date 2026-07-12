@@ -33,10 +33,8 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
  public:
   BatchedNNEvaluator(
       std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval,
-      double value_scale = 1.0,
       float logit_cap = 10.0f)
       : batched_eval_(batched_eval),
-        value_scale_(value_scale),
         logit_cap_(logit_cap) {
     obs_size_ = 5580;
   }
@@ -47,7 +45,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     for (int p = 0; p < num_players; ++p) {
       std::vector<float> obs = state.InformationStateTensor(p);
       open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
-      double val = result.value * value_scale_;
+      double val = result.value;
       values[p] = val;
       DuneNNEvaluator::RecordLeafValue(val);
     }
@@ -102,9 +100,61 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return policy;
   }
 
+  std::pair<ActionsAndProbs, std::vector<double>> PriorAndEvaluate(const State& state) override {
+    int num_players = state.NumPlayers();
+    std::vector<double> values(num_players, 0.0);
+    ActionsAndProbs policy;
+
+    if (state.IsTerminal()) {
+      return {policy, values};
+    }
+    Player current_player = state.CurrentPlayer();
+
+    for (int p = 0; p < num_players; ++p) {
+      std::vector<float> obs = state.InformationStateTensor(p);
+      open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
+      double val = result.value;
+      values[p] = val;
+      DuneNNEvaluator::RecordLeafValue(val);
+
+      if (p == current_player) {
+        std::vector<Action> legal_actions = state.LegalActions();
+        if (!legal_actions.empty()) {
+          std::vector<float> logits(result.logits.begin(), result.logits.end());
+          open_spiel::CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+
+          double max_logit = -std::numeric_limits<double>::infinity();
+          for (Action action : legal_actions) {
+            if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+              max_logit = std::max(max_logit, static_cast<double>(logits[action]));
+            }
+          }
+
+          double sum_exp = 0.0;
+          std::vector<double> exps(legal_actions.size());
+          for (size_t i = 0; i < legal_actions.size(); ++i) {
+            Action action = legal_actions[i];
+            if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
+              exps[i] = std::exp(logits[action] - max_logit);
+              sum_exp += exps[i];
+            } else {
+              exps[i] = 0.0;
+            }
+          }
+
+          policy.reserve(legal_actions.size());
+          for (size_t i = 0; i < legal_actions.size(); ++i) {
+            double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
+            policy.push_back({legal_actions[i], prob});
+          }
+        }
+      }
+    }
+    return {policy, values};
+  }
+
  private:
   std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval_;
-  double value_scale_;
   float logit_cap_;
   int64_t obs_size_;
 };
@@ -121,7 +171,7 @@ ABSL_FLAG(int, target_validation_labels, 1024, "Target count for validation labe
 ABSL_FLAG(int, max_games, 5000, "Hard game cap");
 ABSL_FLAG(int, max_simulations, 50, "MCTS budget");
 ABSL_FLAG(double, puct_c, 1.0, "Exploration constant");
-ABSL_FLAG(double, value_scale, 1.0, "Leaf value scaling");
+ABSL_FLAG(double, utility_divisor, 4.0, "Terminal utility divisor");
 ABSL_FLAG(double, blueprint_temperature, 1.0, "PPO action sampling temperature");
 ABSL_FLAG(double, search_fraction, 0.10, "Search prob for high-entropy states");
 ABSL_FLAG(double, min_entropy_ratio, 0.30, "Entropy threshold");
@@ -176,49 +226,7 @@ uint64_t ComputeFileHash(const std::string& filepath) {
   return hash;
 }
 
-bool IsStrategicAction(const std::string& action_str) {
-  // Strategic action families where search can provide useful signal.
-  if (action_str.rfind("PlaceAgent", 0) == 0 ||
-      action_str.rfind("Deploy ", 0) == 0 ||
-      action_str.rfind("CombatCommit", 0) == 0 ||
-      action_str.rfind("Buy", 0) == 0 ||
-      action_str.rfind("AcquireTech", 0) == 0 ||
-      action_str.rfind("AcquireTleilaxu", 0) == 0 ||
-      action_str.rfind("Shipping", 0) == 0 ||
-      action_str.rfind("SignetRing", 0) == 0 ||
-      action_str.rfind("tech_", 0) == 0 ||
-      action_str.rfind("ResearchBranch", 0) == 0 ||
-      action_str.rfind("SelectAgentCard", 0) == 0 ||
-      action_str.rfind("SelectGraftPartner", 0) == 0 ||
-      action_str.rfind("PlayAgentSolo", 0) == 0 ||
-      action_str.rfind("PlayPlotIntrigue", 0) == 0 ||
-      action_str.rfind("PlayCombatIntrigue", 0) == 0 ||
-      action_str.rfind("IntrigueChoice", 0) == 0 ||
-      action_str.rfind("CombatPass", 0) == 0 ||
-      action_str.rfind("AgentPass", 0) == 0 ||
-      action_str.rfind("Reveal", 0) == 0 ||
-      action_str == "PlayKwisatzHaderach" ||
-      action_str == "FamilyAtomics" ||
-      action_str == "AgentPlayGeneric") {
-    return true;
-  }
-  return false;
-}
 
-bool IsStrategicState(const State& state, Player searched_player) {
-  if (state.CurrentPlayer() != searched_player) return false;
-  std::vector<Action> legal_actions = state.LegalActions();
-  if (legal_actions.size() < 2 || legal_actions.size() > 20) return false;
-
-  // Check if ANY action in the set is strategic.
-  const dune_imperium::DuneImperiumState& dune_state =
-      static_cast<const dune_imperium::DuneImperiumState&>(state);
-  for (Action a : legal_actions) {
-    std::string action_str = dune_state.ActionToString(state.CurrentPlayer(), a);
-    if (IsStrategicAction(action_str)) return true;
-  }
-  return false;
-}
 
 double ComputeEntropy(const ActionsAndProbs& prior) {
   double h = 0.0;
@@ -283,11 +291,11 @@ double CalibrateEta(const ActionsAndProbs& ppo_prior, const std::vector<double>&
 class LabelWriter {
  public:
   LabelWriter(const std::string& dir, int obs_size, int action_dim, int max_simulations,
-              float value_scale, float puct_c, float target_teacher_kl,
+              float utility_divisor, float puct_c, float target_teacher_kl,
               int min_visits_per_action, int min_coverage, float blueprint_temperature,
               uint64_t fingerprint, int labels_per_file)
       : dir_(dir), obs_size_(obs_size), action_dim_(action_dim), max_simulations_(max_simulations),
-        value_scale_(value_scale), puct_c_(puct_c), target_teacher_kl_(target_teacher_kl),
+        utility_divisor_(utility_divisor), puct_c_(puct_c), target_teacher_kl_(target_teacher_kl),
         min_visits_per_action_(min_visits_per_action), min_coverage_(min_coverage),
         blueprint_temperature_(blueprint_temperature), fingerprint_(fingerprint),
         labels_per_file_(labels_per_file) {
@@ -356,7 +364,7 @@ class LabelWriter {
     int32_t obs_size = obs_size_;
     int32_t action_dim = action_dim_;
     int32_t max_sim = max_simulations_;
-    float val_scale = value_scale_;
+    float utility_divisor = utility_divisor_;
     float p_c = puct_c_;
     float t_kl = target_teacher_kl_;
     int32_t min_visits = min_visits_per_action_;
@@ -370,7 +378,7 @@ class LabelWriter {
     out_.write(reinterpret_cast<const char*>(&obs_size), 4);
     out_.write(reinterpret_cast<const char*>(&action_dim), 4);
     out_.write(reinterpret_cast<const char*>(&max_sim), 4);
-    out_.write(reinterpret_cast<const char*>(&val_scale), 4);
+    out_.write(reinterpret_cast<const char*>(&utility_divisor), 4);
     out_.write(reinterpret_cast<const char*>(&p_c), 4);
     out_.write(reinterpret_cast<const char*>(&t_kl), 4);
     out_.write(reinterpret_cast<const char*>(&min_visits), 4);
@@ -394,7 +402,7 @@ class LabelWriter {
   int obs_size_;
   int action_dim_;
   int max_simulations_;
-  float value_scale_;
+  float utility_divisor_;
   float puct_c_;
   float target_teacher_kl_;
   int min_visits_per_action_;
@@ -506,7 +514,7 @@ int main(int argc, char** argv) {
 
   open_spiel::LabelWriter writer(
       output_dir, obs_size, action_size, absl::GetFlag(FLAGS_max_simulations),
-      absl::GetFlag(FLAGS_value_scale), absl::GetFlag(FLAGS_puct_c),
+      absl::GetFlag(FLAGS_utility_divisor), absl::GetFlag(FLAGS_puct_c),
       absl::GetFlag(FLAGS_target_teacher_kl), absl::GetFlag(FLAGS_min_visits_per_action),
       absl::GetFlag(FLAGS_min_coverage), absl::GetFlag(FLAGS_blueprint_temperature),
       fingerprint, absl::GetFlag(FLAGS_labels_per_file));
@@ -531,7 +539,6 @@ int main(int argc, char** argv) {
   auto worker_fn = [&](int thread_id) {
     auto evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(
         batched_eval,
-        absl::GetFlag(FLAGS_value_scale),
         10.0f
     );
 
@@ -587,7 +594,7 @@ int main(int argc, char** argv) {
             uint64_t mcts_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamMCTS);
             open_spiel::DunePUCTISMCTSBot bot(
                 mcts_seed, evaluator, absl::GetFlag(FLAGS_puct_c), absl::GetFlag(FLAGS_max_simulations),
-                -1, 1.0, 0.0, 0.3, 1.0, true,
+                -1, 1.0, 0.0, 0.3, absl::GetFlag(FLAGS_utility_divisor), true,
                 open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
                 true, absl::GetFlag(FLAGS_search_opponent_temperature));
             bot.RunSearch(*state);
@@ -750,7 +757,7 @@ int main(int argc, char** argv) {
     
     open_spiel::json::Object config_obj;
     config_obj["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
-    config_obj["value_scale"] = absl::GetFlag(FLAGS_value_scale);
+    config_obj["utility_divisor"] = absl::GetFlag(FLAGS_utility_divisor);
     config_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     config_obj["target_teacher_kl"] = absl::GetFlag(FLAGS_target_teacher_kl);
     config_obj["eta_max"] = absl::GetFlag(FLAGS_eta_max);

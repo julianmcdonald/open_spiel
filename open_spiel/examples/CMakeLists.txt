@@ -14,8 +14,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_evaluator_test dune_evaluator_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator_test ${TORCH_LIBRARIES})
 
-  add_executable(dune_puct_is_mcts_test dune_puct_is_mcts_test.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_puct_is_mcts_test ${TORCH_LIBRARIES})
+  add_library(dune_search STATIC dune_puct_is_mcts.cc)
+  target_link_libraries(dune_search PRIVATE ${TORCH_LIBRARIES})
+  target_include_directories(dune_search PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(dune_puct_is_mcts_test dune_puct_is_mcts_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_puct_is_mcts_test dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
@@ -23,14 +27,14 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_population_eval dune_population_eval.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_population_eval ${TORCH_LIBRARIES})
 
-  add_executable(dune_search_benchmark dune_search_benchmark.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_search_benchmark ${TORCH_LIBRARIES})
+  add_executable(dune_search_benchmark dune_search_benchmark.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_benchmark dune_search ${TORCH_LIBRARIES})
 
-  add_executable(dune_search_teacher dune_search_teacher.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_search_teacher ${TORCH_LIBRARIES})
+  add_executable(dune_search_teacher dune_search_teacher.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_teacher dune_search ${TORCH_LIBRARIES})
 
-  add_executable(dune_sm_value_probe dune_sm_value_probe.cc dune_puct_is_mcts.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_sm_value_probe ${TORCH_LIBRARIES})
+  add_executable(dune_sm_value_probe dune_sm_value_probe.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_sm_value_probe dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_diagnose dune_diagnose.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_diagnose ${TORCH_LIBRARIES})

@@ -24,7 +24,7 @@ if(Python3_VERSION VERSION_LESS "3.8.0")
 endif()
 
 # List of all Python bindings to add to pyspiel.
-include_directories (../pybind11_abseil ../../pybind11/include)
+include_directories (../pybind11_abseil ../../pybind11/include ../examples)
 set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   pybind11/algorithms_infostate_tree.cc
   pybind11/algorithms_infostate_tree_templates.h
@@ -155,6 +155,10 @@ target_link_libraries(pyspiel PRIVATE
   absl::strings
   absl::time
 )
+
+if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
+  target_link_libraries(pyspiel PRIVATE dune_search)
+endif()
 
 # Without this, the binary is called `libpyspiel.so`
 set_target_properties(pyspiel PROPERTIES PREFIX "")
