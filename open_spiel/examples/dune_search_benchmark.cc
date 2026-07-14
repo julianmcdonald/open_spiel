@@ -59,6 +59,7 @@ ABSL_FLAG(bool, use_opponent_model, false, "Whether non-search players in simula
 ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth diagnostics periodically.");
 ABSL_FLAG(bool, check_strategic_state, false, "Whether to bypass MCTS search at non-strategic states.");
 ABSL_FLAG(bool, disable_time_limit, false, "Disable the time limit per move for fixed-simulation evaluation.");
+ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
 
 namespace open_spiel {
 namespace {
@@ -298,7 +299,8 @@ void WorkerThread(
             absl::GetFlag(FLAGS_dirichlet_alpha),
             true,  // use_observation_string
             absl::GetFlag(FLAGS_verbose_diagnostics),
-            absl::GetFlag(FLAGS_check_strategic_state)
+            absl::GetFlag(FLAGS_check_strategic_state),
+            absl::GetFlag(FLAGS_root_prior_temperature)
         };
         bots[p] = std::make_unique<DunePUCTISMCTSBot>(config, search_evaluator);
       } else {
@@ -953,6 +955,7 @@ int main(int argc, char* argv[]) {
     agg_obj["threads"] = static_cast<int64_t>(num_threads);
     agg_obj["max_simulations"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_simulations));
     agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
+    agg_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
     agg_obj["use_opponent_model"] = absl::GetFlag(FLAGS_use_opponent_model);
     agg_obj["simulated_opponent_temperature"] = absl::GetFlag(FLAGS_simulated_opponent_temperature);
     agg_obj["external_opponent_temperature"] = absl::GetFlag(FLAGS_external_opponent_temperature);

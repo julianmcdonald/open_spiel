@@ -203,10 +203,26 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   inference_count_this_search_++;
 
   const ActionsAndProbs& priors = eval_res.first;
-  for (const auto& action_prob : priors) {
-    Action action = action_prob.first;
-    double prob = action_prob.second;
-    node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+  if (node == root_node_ && config_.root_prior_temperature != 1.0 && config_.root_prior_temperature > 0.0) {
+    double sum = 0.0;
+    std::vector<double> scaled_probs;
+    scaled_probs.reserve(priors.size());
+    for (const auto& action_prob : priors) {
+      double p = std::pow(std::max(action_prob.second, 1e-12), 1.0 / config_.root_prior_temperature);
+      scaled_probs.push_back(p);
+      sum += p;
+    }
+    for (size_t i = 0; i < priors.size(); ++i) {
+      Action action = priors[i].first;
+      double prob = sum > 0.0 ? (scaled_probs[i] / sum) : (1.0 / priors.size());
+      node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+    }
+  } else {
+    for (const auto& action_prob : priors) {
+      Action action = action_prob.first;
+      double prob = action_prob.second;
+      node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+    }
   }
 
   node->cached_values.resize(state.NumPlayers());

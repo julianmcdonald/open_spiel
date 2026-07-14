@@ -50,6 +50,7 @@ struct DuneSearchConfig {
   bool use_observation_string = true;
   bool verbose_diagnostics = false;
   bool check_strategic_state = false;
+  double root_prior_temperature = 1.0;
 };
 
 struct SearchDiagnostics {

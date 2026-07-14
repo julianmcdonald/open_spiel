@@ -60,6 +60,7 @@ ABSL_FLAG(double, search_opponent_temperature, 0.0,
 ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension");
 ABSL_FLAG(int, num_blocks, 8, "Network residual block count");
 ABSL_FLAG(int, seed, 42, "Seed for rng");
+ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
 
 
 namespace open_spiel {
@@ -463,11 +464,28 @@ int main(int argc, char** argv) {
           if (absl::Uniform(search_gate_rng, 0.0, 1.0) < search_prob) {
             total_search_attempted++;
             uint64_t mcts_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamMCTS);
-            open_spiel::DunePUCTISMCTSBot bot(
-                mcts_seed, evaluator, absl::GetFlag(FLAGS_puct_c), absl::GetFlag(FLAGS_max_simulations),
-                -1, 1.0, 0.0, 0.3, absl::GetFlag(FLAGS_utility_divisor), true,
-                open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
-                true, absl::GetFlag(FLAGS_search_opponent_temperature));
+            open_spiel::DuneSearchConfig search_config;
+            search_config.max_simulations = absl::GetFlag(FLAGS_max_simulations);
+            search_config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+            search_config.max_nodes = 50000;
+            search_config.puct_c = absl::GetFlag(FLAGS_puct_c);
+            search_config.opponent_mode = SearchOpponentMode::kPolicy;
+            search_config.temperature = 1.0;
+            search_config.opponent_temperature = absl::GetFlag(FLAGS_search_opponent_temperature);
+            search_config.max_world_samples = -1;
+            search_config.utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
+            search_config.min_visit_threshold = 2;
+            search_config.covered_prior_threshold = 0.50;
+            search_config.seed = mcts_seed;
+            search_config.final_policy_type = open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+            search_config.dirichlet_epsilon = 0.0;
+            search_config.dirichlet_alpha = 0.3;
+            search_config.use_observation_string = true;
+            search_config.verbose_diagnostics = false;
+            search_config.check_strategic_state = false;
+            search_config.root_prior_temperature = absl::GetFlag(FLAGS_root_prior_temperature);
+
+            open_spiel::DunePUCTISMCTSBot bot(search_config, evaluator);
             bot.RunSearch(*state);
             open_spiel::SearchDiagnostics diag = bot.GetRootDiagnostics(*state, absl::GetFlag(FLAGS_min_visits_per_action));
 
@@ -640,6 +658,7 @@ int main(int argc, char** argv) {
     config_obj["search_fraction"] = absl::GetFlag(FLAGS_search_fraction);
     config_obj["uniform_ratio"] = absl::GetFlag(FLAGS_uniform_ratio);
     config_obj["search_opponent_temperature"] = absl::GetFlag(FLAGS_search_opponent_temperature);
+    config_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
     
     manifest_obj["effective_search_config"] = config_obj;
     

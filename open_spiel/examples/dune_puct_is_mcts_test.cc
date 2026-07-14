@@ -47,6 +47,9 @@ struct TestBotAccessor {
   static int GetOpponentPriorCacheSize(DunePUCTISMCTSBot& b) {
     return b.opponent_prior_cache_.size();
   }
+  static const absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*>& GetNodes(DunePUCTISMCTSBot& b) {
+    return b.nodes_;
+  }
 };
 
 namespace {
@@ -1040,6 +1043,78 @@ void TestFixedSimulationCompleteness() {
   std::cout << "Test 23 Passed!\n\n";
 }
 
+void TestRootPriorTemperatureScaling() {
+  std::cout << "Running Test 24: Root Prior Temperature Scaling...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() >= 2);
+
+  // Set distinct priors
+  ActionsAndProbs mock_priors;
+  double sum = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    double p = 0.1 + 0.1 * i;
+    mock_priors.push_back({legal_actions[i], p});
+    sum += p;
+  }
+  for (auto& ap : mock_priors) {
+    ap.second /= sum;
+  }
+
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  DuneSearchConfig config;
+  config.max_simulations = 2;
+  config.root_prior_temperature = 2.0; // scale with temperature 2.0
+  config.check_strategic_state = false;
+
+  DunePUCTISMCTSBot bot(config, evaluator);
+  DuneSearchResult res = bot.RunSearch(*state);
+
+  DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
+  assert(root != nullptr);
+  
+  // Calculate expected scaled priors dynamically based on what the evaluator actually returns for the state
+  ActionsAndProbs raw_priors = evaluator->Prior(*state);
+  double expected_sum = 0.0;
+  std::vector<double> expected_p_T;
+  for (const auto& ap : raw_priors) {
+    double p = std::sqrt(ap.second);
+    expected_p_T.push_back(p);
+    expected_sum += p;
+  }
+  for (double& p : expected_p_T) {
+    p /= expected_sum;
+  }
+
+  // Verify root priors match expectations
+  for (size_t i = 0; i < raw_priors.size(); ++i) {
+    auto child_it = root->child_info.find(raw_priors[i].first);
+    assert(child_it != root->child_info.end());
+    double actual_prior = child_it->second.prior;
+    AssertAlmostEqual(actual_prior, expected_p_T[i]);
+  }
+
+  // Verify that child nodes do NOT have their priors scaled
+  DuneISMCTSNode non_root;
+  non_root.priors_initialized = false;
+  TestBotAccessor::RunInitialize(bot, &non_root, *state);
+  
+  for (size_t i = 0; i < raw_priors.size(); ++i) {
+    auto child_it = non_root.child_info.find(raw_priors[i].first);
+    assert(child_it != non_root.child_info.end());
+    AssertAlmostEqual(child_it->second.prior, raw_priors[i].second);
+  }
+
+  std::cout << "Test 24 Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -1067,6 +1142,7 @@ int main() {
   open_spiel::TestOpponentTemperatureIsolation();
   open_spiel::TestCorrectedTerminalRounds();
   open_spiel::TestFixedSimulationCompleteness();
+  open_spiel::TestRootPriorTemperatureScaling();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }
