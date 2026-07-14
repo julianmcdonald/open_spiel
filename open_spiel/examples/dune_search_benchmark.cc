@@ -21,18 +21,25 @@
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
+#include "open_spiel/utils/json.h"
 #include <torch/torch.h>
 
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_seed_utils.h"
+#include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
+#include <fstream>
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Path to load search agent model checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Path to load opponent model checkpoint. If empty, the search agent model is reused. If 'random', random opponents are used.");
 ABSL_FLAG(int, seed, 42, "Seed for deterministic RNG.");
 ABSL_FLAG(int, games, 1000, "How many games to play in total.");
+ABSL_FLAG(int, start_episode_id, 0, "Episode ID to start the range of games (for resumability).");
+ABSL_FLAG(std::string, game_jsonl_path, "", "Path to write structured game-level JSONL outcomes.");
+ABSL_FLAG(std::string, search_jsonl_path, "", "Path to write structured search-level JSONL diagnostics.");
+ABSL_FLAG(std::string, aggregate_json_path, "", "Path to write structured aggregate JSON outcome.");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
 ABSL_FLAG(int, hidden_dim, 2048, "Search agent model hidden dimension.");
 ABSL_FLAG(int, num_blocks, 8, "Search agent model residual blocks count.");
@@ -228,6 +235,9 @@ struct GameStats {
   int64_t total_fallbacks = 0;
   int64_t total_inferences = 0;
   std::map<std::string, int64_t> fallback_reason_counts;
+  int64_t total_incomplete_searches = 0;
+  std::vector<double> search_mcts_step_times;
+  double covered_prior_mass_sum = 0.0;
 };
 
 
@@ -249,11 +259,13 @@ void WorkerThread(
   GameStats thread_stats;
 
   while (true) {
-    int g = next_game_id++;
-    if (g >= total_games) break;
+    int offset = next_game_id++;
+    if (offset >= total_games) break;
+    int g = absl::GetFlag(FLAGS_start_episode_id) + offset;
 
     uint64_t game_seed = dune_seed::DeriveSeed(absl::GetFlag(FLAGS_seed), dune_seed::kStreamBlueprint, g);
     std::mt19937 game_rng(game_seed);
+    auto game_start_time = std::chrono::steady_clock::now();
 
     bool rotate_seat = absl::GetFlag(FLAGS_rotate_seat);
     int search_seat = rotate_seat ? (g % 4) : 0;
@@ -338,17 +350,77 @@ void WorkerThread(
         if (is_strategic) {
           thread_stats.search_mcts_step_time_sum += step_duration;
           thread_stats.search_mcts_steps_count++;
+          thread_stats.search_mcts_step_times.push_back(step_duration);
           auto* mcts_bot = dynamic_cast<DunePUCTISMCTSBot*>(bots[current_player].get());
           if (mcts_bot != nullptr) {
             const DuneSearchResult& last_res = mcts_bot->GetLastSearchResult();
             thread_stats.total_simulations_completed += last_res.simulations_completed;
             thread_stats.total_inferences += last_res.inference_count;
+            thread_stats.covered_prior_mass_sum += last_res.diagnostics.covered_prior_mass;
             if (last_res.timeout_status) {
               thread_stats.total_timeouts++;
             }
             if (last_res.used_fallback) {
               thread_stats.total_fallbacks++;
               thread_stats.fallback_reason_counts[last_res.fallback_reason]++;
+            }
+            if (last_res.simulations_completed < absl::GetFlag(FLAGS_max_simulations)) {
+              thread_stats.total_incomplete_searches++;
+              if (last_res.fallback_reason == "timeout" || last_res.fallback_reason == "max_nodes" || last_res.timeout_status) {
+                std::cerr << "\nCRITICAL FAILURE: Strategic search at episode " << g 
+                          << " stopped before completing " << absl::GetFlag(FLAGS_max_simulations)
+                          << " simulations due to " << last_res.fallback_reason 
+                          << " (completed " << last_res.simulations_completed << " simulations).\n";
+                std::exit(1);
+              }
+            }
+
+            std::string search_jsonl = absl::GetFlag(FLAGS_search_jsonl_path);
+            if (!search_jsonl.empty()) {
+              open_spiel::json::Object search_obj;
+              search_obj["episode_id"] = static_cast<int64_t>(g);
+              search_obj["game_seed"] = static_cast<int64_t>(game_seed);
+              search_obj["search_seat"] = static_cast<int64_t>(search_seat);
+              search_obj["player"] = static_cast<int64_t>(current_player);
+              search_obj["is_strategic"] = true;
+              search_obj["simulations_completed"] = static_cast<int64_t>(last_res.simulations_completed);
+              search_obj["inference_count"] = static_cast<int64_t>(last_res.inference_count);
+              search_obj["timeout_status"] = last_res.timeout_status;
+              search_obj["used_fallback"] = last_res.used_fallback;
+              search_obj["fallback_reason"] = last_res.fallback_reason;
+              search_obj["elapsed_time_ms"] = last_res.elapsed_time_ms;
+              search_obj["action_chosen"] = static_cast<int64_t>(chosen_action);
+              const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+              if (dune_state != nullptr) {
+                search_obj["action_chosen_string"] = dune_state->ActionToString(current_player, chosen_action);
+              }
+              open_spiel::json::Array legals_arr;
+              for (Action a : last_res.diagnostics.actions) {
+                legals_arr.push_back(static_cast<int64_t>(a));
+              }
+              search_obj["legal_actions"] = legals_arr;
+              open_spiel::json::Array visits_arr;
+              for (int v : last_res.diagnostics.visit_counts) {
+                visits_arr.push_back(static_cast<int64_t>(v));
+              }
+              search_obj["visit_counts"] = visits_arr;
+              open_spiel::json::Array q_arr;
+              for (double q : last_res.diagnostics.q_values) {
+                q_arr.push_back(q);
+              }
+              search_obj["q_values"] = q_arr;
+              open_spiel::json::Array priors_arr;
+              for (double p_val : last_res.diagnostics.priors) {
+                priors_arr.push_back(p_val);
+              }
+              search_obj["priors"] = priors_arr;
+              search_obj["root_value"] = last_res.diagnostics.root_value;
+
+              std::lock_guard<std::mutex> lock(log_mutex);
+              std::ofstream search_file(search_jsonl, std::ios::app);
+              if (search_file) {
+                search_file << open_spiel::json::ToString(search_obj, false) << "\n";
+              }
             }
           }
         }
@@ -398,6 +470,37 @@ void WorkerThread(
 
     const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
     if (dune_state != nullptr) {
+      if (g == 67) {
+        std::cout << "\n=== EPISODE 67 VP BREAKDOWN FOR PLAYER 3 ===" << std::endl;
+        std::cout << "Base VP: " << dune_state->GetPlayerVp(3) << std::endl;
+        std::cout << "Conflict VPs: " << dune_state->ConflictVpDelta(3) << std::endl;
+        std::cout << "Tleilaxu Track Level: " << dune_state->GetTleilaxuTrackForTesting(3) << std::endl;
+        std::cout << "The Spice Must Flow Cards Owned: " << dune_state->CountImperiumCardsOwnedForTesting(3, 10) << std::endl;
+        std::cout << "Emperor Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kEmperor) << std::endl;
+        std::cout << "Spacing Guild Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kSpacingGuild) << std::endl;
+        std::cout << "Bene Gesserit Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kBeneGesserit) << std::endl;
+        std::cout << "Fremen Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kFremen) << std::endl;
+        
+        std::cout << "Alliance Owners: Emperor=" << dune_state->GetAllianceOwnerForTesting(0)
+                  << ", SG=" << dune_state->GetAllianceOwnerForTesting(1)
+                  << ", BG=" << dune_state->GetAllianceOwnerForTesting(2)
+                  << ", Fremen=" << dune_state->GetAllianceOwnerForTesting(3) << std::endl;
+        
+        std::cout << "Intrigue Cards in Hand: ";
+        for (int intrigue_id : dune_state->GetIntrigueHandForTesting(3)) {
+          std::cout << intrigue_id << " ";
+        }
+        std::cout << std::endl;
+        
+        std::cout << "All Owned Cards (ID xCount): ";
+        for (int card_id = 0; card_id < 200; ++card_id) {
+          int count = dune_state->CountImperiumCardsOwnedForTesting(3, card_id);
+          if (count > 0) {
+            std::cout << card_id << "x" << count << " ";
+          }
+        }
+        std::cout << "\n============================================\n" << std::endl;
+      }
       for (int p = 0; p < 4; ++p) {
         if (dune_state->HasSwordmaster(p)) {
           if (p == search_seat) {
@@ -407,7 +510,8 @@ void WorkerThread(
           }
         }
       }
-      thread_stats.rounds_played.push_back(dune_state->GetCurrentRound());
+      int corrected_round = dune_state->GetCurrentRound() - 1;
+      thread_stats.rounds_played.push_back(corrected_round);
 
       double search_vp = GetTrueFinalVp(dune_state, search_seat);
       double opp_vp_sum = 0.0;
@@ -420,6 +524,53 @@ void WorkerThread(
       thread_stats.vp_margin_sum += margin;
       thread_stats.vp_margin_count++;
       thread_stats.vp_margins.push_back(margin);
+
+      double game_duration_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - game_start_time).count();
+
+      std::string game_jsonl = absl::GetFlag(FLAGS_game_jsonl_path);
+      if (!game_jsonl.empty()) {
+        open_spiel::json::Object game_obj;
+        game_obj["episode_id"] = static_cast<int64_t>(g);
+        game_obj["seed"] = static_cast<int64_t>(game_seed);
+        game_obj["search_seat"] = static_cast<int64_t>(search_seat);
+        game_obj["winner"] = static_cast<int64_t>(winner);
+        
+        open_spiel::json::Array returns_arr;
+        for (double r : returns) {
+          returns_arr.push_back(r);
+        }
+        game_obj["returns"] = returns_arr;
+        game_obj["search_return"] = returns[search_seat];
+        game_obj["search_vp"] = search_vp;
+        
+        open_spiel::json::Array opp_vps_arr;
+        for (int p = 0; p < 4; ++p) {
+          if (p != search_seat) {
+            opp_vps_arr.push_back(static_cast<double>(GetTrueFinalVp(dune_state, p)));
+          }
+        }
+        game_obj["opponent_vps"] = opp_vps_arr;
+        
+        game_obj["vp_margin"] = margin;
+        game_obj["rounds_played"] = static_cast<int64_t>(corrected_round);
+        game_obj["search_steps"] = static_cast<int64_t>(thread_stats.search_steps_count);
+        game_obj["search_swordmasters"] = dune_state->HasSwordmaster(search_seat);
+        
+        open_spiel::json::Array opp_sm_arr;
+        for (int p = 0; p < 4; ++p) {
+          if (p != search_seat) {
+            opp_sm_arr.push_back(dune_state->HasSwordmaster(p));
+          }
+        }
+        game_obj["opponent_swordmasters"] = opp_sm_arr;
+        game_obj["wall_time_s"] = game_duration_s;
+
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::ofstream game_file(game_jsonl, std::ios::app);
+        if (game_file) {
+          game_file << open_spiel::json::ToString(game_obj, false) << "\n";
+        }
+      }
     }
 
     // Flush stats and perform intermediate logging under a single lock
@@ -450,6 +601,9 @@ void WorkerThread(
       global_stats.total_timeouts += thread_stats.total_timeouts;
       global_stats.total_fallbacks += thread_stats.total_fallbacks;
       global_stats.total_inferences += thread_stats.total_inferences;
+      global_stats.total_incomplete_searches += thread_stats.total_incomplete_searches;
+      global_stats.search_mcts_step_times.insert(global_stats.search_mcts_step_times.end(), thread_stats.search_mcts_step_times.begin(), thread_stats.search_mcts_step_times.end());
+      global_stats.covered_prior_mass_sum += thread_stats.covered_prior_mass_sum;
       for (const auto& pair : thread_stats.fallback_reason_counts) {
         global_stats.fallback_reason_counts[pair.first] += pair.second;
       }
@@ -497,6 +651,9 @@ void WorkerThread(
     global_stats.total_timeouts += thread_stats.total_timeouts;
     global_stats.total_fallbacks += thread_stats.total_fallbacks;
     global_stats.total_inferences += thread_stats.total_inferences;
+    global_stats.total_incomplete_searches += thread_stats.total_incomplete_searches;
+    global_stats.search_mcts_step_times.insert(global_stats.search_mcts_step_times.end(), thread_stats.search_mcts_step_times.begin(), thread_stats.search_mcts_step_times.end());
+    global_stats.covered_prior_mass_sum += thread_stats.covered_prior_mass_sum;
     for (const auto& pair : thread_stats.fallback_reason_counts) {
       global_stats.fallback_reason_counts[pair.first] += pair.second;
     }
@@ -546,6 +703,7 @@ void ComputeVpMarginCI(const std::vector<double>& margins, double* mean, double*
 }
 
 int main(int argc, char* argv[]) {
+  auto run_start_time = std::chrono::steady_clock::now();
   absl::ParseCommandLine(argc, argv);
 
   // Set PyTorch thread limit to 1 to avoid thread contention across CPU-bound forward runs
@@ -722,6 +880,15 @@ int main(int argc, char* argv[]) {
   std::cout << absl::StrFormat("Mean |leaf value|: %.4f (normalized/NN) / %.4f (raw equivalent) vs Mean |terminal return|: %.4f (raw) (utility_divisor = %.1f)\n",
                                mean_abs_leaf_value, raw_mean_abs_leaf_value, mean_abs_terminal_return, utility_divisor_used);
 
+  double p95_latency = 0.0;
+  if (!global_stats.search_mcts_step_times.empty()) {
+    std::vector<double> sorted_times = global_stats.search_mcts_step_times;
+    std::sort(sorted_times.begin(), sorted_times.end());
+    size_t idx = static_cast<size_t>(std::round(0.95 * (sorted_times.size() - 1)));
+    p95_latency = sorted_times[idx];
+  }
+  double total_wall_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start_time).count();
+
   std::cout << "\nIS-MCTS MCTS Search Diagnostics:\n";
   std::cout << absl::StrFormat("  Total Strategic MCTS Steps: %d\n", global_stats.search_mcts_steps_count);
   if (global_stats.search_mcts_steps_count > 0) {
@@ -733,6 +900,9 @@ int main(int argc, char* argv[]) {
     std::cout << absl::StrFormat("  Average NN inferences per step: %.2f\n", avg_inf);
     std::cout << absl::StrFormat("  Timeout rate:                   %.2f%% (%d/%d steps)\n", timeout_rate, global_stats.total_timeouts, global_stats.search_mcts_steps_count);
     std::cout << absl::StrFormat("  Fallback rate:                  %.2f%% (%d/%d steps)\n", fallback_rate, global_stats.total_fallbacks, global_stats.search_mcts_steps_count);
+    std::cout << absl::StrFormat("  Mean MCTS Latency:              %.4fs\n", avg_mcts_step_time);
+    std::cout << absl::StrFormat("  P95 MCTS Latency:               %.4fs\n", p95_latency);
+    std::cout << absl::StrFormat("  Wall Time:                      %.2fs (%.2f games/hour)\n", total_wall_time, (total_games * 3600.0 / total_wall_time));
     if (!global_stats.fallback_reason_counts.empty()) {
       std::cout << "  Fallback reasons break down:\n";
       for (const auto& pair : global_stats.fallback_reason_counts) {
@@ -741,6 +911,89 @@ int main(int argc, char* argv[]) {
     }
   } else {
     std::cout << "  No strategic steps were evaluated by MCTS.\n";
+  }
+
+  std::string aggregate_json_path = absl::GetFlag(FLAGS_aggregate_json_path);
+  if (!aggregate_json_path.empty()) {
+    std::string checkpoint_hash = "unknown";
+    try {
+      checkpoint_hash = open_spiel::ComputeFileSHA256(model_ckpt);
+    } catch (const std::exception& e) {
+      std::cerr << "Warning: Could not compute SHA-256 for checkpoint: " << e.what() << "\n";
+    }
+
+    open_spiel::json::Object agg_obj;
+    agg_obj["checkpoint_hash"] = checkpoint_hash;
+    agg_obj["opponent_checkpoint"] = opp_ckpt;
+    agg_obj["start_episode_id"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id));
+    agg_obj["games_played"] = static_cast<int64_t>(total_games);
+    agg_obj["threads"] = static_cast<int64_t>(num_threads);
+    agg_obj["max_simulations"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_simulations));
+    agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
+    agg_obj["use_opponent_model"] = absl::GetFlag(FLAGS_use_opponent_model);
+    agg_obj["simulated_opponent_temperature"] = absl::GetFlag(FLAGS_simulated_opponent_temperature);
+    agg_obj["external_opponent_temperature"] = absl::GetFlag(FLAGS_external_opponent_temperature);
+    agg_obj["disable_time_limit"] = absl::GetFlag(FLAGS_disable_time_limit);
+    agg_obj["utility_divisor"] = absl::GetFlag(FLAGS_utility_divisor);
+    agg_obj["elapsed_wall_time_s"] = total_wall_time;
+    agg_obj["games_per_hour"] = total_games * 3600.0 / total_wall_time;
+    agg_obj["search_wins"] = static_cast<int64_t>(global_stats.search_wins);
+    agg_obj["search_winrate"] = (global_stats.search_wins * 100.0 / total_games);
+    
+    double lcb_winrate = 0.0, ucb_winrate = 0.0;
+    ComputeWilsonWinrateCI(global_stats.search_wins, total_games, &lcb_winrate, &ucb_winrate);
+    agg_obj["search_winrate_lcb"] = lcb_winrate;
+    agg_obj["search_winrate_ucb"] = ucb_winrate;
+    
+    double mean_vp_margin = 0.0, lcb_vp_margin = 0.0, ucb_vp_margin = 0.0;
+    ComputeVpMarginCI(global_stats.vp_margins, &mean_vp_margin, &lcb_vp_margin, &ucb_vp_margin);
+    agg_obj["mean_vp_margin"] = mean_vp_margin;
+    agg_obj["mean_vp_margin_lcb"] = lcb_vp_margin;
+    agg_obj["mean_vp_margin_ucb"] = ucb_vp_margin;
+    
+    agg_obj["strategic_root_count"] = static_cast<int64_t>(global_stats.search_mcts_steps_count);
+    agg_obj["total_simulations_completed"] = static_cast<int64_t>(global_stats.total_simulations_completed);
+    agg_obj["incomplete_searches"] = static_cast<int64_t>(global_stats.total_incomplete_searches);
+    
+    double timeout_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_timeouts * 100.0) / global_stats.search_mcts_steps_count : 0.0;
+    double fallback_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_fallbacks * 100.0) / global_stats.search_mcts_steps_count : 0.0;
+    agg_obj["timeout_rate"] = timeout_rate;
+    agg_obj["fallback_rate"] = fallback_rate;
+    agg_obj["total_inferences"] = static_cast<int64_t>(global_stats.total_inferences);
+    
+    double avg_sims = global_stats.search_mcts_steps_count > 0 ? static_cast<double>(global_stats.total_simulations_completed) / global_stats.search_mcts_steps_count : 0.0;
+    double avg_inf = global_stats.search_mcts_steps_count > 0 ? static_cast<double>(global_stats.total_inferences) / global_stats.search_mcts_steps_count : 0.0;
+    agg_obj["average_simulations"] = avg_sims;
+    agg_obj["average_inferences_per_step"] = avg_inf;
+    agg_obj["mean_latency_s"] = avg_mcts_step_time;
+    agg_obj["p95_latency_s"] = p95_latency;
+    
+    double avg_covered = global_stats.search_mcts_steps_count > 0 ? (global_stats.covered_prior_mass_sum / global_stats.search_mcts_steps_count) : 0.0;
+    agg_obj["average_coverage"] = avg_covered;
+    
+    agg_obj["search_swordmaster_rate"] = (global_stats.search_swordmasters * 100.0) / total_games;
+    agg_obj["opponent_swordmaster_rate"] = (global_stats.opponent_swordmasters * 100.0) / (3.0 * total_games);
+    
+    open_spiel::json::Object reasons_obj;
+    for (const auto& pair : global_stats.fallback_reason_counts) {
+      reasons_obj[pair.first] = static_cast<int64_t>(pair.second);
+    }
+    agg_obj["fallback_reasons"] = reasons_obj;
+    
+    open_spiel::json::Object rounds_obj;
+    std::map<int, int> round_counts;
+    for (int r : global_stats.rounds_played) {
+      round_counts[r]++;
+    }
+    for (const auto& pair : round_counts) {
+      rounds_obj[std::to_string(pair.first)] = static_cast<int64_t>(pair.second);
+    }
+    agg_obj["rounds_played_distribution"] = rounds_obj;
+
+    std::ofstream agg_file(aggregate_json_path);
+    if (agg_file) {
+      agg_file << open_spiel::json::ToString(agg_obj, true);
+    }
   }
 
   return 0;

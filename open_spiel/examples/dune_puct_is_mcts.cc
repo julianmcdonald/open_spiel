@@ -355,6 +355,27 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
       inference_count_this_search_++;
       opponent_prior_cache_[key] = prior;
     }
+
+    // Filter cached/evaluated prior by current concrete legal actions
+    ActionsAndProbs filtered_prior;
+    double sum_prob = 0.0;
+    for (const auto& ap : prior) {
+      if (std::find(legal_actions.begin(), legal_actions.end(), ap.first) != legal_actions.end()) {
+        filtered_prior.push_back(ap);
+        sum_prob += ap.second;
+      }
+    }
+    if (filtered_prior.empty()) {
+      for (Action a : legal_actions) {
+        filtered_prior.push_back({a, 1.0 / legal_actions.size()});
+      }
+    } else {
+      for (auto& ap : filtered_prior) {
+        ap.second = (sum_prob > 0.0) ? (ap.second / sum_prob) : (1.0 / filtered_prior.size());
+      }
+    }
+    prior = filtered_prior;
+
     Action chosen_action = kInvalidAction;
     if (prior.empty()) {
       if (!legal_actions.empty()) {
