@@ -128,9 +128,6 @@ void DunePUCTISMCTSBot::Reset() {
   node_pool_.clear();
   root_samples_.clear();
   root_node_ = nullptr;
-  max_depth_this_search_ = 0;
-  sum_depth_this_search_ = 0.0;
-  num_sims_this_search_ = 0;
   total_lookups_ = 0;
   reused_lookups_ = 0;
   opponent_prior_cache_.clear();
@@ -189,6 +186,7 @@ DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
 }
 
 DuneISMCTSNode* DunePUCTISMCTSBot::LookupOrCreateNode(const State& state) {
+  visited_nodes_this_search_.insert(GetStateKey(state));
   DuneISMCTSNode* node = LookupNode(state);
   if (node != nullptr) {
     return node;
@@ -326,6 +324,12 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
     }
     sum_depth_this_search_ += depth;
     num_sims_this_search_++;
+    simulation_depths_this_search_.push_back(depth);
+    terminal_leaf_simulations_count_++;
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state);
+    if (dune_state) {
+      max_round_this_search_ = std::max(max_round_this_search_, dune_state->GetCurrentRound());
+    }
     return returns;
   } else if (state->IsChanceNode()) {
     // Chance outcome RNG derived deterministically from stream seed
@@ -423,6 +427,11 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
       }
       sum_depth_this_search_ += depth;
       num_sims_this_search_++;
+      simulation_depths_this_search_.push_back(depth);
+      const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state);
+      if (dune_state) {
+        max_round_this_search_ = std::max(max_round_this_search_, dune_state->GetCurrentRound());
+      }
       return returns;
     }
   }
@@ -436,6 +445,11 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
     node->total_visits = 0;
     sum_depth_this_search_ += depth;
     num_sims_this_search_++;
+    simulation_depths_this_search_.push_back(depth);
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state);
+    if (dune_state) {
+      max_round_this_search_ = std::max(max_round_this_search_, dune_state->GetCurrentRound());
+    }
     return node->cached_values;
   }
 
@@ -457,6 +471,14 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
   root_samples_.clear();
   opponent_prior_cache_.clear();
   inference_count_this_search_ = 0;
+  
+  visited_nodes_this_search_.clear();
+  simulation_depths_this_search_.clear();
+  terminal_leaf_simulations_count_ = 0;
+  max_round_this_search_ = 0;
+  max_depth_this_search_ = 0;
+  sum_depth_this_search_ = 0.0;
+  num_sims_this_search_ = 0;
 
   if (evaluators_ != last_evaluators_ ||
       state.CurrentPlayer() != last_searching_player_ ||
@@ -697,7 +719,7 @@ std::pair<ActionsAndProbs, Action> DunePUCTISMCTSBot::StepWithPolicy(const State
   return {res.policy, sampled_action};
 }
 
-SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int min_visit_threshold) const {
+SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action) const {
   SearchDiagnostics diag;
   diag.root_value = 0.0;
   diag.total_root_visits = 0;
@@ -766,6 +788,106 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     diag.visit_counts.assign(legal_actions.size(), 0);
     diag.q_values.assign(legal_actions.size(), 0.0);
   }
+
+  // 18A diagnostics calculations
+  if (!simulation_depths_this_search_.empty()) {
+    double max_d = 0.0;
+    double sum_d = 0.0;
+    for (int d : simulation_depths_this_search_) {
+      max_d = std::max(max_d, static_cast<double>(d));
+      sum_d += d;
+    }
+    diag.max_depth = max_d;
+    diag.mean_depth = sum_d / simulation_depths_this_search_.size();
+    
+    std::vector<int> sorted_depths = simulation_depths_this_search_;
+    std::sort(sorted_depths.begin(), sorted_depths.end());
+    size_t p95_idx = std::min<size_t>(
+        sorted_depths.size() - 1,
+        static_cast<size_t>(0.95 * (sorted_depths.size() - 1)));
+    diag.p95_depth = sorted_depths[p95_idx];
+  } else {
+    diag.max_depth = 0.0;
+    diag.mean_depth = 0.0;
+    diag.p95_depth = 0.0;
+  }
+  
+  diag.deepest_simulated_round = max_round_this_search_;
+  diag.terminal_leaf_fraction = num_sims_this_search_ > 0 
+      ? static_cast<double>(terminal_leaf_simulations_count_) / num_sims_this_search_ 
+      : 0.0;
+  diag.unique_nodes = visited_nodes_this_search_.size();
+  diag.inference_count = inference_count_this_search_;
+
+  diag.forced_visit_counts.assign(legal_actions.size(), 0);
+  diag.pruned_visit_counts.assign(legal_actions.size(), 0);
+
+  double total_visits = 0.0;
+  for (int v : diag.visit_counts) {
+    total_visits += v;
+  }
+  std::vector<double> search_probs(legal_actions.size());
+  if (total_visits > 0.0) {
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      search_probs[i] = diag.visit_counts[i] / total_visits;
+    }
+  } else {
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      search_probs[i] = 1.0 / legal_actions.size();
+    }
+  }
+
+  diag.raw_to_search_policy_kl = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    double p_search = search_probs[i];
+    double p_raw = diag.priors[i];
+    if (p_search > 0.0) {
+      diag.raw_to_search_policy_kl += p_search * std::log(p_search / std::max(p_raw, 1e-12));
+    }
+  }
+
+  size_t chosen_idx = 0;
+  bool found_chosen = false;
+  if (chosen_action != kInvalidAction) {
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      if (legal_actions[i] == chosen_action) {
+        chosen_idx = i;
+        found_chosen = true;
+        break;
+      }
+    }
+  }
+  
+  if (!found_chosen) {
+    double max_prob = -1.0;
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      if (search_probs[i] > max_prob) {
+        max_prob = search_probs[i];
+        chosen_idx = i;
+      }
+    }
+  }
+  
+  diag.chosen_action_raw_prior_probability = diag.priors[chosen_idx];
+
+  int rank = 1;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    if (diag.priors[i] > diag.chosen_action_raw_prior_probability) {
+      rank++;
+    }
+  }
+  diag.chosen_action_raw_prior_rank = rank;
+
+  size_t raw_argmax_idx = 0;
+  double max_raw_prob = -1.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    if (diag.priors[i] > max_raw_prob) {
+      max_raw_prob = diag.priors[i];
+      raw_argmax_idx = i;
+    }
+  }
+  diag.action_changed_vs_raw_argmax = (chosen_idx != raw_argmax_idx);
+
   return diag;
 }
 

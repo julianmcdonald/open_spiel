@@ -377,6 +377,7 @@ void WorkerThread(
 
             std::string search_jsonl = absl::GetFlag(FLAGS_search_jsonl_path);
             if (!search_jsonl.empty()) {
+              SearchDiagnostics diag = mcts_bot->GetRootDiagnostics(*state, 2, chosen_action);
               open_spiel::json::Object search_obj;
               search_obj["episode_id"] = static_cast<int64_t>(g);
               search_obj["game_seed"] = static_cast<int64_t>(game_seed);
@@ -395,26 +396,48 @@ void WorkerThread(
                 search_obj["action_chosen_string"] = dune_state->ActionToString(current_player, chosen_action);
               }
               open_spiel::json::Array legals_arr;
-              for (Action a : last_res.diagnostics.actions) {
+              for (Action a : diag.actions) {
                 legals_arr.push_back(static_cast<int64_t>(a));
               }
               search_obj["legal_actions"] = legals_arr;
               open_spiel::json::Array visits_arr;
-              for (int v : last_res.diagnostics.visit_counts) {
+              for (int v : diag.visit_counts) {
                 visits_arr.push_back(static_cast<int64_t>(v));
               }
               search_obj["visit_counts"] = visits_arr;
               open_spiel::json::Array q_arr;
-              for (double q : last_res.diagnostics.q_values) {
+              for (double q : diag.q_values) {
                 q_arr.push_back(q);
               }
               search_obj["q_values"] = q_arr;
               open_spiel::json::Array priors_arr;
-              for (double p_val : last_res.diagnostics.priors) {
+              for (double p_val : diag.priors) {
                 priors_arr.push_back(p_val);
               }
               search_obj["priors"] = priors_arr;
-              search_obj["root_value"] = last_res.diagnostics.root_value;
+              search_obj["root_value"] = diag.root_value;
+              search_obj["max_depth"] = diag.max_depth;
+              search_obj["mean_depth"] = diag.mean_depth;
+              search_obj["p95_depth"] = diag.p95_depth;
+              search_obj["deepest_simulated_round"] = static_cast<int64_t>(diag.deepest_simulated_round);
+              search_obj["terminal_leaf_fraction"] = diag.terminal_leaf_fraction;
+              search_obj["unique_nodes"] = static_cast<int64_t>(diag.unique_nodes);
+              search_obj["raw_to_search_policy_kl"] = diag.raw_to_search_policy_kl;
+              search_obj["chosen_action_raw_prior_probability"] = diag.chosen_action_raw_prior_probability;
+              search_obj["chosen_action_raw_prior_rank"] = static_cast<int64_t>(diag.chosen_action_raw_prior_rank);
+              search_obj["action_changed_vs_raw_argmax"] = diag.action_changed_vs_raw_argmax;
+
+              open_spiel::json::Array forced_arr;
+              for (int v : diag.forced_visit_counts) {
+                forced_arr.push_back(static_cast<int64_t>(v));
+              }
+              search_obj["forced_visit_counts"] = forced_arr;
+
+              open_spiel::json::Array pruned_arr;
+              for (int v : diag.pruned_visit_counts) {
+                pruned_arr.push_back(static_cast<int64_t>(v));
+              }
+              search_obj["pruned_visit_counts"] = pruned_arr;
 
               std::lock_guard<std::mutex> lock(log_mutex);
               std::ofstream search_file(search_jsonl, std::ios::app);

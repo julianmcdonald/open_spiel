@@ -20,6 +20,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_puct_is_mcts_test dune_puct_is_mcts_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_puct_is_mcts_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_puct_is_mcts_test COMMAND dune_puct_is_mcts_test)
 
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
@@ -38,6 +39,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_diagnose dune_diagnose.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_diagnose ${TORCH_LIBRARIES})
+
+  add_executable(dune_create_corpus dune_create_corpus.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_create_corpus dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_critic_fidelity_gate dune_critic_fidelity_gate.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_critic_fidelity_gate dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_seed_utils_test dune_seed_utils_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_seed_utils_test ${TORCH_LIBRARIES})

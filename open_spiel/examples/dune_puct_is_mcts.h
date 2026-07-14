@@ -61,6 +61,21 @@ struct SearchDiagnostics {
   int total_root_visits = 0;
   int num_covered_actions = 0;       // Actions with visits >= min_visit_threshold
   double covered_prior_mass = 0.0;   // Sum of π(a) for covered actions
+
+  // 18A metrics
+  double max_depth = 0.0;
+  double mean_depth = 0.0;
+  double p95_depth = 0.0;
+  int deepest_simulated_round = 0;
+  double terminal_leaf_fraction = 0.0;
+  int unique_nodes = 0;
+  int inference_count = 0;
+  double raw_to_search_policy_kl = 0.0;
+  double chosen_action_raw_prior_probability = 0.0;
+  int chosen_action_raw_prior_rank = 0;
+  std::vector<int> forced_visit_counts;
+  std::vector<int> pruned_visit_counts;
+  bool action_changed_vs_raw_argmax = false;
 };
 
 struct DuneSearchResult {
@@ -145,7 +160,7 @@ class DunePUCTISMCTSBot : public Bot {
   std::pair<ActionsAndProbs, Action> StepWithPolicy(const State& state) override;
 
   DuneSearchResult RunSearch(const State& state);
-  SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold = 2) const;
+  SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action = kInvalidAction) const;
   const DuneSearchResult& GetLastSearchResult() const;
 
   void Restart() override { Reset(); }
@@ -180,6 +195,11 @@ class DunePUCTISMCTSBot : public Bot {
   int reused_lookups_ = 0;
   int search_count_ = 0;
 
+  // 18A diagnostics tracking fields
+  std::vector<int> simulation_depths_this_search_;
+  int terminal_leaf_simulations_count_ = 0;
+  int max_round_this_search_ = 0;
+
   absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*> nodes_;
   std::vector<std::unique_ptr<DuneISMCTSNode>> node_pool_;
   std::vector<std::unique_ptr<State>> root_samples_;
@@ -192,6 +212,7 @@ class DunePUCTISMCTSBot : public Bot {
   DuneSearchResult last_search_result_;
   int inference_count_this_search_ = 0;
   absl::flat_hash_map<std::pair<Player, std::string>, ActionsAndProbs> opponent_prior_cache_;
+  absl::flat_hash_set<std::pair<Player, std::string>> visited_nodes_this_search_;
 };
 
 }  // namespace open_spiel
