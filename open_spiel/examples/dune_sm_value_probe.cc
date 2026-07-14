@@ -21,6 +21,7 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_search_session.h"
 #include "dune_evaluator.h"
 #include "dune_warmstart_helpers.h"
 #include "dune_network.h"
@@ -130,13 +131,23 @@ int main(int argc, char** argv) {
     auto thread_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
         model, device);
         
-    std::vector<std::unique_ptr<open_spiel::DunePUCTISMCTSBot>> thread_bots;
+    std::vector<std::unique_ptr<open_spiel::DuneSearchSession>> thread_sessions;
     for (int p = 0; p < 4; ++p) {
-      thread_bots.push_back(std::make_unique<open_spiel::DunePUCTISMCTSBot>(
-          rng(), thread_evaluator, puct_c, probe_simulations,
-          -1, 1.0, 0.0, 0.3, utility_divisor, true,
-          open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
-          true, search_opponent_temperature));
+      open_spiel::DuneSearchConfig bot_cfg;
+      bot_cfg.max_simulations = probe_simulations;
+      bot_cfg.puct_c = puct_c;
+      bot_cfg.opponent_mode = open_spiel::SearchOpponentMode::kPolicy;
+      bot_cfg.opponent_temperature = search_opponent_temperature;
+      bot_cfg.temperature = 0.0;
+      bot_cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+      bot_cfg.seed = rng();
+      bot_cfg.fixed_session_limit = probe_simulations;
+      bot_cfg.purchase_combat_budget = 16;
+      open_spiel::LoadCalibratedParameters(bot_cfg);
+      bot_cfg.utility_divisor = utility_divisor;
+      
+      thread_sessions.push_back(std::make_unique<open_spiel::DuneSearchSession>(
+          bot_cfg, thread_evaluator, open_spiel::DuneSearchBudgetMode::kFixedSessionSimulations));
     }
     
     while (true) {
@@ -158,6 +169,10 @@ int main(int argc, char** argv) {
       else if (config_idx == 4) { is_search[1] = is_search[3] = true; }
       else if (config_idx == 5) { is_search[2] = is_search[3] = true; }
       
+      for (int p = 0; p < 4; ++p) {
+        thread_sessions[p]->ResetSession("new_game");
+      }
+
       auto state = game->NewInitialState();
       
       int last_logged_round = -1;
@@ -190,7 +205,8 @@ int main(int argc, char** argv) {
           open_spiel::Player cur_player = state->CurrentPlayer();
           open_spiel::Action action = open_spiel::kInvalidAction;
           if (is_search[cur_player]) {
-            action = thread_bots[cur_player]->Step(*state);
+            open_spiel::DuneSearchResult res = thread_sessions[cur_player]->Search(*state);
+            action = res.diagnostics.selected_action;
           } else {
             open_spiel::ActionsAndProbs prior = thread_evaluator->Prior(*state);
             double max_p = -1.0;

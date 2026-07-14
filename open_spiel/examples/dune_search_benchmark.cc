@@ -27,6 +27,7 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_search_session.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
@@ -60,6 +61,11 @@ ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth d
 ABSL_FLAG(bool, check_strategic_state, false, "Whether to bypass MCTS search at non-strategic states.");
 ABSL_FLAG(bool, disable_time_limit, false, "Disable the time limit per move for fixed-simulation evaluation.");
 ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
+ABSL_FLAG(int, fixed_continuation_reserve, 0, "Continuation reserve simulations.");
+ABSL_FLAG(int, purchase_combat_budget, 16, "Purchase/combat short-window simulation budget.");
+ABSL_FLAG(double, live_continuation_reserve_seconds, 10.0, "Live continuation reserve seconds.");
+ABSL_FLAG(bool, live_deadline, false, "Use live deadline budget mode instead of fixed simulations.");
+ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
 
 namespace open_spiel {
 namespace {
@@ -239,6 +245,7 @@ struct GameStats {
   int64_t total_incomplete_searches = 0;
   std::vector<double> search_mcts_step_times;
   double covered_prior_mass_sum = 0.0;
+  int64_t role_counts[7] = {0, 0, 0, 0, 0, 0, 0};
 };
 
 
@@ -273,17 +280,17 @@ void WorkerThread(
     thread_stats.games_by_seat[search_seat]++;
 
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
-    
     // Create thread-local, bot-specific evaluator wrapping the shared search model
     auto search_evaluator = std::make_shared<DuneNNEvaluator>(
         search_model, device, 10.0f);
 
+    std::unique_ptr<DuneSearchSession> search_session;
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
       if (p == search_seat) {
         DuneSearchConfig config{
             absl::GetFlag(FLAGS_max_simulations),
-            absl::GetFlag(FLAGS_disable_time_limit) ? std::numeric_limits<double>::infinity() : 10000.0, // relative_time_budget_ms
+            absl::GetFlag(FLAGS_disable_time_limit) ? std::numeric_limits<double>::infinity() : absl::GetFlag(FLAGS_relative_time_budget_ms), // relative_time_budget_ms
             50000,   // max_nodes
             absl::GetFlag(FLAGS_puct_c),
             absl::GetFlag(FLAGS_use_opponent_model) ? SearchOpponentMode::kPolicy : SearchOpponentMode::kMaxN,
@@ -302,7 +309,15 @@ void WorkerThread(
             absl::GetFlag(FLAGS_check_strategic_state),
             absl::GetFlag(FLAGS_root_prior_temperature)
         };
-        bots[p] = std::make_unique<DunePUCTISMCTSBot>(config, search_evaluator);
+        config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
+        config.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
+        config.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+        config.live_continuation_reserve_seconds = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+        config.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+        DuneSearchBudgetMode budget_mode = absl::GetFlag(FLAGS_live_deadline)
+            ? DuneSearchBudgetMode::kLiveDeadline
+            : DuneSearchBudgetMode::kFixedSessionSimulations;
+        search_session = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
       } else {
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
@@ -319,7 +334,28 @@ void WorkerThread(
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
 
+    std::vector<int> game_role_counts(7, 0);
+    bool in_search_turn = false;
+    int turn_decisions = 0;
+    int turn_primary_sims = 0;
+    int turn_continuation_sims = 0;
+    double turn_wall_time_ms = 0.0;
+    bool turn_had_timeout = false;
+    bool turn_had_fallback = false;
+    std::string turn_fallback_reason = "none";
+
     while (!state->IsTerminal()) {
+      Player current_player = state->CurrentPlayer();
+      if (in_search_turn && current_player != search_seat && current_player != kChancePlayerId) {
+        std::cout << "--- End of Agent Turn Audit Summary ---\n"
+                  << "Decisions: " << turn_decisions << " (Primary: 1, Continuations: " << (turn_decisions - 1) << ")\n"
+                  << "Total simulations completed: " << (turn_primary_sims + turn_continuation_sims) << " (Primary: " << turn_primary_sims << ", Continuation: " << turn_continuation_sims << ")\n"
+                  << "Total wall-clock time: " << turn_wall_time_ms << " ms\n"
+                  << "Timeout status: " << (turn_had_timeout ? "Yes" : "No") << "\n"
+                  << "Fallback status: " << (turn_had_fallback ? "Yes" : "No") << " (Reason: " << turn_fallback_reason << ")\n"
+                  << "---------------------------------------\n";
+        in_search_turn = false;
+      }
       ++game_length;
       if (game_length > 5000) {
         std::cerr << "Infinite loop guard hit in thread " << thread_id << "!\n";
@@ -338,54 +374,109 @@ void WorkerThread(
         continue;
       }
 
-      Player current_player = state->CurrentPlayer();
       Action chosen_action = -1;
 
       if (current_player == search_seat) {
-        bool is_strategic = IsStrategicState(*state, current_player);
+        open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, search_session->HasActiveSession());
+        game_role_counts[static_cast<int>(role)]++;
+        bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
-        chosen_action = bots[current_player]->Step(*state);
+        DuneSearchResult last_res = search_session->Search(*state);
+        chosen_action = last_res.diagnostics.selected_action;
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
+        
+        // Update turn statistics
+        if (role == open_spiel::DuneDecisionRole::kAgentPrimary) {
+          in_search_turn = true;
+          turn_decisions = 1;
+          turn_primary_sims = last_res.simulations_completed;
+          turn_continuation_sims = 0;
+          turn_wall_time_ms = step_duration * 1000.0;
+          turn_had_timeout = last_res.timeout_status;
+          turn_had_fallback = last_res.used_fallback;
+          turn_fallback_reason = last_res.fallback_reason;
+        } else if (in_search_turn && role == open_spiel::DuneDecisionRole::kAgentContinuation) {
+          turn_decisions++;
+          turn_continuation_sims += last_res.simulations_completed;
+          turn_wall_time_ms += step_duration * 1000.0;
+          if (last_res.timeout_status) turn_had_timeout = true;
+          if (last_res.used_fallback) {
+            turn_had_fallback = true;
+            turn_fallback_reason = last_res.fallback_reason;
+          }
+        }
         thread_stats.search_step_time_sum += step_duration;
         thread_stats.search_steps_count++;
         if (is_strategic) {
           thread_stats.search_mcts_step_time_sum += step_duration;
           thread_stats.search_mcts_steps_count++;
           thread_stats.search_mcts_step_times.push_back(step_duration);
-          auto* mcts_bot = dynamic_cast<DunePUCTISMCTSBot*>(bots[current_player].get());
-          if (mcts_bot != nullptr) {
-            const DuneSearchResult& last_res = mcts_bot->GetLastSearchResult();
-            thread_stats.total_simulations_completed += last_res.simulations_completed;
-            thread_stats.total_inferences += last_res.inference_count;
-            thread_stats.covered_prior_mass_sum += last_res.diagnostics.covered_prior_mass;
-            if (last_res.timeout_status) {
-              thread_stats.total_timeouts++;
+          
+          thread_stats.total_simulations_completed += last_res.simulations_completed;
+          thread_stats.total_inferences += last_res.inference_count;
+          thread_stats.covered_prior_mass_sum += last_res.diagnostics.covered_prior_mass;
+          if (last_res.timeout_status) {
+            thread_stats.total_timeouts++;
+          }
+          if (last_res.used_fallback) {
+            thread_stats.total_fallbacks++;
+            thread_stats.fallback_reason_counts[last_res.fallback_reason]++;
+          }
+          int reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
+          int target_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary)
+              ? (absl::GetFlag(FLAGS_max_simulations) - reserve)
+              : absl::GetFlag(FLAGS_max_simulations);
+          int completed_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary)
+              ? last_res.simulations_completed
+              : search_session->session_new_simulations_completed();
+
+          bool is_incomplete = false;
+          if (absl::GetFlag(FLAGS_live_deadline)) {
+            int step_sims = last_res.simulations_completed;
+            if (role == open_spiel::DuneDecisionRole::kAgentContinuation) {
+              if (step_sims < absl::GetFlag(FLAGS_fixed_continuation_reserve)) {
+                is_incomplete = true;
+              }
+            } else if (role == open_spiel::DuneDecisionRole::kPurchase ||
+                       role == open_spiel::DuneDecisionRole::kCombatIntrigue ||
+                       role == open_spiel::DuneDecisionRole::kOtherOptional) {
+              if (step_sims < absl::GetFlag(FLAGS_purchase_combat_budget)) {
+                is_incomplete = true;
+              }
             }
-            if (last_res.used_fallback) {
-              thread_stats.total_fallbacks++;
-              thread_stats.fallback_reason_counts[last_res.fallback_reason]++;
+          } else {
+            if (completed_sims < target_sims) {
+              is_incomplete = true;
             }
-            if (last_res.simulations_completed < absl::GetFlag(FLAGS_max_simulations)) {
-              thread_stats.total_incomplete_searches++;
+          }
+
+          if (is_incomplete) {
+            thread_stats.total_incomplete_searches++;
+            if (!absl::GetFlag(FLAGS_live_deadline)) {
               if (last_res.fallback_reason == "timeout" || last_res.fallback_reason == "max_nodes" || last_res.timeout_status) {
-                std::cerr << "\nCRITICAL FAILURE: Strategic search at episode " << g 
-                          << " stopped before completing " << absl::GetFlag(FLAGS_max_simulations)
+                std::cerr << "\nCRITICAL FAILURE: Strategic search stopped before completing "
+                          << target_sims
                           << " simulations due to " << last_res.fallback_reason 
-                          << " (completed " << last_res.simulations_completed << " simulations).\n";
+                          << " (completed " << completed_sims << " simulations).\n";
                 std::exit(1);
               }
             }
-
+          }
+        }
             std::string search_jsonl = absl::GetFlag(FLAGS_search_jsonl_path);
             if (!search_jsonl.empty()) {
-              SearchDiagnostics diag = mcts_bot->GetRootDiagnostics(*state, 2, chosen_action);
+              SearchDiagnostics diag = last_res.diagnostics;
               open_spiel::json::Object search_obj;
               search_obj["episode_id"] = static_cast<int64_t>(g);
               search_obj["game_seed"] = static_cast<int64_t>(game_seed);
               search_obj["search_seat"] = static_cast<int64_t>(search_seat);
               search_obj["player"] = static_cast<int64_t>(current_player);
-              search_obj["is_strategic"] = true;
+              search_obj["decision_role"] = diag.decision_role;
+              search_obj["is_strategic"] = (diag.decision_role == "2" || diag.decision_role == "3");
+              search_obj["re_root_status"] = diag.re_root_status;
+              search_obj["reset_reason"] = diag.reset_reason;
+              search_obj["hard_sim_limit"] = static_cast<int64_t>(diag.hard_sim_limit);
               search_obj["simulations_completed"] = static_cast<int64_t>(last_res.simulations_completed);
               search_obj["inference_count"] = static_cast<int64_t>(last_res.inference_count);
               search_obj["timeout_status"] = last_res.timeout_status;
@@ -441,20 +532,64 @@ void WorkerThread(
               }
               search_obj["pruned_visit_counts"] = pruned_arr;
 
+              // Write 18A-v2 specific diagnostics/telemetry
+              search_obj["protocol_version"] = diag.protocol_version;
+              search_obj["session_id"] = diag.session_id;
+              search_obj["searched_seat"] = static_cast<int64_t>(diag.searched_seat);
+              search_obj["round"] = static_cast<int64_t>(diag.round);
+              search_obj["phase"] = diag.phase;
+              search_obj["decision_role"] = diag.decision_role;
+              search_obj["budget_mode"] = diag.budget_mode;
+              search_obj["hard_sim_limit"] = static_cast<int64_t>(diag.hard_sim_limit);
+              search_obj["soft_sim_limit"] = static_cast<int64_t>(diag.soft_sim_limit);
+              search_obj["hard_time_limit_ms"] = diag.hard_time_limit_ms;
+              search_obj["soft_time_limit_ms"] = diag.soft_time_limit_ms;
+              search_obj["elapsed_search_time_ms"] = diag.elapsed_search_time_ms;
+              search_obj["observation_wait_time_ms"] = diag.observation_wait_time_ms;
+              search_obj["inherited_root_visits"] = static_cast<int64_t>(diag.inherited_root_visits);
+              search_obj["newly_completed_simulations"] = static_cast<int64_t>(diag.newly_completed_simulations);
+              search_obj["session_cumulative_simulations"] = static_cast<int64_t>(diag.session_cumulative_simulations);
+              search_obj["session_cumulative_search_time_ms"] = diag.session_cumulative_search_time_ms;
+              search_obj["long_agent_session_cumulative_time_ms"] = diag.long_agent_session_cumulative_time_ms;
+              search_obj["re_root_status"] = diag.re_root_status;
+              search_obj["post_chance_branch_miss"] = diag.post_chance_branch_miss;
+              search_obj["root_coverage"] = diag.root_coverage;
+              search_obj["reset_reason"] = diag.reset_reason;
+              search_obj["tree_node_count"] = static_cast<int64_t>(diag.tree_node_count);
+              search_obj["legality_result"] = diag.legality_result;
+
               std::lock_guard<std::mutex> lock(log_mutex);
               std::ofstream search_file(search_jsonl, std::ios::app);
               if (search_file) {
                 search_file << open_spiel::json::ToString(search_obj, false) << "\n";
               }
             }
-          }
-        }
-      } else {
+          } else {
         chosen_action = bots[current_player]->Step(*state);
       }
 
       state->ApplyAction(chosen_action);
     }
+
+    if (in_search_turn) {
+      std::cout << "--- End of Agent Turn Audit Summary ---\n"
+                << "Decisions: " << turn_decisions << " (Primary: 1, Continuations: " << (turn_decisions - 1) << ")\n"
+                << "Total simulations completed: " << (turn_primary_sims + turn_continuation_sims) << " (Primary: " << turn_primary_sims << ", Continuation: " << turn_continuation_sims << ")\n"
+                << "Total wall-clock time: " << turn_wall_time_ms << " ms\n"
+                << "Timeout status: " << (turn_had_timeout ? "Yes" : "No") << "\n"
+                << "Fallback status: " << (turn_had_fallback ? "Yes" : "No") << " (Reason: " << turn_fallback_reason << ")\n"
+                << "---------------------------------------\n";
+    }
+
+    std::cout << "=== Game " << g << " Role Counts ===\n"
+              << "kForcedOrBookkeeping: " << game_role_counts[0] << "\n"
+              << "kLeaderSelection: " << game_role_counts[1] << "\n"
+              << "kAgentPrimary: " << game_role_counts[2] << "\n"
+              << "kAgentContinuation: " << game_role_counts[3] << "\n"
+              << "kPurchase: " << game_role_counts[4] << "\n"
+              << "kCombatIntrigue: " << game_role_counts[5] << "\n"
+              << "kOtherOptional: " << game_role_counts[6] << "\n"
+              << "========================\n";
 
     std::vector<double> returns = state->Returns();
     for (double r : returns) {
@@ -631,6 +766,9 @@ void WorkerThread(
       global_stats.covered_prior_mass_sum += thread_stats.covered_prior_mass_sum;
       for (const auto& pair : thread_stats.fallback_reason_counts) {
         global_stats.fallback_reason_counts[pair.first] += pair.second;
+      }
+      for (int i = 0; i < 7; ++i) {
+        global_stats.role_counts[i] += game_role_counts[i];
       }
 
       int comp = ++completed_games;
@@ -981,6 +1119,16 @@ int main(int argc, char* argv[]) {
     agg_obj["total_simulations_completed"] = static_cast<int64_t>(global_stats.total_simulations_completed);
     agg_obj["incomplete_searches"] = static_cast<int64_t>(global_stats.total_incomplete_searches);
     
+    open_spiel::json::Object roles_obj;
+    roles_obj["kForcedOrBookkeeping"] = static_cast<int64_t>(global_stats.role_counts[0]);
+    roles_obj["kLeaderSelection"] = static_cast<int64_t>(global_stats.role_counts[1]);
+    roles_obj["kAgentPrimary"] = static_cast<int64_t>(global_stats.role_counts[2]);
+    roles_obj["kAgentContinuation"] = static_cast<int64_t>(global_stats.role_counts[3]);
+    roles_obj["kPurchase"] = static_cast<int64_t>(global_stats.role_counts[4]);
+    roles_obj["kCombatIntrigue"] = static_cast<int64_t>(global_stats.role_counts[5]);
+    roles_obj["kOtherOptional"] = static_cast<int64_t>(global_stats.role_counts[6]);
+    agg_obj["decision_role_counts"] = roles_obj;
+    
     double timeout_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_timeouts * 100.0) / global_stats.search_mcts_steps_count : 0.0;
     double fallback_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_fallbacks * 100.0) / global_stats.search_mcts_steps_count : 0.0;
     agg_obj["timeout_rate"] = timeout_rate;
@@ -1008,13 +1156,23 @@ int main(int argc, char* argv[]) {
     
     open_spiel::json::Object rounds_obj;
     std::map<int, int> round_counts;
+    double sum_rounds = 0.0;
     for (int r : global_stats.rounds_played) {
       round_counts[r]++;
+      sum_rounds += r;
     }
     for (const auto& pair : round_counts) {
       rounds_obj[std::to_string(pair.first)] = static_cast<int64_t>(pair.second);
     }
     agg_obj["rounds_played_distribution"] = rounds_obj;
+    
+    double mean_rounds = global_stats.rounds_played.empty() ? 0.0 : sum_rounds / global_stats.rounds_played.size();
+    agg_obj["mean_rounds"] = mean_rounds;
+
+    double search_completeness = global_stats.search_mcts_steps_count > 0
+        ? 1.0 - (static_cast<double>(global_stats.total_incomplete_searches) / global_stats.search_mcts_steps_count)
+        : 1.0;
+    agg_obj["search_completeness"] = search_completeness;
 
     std::ofstream agg_file(aggregate_json_path);
     if (agg_file) {

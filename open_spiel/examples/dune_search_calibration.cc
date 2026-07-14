@@ -28,6 +28,7 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_search_session.h"
 #include "dune_warmstart_helpers.h"
 #include "dune_batched_evaluator.h"
 #include "dune_sha256.h"
@@ -43,8 +44,11 @@ ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature");
 ABSL_FLAG(double, utility_divisor, 4.0, "Utility divisor");
 ABSL_FLAG(int, threads, 32, "Number of threads");
 ABSL_FLAG(double, relative_time_budget_ms, std::numeric_limits<double>::infinity(), "Time limit per move in ms");
-ABSL_FLAG(int, limit_states, 64, "Limit count of states evaluated");
+ABSL_FLAG(int, limit_states, 0, "Limit count of states evaluated");
 ABSL_FLAG(std::string, report_path, "", "Path to output a structured JSON report");
+ABSL_FLAG(int, fixed_continuation_reserve, 0, "Continuation reserve simulations.");
+ABSL_FLAG(int, purchase_combat_budget, 16, "Purchase/combat short-window simulation budget.");
+ABSL_FLAG(std::string, target_role, "primary", "Role to calibrate: 'primary', 'purchase', or 'combat'");
 
 using namespace open_spiel;
 
@@ -188,15 +192,27 @@ int main(int argc, char** argv) {
     corpus.push_back(cs);
   }
 
+  std::string target_role = absl::GetFlag(FLAGS_target_role);
+  open_spiel::DuneDecisionRole expected_role = open_spiel::DuneDecisionRole::kAgentPrimary;
+  if (target_role == "purchase") {
+    expected_role = open_spiel::DuneDecisionRole::kPurchase;
+  } else if (target_role == "combat") {
+    expected_role = open_spiel::DuneDecisionRole::kCombatIntrigue;
+  }
+
   std::vector<size_t> strategic_indices;
   for (size_t i = 0; i < corpus.size(); ++i) {
-    if (corpus[i].category == "strategic") {
+    auto state = ReconstructState(game, corpus[i].history);
+    open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, state->CurrentPlayer(), false);
+    if (role == expected_role) {
       strategic_indices.push_back(i);
     }
   }
 
-  if (limit_states > 0 && limit_states < static_cast<int>(strategic_indices.size())) {
+  if (limit_states > 0) {
+    SPIEL_CHECK_GE(strategic_indices.size(), static_cast<size_t>(limit_states));
     strategic_indices.erase(strategic_indices.begin() + limit_states, strategic_indices.end());
+    SPIEL_CHECK_EQ(strategic_indices.size(), static_cast<size_t>(limit_states));
   }
 
   std::cout << absl::StrFormat("Loaded %d strategic states for evaluation.\n", strategic_indices.size());
@@ -240,16 +256,20 @@ int main(int argc, char** argv) {
       bot_cfg.relative_time_budget_ms = time_budget_ms;
       bot_cfg.seed = seed + 200000 + 1000 * idx;
       bot_cfg.root_prior_temperature = prior_temp;
+      bot_cfg.fixed_session_limit = max_simulations;
+      bot_cfg.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
+      bot_cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+      bot_cfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
 
-      DunePUCTISMCTSBot bot(bot_cfg, global_evaluator);
-      DuneSearchResult result = bot.RunSearch(*state);
+      DuneSearchSession session(bot_cfg, global_evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+      DuneSearchResult result = session.Search(*state);
 
       Action a_search = kInvalidAction;
-      int max_visits = -1;
-      for (size_t k = 0; k < result.diagnostics.actions.size(); ++k) {
-        if (result.diagnostics.visit_counts[k] > max_visits) {
-          max_visits = result.diagnostics.visit_counts[k];
-          a_search = result.diagnostics.actions[k];
+      double max_prob = -1.0;
+      for (const auto& ap : result.policy) {
+        if (ap.second > max_prob) {
+          max_prob = ap.second;
+          a_search = ap.first;
         }
       }
 
@@ -286,19 +306,24 @@ int main(int argc, char** argv) {
       double q_search = q_search_sum / rollouts;
       double state_advantage = q_search - q_raw;
 
-      // Acceptance yield calculations
-      open_spiel::SearchDiagnostics diag = bot.GetRootDiagnostics(*state, 2);
+      open_spiel::SearchDiagnostics diag = result.diagnostics;
       int required_coverage = std::min(3, static_cast<int>(diag.actions.size()));
       bool has_coverage = (diag.num_covered_actions >= required_coverage);
       bool has_mass = (diag.covered_prior_mass >= 0.50);
       bool accepted = (has_coverage && has_mass);
 
-      // Discovery rate
+      // Discovery rate using true unscaled ppo_prior
       int discovered = 0;
       for (size_t k = 0; k < diag.actions.size(); ++k) {
-        double raw_p = diag.priors[k];
+        double true_raw_p = 0.0;
+        for (const auto& ap : ppo_prior) {
+          if (ap.first == diag.actions[k]) {
+            true_raw_p = ap.second;
+            break;
+          }
+        }
         double visit_prob = static_cast<double>(diag.visit_counts[k]) / std::max(1, diag.total_root_visits);
-        if (raw_p < 0.01 && visit_prob >= 0.05) {
+        if (true_raw_p < 0.01 && visit_prob >= 0.05) {
           discovered++;
         }
       }

@@ -19,7 +19,9 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include "dune_puct_is_mcts.h"
+#include "dune_search_session.h"
 #include "dune_evaluator.h"
+#include "dune_search_routing.h"
 #endif
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
@@ -552,7 +554,14 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readwrite("dirichlet_alpha", &open_spiel::DuneSearchConfig::dirichlet_alpha)
       .def_readwrite("use_observation_string", &open_spiel::DuneSearchConfig::use_observation_string)
       .def_readwrite("verbose_diagnostics", &open_spiel::DuneSearchConfig::verbose_diagnostics)
-      .def_readwrite("check_strategic_state", &open_spiel::DuneSearchConfig::check_strategic_state);
+      .def_readwrite("check_strategic_state", &open_spiel::DuneSearchConfig::check_strategic_state)
+      .def_readwrite("fixed_continuation_reserve", &open_spiel::DuneSearchConfig::fixed_continuation_reserve)
+      .def_readwrite("purchase_combat_budget", &open_spiel::DuneSearchConfig::purchase_combat_budget)
+      .def_readwrite("live_continuation_reserve_seconds", &open_spiel::DuneSearchConfig::live_continuation_reserve_seconds)
+      .def_readwrite("fixed_session_limit", &open_spiel::DuneSearchConfig::fixed_session_limit)
+      .def_readwrite("model_checkpoint_path", &open_spiel::DuneSearchConfig::model_checkpoint_path)
+      .def_readwrite("root_prior_temperature", &open_spiel::DuneSearchConfig::root_prior_temperature)
+      .def_readwrite("training_root_prior_temperature", &open_spiel::DuneSearchConfig::training_root_prior_temperature);
 
   py::class_<open_spiel::SearchDiagnostics>(di, "SearchDiagnostics")
       .def_readonly("actions", &open_spiel::SearchDiagnostics::actions)
@@ -562,7 +571,33 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("root_value", &open_spiel::SearchDiagnostics::root_value)
       .def_readonly("total_root_visits", &open_spiel::SearchDiagnostics::total_root_visits)
       .def_readonly("num_covered_actions", &open_spiel::SearchDiagnostics::num_covered_actions)
-      .def_readonly("covered_prior_mass", &open_spiel::SearchDiagnostics::covered_prior_mass);
+      .def_readonly("covered_prior_mass", &open_spiel::SearchDiagnostics::covered_prior_mass)
+      .def_readonly("protocol_version", &open_spiel::SearchDiagnostics::protocol_version)
+      .def_readonly("session_id", &open_spiel::SearchDiagnostics::session_id)
+      .def_readonly("searched_seat", &open_spiel::SearchDiagnostics::searched_seat)
+      .def_readonly("round", &open_spiel::SearchDiagnostics::round)
+      .def_readonly("phase", &open_spiel::SearchDiagnostics::phase)
+      .def_readonly("decision_role", &open_spiel::SearchDiagnostics::decision_role)
+      .def_readonly("budget_mode", &open_spiel::SearchDiagnostics::budget_mode)
+      .def_readonly("hard_sim_limit", &open_spiel::SearchDiagnostics::hard_sim_limit)
+      .def_readonly("soft_sim_limit", &open_spiel::SearchDiagnostics::soft_sim_limit)
+      .def_readonly("hard_time_limit_ms", &open_spiel::SearchDiagnostics::hard_time_limit_ms)
+      .def_readonly("soft_time_limit_ms", &open_spiel::SearchDiagnostics::soft_time_limit_ms)
+      .def_readonly("elapsed_search_time_ms", &open_spiel::SearchDiagnostics::elapsed_search_time_ms)
+      .def_readonly("observation_wait_time_ms", &open_spiel::SearchDiagnostics::observation_wait_time_ms)
+      .def_readonly("inherited_root_visits", &open_spiel::SearchDiagnostics::inherited_root_visits)
+      .def_readonly("newly_completed_simulations", &open_spiel::SearchDiagnostics::newly_completed_simulations)
+      .def_readonly("session_cumulative_simulations", &open_spiel::SearchDiagnostics::session_cumulative_simulations)
+      .def_readonly("session_cumulative_search_time_ms", &open_spiel::SearchDiagnostics::session_cumulative_search_time_ms)
+      .def_readonly("long_agent_session_cumulative_time_ms", &open_spiel::SearchDiagnostics::long_agent_session_cumulative_time_ms)
+      .def_readonly("re_root_status", &open_spiel::SearchDiagnostics::re_root_status)
+      .def_readonly("post_chance_branch_miss", &open_spiel::SearchDiagnostics::post_chance_branch_miss)
+      .def_readonly("root_coverage", &open_spiel::SearchDiagnostics::root_coverage)
+      .def_readonly("reset_reason", &open_spiel::SearchDiagnostics::reset_reason)
+      .def_readonly("tree_node_count", &open_spiel::SearchDiagnostics::tree_node_count)
+      .def_readonly("selected_action", &open_spiel::SearchDiagnostics::selected_action)
+      .def_readonly("legality_result", &open_spiel::SearchDiagnostics::legality_result)
+      .def_readonly("fallback_reason", &open_spiel::SearchDiagnostics::fallback_reason);
 
   py::class_<open_spiel::DuneSearchResult>(di, "DuneSearchResult")
       .def_readonly("policy", &open_spiel::DuneSearchResult::policy)
@@ -579,9 +614,46 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("config"), py::arg("evaluator"))
       .def(py::init<const open_spiel::DuneSearchConfig&, const std::vector<std::shared_ptr<open_spiel::algorithms::Evaluator>>&>(),
            py::arg("config"), py::arg("evaluators"))
-      .def("run_search", &open_spiel::DunePUCTISMCTSBot::RunSearch, py::arg("state"))
+      .def("run_search", &open_spiel::DunePUCTISMCTSBot::RunSearch, py::arg("state"), py::arg("max_sims") = -1, py::arg("max_time_ms") = -1.0, py::arg("start_sim_index") = 0)
       .def("get_root_diagnostics", &open_spiel::DunePUCTISMCTSBot::GetRootDiagnostics,
-           py::arg("state"), py::arg("min_visit_threshold") = 2)
+           py::arg("state"), py::arg("min_visit_threshold") = 2, py::arg("chosen_action") = open_spiel::kInvalidAction)
       .def("get_last_search_result", &open_spiel::DunePUCTISMCTSBot::GetLastSearchResult);
+
+  py::enum_<open_spiel::DuneSearchBudgetMode>(di, "DuneSearchBudgetMode")
+      .value("POLICY_ONLY", open_spiel::DuneSearchBudgetMode::kPolicyOnly)
+      .value("FIXED_SESSION_SIMULATIONS", open_spiel::DuneSearchBudgetMode::kFixedSessionSimulations)
+      .value("TRAINING_FULL_FAST", open_spiel::DuneSearchBudgetMode::kTrainingFullFast)
+      .value("LIVE_DEADLINE", open_spiel::DuneSearchBudgetMode::kLiveDeadline);
+
+  py::class_<open_spiel::DuneSearchSession>(di, "DuneSearchSession")
+      .def(py::init<const open_spiel::DuneSearchConfig&, std::shared_ptr<open_spiel::algorithms::Evaluator>, open_spiel::DuneSearchBudgetMode>(),
+           py::arg("config"), py::arg("evaluator"), py::arg("budget_mode"))
+      .def(py::init<const open_spiel::DuneSearchConfig&, const std::vector<std::shared_ptr<open_spiel::algorithms::Evaluator>>&, open_spiel::DuneSearchBudgetMode>(),
+           py::arg("config"), py::arg("evaluators"), py::arg("budget_mode"))
+      .def("search", &open_spiel::DuneSearchSession::Search, py::arg("state"), py::arg("remaining_time_ms") = -1.0)
+      .def("set_episode_id", &open_spiel::DuneSearchSession::SetEpisodeId, py::arg("episode_id"))
+      .def("set_update_id", &open_spiel::DuneSearchSession::SetUpdateId, py::arg("update_id"))
+      .def("reset_session", &open_spiel::DuneSearchSession::ResetSession, py::arg("reason"))
+      .def("has_active_session", &open_spiel::DuneSearchSession::HasActiveSession)
+      .def("get_bot", &open_spiel::DuneSearchSession::GetBot)
+      .def("get_short_bot", &open_spiel::DuneSearchSession::GetShortBot)
+      .def_property_readonly("session_new_simulations_completed", &open_spiel::DuneSearchSession::session_new_simulations_completed)
+      .def_property_readonly("session_elapsed_time_ms", &open_spiel::DuneSearchSession::session_elapsed_time_ms);
+
+  di.def("make_dune_nn_evaluator", &open_spiel::MakeDuneNNEvaluator,
+         py::arg("checkpoint_path"), py::arg("device_str"),
+         py::arg("hidden_dim") = 1024, py::arg("num_blocks") = 4);
+
+  py::enum_<open_spiel::DuneDecisionRole>(di, "DuneDecisionRole")
+      .value("FORCED_OR_BOOKKEEPING", open_spiel::DuneDecisionRole::kForcedOrBookkeeping)
+      .value("LEADER_SELECTION", open_spiel::DuneDecisionRole::kLeaderSelection)
+      .value("AGENT_PRIMARY", open_spiel::DuneDecisionRole::kAgentPrimary)
+      .value("AGENT_CONTINUATION", open_spiel::DuneDecisionRole::kAgentContinuation)
+      .value("PURCHASE", open_spiel::DuneDecisionRole::kPurchase)
+      .value("COMBAT_INTRIGUE", open_spiel::DuneDecisionRole::kCombatIntrigue)
+      .value("OTHER_OPTIONAL", open_spiel::DuneDecisionRole::kOtherOptional);
+
+  di.def("classify_dune_decision_role", &open_spiel::ClassifyDuneDecisionRole,
+         py::arg("state"), py::arg("searched_player"), py::arg("has_active_session"));
 #endif
 }

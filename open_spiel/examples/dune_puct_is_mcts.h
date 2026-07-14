@@ -51,6 +51,14 @@ struct DuneSearchConfig {
   bool verbose_diagnostics = false;
   bool check_strategic_state = false;
   double root_prior_temperature = 1.0;
+  double training_root_prior_temperature = 1.0;
+
+  // Session calibration parameters
+  int fixed_continuation_reserve = 0;
+  int purchase_combat_budget = 16;
+  double live_continuation_reserve_seconds = 0.0;
+  int fixed_session_limit = 200;
+  std::string model_checkpoint_path = "";
 };
 
 struct SearchDiagnostics {
@@ -77,6 +85,35 @@ struct SearchDiagnostics {
   std::vector<int> forced_visit_counts;
   std::vector<int> pruned_visit_counts;
   bool action_changed_vs_raw_argmax = false;
+
+  // Telemetry fields
+  std::string protocol_version = "v2";
+  std::string session_id = "";
+  int searched_seat = -1;
+  int round = -1;
+  std::string phase = "";
+  std::string decision_role = "";
+  std::string budget_mode = "";
+  int hard_sim_limit = 0;
+  int soft_sim_limit = 0;
+  double hard_time_limit_ms = 0.0;
+  double soft_time_limit_ms = 0.0;
+  double elapsed_search_time_ms = 0.0;
+  double observation_wait_time_ms = 0.0;
+  int inherited_root_visits = 0;
+  int newly_completed_simulations = 0;
+  int session_cumulative_simulations = 0;
+  double session_cumulative_search_time_ms = 0.0;
+  double long_agent_session_cumulative_time_ms = 0.0;
+  std::string re_root_status = "none"; // "hit", "miss", "none"
+  bool post_chance_branch_miss = false;
+  double root_coverage = 0.0;
+  std::string reset_reason = "none";
+  int tree_node_count = 0;
+  int inference_count_telemetry = 0;
+  Action selected_action = -1;
+  bool legality_result = true;
+  std::string fallback_reason = "none";
 };
 
 struct DuneSearchResult {
@@ -124,12 +161,14 @@ struct DuneISMCTSNode {
   bool priors_initialized = false;
   double cached_value = 0.0;  // Neural V(s) for this node's current player
   std::vector<double> cached_values; // Neural V(s) for all players
+  bool dirichlet_noise_applied = false;
 };
 
 struct TestBotAccessor;
 
 class DunePUCTISMCTSBot : public Bot {
   friend struct TestBotAccessor;
+  friend class DuneSearchSession;
  public:
   DunePUCTISMCTSBot(
       const DuneSearchConfig& config,
@@ -139,8 +178,6 @@ class DunePUCTISMCTSBot : public Bot {
       const DuneSearchConfig& config,
       std::shared_ptr<algorithms::Evaluator> evaluator)
       : DunePUCTISMCTSBot(config, std::vector<std::shared_ptr<algorithms::Evaluator>>(4, evaluator)) {}
-
-
 
   DunePUCTISMCTSBot(uint64_t seed, std::shared_ptr<algorithms::Evaluator> evaluator,
                     double puct_c, int max_simulations,
@@ -160,12 +197,15 @@ class DunePUCTISMCTSBot : public Bot {
   ActionsAndProbs GetPolicy(const State& state) override;
   std::pair<ActionsAndProbs, Action> StepWithPolicy(const State& state) override;
 
-  DuneSearchResult RunSearch(const State& state);
+  DuneSearchResult RunSearch(const State& state, int max_sims = -1, double max_time_ms = -1.0, int start_sim_index = 0);
   SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action = kInvalidAction) const;
   const DuneSearchResult& GetLastSearchResult() const;
 
   void Restart() override { Reset(); }
   void RestartAt(const State& state) override { Reset(); }
+
+  DuneSearchConfig& GetConfig() { return config_; }
+  const DuneSearchConfig& GetConfig() const { return config_; }
 
  private:
   void Reset();
@@ -195,6 +235,7 @@ class DunePUCTISMCTSBot : public Bot {
   int total_lookups_ = 0;
   int reused_lookups_ = 0;
   int search_count_ = 0;
+  bool is_continuation_ = false;
 
   // 18A diagnostics tracking fields
   std::vector<int> simulation_depths_this_search_;
@@ -214,6 +255,9 @@ class DunePUCTISMCTSBot : public Bot {
   int inference_count_this_search_ = 0;
   absl::flat_hash_map<std::pair<Player, std::string>, ActionsAndProbs> opponent_prior_cache_;
   absl::flat_hash_set<std::pair<Player, std::string>> visited_nodes_this_search_;
+  bool in_session_ = false;
+  bool has_deadline_ = false;
+  std::chrono::steady_clock::time_point deadline_;
 };
 
 }  // namespace open_spiel

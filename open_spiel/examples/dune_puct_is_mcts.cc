@@ -138,11 +138,21 @@ const DuneSearchResult& DunePUCTISMCTSBot::GetLastSearchResult() const {
 }
 
 std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state) const {
-  if (config_.use_observation_string) {
-    return {state.CurrentPlayer(), state.ObservationString()};
-  } else {
-    return {state.CurrentPlayer(), state.InformationStateString()};
+  std::string obs = config_.use_observation_string ? state.ObservationString() : state.InformationStateString();
+  std::vector<Action> actions = state.LegalActions();
+  std::sort(actions.begin(), actions.end());
+  std::string actions_sig;
+  for (Action a : actions) {
+    absl::StrAppend(&actions_sig, a, ",");
   }
+  std::string full_key = absl::StrCat(
+      "obs=", obs,
+      "|model=", config_.model_checkpoint_path,
+      "|utility=", config_.utility_divisor,
+      "|puct_c=", config_.puct_c,
+      "|actions=", actions_sig
+  );
+  return {state.CurrentPlayer(), full_key};
 }
 
 std::unique_ptr<State> DunePUCTISMCTSBot::SampleRootState(const State& state, int sim_index) {
@@ -181,8 +191,16 @@ DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
   if (iter == nodes_.end()) {
     return nullptr;
   }
+  DuneISMCTSNode* node = iter->second;
+  if (node->priors_initialized) {
+    std::vector<Action> state_actions = state.LegalActions();
+    for (Action a : state_actions) {
+      SPIEL_CHECK_TRUE(node->child_info.count(a) > 0);
+    }
+    SPIEL_CHECK_EQ(node->child_info.size(), state_actions.size());
+  }
   reused_lookups_++;
-  return iter->second;
+  return node;
 }
 
 DuneISMCTSNode* DunePUCTISMCTSBot::LookupOrCreateNode(const State& state) {
@@ -202,8 +220,13 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   auto eval_res = evaluators_[cur_player]->PriorAndEvaluate(state);
   inference_count_this_search_++;
 
+  // Initialize all legal actions with 0.0 prior first
+  for (Action a : state.LegalActions()) {
+    node->child_info[a] = DuneChildInfo{0, 0.0, 0.0};
+  }
+
   const ActionsAndProbs& priors = eval_res.first;
-  if (node == root_node_ && config_.root_prior_temperature != 1.0 && config_.root_prior_temperature > 0.0) {
+  if (node == root_node_ && !is_continuation_ && config_.root_prior_temperature != 1.0 && config_.root_prior_temperature > 0.0) {
     double sum = 0.0;
     std::vector<double> scaled_probs;
     scaled_probs.reserve(priors.size());
@@ -435,7 +458,11 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
 
     if (chosen_action != kInvalidAction) {
       state->ApplyAction(chosen_action);
-      return RunSimulation(state, depth + 1, sim_index);
+      std::vector<double> returns = RunSimulation(state, depth + 1, sim_index);
+      if (returns.empty()) {
+        return {};
+      }
+      return returns;
     } else {
       std::vector<double> returns = state->Returns();
       for (double& r : returns) {
@@ -452,8 +479,16 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
     }
   }
 
+  if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_) {
+    return {};
+  }
+
   DuneISMCTSNode* node = LookupOrCreateNode(*state);
   SPIEL_CHECK_TRUE(node != nullptr);
+
+  if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_) {
+    return {};
+  }
 
   InitializePriorsAndValue(node, *state); // Combined evaluation expansion!
 
@@ -477,13 +512,18 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
 
   state->ApplyAction(chosen_action);
   std::vector<double> returns = RunSimulation(state, depth + 1, sim_index);
+  if (returns.empty()) {
+    node->total_visits--;
+    node->child_info[chosen_action].visits--;
+    return {};
+  }
   
   // Multi-player Max-N backup
   node->child_info[chosen_action].return_sum += returns[cur_player];
   return returns;
 }
 
-DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
+DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, double max_time_ms, int start_sim_index) {
   root_samples_.clear();
   opponent_prior_cache_.clear();
   inference_count_this_search_ = 0;
@@ -495,21 +535,31 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
   max_depth_this_search_ = 0;
   sum_depth_this_search_ = 0.0;
   num_sims_this_search_ = 0;
-
-  if (evaluators_ != last_evaluators_ ||
-      state.CurrentPlayer() != last_searching_player_ ||
-      last_searching_player_ == kInvalidPlayer) {
-    Reset();
-    last_evaluators_ = evaluators_;
-    last_searching_player_ = state.CurrentPlayer();
-  } else {
-    auto root_key = GetStateKey(state);
-    if (nodes_.find(root_key) == nodes_.end()) {
+  is_continuation_ = (start_sim_index > 0);
+  if (!in_session_) {
+    if (evaluators_ != last_evaluators_ ||
+        state.CurrentPlayer() != last_searching_player_ ||
+        last_searching_player_ == kInvalidPlayer) {
       Reset();
+      last_evaluators_ = evaluators_;
+      last_searching_player_ = state.CurrentPlayer();
+    } else {
+      auto root_key = GetStateKey(state);
+      if (nodes_.find(root_key) == nodes_.end()) {
+        Reset();
+      }
     }
   }
 
+  int actual_max_sims = (max_sims >= 0) ? max_sims : config_.max_simulations;
+  double actual_max_time_ms = (max_time_ms >= 0.0) ? max_time_ms : config_.relative_time_budget_ms;
+
   auto start_time = std::chrono::steady_clock::now();
+  has_deadline_ = (actual_max_time_ms != std::numeric_limits<double>::infinity());
+  if (has_deadline_) {
+    deadline_ = start_time + std::chrono::milliseconds(static_cast<int64_t>(actual_max_time_ms));
+  }
+
   DuneSearchResult result;
   result.timeout_status = false;
 
@@ -535,12 +585,31 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
   }
 
   searching_player_ = state.CurrentPlayer();
+  
+  auto check_time = std::chrono::steady_clock::now();
+  double check_elapsed_ms = std::chrono::duration<double, std::milli>(check_time - start_time).count();
+  double safety_margin = std::min(50.0, std::max(5.0, actual_max_time_ms - 10.0));
+  if (check_elapsed_ms + safety_margin >= actual_max_time_ms) {
+    ActionsAndProbs uniform_policy;
+    double prob = 1.0 / legal_actions.size();
+    for (Action a : legal_actions) {
+      uniform_policy.push_back({a, prob});
+    }
+    result.policy = uniform_policy;
+    result.simulations_completed = 0;
+    result.elapsed_time_ms = check_elapsed_ms;
+    result.timeout_status = true;
+    result.fallback_reason = "timeout";
+    result.inference_count = inference_count_this_search_;
+    last_search_result_ = result;
+    return result;
+  }
 
   root_node_ = LookupOrCreateNode(state);
   InitializePriorsAndValue(root_node_, state);
 
   // Apply Dirichlet noise exactly once at the root node's priors (if enabled)
-  if (config_.dirichlet_epsilon > 0.0 && config_.dirichlet_alpha > 0.0) {
+  if (config_.dirichlet_epsilon > 0.0 && config_.dirichlet_alpha > 0.0 && !is_continuation_ && !root_node_->dirichlet_noise_applied) {
     if (legal_actions.size() > 1) {
       uint64_t noise_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, 0);
       std::mt19937 noise_rng(noise_seed);
@@ -557,15 +626,17 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
         auto& child = root_node_->child_info[action];
         child.prior = (1.0 - config_.dirichlet_epsilon) * child.prior + config_.dirichlet_epsilon * d_noise;
       }
+      root_node_->dirichlet_noise_applied = true;
     }
   }
 
   int sim = 0;
-  for (; sim < config_.max_simulations; ++sim) {
-    // Check relative time budget limit
+  double max_sim_duration_ms = 10.0;
+  for (; sim < actual_max_sims; ++sim) {
+    // Check relative time budget limit with measured max simulation latency safety margin
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
-    if (elapsed_ms >= config_.relative_time_budget_ms) {
+    if (elapsed_ms + max_sim_duration_ms >= actual_max_time_ms) {
       result.timeout_status = true;
       result.fallback_reason = "timeout";
       break;
@@ -577,8 +648,19 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state) {
       break;
     }
 
-    std::unique_ptr<State> sampled_root_state = SampleRootState(state, sim);
-    RunSimulation(sampled_root_state.get(), 0, sim);
+    auto sim_start = std::chrono::steady_clock::now();
+    std::unique_ptr<State> sampled_root_state = SampleRootState(state, start_sim_index + sim);
+    std::vector<double> returns = RunSimulation(sampled_root_state.get(), 0, start_sim_index + sim);
+    auto sim_end = std::chrono::steady_clock::now();
+
+    if (returns.empty()) {
+      result.timeout_status = true;
+      result.fallback_reason = "timeout";
+      break;
+    }
+
+    double sim_duration = std::chrono::duration<double, std::milli>(sim_end - sim_start).count();
+    max_sim_duration_ms = std::max(max_sim_duration_ms, sim_duration);
   }
 
   auto end_time = std::chrono::steady_clock::now();

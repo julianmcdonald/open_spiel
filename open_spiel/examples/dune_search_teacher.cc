@@ -21,6 +21,7 @@
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_search_session.h"
 #include "dune_evaluator.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
@@ -420,10 +421,37 @@ int main(int argc, char** argv) {
       int game_id = games_started.fetch_add(1);
       if (game_id >= max_games) break;
       std::unique_ptr<open_spiel::State> state = game->NewInitialState();
-      open_spiel::Player searched_player = game_id % state->NumPlayers();
+    open_spiel::Player searched_player = game_id % state->NumPlayers();
       int chance_index = 0;
       int decision_index = 0;
       uint64_t master = absl::GetFlag(FLAGS_seed);
+
+      open_spiel::DuneSearchConfig search_config;
+      search_config.max_simulations = absl::GetFlag(FLAGS_max_simulations);
+      search_config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+      search_config.max_nodes = 50000;
+      search_config.puct_c = absl::GetFlag(FLAGS_puct_c);
+      search_config.opponent_mode = SearchOpponentMode::kPolicy;
+      search_config.temperature = 1.0;
+      search_config.opponent_temperature = absl::GetFlag(FLAGS_search_opponent_temperature);
+      search_config.max_world_samples = -1;
+      search_config.utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
+      search_config.min_visit_threshold = 2;
+      search_config.covered_prior_threshold = 0.50;
+      search_config.seed = absl::GetFlag(FLAGS_seed) + game_id * 1000000;
+      search_config.final_policy_type = open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+      search_config.dirichlet_epsilon = 0.0;
+      search_config.dirichlet_alpha = 0.3;
+      search_config.use_observation_string = true;
+      search_config.verbose_diagnostics = false;
+      search_config.check_strategic_state = false;
+      search_config.root_prior_temperature = absl::GetFlag(FLAGS_root_prior_temperature);
+      search_config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
+      search_config.purchase_combat_budget = 16;
+      LoadCalibratedParameters(search_config);
+
+      open_spiel::DuneSearchSession session(search_config, evaluator, open_spiel::DuneSearchBudgetMode::kTrainingFullFast);
+      session.SetEpisodeId(game_id);
 
       std::vector<LabelData> game_labels;
 
@@ -448,47 +476,21 @@ int main(int argc, char** argv) {
         auto blueprint_rng = dune_seed::MakeRng32(blueprint_seed);
         open_spiel::Action blueprint_action = open_spiel::SampleBlueprintAction(ppo_prior, absl::GetFlag(FLAGS_blueprint_temperature), blueprint_rng);
 
-        bool should_search = (cur_player == searched_player && open_spiel::IsStrategicState(*state, searched_player));
+        open_spiel::Action action_to_apply = blueprint_action;
+        bool should_search = (cur_player == searched_player);
 
         if (should_search) {
-          double entropy = open_spiel::ComputeEntropy(ppo_prior);
-          double max_entropy = std::log(state->LegalActions().size());
-          double entropy_ratio = max_entropy > 0.0 ? (entropy / max_entropy) : 0.0;
-          double search_prob = absl::GetFlag(FLAGS_search_fraction);
-          if (entropy_ratio < absl::GetFlag(FLAGS_min_entropy_ratio)) {
-            search_prob = absl::GetFlag(FLAGS_search_fraction) * absl::GetFlag(FLAGS_uniform_ratio);
+          open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, searched_player, session.HasActiveSession());
+          open_spiel::DuneSearchResult last_res = session.Search(*state);
+          open_spiel::SearchDiagnostics diag = last_res.diagnostics;
+
+          if (diag.selected_action != open_spiel::kInvalidAction) {
+            action_to_apply = diag.selected_action;
           }
 
-          uint64_t search_gate_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamSearchGate);
-          auto search_gate_rng = dune_seed::MakeRng64(search_gate_seed);
-          if (absl::Uniform(search_gate_rng, 0.0, 1.0) < search_prob) {
+          bool is_primary_full = (role == open_spiel::DuneDecisionRole::kAgentPrimary && session.is_full_session());
+          if (is_primary_full) {
             total_search_attempted++;
-            uint64_t mcts_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainSearchTeacher, game_id, decision_index, dune_seed::kStreamMCTS);
-            open_spiel::DuneSearchConfig search_config;
-            search_config.max_simulations = absl::GetFlag(FLAGS_max_simulations);
-            search_config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
-            search_config.max_nodes = 50000;
-            search_config.puct_c = absl::GetFlag(FLAGS_puct_c);
-            search_config.opponent_mode = SearchOpponentMode::kPolicy;
-            search_config.temperature = 1.0;
-            search_config.opponent_temperature = absl::GetFlag(FLAGS_search_opponent_temperature);
-            search_config.max_world_samples = -1;
-            search_config.utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
-            search_config.min_visit_threshold = 2;
-            search_config.covered_prior_threshold = 0.50;
-            search_config.seed = mcts_seed;
-            search_config.final_policy_type = open_spiel::DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
-            search_config.dirichlet_epsilon = 0.0;
-            search_config.dirichlet_alpha = 0.3;
-            search_config.use_observation_string = true;
-            search_config.verbose_diagnostics = false;
-            search_config.check_strategic_state = false;
-            search_config.root_prior_temperature = absl::GetFlag(FLAGS_root_prior_temperature);
-
-            open_spiel::DunePUCTISMCTSBot bot(search_config, evaluator);
-            bot.RunSearch(*state);
-            open_spiel::SearchDiagnostics diag = bot.GetRootDiagnostics(*state, absl::GetFlag(FLAGS_min_visits_per_action));
-
             int required_coverage = std::min(absl::GetFlag(FLAGS_min_coverage), static_cast<int>(diag.actions.size()));
             bool has_coverage = (diag.num_covered_actions >= required_coverage);
             bool has_mass = (diag.covered_prior_mass >= absl::GetFlag(FLAGS_min_prior_mass));
@@ -562,7 +564,7 @@ int main(int argc, char** argv) {
         }
 
         decision_index++;
-        state->ApplyAction(blueprint_action);
+        state->ApplyAction(action_to_apply);
       } // end while (!state->IsTerminal())
 
       {

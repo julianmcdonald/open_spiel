@@ -14,7 +14,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_evaluator_test dune_evaluator_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator_test ${TORCH_LIBRARIES})
 
-  add_library(dune_search STATIC dune_puct_is_mcts.cc)
+  add_library(dune_search STATIC dune_puct_is_mcts.cc dune_search_routing.cc dune_search_session.cc)
   target_link_libraries(dune_search PRIVATE ${TORCH_LIBRARIES})
   target_include_directories(dune_search PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

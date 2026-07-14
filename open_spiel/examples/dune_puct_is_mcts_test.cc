@@ -11,6 +11,8 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_puct_is_mcts.h"
+#include "dune_search_routing.h"
+#include "dune_search_session.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 
 namespace open_spiel {
@@ -49,6 +51,9 @@ struct TestBotAccessor {
   }
   static const absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*>& GetNodes(DunePUCTISMCTSBot& b) {
     return b.nodes_;
+  }
+  static DuneISMCTSNode* CallLookupNode(DunePUCTISMCTSBot& b, const State& s) {
+    return b.LookupNode(s);
   }
 };
 
@@ -1115,6 +1120,676 @@ void TestRootPriorTemperatureScaling() {
   std::cout << "Test 24 Passed!\n\n";
 }
 
+class TestRoutingState : public dune_imperium::DuneImperiumState {
+ public:
+  TestRoutingState(std::shared_ptr<const Game> game) 
+      : dune_imperium::DuneImperiumState(game), 
+        mock_current_player_(0), 
+        mock_root_history_size_(0) {
+    SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+    SetPlayerAgentsRemainingForTesting(0, 2);
+    SetPendingImperiumSlotForTesting(dune_imperium::kInvalidCard);
+    SetImperiumRowForTesting({5, 6, 7, 8, 9});
+    SetPlayerSolariForTesting(0, 10);
+    SetPlayerSpiceForTesting(0, 10);
+    SetPlayerPersuasionForTesting(0, 10);
+    for (int p = 0; p < 4; ++p) {
+      SetPlayerHandForTesting(p, {0, 1, 2, 3, 4});
+    }
+  }
+  
+  std::vector<Action> LegalActions() const override {
+    if (CurrentPlayer() == mock_current_player_ && History().size() == mock_root_history_size_) {
+      return mock_legal_actions_;
+    }
+    return dune_imperium::DuneImperiumState::LegalActions();
+  }
+  
+  void SetMockLegalActions(const std::vector<Action>& actions) {
+    mock_legal_actions_ = actions;
+    mock_root_history_size_ = History().size();
+  }
+
+  void SetMockCurrentPlayer(Player p) {
+    mock_current_player_ = p;
+    SetCurrentPlayerForTesting(p);
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<TestRoutingState>(*this);
+  }
+
+  std::unique_ptr<State> ResampleFromInfostate(Player player, std::function<double()> rng_prob) const override {
+    return Clone();
+  }
+
+ private:
+  std::vector<Action> mock_legal_actions_;
+  Player mock_current_player_;
+  int mock_root_history_size_;
+};
+
+void TestClassifierSearchRouting() {
+  std::cout << "Running Test: Classifier Search Routing...\n";
+  auto game = LoadGame("dune_imperium");
+  TestRoutingState state(game);
+  
+  // 1. Forced/bookkeeping (size <= 1)
+  state.SetMockLegalActions({1});
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kForcedOrBookkeeping);
+  
+  // 2. LeaderDraft phase
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kLeaderDraft);
+  state.SetMockLegalActions({1, 2});
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kLeaderSelection);
+  
+  // 3. Purchase phase
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+  state.SetMockLegalActions({
+    dune_imperium::kActionBuyImperiumRow0,
+    dune_imperium::kActionBuyReserveArrakisLiaison
+  });
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kPurchase);
+  
+  // 4. Combat Intrigue
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kCombat);
+  state.SetMockLegalActions({
+    dune_imperium::kActionCombatPass,
+    dune_imperium::kActionPlayIntrigueCombatCard0 + 5
+  });
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kCombatIntrigue);
+  
+  // 5. Agent Primary vs Continuation
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+  state.SetPlayerAgentsRemainingForTesting(0, 1);
+  state.SetMockLegalActions({
+    dune_imperium::kActionSelectAgentCard0 + 10,
+    dune_imperium::kActionReveal
+  });
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kAgentPrimary);
+  
+  state.SetMockLegalActions({
+    dune_imperium::kActionAgentSpaceConspire,
+    dune_imperium::kActionAgentSpaceHighCouncil
+  });
+  assert(ClassifyDuneDecisionRole(state, 0, true) == DuneDecisionRole::kAgentContinuation);
+  
+  // 6. Other Optional
+  state.SetPlayerAgentsRemainingForTesting(0, 0);
+  state.SetMockLegalActions({
+    dune_imperium::kActionPlayIntriguePlotCard0 + 2,
+    dune_imperium::kActionReveal
+  });
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kOtherOptional);
+  
+  std::cout << "Test Classifier Search Routing Passed!\n\n";
+}
+
+void TestSearchSessionControls() {
+  std::cout << "Running Test: Search Session Controls...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (!state->IsTerminal()) {
+    if (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    } else {
+      const dune_imperium::DuneImperiumState& dune_state =
+          static_cast<const dune_imperium::DuneImperiumState&>(*state);
+      if (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns && state->LegalActions().size() > 1) {
+        break;
+      }
+      state->ApplyAction(state->LegalActions().front());
+    }
+  }
+
+  // Setup evaluator
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  DuneSearchConfig config;
+  config.max_simulations = 10;
+
+  // 1. PolicyOnly mode
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kPolicyOnly);
+    DuneSearchResult res = session.Search(*state);
+    std::cout << "DEBUG PolicyOnly fallback: " << res.fallback_reason << std::endl;
+    assert(res.simulations_completed == 0);
+    assert(res.used_fallback == true);
+    assert(res.fallback_reason == "policy_only_mode");
+  }
+
+  // 2. FixedSessionSimulations mode
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    DuneSearchResult res = session.Search(*state);
+    assert(session.HasActiveSession());
+    assert(session.session_new_simulations_completed() > 0);
+    int first_search_sims = session.session_new_simulations_completed();
+
+    Action play_card_action = res.diagnostics.selected_action;
+    assert(play_card_action != kInvalidAction);
+    state->ApplyAction(play_card_action);
+
+    // Now call Search on the continuation state
+    DuneSearchResult res2 = session.Search(*state);
+    assert(session.session_new_simulations_completed() == first_search_sims + res2.simulations_completed);
+    assert(session.session_new_simulations_completed() <= 200);
+
+    // Verify long-agent cumulative time is tracked and reset correctly
+    double t1 = res.diagnostics.long_agent_session_cumulative_time_ms;
+    double t2 = res2.diagnostics.long_agent_session_cumulative_time_ms;
+    assert(t2 >= t1);
+
+    session.ResetSession("test_reset");
+    assert(session.session_elapsed_time_ms() == 0.0);
+
+    std::unique_ptr<State> state_new = game->NewInitialState();
+    while (state_new->IsChanceNode()) {
+      state_new->ApplyAction(state_new->ChanceOutcomes().front().first);
+    }
+    DuneSearchResult res3 = session.Search(*state_new);
+    assert(res3.diagnostics.long_agent_session_cumulative_time_ms == res3.elapsed_time_ms);
+  }
+
+  std::cout << "Test Search Session Controls Passed!\n\n";
+}
+
+void TestTransactionalMCTSAndTreeFallback() {
+  std::cout << "Running Test 27: Transactional MCTS & Tree Fallback...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  ActionsAndProbs mock_priors;
+  for (Action a : legal_actions) {
+    mock_priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values, 20); // 20 ms latency
+  DuneSearchConfig config;
+  config.max_simulations = 100;
+  config.relative_time_budget_ms = 35.0; // 35 ms budget
+  
+  DunePUCTISMCTSBot bot(config, evaluator);
+  DuneSearchResult res = bot.RunSearch(*state);
+  
+  DuneISMCTSNode* root = TestBotAccessor::CallLookupNode(bot, *state);
+
+  assert(res.timeout_status == true);
+  assert(res.simulations_completed == 2); // simulation 0 and 1 completed, simulation 2 aborted and rolled back
+  assert(root != nullptr);
+  assert(root->total_visits == 1); // transactional rollback of sim 2 worked!
+
+  // 2. Tree Fallback:
+  DuneSearchConfig config2;
+  config2.max_simulations = 10;
+  config2.relative_time_budget_ms = 10000.0;
+  config2.min_visit_threshold = 1;
+  config2.covered_prior_threshold = 0.01;
+  
+  DunePUCTISMCTSBot bot2(config2, evaluator);
+  DuneSearchResult res2 = bot2.RunSearch(*state);
+  assert(res2.used_fallback == false);
+  
+  DuneSearchResult res3 = bot2.RunSearch(*state, 0, 10000.0);
+  assert(res3.simulations_completed == 0);
+  assert(res3.used_fallback == false); // retrieved from the tree!
+  assert(res3.policy.size() == legal_actions.size());
+
+  std::cout << "Test 27 Passed!\n\n";
+}
+
+void TestInvariantGatesAndScenarios() {
+  std::cout << "Running TestInvariantGatesAndScenarios...\n";
+  auto game = open_spiel::LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  while (!state->IsTerminal()) {
+    if (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    } else {
+      const dune_imperium::DuneImperiumState& dune_state =
+          static_cast<const dune_imperium::DuneImperiumState&>(*state);
+      if (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns && state->LegalActions().size() > 1) {
+        break;
+      }
+      state->ApplyAction(state->LegalActions().front());
+    }
+  }
+
+  ActionsAndProbs priors;
+  std::vector<Action> legal_actions = state->LegalActions();
+  for (Action a : legal_actions) {
+    priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  std::vector<double> mock_vals(4, 0.0);
+  auto evaluator = std::make_shared<MockEvaluator>(priors, mock_vals);
+
+  // 1. Branch hits/misses & Reset boundary checks
+  {
+    DuneSearchConfig config;
+    config.max_simulations = 10;
+    config.fixed_session_limit = 10;
+    config.fixed_continuation_reserve = 0;
+    config.purchase_combat_budget = 16;
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    DuneSearchResult res1 = session.Search(*state);
+    assert(session.last_re_root_status() == "none");
+
+    // Test branch hit (apply the chosen/selected action)
+    auto next_state_hit = state->Clone();
+    Action act = res1.diagnostics.selected_action;
+    next_state_hit->ApplyAction(act);
+    DuneSearchResult res2 = session.Search(*next_state_hit);
+    assert(session.last_re_root_status() == "hit");
+
+    // Test branch miss (search on a sibling state that is not a descendant of current session root)
+    DuneSearchSession session_miss(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    session_miss.Search(*state);
+    
+    auto state_a = state->Clone();
+    state_a->ApplyAction(act);
+    session_miss.Search(*state_a);
+    assert(session_miss.last_re_root_status() == "hit");
+    
+    Action other_card_action = kInvalidAction;
+    for (Action a : state->LegalActions()) {
+      if (a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256 && a != act) {
+        auto test_state = state->Clone();
+        test_state->ApplyAction(a);
+        while (test_state->IsChanceNode()) {
+          test_state->ApplyAction(test_state->ChanceOutcomes().front().first);
+        }
+        if (test_state->LegalActions().size() > 1) {
+          other_card_action = a;
+          break;
+        }
+      }
+    }
+    assert(other_card_action != kInvalidAction);
+    auto state_b = state->Clone();
+    state_b->ApplyAction(other_card_action);
+    while (state_b->IsChanceNode()) {
+      state_b->ApplyAction(state_b->ChanceOutcomes().front().first);
+    }
+    
+    session_miss.Search(*state_b);
+    assert(session_miss.last_re_root_status() == "miss");
+
+    // Test seat boundary boundary reset
+    DuneSearchSession session_seat(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    DuneSearchResult r_primary = session_seat.Search(*state);
+    
+    auto state_seat = state->Clone();
+    Action act_card = r_primary.diagnostics.selected_action;
+    state_seat->ApplyAction(act_card);
+    while (state_seat->IsChanceNode()) {
+      state_seat->ApplyAction(state_seat->ChanceOutcomes().front().first);
+    }
+    
+    DuneSearchResult r_cont = session_seat.Search(*state_seat);
+    Action act_space = r_cont.diagnostics.selected_action;
+    if (act_space != kInvalidAction) {
+      state_seat->ApplyAction(act_space);
+    }
+    
+    // Advance state until another real player's turn is reached (descendant history preserved)
+    while (!state_seat->IsTerminal()) {
+      if (state_seat->IsChanceNode()) {
+        state_seat->ApplyAction(state_seat->ChanceOutcomes().front().first);
+      } else {
+        if (state_seat->CurrentPlayer() != state->CurrentPlayer()) {
+          break;
+        }
+        state_seat->ApplyAction(state_seat->LegalActions().front());
+      }
+    }
+    
+    if (!state_seat->IsTerminal()) {
+      DuneSearchResult res_seat = session_seat.Search(*state_seat);
+      assert(res_seat.diagnostics.reset_reason == "seat_or_round_boundary");
+    }
+  }
+
+  // 2. Exact 52-second deadlines & live continuation reserve
+  {
+    DuneSearchConfig config;
+    config.max_simulations = 20;
+    config.live_continuation_reserve_seconds = 10.0;
+
+    Action act = kInvalidAction;
+    for (Action a : state->LegalActions()) {
+      if (a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256) {
+        auto test_state = state->Clone();
+        test_state->ApplyAction(a);
+        while (test_state->IsChanceNode()) {
+          test_state->ApplyAction(test_state->ChanceOutcomes().front().first);
+        }
+        if (test_state->LegalActions().size() > 1) {
+          act = a;
+          break;
+        }
+      }
+    }
+    assert(act != kInvalidAction);
+
+    ActionsAndProbs live_priors;
+    for (Action a : state->LegalActions()) {
+      live_priors.push_back({a, a == act ? 1.0 : 0.0});
+    }
+    auto live_evaluator = std::make_shared<MockEvaluator>(live_priors, mock_vals);
+    DuneSearchSession session(config, live_evaluator, DuneSearchBudgetMode::kLiveDeadline);
+    
+    DuneSearchResult res1 = session.Search(*state, 52000.0);
+    assert(res1.diagnostics.hard_time_limit_ms == 52000.0);
+    assert(res1.diagnostics.soft_time_limit_ms <= 42050.0);
+    assert(res1.diagnostics.soft_time_limit_ms >= 41500.0);
+
+    auto state_a = state->Clone();
+    state_a->ApplyAction(res1.diagnostics.selected_action);
+    while (state_a->IsChanceNode()) {
+      state_a->ApplyAction(state_a->ChanceOutcomes().front().first);
+    }
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    DuneSearchResult res2 = session.Search(*state_a, -1.0);
+    // Soft limit should subtract elapsed time (approx 100ms + search latency)
+    assert(res2.diagnostics.soft_time_limit_ms < 51950.0);
+    assert(res2.diagnostics.soft_time_limit_ms > 40000.0);
+    // Continuation has zero reserve, so soft limit is much higher than primary (which subtracted 10s reserve)
+    assert(res2.diagnostics.soft_time_limit_ms > 45000.0);
+  }
+
+  // 3. Full/fast selection & dynamic configuration updates
+  {
+    DuneSearchConfig config;
+    config.fixed_continuation_reserve = 2;
+    config.root_prior_temperature = 1.5;
+    config.training_root_prior_temperature = 1.5;
+    
+    bool rolled_full = false;
+    bool rolled_fast = false;
+    
+    for (int i = 0; i < 50; ++i) {
+      DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kTrainingFullFast);
+      session.SetEpisodeId(i);
+      DuneSearchResult res = session.Search(*state);
+      if (res.diagnostics.hard_sim_limit == 64) {
+        rolled_full = true;
+        assert(session.GetBot()->GetConfig().temperature == 1.0);
+        assert(session.GetBot()->GetConfig().dirichlet_epsilon == 0.25);
+        assert(session.GetBot()->GetConfig().root_prior_temperature == 1.5);
+      } else if (res.diagnostics.hard_sim_limit == 8) {
+        rolled_fast = true;
+        assert(session.GetBot()->GetConfig().temperature == 0.0);
+        assert(session.GetBot()->GetConfig().dirichlet_epsilon == 0.0);
+        assert(session.GetBot()->GetConfig().root_prior_temperature == 1.0);
+      }
+    }
+    assert(rolled_full && rolled_fast);
+  }
+
+  // 4. Tiny window budget sharing
+  {
+    DuneSearchConfig config;
+    config.max_simulations = 100;
+    config.purchase_combat_budget = 16;
+    
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    // Advance to reveal turns phase (where purchases are made)
+    auto state_combat = state->Clone();
+    while (!state_combat->IsTerminal()) {
+      const dune_imperium::DuneImperiumState& ds = static_cast<const dune_imperium::DuneImperiumState&>(*state_combat);
+      if (ds.phase() == dune_imperium::GamePhase::kRevealTurns) {
+        break;
+      }
+      if (state_combat->IsChanceNode()) {
+        state_combat->ApplyAction(state_combat->ChanceOutcomes().front().first);
+      } else {
+        Action chosen = state_combat->LegalActions().front();
+        for (Action a : state_combat->LegalActions()) {
+          if (a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256) {
+            chosen = a;
+            break;
+          }
+        }
+        state_combat->ApplyAction(chosen);
+      }
+    }
+    assert(!state_combat->IsTerminal());
+    
+    // First search in combat intrigue (gets full tiny budget = 16)
+    DuneSearchResult res1 = session.Search(*state_combat);
+    assert(res1.diagnostics.hard_sim_limit == 16);
+    assert(res1.simulations_completed == 16);
+    
+    // Advance state to next combat action for the same player (we construct state descendant history)
+    auto state_combat2 = state_combat->Clone();
+    state_combat2->ApplyAction(res1.diagnostics.selected_action);
+    while (state_combat2->IsChanceNode()) {
+      state_combat2->ApplyAction(state_combat2->ChanceOutcomes().front().first);
+    }
+
+
+    
+    // Test that intermediate forced/bookkeeping search (a state with 1 legal action) does NOT renew the budget
+    // Test that intermediate forced/bookkeeping search (a state with 1 legal action) does NOT renew the budget
+    // Second search in combat intrigue (descendant of state_combat) has exactly 1 legal action, so it is forced/bookkeeping
+    // and should have 0 simulations completed.
+    DuneSearchResult res2 = session.Search(*state_combat2);
+    assert(res2.diagnostics.hard_sim_limit == 0);
+    assert(res2.simulations_completed == 0);
+  }
+
+  // 5. Reset reasons
+  {
+    DuneSearchConfig config;
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    session.Search(*state);
+    session.ResetSession("manual_reset_test");
+    DuneSearchResult res = session.Search(*state);
+    assert(res.diagnostics.reset_reason == "manual_reset_test");
+  }
+
+  std::cout << "TestInvariantGatesAndScenarios Passed!\n\n";
+}
+
+void TestMoreRoutingAndScenarioInvariants() {
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::shared_ptr<algorithms::Evaluator> evaluator =
+      std::make_shared<MockEvaluator>(ActionsAndProbs{}, std::vector<double>{0.0, 0.0, 0.0, 0.0});
+
+  DuneSearchConfig config;
+  config.max_simulations = 100;
+  config.check_strategic_state = false;
+  
+  // 1. Duplicate calls at one primary root & Descendant Continuation
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    TestRoutingState state(game);
+    state.SetMockLegalActions({
+      dune_imperium::kActionSelectAgentCard0,
+      dune_imperium::kActionSelectAgentCard0 + 1
+    });
+    
+    DuneSearchResult res1 = session.Search(state);
+    std::cout << "res1.diagnostics.reset_reason: " << res1.diagnostics.reset_reason << "\n";
+    std::string first_session_id = res1.diagnostics.session_id;
+    assert(res1.diagnostics.reset_reason == "new_placement_activation");
+    
+    DuneSearchResult res2 = session.Search(state);
+    assert(res2.diagnostics.session_id == first_session_id);
+    assert(res2.diagnostics.reset_reason == "none");
+    
+    // Simulate descendant continuation
+    auto state_next = state;
+    if (res2.diagnostics.selected_action != kInvalidAction) {
+      state_next.ApplyAction(res2.diagnostics.selected_action);
+    } else {
+      state_next.ApplyAction(dune_imperium::kActionSelectAgentCard0);
+    }
+    state_next.SetMockLegalActions({
+      dune_imperium::kActionAgentSpaceConspire,
+      dune_imperium::kActionAgentSpaceArrakeen
+    });
+    
+    std::cout << "res1.selected_action: " << res1.diagnostics.selected_action << "\n";
+    std::cout << "first_session_id: " << first_session_id << "\n";
+    DuneSearchResult res3 = session.Search(state_next);
+    std::cout << "res3.diagnostics.reset_reason: " << res3.diagnostics.reset_reason << "\n";
+    std::cout << "res3.diagnostics.session_id: " << res3.diagnostics.session_id << "\n";
+    assert(res3.diagnostics.session_id == first_session_id);
+    assert(res3.diagnostics.reset_reason == "none");
+  }
+
+  // 2. Multiple placement activations & Early Reveal
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    // Scenario A: 2 Normal Activations
+    {
+      TestRoutingState state1(game);
+      state1.SetPlayerAgentsRemainingForTesting(0, 2);
+      state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+      DuneSearchResult res1 = session.Search(state1);
+      assert(res1.diagnostics.reset_reason == "new_placement_activation");
+
+      // Apply card select and space placement to advance history
+      state1.ApplyAction(dune_imperium::kActionSelectAgentCard0);
+      state1.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+      state1.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+      while (state1.IsChanceNode()) {
+        state1.ApplyAction(state1.LegalActions()[0]);
+      }
+
+      // Activation 2: 1 agent remaining
+      TestRoutingState state2 = state1;
+      state2.SetPlayerAgentsRemainingForTesting(0, 1);
+      state2.SetMockCurrentPlayer(0);
+      state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + 1, dune_imperium::kActionSelectAgentCard0 + 2});
+      DuneSearchResult res2 = session.Search(state2);
+      assert(res2.diagnostics.reset_reason == "new_placement_activation");
+    }
+
+    // Scenario B: 3 Activations (Swordmaster)
+    {
+      TestRoutingState state1(game);
+      state1.SetPlayerAgentsRemainingForTesting(0, 3);
+      state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+      DuneSearchResult res1 = session.Search(state1);
+      assert(res1.diagnostics.reset_reason == "new_placement_activation");
+
+      // Play 1st agent (plays card 0)
+      state1.ApplyAction(dune_imperium::kActionSelectAgentCard0);
+      state1.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+      state1.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+      while (state1.IsChanceNode()) {
+        state1.ApplyAction(state1.LegalActions()[0]);
+      }
+
+      // 2nd activation: 2 agents remaining
+      TestRoutingState state2 = state1;
+      state2.SetPlayerAgentsRemainingForTesting(0, 2);
+      state2.SetMockCurrentPlayer(0);
+      state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + 1, dune_imperium::kActionSelectAgentCard0 + 2});
+      DuneSearchResult res2 = session.Search(state2);
+      assert(res2.diagnostics.reset_reason == "new_placement_activation");
+
+      // Play 2nd agent (plays card 1)
+      state2.ApplyAction(dune_imperium::kActionSelectAgentCard0 + 1);
+      state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+      state2.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+      while (state2.IsChanceNode()) {
+        state2.ApplyAction(state2.LegalActions()[0]);
+      }
+
+      // 3rd activation: 1 agent remaining
+      TestRoutingState state3 = state2;
+      state3.SetPlayerAgentsRemainingForTesting(0, 1);
+      state3.SetMockCurrentPlayer(0);
+      state3.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + 2, dune_imperium::kActionSelectAgentCard0 + 3});
+      DuneSearchResult res3 = session.Search(state3);
+      assert(res3.diagnostics.reset_reason == "new_placement_activation");
+    }
+
+    // Scenario C: 4 Activations (Swordmaster + Mentat)
+    {
+      TestRoutingState state(game);
+      state.SetPlayerAgentsRemainingForTesting(0, 4);
+      
+      for (int a = 4; a >= 1; --a) {
+        state.SetPlayerAgentsRemainingForTesting(0, a);
+        state.SetMockCurrentPlayer(0);
+        int card_offset = 4 - a; // 0, 1, 2, 3
+        state.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + card_offset, dune_imperium::kActionSelectAgentCard0 + card_offset + 1});
+        DuneSearchResult res = session.Search(state);
+        assert(res.diagnostics.reset_reason == "new_placement_activation");
+        
+        if (a > 1) {
+          state.ApplyAction(dune_imperium::kActionSelectAgentCard0 + card_offset);
+          state.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+          state.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+          while (state.IsChanceNode()) {
+            state.ApplyAction(state.LegalActions()[0]);
+          }
+        }
+      }
+    }
+
+    // Scenario D: Early Reveal Suppression
+    {
+      // 1st placement activation
+      TestRoutingState state1(game);
+      state1.SetPlayerAgentsRemainingForTesting(0, 2);
+      state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+      DuneSearchResult res1 = session.Search(state1);
+      assert(res1.diagnostics.reset_reason == "new_placement_activation");
+
+      // Play 1st agent card and space
+      state1.ApplyAction(dune_imperium::kActionSelectAgentCard0);
+      state1.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+      state1.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+      while (state1.IsChanceNode()) {
+        state1.ApplyAction(state1.LegalActions()[0]);
+      }
+
+      // Player does early reveal: plays Reveal action (agents remaining -> 0)
+      TestRoutingState state2 = state1;
+      state2.SetMockCurrentPlayer(0);
+      state2.SetMockLegalActions({dune_imperium::kActionReveal});
+      state2.ApplyAction(dune_imperium::kActionReveal);
+      while (state2.IsChanceNode()) {
+        state2.ApplyAction(state2.LegalActions()[0]);
+      }
+      
+      // Transition player state to have 0 agents remaining and show purchase/end actions
+      state2.SetPlayerAgentsRemainingForTesting(0, 0);
+      state2.SetMockLegalActions({dune_imperium::kActionBuyImperiumRow0, dune_imperium::kActionEndTurn});
+      
+      DuneSearchResult res2 = session.Search(state2);
+      // Since agents remaining == 0, the decision role is classified as kPurchase or kOtherOptional (not kAgentPrimary).
+      // So reset_reason must NOT be new_placement_activation!
+      assert(res2.diagnostics.reset_reason != "new_placement_activation");
+    }
+  }
+
+  std::cout << "TestMoreRoutingAndScenarioInvariants Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -1143,6 +1818,11 @@ int main() {
   open_spiel::TestCorrectedTerminalRounds();
   open_spiel::TestFixedSimulationCompleteness();
   open_spiel::TestRootPriorTemperatureScaling();
+  open_spiel::TestClassifierSearchRouting();
+  open_spiel::TestSearchSessionControls();
+  open_spiel::TestTransactionalMCTSAndTreeFallback();
+  open_spiel::TestInvariantGatesAndScenarios();
+  open_spiel::TestMoreRoutingAndScenarioInvariants();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }
