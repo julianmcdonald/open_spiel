@@ -103,6 +103,7 @@ struct SearchDiagnostics {
   int inherited_root_visits = 0;
   int newly_completed_simulations = 0;
   int session_cumulative_simulations = 0;
+  int short_window_cumulative_simulations = 0;
   double session_cumulative_search_time_ms = 0.0;
   double long_agent_session_cumulative_time_ms = 0.0;
   std::string re_root_status = "none"; // "hit", "miss", "none"

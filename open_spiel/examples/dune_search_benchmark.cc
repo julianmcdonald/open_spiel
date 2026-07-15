@@ -489,7 +489,7 @@ void WorkerThread(
                 search_obj["action_chosen_string"] = dune_state->ActionToString(current_player, chosen_action);
               }
               open_spiel::json::Array legals_arr;
-              for (Action a : diag.actions) {
+              for (Action a : state->LegalActions()) {
                 legals_arr.push_back(static_cast<int64_t>(a));
               }
               search_obj["legal_actions"] = legals_arr;
@@ -549,6 +549,7 @@ void WorkerThread(
               search_obj["inherited_root_visits"] = static_cast<int64_t>(diag.inherited_root_visits);
               search_obj["newly_completed_simulations"] = static_cast<int64_t>(diag.newly_completed_simulations);
               search_obj["session_cumulative_simulations"] = static_cast<int64_t>(diag.session_cumulative_simulations);
+              search_obj["short_window_cumulative_simulations"] = static_cast<int64_t>(diag.short_window_cumulative_simulations);
               search_obj["session_cumulative_search_time_ms"] = diag.session_cumulative_search_time_ms;
               search_obj["long_agent_session_cumulative_time_ms"] = diag.long_agent_session_cumulative_time_ms;
               search_obj["re_root_status"] = diag.re_root_status;

@@ -364,6 +364,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   result.diagnostics.inherited_root_visits = inherited_visits;
   result.diagnostics.newly_completed_simulations = result.simulations_completed;
   result.diagnostics.session_cumulative_simulations = session_new_simulations_completed_;
+  result.diagnostics.short_window_cumulative_simulations = short_sims_completed_;
   result.diagnostics.session_cumulative_search_time_ms = session_elapsed_time_ms_;
   result.diagnostics.long_agent_session_cumulative_time_ms = long_agent_elapsed_time_ms_;
   result.diagnostics.re_root_status = last_re_root_status_;

@@ -645,7 +645,7 @@ int main(int argc, char** argv) {
   std::cout << "============================================\n";
   
   bool bias_passed = (std::abs(mean_bias) <= 0.05);
-  bool bootstrap_passed = (bootstrap_lcb >= -0.05);
+  bool bootstrap_passed = (bootstrap_lcb > 0.0);
   
   if (!bias_passed) {
     std::cerr << absl::StrFormat("\nCRITICAL FAILURE: Critic absolute mean bias %.4f exceeds 0.05 limit!\n", std::abs(mean_bias));

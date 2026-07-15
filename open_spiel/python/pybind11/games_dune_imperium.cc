@@ -588,6 +588,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("inherited_root_visits", &open_spiel::SearchDiagnostics::inherited_root_visits)
       .def_readonly("newly_completed_simulations", &open_spiel::SearchDiagnostics::newly_completed_simulations)
       .def_readonly("session_cumulative_simulations", &open_spiel::SearchDiagnostics::session_cumulative_simulations)
+      .def_readonly("short_window_cumulative_simulations", &open_spiel::SearchDiagnostics::short_window_cumulative_simulations)
       .def_readonly("session_cumulative_search_time_ms", &open_spiel::SearchDiagnostics::session_cumulative_search_time_ms)
       .def_readonly("long_agent_session_cumulative_time_ms", &open_spiel::SearchDiagnostics::long_agent_session_cumulative_time_ms)
       .def_readonly("re_root_status", &open_spiel::SearchDiagnostics::re_root_status)
