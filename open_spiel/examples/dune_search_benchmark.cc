@@ -70,6 +70,12 @@ ABSL_FLAG(int, purchase_combat_budget, 16, "Purchase/combat short-window simulat
 ABSL_FLAG(double, live_continuation_reserve_seconds, 10.0, "Live continuation reserve seconds.");
 ABSL_FLAG(bool, live_deadline, false, "Use live deadline budget mode instead of fixed simulations.");
 ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
+ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
+ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
+ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits required for raw and argmax actions");
+ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
+ABSL_FLAG(double, conservative_stability_checkpoint_fraction, 0.5, "Fraction of budget at which to check stability");
+ABSL_FLAG(bool, conservative_continuation_overrides_disabled, true, "Disable overrides during continuation decisions");
 
 namespace open_spiel {
 namespace {
@@ -318,6 +324,12 @@ void WorkerThread(
         config.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
         config.live_continuation_reserve_seconds = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
         config.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+        config.conservative_override_enabled = absl::GetFlag(FLAGS_conservative_override_enabled);
+        config.conservative_covered_prior_threshold = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
+        config.conservative_meaningful_visit_threshold = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
+        config.conservative_q_margin_threshold = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
+        config.conservative_stability_checkpoint_fraction = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
+        config.conservative_continuation_overrides_disabled = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
         DuneSearchBudgetMode budget_mode = absl::GetFlag(FLAGS_live_deadline)
             ? DuneSearchBudgetMode::kLiveDeadline
             : DuneSearchBudgetMode::kFixedSessionSimulations;

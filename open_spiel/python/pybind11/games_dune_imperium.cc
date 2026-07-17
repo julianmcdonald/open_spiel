@@ -604,7 +604,20 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("tree_node_count", &open_spiel::SearchDiagnostics::tree_node_count)
       .def_readonly("selected_action", &open_spiel::SearchDiagnostics::selected_action)
       .def_readonly("legality_result", &open_spiel::SearchDiagnostics::legality_result)
-      .def_readonly("fallback_reason", &open_spiel::SearchDiagnostics::fallback_reason);
+      .def_readonly("fallback_reason", &open_spiel::SearchDiagnostics::fallback_reason)
+      .def_readonly("raw_reference_action", &open_spiel::SearchDiagnostics::raw_reference_action)
+      .def_readonly("mcts_proposed_action", &open_spiel::SearchDiagnostics::mcts_proposed_action)
+      .def_readonly("confidence_fallback", &open_spiel::SearchDiagnostics::confidence_fallback)
+      .def_readonly("mcts_overrode_raw", &open_spiel::SearchDiagnostics::mcts_overrode_raw)
+      .def_readonly("stability_checkpoint_action", &open_spiel::SearchDiagnostics::stability_checkpoint_action)
+      .def_readonly("stability_checkpoint_reached", &open_spiel::SearchDiagnostics::stability_checkpoint_reached)
+      .def_readonly("stability_agreement", &open_spiel::SearchDiagnostics::stability_agreement)
+      .def_readonly("pass_complete_search", &open_spiel::SearchDiagnostics::pass_complete_search)
+      .def_readonly("pass_min_actions", &open_spiel::SearchDiagnostics::pass_min_actions)
+      .def_readonly("pass_prior_mass", &open_spiel::SearchDiagnostics::pass_prior_mass)
+      .def_readonly("pass_meaningful_visits", &open_spiel::SearchDiagnostics::pass_meaningful_visits)
+      .def_readonly("pass_q_margin", &open_spiel::SearchDiagnostics::pass_q_margin)
+      .def_readonly("pass_stability", &open_spiel::SearchDiagnostics::pass_stability);
 
   py::class_<open_spiel::DuneSearchResult>(di, "DuneSearchResult")
       .def_readonly("policy", &open_spiel::DuneSearchResult::policy)

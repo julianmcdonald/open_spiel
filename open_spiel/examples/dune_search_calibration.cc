@@ -53,6 +53,12 @@ ABSL_FLAG(int, opponent_mode, 1,
           "Search opponent mode: 0=kMaxN, 1=policy sampling.");
 ABSL_FLAG(bool, nonlinear_value_head, false,
           "Use the versioned nonlinear value-head architecture.");
+ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
+ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
+ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits required for raw and argmax actions");
+ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
+ABSL_FLAG(double, conservative_stability_checkpoint_fraction, 0.5, "Fraction of budget at which to check stability");
+ABSL_FLAG(bool, conservative_continuation_overrides_disabled, true, "Disable overrides during continuation decisions");
 
 using namespace open_spiel;
 
@@ -259,6 +265,12 @@ int main(int argc, char** argv) {
       bot_cfg.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
       bot_cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
       bot_cfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+      bot_cfg.conservative_override_enabled = absl::GetFlag(FLAGS_conservative_override_enabled);
+      bot_cfg.conservative_covered_prior_threshold = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
+      bot_cfg.conservative_meaningful_visit_threshold = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
+      bot_cfg.conservative_q_margin_threshold = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
+      bot_cfg.conservative_stability_checkpoint_fraction = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
+      bot_cfg.conservative_continuation_overrides_disabled = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
 
       DuneSearchSession session(bot_cfg, global_evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
       DuneSearchResult result = session.Search(*state);

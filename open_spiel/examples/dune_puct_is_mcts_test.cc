@@ -2260,20 +2260,39 @@ void TestFallbackDeterministic() {
   {
     DuneSearchConfig config;
     config.max_simulations = 0; // force zero sims (direct fallback)
+    config.conservative_override_enabled = true;
     DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
 
+    ActionsAndProbs prior = evaluator->Prior(*state);
+    Action argmax_raw_action = kInvalidAction;
+    double max_prob = -1.0;
+    for (const auto& ap : prior) {
+      if (ap.second > max_prob) {
+        max_prob = ap.second;
+        argmax_raw_action = ap.first;
+      }
+    }
+
+    bool found_non_argmax = false;
     // Test across multiple r_vals to check stochastic mapping
-    for (double r_val : {0.1, 0.35, 0.6, 0.85}) {
-      ActionsAndProbs prior = evaluator->Prior(*state);
+    for (double r_val : {0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0}) {
       Action raw_act = SampleActionFromPrior(prior, r_val);
+      if (raw_act != argmax_raw_action) {
+        found_non_argmax = true;
+      }
 
       DuneSearchResult res = session.Search(*state);
       ControllerDecision dec = session.SelectControllerAction(*state, res, r_val);
       res = session.CommitAction(dec);
 
-      assert(res.used_fallback);
+      assert(res.used_fallback || dec.confidence_fallback);
+      assert(dec.raw_reference_action == raw_act);
+      assert(dec.selected_action == raw_act);
+      assert(res.diagnostics.raw_reference_action == raw_act);
       assert(res.diagnostics.selected_action == raw_act);
+      assert(res.diagnostics.confidence_fallback);
     }
+    assert(found_non_argmax);
   }
 
   std::cout << "TestFallbackDeterministic Passed!\n\n";
@@ -2304,6 +2323,7 @@ void TestConservativeOverrideCriteria() {
   config.conservative_continuation_overrides_disabled = true;
 
   DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+  session.SetLastRequestedMaxSimsForTesting(200);
 
   DuneSearchResult res;
   res.simulations_completed = 200;
@@ -2362,7 +2382,7 @@ void TestConservativeOverrideCriteria() {
     DuneSearchResult res_fail = res;
     res_fail.diagnostics.q_values = {0.8, 0.79, 0.1};
     res_fail.diagnostics.visit_counts = {100, 15, 5};
-    ControllerDecision dec = session.SelectControllerAction(state, res_fail, 0.95);
+    ControllerDecision dec = session.SelectControllerAction(state, res_fail, r_val);
     assert(!dec.pass_q_margin);
     assert(dec.selected_action == dec.raw_reference_action);
   }

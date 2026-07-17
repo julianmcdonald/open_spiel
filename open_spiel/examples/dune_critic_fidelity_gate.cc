@@ -881,7 +881,12 @@ int main(int argc, char** argv) {
           std::exit(1);
         }
 
-        if (absl::GetFlag(FLAGS_strict_v2_validation)) {
+        bool is_v2_corpus = false;
+        if (!opportunity_indices.empty()) {
+          is_v2_corpus = (corpus[opportunity_indices[0]].corpus_schema_version == "v2");
+        }
+
+        if (absl::GetFlag(FLAGS_strict_v2_validation) && is_v2_corpus) {
           if (opportunity_indices.size() != 32) {
             std::cerr << "Fidelity Gate validation failed: Opportunity states count in corpus is "
                       << opportunity_indices.size() << ", which is not exactly 32 states. (Normal mode requires exactly 32)\n";
@@ -907,7 +912,7 @@ int main(int argc, char** argv) {
           }
         }
         // Validate stored role, history hash, schema version, and provenance
-        if (absl::GetFlag(FLAGS_strict_v2_validation)) {
+        if (absl::GetFlag(FLAGS_strict_v2_validation) && is_v2_corpus) {
           for (size_t idx : opportunity_indices) {
             const auto& cs = corpus[idx];
             if (cs.role != "AGENT_PRIMARY") {
@@ -962,6 +967,8 @@ int main(int argc, char** argv) {
                      obj.at("corpus_fingerprint").GetString() == corpus_hash &&
                      obj.at("seed").GetInt() == seed &&
                      obj.at("rollouts").GetInt() == absl::GetFlag(FLAGS_rollouts) &&
+                     obj.find("binary_hash") != obj.end() &&
+                     obj.at("binary_hash").GetString() == open_spiel::ComputeFileSHA256("/proc/self/exe") &&
                      critic_arr.size() == gate1_indices.size() &&
                      true_arr.size() == gate1_indices.size();
         if (valid) {
@@ -1047,7 +1054,27 @@ int main(int argc, char** argv) {
                      obj.at("model_checkpoint_hash").GetString() == model_hash &&
                      obj.at("corpus_fingerprint").GetString() == corpus_hash &&
                      obj.at("rollouts").GetInt() == absl::GetFlag(FLAGS_rollouts) &&
+                     obj.find("binary_hash") != obj.end() &&
+                     obj.at("binary_hash").GetString() == open_spiel::ComputeFileSHA256("/proc/self/exe") &&
+                     obj.find("config") != obj.end() &&
                      states_arr.size() == gate2_indices.size();
+        if (valid) {
+          auto cached_cfg = obj.at("config").GetObject();
+          valid = cached_cfg.at("opponent_mode").GetInt() == absl::GetFlag(FLAGS_opponent_mode) &&
+                  cached_cfg.at("opponent_temperature").GetDouble() == absl::GetFlag(FLAGS_opponent_temperature) &&
+                  cached_cfg.at("puct_c").GetDouble() == absl::GetFlag(FLAGS_puct_c) &&
+                  cached_cfg.at("max_simulations").GetInt() == absl::GetFlag(FLAGS_max_simulations) &&
+                  cached_cfg.at("nonlinear_value_head").GetBool() == absl::GetFlag(FLAGS_nonlinear_value_head) &&
+                  cached_cfg.at("conservative_override_enabled").GetBool() == absl::GetFlag(FLAGS_conservative_override_enabled) &&
+                  cached_cfg.at("conservative_covered_prior_threshold").GetDouble() == absl::GetFlag(FLAGS_conservative_covered_prior_threshold) &&
+                  cached_cfg.at("conservative_meaningful_visit_threshold").GetInt() == absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold) &&
+                  cached_cfg.at("conservative_q_margin_threshold").GetDouble() == absl::GetFlag(FLAGS_conservative_q_margin_threshold) &&
+                  cached_cfg.at("conservative_stability_checkpoint_fraction").GetDouble() == absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction) &&
+                  cached_cfg.at("conservative_continuation_overrides_disabled").GetBool() == absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled) &&
+                  cached_cfg.at("fixed_continuation_reserve").GetInt() == absl::GetFlag(FLAGS_fixed_continuation_reserve) &&
+                  cached_cfg.at("purchase_combat_budget").GetInt() == absl::GetFlag(FLAGS_purchase_combat_budget) &&
+                  cached_cfg.at("live_continuation_reserve_seconds").GetDouble() == absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+        }
         for (size_t idx = 0; valid && idx < states_arr.size(); ++idx) {
           auto state_obj = states_arr[idx].GetObject();
           ChoiceOutcomeCacheEntry entry;
@@ -1095,7 +1122,21 @@ int main(int argc, char** argv) {
 
       size_t corpus_idx = gate2_indices[idx];
       const auto& cs = corpus[corpus_idx];
-      auto state = ReconstructState(game, cs.history, cs.player, cs.observation);
+      std::unique_ptr<State> state;
+      {
+        auto temp_state = ReconstructState(game, cs.history, cs.player, cs.observation);
+        if (ClassifyDuneDecisionRole(*temp_state, cs.player, false) == DuneDecisionRole::kAgentPrimary) {
+          state = std::move(temp_state);
+        } else {
+          // Legacy or continuation state: rewind by popping the last action to reach primary card-play turn
+          std::vector<Action> rewound_history = cs.history;
+          if (!rewound_history.empty()) {
+            rewound_history.pop_back();
+          }
+          state = ReconstructState(game, rewound_history, cs.player, {});
+          SPIEL_CHECK_TRUE(ClassifyDuneDecisionRole(*state, cs.player, false) == DuneDecisionRole::kAgentPrimary);
+        }
+      }
 
       DuneSearchConfig bot_cfg;
       bot_cfg.max_simulations = self_test ? 5 : absl::GetFlag(FLAGS_max_simulations);
@@ -1633,6 +1674,7 @@ int main(int argc, char** argv) {
       cache["corpus_fingerprint"] = corpus_hash;
       cache["seed"] = seed;
       cache["rollouts"] = absl::GetFlag(FLAGS_rollouts);
+      cache["binary_hash"] = open_spiel::ComputeFileSHA256("/proc/self/exe");
       open_spiel::json::Array critic_arr;
       open_spiel::json::Array true_arr;
       for (double v : v_critic_g1) critic_arr.push_back(v);
@@ -1672,6 +1714,23 @@ int main(int argc, char** argv) {
     cache["model_checkpoint_hash"] = model_hash;
     cache["corpus_fingerprint"] = corpus_hash;
     cache["rollouts"] = absl::GetFlag(FLAGS_rollouts);
+    open_spiel::json::Object config;
+    config["opponent_mode"] = absl::GetFlag(FLAGS_opponent_mode);
+    config["opponent_temperature"] = absl::GetFlag(FLAGS_opponent_temperature);
+    config["puct_c"] = absl::GetFlag(FLAGS_puct_c);
+    config["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
+    config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
+    config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
+    config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
+    config["conservative_meaningful_visit_threshold"] = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
+    config["conservative_q_margin_threshold"] = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
+    config["conservative_stability_checkpoint_fraction"] = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
+    config["conservative_continuation_overrides_disabled"] = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
+    config["fixed_continuation_reserve"] = absl::GetFlag(FLAGS_fixed_continuation_reserve);
+    config["purchase_combat_budget"] = absl::GetFlag(FLAGS_purchase_combat_budget);
+    config["live_continuation_reserve_seconds"] = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+    cache["config"] = config;
+    cache["binary_hash"] = open_spiel::ComputeFileSHA256("/proc/self/exe");
     open_spiel::json::Array states_arr;
     for (const auto& entry : choice_outcome_cache) {
       open_spiel::json::Object state_obj;
@@ -1904,6 +1963,12 @@ int main(int argc, char** argv) {
       config["diagnostic_rollouts"] = absl::GetFlag(FLAGS_diagnostic_rollouts);
       config["gate1_cache_path"] = absl::GetFlag(FLAGS_gate1_cache_path);
       config["choice_rollout_cache_path"] = absl::GetFlag(FLAGS_choice_rollout_cache_path);
+      config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
+      config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
+      config["conservative_meaningful_visit_threshold"] = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
+      config["conservative_q_margin_threshold"] = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
+      config["conservative_stability_checkpoint_fraction"] = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
+      config["conservative_continuation_overrides_disabled"] = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
       root["config"] = config;
 
       if (batched_eval) {

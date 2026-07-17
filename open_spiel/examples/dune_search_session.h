@@ -80,6 +80,7 @@ class DuneSearchSession {
   double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
   bool is_full_session() const { return is_full_session_; }
   std::string last_re_root_status() const { return last_re_root_status_; }
+  void SetLastRequestedMaxSimsForTesting(int sims) { last_requested_max_sims_ = sims; }
 
  private:
   DuneSearchConfig config_;
