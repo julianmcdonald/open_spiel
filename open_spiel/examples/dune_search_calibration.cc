@@ -49,6 +49,10 @@ ABSL_FLAG(std::string, report_path, "", "Path to output a structured JSON report
 ABSL_FLAG(int, fixed_continuation_reserve, 0, "Continuation reserve simulations.");
 ABSL_FLAG(int, purchase_combat_budget, 16, "Purchase/combat short-window simulation budget.");
 ABSL_FLAG(std::string, target_role, "primary", "Role to calibrate: 'primary', 'purchase', or 'combat'");
+ABSL_FLAG(int, opponent_mode, 1,
+          "Search opponent mode: 0=kMaxN, 1=policy sampling.");
+ABSL_FLAG(bool, nonlinear_value_head, false,
+          "Use the versioned nonlinear value-head architecture.");
 
 using namespace open_spiel;
 
@@ -77,17 +81,6 @@ std::unique_ptr<State> ReconstructState(const std::shared_ptr<const Game>& game,
     state->ApplyAction(action);
   }
   return state;
-}
-
-// Sample action from prior stochastically
-Action SampleActionFromPrior(const ActionsAndProbs& prior, double r_val) {
-  if (prior.empty()) return kInvalidAction;
-  double sum = 0.0;
-  for (const auto& ap : prior) {
-    sum += ap.second;
-    if (r_val <= sum) return ap.first;
-  }
-  return prior.back().first;
 }
 
 // Evaluate a single rollout using a generic algorithms::Evaluator pointer
@@ -144,7 +137,9 @@ int main(int argc, char** argv) {
   std::shared_mutex model_mutex;
 
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size, absl::GetFlag(FLAGS_num_blocks));
+      obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+      absl::GetFlag(FLAGS_num_blocks),
+      absl::GetFlag(FLAGS_nonlinear_value_head));
   try {
     torch::load(model, model_checkpoint, device);
   } catch (const std::exception& e) {
@@ -250,7 +245,11 @@ int main(int argc, char** argv) {
       DuneSearchConfig bot_cfg;
       bot_cfg.max_simulations = max_simulations;
       bot_cfg.puct_c = puct_c;
-      bot_cfg.opponent_mode = SearchOpponentMode::kPolicy;
+      const int opponent_mode = absl::GetFlag(FLAGS_opponent_mode);
+      SPIEL_CHECK_TRUE(opponent_mode == 0 || opponent_mode == 1);
+      bot_cfg.opponent_mode = opponent_mode == 0
+                                  ? SearchOpponentMode::kMaxN
+                                  : SearchOpponentMode::kPolicy;
       bot_cfg.opponent_temperature = 1.0;
       bot_cfg.temperature = 0.0;
       bot_cfg.relative_time_budget_ms = time_budget_ms;
@@ -263,15 +262,12 @@ int main(int argc, char** argv) {
 
       DuneSearchSession session(bot_cfg, global_evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
       DuneSearchResult result = session.Search(*state);
+      std::mt19937 step_rng(bot_cfg.seed);
+      double r_val = absl::Uniform(step_rng, 0.0, 1.0);
+      ControllerDecision decision = session.SelectControllerAction(*state, result, r_val);
+      result = session.CommitAction(decision);
 
-      Action a_search = kInvalidAction;
-      double max_prob = -1.0;
-      for (const auto& ap : result.policy) {
-        if (ap.second > max_prob) {
-          max_prob = ap.second;
-          a_search = ap.first;
-        }
-      }
+      Action a_search = result.diagnostics.selected_action;
 
       // Compute rollout advantage (32 continuations)
       double q_raw_sum = 0.0;
@@ -329,7 +325,7 @@ int main(int argc, char** argv) {
       }
 
       if (accepted) total_accepted.fetch_add(1);
-      
+
       double prev_adv = total_paired_advantage.load(std::memory_order_relaxed);
       while (!total_paired_advantage.compare_exchange_weak(prev_adv, prev_adv + state_advantage)) {}
 
@@ -370,6 +366,10 @@ int main(int argc, char** argv) {
     rep["root_prior_temperature"] = prior_temp;
     rep["max_simulations"] = static_cast<int64_t>(max_simulations);
     rep["puct_c"] = puct_c;
+    rep["opponent_mode"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_opponent_mode));
+    rep["nonlinear_value_head"] =
+        absl::GetFlag(FLAGS_nonlinear_value_head);
     rep["relative_time_budget_ms"] = time_budget_ms;
     rep["states_evaluated"] = static_cast<int64_t>(strategic_indices.size());
     rep["accepted_states"] = static_cast<int64_t>(total_accepted.load());

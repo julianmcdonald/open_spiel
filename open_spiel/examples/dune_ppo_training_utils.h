@@ -79,7 +79,8 @@ PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
-    uint64_t master, int global_update);
+    uint64_t master, int global_update,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model = nullptr);
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,

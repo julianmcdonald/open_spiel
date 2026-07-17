@@ -131,6 +131,9 @@ void DunePUCTISMCTSBot::Reset() {
   total_lookups_ = 0;
   reused_lookups_ = 0;
   opponent_prior_cache_.clear();
+  current_search_leaf_histories_.clear();
+  current_search_sampled_leaf_states_.clear();
+  diagnostic_leaf_states_seen_ = 0;
 }
 
 const DuneSearchResult& DunePUCTISMCTSBot::GetLastSearchResult() const {
@@ -219,6 +222,22 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   Player cur_player = state.CurrentPlayer();
   auto eval_res = evaluators_[cur_player]->PriorAndEvaluate(state);
   inference_count_this_search_++;
+  current_search_leaf_histories_.push_back(state.History());
+  ++diagnostic_leaf_states_seen_;
+  auto leaf_clone = std::shared_ptr<State>(state.Clone().release());
+  if (current_search_sampled_leaf_states_.size() < 16) {
+    current_search_sampled_leaf_states_.push_back(std::move(leaf_clone));
+  } else {
+    // Deterministic reservoir sampling keeps representative leaves without
+    // perturbing the search RNG or retaining up to 100,000 cloned states.
+    uint64_t sample_seed = dune_seed::Combine(
+        config_.seed, dune_seed::kStreamSearchSampling,
+        diagnostic_leaf_states_seen_ + 0x4c454146ULL);
+    size_t slot = sample_seed % diagnostic_leaf_states_seen_;
+    if (slot < current_search_sampled_leaf_states_.size()) {
+      current_search_sampled_leaf_states_[slot] = std::move(leaf_clone);
+    }
+  }
 
   // Initialize all legal actions with 0.0 prior first
   for (Action a : state.LegalActions()) {
@@ -284,7 +303,7 @@ ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
   ActionsAndProbs result;
   result.reserve(legal_actions.size());
   double sum_prior = 0.0;
-  
+
   for (Action action : legal_actions) {
     double prior = 1e-5; // fallback prior
     auto iter = node->child_info.find(action);
@@ -294,7 +313,7 @@ ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
     result.push_back({action, prior});
     sum_prior += prior;
   }
-  
+
   if (sum_prior > 0.0) {
     for (auto& action_prob : result) {
       action_prob.second /= sum_prior;
@@ -325,7 +344,7 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
     Action a = action_prob.first;
     double prior = action_prob.second;
     auto& child = node->child_info[a];
-    
+
     if (child.prior == 0.0) {
       child.prior = prior;
     }
@@ -517,17 +536,38 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
     node->child_info[chosen_action].visits--;
     return {};
   }
-  
-  // Multi-player Max-N backup
+
+// Multi-player Max-N backup
   node->child_info[chosen_action].return_sum += returns[cur_player];
   return returns;
+}
+
+Action GetRootArgmaxAction(const DuneISMCTSNode* root_node, const std::vector<Action>& legal_actions) {
+  if (root_node == nullptr) return kInvalidAction;
+  Action best_action = kInvalidAction;
+  int max_visits = -1;
+  for (Action action : legal_actions) {
+    auto iter = root_node->child_info.find(action);
+    if (iter != root_node->child_info.end()) {
+      if (iter->second.visits > max_visits) {
+        max_visits = iter->second.visits;
+        best_action = action;
+      }
+    }
+  }
+  return best_action;
 }
 
 DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, double max_time_ms, int start_sim_index) {
   root_samples_.clear();
   opponent_prior_cache_.clear();
   inference_count_this_search_ = 0;
-  
+  if (start_sim_index == 0) {
+    current_search_leaf_histories_.clear();
+    current_search_sampled_leaf_states_.clear();
+    diagnostic_leaf_states_seen_ = 0;
+  }
+
   visited_nodes_this_search_.clear();
   simulation_depths_this_search_.clear();
   terminal_leaf_simulations_count_ = 0;
@@ -585,7 +625,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   }
 
   searching_player_ = state.CurrentPlayer();
-  
+
   auto check_time = std::chrono::steady_clock::now();
   double check_elapsed_ms = std::chrono::duration<double, std::milli>(check_time - start_time).count();
   double safety_margin = std::min(50.0, std::max(5.0, actual_max_time_ms - 10.0));
@@ -630,9 +670,19 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     }
   }
 
+  int stability_checkpoint = std::floor(actual_max_sims * config_.conservative_stability_checkpoint_fraction);
+  Action stability_checkpoint_action = kInvalidAction;
+  bool stability_checkpoint_reached = false;
+
   int sim = 0;
   double max_sim_duration_ms = 10.0;
   for (; sim < actual_max_sims; ++sim) {
+    // Checkpoint stability snapshot
+    if (sim == stability_checkpoint) {
+      stability_checkpoint_action = GetRootArgmaxAction(root_node_, legal_actions);
+      stability_checkpoint_reached = true;
+    }
+
     // Check relative time budget limit with measured max simulation latency safety margin
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
@@ -707,7 +757,14 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     }
   }
 
+  Action final_proposed_action = GetRootArgmaxAction(root_node_, legal_actions);
+
   result.diagnostics = GetRootDiagnostics(state, config_.min_visit_threshold);
+  result.diagnostics.leaf_histories = current_search_leaf_histories_;
+  result.diagnostics.sampled_leaf_states = current_search_sampled_leaf_states_;
+  result.diagnostics.stability_checkpoint_action = stability_checkpoint_action;
+  result.diagnostics.stability_checkpoint_reached = stability_checkpoint_reached;
+  result.diagnostics.stability_agreement = stability_checkpoint_reached && (stability_checkpoint_action == final_proposed_action);
   result.inference_count = inference_count_this_search_;
   last_search_result_ = result;
   return result;
@@ -826,7 +883,7 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
 
   auto key = GetStateKey(state);
   auto iter = nodes_.find(key);
-  
+
   std::vector<Action> legal_actions = state.LegalActions();
   diag.actions = legal_actions;
   diag.visit_counts.reserve(legal_actions.size());
@@ -882,7 +939,7 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     } else {
       for (double& p : diag.priors) p = 1.0 / legal_actions.size();
     }
-    
+
     diag.visit_counts.assign(legal_actions.size(), 0);
     diag.q_values.assign(legal_actions.size(), 0.0);
   }
@@ -897,7 +954,7 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     }
     diag.max_depth = max_d;
     diag.mean_depth = sum_d / simulation_depths_this_search_.size();
-    
+
     std::vector<int> sorted_depths = simulation_depths_this_search_;
     std::sort(sorted_depths.begin(), sorted_depths.end());
     size_t p95_idx = std::min<size_t>(
@@ -909,10 +966,10 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     diag.mean_depth = 0.0;
     diag.p95_depth = 0.0;
   }
-  
+
   diag.deepest_simulated_round = max_round_this_search_;
-  diag.terminal_leaf_fraction = num_sims_this_search_ > 0 
-      ? static_cast<double>(terminal_leaf_simulations_count_) / num_sims_this_search_ 
+  diag.terminal_leaf_fraction = num_sims_this_search_ > 0
+      ? static_cast<double>(terminal_leaf_simulations_count_) / num_sims_this_search_
       : 0.0;
   diag.unique_nodes = visited_nodes_this_search_.size();
   diag.inference_count = inference_count_this_search_;
@@ -955,7 +1012,7 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
       }
     }
   }
-  
+
   if (!found_chosen) {
     double max_prob = -1.0;
     for (size_t i = 0; i < legal_actions.size(); ++i) {
@@ -965,7 +1022,7 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
       }
     }
   }
-  
+
   diag.chosen_action_raw_prior_probability = diag.priors[chosen_idx];
 
   int rank = 1;

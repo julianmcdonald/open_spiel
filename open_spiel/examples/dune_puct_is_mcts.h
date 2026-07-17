@@ -59,6 +59,14 @@ struct DuneSearchConfig {
   double live_continuation_reserve_seconds = 0.0;
   int fixed_session_limit = 200;
   std::string model_checkpoint_path = "";
+
+  // Conservative override fields
+  bool conservative_override_enabled = false;
+  double conservative_covered_prior_threshold = 0.95;
+  int conservative_meaningful_visit_threshold = 10;
+  double conservative_q_margin_threshold = 0.03;
+  double conservative_stability_checkpoint_fraction = 0.5;
+  bool conservative_continuation_overrides_disabled = true;
 };
 
 struct SearchDiagnostics {
@@ -85,6 +93,10 @@ struct SearchDiagnostics {
   std::vector<int> forced_visit_counts;
   std::vector<int> pruned_visit_counts;
   bool action_changed_vs_raw_argmax = false;
+  std::vector<std::vector<Action>> leaf_histories;
+  // In-memory sampled determinized leaves for fidelity diagnostics. Histories
+  // alone cannot always be replayed through a different hidden-world sample.
+  std::vector<std::shared_ptr<State>> sampled_leaf_states;
 
   // Telemetry fields
   std::string protocol_version = "v2";
@@ -115,6 +127,21 @@ struct SearchDiagnostics {
   Action selected_action = -1;
   bool legality_result = true;
   std::string fallback_reason = "none";
+
+  // Centralized controller selection and conservative override telemetry
+  Action raw_reference_action = -1;
+  Action mcts_proposed_action = -1;
+  bool confidence_fallback = false;
+  bool mcts_overrode_raw = false;
+  Action stability_checkpoint_action = -1;
+  bool stability_checkpoint_reached = false;
+  bool stability_agreement = false;
+  bool pass_complete_search = false;
+  bool pass_min_actions = false;
+  bool pass_prior_mass = false;
+  bool pass_meaningful_visits = false;
+  bool pass_q_margin = false;
+  bool pass_stability = false;
 };
 
 struct DuneSearchResult {
@@ -208,10 +235,12 @@ class DunePUCTISMCTSBot : public Bot {
   DuneSearchConfig& GetConfig() { return config_; }
   const DuneSearchConfig& GetConfig() const { return config_; }
 
+  std::pair<Player, std::string> GetStateKey(const State& state) const;
+  const absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*>& nodes() const { return nodes_; }
+
  private:
   void Reset();
   double RandomNumber();
-  std::pair<Player, std::string> GetStateKey(const State& state) const;
   std::unique_ptr<State> SampleRootState(const State& state, int sim_index);
   std::unique_ptr<State> ResampleFromInfostate(const State& state, int sim_index);
   DuneISMCTSNode* LookupOrCreateNode(const State& state);
@@ -259,6 +288,9 @@ class DunePUCTISMCTSBot : public Bot {
   bool in_session_ = false;
   bool has_deadline_ = false;
   std::chrono::steady_clock::time_point deadline_;
+  std::vector<std::vector<Action>> current_search_leaf_histories_;
+  std::vector<std::shared_ptr<State>> current_search_sampled_leaf_states_;
+  uint64_t diagnostic_leaf_states_seen_ = 0;
 };
 
 }  // namespace open_spiel

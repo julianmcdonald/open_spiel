@@ -57,6 +57,10 @@ ABSL_FLAG(double, dirichlet_epsilon, 0.0, "Dirichlet noise weight at root.");
 ABSL_FLAG(double, dirichlet_alpha, 0.3, "Dirichlet noise alpha.");
 ABSL_FLAG(bool, rotate_seat, true, "Rotate the seat of the search agent across games.");
 ABSL_FLAG(bool, use_opponent_model, false, "Whether non-search players in simulation follow the PPO prior policy instead of PUCT.");
+ABSL_FLAG(bool, nonlinear_value_head, false,
+          "Use the versioned nonlinear value head for the search model.");
+ABSL_FLAG(bool, opponent_nonlinear_value_head, false,
+          "Use the versioned nonlinear value head for the external opponent model.");
 ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth diagnostics periodically.");
 ABSL_FLAG(bool, check_strategic_state, false, "Whether to bypass MCTS search at non-strategic states.");
 ABSL_FLAG(bool, disable_time_limit, false, "Disable the time limit per move for fixed-simulation evaluation.");
@@ -132,28 +136,28 @@ class DuneGreedyBot : public Bot {
  public:
   DuneGreedyBot(std::unique_ptr<DuneNNEvaluator> evaluator, int seed, double temperature)
       : evaluator_(std::move(evaluator)), rng_(seed), temperature_(temperature) {}
-  
+
   Action Step(const State& state) override {
     if (state.IsTerminal()) return kInvalidAction;
     ActionsAndProbs prior = evaluator_->Prior(state);
     return SelectBestAction(prior, state);
   }
-  
+
   bool ProvidesPolicy() override { return true; }
-  
-  ActionsAndProbs GetPolicy(const State& state) override { 
-    return evaluator_->Prior(state); 
+
+  ActionsAndProbs GetPolicy(const State& state) override {
+    return evaluator_->Prior(state);
   }
-  
+
   std::pair<ActionsAndProbs, Action> StepWithPolicy(const State& state) override {
     ActionsAndProbs policy = GetPolicy(state);
     Action chosen = SelectBestAction(policy, state);
     return {policy, chosen};
   }
-  
+
   void Restart() override {}
   void RestartAt(const State& state) override {}
-  
+
  private:
   double RandomNumber() {
     return absl::Uniform(rng_, 0.0, 1.0);
@@ -260,7 +264,7 @@ void WorkerThread(
     std::mutex& log_mutex,
     GameStats& global_stats,
     std::mutex& stats_mutex) {
-  
+
   torch::InferenceMode inference_guard;
 
   // Local thread stats accumulation to reduce lock contention
@@ -381,11 +385,11 @@ void WorkerThread(
         game_role_counts[static_cast<int>(role)]++;
         bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
-        DuneSearchResult last_res = search_session->Search(*state);
+        DuneSearchResult last_res = search_session->SearchAndSelect(*state);
         chosen_action = last_res.diagnostics.selected_action;
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
-        
+
         // Update turn statistics
         if (role == open_spiel::DuneDecisionRole::kAgentPrimary) {
           in_search_turn = true;
@@ -412,7 +416,7 @@ void WorkerThread(
           thread_stats.search_mcts_step_time_sum += step_duration;
           thread_stats.search_mcts_steps_count++;
           thread_stats.search_mcts_step_times.push_back(step_duration);
-          
+
           thread_stats.total_simulations_completed += last_res.simulations_completed;
           thread_stats.total_inferences += last_res.inference_count;
           thread_stats.covered_prior_mass_sum += last_res.diagnostics.covered_prior_mass;
@@ -457,7 +461,7 @@ void WorkerThread(
               if (last_res.fallback_reason == "timeout" || last_res.fallback_reason == "max_nodes" || last_res.timeout_status) {
                 std::cerr << "\nCRITICAL FAILURE: Strategic search stopped before completing "
                           << target_sims
-                          << " simulations due to " << last_res.fallback_reason 
+                          << " simulations due to " << last_res.fallback_reason
                           << " (completed " << completed_sims << " simulations).\n";
                 std::exit(1);
               }
@@ -641,18 +645,18 @@ void WorkerThread(
         std::cout << "Spacing Guild Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kSpacingGuild) << std::endl;
         std::cout << "Bene Gesserit Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kBeneGesserit) << std::endl;
         std::cout << "Fremen Influence: " << dune_state->GetPlayerInfluenceForTesting(3, dune_imperium::Faction::kFremen) << std::endl;
-        
+
         std::cout << "Alliance Owners: Emperor=" << dune_state->GetAllianceOwnerForTesting(0)
                   << ", SG=" << dune_state->GetAllianceOwnerForTesting(1)
                   << ", BG=" << dune_state->GetAllianceOwnerForTesting(2)
                   << ", Fremen=" << dune_state->GetAllianceOwnerForTesting(3) << std::endl;
-        
+
         std::cout << "Intrigue Cards in Hand: ";
         for (int intrigue_id : dune_state->GetIntrigueHandForTesting(3)) {
           std::cout << intrigue_id << " ";
         }
         std::cout << std::endl;
-        
+
         std::cout << "All Owned Cards (ID xCount): ";
         for (int card_id = 0; card_id < 200; ++card_id) {
           int count = dune_state->CountImperiumCardsOwnedForTesting(3, card_id);
@@ -695,7 +699,7 @@ void WorkerThread(
         game_obj["seed"] = static_cast<int64_t>(game_seed);
         game_obj["search_seat"] = static_cast<int64_t>(search_seat);
         game_obj["winner"] = static_cast<int64_t>(winner);
-        
+
         open_spiel::json::Array returns_arr;
         for (double r : returns) {
           returns_arr.push_back(r);
@@ -703,7 +707,7 @@ void WorkerThread(
         game_obj["returns"] = returns_arr;
         game_obj["search_return"] = returns[search_seat];
         game_obj["search_vp"] = search_vp;
-        
+
         open_spiel::json::Array opp_vps_arr;
         for (int p = 0; p < 4; ++p) {
           if (p != search_seat) {
@@ -711,12 +715,12 @@ void WorkerThread(
           }
         }
         game_obj["opponent_vps"] = opp_vps_arr;
-        
+
         game_obj["vp_margin"] = margin;
         game_obj["rounds_played"] = static_cast<int64_t>(corrected_round);
         game_obj["search_steps"] = static_cast<int64_t>(thread_stats.search_steps_count);
         game_obj["search_swordmasters"] = dune_state->HasSwordmaster(search_seat);
-        
+
         open_spiel::json::Array opp_sm_arr;
         for (int p = 0; p < 4; ++p) {
           if (p != search_seat) {
@@ -894,7 +898,9 @@ int main(int argc, char* argv[]) {
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
   std::cout << "Loading search model weights from: " << model_ckpt << " on device " << device << "\n";
-  auto search_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
+  auto search_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      obs_size, hidden_dim, action_size, num_blocks,
+      absl::GetFlag(FLAGS_nonlinear_value_head));
   search_model->eval();
   try {
     torch::serialize::InputArchive archive;
@@ -913,7 +919,9 @@ int main(int argc, char* argv[]) {
       opp_ckpt = model_ckpt;
     }
     std::cout << "Loading opponent model weights from: " << opp_ckpt << " on device " << device << "\n";
-    opponent_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(obs_size, opp_hidden_dim, action_size, opp_num_blocks);
+    opponent_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        obs_size, opp_hidden_dim, action_size, opp_num_blocks,
+        absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
     opponent_model->eval();
     try {
       torch::serialize::InputArchive archive;
@@ -1096,6 +1104,10 @@ int main(int argc, char* argv[]) {
     agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     agg_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
     agg_obj["use_opponent_model"] = absl::GetFlag(FLAGS_use_opponent_model);
+    agg_obj["nonlinear_value_head"] =
+        absl::GetFlag(FLAGS_nonlinear_value_head);
+    agg_obj["opponent_nonlinear_value_head"] =
+        absl::GetFlag(FLAGS_opponent_nonlinear_value_head);
     agg_obj["simulated_opponent_temperature"] = absl::GetFlag(FLAGS_simulated_opponent_temperature);
     agg_obj["external_opponent_temperature"] = absl::GetFlag(FLAGS_external_opponent_temperature);
     agg_obj["disable_time_limit"] = absl::GetFlag(FLAGS_disable_time_limit);
@@ -1104,22 +1116,22 @@ int main(int argc, char* argv[]) {
     agg_obj["games_per_hour"] = total_games * 3600.0 / total_wall_time;
     agg_obj["search_wins"] = static_cast<int64_t>(global_stats.search_wins);
     agg_obj["search_winrate"] = (global_stats.search_wins * 100.0 / total_games);
-    
+
     double lcb_winrate = 0.0, ucb_winrate = 0.0;
     ComputeWilsonWinrateCI(global_stats.search_wins, total_games, &lcb_winrate, &ucb_winrate);
     agg_obj["search_winrate_lcb"] = lcb_winrate;
     agg_obj["search_winrate_ucb"] = ucb_winrate;
-    
+
     double mean_vp_margin = 0.0, lcb_vp_margin = 0.0, ucb_vp_margin = 0.0;
     ComputeVpMarginCI(global_stats.vp_margins, &mean_vp_margin, &lcb_vp_margin, &ucb_vp_margin);
     agg_obj["mean_vp_margin"] = mean_vp_margin;
     agg_obj["mean_vp_margin_lcb"] = lcb_vp_margin;
     agg_obj["mean_vp_margin_ucb"] = ucb_vp_margin;
-    
+
     agg_obj["strategic_root_count"] = static_cast<int64_t>(global_stats.search_mcts_steps_count);
     agg_obj["total_simulations_completed"] = static_cast<int64_t>(global_stats.total_simulations_completed);
     agg_obj["incomplete_searches"] = static_cast<int64_t>(global_stats.total_incomplete_searches);
-    
+
     open_spiel::json::Object roles_obj;
     roles_obj["kForcedOrBookkeeping"] = static_cast<int64_t>(global_stats.role_counts[0]);
     roles_obj["kLeaderSelection"] = static_cast<int64_t>(global_stats.role_counts[1]);
@@ -1129,32 +1141,32 @@ int main(int argc, char* argv[]) {
     roles_obj["kCombatIntrigue"] = static_cast<int64_t>(global_stats.role_counts[5]);
     roles_obj["kOtherOptional"] = static_cast<int64_t>(global_stats.role_counts[6]);
     agg_obj["decision_role_counts"] = roles_obj;
-    
+
     double timeout_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_timeouts * 100.0) / global_stats.search_mcts_steps_count : 0.0;
     double fallback_rate = global_stats.search_mcts_steps_count > 0 ? (global_stats.total_fallbacks * 100.0) / global_stats.search_mcts_steps_count : 0.0;
     agg_obj["timeout_rate"] = timeout_rate;
     agg_obj["fallback_rate"] = fallback_rate;
     agg_obj["total_inferences"] = static_cast<int64_t>(global_stats.total_inferences);
-    
+
     double avg_sims = global_stats.search_mcts_steps_count > 0 ? static_cast<double>(global_stats.total_simulations_completed) / global_stats.search_mcts_steps_count : 0.0;
     double avg_inf = global_stats.search_mcts_steps_count > 0 ? static_cast<double>(global_stats.total_inferences) / global_stats.search_mcts_steps_count : 0.0;
     agg_obj["average_simulations"] = avg_sims;
     agg_obj["average_inferences_per_step"] = avg_inf;
     agg_obj["mean_latency_s"] = avg_mcts_step_time;
     agg_obj["p95_latency_s"] = p95_latency;
-    
+
     double avg_covered = global_stats.search_mcts_steps_count > 0 ? (global_stats.covered_prior_mass_sum / global_stats.search_mcts_steps_count) : 0.0;
     agg_obj["average_coverage"] = avg_covered;
-    
+
     agg_obj["search_swordmaster_rate"] = (global_stats.search_swordmasters * 100.0) / total_games;
     agg_obj["opponent_swordmaster_rate"] = (global_stats.opponent_swordmasters * 100.0) / (3.0 * total_games);
-    
+
     open_spiel::json::Object reasons_obj;
     for (const auto& pair : global_stats.fallback_reason_counts) {
       reasons_obj[pair.first] = static_cast<int64_t>(pair.second);
     }
     agg_obj["fallback_reasons"] = reasons_obj;
-    
+
     open_spiel::json::Object rounds_obj;
     std::map<int, int> round_counts;
     double sum_rounds = 0.0;
@@ -1166,7 +1178,7 @@ int main(int argc, char* argv[]) {
       rounds_obj[std::to_string(pair.first)] = static_cast<int64_t>(pair.second);
     }
     agg_obj["rounds_played_distribution"] = rounds_obj;
-    
+
     double mean_rounds = global_stats.rounds_played.empty() ? 0.0 : sum_rounds / global_stats.rounds_played.size();
     agg_obj["mean_rounds"] = mean_rounds;
 

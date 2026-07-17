@@ -41,7 +41,7 @@ DuneSearchSession::DuneSearchSession(
     const DuneSearchConfig& config,
     const std::vector<std::shared_ptr<algorithms::Evaluator>>& evaluators,
     DuneSearchBudgetMode budget_mode)
-    : config_(config), evaluators_(evaluators), budget_mode_(budget_mode) {
+    : config_(config), evaluators_(evaluators), budget_mode_(budget_mode), rng_(config.seed) {
   placement_bot_ = std::make_shared<DunePUCTISMCTSBot>(config_, evaluators_);
   placement_bot_->in_session_ = true;
 
@@ -73,9 +73,24 @@ void DuneSearchSession::ResetSession(const std::string& reason) {
   session_history_.clear();
   last_input_history_.clear();
   last_reset_reason_ = reason;
+
+  has_pending_commit_ = false;
+  last_search_state_.reset();
+  last_requested_max_sims_ = 0;
+}
+
+void DuneSearchSession::HandleReRootMismatch(const std::string& reason) {
+  placement_bot_->Reset();
+  short_bot_->Reset();
+  last_re_root_status_ = "miss";
+  post_chance_branch_miss_ = true;
+  last_reset_reason_ = reason;
 }
 
 DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_time_ms) {
+  if (has_pending_commit_) {
+    SpielFatalError("DuneSearchSession::Search called while a commit is still pending!");
+  }
   DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
   const dune_imperium::DuneImperiumState& dune_state =
       static_cast<const dune_imperium::DuneImperiumState&>(state);
@@ -91,21 +106,18 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         is_descendant = true;
         for (size_t i = 0; i < session_history_.size(); ++i) {
           if (history[i] != session_history_[i]) {
+            std::cerr << "DEBUG RE-ROOT MISMATCH at index " << i << ": history=" << history[i]
+                      << ", session_history=" << session_history_[i] << std::endl;
             is_descendant = false;
             break;
           }
         }
       }
-      if (!is_descendant) {
+      if (is_descendant) {
+        last_re_root_status_ = "hit";
+      } else {
         if (role != DuneDecisionRole::kAgentPrimary) {
-          ResetSession("re_root_mismatch");
-          bool is_short_window_role = (role == DuneDecisionRole::kPurchase ||
-                                       role == DuneDecisionRole::kCombatIntrigue ||
-                                       role == DuneDecisionRole::kOtherOptional);
-          if (role == DuneDecisionRole::kAgentContinuation || role == DuneDecisionRole::kOtherOptional || is_short_window_role) {
-            last_re_root_status_ = "miss";
-            post_chance_branch_miss_ = true;
-          }
+          HandleReRootMismatch("re_root_mismatch");
         }
       }
     }
@@ -185,8 +197,6 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     res.diagnostics.legality_result = true;
     res.diagnostics.fallback_reason = fallback_reason;
 
-    Action selected = kInvalidAction;
-    double max_prob = -1.0;
     res.diagnostics.actions.reserve(res.policy.size());
     res.diagnostics.priors.reserve(res.policy.size());
     res.diagnostics.visit_counts.assign(res.policy.size(), 0);
@@ -194,12 +204,12 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     for (const auto& ap : res.policy) {
       res.diagnostics.actions.push_back(ap.first);
       res.diagnostics.priors.push_back(ap.second);
-      if (ap.second > max_prob) {
-        max_prob = ap.second;
-        selected = ap.first;
-      }
     }
-    res.diagnostics.selected_action = selected;
+
+    last_search_state_ = state.Clone();
+    has_pending_commit_ = true;
+    last_requested_max_sims_ = 0;
+    last_search_result_ = res;
     return res;
   };
 
@@ -220,6 +230,19 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       return get_policy_only_result("policy_only_purchase_combat");
     }
     max_sims = config_.purchase_combat_budget - short_sims_completed_;
+    if (budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) {
+      int overall_remaining = config_.fixed_session_limit - session_new_simulations_completed_ - short_sims_completed_;
+      if (overall_remaining < max_sims) {
+        max_sims = overall_remaining;
+      }
+    } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingFullFast) {
+      int total_limit = is_full_session_ ? 64 : 8;
+      int overall_remaining = total_limit - session_new_simulations_completed_ - short_sims_completed_;
+      if (overall_remaining < max_sims) {
+        max_sims = overall_remaining;
+      }
+    }
+
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - short_window_start_time_).count();
     max_time_ms = (config_.relative_time_budget_ms == std::numeric_limits<double>::infinity())
@@ -239,7 +262,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
 
     if (budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) {
       int reserve = (role == DuneDecisionRole::kAgentPrimary) ? config_.fixed_continuation_reserve : 0;
-      max_sims = config_.fixed_session_limit - reserve - session_new_simulations_completed_;
+      max_sims = config_.fixed_session_limit - reserve - session_new_simulations_completed_ - short_sims_completed_;
       if (max_sims <= 0) {
         max_sims = 0;
         limit_exceeded = true;
@@ -252,7 +275,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         is_full_session_ = (roll_rng() % 4 == 0); // 25% chance of full search
         training_full_fast_rolled_ = true;
       }
-      
+
       // Dynamic config adjusting for full vs fast searches:
       if (is_full_session_) {
         placement_bot_->GetConfig().temperature = 1.0;
@@ -269,7 +292,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         reserve = config_.fixed_continuation_reserve;
       }
       int total_limit = is_full_session_ ? 64 : 8;
-      max_sims = total_limit - reserve - session_new_simulations_completed_;
+      max_sims = total_limit - reserve - session_new_simulations_completed_ - short_sims_completed_;
       if (max_sims <= 0) {
         max_sims = 0;
         limit_exceeded = true;
@@ -296,7 +319,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
 
   // 3. Re-routing key matching check
   int inherited_visits = 0;
-  if (has_active_session_ && last_re_root_status_ != "miss") {
+  if (has_active_session_) {
     auto root_key = active_bot->GetStateKey(state);
     auto it = active_bot->nodes_.find(root_key);
     if (it != active_bot->nodes_.end()) {
@@ -310,7 +333,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         last_re_root_status_ = "none";
       }
     }
-  } else if (!has_active_session_ && last_re_root_status_ != "miss") {
+  } else {
     last_re_root_status_ = "none";
   }
 
@@ -332,16 +355,6 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   session_elapsed_time_ms_ += result.elapsed_time_ms;
   if (!is_short_window_role) {
     long_agent_elapsed_time_ms_ += result.elapsed_time_ms;
-  }
-
-  // Sample selected action for telemetry
-  Action selected_act = kInvalidAction;
-  if (!result.policy.empty()) {
-    active_bot->search_count_++;
-    uint64_t step_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, active_bot->search_count_);
-    std::mt19937 step_rng(step_seed);
-    double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-    selected_act = SampleAction(result.policy, r_val).first;
   }
 
   // Add rich telemetry and audit record fields
@@ -374,25 +387,12 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   last_reset_reason_ = "none"; // Clear it after use so it doesn't persist
   result.diagnostics.tree_node_count = active_bot->nodes_.size();
   result.diagnostics.inference_count = result.inference_count;
-  result.diagnostics.selected_action = selected_act;
-
-  bool is_legal = false;
-  if (selected_act != kInvalidAction) {
-    std::vector<Action> legal_acts = state.LegalActions();
-    is_legal = (std::find(legal_acts.begin(), legal_acts.end(), selected_act) != legal_acts.end());
-  }
-  result.diagnostics.legality_result = is_legal;
   result.diagnostics.fallback_reason = result.fallback_reason;
 
-  if (has_active_session_) {
-    session_history_ = state.History();
-    if (selected_act != kInvalidAction) {
-      session_history_.push_back(selected_act);
-    }
-  } else {
-    session_history_.clear();
-  }
-  last_input_history_ = state.History();
+  last_search_state_ = state.Clone();
+  has_pending_commit_ = true;
+  last_requested_max_sims_ = max_sims;
+  last_search_result_ = result;
 
   return result;
 }
@@ -453,10 +453,259 @@ void LoadCalibratedParameters(DuneSearchConfig& config) {
         const auto& val = dict.at("training_root_prior_temperature");
         config.training_root_prior_temperature = val.IsDouble() ? val.GetDouble() : static_cast<double>(val.GetInt());
       }
+      if (dict.find("winning_conservative_override_enabled") != dict.end()) {
+        config.conservative_override_enabled = dict.at("winning_conservative_override_enabled").GetBool();
+      }
+      if (dict.find("winning_conservative_covered_prior_threshold") != dict.end()) {
+        const auto& val = dict.at("winning_conservative_covered_prior_threshold");
+        config.conservative_covered_prior_threshold = val.IsDouble() ? val.GetDouble() : static_cast<double>(val.GetInt());
+      }
+      if (dict.find("winning_conservative_meaningful_visit_threshold") != dict.end()) {
+        const auto& val = dict.at("winning_conservative_meaningful_visit_threshold");
+        config.conservative_meaningful_visit_threshold = static_cast<int>(val.IsDouble() ? val.GetDouble() : static_cast<double>(val.GetInt()));
+      }
+      if (dict.find("winning_conservative_q_margin_threshold") != dict.end()) {
+        const auto& val = dict.at("winning_conservative_q_margin_threshold");
+        config.conservative_q_margin_threshold = val.IsDouble() ? val.GetDouble() : static_cast<double>(val.GetInt());
+      }
+      if (dict.find("winning_conservative_stability_checkpoint_fraction") != dict.end()) {
+        const auto& val = dict.at("winning_conservative_stability_checkpoint_fraction");
+        config.conservative_stability_checkpoint_fraction = val.IsDouble() ? val.GetDouble() : static_cast<double>(val.GetInt());
+      }
+      if (dict.find("winning_conservative_continuation_overrides_disabled") != dict.end()) {
+        config.conservative_continuation_overrides_disabled = dict.at("winning_conservative_continuation_overrides_disabled").GetBool();
+      }
     }
   } else {
     std::cout << "Calibration manifest not found. Using default parameters.\n";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Centralized Controller Selection and Lifecycle Commit Implementation
+// ---------------------------------------------------------------------------
+
+Action SampleActionFromPrior(const ActionsAndProbs& prior, double r_val) {
+  if (prior.empty()) return kInvalidAction;
+  double sum = 0.0;
+  for (const auto& ap : prior) {
+    sum += ap.second;
+    if (r_val <= sum) return ap.first;
+  }
+  return prior.back().first;
+}
+
+Action ArgmaxVisitAction(const SearchDiagnostics& diagnostics) {
+  if (diagnostics.actions.empty() || diagnostics.visit_counts.empty() ||
+      diagnostics.actions.size() != diagnostics.visit_counts.size()) {
+    return kInvalidAction;
+  }
+  Action best_action = kInvalidAction;
+  int max_visits = 0;
+  for (size_t i = 0; i < diagnostics.actions.size(); ++i) {
+    if (diagnostics.visit_counts[i] > max_visits) {
+      max_visits = diagnostics.visit_counts[i];
+      best_action = diagnostics.actions[i];
+    }
+  }
+  return best_action;
+}
+
+int GetActionVisits(const SearchDiagnostics& diagnostics, Action action) {
+  for (size_t i = 0; i < diagnostics.actions.size(); ++i) {
+    if (diagnostics.actions[i] == action) {
+      return diagnostics.visit_counts[i];
+    }
+  }
+  return 0;
+}
+
+double GetActionQValue(const SearchDiagnostics& diagnostics, Action action) {
+  for (size_t i = 0; i < diagnostics.actions.size(); ++i) {
+    if (diagnostics.actions[i] == action) {
+      return diagnostics.q_values[i];
+    }
+  }
+  return 0.0;
+}
+
+ControllerDecision DuneSearchSession::SelectControllerAction(
+    const State& state,
+    const DuneSearchResult& search_result,
+    double r_val) {
+  ControllerDecision decision;
+
+  // 1. Raw Reference Action
+  ActionsAndProbs raw_prior;
+  if (state.IsChanceNode()) {
+    raw_prior = state.ChanceOutcomes();
+  } else {
+    Player p = state.CurrentPlayer();
+    if (p >= 0 && p < evaluators_.size()) {
+      raw_prior = evaluators_[p]->Prior(state);
+    }
+    if (raw_prior.empty()) {
+      std::vector<Action> legals = state.LegalActions();
+      for (Action a : legals) {
+        raw_prior.push_back({a, 1.0 / legals.size()});
+      }
+    }
+  }
+  decision.raw_reference_action = SampleActionFromPrior(raw_prior, r_val);
+
+  // 2. MCTS Proposed Action
+  decision.mcts_proposed_action = ArgmaxVisitAction(search_result.diagnostics);
+
+  // Get decision role
+  DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
+
+  // Per-role logic
+  if (role == DuneDecisionRole::kAgentPrimary) {
+    if (config_.conservative_override_enabled) {
+      // Enforce the conservative override protocol
+      decision.pass_complete_search = (search_result.simulations_completed == last_requested_max_sims_ &&
+                                       !search_result.timeout_status &&
+                                       search_result.fallback_reason == "none");
+
+      std::vector<Action> legal_actions = state.LegalActions();
+      decision.pass_min_actions = (search_result.diagnostics.num_covered_actions >= std::min<int>(3, legal_actions.size()));
+      decision.pass_prior_mass = (search_result.diagnostics.covered_prior_mass >= config_.conservative_covered_prior_threshold);
+
+      int raw_visits = GetActionVisits(search_result.diagnostics, decision.raw_reference_action);
+      int mcts_visits = GetActionVisits(search_result.diagnostics, decision.mcts_proposed_action);
+      decision.pass_meaningful_visits = (raw_visits >= config_.conservative_meaningful_visit_threshold &&
+                                         mcts_visits >= config_.conservative_meaningful_visit_threshold);
+
+      double q_proposed = GetActionQValue(search_result.diagnostics, decision.mcts_proposed_action);
+      double q_raw = GetActionQValue(search_result.diagnostics, decision.raw_reference_action);
+      decision.pass_q_margin = (decision.mcts_proposed_action == decision.raw_reference_action) ||
+                               ((q_proposed - q_raw) >= config_.conservative_q_margin_threshold);
+
+      decision.stability_checkpoint_reached = search_result.diagnostics.stability_checkpoint_reached;
+      decision.stability_agreement = search_result.diagnostics.stability_agreement;
+      decision.pass_stability = decision.stability_agreement;
+
+      if (decision.pass_complete_search &&
+          decision.pass_min_actions &&
+          decision.pass_prior_mass &&
+          decision.pass_meaningful_visits &&
+          decision.pass_q_margin &&
+          decision.pass_stability) {
+        decision.selected_action = decision.mcts_proposed_action;
+        decision.mcts_overrode_raw = (decision.mcts_proposed_action != decision.raw_reference_action);
+        decision.confidence_fallback = false;
+      } else {
+        decision.selected_action = decision.raw_reference_action;
+        decision.mcts_overrode_raw = false;
+        decision.confidence_fallback = true;
+      }
+    } else {
+      // Legacy primary role logic (non-conservative MCTS action selection)
+      if (search_result.policy.empty()) {
+        decision.selected_action = decision.raw_reference_action;
+      } else {
+        decision.selected_action = SampleAction(search_result.policy, r_val).first;
+      }
+      decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+      decision.confidence_fallback = search_result.used_fallback;
+    }
+  } else if (role == DuneDecisionRole::kAgentContinuation) {
+    if (config_.conservative_override_enabled && config_.conservative_continuation_overrides_disabled) {
+      // Disable continuation overrides: return raw_ref, confidence_fallback = true
+      decision.selected_action = decision.raw_reference_action;
+      decision.confidence_fallback = true;
+      decision.mcts_overrode_raw = false;
+    } else {
+      // Legacy continuation routing
+      if (search_result.policy.empty()) {
+        decision.selected_action = decision.raw_reference_action;
+      } else {
+        decision.selected_action = SampleAction(search_result.policy, r_val).first;
+      }
+      decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+      decision.confidence_fallback = search_result.used_fallback;
+    }
+  } else if (role == DuneDecisionRole::kForcedOrBookkeeping || role == DuneDecisionRole::kLeaderSelection) {
+    std::vector<Action> legal_actions = state.LegalActions();
+    if (role == DuneDecisionRole::kForcedOrBookkeeping && legal_actions.size() == 1) {
+      decision.selected_action = legal_actions[0];
+    } else {
+      decision.selected_action = decision.raw_reference_action;
+    }
+    decision.confidence_fallback = true;
+    decision.mcts_overrode_raw = false;
+  } else if (role == DuneDecisionRole::kPurchase ||
+             role == DuneDecisionRole::kCombatIntrigue ||
+             role == DuneDecisionRole::kOtherOptional) {
+    // Preserve their configured routing (use search result directly)
+    if (search_result.policy.empty()) {
+      decision.selected_action = decision.raw_reference_action;
+    } else {
+      decision.selected_action = SampleAction(search_result.policy, r_val).first;
+    }
+    decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+    decision.confidence_fallback = search_result.used_fallback;
+  } else {
+    SpielFatalError("Unknown/unhandled DuneDecisionRole in SelectControllerAction");
+  }
+
+  return decision;
+}
+
+DuneSearchResult DuneSearchSession::CommitAction(const ControllerDecision& decision) {
+  SPIEL_CHECK_TRUE(has_pending_commit_);
+  std::vector<Action> legal_acts = last_search_state_->LegalActions();
+  bool is_legal = (std::find(legal_acts.begin(), legal_acts.end(), decision.selected_action) != legal_acts.end());
+  SPIEL_CHECK_TRUE(is_legal);
+
+  if (has_active_session_) {
+    session_history_ = last_search_state_->History();
+    session_history_.push_back(decision.selected_action);
+  } else {
+    session_history_.clear();
+  }
+
+  last_input_history_ = last_search_state_->History();
+
+  last_search_state_.reset();
+  has_pending_commit_ = false;
+
+  // Propagate Decision Telemetry
+  last_search_result_.diagnostics.raw_reference_action = decision.raw_reference_action;
+  last_search_result_.diagnostics.mcts_proposed_action = decision.mcts_proposed_action;
+  last_search_result_.diagnostics.selected_action = decision.selected_action;
+  last_search_result_.diagnostics.confidence_fallback = decision.confidence_fallback;
+  last_search_result_.diagnostics.mcts_overrode_raw = decision.mcts_overrode_raw;
+  last_search_result_.diagnostics.stability_checkpoint_reached = decision.stability_checkpoint_reached;
+  last_search_result_.diagnostics.stability_agreement = decision.stability_agreement;
+
+  last_search_result_.diagnostics.pass_complete_search = decision.pass_complete_search;
+  last_search_result_.diagnostics.pass_min_actions = decision.pass_min_actions;
+  last_search_result_.diagnostics.pass_prior_mass = decision.pass_prior_mass;
+  last_search_result_.diagnostics.pass_meaningful_visits = decision.pass_meaningful_visits;
+  last_search_result_.diagnostics.pass_q_margin = decision.pass_q_margin;
+  last_search_result_.diagnostics.pass_stability = decision.pass_stability;
+
+  return last_search_result_;
+}
+
+void DuneSearchSession::DiscardPendingAction() {
+  last_search_state_.reset();
+  has_pending_commit_ = false;
+}
+
+DuneSearchResult DuneSearchSession::SearchAndSelect(const State& state) {
+  DuneSearchResult res = Search(state);
+  std::uniform_real_distribution<double> dist(0.0, 1.0);
+  double r_val = dist(rng_);
+  ControllerDecision dec = SelectControllerAction(state, res, r_val);
+  return CommitAction(dec);
+}
+
+DuneSearchResult DuneSearchSession::SearchAndSelect(const State& state, double r_val) {
+  DuneSearchResult res = Search(state);
+  ControllerDecision dec = SelectControllerAction(state, res, r_val);
+  return CommitAction(dec);
 }
 
 } // namespace open_spiel

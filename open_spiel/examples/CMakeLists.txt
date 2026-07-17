@@ -6,7 +6,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
 
   add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_ppo_train ${TORCH_LIBRARIES})
+  target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator ${TORCH_LIBRARIES})
@@ -45,6 +45,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_critic_fidelity_gate dune_critic_fidelity_gate.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_critic_fidelity_gate dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_checkpoint_policy_identity dune_checkpoint_policy_identity.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_checkpoint_policy_identity ${TORCH_LIBRARIES})
 
   add_executable(dune_search_calibration dune_search_calibration.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_calibration dune_search ${TORCH_LIBRARIES})
@@ -110,13 +113,13 @@ add_executable(count_all_states count_all_states.cc ${OPEN_SPIEL_OBJECTS})
 #                 ${OPEN_SPIEL_OBJECTS}
 #                 $<TARGET_OBJECTS:alpha_zero_torch>)
 #   target_link_libraries (alpha_zero_torch_example ${TORCH_LIBRARIES})
-# 
+#
 #   add_executable(alpha_zero_torch_game_example alpha_zero_torch_game_example.cc
 #                 ${OPEN_SPIEL_OBJECTS}
 #                 $<TARGET_OBJECTS:alpha_zero_torch>
 #                 $<TARGET_OBJECTS:bots>)
 #   target_link_libraries (alpha_zero_torch_game_example ${TORCH_LIBRARIES})
-# 
+#
 #   add_executable(dqn_torch_example dqn_torch_example.cc
 #                 ${OPEN_SPIEL_OBJECTS}
 #                 $<TARGET_OBJECTS:dqn_torch>)

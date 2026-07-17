@@ -73,13 +73,13 @@ double CalculateMedian(std::vector<int> rounds) {
 
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
-  
+
   std::string model_checkpoint = absl::GetFlag(FLAGS_model_checkpoint);
   if (model_checkpoint.empty()) {
     std::cerr << "Error: --model_checkpoint must be specified.\n";
     return 1;
   }
-  
+
   int num_games = absl::GetFlag(FLAGS_games);
   int num_threads = absl::GetFlag(FLAGS_threads);
   int probe_simulations = absl::GetFlag(FLAGS_search_simulations);
@@ -87,22 +87,22 @@ int main(int argc, char** argv) {
   double utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
   double search_opponent_temperature = absl::GetFlag(FLAGS_search_opponent_temperature);
   int seed = absl::GetFlag(FLAGS_seed);
-  
+
   uint64_t fingerprint = ComputeFileHash(model_checkpoint);
   std::cout << absl::StrFormat("Loading checkpoint: %s (fingerprint: 0x%016llx)\n", model_checkpoint, fingerprint);
-  
+
   auto game = open_spiel::LoadGame("dune_imperium");
   int64_t obs_size = game->GetType().provides_information_state_tensor
                          ? game->InformationStateTensorSize()
                          : game->ObservationTensorSize();
   int64_t action_size = game->NumDistinctActions();
-  
+
   torch::Device device(torch::kCPU);
   if (torch::cuda::is_available()) {
     device = torch::Device(torch::kCUDA);
   }
   std::cout << "Running on device: " << (device.is_cuda() ? "CUDA GPU" : "CPU") << "\n";
-  
+
   auto model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
       obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size, absl::GetFlag(FLAGS_num_blocks));
   try {
@@ -114,23 +114,23 @@ int main(int argc, char** argv) {
   }
   model->to(device);
   model->eval();
-  
+
   std::atomic<int> games_completed{0};
   std::atomic<int> games_finished{0};
   std::atomic<int> search_win_shares_scaled{0}; // Win shares multiplied by 1000
   std::atomic<int> policy_win_shares_scaled{0};
-  
+
   std::mutex stats_mutex;
   std::vector<int> search_finish_rounds;
   std::vector<int> policy_finish_rounds;
-  
+
   auto worker_fn = [&](int thread_id) {
     std::mt19937 rng(seed + 100 + thread_id);
-    
+
     // Create evaluator and bots for this thread
     auto thread_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
         model, device);
-        
+
     std::vector<std::unique_ptr<open_spiel::DuneSearchSession>> thread_sessions;
     for (int p = 0; p < 4; ++p) {
       open_spiel::DuneSearchConfig bot_cfg;
@@ -145,18 +145,18 @@ int main(int argc, char** argv) {
       bot_cfg.purchase_combat_budget = 16;
       open_spiel::LoadCalibratedParameters(bot_cfg);
       bot_cfg.utility_divisor = utility_divisor;
-      
+
       thread_sessions.push_back(std::make_unique<open_spiel::DuneSearchSession>(
           bot_cfg, thread_evaluator, open_spiel::DuneSearchBudgetMode::kFixedSessionSimulations));
     }
-    
+
     while (true) {
       int game_idx = games_completed.fetch_add(1);
       if (game_idx >= num_games) {
         games_completed.fetch_sub(1);
         break;
       }
-      
+
       // Determine seat assignment configuration
       // We choose 2 search players and 2 policy players out of 4 seats.
       // There are 6 combinations of choosing 2 seats. We rotate them systematically.
@@ -168,13 +168,13 @@ int main(int argc, char** argv) {
       else if (config_idx == 3) { is_search[1] = is_search[2] = true; }
       else if (config_idx == 4) { is_search[1] = is_search[3] = true; }
       else if (config_idx == 5) { is_search[2] = is_search[3] = true; }
-      
+
       for (int p = 0; p < 4; ++p) {
         thread_sessions[p]->ResetSession("new_game");
       }
 
       auto state = game->NewInitialState();
-      
+
       int last_logged_round = -1;
       while (!state->IsTerminal()) {
         const auto* dune_state = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(state.get());
@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
           open_spiel::Player cur_player = state->CurrentPlayer();
           open_spiel::Action action = open_spiel::kInvalidAction;
           if (is_search[cur_player]) {
-            open_spiel::DuneSearchResult res = thread_sessions[cur_player]->Search(*state);
+            open_spiel::DuneSearchResult res = thread_sessions[cur_player]->SearchAndSelect(*state);
             action = res.diagnostics.selected_action;
           } else {
             open_spiel::ActionsAndProbs prior = thread_evaluator->Prior(*state);
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
           state->ApplyAction(action);
         }
       }
-      
+
       // Determine winner(s)
       std::vector<double> returns = state->Returns();
       double max_return = -9999.0;
@@ -233,10 +233,10 @@ int main(int argc, char** argv) {
           winners.push_back(p);
         }
       }
-      
+
       const auto* dune_state = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(state.get());
       int round = dune_state ? dune_state->GetCurrentRound() : -1;
-      
+
       // Compute win increment in scaled integer units (scaled by 1000 to avoid float atomics)
       int win_increment = 1000 / winners.size();
       for (int w : winners) {
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
           policy_win_shares_scaled.fetch_add(win_increment);
         }
       }
-      
+
       {
         std::lock_guard<std::mutex> lock(stats_mutex);
         for (int w : winners) {
@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
           }
         }
       }
-      
+
       int current_finished = games_finished.fetch_add(1) + 1;
       std::cout << absl::StrFormat("Finished game %d / %d on thread %d. Winner(s):", current_finished, num_games, thread_id);
       for (int w : winners) {
@@ -266,27 +266,27 @@ int main(int argc, char** argv) {
       std::cout << absl::StrFormat(" in round %d.\n", round) << std::flush;
     }
   };
-  
+
   std::cout << "Starting " << num_games << " match games on " << num_threads << " threads...\n";
   std::vector<std::thread> workers;
   for (int i = 0; i < num_threads; ++i) {
     workers.emplace_back(worker_fn, i);
   }
-  
+
   for (auto& t : workers) {
     t.join();
   }
-  
+
   double search_win_shares = search_win_shares_scaled.load() / 1000.0;
   double policy_win_shares = policy_win_shares_scaled.load() / 1000.0;
   double total_win_shares = search_win_shares + policy_win_shares;
-  
+
   double search_winrate = total_win_shares > 0.0 ? search_win_shares / total_win_shares : 0.0;
   double policy_winrate = total_win_shares > 0.0 ? policy_win_shares / total_win_shares : 0.0;
-  
+
   double median_search_round = CalculateMedian(search_finish_rounds);
   double median_policy_round = CalculateMedian(policy_finish_rounds);
-  
+
   std::cout << "\n========================================\n";
   std::cout << "      MATCHUP RESULTS: MCTS VS POLICY   \n";
   std::cout << "========================================\n";
@@ -297,6 +297,6 @@ int main(int argc, char** argv) {
   std::cout << absl::StrFormat("MCTS Winner Median Round:   %.1f\n", median_search_round);
   std::cout << absl::StrFormat("Policy Winner Median Round: %.1f\n", median_policy_round);
   std::cout << "========================================\n";
-  
+
   return 0;
 }

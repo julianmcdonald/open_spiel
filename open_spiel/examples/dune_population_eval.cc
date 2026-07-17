@@ -75,6 +75,10 @@ ABSL_FLAG(float, temperature, 1.0f,
 ABSL_FLAG(bool, deterministic_eval, true,
           "If true, use batch-1 mutex-serialized inference for strict bitwise "
           "thread-count reproducibility. Much slower than batched mode.");
+ABSL_FLAG(bool, nonlinear_value_head, false,
+          "Use the versioned nonlinear value head for the evaluated model.");
+ABSL_FLAG(bool, opponent_nonlinear_value_head, false,
+          "Use the versioned nonlinear value head for opponent checkpoints.");
 
 namespace open_spiel {
 namespace {
@@ -210,7 +214,7 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
   try {
     torch::serialize::InputArchive archive;
     archive.load_from(model_path, torch::kCPU);
-    
+
     torch::serialize::InputArchive input_layer_archive;
     archive.read("input_layer", input_layer_archive);
     torch::Tensor weight;
@@ -229,14 +233,14 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
       }
     }
     *num_blocks = blocks;
-    
-    std::cerr << "WARNING: Manifest JSON not found for model checkpoint " << model_path 
-              << ". Auto-detected architecture (hidden_dim=" << *hidden_dim 
+
+    std::cerr << "WARNING: Manifest JSON not found for model checkpoint " << model_path
+              << ". Auto-detected architecture (hidden_dim=" << *hidden_dim
               << ", num_blocks=" << *num_blocks << ") from weight keys. "
               << "Note: this inspection logic is coupled to the SharedDunePolicyValueNetImpl class architecture.\n";
     return true;
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Failed to detect model dimensions or load archive from " << model_path 
+    std::cerr << "ERROR: Failed to detect model dimensions or load archive from " << model_path
               << ": " << e.what() << "\n";
     return false;
   }
@@ -579,7 +583,8 @@ void RunEvaluation() {
   }
 
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      obs_size, main_hidden_dim, action_size, main_num_blocks);
+      obs_size, main_hidden_dim, action_size, main_num_blocks,
+      absl::GetFlag(FLAGS_nonlinear_value_head));
   model->eval();
   {
     torch::serialize::InputArchive archive;
@@ -615,7 +620,8 @@ void RunEvaluation() {
     opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks});
 
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-        obs_size, opp_detected_hidden, action_size, opp_detected_blocks);
+        obs_size, opp_detected_hidden, action_size, opp_detected_blocks,
+        absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
     opp_model->eval();
     {
       torch::serialize::InputArchive archive;
@@ -646,6 +652,9 @@ void RunEvaluation() {
             << "Temperature:" << temperature << "\n"
             << "Threads:    " << num_threads << "\n"
             << "Eval mode:  " << (deterministic ? "Deterministic (batch-1)" : "Batched") << "\n"
+            << "Nonlinear: "
+            << (absl::GetFlag(FLAGS_nonlinear_value_head) ? "true" : "false")
+            << "\n"
             << "Batch size: " << eval_batch_size << "\n"
             << "Device:     " << device_name << "\n"
             << "Hidden dim: " << hidden_dim << " / Blocks: " << num_blocks

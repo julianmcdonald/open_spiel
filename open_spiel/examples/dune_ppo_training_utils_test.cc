@@ -42,6 +42,7 @@
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
 #include "dune_network.h"
+#include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 
 ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
@@ -58,6 +59,7 @@ ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
+ABSL_DECLARE_FLAG(bool, train_value_only);
 #endif
 
 using namespace open_spiel;
@@ -122,7 +124,7 @@ void TestTrainPpoUpdateMasking() {
     auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
     torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-4));
-    
+
     std::vector<PpoTransition> batch(2);
     batch[0].state = std::vector<float>(obs_size, 0.1f);
     batch[0].legal_actions = {0};
@@ -146,10 +148,10 @@ void TestTrainPpoUpdateMasking() {
 
     absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
     absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
-    
+
     auto stats = TrainPpoUpdate(model, optimizer, batch, obs_size, action_dim,
                                 torch::kCPU, /*master=*/42, /*global_update=*/1);
-    
+
     CHECK_EQ(stats.nontrivial_transitions, 0);
     CHECK_EQ(stats.forced_transitions, 2);
     UTILS_CHECK(!std::isnan(stats.policy_loss));
@@ -162,7 +164,7 @@ void TestTrainPpoUpdateMasking() {
     auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
     torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-4));
-    
+
     std::vector<PpoTransition> batch(2);
     batch[0].state = std::vector<float>(obs_size, 0.1f);
     batch[0].legal_actions = {0};
@@ -186,13 +188,55 @@ void TestTrainPpoUpdateMasking() {
 
     absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
     absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
-    
+
     auto stats = TrainPpoUpdate(model, optimizer, batch, obs_size, action_dim,
                                 torch::kCPU, /*master=*/42, /*global_update=*/1);
-    
+
     CHECK_EQ(stats.nontrivial_transitions, 1);
     CHECK_EQ(stats.forced_transitions, 1);
     UTILS_CHECK(!std::isnan(stats.policy_loss));
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate value-only mode with kInvalidAction sample") {
+    int64_t obs_size = 10;
+    int64_t action_dim = 4;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
+    torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-4));
+
+    std::vector<PpoTransition> batch(2);
+    batch[0].state = std::vector<float>(obs_size, 0.1f);
+    batch[0].legal_actions = {0};
+    batch[0].action = 0;
+    batch[0].reward = 0.5f;
+    batch[0].value = 0.1f;
+    batch[0].advantage = 0.2f;
+    batch[0].return_value = 0.3f;
+    batch[0].player_id = 0;
+    batch[0].episode_id = 1;
+
+    // Transition with action = -1 (kInvalidAction)
+    batch[1].state = std::vector<float>(obs_size, 0.2f);
+    batch[1].legal_actions = {2, 3};
+    batch[1].action = -1;  // kInvalidAction
+    batch[1].reward = 0.5f;
+    batch[1].value = 0.1f;
+    batch[1].advantage = 0.5f;
+    batch[1].return_value = 0.6f;
+    batch[1].player_id = 0;
+    batch[1].episode_id = 1;
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+    absl::SetFlag(&FLAGS_train_value_only, true);
+
+    auto stats = TrainPpoUpdate(model, optimizer, batch, obs_size, action_dim,
+                                torch::kCPU, /*master=*/42, /*global_update=*/1);
+
+    absl::SetFlag(&FLAGS_train_value_only, false);
+
+    CHECK_EQ(stats.policy_loss, 0.0);
+    UTILS_CHECK(!std::isnan(stats.value_loss));
   } TEST_END();
 }
 
@@ -202,10 +246,10 @@ void TestGradientMatching() {
     int64_t action_dim = 4;
     auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
-    
+
     auto model2 = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
-    
+
     {
       torch::NoGradGuard no_grad;
       auto params1 = model->parameters();
@@ -290,9 +334,9 @@ void TestCriticOnlyParameterMovement() {
     int64_t action_dim = 4;
     auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
-    
+
     torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-3));
-    
+
     std::vector<torch::Tensor> initial_policy_weights;
     for (const auto& param : model->policy_head->parameters()) {
       initial_policy_weights.push_back(param.clone());
@@ -350,9 +394,9 @@ void TestKLEarlyStopping() {
     int64_t action_dim = 4;
     auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/1);
-    
+
     torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-1));
-    
+
     std::vector<PpoTransition> batch(2);
     batch[0].state = std::vector<float>(obs_size, 0.1f);
     batch[0].legal_actions = {0, 1};
@@ -396,7 +440,7 @@ void TestKLEarlyStopping() {
 
     auto stats = TrainPpoUpdate(model, optimizer, batch, obs_size, action_dim,
                                 torch::kCPU, /*master=*/42, /*global_update=*/1);
-    
+
     UTILS_CHECK(stats.early_stopped);
     UTILS_CHECK(stats.epoch_kls.size() < 20);
     UTILS_CHECK(stats.clip_fraction >= 0.0 && stats.clip_fraction <= 1.0);
@@ -540,7 +584,7 @@ int main() {
 
     auto state = game->NewInitialState();
     auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
-    
+
     // Increment VP via ApplyConflictChoice
     ConflictRewardChoice choice{};
     choice.vp = 1;

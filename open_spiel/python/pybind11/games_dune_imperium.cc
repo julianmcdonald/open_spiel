@@ -561,7 +561,13 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readwrite("fixed_session_limit", &open_spiel::DuneSearchConfig::fixed_session_limit)
       .def_readwrite("model_checkpoint_path", &open_spiel::DuneSearchConfig::model_checkpoint_path)
       .def_readwrite("root_prior_temperature", &open_spiel::DuneSearchConfig::root_prior_temperature)
-      .def_readwrite("training_root_prior_temperature", &open_spiel::DuneSearchConfig::training_root_prior_temperature);
+      .def_readwrite("training_root_prior_temperature", &open_spiel::DuneSearchConfig::training_root_prior_temperature)
+      .def_readwrite("conservative_override_enabled", &open_spiel::DuneSearchConfig::conservative_override_enabled)
+      .def_readwrite("conservative_covered_prior_threshold", &open_spiel::DuneSearchConfig::conservative_covered_prior_threshold)
+      .def_readwrite("conservative_meaningful_visit_threshold", &open_spiel::DuneSearchConfig::conservative_meaningful_visit_threshold)
+      .def_readwrite("conservative_q_margin_threshold", &open_spiel::DuneSearchConfig::conservative_q_margin_threshold)
+      .def_readwrite("conservative_stability_checkpoint_fraction", &open_spiel::DuneSearchConfig::conservative_stability_checkpoint_fraction)
+      .def_readwrite("conservative_continuation_overrides_disabled", &open_spiel::DuneSearchConfig::conservative_continuation_overrides_disabled);
 
   py::class_<open_spiel::SearchDiagnostics>(di, "SearchDiagnostics")
       .def_readonly("actions", &open_spiel::SearchDiagnostics::actions)
@@ -610,6 +616,22 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("fallback_reason", &open_spiel::DuneSearchResult::fallback_reason)
       .def_readonly("inference_count", &open_spiel::DuneSearchResult::inference_count);
 
+  py::class_<open_spiel::ControllerDecision>(di, "ControllerDecision")
+      .def(py::init<>())
+      .def_readwrite("selected_action", &open_spiel::ControllerDecision::selected_action)
+      .def_readwrite("raw_reference_action", &open_spiel::ControllerDecision::raw_reference_action)
+      .def_readwrite("mcts_proposed_action", &open_spiel::ControllerDecision::mcts_proposed_action)
+      .def_readwrite("confidence_fallback", &open_spiel::ControllerDecision::confidence_fallback)
+      .def_readwrite("mcts_overrode_raw", &open_spiel::ControllerDecision::mcts_overrode_raw)
+      .def_readwrite("stability_checkpoint_reached", &open_spiel::ControllerDecision::stability_checkpoint_reached)
+      .def_readwrite("stability_agreement", &open_spiel::ControllerDecision::stability_agreement)
+      .def_readwrite("pass_complete_search", &open_spiel::ControllerDecision::pass_complete_search)
+      .def_readwrite("pass_min_actions", &open_spiel::ControllerDecision::pass_min_actions)
+      .def_readwrite("pass_prior_mass", &open_spiel::ControllerDecision::pass_prior_mass)
+      .def_readwrite("pass_meaningful_visits", &open_spiel::ControllerDecision::pass_meaningful_visits)
+      .def_readwrite("pass_q_margin", &open_spiel::ControllerDecision::pass_q_margin)
+      .def_readwrite("pass_stability", &open_spiel::ControllerDecision::pass_stability);
+
   py::classh<open_spiel::DunePUCTISMCTSBot, open_spiel::Bot>(di, "DunePUCTISMCTSBot")
       .def(py::init<const open_spiel::DuneSearchConfig&, std::shared_ptr<open_spiel::algorithms::Evaluator>>(),
            py::arg("config"), py::arg("evaluator"))
@@ -632,6 +654,11 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def(py::init<const open_spiel::DuneSearchConfig&, const std::vector<std::shared_ptr<open_spiel::algorithms::Evaluator>>&, open_spiel::DuneSearchBudgetMode>(),
            py::arg("config"), py::arg("evaluators"), py::arg("budget_mode"))
       .def("search", &open_spiel::DuneSearchSession::Search, py::arg("state"), py::arg("remaining_time_ms") = -1.0)
+      .def("select_controller_action", &open_spiel::DuneSearchSession::SelectControllerAction, py::arg("state"), py::arg("search_result"), py::arg("r_val"))
+      .def("commit_action", &open_spiel::DuneSearchSession::CommitAction, py::arg("decision"))
+      .def("discard_pending_action", &open_spiel::DuneSearchSession::DiscardPendingAction)
+      .def("search_and_select", py::overload_cast<const State&>(&open_spiel::DuneSearchSession::SearchAndSelect), py::arg("state"))
+      .def("search_and_select", py::overload_cast<const State&, double>(&open_spiel::DuneSearchSession::SearchAndSelect), py::arg("state"), py::arg("r_val"))
       .def("set_episode_id", &open_spiel::DuneSearchSession::SetEpisodeId, py::arg("episode_id"))
       .def("set_update_id", &open_spiel::DuneSearchSession::SetUpdateId, py::arg("update_id"))
       .def("reset_session", &open_spiel::DuneSearchSession::ResetSession, py::arg("reason"))

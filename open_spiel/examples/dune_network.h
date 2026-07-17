@@ -52,19 +52,27 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   std::vector<std::shared_ptr<ResBlockImpl>> res_blocks;
   torch::nn::Linear policy_head{nullptr};
   torch::nn::Linear value_head{nullptr};
+  torch::nn::Linear value_head2{nullptr};
+  bool use_nonlinear_value_head_ = false;
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8) {
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false) {
+    use_nonlinear_value_head_ = use_nonlinear;
     input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
-    
+
     // Register custom submodules dynamically (res1, res2, etc.)
     for (int i = 0; i < num_blocks; ++i) {
       auto block = std::make_shared<ResBlockImpl>(hidden_dim);
       res_blocks.push_back(block);
       register_module("res" + std::to_string(i + 1), block);
     }
-    
+
     policy_head = register_module("policy_head", torch::nn::Linear(hidden_dim, action_dim));
-    value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
+    if (use_nonlinear) {
+      value_head = register_module("value_head", torch::nn::Linear(hidden_dim, hidden_dim / 2));
+      value_head2 = register_module("value_head2", torch::nn::Linear(hidden_dim / 2, 1));
+    } else {
+      value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
+    }
   }
 
   struct ModelOutputs {
@@ -77,9 +85,15 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     for (auto& block : res_blocks) {
       x = block->forward(x);
     }
-    
+
     torch::Tensor logits = policy_head->forward(x);
-    torch::Tensor values = torch::tanh(value_head->forward(x));
+    torch::Tensor values;
+    if (use_nonlinear_value_head_) {
+      auto h = torch::relu(value_head->forward(x));
+      values = torch::tanh(value_head2->forward(h));
+    } else {
+      values = torch::tanh(value_head->forward(x));
+    }
     return {logits, values};
   }
 };
@@ -118,7 +132,7 @@ struct AutocastGuard {
 
 struct EvalResult {
     std::vector<float> logits;
-    float value; 
+    float value;
 };
 
 inline void CenterAndCapLegalLogits(std::vector<float>& logits,
@@ -137,7 +151,11 @@ inline void CenterAndCapLegalLogits(std::vector<float>& logits,
     if (legal_count == 0) return;
 
     const float legal_mean = static_cast<float>(legal_sum / legal_count);
-    for (float& logit : logits) {
+    // Only legal logits are consumed by the softmax. Transforming all 2,391
+    // outputs performed thousands of unnecessary tanh calls per game.
+    for (Action action : legal_actions) {
+        if (action < 0 || static_cast<size_t>(action) >= logits.size()) continue;
+        float& logit = logits[action];
         logit -= legal_mean;
         if (logit_cap > 0.0f) {
             logit = logit_cap * std::tanh(logit / logit_cap);
@@ -156,6 +174,15 @@ class IGameEvaluator {
 public:
     virtual ~IGameEvaluator() = default;
     virtual EvalResult Evaluate(const std::vector<float>& obs) = 0;
+    virtual std::vector<EvalResult> EvaluateBatch(
+        const std::vector<std::vector<float>>& observations) {
+        std::vector<EvalResult> results;
+        results.reserve(observations.size());
+        for (const auto& obs : observations) {
+            results.push_back(Evaluate(obs));
+        }
+        return results;
+    }
     virtual EvaluatorStats GetStats() const = 0;
 };
 
@@ -247,27 +274,27 @@ private:
 
 class BatchedEvaluator : public IGameEvaluator {
 public:
-    BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model, 
-                     int target_batch_size, 
-                     int timeout_ms, 
+    BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+                     int target_batch_size,
+                     int timeout_ms,
                      torch::Device device,
                      std::shared_mutex* sync_mutex,
                      float logit_cap = 0.0f,
                      bool device_synchronize = true)
-        : model_(model), target_batch_size_(target_batch_size), 
-          timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex), 
+        : model_(model), target_batch_size_(target_batch_size),
+          timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
           stop_(false) {
-        
+
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
-        
+
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {
             at::globalContext().setAllowTF32CuBLAS(true);
             at::globalContext().setAllowTF32CuDNN(true);
         }
-        
+
         model_->eval(); // Defensive hygiene: ResBlocks use LayerNorm so this is a no-op, but protects future Dropout additions.
         runner_thread_ = std::thread(&BatchedEvaluator::Runner, this);
     }
@@ -292,13 +319,13 @@ public:
                 first_request_ts_ = std::chrono::steady_clock::now();
             }
             requests_.push_back({&obs, &result, &ready});
-            
+
             // Only wake the Runner on the first arrival or when the batch is full
             if (requests_.size() == 1 || requests_.size() >= (size_t)target_batch_size_) {
-                cv_.notify_one(); 
+                cv_.notify_one();
             }
         }
-        
+
         // HYBRID WAIT: Spin briefly to catch ultra-fast GPU responses, then park.
         int spin_count = 0;
         while (!ready.load(std::memory_order_acquire)) {
@@ -317,8 +344,51 @@ public:
                 park_cv_.wait(park_lock, [&] { return ready.load(std::memory_order_acquire); });
             }
         }
-        
+
         return result; // Move semantics
+    }
+
+    std::vector<EvalResult> EvaluateBatch(
+        const std::vector<std::vector<float>>& observations) override {
+        std::vector<EvalResult> results(observations.size());
+        if (observations.empty()) return results;
+
+        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (requests_.empty()) {
+                first_request_ts_ = std::chrono::steady_clock::now();
+            }
+            for (size_t i = 0; i < observations.size(); ++i) {
+                ready[i].store(false, std::memory_order_relaxed);
+                requests_.push_back({&observations[i], &results[i], &ready[i]});
+            }
+            // Submit all player observations atomically so the runner can form
+            // a useful batch without four serial queue/wait cycles.
+            cv_.notify_one();
+        }
+
+        auto all_ready = [&]() {
+            for (size_t i = 0; i < observations.size(); ++i) {
+                if (!ready[i].load(std::memory_order_acquire)) return false;
+            }
+            return true;
+        };
+        int spin_count = 0;
+        while (!all_ready()) {
+            if (spin_count < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+                ++spin_count;
+            } else {
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, all_ready);
+            }
+        }
+        return results;
     }
 
     EvaluatorStats GetStats() const override {
@@ -340,7 +410,7 @@ private:
         EvalResult* result_dest;
         std::atomic<bool>* ready_flag;
     };
-    
+
     std::mutex park_mutex_;
     std::condition_variable park_cv_;
 
@@ -352,12 +422,12 @@ private:
     float logit_cap_;
     bool device_synchronize_;
     int64_t model_input_dim_;
-    
+
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Request> requests_;
     std::chrono::steady_clock::time_point first_request_ts_;
-    
+
     bool stop_;
     std::thread runner_thread_;
     std::atomic<uint64_t> total_batches_{0};
@@ -371,20 +441,20 @@ private:
 
         while (true) {
             std::vector<Request> batch;
-            
+
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                
+
                 // 1. Wait until we have at least one request or we are shutting down
                 cv_.wait(lock, [this]() { return stop_ || !requests_.empty(); });
                 if (stop_ && requests_.empty()) break;
-                
+
                 // 2. We have requests. Calculate the absolute timeout deadline
                 auto deadline = first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
-                
+
                 // 3. Wait until the batch is full OR the timeout expires (Deadlock fix!)
                 cv_.wait_until(lock, deadline, [this, deadline]() {
-                    return stop_ || requests_.size() >= (size_t)target_batch_size_ || 
+                    return stop_ || requests_.size() >= (size_t)target_batch_size_ ||
                            std::chrono::steady_clock::now() >= deadline;
                 });
 
@@ -397,7 +467,7 @@ private:
                     batch.push_back(std::move(requests_.front()));
                     requests_.pop_front();
                 }
-                
+
                 // Reset the timer if there are leftovers
                 if (!requests_.empty()) {
                     first_request_ts_ = std::chrono::steady_clock::now();
@@ -427,7 +497,7 @@ private:
                 }
                 pinned_allocated = true;
             }
-            
+
             float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
             for (size_t i = 0; i < batch_size; ++i) {
                 const int64_t copy_size = std::min<int64_t>(model_input_dim_, obs_size);
@@ -438,8 +508,8 @@ private:
             }
 
             // Non-blocking H2D transfer using .slice() for partial batches
-            torch::Tensor device_obs = device_.is_cuda() 
-                ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true) 
+            torch::Tensor device_obs = device_.is_cuda()
+                ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true)
                 : pinned_stacked_obs.slice(0, 0, batch_size);
 
             // B. FORWARD PASS WITH AMP (FP16/TF32) AND WRITE PROTECTION
@@ -488,12 +558,12 @@ private:
             for (size_t i = 0; i < batch_size; ++i) {
                 batch[i].result_dest->logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
                 batch[i].result_dest->value = values_ptr[i];
-                
+
                 // Set the atomic flag (fast spinning threads will catch this instantly)
                 batch[i].ready_flag->store(true, std::memory_order_release);
             }
-            
-            // Memory barrier to guarantee parked threads see the ready flag, 
+
+            // Memory barrier to guarantee parked threads see the ready flag,
             // followed by a SINGLE broadcast syscall (instead of 64 individual futex wakes)
             { std::lock_guard<std::mutex> park_lock(park_mutex_); }
             park_cv_.notify_all();

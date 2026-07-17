@@ -481,7 +481,10 @@ int main(int argc, char** argv) {
 
         if (should_search) {
           open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, searched_player, session.HasActiveSession());
+          double r_val = absl::Uniform(blueprint_rng, 0.0, 1.0);
           open_spiel::DuneSearchResult last_res = session.Search(*state);
+          open_spiel::ControllerDecision decision = session.SelectControllerAction(*state, last_res, r_val);
+          last_res = session.CommitAction(decision);
           open_spiel::SearchDiagnostics diag = last_res.diagnostics;
 
           if (diag.selected_action != open_spiel::kInvalidAction) {
@@ -628,10 +631,10 @@ int main(int argc, char** argv) {
 
   if (training_labels_emitted.load() < target_training_labels ||
       validation_labels_emitted.load() < target_validation_labels) {
-    std::cerr << "Error: reached max_games=" << max_games 
-              << " without satisfying targets (training=" << training_labels_emitted.load() 
-              << "/" << target_training_labels 
-              << ", validation=" << validation_labels_emitted.load() 
+    std::cerr << "Error: reached max_games=" << max_games
+              << " without satisfying targets (training=" << training_labels_emitted.load()
+              << "/" << target_training_labels
+              << ", validation=" << validation_labels_emitted.load()
               << "/" << target_validation_labels << ").\n";
     return 1;
   }
@@ -640,12 +643,12 @@ int main(int argc, char** argv) {
   try {
     std::filesystem::path dir_path(output_dir);
     std::filesystem::create_directories(dir_path);
-    
+
     open_spiel::json::Object manifest_obj;
     manifest_obj["schema_version"] = 2;
     manifest_obj["base_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
     manifest_obj["model_checkpoint_sha256"] = open_spiel::ComputeFileSHA256(model_checkpoint);
-    
+
     open_spiel::json::Object config_obj;
     config_obj["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
     config_obj["utility_divisor"] = absl::GetFlag(FLAGS_utility_divisor);
@@ -661,17 +664,17 @@ int main(int argc, char** argv) {
     config_obj["uniform_ratio"] = absl::GetFlag(FLAGS_uniform_ratio);
     config_obj["search_opponent_temperature"] = absl::GetFlag(FLAGS_search_opponent_temperature);
     config_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
-    
+
     manifest_obj["effective_search_config"] = config_obj;
-    
+
     open_spiel::json::Object arch_obj;
     arch_obj["hidden_dim"] = absl::GetFlag(FLAGS_hidden_dim);
     arch_obj["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
     manifest_obj["architecture"] = arch_obj;
-    
+
     manifest_obj["training_label_count"] = static_cast<int64_t>(training_labels_emitted.load());
     manifest_obj["validation_label_count"] = static_cast<int64_t>(validation_labels_emitted.load());
-    
+
     open_spiel::json::Array files_arr;
     std::vector<std::string> bin_files;
     for (const auto& entry : std::filesystem::directory_iterator(dir_path)) {
@@ -680,7 +683,7 @@ int main(int argc, char** argv) {
       }
     }
     std::sort(bin_files.begin(), bin_files.end());
-    
+
     for (const auto& bin_fn : bin_files) {
       std::filesystem::path bin_path = dir_path / bin_fn;
       open_spiel::json::Object f_obj;
@@ -689,7 +692,7 @@ int main(int argc, char** argv) {
       files_arr.push_back(f_obj);
     }
     manifest_obj["files"] = files_arr;
-    
+
     // Semantic identity hash (excluding operational files list for fingerprint)
     open_spiel::json::Object semantic_obj;
     semantic_obj["schema_version"] = manifest_obj["schema_version"];
@@ -699,10 +702,10 @@ int main(int argc, char** argv) {
     semantic_obj["architecture"] = manifest_obj["architecture"];
     semantic_obj["training_label_count"] = manifest_obj["training_label_count"];
     semantic_obj["validation_label_count"] = manifest_obj["validation_label_count"];
-    
+
     std::string semantic_json = open_spiel::json::ToString(semantic_obj);
     manifest_obj["search_label_fingerprint"] = open_spiel::ComputeStringSHA256(semantic_json);
-    
+
     std::ofstream out_manifest(dir_path / "manifest.json");
     if (!out_manifest) {
       std::cerr << "Failed to write manifest.json\n";

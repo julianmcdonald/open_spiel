@@ -16,6 +16,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <iomanip>
 
 #include <random>
 #include <shared_mutex>
@@ -38,6 +40,7 @@
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_search_routing.h"
 #include "open_spiel/utils/json.h"
 #endif
 
@@ -132,9 +135,20 @@ ABSL_FLAG(uint64_t, start_env_steps, 0, "Fallback start environment steps for bo
 ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstrap mode.");
 ABSL_FLAG(std::string, diagnostics_path, "",
           "Path to write structured diagnostics JSON/CSV. Extension determines format.");
+ABSL_DECLARE_FLAG(bool, train_value_only);
+ABSL_FLAG(bool, unfreeze_trunk, false, "Unfreeze the shared trunk (input + res blocks) during training.");
+ABSL_FLAG(bool, nonlinear_value_head, false, "Use a nonlinear value head.");
+ABSL_FLAG(bool, sample_counterfactual_states, false, "Sample generic counterfactual successor states.");
+ABSL_FLAG(int, counterfactual_samples_per_game, 4,
+          "Maximum uniformly sampled alternate primary-action successors per game.");
+ABSL_FLAG(int, counterfactual_replay_weight, 8,
+          "Value-loss replay multiplicity for each sampled counterfactual successor.");
+ABSL_DECLARE_FLAG(double, policy_kl_anchor_coeff);
 
 namespace open_spiel {
 namespace {
+
+std::set<std::vector<open_spiel::Action>> prohibited_histories;
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -214,47 +228,47 @@ class SearchLabelBuffer {
 
   void LoadFromDirectory(const std::string& dir) {
     if (dir.empty() || !std::filesystem::exists(dir)) return;
-    
+
     // Verify manifest.json
     std::filesystem::path manifest_path = std::filesystem::path(dir) / "manifest.json";
     if (!std::filesystem::exists(manifest_path)) {
       SpielFatalError("SearchLabelBuffer: manifest.json not found in " + dir);
     }
-    
+
     std::ifstream ifs(manifest_path.string());
     if (!ifs) {
       SpielFatalError("SearchLabelBuffer: Failed to open manifest.json in " + dir);
     }
     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     ifs.close();
-    
+
     auto val_opt = open_spiel::json::FromString(content);
     if (!val_opt) {
       SpielFatalError("SearchLabelBuffer: Failed to parse manifest.json in " + dir);
     }
-    
+
     const auto& manifest_obj = val_opt->GetObject();
-    
+
     // Verify schema_version
     auto schema_it = manifest_obj.find("schema_version");
     if (schema_it == manifest_obj.end() || static_cast<int>(schema_it->second.GetInt()) != 2) {
       SpielFatalError("SearchLabelBuffer: Unsupported manifest schema version in " + dir + " (expected 2)");
     }
-    
+
     // Verify training_label_count & validation_label_count
     auto train_cnt_it = manifest_obj.find("training_label_count");
     auto val_cnt_it = manifest_obj.find("validation_label_count");
     if (train_cnt_it == manifest_obj.end() || val_cnt_it == manifest_obj.end()) {
       SpielFatalError("SearchLabelBuffer: Missing training/validation counts in manifest.json");
     }
-    
+
     int64_t training_count = train_cnt_it->second.GetInt();
     int64_t validation_count = val_cnt_it->second.GetInt();
     if (training_count < 8192 || validation_count < 1024) {
-      SpielFatalError("SearchLabelBuffer: Manifest training count (" + std::to_string(training_count) + 
+      SpielFatalError("SearchLabelBuffer: Manifest training count (" + std::to_string(training_count) +
                      ") or validation count (" + std::to_string(validation_count) + ") is insufficient.");
     }
-    
+
     // Verify files & SHA-256 hashes
     auto files_it = manifest_obj.find("files");
     if (files_it == manifest_obj.end()) {
@@ -268,21 +282,21 @@ class SearchLabelBuffer {
       if (fn_it == f_obj.end() || hash_it == f_obj.end()) {
         SpielFatalError("SearchLabelBuffer: Missing filename or sha256 in file entry");
       }
-      
+
       std::string filename = fn_it->second.GetString();
       std::string expected_sha256 = hash_it->second.GetString();
       std::filesystem::path bin_path = std::filesystem::path(dir) / filename;
       if (!std::filesystem::exists(bin_path)) {
         SpielFatalError("SearchLabelBuffer: Label file " + filename + " listed in manifest does not exist.");
       }
-      
+
       std::string actual_sha256 = open_spiel::ComputeFileSHA256(bin_path.string());
       if (actual_sha256 != expected_sha256) {
-        SpielFatalError("SearchLabelBuffer: Hash mismatch for file " + filename + 
+        SpielFatalError("SearchLabelBuffer: Hash mismatch for file " + filename +
                        ": expected=" + expected_sha256 + " actual=" + actual_sha256);
       }
     }
-    
+
     // Reconstruct semantic object for fingerprint verification
     open_spiel::json::Object semantic_obj;
     semantic_obj["schema_version"] = manifest_obj.at("schema_version");
@@ -292,18 +306,18 @@ class SearchLabelBuffer {
     semantic_obj["architecture"] = manifest_obj.at("architecture");
     semantic_obj["training_label_count"] = manifest_obj.at("training_label_count");
     semantic_obj["validation_label_count"] = manifest_obj.at("validation_label_count");
-    
+
     std::string semantic_json = open_spiel::json::ToString(semantic_obj);
     std::string expected_fingerprint = open_spiel::ComputeStringSHA256(semantic_json);
-    
+
     auto fp_it = manifest_obj.find("search_label_fingerprint");
     if (fp_it == manifest_obj.end() || fp_it->second.GetString() != expected_fingerprint) {
       SpielFatalError("SearchLabelBuffer: Manifest search_label_fingerprint mismatch!");
     }
-    
-    std::cout << "SearchLabelBuffer: manifest.json verified successfully. Fingerprint: " 
+
+    std::cout << "SearchLabelBuffer: manifest.json verified successfully. Fingerprint: "
               << expected_fingerprint << "\n";
-              
+
     LoadNewFiles(dir);
   }
 
@@ -342,27 +356,27 @@ class SearchLabelBuffer {
     return labels_.size();
   }
 
-  double ComputeValidationKL(const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model, 
+  double ComputeValidationKL(const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model,
                              const torch::Device& device, float logit_cap) const {
     std::lock_guard<std::mutex> lock(mu_);
     if (validation_labels_.empty()) return 0.0;
-    
+
     torch::NoGradGuard no_grad;
     const size_t batch_size = 512;
     double kl_sum = 0.0;
     size_t total_count = 0;
-    
+
     for (size_t i = 0; i < validation_labels_.size(); i += batch_size) {
       size_t current_batch_size = std::min(batch_size, validation_labels_.size() - i);
-      
+
       torch::Tensor states_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_obs_size_}, torch::kFloat);
       torch::Tensor masks_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kBool);
       torch::Tensor teacher_probs_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kFloat);
-      
+
       float* states_ptr = states_cpu.data_ptr<float>();
       bool* masks_ptr = masks_cpu.data_ptr<bool>();
       float* teacher_ptr = teacher_probs_cpu.data_ptr<float>();
-      
+
       for (size_t j = 0; j < current_batch_size; ++j) {
         const auto& label = validation_labels_[i + j];
         std::copy(label.state.begin(), label.state.end(), states_ptr + j * expected_obs_size_);
@@ -373,24 +387,24 @@ class SearchLabelBuffer {
           teacher_ptr[j * expected_action_dim_ + action_id] = prob;
         }
       }
-      
+
       torch::Tensor states = states_cpu.to(device);
       torch::Tensor masks = masks_cpu.to(device);
       torch::Tensor teacher_probs = teacher_probs_cpu.to(device);
-      
+
       auto outputs = model->forward(states);
       torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
       torch::Tensor masked_logits = logits.masked_fill(masks.logical_not(), -1e9f);
       torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-      
+
       torch::Tensor log_teacher = torch::log(teacher_probs.clamp_min(1e-12f));
       torch::Tensor kl_loss = teacher_probs * (log_teacher - log_probs);
       torch::Tensor mean_kl = kl_loss.sum(-1);
-      
+
       kl_sum += mean_kl.sum().item<double>();
       total_count += current_batch_size;
     }
-    
+
     return total_count > 0 ? (kl_sum / total_count) : 0.0;
   }
 
@@ -505,7 +519,7 @@ class SearchLabelBuffer {
       in.read(reinterpret_cast<char*>(&label.num_covered_actions), sizeof(int32_t));
       in.read(reinterpret_cast<char*>(&label.eta), sizeof(float));
       in.read(reinterpret_cast<char*>(&label.eta_capped), sizeof(uint8_t));
-      
+
       uint8_t pid = 0;
       uint8_t padding[2];
       in.read(reinterpret_cast<char*>(&pid), sizeof(uint8_t));
@@ -582,6 +596,76 @@ void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
   CopyModelWeights(training_model, inference_model);
 }
 
+std::string HashNonValueParameters(const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  std::stringstream ss;
+  torch::NoGradGuard no_grad;
+  bool unfreeze_trunk = absl::GetFlag(FLAGS_unfreeze_trunk);
+  for (auto& name_param : model->named_parameters()) {
+    std::string name = name_param.key();
+    bool should_hash = false;
+    if (unfreeze_trunk) {
+      if (name.rfind("policy_head", 0) == 0) {
+        should_hash = true;
+      }
+    } else {
+      if (name.find("value_head") == std::string::npos) {
+        should_hash = true;
+      }
+    }
+    if (should_hash) {
+      auto tensor = name_param.value().contiguous().cpu().to(torch::kFloat32);
+      float* data = static_cast<float*>(tensor.data_ptr());
+      size_t num_el = tensor.numel();
+      ss.write(reinterpret_cast<const char*>(data), num_el * sizeof(float));
+    }
+  }
+  return open_spiel::ComputeStringSHA256(ss.str());
+}
+
+void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+                         const std::string& path, torch::Device device) {
+  if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
+    torch::load(model, path, device);
+    return;
+  }
+  int64_t input_dim = model->input_layer->weight.size(1);
+  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+  int64_t action_dim = model->policy_head->weight.size(0);
+  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+
+  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      input_dim, hidden_dim, action_dim, num_blocks, /*use_nonlinear=*/false);
+  temp_model->to(device);
+
+  std::cout << "[INFO] Loading standard checkpoint for partial weight copy (nonlinear model)..." << std::endl;
+  torch::load(temp_model, path, device);
+
+  torch::NoGradGuard no_grad;
+  model->input_layer->weight.copy_(temp_model->input_layer->weight);
+  if (model->input_layer->bias.defined() && temp_model->input_layer->bias.defined()) {
+    model->input_layer->bias.copy_(temp_model->input_layer->bias);
+  }
+  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+    auto& target_block = model->res_blocks[i];
+    auto& source_block = temp_model->res_blocks[i];
+    auto source_params = source_block->parameters();
+    auto target_params = target_block->parameters();
+    for (size_t j = 0; j < source_params.size(); ++j) {
+      target_params[j].copy_(source_params[j]);
+    }
+    auto source_buffers = source_block->buffers();
+    auto target_buffers = target_block->buffers();
+    for (size_t j = 0; j < source_buffers.size(); ++j) {
+      target_buffers[j].copy_(source_buffers[j]);
+    }
+  }
+  model->policy_head->weight.copy_(temp_model->policy_head->weight);
+  if (model->policy_head->bias.defined() && temp_model->policy_head->bias.defined()) {
+    model->policy_head->bias.copy_(temp_model->policy_head->bias);
+  }
+  std::cout << "[INFO] Partial weight copy completed successfully." << std::endl;
+}
+
 void SetOptimizerLearningRate(torch::optim::Optimizer& optimizer, double lr) {
   for (auto& group : optimizer.param_groups()) {
     auto& options = static_cast<torch::optim::AdamWOptions&>(group.options());
@@ -591,6 +675,23 @@ void SetOptimizerLearningRate(torch::optim::Optimizer& optimizer, double lr) {
 
 std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model) {
+  if (absl::GetFlag(FLAGS_train_value_only)) {
+    std::vector<torch::Tensor> trainable_params;
+    for (auto& param : model->parameters()) {
+      if (param.requires_grad()) {
+        trainable_params.push_back(param);
+      }
+    }
+    std::vector<torch::optim::OptimizerParamGroup> groups;
+    groups.emplace_back(trainable_params);
+    auto optimizer = std::make_unique<torch::optim::AdamW>(
+        groups, torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
+    static_cast<torch::optim::AdamWOptions&>(
+        optimizer->param_groups()[0].options())
+        .weight_decay(absl::GetFlag(FLAGS_weight_decay));
+    return optimizer;
+  }
+
   std::vector<torch::Tensor> policy_params;
   std::vector<torch::Tensor> other_params;
   auto policy_params_set = model->policy_head->parameters();
@@ -715,6 +816,21 @@ std::string ComputeConfigFingerprint() {
   // New flags added for complete config fingerprint validation
   config_obj["deterministic"] = absl::GetFlag(FLAGS_deterministic);
   config_obj["deterministic_rollout_eval"] = absl::GetFlag(FLAGS_deterministic_rollout_eval);
+  // Critic-remediation settings are training semantics, not launcher details.
+  // Persist them in the fingerprint so a partially completed value-only run
+  // cannot be resumed with a different set of trainable parameters or data.
+  config_obj["train_value_only"] = absl::GetFlag(FLAGS_train_value_only);
+  config_obj["unfreeze_trunk"] = absl::GetFlag(FLAGS_unfreeze_trunk);
+  config_obj["nonlinear_value_head"] =
+      absl::GetFlag(FLAGS_nonlinear_value_head);
+  config_obj["sample_counterfactual_states"] =
+      absl::GetFlag(FLAGS_sample_counterfactual_states);
+  config_obj["counterfactual_samples_per_game"] =
+      absl::GetFlag(FLAGS_counterfactual_samples_per_game);
+  config_obj["counterfactual_replay_weight"] =
+      absl::GetFlag(FLAGS_counterfactual_replay_weight);
+  config_obj["policy_kl_anchor_coeff"] =
+      absl::GetFlag(FLAGS_policy_kl_anchor_coeff);
 
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
@@ -761,7 +877,7 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     const std::string& run_uuid) {
   std::string model_tmp = model_path + ".tmp";
   std::string optim_tmp = optim_path + ".tmp";
-  
+
   std::filesystem::path manifest_path = model_path;
   manifest_path.replace_extension(".json");
   std::string manifest_path_str = manifest_path.string();
@@ -860,7 +976,10 @@ std::pair<Action, float> SamplePolicyAction(
   return {action, static_cast<float>(std::log(std::max(prob, 1e-12)))};
 }
 
-
+struct CounterfactualPending {
+  PpoTransition transition;
+  int replay_weight;
+};
 
 int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   std::shared_ptr<IGameEvaluator> evaluator, int64_t obs_size,
@@ -913,6 +1032,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
     torch::NoGradGuard no_grad;
     int game_length = 0;
+    int counterfactual_samples = 0;
+    std::vector<CounterfactualPending> pending_cf;
     while (!state->IsTerminal()) {
       ++game_length;
       if (game_length > 5000) {
@@ -945,6 +1066,12 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         continue;
       }
 
+      if (absl::GetFlag(FLAGS_train_value_only)) {
+        if (!prohibited_histories.empty() && prohibited_histories.count(state->History())) {
+          SpielFatalError("CRITICAL PROTECTION BOUNDARY FAILURE: Attempted to process or train on a prohibited official-corpus state!");
+        }
+      }
+
       Player current_player = state->CurrentPlayer();
       std::vector<Action> actions = state->LegalActions();
       if (actions.empty()) {
@@ -967,6 +1094,136 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       auto policy_sample = SamplePolicyAction(&policy_rng[current_player], logits, actions);
       Action action = policy_sample.first;
       float old_log_prob = policy_sample.second;
+
+      if (absl::GetFlag(FLAGS_sample_counterfactual_states) &&
+          counterfactual_samples <
+              absl::GetFlag(FLAGS_counterfactual_samples_per_game) &&
+          ClassifyDuneDecisionRole(*state, current_player, false) == DuneDecisionRole::kAgentPrimary) {
+        // Clone independent RNGs to prevent perturbing the live trajectory
+        std::mt19937_64 cf_chance_rng = chance_rng;
+        std::mt19937_64 cf_policy_rng[4];
+        for (int p = 0; p < 4; ++p) {
+          cf_policy_rng[p] = policy_rng[p];
+        }
+
+        std::vector<Action> alternate_actions;
+        alternate_actions.reserve(actions.size());
+        for (Action candidate : actions) {
+          if (candidate != action) alternate_actions.push_back(candidate);
+        }
+        if (!alternate_actions.empty()) {
+          // One uniformly sampled alternative per encountered primary state.
+          // Episode/player RNG streams make this deterministic while the full
+          // raw-policy game set provides coverage across all legal actions.
+          std::uniform_int_distribution<size_t> alternate_distribution(
+              0, alternate_actions.size() - 1);
+          Action alt_act = alternate_actions[
+              alternate_distribution(cf_policy_rng[current_player])];
+
+          auto succ_state = state->Clone();
+          succ_state->ApplyAction(alt_act);
+
+          while (succ_state->IsChanceNode()) {
+            auto outcomes = succ_state->ChanceOutcomes();
+            if (outcomes.empty()) break;
+            Action chance_act = game.GetType().chance_mode == GameType::ChanceMode::kSampledStochastic
+                        ? outcomes.front().first
+                        : SampleAction(outcomes, cf_chance_rng).first;
+            succ_state->ApplyAction(chance_act);
+          }
+
+          std::vector<float> succ_obs(obs_size, 0.0f);
+          bool valid = false;
+          float succ_val = 0.0f;
+          float target_return = 0.0f;
+          if (!succ_state->IsTerminal()) {
+            if (provides_info_state_tensor) {
+              succ_state->InformationStateTensor(current_player, absl::MakeSpan(succ_obs));
+              valid = true;
+            } else if (provides_observations_tensor) {
+              succ_state->ObservationTensor(current_player, absl::MakeSpan(succ_obs));
+              valid = true;
+            }
+            if (valid) {
+              EvalResult succ_result = evaluator->Evaluate(succ_obs);
+              succ_val = succ_result.value;
+
+              // Run a counterfactual rollout to get a terminal-return learning signal
+              auto roll_state = succ_state->Clone();
+              while (!roll_state->IsTerminal()) {
+                if (roll_state->IsChanceNode()) {
+                  auto outcomes = roll_state->ChanceOutcomes();
+                  if (outcomes.empty()) break;
+                  Action choice = game.GetType().chance_mode == GameType::ChanceMode::kSampledStochastic
+                              ? outcomes.front().first
+                              : SampleAction(outcomes, cf_chance_rng).first;
+                  roll_state->ApplyAction(choice);
+                  continue;
+                }
+
+                if (roll_state->CurrentPlayer() == kSimultaneousPlayerId) {
+                  std::vector<Action> joint_action;
+                  for (int p = 0; p < game.NumPlayers(); ++p) {
+                    std::vector<Action> actions = roll_state->LegalActions(p);
+                    if (actions.empty()) {
+                      joint_action.push_back(0);
+                    } else {
+                      std::uniform_int_distribution<int> dis(0, actions.size() - 1);
+                      joint_action.push_back(actions[dis(cf_policy_rng[p])]);
+                    }
+                  }
+                  roll_state->ApplyActions(joint_action);
+                  continue;
+                }
+
+                Player curr_p = roll_state->CurrentPlayer();
+                std::vector<Action> curr_acts = roll_state->LegalActions();
+                std::vector<float> curr_obs(obs_size, 0.0f);
+                if (provides_info_state_tensor) {
+                  roll_state->InformationStateTensor(curr_p, absl::MakeSpan(curr_obs));
+                } else {
+                  roll_state->ObservationTensor(curr_p, absl::MakeSpan(curr_obs));
+                }
+                EvalResult roll_res = evaluator->Evaluate(curr_obs);
+                CenterAndCapLegalLogits(roll_res.logits, curr_acts, logit_cap);
+                Action roll_act = SamplePolicyAction(&cf_policy_rng[curr_p], roll_res.logits, curr_acts).first;
+                roll_state->ApplyAction(roll_act);
+              }
+              target_return = static_cast<float>(roll_state->Returns()[current_player]) / 4.0f;
+            }
+          } else {
+            succ_val = static_cast<float>(succ_state->Returns()[current_player]) / 4.0f;
+            target_return = succ_val;
+            valid = true;
+          }
+
+          if (valid) {
+            if (absl::GetFlag(FLAGS_train_value_only)) {
+              if (!prohibited_histories.empty() && prohibited_histories.count(succ_state->History())) {
+                SpielFatalError("CRITICAL PROTECTION BOUNDARY FAILURE: Attempted to process or train on a prohibited official-corpus state via counterfactual generation!");
+              }
+            }
+            PpoTransition cf_trans;
+            cf_trans.state = std::move(succ_obs);
+            cf_trans.legal_actions = succ_state->IsTerminal() ? std::vector<Action>{} : succ_state->LegalActions();
+            cf_trans.action = kInvalidAction;
+            cf_trans.old_log_prob = 0.0f;
+            cf_trans.reward = 0.0f;
+            cf_trans.value = succ_val;
+            cf_trans.advantage = target_return - succ_val;
+            cf_trans.return_value = target_return;
+            cf_trans.player_id = current_player;
+            cf_trans.episode_id = episode_id;
+
+            CounterfactualPending pending;
+            pending.replay_weight =
+                absl::GetFlag(FLAGS_counterfactual_replay_weight);
+            pending.transition = std::move(cf_trans);
+            pending_cf.push_back(std::move(pending));
+            ++counterfactual_samples;
+          }
+        }
+      }
 
       if (dune_state != nullptr) {
         pre_action_phase = dune_state->phase();
@@ -1097,8 +1354,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     }
 
     std::vector<double> terminal_returns = state->Returns();
-    double gamma = absl::GetFlag(FLAGS_gamma);
-    double gae_lambda = absl::GetFlag(FLAGS_gae_lambda);
+    double gamma = absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gamma);
+    double gae_lambda = absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gae_lambda);
     float reward_scale = static_cast<float>(
         std::max(1e-6, absl::GetFlag(FLAGS_reward_scale)));
     std::vector<float> last_value(game.NumPlayers(), 0.0f);
@@ -1108,10 +1365,18 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     for (auto it = trajectory->rbegin(); it != trajectory->rend(); ++it) {
       if (it->player_id < 0 || it->player_id >= game.NumPlayers()) continue;
       int p = it->player_id;
-      float reward = it->reward;
-      if (!seen_last_action[p]) {
-        reward += static_cast<float>(terminal_returns[p]);
-        seen_last_action[p] = true;
+      float reward = 0.0f;
+      if (absl::GetFlag(FLAGS_train_value_only)) {
+        if (!seen_last_action[p]) {
+          reward = static_cast<float>(terminal_returns[p]);
+          seen_last_action[p] = true;
+        }
+      } else {
+        reward = it->reward;
+        if (!seen_last_action[p]) {
+          reward += static_cast<float>(terminal_returns[p]);
+          seen_last_action[p] = true;
+        }
       }
       reward = std::clamp(reward / reward_scale, -1.0f, 1.0f);
 
@@ -1123,6 +1388,16 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       it->return_value = advantage + it->value;
       last_value[p] = it->value;
       last_gae[p] = advantage;
+    }
+
+    for (auto& cf : pending_cf) {
+      for (int repeat = 0; repeat < cf.replay_weight; ++repeat) {
+        if (repeat + 1 == cf.replay_weight) {
+          trajectory->push_back(std::move(cf.transition));
+        } else {
+          trajectory->push_back(cf.transition);
+        }
+      }
     }
 
     return game_length;
@@ -1211,7 +1486,7 @@ CollectResult CollectRollout(const Game* game,
                          &worker_stats, &local_episode_id, actual_start_ep, rollout_games, reward_lambda);
   }
   for (auto& worker : workers) worker.join();
-  
+
   if (rollout_games > 0) {
     next_episode_id->store(actual_start_ep + rollout_games);
   } else {
@@ -1306,20 +1581,87 @@ int main(int argc, char** argv) {
     std::cout << "CUDA available. PPO training on GPU.\n";
   }
 
-  auto training_model =
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-          absl::GetFlag(FLAGS_num_blocks));
-  auto inference_model =
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-          absl::GetFlag(FLAGS_num_blocks));
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
   training_model->to(device);
   inference_model->to(device);
+
+  if (absl::GetFlag(FLAGS_sample_counterfactual_states) && !absl::GetFlag(FLAGS_train_value_only)) {
+    SpielFatalError("Counterfactual states sampling can only be enabled during value-only training (train_value_only=true).");
+  }
+  if (absl::GetFlag(FLAGS_sample_counterfactual_states) &&
+      (absl::GetFlag(FLAGS_counterfactual_samples_per_game) <= 0 ||
+       absl::GetFlag(FLAGS_counterfactual_replay_weight) <= 0)) {
+    SpielFatalError("Counterfactual sample and replay counts must both be positive.");
+  }
+
+  if (absl::GetFlag(FLAGS_train_value_only)) {
+    if (absl::GetFlag(FLAGS_reward_scale) != 4.0) {
+      SpielFatalError("reward_scale must be exactly 4.0 when train_value_only is active.");
+    }
+    {
+      std::string corpus_path = "data/dune_diagnostic_corpus.json";
+      std::ifstream f(corpus_path);
+      if (!f.good()) {
+        SpielFatalError(absl::StrCat("CRITICAL EXCEPTION: Prohibited histories corpus file ", corpus_path, " is missing! Fail-closed boundary triggered."));
+      }
+      std::string content((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+      auto json_parsed = open_spiel::json::FromString(content);
+      if (!json_parsed) {
+        SpielFatalError(absl::StrCat("CRITICAL EXCEPTION: Failed to parse prohibited histories corpus from ", corpus_path, "!"));
+      }
+      auto json_arr = json_parsed.value().GetArray();
+      for (const auto& item_val : json_arr) {
+        auto item = item_val.GetObject();
+        auto history_arr = item.at("history").GetArray();
+        std::vector<open_spiel::Action> hist;
+        for (const auto& act_val : history_arr) {
+          hist.push_back(static_cast<open_spiel::Action>(act_val.GetInt()));
+        }
+        prohibited_histories.insert(hist);
+      }
+      std::cout << "[INFO] Loaded " << prohibited_histories.size()
+                << " prohibited histories from official corpus to prevent training leakage.\n";
+    }
+    std::cout << "[INFO] train_value_only is true: freezing trunk & policy head parameters.\n";
+    if (absl::GetFlag(FLAGS_unfreeze_trunk)) {
+      if (absl::GetFlag(FLAGS_policy_kl_anchor_coeff) <= 0.0) {
+        SpielFatalError("CRITICAL SAFETY ERROR: policy_kl_anchor_coeff must be positive when unfreezing the trunk layer in value-only training mode.");
+      }
+    } else {
+      for (auto& p : training_model->input_layer->parameters()) {
+        p.set_requires_grad(false);
+      }
+      for (auto& block : training_model->res_blocks) {
+        for (auto& p : block->parameters()) {
+          p.set_requires_grad(false);
+        }
+      }
+    }
+    for (auto& p : training_model->policy_head->parameters()) {
+      p.set_requires_grad(false);
+    }
+  }
+
   training_model->train();
   inference_model->eval();
 
   auto optimizer = open_spiel::MakeOptimizer(training_model);
+
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> anchor_model = nullptr;
+  if (absl::GetFlag(FLAGS_train_value_only) && absl::GetFlag(FLAGS_unfreeze_trunk)) {
+    anchor_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+    anchor_model->to(device);
+  }
 
   std::string init_mode = absl::GetFlag(FLAGS_init_mode);
   if (init_mode.empty()) {
@@ -1357,7 +1699,12 @@ int main(int argc, char** argv) {
 
     CheckpointManifest manifest;
     std::string err;
-    std::string legacy_fingerprint = ComputeLegacyConfigFingerprint();
+    // Legacy fingerprints predate critic-remediation flags and therefore
+    // cannot prove which parameters or data source were active. Never use
+    // that compatibility escape hatch for value-only resumes.
+    std::string legacy_fingerprint = absl::GetFlag(FLAGS_train_value_only)
+        ? ""
+        : ComputeLegacyConfigFingerprint();
     if (!ParseAndValidateManifest(manifest_path, model_path, optim_path,
                                   master, target_end_update,
                                   absl::GetFlag(FLAGS_seed_scheme_version),
@@ -1380,8 +1727,20 @@ int main(int argc, char** argv) {
     std::string manifest_run_uuid = manifest.run_uuid;
 
     try {
-      torch::load(training_model, model_path, device);
-      torch::load(*optimizer, optim_path, device);
+      LoadModelCheckpoint(training_model, model_path, device);
+      if (anchor_model) {
+        LoadModelCheckpoint(anchor_model, model_path, device);
+        anchor_model->eval();
+        for (auto& p : anchor_model->parameters()) {
+          p.set_requires_grad(false);
+        }
+        std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
+      }
+      if (!absl::GetFlag(FLAGS_train_value_only)) {
+        torch::load(*optimizer, optim_path, device);
+      } else {
+        std::cout << "[INFO] train_value_only is true: keeping fresh value-only optimizer. Skipping optimizer checkpoint load.\n";
+      }
     } catch (const c10::Error& e) {
       SpielFatalError("LibTorch load failed: " + std::string(e.msg()));
     }
@@ -1415,8 +1774,9 @@ int main(int argc, char** argv) {
   } else if (init_mode == "bootstrap") {
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
-    if (model_path.find("artifacts/baselines") != std::string::npos) {
-      SpielFatalError("Refusing to bootstrap directly inside the frozen baseline directory: " + model_path + 
+    if (model_path.find("artifacts/baselines") != std::string::npos ||
+        model_path.find("artifacts/branch_a_frozen") != std::string::npos) {
+      SpielFatalError("Refusing to bootstrap directly inside the frozen baseline or branch_a_frozen directory: " + model_path +
                       "\nRun bootstrap beside a BRANCH COPY in a separate output directory.");
     }
     if (!std::filesystem::exists(model_path)) {
@@ -1427,8 +1787,20 @@ int main(int argc, char** argv) {
     }
 
     try {
-      torch::load(training_model, model_path, device);
-      torch::load(*optimizer, optim_path, device);
+      LoadModelCheckpoint(training_model, model_path, device);
+      if (anchor_model) {
+        LoadModelCheckpoint(anchor_model, model_path, device);
+        anchor_model->eval();
+        for (auto& p : anchor_model->parameters()) {
+          p.set_requires_grad(false);
+        }
+        std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
+      }
+      if (!absl::GetFlag(FLAGS_train_value_only)) {
+        torch::load(*optimizer, optim_path, device);
+      } else {
+        std::cout << "[INFO] train_value_only is true: using fresh value-only optimizer (skipping baseline optimizer load).\n";
+      }
     } catch (const c10::Error& e) {
       SpielFatalError("LibTorch load failed during bootstrap: " + std::string(e.msg()));
     }
@@ -1579,7 +1951,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-      torch::load(training_model, model_path, device);
+      LoadModelCheckpoint(training_model, model_path, device);
     } catch (const c10::Error& e) {
       SpielFatalError("LibTorch load failed: " + std::string(e.msg()));
     }
@@ -1590,7 +1962,7 @@ int main(int argc, char** argv) {
     }
 
     auto dummy_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-        manifest_obs_size, manifest_hidden_dim, manifest_action_size, manifest_num_blocks);
+        manifest_obs_size, manifest_hidden_dim, manifest_action_size, manifest_num_blocks, absl::GetFlag(FLAGS_nonlinear_value_head));
     int64_t expected_param_count = 0;
     for (const auto& param : dummy_model->parameters()) {
       expected_param_count += param.numel();
@@ -1655,6 +2027,12 @@ int main(int argc, char** argv) {
 
   int rollout_games = absl::GetFlag(FLAGS_rollout_games);
 
+  std::string initial_non_value_hash = "";
+  if (absl::GetFlag(FLAGS_train_value_only)) {
+    initial_non_value_hash = HashNonValueParameters(training_model);
+    std::cout << "[INFO] Initial non-value parameters SHA256: " << initial_non_value_hash << "\n";
+  }
+
   // Collect first rollout synchronously.
   float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
@@ -1665,7 +2043,7 @@ int main(int argc, char** argv) {
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
-                                   obs_size, action_size, device, master, start_update);
+                                   obs_size, action_size, device, master, start_update, anchor_model);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
@@ -1717,8 +2095,16 @@ int main(int argc, char** argv) {
     auto ppo_start = std::chrono::high_resolution_clock::now();
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
-                                   obs_size, action_size, device, master, update);
+                                   obs_size, action_size, device, master, update, anchor_model);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+
+    if (absl::GetFlag(FLAGS_train_value_only)) {
+      std::string current_non_value_hash = HashNonValueParameters(training_model);
+      if (current_non_value_hash != initial_non_value_hash) {
+        SpielFatalError(absl::StrFormat("Policy/trunk parameters changed during value-only training! Expected: %s, Got: %s",
+                                        initial_non_value_hash, current_non_value_hash));
+      }
+    }
 
     double ppo_elapsed = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - ppo_start).count();
@@ -1900,7 +2286,9 @@ int main(int argc, char** argv) {
     }
 
     int checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
-    if (checkpoint_interval > 0 && update % checkpoint_interval == 0) {
+    int training_step = update - start_update + 1;
+    bool is_pilot_update = (training_step == 10 || training_step == 25 || training_step == 50);
+    if (is_pilot_update || (checkpoint_interval > 0 && update % checkpoint_interval == 0)) {
       std::string prefix = absl::GetFlag(FLAGS_run_prefix);
       std::string model_path =
           absl::StrCat(prefix, "_model_update_", update, ".pt");

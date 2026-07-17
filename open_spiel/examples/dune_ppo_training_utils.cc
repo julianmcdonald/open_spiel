@@ -18,6 +18,7 @@
 
 ABSL_DECLARE_FLAG(int, ppo_minibatch_size);
 ABSL_DECLARE_FLAG(int, ppo_update_epochs);
+ABSL_FLAG(double, policy_kl_anchor_coeff, 0.0, "Coefficient for policy KL anchor penalty to prevent policy drift when unfreezing trunk in value-only training");
 ABSL_DECLARE_FLAG(double, ppo_clip_epsilon);
 ABSL_DECLARE_FLAG(bool, normalize_advantages);
 ABSL_DECLARE_FLAG(bool, ppo_clip_value_loss);
@@ -28,6 +29,7 @@ ABSL_DECLARE_FLAG(double, target_kl);
 ABSL_DECLARE_FLAG(bool, train_amp);
 ABSL_DECLARE_FLAG(double, grad_clip_norm);
 ABSL_DECLARE_FLAG(bool, diagnostics_only);
+ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 #endif
 
 namespace open_spiel {
@@ -285,7 +287,8 @@ PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
-    uint64_t master, int global_update) {
+    uint64_t master, int global_update,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
   stats.rollout_hash = ComputeRolloutHash(batch);
@@ -401,19 +404,21 @@ PpoUpdateStats TrainPpoUpdate(
       torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
 
       auto outputs = model->forward(mb_states);
-      torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-      torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
-      torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-      torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+      if (!::absl::GetFlag(::FLAGS_train_value_only)) {
+        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+        torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+        torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
 
-      torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-      torch::Tensor ratio = torch::exp(log_ratio);
-      torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+        torch::Tensor ratio = torch::exp(log_ratio);
+        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
 
-      torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
-      if (masked_kl.numel() > 0) {
-        kl_before_sum += masked_kl.sum().item<double>();
-        kl_before_nontrivial_count += masked_kl.numel();
+        torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+        if (masked_kl.numel() > 0) {
+          kl_before_sum += masked_kl.sum().item<double>();
+          kl_before_nontrivial_count += masked_kl.numel();
+        }
       }
 
       torch::Tensor mb_values = outputs.values.squeeze(1);
@@ -490,6 +495,54 @@ PpoUpdateStats TrainPpoUpdate(
 
       auto compute_loss = [&]() {
         auto outputs = model->forward(mb_states);
+
+        // 3. Critic loss (Retain all samples)
+        torch::Tensor new_values = outputs.values.squeeze(1);
+        if (clip_value_loss) {
+          torch::Tensor value_loss_unclipped =
+              (new_values - mb_returns).pow(2);
+          torch::Tensor value_clipped =
+              mb_old_values +
+              (new_values - mb_old_values)
+                  .clamp(-clip_epsilon, clip_epsilon);
+          torch::Tensor value_loss_clipped =
+              (value_clipped - mb_returns).pow(2);
+          value_loss =
+              0.5f * torch::max(value_loss_unclipped, value_loss_clipped).mean();
+        } else {
+          value_loss = 0.5f * (new_values - mb_returns).pow(2).mean();
+        }
+
+        if (::absl::GetFlag(::FLAGS_train_value_only)) {
+          policy_loss = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          entropy = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          approx_kl = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          clip_fraction = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          total_loss = value_coef * value_loss;
+          if (anchor_model) {
+            auto anchor_outputs = anchor_model->forward(mb_states);
+            torch::Tensor anchor_logits = CenterAndCapLogitsTensor(anchor_outputs.logits, mb_masks, logit_cap);
+            torch::Tensor masked_anchor_logits = anchor_logits.masked_fill(mb_masks.logical_not(), -1e9f);
+            torch::Tensor anchor_probs = torch::softmax(masked_anchor_logits, -1);
+            torch::Tensor log_anchor_probs = torch::log_softmax(masked_anchor_logits, -1);
+
+            torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+            torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+            torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+
+            torch::Tensor kl_loss = anchor_probs * (log_anchor_probs - log_probs);
+            torch::Tensor mean_kl;
+            if (mb_num_nontrivial > 0) {
+              mean_kl = kl_loss.sum(-1).masked_select(mb_nontrivial).mean();
+            } else {
+              mean_kl = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+            }
+            double kl_anchor_coeff = ::absl::GetFlag(::FLAGS_policy_kl_anchor_coeff);
+            total_loss += kl_anchor_coeff * mean_kl;
+          }
+          return;
+        }
+
         torch::Tensor logits =
             CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
         torch::Tensor masked_logits =
@@ -511,7 +564,6 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
             mb_adv = (mb_advantages - mean) / std;
           }
-          // If mb_num_nontrivial <= 1, standard deviation is undefined or zero, use raw.
         }
         mb_adv = mb_adv.detach();
 
@@ -521,23 +573,6 @@ PpoUpdateStats TrainPpoUpdate(
             -mb_adv * ratio.clamp(1.0f - clip_epsilon,
                                   1.0f + clip_epsilon);
         torch::Tensor pg_loss = torch::max(pg_loss1, pg_loss2);
-
-        // 3. Critic loss (Retain all samples)
-        torch::Tensor new_values = outputs.values.squeeze(1);
-        if (clip_value_loss) {
-          torch::Tensor value_loss_unclipped =
-              (new_values - mb_returns).pow(2);
-          torch::Tensor value_clipped =
-              mb_old_values +
-              (new_values - mb_old_values)
-                  .clamp(-clip_epsilon, clip_epsilon);
-          torch::Tensor value_loss_clipped =
-              (value_clipped - mb_returns).pow(2);
-          value_loss =
-              0.5f * torch::max(value_loss_unclipped, value_loss_clipped).mean();
-        } else {
-          value_loss = 0.5f * (new_values - mb_returns).pow(2).mean();
-        }
 
         // 4. Actor metrics and entropy
         if (mb_num_nontrivial > 0) {

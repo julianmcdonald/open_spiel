@@ -25,10 +25,14 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   std::vector<double> Evaluate(const State& state) override {
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);
+    std::vector<std::vector<float>> observations;
+    observations.reserve(num_players);
     for (int p = 0; p < num_players; ++p) {
-      std::vector<float> obs = state.InformationStateTensor(p);
-      open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
-      double val = result.value;
+      observations.push_back(state.InformationStateTensor(p));
+    }
+    auto results = batched_eval_->EvaluateBatch(observations);
+    for (int p = 0; p < num_players; ++p) {
+      double val = results[p].value;
       values[p] = val;
       DuneNNEvaluator::RecordLeafValue(val);
     }
@@ -93,9 +97,15 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     }
     Player current_player = state.CurrentPlayer();
 
+    std::vector<std::vector<float>> observations;
+    observations.reserve(num_players);
     for (int p = 0; p < num_players; ++p) {
-      std::vector<float> obs = state.InformationStateTensor(p);
-      open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
+      observations.push_back(state.InformationStateTensor(p));
+    }
+    auto results = batched_eval_->EvaluateBatch(observations);
+
+    for (int p = 0; p < num_players; ++p) {
+      const open_spiel::EvalResult& result = results[p];
       double val = result.value;
       values[p] = val;
       DuneNNEvaluator::RecordLeafValue(val);

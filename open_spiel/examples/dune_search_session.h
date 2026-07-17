@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <random>
 #include "open_spiel/spiel.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_search_routing.h"
@@ -17,6 +18,27 @@ enum class DuneSearchBudgetMode {
   kTrainingFullFast = 2,
   kLiveDeadline = 3
 };
+
+struct ControllerDecision {
+  Action selected_action = kInvalidAction;
+  Action raw_reference_action = kInvalidAction;
+  Action mcts_proposed_action = kInvalidAction;
+  bool confidence_fallback = false;
+  bool mcts_overrode_raw = false;
+  bool stability_checkpoint_reached = false;
+  bool stability_agreement = false;
+
+  // Per-criterion pass/fail fields
+  bool pass_complete_search = false;
+  bool pass_min_actions = false;
+  bool pass_prior_mass = false;
+  bool pass_meaningful_visits = false;
+  bool pass_q_margin = false;
+  bool pass_stability = false;
+};
+
+// Helper function to sample an action from a policy prior.
+Action SampleActionFromPrior(const ActionsAndProbs& prior, double r_val);
 
 class DuneSearchSession {
  public:
@@ -32,15 +54,29 @@ class DuneSearchSession {
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
 
+  ControllerDecision SelectControllerAction(
+      const State& state,
+      const DuneSearchResult& search_result,
+      double r_val);
+
+  DuneSearchResult CommitAction(const ControllerDecision& decision);
+
+  void DiscardPendingAction();
+
+  DuneSearchResult SearchAndSelect(const State& state);
+  DuneSearchResult SearchAndSelect(const State& state, double r_val);
+
   // Setters/Getters for session metadata/diagnostics
   void SetEpisodeId(int episode_id) { episode_id_ = episode_id; }
   void SetUpdateId(int update_id) { update_id_ = update_id; }
   void ResetSession(const std::string& reason);
+  void HandleReRootMismatch(const std::string& reason);
   bool HasActiveSession() const { return has_active_session_; }
   std::shared_ptr<DunePUCTISMCTSBot> GetBot() const { return placement_bot_; }
   std::shared_ptr<DunePUCTISMCTSBot> GetShortBot() const { return short_bot_; }
 
   int session_new_simulations_completed() const { return session_new_simulations_completed_; }
+  int short_sims_completed() const { return short_sims_completed_; }
   double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
   bool is_full_session() const { return is_full_session_; }
   std::string last_re_root_status() const { return last_re_root_status_; }
@@ -61,6 +97,8 @@ class DuneSearchSession {
   int episode_id_ = 0;
   int update_id_ = 0;
   int decision_id_ = 0;
+
+  std::mt19937 rng_;
 
   // Cumulative budget tracking
   int session_new_simulations_completed_ = 0;
@@ -89,6 +127,12 @@ class DuneSearchSession {
   std::vector<Action> last_input_history_;
 
   std::string last_reset_reason_ = "none";
+
+  // Commit lifecycle state
+  bool has_pending_commit_ = false;
+  std::unique_ptr<State> last_search_state_;
+  DuneSearchResult last_search_result_;
+  int last_requested_max_sims_ = 0;
 };
 
 // Factory helper to construct neural network evaluator from checkpoint
