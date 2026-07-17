@@ -306,11 +306,28 @@ ForcedActionRolloutResult RunForcedActionPolicyRollout(
   return {final_return, critic};
 }
 
+std::string DuneDecisionRoleToString(DuneDecisionRole role) {
+  switch (role) {
+    case DuneDecisionRole::kForcedOrBookkeeping: return "FORCED_OR_BOOKKEEPING";
+    case DuneDecisionRole::kLeaderSelection: return "LEADER_SELECTION";
+    case DuneDecisionRole::kAgentPrimary: return "AGENT_PRIMARY";
+    case DuneDecisionRole::kAgentContinuation: return "AGENT_CONTINUATION";
+    case DuneDecisionRole::kPurchase: return "PURCHASE";
+    case DuneDecisionRole::kCombatIntrigue: return "COMBAT_INTRIGUE";
+    case DuneDecisionRole::kOtherOptional: return "OTHER_OPTIONAL";
+    default: return "UNKNOWN";
+  }
+}
+
 struct RolloutEvidence {
   int rollout_index = 0;
   std::string session_id = "";
   std::vector<int> raw_action_sequence;
   std::vector<int> search_action_sequence;
+  std::vector<std::vector<int>> raw_legal_actions;
+  std::vector<std::string> raw_decision_roles;
+  std::vector<std::vector<int>> search_legal_actions;
+  std::vector<std::string> search_decision_roles;
   std::vector<double> raw_priors;
   std::vector<int> search_visits;
   std::vector<double> root_q_values;
@@ -343,6 +360,10 @@ struct OpportunityStateEvidence {
   std::string role = "";
   std::vector<int> raw_action_sequence;
   std::vector<int> search_action_sequence;
+  std::vector<std::vector<int>> raw_legal_actions;
+  std::vector<std::string> raw_decision_roles;
+  std::vector<std::vector<int>> search_legal_actions;
+  std::vector<std::string> search_decision_roles;
   std::vector<double> raw_priors;
   std::vector<int> search_visits;
   std::vector<double> root_q_values;
@@ -413,6 +434,8 @@ struct ChoiceOutcomeCacheEntry {
 struct RolloutDiagnostics {
   double return_val = 0.0;
   std::vector<Action> action_sequence;
+  std::vector<std::vector<Action>> legal_actions_sequence;
+  std::vector<std::string> decision_roles_sequence;
   int session_simulations = 0;
   int initial_simulations = 0;
   int continuation_simulations = 0;
@@ -439,6 +462,8 @@ struct RolloutDiagnostics {
 struct RawRolloutResult {
   double return_val = 0.0;
   std::vector<Action> action_sequence;
+  std::vector<std::vector<Action>> legal_actions_sequence;
+  std::vector<std::string> decision_roles_sequence;
 };
 
 RawRolloutResult RunRawControllerRollout(
@@ -456,6 +481,9 @@ RawRolloutResult RunRawControllerRollout(
   Player active_player = state->CurrentPlayer();
   int round = dune_state->GetCurrentRound();
   std::vector<Action> action_sequence;
+  std::vector<std::vector<Action>> legal_actions_sequence;
+  std::vector<std::string> decision_roles_sequence;
+  int raw_decisions_count = 0;
 
   while (!state->IsTerminal()) {
     if (state->IsChanceNode()) {
@@ -486,6 +514,10 @@ RawRolloutResult RunRawControllerRollout(
       if (in_activation && current_player == owner) {
         action = SampleActionFromPrior(prior, r_val);
         action_sequence.push_back(action);
+        legal_actions_sequence.push_back(state->LegalActions());
+        decision_roles_sequence.push_back(
+            raw_decisions_count == 0 ? "AGENT_PRIMARY" : "AGENT_CONTINUATION");
+        raw_decisions_count++;
       } else {
         action = SampleActionFromPrior(prior, r_val);
       }
@@ -509,7 +541,7 @@ RawRolloutResult RunRawControllerRollout(
       state->ApplyAction(action);
     }
   }
-  return {state->Returns()[owner] / utility_divisor, action_sequence};
+  return {state->Returns()[owner] / utility_divisor, action_sequence, legal_actions_sequence, decision_roles_sequence};
 }
 
 Action GetBestActionFromSearchResult(const DuneSearchResult& result) {
@@ -707,6 +739,9 @@ RolloutDiagnostics RunSearchControllerRollout(
             diag.selected_action_rank = rank;
           }
         }
+
+        diag.legal_actions_sequence.push_back(state->LegalActions());
+        diag.decision_roles_sequence.push_back(DuneDecisionRoleToString(role));
 
         diag.search_decisions_count++;
         diag.inference_count += result.inference_count;
@@ -1260,6 +1295,12 @@ int main(int argc, char** argv) {
           rev.session_id = root_res.diagnostics.session_id;
           rev.raw_action_sequence = {static_cast<int>(raw_action)};
           rev.search_action_sequence = {static_cast<int>(search_action)};
+          std::vector<int> root_acts_int;
+          for (Action a : root_actions) root_acts_int.push_back(static_cast<int>(a));
+          rev.raw_legal_actions = {root_acts_int};
+          rev.raw_decision_roles = {"AGENT_PRIMARY"};
+          rev.search_legal_actions = {root_acts_int};
+          rev.search_decision_roles = {"AGENT_PRIMARY"};
           rev.raw_priors = root_res.diagnostics.priors;
           rev.search_visits = root_res.diagnostics.visit_counts;
           rev.root_q_values = root_res.diagnostics.q_values;
@@ -1286,6 +1327,12 @@ int main(int argc, char** argv) {
 
         ev.raw_action_sequence = {static_cast<int>(raw_action)};
         ev.search_action_sequence = {static_cast<int>(search_action)};
+        std::vector<int> root_acts_int;
+        for (Action a : root_actions) root_acts_int.push_back(static_cast<int>(a));
+        ev.raw_legal_actions = {root_acts_int};
+        ev.raw_decision_roles = {"AGENT_PRIMARY"};
+        ev.search_legal_actions = {root_acts_int};
+        ev.search_decision_roles = {"AGENT_PRIMARY"};
         ev.raw_priors = root_res.diagnostics.priors;
         ev.search_visits = root_res.diagnostics.visit_counts;
         ev.root_q_values = root_res.diagnostics.q_values;
@@ -1429,6 +1476,20 @@ int main(int argc, char** argv) {
 
           for (Action a : search_res.root_action_ids) ev.root_action_ids.push_back(static_cast<int>(a));
           ev.session_id = search_res.session_id;
+
+          for (const auto& acts : raw_res.legal_actions_sequence) {
+            std::vector<int> inner;
+            for (Action a : acts) inner.push_back(static_cast<int>(a));
+            ev.raw_legal_actions.push_back(inner);
+          }
+          ev.raw_decision_roles = raw_res.decision_roles_sequence;
+
+          for (const auto& acts : search_res.legal_actions_sequence) {
+            std::vector<int> inner;
+            for (Action a : acts) inner.push_back(static_cast<int>(a));
+            ev.search_legal_actions.push_back(inner);
+          }
+          ev.search_decision_roles = search_res.decision_roles_sequence;
         }
 
         RolloutEvidence rev;
@@ -1436,6 +1497,18 @@ int main(int argc, char** argv) {
         rev.session_id = search_res.session_id;
         for (Action a : raw_res.action_sequence) rev.raw_action_sequence.push_back(static_cast<int>(a));
         for (Action a : search_res.action_sequence) rev.search_action_sequence.push_back(static_cast<int>(a));
+        for (const auto& acts : raw_res.legal_actions_sequence) {
+          std::vector<int> inner;
+          for (Action a : acts) inner.push_back(static_cast<int>(a));
+          rev.raw_legal_actions.push_back(inner);
+        }
+        rev.raw_decision_roles = raw_res.decision_roles_sequence;
+        for (const auto& acts : search_res.legal_actions_sequence) {
+          std::vector<int> inner;
+          for (Action a : acts) inner.push_back(static_cast<int>(a));
+          rev.search_legal_actions.push_back(inner);
+        }
+        rev.search_decision_roles = search_res.decision_roles_sequence;
         rev.raw_priors = search_res.raw_priors;
         rev.search_visits = search_res.search_visits;
         rev.root_q_values = search_res.root_q_values;
@@ -2030,6 +2103,30 @@ int main(int argc, char** argv) {
         for (int a : ev.search_action_sequence) search_act_arr.push_back(static_cast<int64_t>(a));
         ev_obj["search_action_sequence"] = search_act_arr;
 
+        open_spiel::json::Array raw_legal_acts_arr;
+        for (const auto& acts : ev.raw_legal_actions) {
+          open_spiel::json::Array inner;
+          for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+          raw_legal_acts_arr.push_back(inner);
+        }
+        ev_obj["raw_legal_actions"] = raw_legal_acts_arr;
+
+        open_spiel::json::Array raw_roles_arr;
+        for (const auto& r : ev.raw_decision_roles) raw_roles_arr.push_back(r);
+        ev_obj["raw_decision_roles"] = raw_roles_arr;
+
+        open_spiel::json::Array search_legal_acts_arr;
+        for (const auto& acts : ev.search_legal_actions) {
+          open_spiel::json::Array inner;
+          for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+          search_legal_acts_arr.push_back(inner);
+        }
+        ev_obj["search_legal_actions"] = search_legal_acts_arr;
+
+        open_spiel::json::Array search_roles_arr;
+        for (const auto& r : ev.search_decision_roles) search_roles_arr.push_back(r);
+        ev_obj["search_decision_roles"] = search_roles_arr;
+
         open_spiel::json::Array raw_priors_arr;
         for (double p : ev.raw_priors) raw_priors_arr.push_back(p);
         ev_obj["raw_priors"] = raw_priors_arr;
@@ -2129,6 +2226,30 @@ int main(int argc, char** argv) {
           open_spiel::json::Array search_act_arr2;
           for (int a : r.search_action_sequence) search_act_arr2.push_back(static_cast<int64_t>(a));
           r_obj["search_action_sequence"] = search_act_arr2;
+
+          open_spiel::json::Array raw_legal_acts_arr2;
+          for (const auto& acts : r.raw_legal_actions) {
+            open_spiel::json::Array inner;
+            for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+            raw_legal_acts_arr2.push_back(inner);
+          }
+          r_obj["raw_legal_actions"] = raw_legal_acts_arr2;
+
+          open_spiel::json::Array raw_roles_arr2;
+          for (const auto& role : r.raw_decision_roles) raw_roles_arr2.push_back(role);
+          r_obj["raw_decision_roles"] = raw_roles_arr2;
+
+          open_spiel::json::Array search_legal_acts_arr2;
+          for (const auto& acts : r.search_legal_actions) {
+            open_spiel::json::Array inner;
+            for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+            search_legal_acts_arr2.push_back(inner);
+          }
+          r_obj["search_legal_actions"] = search_legal_acts_arr2;
+
+          open_spiel::json::Array search_roles_arr2;
+          for (const auto& role : r.search_decision_roles) search_roles_arr2.push_back(role);
+          r_obj["search_decision_roles"] = search_roles_arr2;
 
           open_spiel::json::Array raw_priors_arr2;
           for (double p : r.raw_priors) raw_priors_arr2.push_back(p);
