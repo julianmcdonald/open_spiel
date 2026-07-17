@@ -2077,7 +2077,7 @@ int main(int argc, char** argv) {
       } catch (...) {
         root["binary_hash"] = "unknown";
       }
-      root["search_protocol_version"] = static_cast<int64_t>(6);
+      root["search_protocol_version"] = "session-v4";
 
       root["passed"] = bias_passed && (gate2_indices.empty() || bootstrap_passed);
 
