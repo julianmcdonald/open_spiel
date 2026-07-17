@@ -77,6 +77,7 @@ class DuneSearchSession {
 
   int session_new_simulations_completed() const { return session_new_simulations_completed_; }
   int short_sims_completed() const { return short_sims_completed_; }
+  int short_cumulative_counter() const { return short_cumulative_counter_; }
   double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
   bool is_full_session() const { return is_full_session_; }
   std::string last_re_root_status() const { return last_re_root_status_; }
@@ -112,6 +113,7 @@ class DuneSearchSession {
   DuneDecisionRole last_role_ = DuneDecisionRole::kForcedOrBookkeeping;
   std::chrono::steady_clock::time_point short_window_start_time_;
   int short_sims_completed_ = 0;
+  int short_cumulative_counter_ = 0;
 
   // Training Full/Fast choice (rolled once per placement activation)
   bool is_full_session_ = false;

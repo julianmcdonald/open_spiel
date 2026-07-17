@@ -2674,6 +2674,71 @@ void TestCommitLifecycle() {
   std::cout << "TestCommitLifecycle Passed!\n\n";
 }
 
+void TestShortWindowRNGSeedContinuity() {
+  std::cout << "Running TestShortWindowRNGSeedContinuity...\n";
+  auto game = open_spiel::LoadGame("dune_imperium");
+  TestRoutingState state(game);
+
+  // Set to a short window role (e.g. kPurchase role: agents remaining = 0)
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kRevealTurns);
+  state.SetPlayerAgentsRemainingForTesting(0, 0);
+  state.SetMockLegalActions({
+    dune_imperium::kActionBuyImperiumRow0,
+    dune_imperium::kActionEndTurn
+  });
+
+  ActionsAndProbs priors;
+  for (Action a : state.LegalActions()) {
+    priors.push_back({a, 1.0 / state.LegalActions().size()});
+  }
+  std::vector<double> mock_vals(4, 0.0);
+  auto evaluator = std::make_shared<MockEvaluator>(priors, mock_vals);
+
+  DuneSearchConfig config;
+  config.max_simulations = 10;
+  config.fixed_session_limit = 100;
+  config.purchase_combat_budget = 16;
+
+  DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+
+  // 1. Initial State: short_cumulative_counter should be 0
+  assert(session.short_cumulative_counter() == 0);
+  assert(session.short_sims_completed() == 0);
+
+  // 2. Perform search 1 (under kPurchase role)
+  DuneSearchResult res1 = RunSessionSearch(session, state);
+  int after1 = session.short_cumulative_counter();
+  assert(after1 > 0);
+  assert(session.short_sims_completed() == after1);
+  assert(res1.diagnostics.short_window_cumulative_simulations == after1);
+
+  // 3. Perform search 2 (same role, no transition)
+  DuneSearchResult res2 = RunSessionSearch(session, state);
+  int after2 = session.short_cumulative_counter();
+  assert(after2 == after1 + res2.simulations_completed);
+  assert(session.short_sims_completed() == after2);
+  assert(res2.diagnostics.short_window_cumulative_simulations == after2);
+
+  // 4. Role transition: from kPurchase to kCombat (another short-window role)
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kCombat);
+  state.SetPlayerIntriguesForTesting(0, {0});
+  state.SetMockLegalActions({
+    dune_imperium::kActionPlayIntrigueCombatCard0,
+    dune_imperium::kActionCombatPass
+  });
+
+  DuneSearchResult res3 = RunSessionSearch(session, state);
+  int after3 = session.short_cumulative_counter();
+  assert(after3 == after2 + res3.simulations_completed);
+  // Verify that short_sims_completed() reset to just res3's completed simulations,
+  // but short_cumulative_counter() grew monotonically.
+  assert(session.short_sims_completed() == res3.simulations_completed);
+  assert(res3.diagnostics.short_window_cumulative_simulations == res3.simulations_completed);
+  assert(session.short_cumulative_counter() > session.short_sims_completed());
+
+  std::cout << "TestShortWindowRNGSeedContinuity Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -2712,6 +2777,7 @@ int main() {
   open_spiel::TestFallbackDeterministic();
   open_spiel::TestCommitLifecycle();
   open_spiel::TestConservativeOverrideCriteria();
+  open_spiel::TestShortWindowRNGSeedContinuity();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

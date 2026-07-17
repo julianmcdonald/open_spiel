@@ -70,6 +70,7 @@ void DuneSearchSession::ResetSession(const std::string& reason) {
   live_deadline_initialized_ = false;
   last_role_ = DuneDecisionRole::kForcedOrBookkeeping;
   short_sims_completed_ = 0;
+  short_cumulative_counter_ = 0;
   session_history_.clear();
   last_input_history_.clear();
   last_reset_reason_ = reason;
@@ -79,6 +80,10 @@ void DuneSearchSession::ResetSession(const std::string& reason) {
   last_requested_max_sims_ = 0;
 }
 
+// HandleReRootMismatch represents caller desynchronization safety reset boundary.
+// When a history mismatch occurs during continuation/optional decision roles, the search
+// forest cache cannot be reused because it is tied to the previous history prefix.
+// Resetting the bot's state is the correct safety boundary to prevent stale state usage.
 void DuneSearchSession::HandleReRootMismatch(const std::string& reason) {
   placement_bot_->Reset();
   short_bot_->Reset();
@@ -228,6 +233,9 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   std::string limit_reason = "";
 
   if (is_short_window_role) {
+    // If purchase_combat_budget is configured to 0 or less, short-window decisions
+    // are routed directly to the policy-only fallback without search.
+    // Zero simulations are completed, making further budget deduction moot.
     if (config_.purchase_combat_budget <= 0) {
       return get_policy_only_result("policy_only_purchase_combat");
     }
@@ -340,7 +348,8 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   }
 
   // Run the MCTS search with limits and RNG seed continuity
-  DuneSearchResult result = active_bot->RunSearch(state, max_sims, max_time_ms, cumulative_simulations_);
+  int start_sim_index = is_short_window_role ? short_cumulative_counter_ : cumulative_simulations_;
+  DuneSearchResult result = active_bot->RunSearch(state, max_sims, max_time_ms, start_sim_index);
 
   if (limit_exceeded && result.used_fallback) {
     result.fallback_reason = limit_reason;
@@ -350,6 +359,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   // Update session counters
   if (is_short_window_role) {
     short_sims_completed_ += result.simulations_completed;
+    short_cumulative_counter_ += result.simulations_completed;
   } else {
     session_new_simulations_completed_ += result.simulations_completed;
     cumulative_simulations_ += result.simulations_completed;
