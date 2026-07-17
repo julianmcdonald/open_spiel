@@ -2072,6 +2072,13 @@ int main(int argc, char** argv) {
         root["model_checkpoint_hash"] = "self_test";
       }
 
+      try {
+        root["binary_hash"] = open_spiel::ComputeFileSHA256(argv[0]);
+      } catch (...) {
+        root["binary_hash"] = "unknown";
+      }
+      root["search_protocol_version"] = static_cast<int64_t>(6);
+
       root["passed"] = bias_passed && (gate2_indices.empty() || bootstrap_passed);
 
       open_spiel::json::Object g1;
