@@ -56,6 +56,17 @@ struct TestBotAccessor {
   static DuneISMCTSNode* CallLookupNode(DunePUCTISMCTSBot& b, const State& s) {
     return b.LookupNode(s);
   }
+  static void InjectMockNode(DunePUCTISMCTSBot& b, const State& s, int total_visits) {
+    auto key = b.GetStateKey(s);
+    auto node = std::make_unique<DuneISMCTSNode>();
+    node->total_visits = total_visits;
+    b.nodes_[key] = node.get();
+    b.node_pool_.push_back(std::move(node));
+  }
+  static void ClearNodes(DunePUCTISMCTSBot& b) {
+    b.nodes_.clear();
+    b.node_pool_.clear();
+  }
 };
 
 namespace {
@@ -2148,6 +2159,248 @@ void TestMoreRoutingAndScenarioInvariants() {
       // So reset_reason must NOT be new_placement_activation!
       assert(res2.diagnostics.reset_reason != "new_placement_activation");
     }
+  }
+
+  // Case 1: Descendant + existing node (hit)
+  {
+    DuneSearchConfig config_case1 = config;
+    config_case1.fixed_session_limit = 200;
+    config_case1.fixed_continuation_reserve = 50;
+    DuneSearchSession session(config_case1, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    // Start session
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+    assert(session.HasActiveSession());
+
+    // Create descendant state
+    auto state2 = state1;
+    Action act = res1.diagnostics.selected_action;
+    state2.ApplyAction(act);
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire, dune_imperium::kActionAgentSpaceHighCouncil});
+
+    // Manually inject a node for state2 to guarantee it is in the cache with visits
+    TestBotAccessor::ClearNodes(*session.GetBot());
+    TestBotAccessor::InjectMockNode(*session.GetBot(), state2, 15);
+    assert(session.GetBot()->nodes().size() == 1);
+
+    // Run search on state2
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "hit");
+    assert(session.last_re_root_status() == "hit");
+    assert(res2.diagnostics.re_root_status == "hit");
+    assert(res2.diagnostics.inherited_root_visits == 15);
+    assert(session.GetBot()->nodes().size() > 1);
+  }
+
+  // Case 1.5: Non-descendant + Cache Presence (Impossibility Test)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    // First, start a session with a primary search
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+    assert(session.HasActiveSession());
+
+    // Construct a non-descendant state2 (same player & round, but different history)
+    TestRoutingState state2(game);
+    state2.SetMockCurrentPlayer(0);
+    // Give it a non-primary, continuation role (e.g. kAgentContinuation)
+    Action act = res1.diagnostics.selected_action;
+    Action other_act = (act == dune_imperium::kActionSelectAgentCard0) 
+                       ? (dune_imperium::kActionSelectAgentCard0 + 1)
+                       : dune_imperium::kActionSelectAgentCard0;
+    state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    state2.ApplyAction(other_act);
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire, dune_imperium::kActionAgentSpaceHighCouncil});
+    
+    // Manually inject a cache entry for state2 and another state
+    TestBotAccessor::ClearNodes(*session.GetBot());
+    auto other_state = state1;
+    TestBotAccessor::InjectMockNode(*session.GetBot(), other_state, 5);
+    auto other_key = session.GetBot()->GetStateKey(other_state);
+
+    TestBotAccessor::InjectMockNode(*session.GetBot(), state2, 10);
+    assert(session.GetBot()->nodes().size() == 2);
+
+    // Now run search on state2.
+    // Pass 1 mismatch check will call HandleReRootMismatch, resetting the bot and nodes.
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "miss");
+    assert(session.last_re_root_status() == "miss");
+    assert(session.GetBot()->nodes().find(other_key) == session.GetBot()->nodes().end());
+  }
+
+  // Case 2: Descendant + absent node (soft miss - Continuation/Optional Role)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+    
+    // Start session
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+    assert(session.HasActiveSession());
+
+    // Create descendant state
+    auto state2 = state1;
+    Action act = res1.diagnostics.selected_action;
+    state2.ApplyAction(act);
+    // Make role kAgentContinuation
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire, dune_imperium::kActionAgentSpaceHighCouncil});
+
+    // We manually clear the bot's nodes so the node is guaranteed absent.
+    TestBotAccessor::ClearNodes(*session.GetBot());
+
+    // Inject a dummy node for ANOTHER state so that the nodes map is NOT empty initially.
+    auto other_state = state1;
+    Action other_act = (act == dune_imperium::kActionSelectAgentCard0) 
+                       ? (dune_imperium::kActionSelectAgentCard0 + 1)
+                       : dune_imperium::kActionSelectAgentCard0;
+    other_state.ApplyAction(other_act);
+    TestBotAccessor::InjectMockNode(*session.GetBot(), other_state, 5);
+    assert(session.GetBot()->nodes().size() == 1);
+
+    // Run search on state2
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "hit");
+    assert(session.last_re_root_status() == "miss");
+    assert(res2.diagnostics.re_root_status == "miss");
+    assert(res2.diagnostics.post_chance_branch_miss == true);
+    // Verify nodes was NOT reset (meaning our injected other_state node is still there, or new nodes were added)
+    assert(!session.GetBot()->nodes().empty());
+  }
+
+  // Case 2.5: Descendant + absent node (soft miss - Primary Role)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+
+    // Start session
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+    assert(session.HasActiveSession());
+
+    // Create descendant state with primary role (agents remaining = 1)
+    auto state2 = state1;
+    Action act = res1.diagnostics.selected_action;
+    state2.ApplyAction(act);
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+    state2.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+    while (state2.IsChanceNode()) {
+      state2.ApplyAction(state2.LegalActions()[0]);
+    }
+    state2.SetMockCurrentPlayer(0);
+    state2.SetPlayerAgentsRemainingForTesting(0, 1);
+    state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + 2, dune_imperium::kActionSelectAgentCard0 + 3});
+    // Make sure nodes are absent
+    TestBotAccessor::ClearNodes(*session.GetBot());
+    // Inject a dummy node for verification
+    auto other_state = state1;
+    TestBotAccessor::InjectMockNode(*session.GetBot(), other_state, 5);
+    auto other_key = session.GetBot()->GetStateKey(other_state);
+
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "hit");
+    assert(session.last_re_root_status() == "none");
+    assert(res2.diagnostics.re_root_status == "none");
+    assert(session.GetBot()->nodes().find(other_key) == session.GetBot()->nodes().end());
+  }
+
+  // Case 2.7: Role transition bot mismatch (Placement to Short-Window)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+
+    // Search on placement state
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+
+    // Transition to descendant other optional role (short-window bot)
+    auto state2 = state1;
+    Action act = res1.diagnostics.selected_action;
+    state2.ApplyAction(act);
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire});
+    state2.ApplyAction(dune_imperium::kActionAgentSpaceConspire);
+    while (state2.IsChanceNode()) {
+      state2.ApplyAction(state2.LegalActions()[0]);
+    }
+    state2.SetMockCurrentPlayer(0);
+    state2.SetPlayerAgentsRemainingForTesting(0, 0);
+    state2.SetMockLegalActions({dune_imperium::kActionPlayIntriguePlotCard0 + 2, dune_imperium::kActionReveal});
+
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "hit");
+    assert(session.last_re_root_status() == "miss"); // Overwritten to miss since short bot cache is empty
+  }
+
+  // Case 3: Non-descendant history mismatch (Continuation/Optional Role)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+
+    // Search on placement state
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+
+    // Create a non-descendant state (same player & round, but different history)
+    TestRoutingState state2(game);
+    state2.SetMockCurrentPlayer(0);
+    Action act = res1.diagnostics.selected_action;
+    Action other_act = (act == dune_imperium::kActionSelectAgentCard0) 
+                       ? (dune_imperium::kActionSelectAgentCard0 + 1)
+                       : dune_imperium::kActionSelectAgentCard0;
+    state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    state2.ApplyAction(other_act);
+    state2.SetMockLegalActions({dune_imperium::kActionAgentSpaceConspire, dune_imperium::kActionAgentSpaceHighCouncil});
+
+    // Populate placement_bot_'s cache
+    TestBotAccessor::ClearNodes(*session.GetBot());
+    auto other_state = state1;
+    TestBotAccessor::InjectMockNode(*session.GetBot(), other_state, 5);
+    auto other_key = session.GetBot()->GetStateKey(other_state);
+
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "miss");
+    assert(session.last_re_root_status() == "miss");
+    assert(res2.diagnostics.re_root_status == "miss");
+    assert(res2.diagnostics.post_chance_branch_miss == true);
+    assert(session.GetBot()->nodes().find(other_key) == session.GetBot()->nodes().end());
+  }
+
+  // Case 3.5: Non-descendant history mismatch (Primary Role)
+  {
+    DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
+
+    // Search on placement state
+    TestRoutingState state1(game);
+    state1.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    DuneSearchResult res1 = RunSessionSearch(session, state1);
+
+    // Create a non-descendant primary role state (same player & round, different history)
+    TestRoutingState state2(game);
+    state2.SetMockCurrentPlayer(0);
+    Action act = res1.diagnostics.selected_action;
+    Action other_act = (act == dune_imperium::kActionSelectAgentCard0) 
+                       ? (dune_imperium::kActionSelectAgentCard0 + 1)
+                       : dune_imperium::kActionSelectAgentCard0;
+    state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0, dune_imperium::kActionSelectAgentCard0 + 1});
+    state2.ApplyAction(other_act);
+    state2.SetPlayerAgentsRemainingForTesting(0, 1);
+    state2.SetMockLegalActions({dune_imperium::kActionSelectAgentCard0 + 2, dune_imperium::kActionSelectAgentCard0 + 3});
+
+    // Populate cache
+    TestBotAccessor::ClearNodes(*session.GetBot());
+    auto other_state = state1;
+    TestBotAccessor::InjectMockNode(*session.GetBot(), other_state, 5);
+    auto other_key = session.GetBot()->GetStateKey(other_state);
+
+    DuneSearchResult res2 = RunSessionSearch(session, state2);
+    assert(session.intermediate_re_root_status() == "none");
+    assert(session.last_re_root_status() == "none");
+    assert(res2.diagnostics.re_root_status == "none");
+    assert(session.GetBot()->nodes().find(other_key) == session.GetBot()->nodes().end());
   }
 
   std::cout << "TestMoreRoutingAndScenarioInvariants Passed!\n\n";

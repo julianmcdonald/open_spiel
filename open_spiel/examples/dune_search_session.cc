@@ -91,6 +91,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   if (has_pending_commit_) {
     SpielFatalError("DuneSearchSession::Search called while a commit is still pending!");
   }
+  intermediate_re_root_status_ = "none";
   DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
   const dune_imperium::DuneImperiumState& dune_state =
       static_cast<const dune_imperium::DuneImperiumState&>(state);
@@ -121,6 +122,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         }
       }
     }
+    intermediate_re_root_status_ = last_re_root_status_;
   }
 
   // Session start boundary
