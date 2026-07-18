@@ -13,6 +13,10 @@
 #include <shared_mutex>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -67,6 +71,7 @@ ABSL_FLAG(std::string, gate1_cache_path, "",
           "Optional validated cache for per-state Gate 1 critic and rollout values.");
 ABSL_FLAG(std::string, choice_rollout_cache_path, "",
           "Optional validated cache for choice-only legal-action outcome rollouts.");
+ABSL_FLAG(std::string, cache_dir, "", "Directory for multi-layer cache storage.");
 
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
@@ -783,6 +788,652 @@ double CalculateStdErr(const std::vector<double>& values, double mean) {
   return std_dev / std::sqrt(values.size());
 }
 
+std::string ComputePolicyFingerprint(const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  open_spiel::SHA256 hasher;
+
+  auto params = model->named_parameters(true);
+  std::vector<std::string> param_keys;
+  for (const auto& item : params) {
+    if (item.key().rfind("value_head", 0) != 0) {
+      param_keys.push_back(item.key());
+    }
+  }
+  std::sort(param_keys.begin(), param_keys.end());
+  for (const auto& key : param_keys) {
+    torch::Tensor t = params[key].to(torch::kCPU).contiguous();
+    hasher.Update(reinterpret_cast<const uint8_t*>(t.data_ptr()), t.numel() * t.element_size());
+  }
+
+  auto buffers = model->named_buffers(true);
+  std::vector<std::string> buffer_keys;
+  for (const auto& item : buffers) {
+    if (item.key().rfind("value_head", 0) != 0) {
+      buffer_keys.push_back(item.key());
+    }
+  }
+  std::sort(buffer_keys.begin(), buffer_keys.end());
+  for (const auto& key : buffer_keys) {
+    torch::Tensor t = buffers[key].to(torch::kCPU).contiguous();
+    hasher.Update(reinterpret_cast<const uint8_t*>(t.data_ptr()), t.numel() * t.element_size());
+  }
+
+  return hasher.Final();
+}
+
+class SplitCacheManager {
+ public:
+  std::string cache_dir;
+  std::string model_checkpoint;
+  std::string corpus_path;
+  int seed;
+  int rollouts;
+  double utility_divisor;
+  bool self_test;
+  std::string model_hash;
+  std::string corpus_hash;
+  std::string binary_hash;
+  std::string policy_fingerprint;
+
+  // Layer directories
+  std::string identity_dir;
+  std::string layer1_dir;
+  std::string layer2_dir;
+  std::string layer3_dir;
+
+  // Configuration hashes
+  std::string config_hash;
+  open_spiel::json::Object search_config;
+  open_spiel::json::Object controller_config;
+
+  // Manifest fast-path lookup sets
+  std::unordered_set<int64_t> completed_g1_set;
+  std::unordered_set<int64_t> completed_g2_set;
+  bool has_manifest = false;
+
+  SplitCacheManager(const std::string& c_dir, const std::string& model_cp, const std::string& corp_path,
+                    int sd, int rolls, double util_div, bool st, const std::string& p_fp)
+      : cache_dir(c_dir), model_checkpoint(model_cp), corpus_path(corp_path),
+        seed(sd), rollouts(rolls), utility_divisor(util_div), self_test(st), policy_fingerprint(p_fp) {
+    if (cache_dir.empty()) return;
+
+    if (self_test) {
+      if (!model_checkpoint.empty() && std::filesystem::exists(model_checkpoint)) {
+        model_hash = open_spiel::ComputeFileSHA256(model_checkpoint);
+      } else {
+        model_hash = "self_test";
+      }
+    } else {
+      model_hash = open_spiel::ComputeFileSHA256(model_checkpoint);
+    }
+    corpus_hash = open_spiel::ComputeFileSHA256(corpus_path);
+    binary_hash = open_spiel::ComputeFileSHA256("/proc/self/exe");
+
+    // Compute prefixes (first 12 characters)
+    std::string corpus_prefix = corpus_hash.substr(0, 12);
+    std::string policy_prefix = policy_fingerprint.substr(0, 12);
+    std::string checkpoint_prefix = model_hash.substr(0, 12);
+    std::string binary_prefix = binary_hash.substr(0, 12);
+
+    // Compute cache-identity directory preventing collisions
+    identity_dir = absl::StrFormat("%s/%s_%s_session-v4",
+        cache_dir, corpus_prefix, policy_prefix);
+
+    // Compute architecture flags
+    std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+    std::string architecture_flags = absl::StrFormat("nb%d_hd%d_%s",
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+
+    // Define Layer 1, 2 directories under identity_dir
+    layer1_dir = absl::StrFormat("%s/layer1_%s_r%d_u%.6f_%s_rollout-v2_%s",
+        identity_dir, corpus_prefix, rollouts, utility_divisor, policy_prefix, binary_prefix);
+    layer2_dir = absl::StrFormat("%s/layer2_%s_%s_%s",
+        identity_dir, corpus_prefix, checkpoint_prefix, architecture_flags);
+
+    // Define Layer 3 settings
+    search_config["opponent_mode"] = absl::GetFlag(FLAGS_opponent_mode);
+    search_config["opponent_temperature"] = absl::GetFlag(FLAGS_opponent_temperature);
+    search_config["puct_c"] = absl::GetFlag(FLAGS_puct_c);
+    search_config["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
+    search_config["fixed_continuation_reserve"] = absl::GetFlag(FLAGS_fixed_continuation_reserve);
+    search_config["purchase_combat_budget"] = absl::GetFlag(FLAGS_purchase_combat_budget);
+    search_config["live_continuation_reserve_seconds"] = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+    search_config["relative_time_budget_ms"] = absl::GetFlag(FLAGS_relative_time_budget_ms);
+    search_config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
+    search_config["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
+
+    controller_config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
+    controller_config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
+    controller_config["conservative_meaningful_visit_threshold"] = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
+    controller_config["conservative_q_margin_threshold"] = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
+    controller_config["conservative_stability_checkpoint_fraction"] = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
+    controller_config["conservative_continuation_overrides_disabled"] = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
+
+    std::string config_str = open_spiel::json::ToString(search_config, false) + ":" + open_spiel::json::ToString(controller_config, false);
+    config_hash = open_spiel::ComputeStringSHA256(config_str);
+
+    layer3_dir = absl::StrFormat("%s/layer3_%s_%s_s%d_session-v4_%s",
+        identity_dir, corpus_prefix, checkpoint_prefix, seed, config_hash.substr(0, 12));
+
+    std::filesystem::create_directories(layer1_dir);
+    std::filesystem::create_directories(layer2_dir);
+    std::filesystem::create_directories(layer3_dir);
+
+    std::vector<int64_t> m_g1;
+    std::vector<int64_t> m_g2;
+    if (LoadManifest(m_g1, m_g2)) {
+      completed_g1_set.insert(m_g1.begin(), m_g1.end());
+      completed_g2_set.insert(m_g2.begin(), m_g2.end());
+      has_manifest = true;
+    }
+  }
+
+  bool IsActive() const { return !cache_dir.empty(); }
+
+  bool LoadGate1ReturnsOnly(int state_idx, std::vector<double>& returns) {
+    if (!IsActive()) return false;
+    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
+    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
+    if (!std::filesystem::exists(shard1)) return false;
+
+    try {
+      std::ifstream in1(shard1);
+      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
+      auto parsed1 = open_spiel::json::FromString(text1);
+      if (!parsed1) return false;
+      auto obj1 = parsed1.value().GetObject();
+      if (obj1.find("gate1_returns") == obj1.end()) return false;
+      auto prov1 = obj1.at("provenance").GetObject();
+      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov1.at("rollout_count").GetInt() != rollouts ||
+          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov1.at("binary_hash").GetString() != binary_hash ||
+          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
+        return false;
+      }
+      auto arr1 = obj1.at("gate1_returns").GetArray();
+      returns.clear();
+      for (const auto& v : arr1) returns.push_back(v.GetDouble());
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  bool LoadGate1CriticOnly(int state_idx, double& critic_val) {
+    if (!IsActive()) return false;
+    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
+    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
+    if (!std::filesystem::exists(shard2)) return false;
+
+    try {
+      std::ifstream in2(shard2);
+      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
+      auto parsed2 = open_spiel::json::FromString(text2);
+      if (!parsed2) return false;
+      auto obj2 = parsed2.value().GetObject();
+      auto prov2 = obj2.at("provenance").GetObject();
+      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
+          prov2.find("architecture_flags") == prov2.end() ||
+          prov2.at("architecture_flags").GetString() != expected_arch) {
+        return false;
+      }
+      critic_val = obj2.at("gate1_critic_value").GetDouble();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Check if a state is fully cached for Gate 1
+  bool LoadGate1Shard(int state_idx, double& critic_val, std::vector<double>& returns) {
+    if (!IsActive()) return false;
+    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
+    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
+    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
+    if (!std::filesystem::exists(shard1) || !std::filesystem::exists(shard2)) return false;
+
+    try {
+      // Load Layer 1
+      std::ifstream in1(shard1);
+      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
+      auto parsed1 = open_spiel::json::FromString(text1);
+      if (!parsed1) return false;
+      auto obj1 = parsed1.value().GetObject();
+      auto prov1 = obj1.at("provenance").GetObject();
+      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov1.at("rollout_count").GetInt() != rollouts ||
+          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov1.at("binary_hash").GetString() != binary_hash ||
+          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
+        return false;
+      }
+      auto arr1 = obj1.at("gate1_returns").GetArray();
+      returns.clear();
+      for (const auto& v : arr1) returns.push_back(v.GetDouble());
+
+      // Load Layer 2
+      std::ifstream in2(shard2);
+      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
+      auto parsed2 = open_spiel::json::FromString(text2);
+      if (!parsed2) return false;
+      auto obj2 = parsed2.value().GetObject();
+      auto prov2 = obj2.at("provenance").GetObject();
+      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
+          prov2.find("architecture_flags") == prov2.end() ||
+          prov2.at("architecture_flags").GetString() != expected_arch) {
+        return false;
+      }
+      critic_val = obj2.at("gate1_critic_value").GetDouble();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void SaveGate1Shard(int state_idx, double critic_val, const std::vector<double>& returns, bool migrated_from_legacy = false, bool save_layer1 = true) {
+    if (!IsActive()) return;
+
+    // Acquire state-level lock
+    std::string lock_path = absl::StrFormat("%s/state_%d.lock", identity_dir, state_idx);
+    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (lock_fd >= 0) {
+      flock(lock_fd, LOCK_EX);
+    }
+
+    if (save_layer1) {
+      // Save Layer 1 Shard
+      open_spiel::json::Object outcomes1;
+      bool existing_migrated = false;
+      std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
+      if (std::filesystem::exists(shard1)) {
+        try {
+          std::ifstream in1(shard1);
+          std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
+          auto parsed1 = open_spiel::json::FromString(text1);
+          if (parsed1) {
+            auto parsed_obj1 = parsed1.value().GetObject();
+            if (parsed_obj1.find("gate2_action_returns") != parsed_obj1.end()) {
+              outcomes1 = parsed_obj1.at("gate2_action_returns").GetObject();
+            }
+            if (parsed_obj1.find("provenance") != parsed_obj1.end()) {
+              auto ext_prov = parsed_obj1.at("provenance").GetObject();
+              if (ext_prov.find("migrated_from_legacy") != ext_prov.end()) {
+                existing_migrated = ext_prov.at("migrated_from_legacy").GetBool();
+              }
+            }
+          }
+        } catch (...) {}
+      }
+
+      open_spiel::json::Object obj1;
+      open_spiel::json::Object prov1;
+      prov1["corpus_fingerprint"] = corpus_hash;
+      prov1["rollout_count"] = rollouts;
+      prov1["utility_divisor"] = utility_divisor;
+      prov1["policy_fingerprint"] = policy_fingerprint;
+      prov1["binary_hash"] = binary_hash;
+      prov1["rollout_protocol_version"] = "rollout-v2";
+      prov1["corpus_index"] = state_idx;
+      if (migrated_from_legacy || existing_migrated) {
+        prov1["migrated_from_legacy"] = true;
+      }
+      obj1["provenance"] = prov1;
+
+      open_spiel::json::Array arr1;
+      for (double r : returns) arr1.push_back(r);
+      obj1["gate1_returns"] = arr1;
+      if (!outcomes1.empty()) {
+        obj1["gate2_action_returns"] = outcomes1;
+      }
+
+      std::string tmp1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer1_dir, state_idx, rollouts, utility_divisor, getpid());
+      std::ofstream out1(tmp1);
+      out1 << open_spiel::json::ToString(obj1, true) << "\n";
+      out1.close();
+      std::filesystem::rename(tmp1, shard1);
+    }
+
+    // Save Layer 2 Shard
+    open_spiel::json::Object obj2;
+    open_spiel::json::Object prov2;
+    prov2["corpus_fingerprint"] = corpus_hash;
+    prov2["full_checkpoint_hash"] = model_hash;
+    std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+    prov2["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+    obj2["provenance"] = prov2;
+    obj2["gate1_critic_value"] = critic_val;
+
+    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
+    std::string tmp2 = absl::StrFormat("%s/state_%d.json.%d.tmp", layer2_dir, state_idx, getpid());
+    std::ofstream out2(tmp2);
+    out2 << open_spiel::json::ToString(obj2, true) << "\n";
+    out2.close();
+    std::filesystem::rename(tmp2, shard2);
+
+    // Release state-level lock
+    if (lock_fd >= 0) {
+      flock(lock_fd, LOCK_UN);
+      close(lock_fd);
+    }
+  }
+
+  bool LoadGate2SearchShard(int state_idx, open_spiel::json::Object& search_result) {
+    if (!IsActive()) return false;
+    if (has_manifest && completed_g2_set.count(state_idx) == 0) return false;
+    std::string shard3 = absl::StrFormat("%s/state_%d.json", layer3_dir, state_idx);
+    if (!std::filesystem::exists(shard3)) return false;
+
+    try {
+      std::ifstream in3(shard3);
+      std::string text3((std::istreambuf_iterator<char>(in3)), std::istreambuf_iterator<char>());
+      auto parsed3 = open_spiel::json::FromString(text3);
+      if (!parsed3) return false;
+      auto obj3 = parsed3.value().GetObject();
+      auto prov3 = obj3.at("provenance").GetObject();
+      if (prov3.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov3.at("checkpoint_hash").GetString() != model_hash ||
+          prov3.at("search_seed").GetInt() != seed ||
+          prov3.at("search_protocol_version").GetString() != "session-v4" ||
+          prov3.at("config_hash").GetString() != config_hash) {
+        return false;
+      }
+      search_result = obj3.at("search_result").GetObject();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void SaveGate2SearchShard(int state_idx, const open_spiel::json::Object& search_result) {
+    if (!IsActive()) return;
+
+    open_spiel::json::Object obj3;
+    open_spiel::json::Object prov3;
+    prov3["corpus_fingerprint"] = corpus_hash;
+    prov3["checkpoint_hash"] = model_hash;
+    prov3["search_seed"] = seed;
+    prov3["search_protocol_version"] = "session-v4";
+    prov3["config_hash"] = config_hash;
+    prov3["search_config"] = search_config;
+    prov3["controller_config"] = controller_config;
+    obj3["provenance"] = prov3;
+    obj3["search_result"] = search_result;
+
+    std::string shard3 = absl::StrFormat("%s/state_%d.json", layer3_dir, state_idx);
+    std::string tmp3 = absl::StrFormat("%s/state_%d.json.%d.tmp", layer3_dir, state_idx, getpid());
+    std::ofstream out3(tmp3);
+    out3 << open_spiel::json::ToString(obj3, true) << "\n";
+    out3.close();
+    std::filesystem::rename(tmp3, shard3);
+  }
+
+  bool LoadGate2OutcomesShard(int state_idx, const std::vector<Action>& actions,
+                               std::vector<std::vector<double>>& returns,
+                               std::vector<double>& successor_critic_values) {
+    if (!IsActive()) return false;
+    if (has_manifest && completed_g2_set.count(state_idx) == 0) return false;
+    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
+    std::string shard2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer2_dir, state_idx, rollouts, utility_divisor);
+    if (!std::filesystem::exists(shard1) || !std::filesystem::exists(shard2)) return false;
+
+    try {
+      // Load Layer 1 Outcomes
+      std::ifstream in1(shard1);
+      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
+      auto parsed1 = open_spiel::json::FromString(text1);
+      if (!parsed1) return false;
+      auto obj1 = parsed1.value().GetObject();
+      auto prov1 = obj1.at("provenance").GetObject();
+      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov1.at("rollout_count").GetInt() != rollouts ||
+          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov1.at("binary_hash").GetString() != binary_hash ||
+          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
+        return false;
+      }
+      auto outcomes1 = obj1.at("gate2_action_returns").GetObject();
+
+      // Load Layer 2 Outcomes
+      std::ifstream in2(shard2);
+      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
+      auto parsed2 = open_spiel::json::FromString(text2);
+      if (!parsed2) return false;
+      auto obj2 = parsed2.value().GetObject();
+      auto prov2 = obj2.at("provenance").GetObject();
+      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
+          prov2.find("architecture_flags") == prov2.end() ||
+          prov2.at("architecture_flags").GetString() != expected_arch ||
+          prov2.find("rollout_count") == prov2.end() ||
+          prov2.at("rollout_count").GetInt() != rollouts ||
+          prov2.find("utility_divisor") == prov2.end() ||
+          prov2.at("utility_divisor").GetDouble() != utility_divisor) {
+        return false;
+      }
+      auto outcomes2 = obj2.at("gate2_successor_critic_values").GetObject();
+
+      // Verify that all actions exist in cached shards
+      std::vector<std::vector<double>> temp_returns;
+      std::vector<double> temp_critics;
+      for (Action a : actions) {
+        std::string act_str = std::to_string(a);
+        if (outcomes1.find(act_str) == outcomes1.end() ||
+            outcomes2.find(act_str) == outcomes2.end()) {
+          return false;
+        }
+        auto ret_arr = outcomes1.at(act_str).GetArray();
+        if (ret_arr.size() != static_cast<size_t>(rollouts)) return false;
+        std::vector<double> act_ret;
+        for (const auto& v : ret_arr) act_ret.push_back(v.GetDouble());
+        temp_returns.push_back(act_ret);
+        temp_critics.push_back(outcomes2.at(act_str).GetDouble());
+      }
+
+      returns = temp_returns;
+      successor_critic_values = temp_critics;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void SaveGate2OutcomesShard(int state_idx, const std::vector<Action>& actions,
+                               const std::vector<std::vector<double>>& returns,
+                               const std::vector<double>& successor_critic_values) {
+    if (!IsActive()) return;
+
+    // Acquire state-level lock
+    std::string lock_path = absl::StrFormat("%s/state_%d.lock", identity_dir, state_idx);
+    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (lock_fd >= 0) {
+      flock(lock_fd, LOCK_EX);
+    }
+
+    // Load existing Layer 1 shard if it exists, to preserve other actions and gate1_returns
+    open_spiel::json::Object outcomes1;
+    open_spiel::json::Array gate1_ret;
+    bool has_gate1_ret = false;
+    bool existing_migrated = false;
+    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
+    if (std::filesystem::exists(shard1)) {
+      try {
+        std::ifstream in1(shard1);
+        std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
+        auto parsed1 = open_spiel::json::FromString(text1);
+        if (parsed1) {
+          auto parsed_obj1 = parsed1.value().GetObject();
+          if (parsed_obj1.find("gate2_action_returns") != parsed_obj1.end()) {
+            outcomes1 = parsed_obj1.at("gate2_action_returns").GetObject();
+          }
+          if (parsed_obj1.find("gate1_returns") != parsed_obj1.end()) {
+            gate1_ret = parsed_obj1.at("gate1_returns").GetArray();
+            has_gate1_ret = true;
+          }
+          if (parsed_obj1.find("provenance") != parsed_obj1.end()) {
+            auto ext_prov = parsed_obj1.at("provenance").GetObject();
+            if (ext_prov.find("migrated_from_legacy") != ext_prov.end()) {
+              existing_migrated = ext_prov.at("migrated_from_legacy").GetBool();
+            }
+          }
+        }
+      } catch (...) {}
+    }
+    // Update outcomes1
+    for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+      open_spiel::json::Array arr;
+      for (double r : returns[a_idx]) arr.push_back(r);
+      outcomes1[std::to_string(actions[a_idx])] = arr;
+    }
+
+    open_spiel::json::Object obj1;
+    open_spiel::json::Object prov1;
+    prov1["corpus_fingerprint"] = corpus_hash;
+    prov1["rollout_count"] = rollouts;
+    prov1["utility_divisor"] = utility_divisor;
+    prov1["policy_fingerprint"] = policy_fingerprint;
+    prov1["binary_hash"] = binary_hash;
+    prov1["rollout_protocol_version"] = "rollout-v2";
+    prov1["corpus_index"] = state_idx;
+    if (existing_migrated) {
+      prov1["migrated_from_legacy"] = true;
+    }
+    obj1["provenance"] = prov1;
+    obj1["gate2_action_returns"] = outcomes1;
+    if (has_gate1_ret) {
+      obj1["gate1_returns"] = gate1_ret;
+    }
+
+    std::string tmp1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer1_dir, state_idx, rollouts, utility_divisor, getpid());
+    std::ofstream out1(tmp1);
+    out1 << open_spiel::json::ToString(obj1, true) << "\n";
+    out1.close();
+    std::filesystem::rename(tmp1, shard1);
+
+    // Load existing Layer 2 shard if it exists, to preserve other actions
+    open_spiel::json::Object outcomes2;
+    std::string shard2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer2_dir, state_idx, rollouts, utility_divisor);
+    if (std::filesystem::exists(shard2)) {
+      try {
+        std::ifstream in2(shard2);
+        std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
+        auto parsed2 = open_spiel::json::FromString(text2);
+        if (parsed2) {
+          auto obj2 = parsed2.value().GetObject();
+          if (obj2.find("gate2_successor_critic_values") != obj2.end()) {
+            outcomes2 = obj2.at("gate2_successor_critic_values").GetObject();
+          }
+        }
+      } catch (...) {}
+    }
+    // Update outcomes2
+    for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+      outcomes2[std::to_string(actions[a_idx])] = successor_critic_values[a_idx];
+    }
+
+    open_spiel::json::Object obj2;
+    open_spiel::json::Object prov2;
+    prov2["corpus_fingerprint"] = corpus_hash;
+    prov2["full_checkpoint_hash"] = model_hash;
+    prov2["rollout_count"] = rollouts;
+    prov2["utility_divisor"] = utility_divisor;
+    std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
+    prov2["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
+    obj2["provenance"] = prov2;
+    obj2["gate2_successor_critic_values"] = outcomes2;
+    std::string tmp2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer2_dir, state_idx, rollouts, utility_divisor, getpid());
+    std::ofstream out2(tmp2);
+    out2 << open_spiel::json::ToString(obj2, true) << "\n";
+    out2.close();
+    std::filesystem::rename(tmp2, shard2);
+
+    // Release state-level lock
+    if (lock_fd >= 0) {
+      flock(lock_fd, LOCK_UN);
+      close(lock_fd);
+    }
+  }
+
+
+
+  void WriteManifest(const std::vector<size_t>& gate1_indices, const std::vector<size_t>& gate2_indices) {
+    if (!IsActive()) return;
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["corpus_fingerprint"] = corpus_hash;
+    prov["full_checkpoint_hash"] = model_hash;
+    prov["policy_fingerprint"] = policy_fingerprint;
+    prov["rollout_count"] = rollouts;
+    prov["utility_divisor"] = utility_divisor;
+    prov["seed"] = seed;
+    prov["search_protocol_version"] = "session-v4";
+    prov["config_hash"] = config_hash;
+    obj["provenance"] = prov;
+
+    open_spiel::json::Array g1_arr;
+    for (size_t idx : gate1_indices) g1_arr.push_back(static_cast<int64_t>(idx));
+    obj["gate1_completed_indices"] = g1_arr;
+
+    open_spiel::json::Array g2_arr;
+    for (size_t idx : gate2_indices) g2_arr.push_back(static_cast<int64_t>(idx));
+    obj["gate2_completed_indices"] = g2_arr;
+
+    std::string manifest_path = absl::StrFormat("%s/manifest.json", identity_dir);
+    std::string tmp_manifest = absl::StrFormat("%s/manifest.json.%d.tmp", identity_dir, getpid());
+    std::ofstream out(tmp_manifest);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp_manifest, manifest_path);
+  }
+
+  bool LoadManifest(std::vector<int64_t>& gate1_completed, std::vector<int64_t>& gate2_completed) {
+    if (!IsActive()) return false;
+    std::string manifest_path = absl::StrFormat("%s/manifest.json", identity_dir);
+    if (!std::filesystem::exists(manifest_path)) return false;
+
+    try {
+      std::ifstream in(manifest_path);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) return false;
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov.at("full_checkpoint_hash").GetString() != model_hash ||
+          prov.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov.at("rollout_count").GetInt() != rollouts ||
+          prov.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov.at("seed").GetInt() != seed ||
+          prov.at("search_protocol_version").GetString() != "session-v4" ||
+          prov.at("config_hash").GetString() != config_hash) {
+        return false;
+      }
+      auto g1_arr = obj.at("gate1_completed_indices").GetArray();
+      for (const auto& v : g1_arr) gate1_completed.push_back(v.GetInt());
+      auto g2_arr = obj.at("gate2_completed_indices").GetArray();
+      for (const auto& v : g2_arr) gate2_completed.push_back(v.GetInt());
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+};
+
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
   at::set_num_threads(1);
@@ -805,13 +1456,14 @@ int main(int argc, char** argv) {
   std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval;
   std::shared_mutex model_mutex;
 
+  std::shared_ptr<SharedDunePolicyValueNetImpl> model;
   if (self_test) {
     std::cout << "[Self Test] Bypassing model loading, using MockEvaluator\n";
     global_evaluator = std::make_shared<MockEvaluator>();
   } else {
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
     std::cout << "Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
-    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+    model = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size, absl::GetFlag(FLAGS_num_blocks),
         absl::GetFlag(FLAGS_nonlinear_value_head));
     try {
@@ -827,6 +1479,27 @@ int main(int argc, char** argv) {
         model, num_threads, /*timeout_ms=*/1, device, &model_mutex,
         /*logit_cap=*/0.0f, /*device_synchronize=*/false);
     global_evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(batched_eval);
+  }
+
+  std::string policy_fp = "";
+  if (!self_test && model) {
+    policy_fp = ComputePolicyFingerprint(model);
+    std::cout << "Computed Policy Fingerprint: " << policy_fp << "\n";
+  } else {
+    policy_fp = "self_test_policy_fp";
+  }
+
+  std::string cache_dir = absl::GetFlag(FLAGS_cache_dir);
+  SplitCacheManager split_cache(cache_dir, model_checkpoint, corpus_path, seed,
+                                self_test ? 2 : absl::GetFlag(FLAGS_rollouts),
+                                utility_divisor, self_test, policy_fp);
+
+  if (split_cache.IsActive()) {
+    std::vector<int64_t> m_g1;
+    std::vector<int64_t> m_g2;
+    if (split_cache.LoadManifest(m_g1, m_g2)) {
+      std::cout << "[Manifest] Verified complete cache manifest on startup.\n" << std::flush;
+    }
   }
 
   std::ifstream f(corpus_path);
@@ -1034,12 +1707,34 @@ int main(int argc, char** argv) {
   std::vector<std::unique_ptr<State>> gate1_states;
   std::vector<std::vector<double>> gate1_returns(
       gate1_indices.size(), std::vector<double>(gate1_rollouts, 0.0));
+
+  std::vector<bool> gate1_returns_cached(gate1_indices.size(), false);
+  std::vector<bool> gate1_critic_cached(gate1_indices.size(), false);
+  if (split_cache.IsActive()) {
+    for (size_t i = 0; i < gate1_indices.size(); ++i) {
+      size_t absolute_idx = gate1_indices[i];
+      if (split_cache.LoadGate1ReturnsOnly(absolute_idx, gate1_returns[i])) {
+        v_true_g1[i] = std::accumulate(gate1_returns[i].begin(), gate1_returns[i].end(), 0.0) / gate1_returns[i].size();
+        gate1_returns_cached[i] = true;
+      }
+      double critic_val = 0.0;
+      if (split_cache.LoadGate1CriticOnly(absolute_idx, critic_val)) {
+        v_critic_g1[i] = critic_val;
+        gate1_critic_cached[i] = true;
+      }
+    }
+  }
+
   if (!gate1_cache_loaded) {
     gate1_states.reserve(gate1_indices.size());
-    for (size_t corpus_idx : gate1_indices) {
-      const auto& cs = corpus[corpus_idx];
-      gate1_states.push_back(
-          ReconstructState(game, cs.history, cs.player, cs.observation));
+    for (size_t i = 0; i < gate1_indices.size(); ++i) {
+      if (gate1_returns_cached[i] && gate1_critic_cached[i]) {
+        gate1_states.push_back(nullptr);
+      } else {
+        const auto& cs = corpus[gate1_indices[i]];
+        gate1_states.push_back(
+            ReconstructState(game, cs.history, cs.player, cs.observation));
+      }
     }
   }
   std::atomic<int> next_gate1_task{0};
@@ -1052,16 +1747,31 @@ int main(int argc, char** argv) {
       if (task >= total_tasks) break;
       int idx = task / tasks_per_state;
       int local_task = task % tasks_per_state;
+      if (gate1_returns_cached[idx] && gate1_critic_cached[idx]) {
+        int done = completed_gate1_tasks.fetch_add(1) + 1;
+        completed_g1.store(std::min<int>(gate1_indices.size(), done / tasks_per_state));
+        continue;
+      }
       size_t corpus_idx = gate1_indices[idx];
       const auto& cs = corpus[corpus_idx];
       if (local_task == 0) {
+        if (gate1_critic_cached[idx]) {
+          int done = completed_gate1_tasks.fetch_add(1) + 1;
+          completed_g1.store(std::min<int>(gate1_indices.size(), done / tasks_per_state));
+          continue;
+        }
         double critic_val = global_evaluator->Evaluate(*gate1_states[idx])[cs.player];
         if (mock_fail) critic_val += 0.10;
         v_critic_g1[idx] = critic_val;
       } else {
+        if (gate1_returns_cached[idx]) {
+          int done = completed_gate1_tasks.fetch_add(1) + 1;
+          completed_g1.store(std::min<int>(gate1_indices.size(), done / tasks_per_state));
+          continue;
+        }
         int k = local_task;
-        // Aligned seeds with Gate 1 space prefix 100000
-        uint64_t roll_seed = seed + 100000 + 1000 * idx + k;
+        // Aligned seeds with Gate 1 space prefix 300000
+        uint64_t roll_seed = 300000 + 1000 * idx + k;
         gate1_returns[idx][k - 1] = RunRawPolicyRollout(
             *gate1_states[idx], cs.player, global_evaluator.get(), roll_seed,
             utility_divisor);
@@ -1212,43 +1922,151 @@ int main(int argc, char** argv) {
       ev.round = cs.round;
       ev.role = cs.role;
 
-      if (!self_test && absl::GetFlag(FLAGS_choice_only_gate2)) {
+      if (absl::GetFlag(FLAGS_choice_only_gate2)) {
         // Root selection is deterministic for a state/configuration/seed. The
         // legacy harness rebuilt the same tree for every one of the 256 outcome
         // rollouts. Search once, then compare the raw and searched root actions
         // under common stochastic continuations.
-        DuneSearchBudgetMode mode =
-            (bot_cfg.relative_time_budget_ms == std::numeric_limits<double>::infinity())
-                ? DuneSearchBudgetMode::kFixedSessionSimulations
-                : DuneSearchBudgetMode::kLiveDeadline;
-        DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
-        DuneSearchResult root_res = root_session.Search(*state);
-        std::mt19937 step_rng(bot_cfg.seed);
-        double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-        ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
-        root_res = root_session.CommitAction(decision);
+        bool has_search_cached = false;
+        open_spiel::json::Object search_cached_res;
+        Action search_action = kInvalidAction;
+        Action raw_action = kInvalidAction;
+        std::vector<Action> root_actions;
+        DuneSearchResult root_res;
 
-        Action search_action = root_res.diagnostics.selected_action;
-        if (search_action == kInvalidAction) {
-          search_action = GetBestActionFromSearchResult(root_res);
+        if (split_cache.IsActive()) {
+          has_search_cached = split_cache.LoadGate2SearchShard(corpus_idx, search_cached_res);
         }
 
-        Action raw_action = decision.raw_reference_action;
-        SPIEL_CHECK_NE(raw_action, kInvalidAction);
-        SPIEL_CHECK_NE(search_action, kInvalidAction);
+        if (has_search_cached) {
+          search_action = static_cast<Action>(search_cached_res.at("selected_action").GetInt());
+          raw_action = static_cast<Action>(search_cached_res.at("raw_reference_action").GetInt());
+          auto act_arr = search_cached_res.at("actions").GetArray();
+          for (const auto& val : act_arr) {
+            root_actions.push_back(static_cast<Action>(val.GetInt()));
+          }
 
-        std::vector<Action> root_actions = root_res.diagnostics.actions;
-        if (root_actions.empty()) root_actions = state->LegalActions();
+          root_res.diagnostics.actions = root_actions;
+          root_res.diagnostics.selected_action = search_action;
+          root_res.diagnostics.raw_reference_action = raw_action;
+
+          root_res.diagnostics.session_id = search_cached_res.at("session_id").GetString();
+          root_res.simulations_completed = search_cached_res.at("simulations_completed").GetInt();
+          root_res.inference_count = search_cached_res.at("inference_count").GetInt();
+          root_res.diagnostics.mean_depth = search_cached_res.at("mean_depth").GetDouble();
+          root_res.diagnostics.terminal_leaf_fraction = search_cached_res.at("terminal_leaf_fraction").GetDouble();
+          root_res.used_fallback = search_cached_res.at("used_fallback").GetBool();
+          root_res.fallback_reason = search_cached_res.at("fallback_reason").GetString();
+          root_res.diagnostics.confidence_fallback = search_cached_res.at("confidence_fallback").GetBool();
+          root_res.diagnostics.mcts_overrode_raw = search_cached_res.at("mcts_overrode_raw").GetBool();
+          root_res.diagnostics.mcts_proposed_action = static_cast<Action>(search_cached_res.at("mcts_proposed_action").GetInt());
+          root_res.diagnostics.stability_checkpoint_reached = search_cached_res.at("stability_checkpoint_reached").GetBool();
+          root_res.diagnostics.stability_agreement = search_cached_res.at("stability_agreement").GetBool();
+          root_res.diagnostics.pass_complete_search = search_cached_res.at("pass_complete_search").GetBool();
+          root_res.diagnostics.pass_min_actions = search_cached_res.at("pass_min_actions").GetBool();
+          root_res.diagnostics.pass_prior_mass = search_cached_res.at("pass_prior_mass").GetBool();
+          root_res.diagnostics.pass_meaningful_visits = search_cached_res.at("pass_meaningful_visits").GetBool();
+          root_res.diagnostics.pass_q_margin = search_cached_res.at("pass_q_margin").GetBool();
+          root_res.diagnostics.pass_stability = search_cached_res.at("pass_stability").GetBool();
+          root_res.diagnostics.chosen_action_raw_prior_rank = search_cached_res.at("chosen_action_raw_prior_rank").GetInt();
+
+          auto pr_arr = search_cached_res.at("priors").GetArray();
+          for (const auto& val : pr_arr) root_res.diagnostics.priors.push_back(val.GetDouble());
+
+          auto vis_arr = search_cached_res.at("visit_counts").GetArray();
+          for (const auto& val : vis_arr) root_res.diagnostics.visit_counts.push_back(static_cast<int>(val.GetInt()));
+
+          auto q_arr = search_cached_res.at("q_values").GetArray();
+          for (const auto& val : q_arr) root_res.diagnostics.q_values.push_back(val.GetDouble());
+
+        } else {
+          // Root selection is deterministic for a state/configuration/seed. The
+          // legacy harness rebuilt the same tree for every one of the 256 outcome
+          // rollouts. Search once, then compare the raw and searched root actions
+          // under common stochastic continuations.
+          DuneSearchBudgetMode mode =
+              (bot_cfg.relative_time_budget_ms == std::numeric_limits<double>::infinity())
+                  ? DuneSearchBudgetMode::kFixedSessionSimulations
+                  : DuneSearchBudgetMode::kLiveDeadline;
+          DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
+          root_res = root_session.Search(*state);
+          std::mt19937 step_rng(bot_cfg.seed);
+          double r_val = absl::Uniform(step_rng, 0.0, 1.0);
+          ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
+          root_res = root_session.CommitAction(decision);
+
+          search_action = root_res.diagnostics.selected_action;
+          if (search_action == kInvalidAction) {
+            search_action = GetBestActionFromSearchResult(root_res);
+          }
+
+          raw_action = decision.raw_reference_action;
+          SPIEL_CHECK_NE(raw_action, kInvalidAction);
+          SPIEL_CHECK_NE(search_action, kInvalidAction);
+
+          root_actions = root_res.diagnostics.actions;
+          if (root_actions.empty()) root_actions = state->LegalActions();
+
+          if (split_cache.IsActive()) {
+            open_spiel::json::Object save_obj;
+            save_obj["selected_action"] = static_cast<int64_t>(search_action);
+            save_obj["raw_reference_action"] = static_cast<int64_t>(raw_action);
+            open_spiel::json::Array save_act;
+            for (Action a : root_actions) save_act.push_back(static_cast<int64_t>(a));
+            save_obj["actions"] = save_act;
+            save_obj["session_id"] = root_res.diagnostics.session_id;
+            save_obj["simulations_completed"] = static_cast<int64_t>(root_res.simulations_completed);
+            save_obj["inference_count"] = static_cast<int64_t>(root_res.inference_count);
+            save_obj["mean_depth"] = root_res.diagnostics.mean_depth;
+            save_obj["terminal_leaf_fraction"] = root_res.diagnostics.terminal_leaf_fraction;
+            save_obj["used_fallback"] = root_res.used_fallback;
+            save_obj["fallback_reason"] = root_res.fallback_reason;
+            save_obj["confidence_fallback"] = root_res.diagnostics.confidence_fallback;
+            save_obj["mcts_overrode_raw"] = root_res.diagnostics.mcts_overrode_raw;
+            save_obj["mcts_proposed_action"] = static_cast<int64_t>(root_res.diagnostics.mcts_proposed_action);
+            save_obj["stability_checkpoint_reached"] = root_res.diagnostics.stability_checkpoint_reached;
+            save_obj["stability_agreement"] = root_res.diagnostics.stability_agreement;
+            save_obj["pass_complete_search"] = root_res.diagnostics.pass_complete_search;
+            save_obj["pass_min_actions"] = root_res.diagnostics.pass_min_actions;
+            save_obj["pass_prior_mass"] = root_res.diagnostics.pass_prior_mass;
+            save_obj["pass_meaningful_visits"] = root_res.diagnostics.pass_meaningful_visits;
+            save_obj["pass_q_margin"] = root_res.diagnostics.pass_q_margin;
+            save_obj["pass_stability"] = root_res.diagnostics.pass_stability;
+            save_obj["chosen_action_raw_prior_rank"] = static_cast<int64_t>(root_res.diagnostics.chosen_action_raw_prior_rank);
+
+            open_spiel::json::Array save_pr;
+            for (double p : root_res.diagnostics.priors) save_pr.push_back(p);
+            save_obj["priors"] = save_pr;
+
+            open_spiel::json::Array save_vis;
+            for (int v : root_res.diagnostics.visit_counts) save_vis.push_back(static_cast<int64_t>(v));
+            save_obj["visit_counts"] = save_vis;
+
+            open_spiel::json::Array save_q;
+            for (double q : root_res.diagnostics.q_values) save_q.push_back(q);
+            save_obj["q_values"] = save_q;
+
+            split_cache.SaveGate2SearchShard(corpus_idx, save_obj);
+          }
+        }
+
         std::vector<std::vector<double>> action_returns;
         std::vector<double> successor_critic_vals;
         std::vector<double> successor_true_vals(root_actions.size(), 0.0);
 
-        if (choice_outcome_cache_loaded) {
+        bool outcomes_cached = false;
+        if (split_cache.IsActive()) {
+          outcomes_cached = split_cache.LoadGate2OutcomesShard(corpus_idx, root_actions, action_returns, successor_critic_vals);
+        } else if (choice_outcome_cache_loaded) {
           const auto& cached = choice_outcome_cache[idx];
-          SPIEL_CHECK_TRUE(cached.actions == root_actions);
-          action_returns = cached.returns;
-          successor_critic_vals = cached.successor_critic_values;
-        } else {
+          if (cached.actions == root_actions) {
+            action_returns = cached.returns;
+            successor_critic_vals = cached.successor_critic_values;
+            outcomes_cached = true;
+          }
+        }
+
+        if (!outcomes_cached) {
           action_returns.assign(
               root_actions.size(), std::vector<double>(rollouts, 0.0));
           successor_critic_vals.assign(root_actions.size(), 0.0);
@@ -1264,10 +2082,15 @@ int main(int argc, char** argv) {
             }
             successor_critic_vals[a_idx] = critic_sum / rollouts;
           }
-          choice_outcome_cache[idx].corpus_index = corpus_idx;
-          choice_outcome_cache[idx].actions = root_actions;
-          choice_outcome_cache[idx].returns = action_returns;
-          choice_outcome_cache[idx].successor_critic_values = successor_critic_vals;
+
+          if (split_cache.IsActive()) {
+            split_cache.SaveGate2OutcomesShard(corpus_idx, root_actions, action_returns, successor_critic_vals);
+          } else {
+            choice_outcome_cache[idx].corpus_index = corpus_idx;
+            choice_outcome_cache[idx].actions = root_actions;
+            choice_outcome_cache[idx].returns = action_returns;
+            choice_outcome_cache[idx].successor_critic_values = successor_critic_vals;
+          }
         }
         for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
           successor_true_vals[a_idx] =
@@ -1735,9 +2558,16 @@ int main(int argc, char** argv) {
       w.join();
     }
     for (size_t idx = 0; idx < gate1_indices.size(); ++idx) {
-      v_true_g1[idx] = std::accumulate(
-          gate1_returns[idx].begin(), gate1_returns[idx].end(), 0.0) /
-          gate1_rollouts;
+      bool need_layer1 = !gate1_returns_cached[idx];
+      bool need_layer2 = !gate1_critic_cached[idx];
+      if (need_layer1 || need_layer2) {
+        v_true_g1[idx] = std::accumulate(
+            gate1_returns[idx].begin(), gate1_returns[idx].end(), 0.0) /
+            gate1_rollouts;
+        if (split_cache.IsActive()) {
+          split_cache.SaveGate1Shard(gate1_indices[idx], v_critic_g1[idx], gate1_returns[idx], false, need_layer1);
+        }
+      }
     }
     completed_g1.store(gate1_indices.size());
     if (!self_test && !gate1_cache_path.empty()) {
@@ -1995,6 +2825,10 @@ int main(int argc, char** argv) {
   }
   if (!gate2_indices.empty() && !bootstrap_passed) {
     std::cerr << absl::StrFormat("\nCRITICAL FAILURE: 95%% Bootstrap LCB %.4f is not positive!\n", bootstrap_lcb);
+  }
+
+  if (split_cache.IsActive()) {
+    split_cache.WriteManifest(gate1_indices, gate2_indices);
   }
 
   // Save structured JSON report if requested
