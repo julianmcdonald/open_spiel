@@ -39,6 +39,63 @@ ABSL_FLAG(int, threads, 16, "Number of threads");
 ABSL_FLAG(bool, nonlinear_value_head, false,
           "Use the versioned nonlinear value-head architecture.");
 
+namespace {
+using namespace open_spiel;
+using namespace open_spiel::dune_imperium;
+
+bool SpaceIsReachable(State *state, Action space_action) {
+  auto legal = state->LegalActions();
+  if (std::find(legal.begin(), legal.end(), space_action) != legal.end()) {
+    return true;
+  }
+
+  for (Action a : legal) {
+    if (a >= dune_imperium::kActionSelectAgentCard0 &&
+        a < dune_imperium::kActionSelectAgentCard0 + 256) {
+      std::unique_ptr<State> clone = state->Clone();
+      clone->ApplyAction(a);
+
+      // Drain forced nodes using the exact logic of DrainForcedNodesForPlanner
+      int safety = 0;
+      while (!clone->IsTerminal()) {
+        ++safety;
+        if (safety > 150) break;
+        if (clone->IsChanceNode()) {
+          auto outcomes = clone->ChanceOutcomes();
+          if (outcomes.empty()) break;
+          clone->ApplyAction(outcomes.front().first);
+          continue;
+        }
+        auto clone_legal = clone->LegalActions();
+        if (clone_legal.empty()) break;
+        if (clone_legal.size() == 1) {
+          clone->ApplyAction(clone_legal[0]);
+          continue;
+        }
+        if (clone_legal.size() > 1) {
+          bool has_ack = false;
+          for (Action act : clone_legal) {
+            if (act == dune_imperium::kActionAcknowledgeChance) {
+              clone->ApplyAction(act);
+              has_ack = true;
+              break;
+            }
+          }
+          if (has_ack) continue;
+        }
+        break;
+      }
+
+      auto clone_legal = clone->LegalActions();
+      if (std::find(clone_legal.begin(), clone_legal.end(), space_action) != clone_legal.end()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+} // namespace
+
 using namespace open_spiel;
 
 // Struct to hold collected candidate states
@@ -52,6 +109,7 @@ struct CandidateState {
   int seed;
   int decision_index;
   std::vector<Action> legal_actions;
+  DuneDecisionRole role;
 
   // Sort deterministically to avoid scheduling non-determinism
   bool operator<(const CandidateState& o) const {
@@ -187,6 +245,7 @@ int main(int argc, char** argv) {
               cs.seed = game_seed;
               cs.decision_index = step_count;
               cs.legal_actions = state->LegalActions();
+              cs.role = ClassifyDuneDecisionRole(*state, player, false);
               thread_candidates[thread_id].push_back(cs);
             }
 
@@ -195,10 +254,9 @@ int main(int argc, char** argv) {
             int solari = dune_state ? dune_state->GetPlayerSolari(player) : 0;
 
             bool is_agent_primary = ClassifyDuneDecisionRole(*state, player, false) == DuneDecisionRole::kAgentPrimary;
-            std::mt19937 dummy_rng(game_seed + step_count * 100);
-            bool has_sm_card_route = FindActionOrCardPathToSpace(*state, player, dune_imperium::kActionAgentSpaceSwordmaster, &dummy_rng) != kInvalidAction;
 
-            if (is_agent_primary && round >= 2 && round <= 5 && !has_sm && solari >= 6 && has_sm_card_route) {
+            if (is_agent_primary && round >= 2 && round <= 5 && !has_sm && solari >= 8 &&
+                SpaceIsReachable(state.get(), dune_imperium::kActionAgentSpaceSwordmaster)) {
               CandidateState cs;
               cs.category = "opportunity";
               cs.player = player;
@@ -209,6 +267,7 @@ int main(int argc, char** argv) {
               cs.seed = game_seed;
               cs.decision_index = step_count;
               cs.legal_actions = state->LegalActions();
+              cs.role = DuneDecisionRole::kAgentPrimary;
               thread_candidates[thread_id].push_back(cs);
             }
 
@@ -259,6 +318,7 @@ int main(int argc, char** argv) {
               cs.seed = game_seed;
               cs.decision_index = step_count;
               cs.legal_actions = legal;
+              cs.role = ClassifyDuneDecisionRole(*state, player, false);
               thread_candidates[thread_id].push_back(cs);
             }
 
@@ -351,6 +411,7 @@ int main(int argc, char** argv) {
         auto state = ReconstructState(game, cs.history);
         cs.info_state_str = state->InformationStateString(cs.player);
         cs.legal_actions = state->LegalActions();
+        cs.role = ClassifyDuneDecisionRole(*state, cs.player, false);
 
         if (item.find("source_seed") != item.end()) {
           cs.seed = static_cast<int>(item.at("source_seed").GetInt());
@@ -501,9 +562,7 @@ int main(int argc, char** argv) {
 
     // Corpus Verification Gate: verify role
     DuneDecisionRole role = ClassifyDuneDecisionRole(*rec_state, cand.player, false);
-    if (cand.category == "opportunity") {
-      SPIEL_CHECK_TRUE(role == DuneDecisionRole::kAgentPrimary);
-    }
+    SPIEL_CHECK_TRUE(role == cand.role);
   };
 
   for (const auto& cand : selected_strategic) check_state(cand);
@@ -538,9 +597,32 @@ int main(int argc, char** argv) {
     obj["seat"] = static_cast<int64_t>(cand.player);
     obj["decision_index"] = static_cast<int64_t>(cand.decision_index);
 
-    // Reconstruct state to get role
+    // Reconstruct state to get role and perform self-check
     auto rec_state = ReconstructState(game, cand.history);
+    if (rec_state->CurrentPlayer() != cand.player) {
+      std::cerr << "Self-check failed: player mismatch on reconstruction.\n";
+      std::exit(1);
+    }
+    if (rec_state->LegalActions() != cand.legal_actions) {
+      std::cerr << "Self-check failed: legal actions mismatch on reconstruction.\n";
+      std::exit(1);
+    }
+    const auto& rec_obs = rec_state->InformationStateTensor(cand.player);
+    if (rec_obs.size() != cand.observation.size()) {
+      std::cerr << "Self-check failed: observation size mismatch on reconstruction.\n";
+      std::exit(1);
+    }
+    for (size_t idx = 0; idx < rec_obs.size(); ++idx) {
+      if (std::abs(rec_obs[idx] - cand.observation[idx]) > 1e-5) {
+        std::cerr << "Self-check failed: observation value mismatch on reconstruction at index " << idx << ".\n";
+        std::exit(1);
+      }
+    }
     DuneDecisionRole role = ClassifyDuneDecisionRole(*rec_state, cand.player, false);
+    if (role != cand.role) {
+      std::cerr << "Self-check failed: role mismatch on reconstruction.\n";
+      std::exit(1);
+    }
     obj["role"] = DecisionRoleToString(role);
     obj["history_hash"] = ComputeHistoryHash(cand.history);
     obj["corpus_schema_version"] = "v2";
@@ -560,6 +642,5 @@ int main(int argc, char** argv) {
   }
   out << open_spiel::json::ToString(corpus_arr, true) << "\n";
   std::cout << "Successfully saved deterministic 128-state diagnostic corpus to: " << output_path << "\n";
-
   return 0;
 }

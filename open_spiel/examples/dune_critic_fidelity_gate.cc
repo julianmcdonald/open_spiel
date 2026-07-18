@@ -1574,6 +1574,19 @@ int main(int argc, char** argv) {
                                strategic_indices.size(), opportunity_indices.size(), planner_indices.size());
 
   if (!self_test) {
+    if (absl::GetFlag(FLAGS_strict_v2_validation)) {
+      if (corpus.empty()) {
+        std::cerr << "Fidelity Gate validation failed: Corpus is empty.\n";
+        std::exit(1);
+      }
+      for (const auto& cs : corpus) {
+        if (cs.corpus_schema_version != "v2") {
+          std::cerr << "Fidelity Gate validation failed: strict_v2_validation is enabled, but the corpus is not a v2 corpus (corpus_schema_version != \"v2\" or missing).\n";
+          std::exit(1);
+        }
+      }
+    }
+
     bool gate1_only = absl::GetFlag(FLAGS_gate1_only);
     bool allow_any_opportunity_count = absl::GetFlag(FLAGS_allow_any_opportunity_count);
 
@@ -1593,6 +1606,8 @@ int main(int argc, char** argv) {
         if (!opportunity_indices.empty()) {
           is_v2_corpus = (corpus[opportunity_indices[0]].corpus_schema_version == "v2");
         }
+
+
 
         if (absl::GetFlag(FLAGS_strict_v2_validation) && is_v2_corpus) {
           if (opportunity_indices.size() != 32) {
