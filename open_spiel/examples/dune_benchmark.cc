@@ -1601,7 +1601,7 @@ int main(int argc, char** argv) {
     at::globalContext().setAllowTF32CuDNN(true);
     
     // CRITICAL: Force Autocast to use BF16 natively on Ada Lovelace
-    at::autocast::set_autocast_gpu_dtype(at::ScalarType::BFloat16);
+    at::autocast::set_autocast_dtype(at::kCUDA, at::ScalarType::BFloat16);
   }
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model = nullptr;

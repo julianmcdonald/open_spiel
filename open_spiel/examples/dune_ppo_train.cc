@@ -1577,7 +1577,7 @@ int main(int argc, char** argv) {
     device = torch::Device(torch::kCUDA);
     at::globalContext().setAllowTF32CuBLAS(true);
     at::globalContext().setAllowTF32CuDNN(true);
-    at::autocast::set_autocast_gpu_dtype(at::ScalarType::BFloat16);
+    at::autocast::set_autocast_dtype(at::kCUDA, at::ScalarType::BFloat16);
     std::cout << "CUDA available. PPO training on GPU.\n";
   }
 

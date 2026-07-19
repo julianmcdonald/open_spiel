@@ -106,14 +106,14 @@ struct AutocastGuard {
     AutocastGuard(c10::DeviceType device_type, bool enabled)
         : device_type_(device_type) {
         if (device_type_ == c10::DeviceType::CUDA) {
-            previous_state_ = at::autocast::is_enabled();
-            previous_dtype_ = at::autocast::get_autocast_gpu_dtype();
-            at::autocast::set_autocast_gpu_dtype(at::ScalarType::BFloat16);
-            at::autocast::set_enabled(enabled);
+            previous_state_ = at::autocast::is_autocast_enabled(at::kCUDA);
+            previous_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
+            at::autocast::set_autocast_dtype(at::kCUDA, at::ScalarType::BFloat16);
+            at::autocast::set_autocast_enabled(at::kCUDA, enabled);
         } else if (device_type_ == c10::DeviceType::CPU) {
-            previous_state_ = at::autocast::is_cpu_enabled();
-            previous_dtype_ = at::autocast::get_autocast_cpu_dtype();
-            at::autocast::set_cpu_enabled(enabled);
+            previous_state_ = at::autocast::is_autocast_enabled(at::kCPU);
+            previous_dtype_ = at::autocast::get_autocast_dtype(at::kCPU);
+            at::autocast::set_autocast_enabled(at::kCPU, enabled);
         } else {
             previous_state_ = false;
             previous_dtype_ = at::ScalarType::Undefined;
@@ -121,11 +121,11 @@ struct AutocastGuard {
     }
     ~AutocastGuard() {
         if (device_type_ == c10::DeviceType::CUDA) {
-            at::autocast::set_enabled(previous_state_);
-            at::autocast::set_autocast_gpu_dtype(previous_dtype_);
+            at::autocast::set_autocast_enabled(at::kCUDA, previous_state_);
+            at::autocast::set_autocast_dtype(at::kCUDA, previous_dtype_);
         } else if (device_type_ == c10::DeviceType::CPU) {
-            at::autocast::set_cpu_enabled(previous_state_);
-            at::autocast::set_autocast_cpu_dtype(previous_dtype_);
+            at::autocast::set_autocast_enabled(at::kCPU, previous_state_);
+            at::autocast::set_autocast_dtype(at::kCPU, previous_dtype_);
         }
     }
 };

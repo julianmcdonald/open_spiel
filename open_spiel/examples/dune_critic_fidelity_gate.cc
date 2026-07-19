@@ -13,7 +13,7 @@
 #include <shared_mutex>
 #include <limits>
 #include <numeric>
-#include <unordered_set>
+#include <set>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -21,7 +21,6 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_common.h"
-#include "open_spiel/games/dune_imperium/dune_imperium_board.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
@@ -31,11 +30,9 @@
 #include <torch/torch.h>
 
 #include "dune_network.h"
-#include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_search_session.h"
 #include "dune_search_routing.h"
-#include "dune_warmstart_helpers.h"
 #include "dune_batched_evaluator.h"
 #include "dune_sha256.h"
 
@@ -80,6 +77,7 @@ ABSL_FLAG(std::string, cache_dir, "", "Directory for multi-layer cache storage."
 
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 std::atomic<bool> g_cache_validation_failed{false};
+std::atomic<bool> g_manifest_verified{false};
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
 ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits required for raw and argmax actions");
 ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
@@ -326,6 +324,24 @@ ForcedActionRolloutResult RunForcedActionPolicyRollout(
   return {final_return, critic};
 }
 
+double GetSuccessorCriticValue(
+    const State& start_state, Player owner, Action root_action,
+    algorithms::Evaluator* evaluator, uint64_t chance_seed,
+    double utility_divisor) {
+  auto state = start_state.Clone();
+  state->ApplyAction(root_action);
+  std::mt19937 chance_rng(chance_seed);
+  while (state->IsChanceNode()) {
+    auto outcomes = state->ChanceOutcomes();
+    if (outcomes.empty()) break;
+    Action choice = SampleAction(outcomes, absl::Uniform(chance_rng, 0.0, 1.0)).first;
+    state->ApplyAction(choice);
+  }
+  return state->IsTerminal()
+      ? state->Returns()[owner] / utility_divisor
+      : evaluator->Evaluate(*state)[owner];
+}
+
 std::string DuneDecisionRoleToString(DuneDecisionRole role) {
   switch (role) {
     case DuneDecisionRole::kForcedOrBookkeeping: return "FORCED_OR_BOOKKEEPING";
@@ -445,7 +461,403 @@ struct OpportunityStateEvidence {
   std::vector<double> leaf_true_values;
   double leaf_mean_bias = 0.0;
   double leaf_rmse = 0.0;
+  std::vector<std::string> leaf_hashes;
 };
+
+open_spiel::json::Object SerializeEvidence(const OpportunityStateEvidence& ev) {
+  open_spiel::json::Object obj;
+  obj["corpus_index"] = static_cast<int64_t>(ev.corpus_index);
+  obj["episode_id"] = static_cast<int64_t>(ev.episode_id);
+  obj["history_hash"] = ev.history_hash;
+  obj["seat"] = static_cast<int64_t>(ev.seat);
+  obj["round"] = static_cast<int64_t>(ev.round);
+  obj["role"] = ev.role;
+
+  open_spiel::json::Array raw_act_arr;
+  for (int a : ev.raw_action_sequence) raw_act_arr.push_back(static_cast<int64_t>(a));
+  obj["raw_action_sequence"] = raw_act_arr;
+
+  open_spiel::json::Array search_act_arr;
+  for (int a : ev.search_action_sequence) search_act_arr.push_back(static_cast<int64_t>(a));
+  obj["search_action_sequence"] = search_act_arr;
+
+  open_spiel::json::Array raw_legal_acts_arr;
+  for (const auto& acts : ev.raw_legal_actions) {
+    open_spiel::json::Array inner;
+    for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+    raw_legal_acts_arr.push_back(inner);
+  }
+  obj["raw_legal_actions"] = raw_legal_acts_arr;
+
+  open_spiel::json::Array raw_roles_arr;
+  for (const auto& r : ev.raw_decision_roles) raw_roles_arr.push_back(r);
+  obj["raw_decision_roles"] = raw_roles_arr;
+
+  open_spiel::json::Array search_legal_acts_arr;
+  for (const auto& acts : ev.search_legal_actions) {
+    open_spiel::json::Array inner;
+    for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+    search_legal_acts_arr.push_back(inner);
+  }
+  obj["search_legal_actions"] = search_legal_acts_arr;
+
+  open_spiel::json::Array search_roles_arr;
+  for (const auto& r : ev.search_decision_roles) search_roles_arr.push_back(r);
+  obj["search_decision_roles"] = search_roles_arr;
+
+  open_spiel::json::Array raw_priors_arr;
+  for (double p : ev.raw_priors) raw_priors_arr.push_back(p);
+  obj["raw_priors"] = raw_priors_arr;
+
+  open_spiel::json::Array search_visits_arr;
+  for (int v : ev.search_visits) search_visits_arr.push_back(static_cast<int64_t>(v));
+  obj["search_visits"] = search_visits_arr;
+
+  open_spiel::json::Array root_q_arr;
+  for (double q : ev.root_q_values) root_q_arr.push_back(q);
+  obj["root_q_values"] = root_q_arr;
+
+  obj["selected_action_rank"] = static_cast<int64_t>(ev.selected_action_rank);
+
+  open_spiel::json::Array raw_returns_arr;
+  for (double r : ev.raw_returns) raw_returns_arr.push_back(r);
+  obj["raw_returns"] = raw_returns_arr;
+
+  open_spiel::json::Array search_returns_arr;
+  for (double r : ev.search_returns) search_returns_arr.push_back(r);
+  obj["search_returns"] = search_returns_arr;
+
+  obj["mean_raw_return"] = ev.mean_raw_return;
+  obj["mean_search_return"] = ev.mean_search_return;
+  obj["raw_return_std_err"] = ev.raw_return_std_err;
+  obj["search_return_std_err"] = ev.search_return_std_err;
+  obj["mean_paired_advantage"] = ev.mean_paired_advantage;
+  obj["paired_advantage_std_err"] = ev.paired_advantage_std_err;
+
+  obj["diagnostic_legacy_raw_return"] = ev.diagnostic_legacy_raw_return;
+  obj["diagnostic_legacy_paired_advantage"] = ev.diagnostic_legacy_paired_advantage;
+
+  obj["total_simulations_used"] = static_cast<int64_t>(ev.total_simulations_used);
+  obj["total_re_root_hits"] = static_cast<int64_t>(ev.total_re_root_hits);
+  obj["total_re_root_misses"] = static_cast<int64_t>(ev.total_re_root_misses);
+  obj["mean_search_depth"] = ev.mean_search_depth;
+  obj["mean_terminal_leaf_fraction"] = ev.mean_terminal_leaf_fraction;
+  obj["total_inference_count"] = static_cast<int64_t>(ev.total_inference_count);
+  obj["primary_action_changed"] = ev.primary_action_changed;
+  obj["continuation_action_changed"] = ev.continuation_action_changed;
+
+  obj["used_fallback"] = ev.used_fallback;
+  obj["fallback_reason"] = ev.fallback_reason;
+  obj["confidence_fallback"] = ev.confidence_fallback;
+  obj["mcts_overrode_raw"] = ev.mcts_overrode_raw;
+  obj["raw_reference_action"] = static_cast<int64_t>(ev.raw_reference_action);
+  obj["mcts_proposed_action"] = static_cast<int64_t>(ev.mcts_proposed_action);
+  obj["selected_action"] = static_cast<int64_t>(ev.selected_action);
+  obj["stability_checkpoint_reached"] = ev.stability_checkpoint_reached;
+  obj["stability_agreement"] = ev.stability_agreement;
+  obj["pass_complete_search"] = ev.pass_complete_search;
+  obj["pass_min_actions"] = ev.pass_min_actions;
+  obj["pass_prior_mass"] = ev.pass_prior_mass;
+  obj["pass_meaningful_visits"] = ev.pass_meaningful_visits;
+  obj["pass_q_margin"] = ev.pass_q_margin;
+  obj["pass_stability"] = ev.pass_stability;
+
+  open_spiel::json::Array root_actions_arr;
+  for (int a : ev.root_action_ids) root_actions_arr.push_back(static_cast<int64_t>(a));
+  obj["root_action_ids"] = root_actions_arr;
+
+  obj["session_id"] = ev.session_id;
+  obj["inherited_visits"] = static_cast<int64_t>(ev.inherited_visits);
+  obj["initial_simulations"] = static_cast<int64_t>(ev.initial_simulations);
+  obj["continuation_simulations"] = static_cast<int64_t>(ev.continuation_simulations);
+
+  open_spiel::json::Array successor_critic_arr;
+  for (double v : ev.successor_critic_values) successor_critic_arr.push_back(v);
+  obj["successor_critic_values"] = successor_critic_arr;
+
+  open_spiel::json::Array successor_true_arr;
+  for (double v : ev.successor_true_values) successor_true_arr.push_back(v);
+  obj["successor_true_values"] = successor_true_arr;
+
+  obj["choice_rank_correlation"] = ev.choice_rank_correlation;
+  obj["successor_mean_bias"] = ev.successor_mean_bias;
+  obj["successor_rmse"] = ev.successor_rmse;
+
+  open_spiel::json::Array leaf_critic_arr;
+  for (double v : ev.leaf_critic_values) leaf_critic_arr.push_back(v);
+  obj["leaf_critic_values"] = leaf_critic_arr;
+
+  open_spiel::json::Array leaf_true_arr;
+  for (double v : ev.leaf_true_values) leaf_true_arr.push_back(v);
+  obj["leaf_true_values"] = leaf_true_arr;
+
+  obj["leaf_mean_bias"] = ev.leaf_mean_bias;
+  obj["leaf_rmse"] = ev.leaf_rmse;
+
+  open_spiel::json::Array leaf_hashes_arr;
+  for (const auto& h : ev.leaf_hashes) leaf_hashes_arr.push_back(h);
+  obj["leaf_hashes"] = leaf_hashes_arr;
+
+  open_spiel::json::Array rollouts_arr;
+  for (const auto& r : ev.rollouts) {
+    open_spiel::json::Object r_obj;
+    r_obj["rollout_index"] = static_cast<int64_t>(r.rollout_index);
+    r_obj["session_id"] = r.session_id;
+
+    open_spiel::json::Array raw_act_arr2;
+    for (int a : r.raw_action_sequence) raw_act_arr2.push_back(static_cast<int64_t>(a));
+    r_obj["raw_action_sequence"] = raw_act_arr2;
+
+    open_spiel::json::Array search_act_arr2;
+    for (int a : r.search_action_sequence) search_act_arr2.push_back(static_cast<int64_t>(a));
+    r_obj["search_action_sequence"] = search_act_arr2;
+
+    open_spiel::json::Array raw_legal_acts_arr2;
+    for (const auto& acts : r.raw_legal_actions) {
+      open_spiel::json::Array inner;
+      for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+      raw_legal_acts_arr2.push_back(inner);
+    }
+    r_obj["raw_legal_actions"] = raw_legal_acts_arr2;
+
+    open_spiel::json::Array raw_roles_arr2;
+    for (const auto& role : r.raw_decision_roles) raw_roles_arr2.push_back(role);
+    r_obj["raw_decision_roles"] = raw_roles_arr2;
+
+    open_spiel::json::Array search_legal_acts_arr2;
+    for (const auto& acts : r.search_legal_actions) {
+      open_spiel::json::Array inner;
+      for (int a : acts) inner.push_back(static_cast<int64_t>(a));
+      search_legal_acts_arr2.push_back(inner);
+    }
+    r_obj["search_legal_actions"] = search_legal_acts_arr2;
+
+    open_spiel::json::Array search_roles_arr2;
+    for (const auto& role : r.search_decision_roles) search_roles_arr2.push_back(role);
+    r_obj["search_decision_roles"] = search_roles_arr2;
+
+    open_spiel::json::Array raw_priors_arr2;
+    for (double p : r.raw_priors) raw_priors_arr2.push_back(p);
+    r_obj["raw_priors"] = raw_priors_arr2;
+
+    open_spiel::json::Array search_visits_arr2;
+    for (int v : r.search_visits) search_visits_arr2.push_back(static_cast<int64_t>(v));
+    r_obj["search_visits"] = search_visits_arr2;
+
+    open_spiel::json::Array root_q_arr2;
+    for (double q : r.root_q_values) root_q_arr2.push_back(q);
+    r_obj["root_q_values"] = root_q_arr2;
+
+    r_obj["selected_action_rank"] = static_cast<int64_t>(r.selected_action_rank);
+    r_obj["raw_return"] = r.raw_return;
+    r_obj["search_return"] = r.search_return;
+    r_obj["paired_advantage"] = r.paired_advantage;
+    r_obj["simulations_used"] = static_cast<int64_t>(r.simulations_used);
+    r_obj["initial_simulations"] = static_cast<int64_t>(r.initial_simulations);
+    r_obj["continuation_simulations"] = static_cast<int64_t>(r.continuation_simulations);
+    r_obj["short_window_simulations"] = static_cast<int64_t>(r.short_window_simulations);
+    r_obj["re_root_hits"] = static_cast<int64_t>(r.re_root_hits);
+    r_obj["re_root_misses"] = static_cast<int64_t>(r.re_root_misses);
+    r_obj["search_depth"] = r.search_depth;
+    r_obj["terminal_leaf_fraction"] = r.terminal_leaf_fraction;
+    r_obj["inference_count"] = static_cast<int64_t>(r.inference_count);
+    r_obj["inherited_visits"] = static_cast<int64_t>(r.inherited_visits);
+
+    open_spiel::json::Array root_actions_arr2;
+    for (int a : r.root_action_ids) root_actions_arr2.push_back(static_cast<int64_t>(a));
+    r_obj["root_action_ids"] = root_actions_arr2;
+
+    r_obj["primary_action_changed"] = r.primary_action_changed;
+    r_obj["continuation_action_changed"] = r.continuation_action_changed;
+    r_obj["search_decisions_count"] = static_cast<int64_t>(r.search_decisions_count);
+
+    rollouts_arr.push_back(r_obj);
+  }
+  obj["rollouts"] = rollouts_arr;
+
+  return obj;
+}
+
+void DeserializeEvidence(const open_spiel::json::Object& obj, OpportunityStateEvidence& ev) {
+  ev.corpus_index = obj.at("corpus_index").GetInt();
+  ev.episode_id = obj.at("episode_id").GetInt();
+  ev.history_hash = obj.at("history_hash").GetString();
+  ev.seat = obj.at("seat").GetInt();
+  ev.round = obj.at("round").GetInt();
+  ev.role = obj.at("role").GetString();
+
+  ev.raw_action_sequence.clear();
+  for (const auto& v : obj.at("raw_action_sequence").GetArray()) {
+    ev.raw_action_sequence.push_back(static_cast<int>(v.GetInt()));
+  }
+
+  ev.search_action_sequence.clear();
+  for (const auto& v : obj.at("search_action_sequence").GetArray()) {
+    ev.search_action_sequence.push_back(static_cast<int>(v.GetInt()));
+  }
+
+  ev.raw_legal_actions.clear();
+  for (const auto& inner_val : obj.at("raw_legal_actions").GetArray()) {
+    std::vector<int> inner;
+    for (const auto& v : inner_val.GetArray()) inner.push_back(static_cast<int>(v.GetInt()));
+    ev.raw_legal_actions.push_back(inner);
+  }
+
+  ev.raw_decision_roles.clear();
+  for (const auto& v : obj.at("raw_decision_roles").GetArray()) {
+    ev.raw_decision_roles.push_back(v.GetString());
+  }
+
+  ev.search_legal_actions.clear();
+  for (const auto& inner_val : obj.at("search_legal_actions").GetArray()) {
+    std::vector<int> inner;
+    for (const auto& v : inner_val.GetArray()) inner.push_back(static_cast<int>(v.GetInt()));
+    ev.search_legal_actions.push_back(inner);
+  }
+
+  ev.search_decision_roles.clear();
+  for (const auto& v : obj.at("search_decision_roles").GetArray()) {
+    ev.search_decision_roles.push_back(v.GetString());
+  }
+
+  ev.raw_priors.clear();
+  for (const auto& v : obj.at("raw_priors").GetArray()) ev.raw_priors.push_back(v.GetDouble());
+
+  ev.search_visits.clear();
+  for (const auto& v : obj.at("search_visits").GetArray()) ev.search_visits.push_back(static_cast<int>(v.GetInt()));
+
+  ev.root_q_values.clear();
+  for (const auto& v : obj.at("root_q_values").GetArray()) ev.root_q_values.push_back(v.GetDouble());
+
+  ev.selected_action_rank = obj.at("selected_action_rank").GetInt();
+
+  ev.raw_returns.clear();
+  for (const auto& v : obj.at("raw_returns").GetArray()) ev.raw_returns.push_back(v.GetDouble());
+
+  ev.search_returns.clear();
+  for (const auto& v : obj.at("search_returns").GetArray()) ev.search_returns.push_back(v.GetDouble());
+
+  ev.mean_raw_return = obj.at("mean_raw_return").GetDouble();
+  ev.mean_search_return = obj.at("mean_search_return").GetDouble();
+  ev.raw_return_std_err = obj.at("raw_return_std_err").GetDouble();
+  ev.search_return_std_err = obj.at("search_return_std_err").GetDouble();
+  ev.mean_paired_advantage = obj.at("mean_paired_advantage").GetDouble();
+  ev.paired_advantage_std_err = obj.at("paired_advantage_std_err").GetDouble();
+
+  ev.leaf_hashes.clear();
+  if (obj.find("leaf_hashes") != obj.end()) {
+    for (const auto& v : obj.at("leaf_hashes").GetArray()) {
+      ev.leaf_hashes.push_back(v.GetString());
+    }
+  }
+
+  ev.diagnostic_legacy_raw_return = obj.at("diagnostic_legacy_raw_return").GetDouble();
+  ev.diagnostic_legacy_paired_advantage = obj.at("diagnostic_legacy_paired_advantage").GetDouble();
+
+  ev.total_simulations_used = obj.at("total_simulations_used").GetInt();
+  ev.total_re_root_hits = obj.at("total_re_root_hits").GetInt();
+  ev.total_re_root_misses = obj.at("total_re_root_misses").GetInt();
+  ev.mean_search_depth = obj.at("mean_search_depth").GetDouble();
+  ev.mean_terminal_leaf_fraction = obj.at("mean_terminal_leaf_fraction").GetDouble();
+  ev.total_inference_count = obj.at("total_inference_count").GetInt();
+  ev.primary_action_changed = obj.at("primary_action_changed").GetBool();
+  ev.continuation_action_changed = obj.at("continuation_action_changed").GetBool();
+
+  ev.used_fallback = obj.at("used_fallback").GetBool();
+  ev.fallback_reason = obj.at("fallback_reason").GetString();
+  ev.confidence_fallback = obj.at("confidence_fallback").GetBool();
+  ev.mcts_overrode_raw = obj.at("mcts_overrode_raw").GetBool();
+  ev.raw_reference_action = obj.at("raw_reference_action").GetInt();
+  ev.mcts_proposed_action = obj.at("mcts_proposed_action").GetInt();
+  ev.selected_action = obj.at("selected_action").GetInt();
+  ev.stability_checkpoint_reached = obj.at("stability_checkpoint_reached").GetBool();
+  ev.stability_agreement = obj.at("stability_agreement").GetBool();
+  ev.pass_complete_search = obj.at("pass_complete_search").GetBool();
+  ev.pass_min_actions = obj.at("pass_min_actions").GetBool();
+  ev.pass_prior_mass = obj.at("pass_prior_mass").GetBool();
+  ev.pass_meaningful_visits = obj.at("pass_meaningful_visits").GetBool();
+  ev.pass_q_margin = obj.at("pass_q_margin").GetBool();
+  ev.pass_stability = obj.at("pass_stability").GetBool();
+
+  ev.root_action_ids.clear();
+  for (const auto& v : obj.at("root_action_ids").GetArray()) ev.root_action_ids.push_back(static_cast<int>(v.GetInt()));
+
+  ev.session_id = obj.at("session_id").GetString();
+  ev.inherited_visits = obj.at("inherited_visits").GetInt();
+  ev.initial_simulations = obj.at("initial_simulations").GetInt();
+  ev.continuation_simulations = obj.at("continuation_simulations").GetInt();
+
+  ev.successor_critic_values.clear();
+  for (const auto& v : obj.at("successor_critic_values").GetArray()) ev.successor_critic_values.push_back(v.GetDouble());
+
+  ev.successor_true_values.clear();
+  for (const auto& v : obj.at("successor_true_values").GetArray()) ev.successor_true_values.push_back(v.GetDouble());
+
+  ev.choice_rank_correlation = obj.at("choice_rank_correlation").GetDouble();
+  ev.successor_mean_bias = obj.at("successor_mean_bias").GetDouble();
+  ev.successor_rmse = obj.at("successor_rmse").GetDouble();
+
+  ev.leaf_critic_values.clear();
+  for (const auto& v : obj.at("leaf_critic_values").GetArray()) ev.leaf_critic_values.push_back(v.GetDouble());
+
+  ev.leaf_true_values.clear();
+  for (const auto& v : obj.at("leaf_true_values").GetArray()) ev.leaf_true_values.push_back(v.GetDouble());
+
+  ev.leaf_mean_bias = obj.at("leaf_mean_bias").GetDouble();
+  ev.leaf_rmse = obj.at("leaf_rmse").GetDouble();
+
+  ev.rollouts.clear();
+  for (const auto& r_val : obj.at("rollouts").GetArray()) {
+    auto r_obj = r_val.GetObject();
+    RolloutEvidence r;
+    r.rollout_index = r_obj.at("rollout_index").GetInt();
+    r.session_id = r_obj.at("session_id").GetString();
+
+    for (const auto& v : r_obj.at("raw_action_sequence").GetArray()) r.raw_action_sequence.push_back(static_cast<int>(v.GetInt()));
+    for (const auto& v : r_obj.at("search_action_sequence").GetArray()) r.search_action_sequence.push_back(static_cast<int>(v.GetInt()));
+
+    for (const auto& inner_val : r_obj.at("raw_legal_actions").GetArray()) {
+      std::vector<int> inner;
+      for (const auto& v : inner_val.GetArray()) inner.push_back(static_cast<int>(v.GetInt()));
+      r.raw_legal_actions.push_back(inner);
+    }
+    for (const auto& v : r_obj.at("raw_decision_roles").GetArray()) r.raw_decision_roles.push_back(v.GetString());
+
+    for (const auto& inner_val : r_obj.at("search_legal_actions").GetArray()) {
+      std::vector<int> inner;
+      for (const auto& v : inner_val.GetArray()) inner.push_back(static_cast<int>(v.GetInt()));
+      r.search_legal_actions.push_back(inner);
+    }
+    for (const auto& v : r_obj.at("search_decision_roles").GetArray()) r.search_decision_roles.push_back(v.GetString());
+
+    for (const auto& v : r_obj.at("raw_priors").GetArray()) r.raw_priors.push_back(v.GetDouble());
+    for (const auto& v : r_obj.at("search_visits").GetArray()) r.search_visits.push_back(static_cast<int>(v.GetInt()));
+    for (const auto& v : r_obj.at("root_q_values").GetArray()) r.root_q_values.push_back(v.GetDouble());
+
+    r.selected_action_rank = r_obj.at("selected_action_rank").GetInt();
+    r.raw_return = r_obj.at("raw_return").GetDouble();
+    r.search_return = r_obj.at("search_return").GetDouble();
+    r.paired_advantage = r_obj.at("paired_advantage").GetDouble();
+    r.simulations_used = r_obj.at("simulations_used").GetInt();
+    r.initial_simulations = r_obj.at("initial_simulations").GetInt();
+    r.continuation_simulations = r_obj.at("continuation_simulations").GetInt();
+    r.short_window_simulations = r_obj.at("short_window_simulations").GetInt();
+    r.re_root_hits = r_obj.at("re_root_hits").GetInt();
+    r.re_root_misses = r_obj.at("re_root_misses").GetInt();
+    r.search_depth = r_obj.at("search_depth").GetDouble();
+    r.terminal_leaf_fraction = r_obj.at("terminal_leaf_fraction").GetDouble();
+    r.inference_count = r_obj.at("inference_count").GetInt();
+    r.inherited_visits = r_obj.at("inherited_visits").GetInt();
+
+    for (const auto& v : r_obj.at("root_action_ids").GetArray()) r.root_action_ids.push_back(static_cast<int>(v.GetInt()));
+
+    r.primary_action_changed = r_obj.at("primary_action_changed").GetBool();
+    r.continuation_action_changed = r_obj.at("continuation_action_changed").GetBool();
+    r.search_decisions_count = r_obj.at("search_decisions_count").GetInt();
+
+    ev.rollouts.push_back(r);
+  }
+}
 
 struct ChoiceOutcomeCacheEntry {
   int corpus_index = -1;
@@ -838,6 +1250,37 @@ std::string ComputePolicyFingerprint(const std::shared_ptr<SharedDunePolicyValue
   return hasher.Final();
 }
 
+std::string GetHistoryHash(const std::vector<Action>& history) {
+  std::string history_str = "";
+  for (size_t i = 0; i < history.size(); ++i) {
+    if (i > 0) history_str += ",";
+    history_str += std::to_string(history[i]);
+  }
+  return open_spiel::ComputeStringSHA256(history_str);
+}
+
+std::string GetStatePlayerHash(const State& state, int player) {
+  std::string representation = "";
+  std::vector<Action> history = state.History();
+  for (size_t i = 0; i < history.size(); ++i) {
+    if (i > 0) representation += ",";
+    representation += std::to_string(history[i]);
+  }
+  representation += ";p=" + std::to_string(player) + ";obs=";
+  std::vector<float> obs = state.InformationStateTensor(player);
+  for (size_t i = 0; i < obs.size(); ++i) {
+    representation += std::to_string(obs[i]);
+  }
+  return open_spiel::ComputeStringSHA256(representation);
+}
+
+struct CacheLayerStats {
+  std::atomic<int> query{0};
+  std::atomic<int> hit{0};
+  std::atomic<int> val_fail{0};
+  std::atomic<int> miss{0};
+};
+
 class SplitCacheManager {
  public:
   std::string cache_dir;
@@ -857,16 +1300,33 @@ class SplitCacheManager {
   std::string layer1_dir;
   std::string layer2_dir;
   std::string layer3_dir;
+  std::string layer4_dir;
+  std::string layer5_dir;
+  std::string layer6_dir;
 
   // Configuration hashes
   std::string config_hash;
   open_spiel::json::Object search_config;
   open_spiel::json::Object controller_config;
 
-  // Manifest fast-path lookup sets
-  std::unordered_set<int64_t> completed_g1_set;
-  std::unordered_set<int64_t> completed_g2_set;
-  bool has_manifest = false;
+  // Hash Truncation Policy Documentation (Issue 1):
+  // We truncate SHA-256 hashes to the first 16 characters (64 bits) for path and
+  // filenames to avoid filesystem path length limits (e.g. eCryptfs 143-char limit)
+  // and ease visual debugging.
+  // The collision threshold under the birthday paradox is ~2^32 (4 billion) states,
+  // which is astronomically larger than our corpus size (32-64 strategic states).
+  // To protect against silent collision corruption, the full 64-character hash is
+  // saved inside the JSON metadata of all cache entries and validated on load; any
+  // full-hash mismatch triggers a validation failure (logged, deleted, recomputed).
+
+
+  // Cache statistics
+  CacheLayerStats l1_stats;
+  CacheLayerStats l2_stats;
+  CacheLayerStats l3_stats;
+  CacheLayerStats l4_stats;
+  CacheLayerStats l5_stats;
+  CacheLayerStats l6_stats;
 
   SplitCacheManager(const std::string& c_dir, const std::string& model_cp, const std::string& corp_path,
                     int sd, int rolls, double util_div, bool st, const std::string& p_fp)
@@ -886,14 +1346,14 @@ class SplitCacheManager {
     corpus_hash = open_spiel::ComputeFileSHA256(corpus_path);
     binary_hash = open_spiel::ComputeFileSHA256("/proc/self/exe");
 
-    // Compute prefixes (first 12 characters)
-    std::string corpus_prefix = corpus_hash.substr(0, 12);
-    std::string policy_prefix = policy_fingerprint.substr(0, 12);
-    std::string checkpoint_prefix = model_hash.substr(0, 12);
-    std::string binary_prefix = binary_hash.substr(0, 12);
+    // Compute prefixes (first 16 characters)
+    std::string corpus_prefix = corpus_hash.substr(0, 16);
+    std::string policy_prefix = policy_fingerprint.substr(0, 16);
+    std::string checkpoint_prefix = model_hash.substr(0, 16);
+    std::string binary_prefix = binary_hash.substr(0, 16);
 
     // Compute cache-identity directory preventing collisions
-    identity_dir = absl::StrFormat("%s/%s_%s_session-v4",
+    identity_dir = absl::StrFormat("%s/corp%s_pol%s_session-v4",
         cache_dir, corpus_prefix, policy_prefix);
 
     // Compute architecture flags
@@ -901,13 +1361,19 @@ class SplitCacheManager {
     std::string architecture_flags = absl::StrFormat("nb%d_hd%d_%s",
         absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
 
-    // Define Layer 1, 2 directories under identity_dir
-    layer1_dir = absl::StrFormat("%s/layer1_%s_r%d_u%.6f_%s_rollout-v2_%s",
-        identity_dir, corpus_prefix, rollouts, utility_divisor, policy_prefix, binary_prefix);
-    layer2_dir = absl::StrFormat("%s/layer2_%s_%s_%s",
-        identity_dir, corpus_prefix, checkpoint_prefix, architecture_flags);
+    std::string evaluator_id = self_test ? "MockEvaluator" : "BatchedNNEvaluator";
+    std::string normalization_schema = absl::StrFormat("utility_div_%.6f", utility_divisor);
 
-    // Define Layer 3 settings
+    // Define Layer directories under identity_dir
+    layer1_dir = absl::StrFormat("%s/layer1_replay_bin%s", identity_dir, binary_prefix);
+    layer2_dir = absl::StrFormat("%s/layer2_policy_model%s_arch%s_eval%s_bin%s", identity_dir, checkpoint_prefix, architecture_flags, evaluator_id, binary_prefix);
+    layer3_dir = absl::StrFormat("%s/layer3_rollout_policy%s_r%d_u%.6f_rseed%d_cseed%d_bin%s",
+        identity_dir, policy_prefix, rollouts, utility_divisor,
+        absl::GetFlag(FLAGS_rollout_seed_base), absl::GetFlag(FLAGS_chance_seed_base), binary_prefix);
+    layer4_dir = absl::StrFormat("%s/layer4_critic_model%s_arch%s_eval%s_bin%s_norm%s",
+        identity_dir, checkpoint_prefix, architecture_flags, evaluator_id, binary_prefix, normalization_schema);
+
+    // Define Layer 5 settings
     search_config["opponent_mode"] = absl::GetFlag(FLAGS_opponent_mode);
     search_config["opponent_temperature"] = absl::GetFlag(FLAGS_opponent_temperature);
     search_config["puct_c"] = absl::GetFlag(FLAGS_puct_c);
@@ -918,6 +1384,7 @@ class SplitCacheManager {
     search_config["relative_time_budget_ms"] = absl::GetFlag(FLAGS_relative_time_budget_ms);
     search_config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
     search_config["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
+    search_config["raw_policy_seed"] = absl::GetFlag(FLAGS_raw_policy_seed);
 
     controller_config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
     controller_config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
@@ -929,482 +1396,522 @@ class SplitCacheManager {
     std::string config_str = open_spiel::json::ToString(search_config, false) + ":" + open_spiel::json::ToString(controller_config, false);
     config_hash = open_spiel::ComputeStringSHA256(config_str);
 
-    layer3_dir = absl::StrFormat("%s/layer3_%s_%s_s%d_session-v4_%s",
-        identity_dir, corpus_prefix, checkpoint_prefix, seed, config_hash.substr(0, 12));
+    layer5_dir = absl::StrFormat("%s/layer5_search_model%s_s%d_rawseed%d_bin%s_%s",
+        identity_dir, checkpoint_prefix, seed, absl::GetFlag(FLAGS_raw_policy_seed), binary_prefix, config_hash.substr(0, 16));
+    layer6_dir = absl::StrFormat("%s/layer6_bootstrap_model%s_s%d_bseed%d_r%d_u%.6f_rseed%d_cseed%d_%s",
+        identity_dir, checkpoint_prefix, seed, absl::GetFlag(FLAGS_bootstrap_seed),
+        rollouts, utility_divisor, absl::GetFlag(FLAGS_rollout_seed_base),
+        absl::GetFlag(FLAGS_chance_seed_base), config_hash.substr(0, 16));
 
     std::filesystem::create_directories(layer1_dir);
     std::filesystem::create_directories(layer2_dir);
     std::filesystem::create_directories(layer3_dir);
+    std::filesystem::create_directories(layer4_dir);
+    std::filesystem::create_directories(layer5_dir);
+    std::filesystem::create_directories(layer6_dir);
 
-    std::vector<int64_t> m_g1;
-    std::vector<int64_t> m_g2;
-    if (LoadManifest(m_g1, m_g2)) {
-      completed_g1_set.insert(m_g1.begin(), m_g1.end());
-      completed_g2_set.insert(m_g2.begin(), m_g2.end());
-      has_manifest = true;
-    }
+
   }
 
   bool IsActive() const { return !cache_dir.empty(); }
+  std::string GetLayer4Dir() const { return layer4_dir; }
 
-  bool LoadGate1ReturnsOnly(int state_idx, std::vector<double>& returns) {
-    if (!IsActive()) return false;
-    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
-    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
-    if (!std::filesystem::exists(shard1)) return false;
-
-    try {
-      std::ifstream in1(shard1);
-      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
-      auto parsed1 = open_spiel::json::FromString(text1);
-      if (!parsed1) return false;
-      auto obj1 = parsed1.value().GetObject();
-      if (obj1.find("gate1_returns") == obj1.end()) return false;
-      auto prov1 = obj1.at("provenance").GetObject();
-      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
-          prov1.at("rollout_count").GetInt() != rollouts ||
-          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
-          prov1.at("binary_hash").GetString() != binary_hash ||
-          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
-        return false;
-      }
-      auto arr1 = obj1.at("gate1_returns").GetArray();
-      returns.clear();
-      for (const auto& v : arr1) returns.push_back(v.GetDouble());
-      return true;
-    } catch (...) {
-      return false;
-    }
-  }
-
-  bool LoadGate1CriticOnly(int state_idx, double& critic_val) {
-    if (!IsActive()) return false;
-    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
-    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
-    if (!std::filesystem::exists(shard2)) return false;
-
-    try {
-      std::ifstream in2(shard2);
-      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
-      auto parsed2 = open_spiel::json::FromString(text2);
-      if (!parsed2) return false;
-      auto obj2 = parsed2.value().GetObject();
-      auto prov2 = obj2.at("provenance").GetObject();
-      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
-      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
-          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
-      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
-          prov2.find("architecture_flags") == prov2.end() ||
-          prov2.at("architecture_flags").GetString() != expected_arch) {
-        return false;
-      }
-      critic_val = obj2.at("gate1_critic_value").GetDouble();
-      return true;
-    } catch (...) {
-      return false;
-    }
-  }
-
-  // Check if a state is fully cached for Gate 1
-  bool LoadGate1Shard(int state_idx, double& critic_val, std::vector<double>& returns) {
-    if (!IsActive()) return false;
-    if (has_manifest && completed_g1_set.count(state_idx) == 0) return false;
-    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
-    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
-    if (!std::filesystem::exists(shard1) || !std::filesystem::exists(shard2)) return false;
-
-    try {
-      // Load Layer 1
-      std::ifstream in1(shard1);
-      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
-      auto parsed1 = open_spiel::json::FromString(text1);
-      if (!parsed1) return false;
-      auto obj1 = parsed1.value().GetObject();
-      auto prov1 = obj1.at("provenance").GetObject();
-      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
-          prov1.at("rollout_count").GetInt() != rollouts ||
-          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
-          prov1.at("binary_hash").GetString() != binary_hash ||
-          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
-        return false;
-      }
-      auto arr1 = obj1.at("gate1_returns").GetArray();
-      returns.clear();
-      for (const auto& v : arr1) returns.push_back(v.GetDouble());
-
-      // Load Layer 2
-      std::ifstream in2(shard2);
-      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
-      auto parsed2 = open_spiel::json::FromString(text2);
-      if (!parsed2) return false;
-      auto obj2 = parsed2.value().GetObject();
-      auto prov2 = obj2.at("provenance").GetObject();
-      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
-      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
-          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
-      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
-          prov2.find("architecture_flags") == prov2.end() ||
-          prov2.at("architecture_flags").GetString() != expected_arch) {
-        return false;
-      }
-      critic_val = obj2.at("gate1_critic_value").GetDouble();
-      return true;
-    } catch (...) {
-      return false;
-    }
-  }
-
-  void SaveGate1Shard(int state_idx, double critic_val, const std::vector<double>& returns, bool migrated_from_legacy = false, bool save_layer1 = true) {
-    if (!IsActive()) return;
-
-    // Acquire state-level lock
-    std::string lock_path = absl::StrFormat("%s/state_%d.lock", identity_dir, state_idx);
+  int AcquireLock(const std::string& history_hash) {
+    std::string lock_path = absl::StrFormat("%s/state_%s.lock", identity_dir, history_hash.substr(0, 16));
     int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
     if (lock_fd >= 0) {
       flock(lock_fd, LOCK_EX);
     }
+    return lock_fd;
+  }
 
-    if (save_layer1) {
-      // Save Layer 1 Shard
-      open_spiel::json::Object outcomes1;
-      bool existing_migrated = false;
-      std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
-      if (std::filesystem::exists(shard1)) {
-        try {
-          std::ifstream in1(shard1);
-          std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
-          auto parsed1 = open_spiel::json::FromString(text1);
-          if (parsed1) {
-            auto parsed_obj1 = parsed1.value().GetObject();
-            if (parsed_obj1.find("gate2_action_returns") != parsed_obj1.end()) {
-              outcomes1 = parsed_obj1.at("gate2_action_returns").GetObject();
-            }
-            if (parsed_obj1.find("provenance") != parsed_obj1.end()) {
-              auto ext_prov = parsed_obj1.at("provenance").GetObject();
-              if (ext_prov.find("migrated_from_legacy") != ext_prov.end()) {
-                existing_migrated = ext_prov.at("migrated_from_legacy").GetBool();
-              }
-            }
-          }
-        } catch (...) {}
-      }
-
-      open_spiel::json::Object obj1;
-      open_spiel::json::Object prov1;
-      prov1["corpus_fingerprint"] = corpus_hash;
-      prov1["rollout_count"] = rollouts;
-      prov1["utility_divisor"] = utility_divisor;
-      prov1["policy_fingerprint"] = policy_fingerprint;
-      prov1["binary_hash"] = binary_hash;
-      prov1["rollout_protocol_version"] = "rollout-v2";
-      prov1["corpus_index"] = state_idx;
-      if (migrated_from_legacy || existing_migrated) {
-        prov1["migrated_from_legacy"] = true;
-      }
-      obj1["provenance"] = prov1;
-
-      open_spiel::json::Array arr1;
-      for (double r : returns) arr1.push_back(r);
-      obj1["gate1_returns"] = arr1;
-      if (!outcomes1.empty()) {
-        obj1["gate2_action_returns"] = outcomes1;
-      }
-
-      std::string tmp1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer1_dir, state_idx, rollouts, utility_divisor, getpid());
-      std::ofstream out1(tmp1);
-      out1 << open_spiel::json::ToString(obj1, true) << "\n";
-      out1.close();
-      std::filesystem::rename(tmp1, shard1);
-    }
-
-    // Save Layer 2 Shard
-    open_spiel::json::Object obj2;
-    open_spiel::json::Object prov2;
-    prov2["corpus_fingerprint"] = corpus_hash;
-    prov2["full_checkpoint_hash"] = model_hash;
-    std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
-    prov2["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
-        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
-    obj2["provenance"] = prov2;
-    obj2["gate1_critic_value"] = critic_val;
-
-    std::string shard2 = absl::StrFormat("%s/state_%d.json", layer2_dir, state_idx);
-    std::string tmp2 = absl::StrFormat("%s/state_%d.json.%d.tmp", layer2_dir, state_idx, getpid());
-    std::ofstream out2(tmp2);
-    out2 << open_spiel::json::ToString(obj2, true) << "\n";
-    out2.close();
-    std::filesystem::rename(tmp2, shard2);
-
-    // Release state-level lock
+  void ReleaseLock(int lock_fd) {
     if (lock_fd >= 0) {
       flock(lock_fd, LOCK_UN);
       close(lock_fd);
     }
   }
 
-  bool LoadGate2SearchShard(int state_idx, open_spiel::json::Object& search_result) {
+  bool LoadLayer1Replay(const std::string& history_hash, int& player, std::vector<Action>& legal_actions, std::vector<float>& observation) {
     if (!IsActive()) return false;
-    if (has_manifest && completed_g2_set.count(state_idx) == 0) return false;
-    std::string shard3 = absl::StrFormat("%s/state_%d.json", layer3_dir, state_idx);
-    if (!std::filesystem::exists(shard3)) return false;
-
+    l1_stats.query++;
+    std::string shard = absl::StrFormat("%s/replay_%s.json", layer1_dir, history_hash.substr(0, 16));
+    if (!std::filesystem::exists(shard)) {
+      l1_stats.miss++;
+      return false;
+    }
     try {
-      std::ifstream in3(shard3);
-      std::string text3((std::istreambuf_iterator<char>(in3)), std::istreambuf_iterator<char>());
-      if (text3.find("NaN") != std::string::npos ||
-          text3.find("Infinity") != std::string::npos ||
-          text3.find("-Infinity") != std::string::npos) {
-        std::cerr << "[ERROR] Cache validation failed: non-finite value found in cache file " << shard3 << std::endl;
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        l1_stats.val_fail++;
+        return false;
+      }
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("binary_hash").GetString() != binary_hash ||
+          prov.at("history_hash").GetString() != history_hash ||
+          prov.at("replay_protocol_version").GetString() != "replay-v1") {
+        l1_stats.val_fail++;
+        return false;
+      }
+      player = obj.at("player").GetInt();
+      auto legal_arr = obj.at("legal_actions").GetArray();
+      legal_actions.clear();
+      for (const auto& v : legal_arr) {
+        legal_actions.push_back(static_cast<Action>(v.GetInt()));
+      }
+      auto obs_arr = obj.at("observation").GetArray();
+      observation.clear();
+      for (const auto& v : obs_arr) {
+        observation.push_back(static_cast<float>(v.GetDouble()));
+      }
+      l1_stats.hit++;
+      return true;
+    } catch (...) {
+      l1_stats.val_fail++;
+      return false;
+    }
+  }
+
+  void SaveLayer1Replay(const std::string& history_hash, int player, const std::vector<Action>& legal_actions, const std::vector<float>& observation) {
+    if (!IsActive()) return;
+    int lock_fd = AcquireLock(history_hash);
+    std::string shard = absl::StrFormat("%s/replay_%s.json", layer1_dir, history_hash.substr(0, 16));
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["binary_hash"] = binary_hash;
+    prov["replay_protocol_version"] = "replay-v1";
+    prov["history_hash"] = history_hash;
+    obj["provenance"] = prov;
+    obj["player"] = static_cast<int64_t>(player);
+    open_spiel::json::Array legal_arr;
+    for (Action a : legal_actions) legal_arr.push_back(static_cast<int64_t>(a));
+    obj["legal_actions"] = legal_arr;
+    open_spiel::json::Array obs_arr;
+    for (float f : observation) obs_arr.push_back(static_cast<double>(f));
+    obj["observation"] = obs_arr;
+
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
+    ReleaseLock(lock_fd);
+  }
+
+  bool LoadLayer2Policy(const std::string& history_hash, ActionsAndProbs& priors) {
+    if (!IsActive()) return false;
+    l2_stats.query++;
+    std::string shard = absl::StrFormat("%s/policy_%s.json", layer2_dir, history_hash.substr(0, 16));
+    if (!std::filesystem::exists(shard)) {
+      l2_stats.miss++;
+      return false;
+    }
+    try {
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        l2_stats.val_fail++;
+        return false;
+      }
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("model_checkpoint_hash").GetString() != model_hash ||
+          prov.at("history_hash").GetString() != history_hash ||
+          prov.find("evaluator_code_identity") == prov.end() ||
+          prov.at("evaluator_code_identity").GetString() != (self_test ? "MockEvaluator" : "BatchedNNEvaluator") ||
+          prov.find("binary_hash") == prov.end() ||
+          prov.at("binary_hash").GetString() != binary_hash ||
+          prov.at("policy_protocol_version").GetString() != "policy-v1") {
+        l2_stats.val_fail++;
+        return false;
+      }
+      auto priors_arr = obj.at("priors").GetArray();
+      priors.clear();
+      double sum = 0.0;
+      for (const auto& item_val : priors_arr) {
+        auto item = item_val.GetObject();
+        Action a = static_cast<Action>(item.at("action").GetInt());
+        double prob = item.at("prob").GetDouble();
+        priors.push_back({a, prob});
+        sum += prob;
+      }
+      if (std::abs(sum - 1.0) > 1e-5) {
+        l2_stats.val_fail++;
+        return false;
+      }
+      l2_stats.hit++;
+      return true;
+    } catch (...) {
+      l2_stats.val_fail++;
+      return false;
+    }
+  }
+
+  void SaveLayer2Policy(const std::string& history_hash, const ActionsAndProbs& priors) {
+    if (!IsActive()) return;
+    int lock_fd = AcquireLock(history_hash);
+    std::string shard = absl::StrFormat("%s/policy_%s.json", layer2_dir, history_hash.substr(0, 16));
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["model_checkpoint_hash"] = model_hash;
+    prov["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim),
+        absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin");
+    prov["evaluator_code_identity"] = self_test ? "MockEvaluator" : "BatchedNNEvaluator";
+    prov["binary_hash"] = binary_hash;
+    prov["policy_protocol_version"] = "policy-v1";
+    prov["history_hash"] = history_hash;
+    obj["provenance"] = prov;
+
+    open_spiel::json::Array priors_arr;
+    for (const auto& pair : priors) {
+      open_spiel::json::Object item;
+      item["action"] = static_cast<int64_t>(pair.first);
+      item["prob"] = pair.second;
+      priors_arr.push_back(item);
+    }
+    obj["priors"] = priors_arr;
+
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
+    ReleaseLock(lock_fd);
+  }
+
+  bool LoadLayer3Rollout(const std::string& history_hash, const std::string& forced_action, std::vector<double>& returns) {
+    if (!IsActive()) return false;
+    l3_stats.query++;
+    std::string shard = absl::StrFormat("%s/rollout_%s_%s.json", layer3_dir, history_hash.substr(0, 16), forced_action);
+    if (!std::filesystem::exists(shard)) {
+      l3_stats.miss++;
+      return false;
+    }
+    try {
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        l3_stats.val_fail++;
+        return false;
+      }
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov.at("binary_hash").GetString() != binary_hash ||
+          prov.at("history_hash").GetString() != history_hash ||
+          prov.at("forced_action").GetString() != forced_action ||
+          prov.at("rollout_count").GetInt() != rollouts ||
+          prov.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov.find("rollout_seed_base") == prov.end() ||
+          prov.at("rollout_seed_base").GetInt() != absl::GetFlag(FLAGS_rollout_seed_base) ||
+          prov.find("chance_seed_base") == prov.end() ||
+          prov.at("chance_seed_base").GetInt() != absl::GetFlag(FLAGS_chance_seed_base) ||
+          prov.at("rollout_protocol_version").GetString() != "rollout-v2") {
+        l3_stats.val_fail++;
+        return false;
+      }
+      auto arr = obj.at("returns").GetArray();
+      if (arr.size() != static_cast<size_t>(rollouts)) {
+        l3_stats.val_fail++;
+        return false;
+      }
+      returns.clear();
+      for (const auto& v : arr) returns.push_back(v.GetDouble());
+      l3_stats.hit++;
+      return true;
+    } catch (...) {
+      l3_stats.val_fail++;
+      return false;
+    }
+  }
+
+  void SaveLayer3Rollout(const std::string& history_hash, const std::string& forced_action, const std::vector<double>& returns) {
+    if (!IsActive()) return;
+    int lock_fd = AcquireLock(history_hash);
+    std::string shard = absl::StrFormat("%s/rollout_%s_%s.json", layer3_dir, history_hash.substr(0, 16), forced_action);
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["policy_fingerprint"] = policy_fingerprint;
+    prov["rollout_count"] = static_cast<int64_t>(rollouts);
+    prov["utility_divisor"] = utility_divisor;
+    prov["rollout_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_seed_base));
+    prov["chance_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_chance_seed_base));
+    prov["binary_hash"] = binary_hash;
+    prov["rollout_protocol_version"] = "rollout-v2";
+    prov["history_hash"] = history_hash;
+    prov["forced_action"] = forced_action;
+    obj["provenance"] = prov;
+
+    open_spiel::json::Array arr;
+    for (double r : returns) arr.push_back(r);
+    obj["returns"] = arr;
+
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
+    ReleaseLock(lock_fd);
+  }
+
+  bool LoadLayer4Critic(const std::string& history_hash, double& critic_value, int expected_rollouts = 0, int expected_chance_seed = 0) {
+    if (!IsActive()) return false;
+    l4_stats.query++;
+    std::string shard = absl::StrFormat("%s/critic_%s.json", layer4_dir, history_hash.substr(0, 16));
+    if (!std::filesystem::exists(shard)) {
+      l4_stats.miss++;
+      return false;
+    }
+    try {
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        l4_stats.val_fail++;
+        return false;
+      }
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("model_checkpoint_hash").GetString() != model_hash ||
+          prov.at("history_hash").GetString() != history_hash ||
+          prov.at("binary_hash").GetString() != binary_hash ||
+          prov.at("evaluator_code_identity").GetString() != (self_test ? "MockEvaluator" : "BatchedNNEvaluator") ||
+          prov.at("normalization_schema").GetString() != absl::StrFormat("utility_div_%.6f", utility_divisor)) {
+        l4_stats.val_fail++;
+        return false;
+      }
+      if (expected_rollouts > 0) {
+        if (prov.find("rollout_count") == prov.end() || prov.at("rollout_count").GetInt() != expected_rollouts ||
+            prov.find("chance_seed_base") == prov.end() || prov.at("chance_seed_base").GetInt() != expected_chance_seed) {
+          l4_stats.val_fail++;
+          return false;
+        }
+      }
+      critic_value = obj.at("critic_value").GetDouble();
+      l4_stats.hit++;
+      return true;
+    } catch (...) {
+      l4_stats.val_fail++;
+      return false;
+    }
+  }
+
+  // Note: Layer 4 caches for successor states store chance-averaged critic values
+  // (over rollout continuations), not single-state evaluations, which is correct
+  // for the gate computation semantics.
+  void SaveLayer4Critic(const std::string& history_hash, double critic_value, int entry_rollouts = 0, int entry_chance_seed = 0) {
+    if (!IsActive()) return;
+    int lock_fd = AcquireLock(history_hash);
+    std::string shard = absl::StrFormat("%s/critic_%s.json", layer4_dir, history_hash.substr(0, 16));
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["model_checkpoint_hash"] = model_hash;
+    prov["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim),
+        absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin");
+    prov["evaluator_code_identity"] = self_test ? "MockEvaluator" : "BatchedNNEvaluator";
+    prov["binary_hash"] = binary_hash;
+    prov["normalization_schema"] = absl::StrFormat("utility_div_%.6f", utility_divisor);
+    prov["history_hash"] = history_hash;
+    if (entry_rollouts > 0) {
+      prov["rollout_count"] = static_cast<int64_t>(entry_rollouts);
+      prov["chance_seed_base"] = static_cast<int64_t>(entry_chance_seed);
+    }
+    obj["provenance"] = prov;
+    obj["critic_value"] = critic_value;
+
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
+    ReleaseLock(lock_fd);
+  }
+
+  bool LoadLayer5Search(const std::string& history_hash, open_spiel::json::Object& search_result) {
+    if (!IsActive()) return false;
+    l5_stats.query++;
+    std::string shard = absl::StrFormat("%s/search_%s.json", layer5_dir, history_hash.substr(0, 16));
+    if (!std::filesystem::exists(shard)) {
+      l5_stats.miss++;
+      return false;
+    }
+    try {
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (text.find("NaN") != std::string::npos ||
+          text.find("Infinity") != std::string::npos ||
+          text.find("-Infinity") != std::string::npos) {
+        std::cerr << "[ERROR] Cache validation failed: non-finite value found in cache file " << shard << std::endl;
         g_cache_validation_failed = true;
+        l5_stats.val_fail++;
         return false;
       }
-      auto parsed3 = open_spiel::json::FromString(text3);
-      if (!parsed3) {
-        std::cerr << "[ERROR] Cache search shard parsing failed for " << shard3 << std::endl;
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        std::cerr << "[ERROR] Cache search shard parsing failed for " << shard << std::endl;
         g_cache_validation_failed = true;
+        l5_stats.val_fail++;
         return false;
       }
-      auto obj3 = parsed3.value().GetObject();
-      auto prov3 = obj3.at("provenance").GetObject();
-      if (prov3.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov3.at("checkpoint_hash").GetString() != model_hash ||
-          prov3.at("search_seed").GetInt() != seed ||
-          prov3.at("search_protocol_version").GetString() != "session-v4" ||
-          prov3.at("config_hash").GetString() != config_hash) {
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("checkpoint_hash").GetString() != model_hash ||
+          prov.at("search_seed").GetInt() != seed ||
+          prov.find("raw_policy_seed") == prov.end() ||
+          prov.at("raw_policy_seed").GetInt() != absl::GetFlag(FLAGS_raw_policy_seed) ||
+          prov.find("binary_hash") == prov.end() ||
+          prov.at("binary_hash").GetString() != binary_hash ||
+          prov.find("diagnostic_rollouts") == prov.end() ||
+          prov.at("diagnostic_rollouts").GetInt() != absl::GetFlag(FLAGS_diagnostic_rollouts) ||
+          prov.at("config_hash").GetString() != config_hash ||
+          prov.at("history_hash").GetString() != history_hash) {
+        l5_stats.val_fail++;
         return false;
       }
-      search_result = obj3.at("search_result").GetObject();
+      search_result = obj.at("search_result").GetObject();
+      l5_stats.hit++;
       return true;
     } catch (const std::exception& e) {
       std::cerr << "[ERROR] Exception loading search shard: " << e.what() << std::endl;
       g_cache_validation_failed = true;
+      l5_stats.val_fail++;
       return false;
     } catch (...) {
       std::cerr << "[ERROR] Unknown exception loading search shard" << std::endl;
       g_cache_validation_failed = true;
+      l5_stats.val_fail++;
       return false;
     }
   }
 
-  void SaveGate2SearchShard(int state_idx, const open_spiel::json::Object& search_result) {
+  void SaveLayer5Search(const std::string& history_hash, const open_spiel::json::Object& search_result) {
     if (!IsActive()) return;
+    int lock_fd = AcquireLock(history_hash);
+    std::string shard = absl::StrFormat("%s/search_%s.json", layer5_dir, history_hash.substr(0, 16));
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["checkpoint_hash"] = model_hash;
+    prov["search_seed"] = static_cast<int64_t>(seed);
+    prov["raw_policy_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_raw_policy_seed));
+    prov["binary_hash"] = binary_hash;
+    prov["diagnostic_rollouts"] = static_cast<int64_t>(absl::GetFlag(FLAGS_diagnostic_rollouts));
+    prov["config_hash"] = config_hash;
+    prov["history_hash"] = history_hash;
+    obj["provenance"] = prov;
+    obj["search_result"] = search_result;
 
-    open_spiel::json::Object obj3;
-    open_spiel::json::Object prov3;
-    prov3["corpus_fingerprint"] = corpus_hash;
-    prov3["checkpoint_hash"] = model_hash;
-    prov3["search_seed"] = seed;
-    prov3["search_protocol_version"] = "session-v4";
-    prov3["config_hash"] = config_hash;
-    prov3["search_config"] = search_config;
-    prov3["controller_config"] = controller_config;
-    obj3["provenance"] = prov3;
-    obj3["search_result"] = search_result;
-
-    std::string shard3 = absl::StrFormat("%s/state_%d.json", layer3_dir, state_idx);
-    std::string tmp3 = absl::StrFormat("%s/state_%d.json.%d.tmp", layer3_dir, state_idx, getpid());
-    std::ofstream out3(tmp3);
-    out3 << open_spiel::json::ToString(obj3, true) << "\n";
-    out3.close();
-    std::filesystem::rename(tmp3, shard3);
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
+    ReleaseLock(lock_fd);
   }
 
-  bool LoadGate2OutcomesShard(int state_idx, const std::vector<Action>& actions,
-                               std::vector<std::vector<double>>& returns,
-                               std::vector<double>& successor_critic_values) {
+  bool LoadLayer6Bootstrap(double& bootstrap_lcb, double& hierarchical_lcb, std::vector<double>& bootstrap_replicates, std::vector<double>& hierarchical_replicates) {
     if (!IsActive()) return false;
-    if (has_manifest && completed_g2_set.count(state_idx) == 0) return false;
-    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
-    std::string shard2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer2_dir, state_idx, rollouts, utility_divisor);
-    if (!std::filesystem::exists(shard1) || !std::filesystem::exists(shard2)) return false;
-
+    l6_stats.query++;
+    std::string corpus_prefix = corpus_hash.substr(0, 16);
+    std::string shard = absl::StrFormat("%s/bootstrap_summary_corp%s.json", layer6_dir, corpus_prefix);
+    if (!std::filesystem::exists(shard)) {
+      l6_stats.miss++;
+      return false;
+    }
     try {
-      // Load Layer 1 Outcomes
-      std::ifstream in1(shard1);
-      std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
-      auto parsed1 = open_spiel::json::FromString(text1);
-      if (!parsed1) return false;
-      auto obj1 = parsed1.value().GetObject();
-      auto prov1 = obj1.at("provenance").GetObject();
-      if (prov1.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov1.at("policy_fingerprint").GetString() != policy_fingerprint ||
-          prov1.at("rollout_count").GetInt() != rollouts ||
-          prov1.at("utility_divisor").GetDouble() != utility_divisor ||
-          prov1.at("binary_hash").GetString() != binary_hash ||
-          prov1.at("rollout_protocol_version").GetString() != "rollout-v2") {
+      std::ifstream in(shard);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) {
+        l6_stats.val_fail++;
         return false;
       }
-      auto outcomes1 = obj1.at("gate2_action_returns").GetObject();
-
-      // Load Layer 2 Outcomes
-      std::ifstream in2(shard2);
-      std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
-      auto parsed2 = open_spiel::json::FromString(text2);
-      if (!parsed2) return false;
-      auto obj2 = parsed2.value().GetObject();
-      auto prov2 = obj2.at("provenance").GetObject();
-      std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
-      std::string expected_arch = absl::StrFormat("nb%d_hd%d_%s",
-          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
-      if (prov2.at("corpus_fingerprint").GetString() != corpus_hash ||
-          prov2.at("full_checkpoint_hash").GetString() != model_hash ||
-          prov2.find("architecture_flags") == prov2.end() ||
-          prov2.at("architecture_flags").GetString() != expected_arch ||
-          prov2.find("rollout_count") == prov2.end() ||
-          prov2.at("rollout_count").GetInt() != rollouts ||
-          prov2.find("utility_divisor") == prov2.end() ||
-          prov2.at("utility_divisor").GetDouble() != utility_divisor) {
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov.at("search_seed").GetInt() != seed ||
+          prov.at("bootstrap_seed").GetInt() != absl::GetFlag(FLAGS_bootstrap_seed) ||
+          prov.at("replicates_count").GetInt() != 10000 ||
+          prov.find("model_checkpoint_hash") == prov.end() ||
+          prov.at("model_checkpoint_hash").GetString() != model_hash ||
+          prov.find("search_config_hash") == prov.end() ||
+          prov.at("search_config_hash").GetString() != config_hash ||
+          prov.find("rollout_count") == prov.end() ||
+          prov.at("rollout_count").GetInt() != rollouts ||
+          prov.find("utility_divisor") == prov.end() ||
+          prov.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov.find("rollout_seed_base") == prov.end() ||
+          prov.at("rollout_seed_base").GetInt() != absl::GetFlag(FLAGS_rollout_seed_base) ||
+          prov.find("chance_seed_base") == prov.end() ||
+          prov.at("chance_seed_base").GetInt() != absl::GetFlag(FLAGS_chance_seed_base) ||
+          prov.find("binary_hash") == prov.end() ||
+          prov.at("binary_hash").GetString() != binary_hash ||
+          prov.find("bootstrap_protocol_version") == prov.end() ||
+          prov.at("bootstrap_protocol_version").GetString() != "bootstrap-v2") {
+        l6_stats.val_fail++;
         return false;
       }
-      auto outcomes2 = obj2.at("gate2_successor_critic_values").GetObject();
+      bootstrap_lcb = obj.at("bootstrap_lcb").GetDouble();
+      hierarchical_lcb = obj.at("hierarchical_lcb").GetDouble();
 
-      // Verify that all actions exist in cached shards
-      std::vector<std::vector<double>> temp_returns;
-      std::vector<double> temp_critics;
-      for (Action a : actions) {
-        std::string act_str = std::to_string(a);
-        if (outcomes1.find(act_str) == outcomes1.end() ||
-            outcomes2.find(act_str) == outcomes2.end()) {
-          return false;
-        }
-        auto ret_arr = outcomes1.at(act_str).GetArray();
-        if (ret_arr.size() != static_cast<size_t>(rollouts)) return false;
-        std::vector<double> act_ret;
-        for (const auto& v : ret_arr) act_ret.push_back(v.GetDouble());
-        temp_returns.push_back(act_ret);
-        temp_critics.push_back(outcomes2.at(act_str).GetDouble());
-      }
+      auto boot_reps = obj.at("bootstrap_replicates").GetArray();
+      bootstrap_replicates.clear();
+      for (const auto& v : boot_reps) bootstrap_replicates.push_back(v.GetDouble());
 
-      returns = temp_returns;
-      successor_critic_values = temp_critics;
+      auto hier_reps = obj.at("hierarchical_replicates").GetArray();
+      hierarchical_replicates.clear();
+      for (const auto& v : hier_reps) hierarchical_replicates.push_back(v.GetDouble());
+
+      l6_stats.hit++;
       return true;
     } catch (...) {
+      l6_stats.val_fail++;
       return false;
     }
   }
 
-  void SaveGate2OutcomesShard(int state_idx, const std::vector<Action>& actions,
-                               const std::vector<std::vector<double>>& returns,
-                               const std::vector<double>& successor_critic_values) {
+  void SaveLayer6Bootstrap(double bootstrap_lcb, double hierarchical_lcb, const std::vector<double>& bootstrap_replicates, const std::vector<double>& hierarchical_replicates) {
     if (!IsActive()) return;
+    std::string corpus_prefix = corpus_hash.substr(0, 16);
+    std::string shard = absl::StrFormat("%s/bootstrap_summary_corp%s.json", layer6_dir, corpus_prefix);
+    open_spiel::json::Object obj;
+    open_spiel::json::Object prov;
+    prov["corpus_fingerprint"] = corpus_hash;
+    prov["model_checkpoint_hash"] = model_hash;
+    prov["search_config_hash"] = config_hash;
+    prov["search_seed"] = static_cast<int64_t>(seed);
+    prov["bootstrap_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_bootstrap_seed));
+    prov["replicates_count"] = static_cast<int64_t>(10000);
+    prov["rollout_count"] = static_cast<int64_t>(rollouts);
+    prov["utility_divisor"] = utility_divisor;
+    prov["rollout_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_seed_base));
+    prov["chance_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_chance_seed_base));
+    prov["binary_hash"] = binary_hash;
+    prov["bootstrap_protocol_version"] = "bootstrap-v2";
+    obj["provenance"] = prov;
+    obj["bootstrap_lcb"] = bootstrap_lcb;
+    obj["hierarchical_lcb"] = hierarchical_lcb;
 
-    // Acquire state-level lock
-    std::string lock_path = absl::StrFormat("%s/state_%d.lock", identity_dir, state_idx);
-    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
-    if (lock_fd >= 0) {
-      flock(lock_fd, LOCK_EX);
-    }
+    open_spiel::json::Array boot_reps;
+    for (double v : bootstrap_replicates) boot_reps.push_back(v);
+    obj["bootstrap_replicates"] = boot_reps;
 
-    // Load existing Layer 1 shard if it exists, to preserve other actions and gate1_returns
-    open_spiel::json::Object outcomes1;
-    open_spiel::json::Array gate1_ret;
-    bool has_gate1_ret = false;
-    bool existing_migrated = false;
-    std::string shard1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer1_dir, state_idx, rollouts, utility_divisor);
-    if (std::filesystem::exists(shard1)) {
-      try {
-        std::ifstream in1(shard1);
-        std::string text1((std::istreambuf_iterator<char>(in1)), std::istreambuf_iterator<char>());
-        auto parsed1 = open_spiel::json::FromString(text1);
-        if (parsed1) {
-          auto parsed_obj1 = parsed1.value().GetObject();
-          if (parsed_obj1.find("gate2_action_returns") != parsed_obj1.end()) {
-            outcomes1 = parsed_obj1.at("gate2_action_returns").GetObject();
-          }
-          if (parsed_obj1.find("gate1_returns") != parsed_obj1.end()) {
-            gate1_ret = parsed_obj1.at("gate1_returns").GetArray();
-            has_gate1_ret = true;
-          }
-          if (parsed_obj1.find("provenance") != parsed_obj1.end()) {
-            auto ext_prov = parsed_obj1.at("provenance").GetObject();
-            if (ext_prov.find("migrated_from_legacy") != ext_prov.end()) {
-              existing_migrated = ext_prov.at("migrated_from_legacy").GetBool();
-            }
-          }
-        }
-      } catch (...) {}
-    }
-    // Update outcomes1
-    for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-      open_spiel::json::Array arr;
-      for (double r : returns[a_idx]) arr.push_back(r);
-      outcomes1[std::to_string(actions[a_idx])] = arr;
-    }
+    open_spiel::json::Array hier_reps;
+    for (double v : hierarchical_replicates) hier_reps.push_back(v);
+    obj["hierarchical_replicates"] = hier_reps;
 
-    open_spiel::json::Object obj1;
-    open_spiel::json::Object prov1;
-    prov1["corpus_fingerprint"] = corpus_hash;
-    prov1["rollout_count"] = rollouts;
-    prov1["utility_divisor"] = utility_divisor;
-    prov1["policy_fingerprint"] = policy_fingerprint;
-    prov1["binary_hash"] = binary_hash;
-    prov1["rollout_protocol_version"] = "rollout-v2";
-    prov1["corpus_index"] = state_idx;
-    if (existing_migrated) {
-      prov1["migrated_from_legacy"] = true;
-    }
-    obj1["provenance"] = prov1;
-    obj1["gate2_action_returns"] = outcomes1;
-    if (has_gate1_ret) {
-      obj1["gate1_returns"] = gate1_ret;
-    }
-
-    std::string tmp1 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer1_dir, state_idx, rollouts, utility_divisor, getpid());
-    std::ofstream out1(tmp1);
-    out1 << open_spiel::json::ToString(obj1, true) << "\n";
-    out1.close();
-    std::filesystem::rename(tmp1, shard1);
-
-    // Load existing Layer 2 shard if it exists, to preserve other actions
-    open_spiel::json::Object outcomes2;
-    std::string shard2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json", layer2_dir, state_idx, rollouts, utility_divisor);
-    if (std::filesystem::exists(shard2)) {
-      try {
-        std::ifstream in2(shard2);
-        std::string text2((std::istreambuf_iterator<char>(in2)), std::istreambuf_iterator<char>());
-        auto parsed2 = open_spiel::json::FromString(text2);
-        if (parsed2) {
-          auto obj2 = parsed2.value().GetObject();
-          if (obj2.find("gate2_successor_critic_values") != obj2.end()) {
-            outcomes2 = obj2.at("gate2_successor_critic_values").GetObject();
-          }
-        }
-      } catch (...) {}
-    }
-    // Update outcomes2
-    for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-      outcomes2[std::to_string(actions[a_idx])] = successor_critic_values[a_idx];
-    }
-
-    open_spiel::json::Object obj2;
-    open_spiel::json::Object prov2;
-    prov2["corpus_fingerprint"] = corpus_hash;
-    prov2["full_checkpoint_hash"] = model_hash;
-    prov2["rollout_count"] = rollouts;
-    prov2["utility_divisor"] = utility_divisor;
-    std::string val_head_type = absl::GetFlag(FLAGS_nonlinear_value_head) ? "nl" : "lin";
-    prov2["architecture_flags"] = absl::StrFormat("nb%d_hd%d_%s",
-        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_hidden_dim), val_head_type);
-    obj2["provenance"] = prov2;
-    obj2["gate2_successor_critic_values"] = outcomes2;
-    std::string tmp2 = absl::StrFormat("%s/state_%d_r%d_u%.6f.json.%d.tmp", layer2_dir, state_idx, rollouts, utility_divisor, getpid());
-    std::ofstream out2(tmp2);
-    out2 << open_spiel::json::ToString(obj2, true) << "\n";
-    out2.close();
-    std::filesystem::rename(tmp2, shard2);
-
-    // Release state-level lock
-    if (lock_fd >= 0) {
-      flock(lock_fd, LOCK_UN);
-      close(lock_fd);
-    }
+    std::string tmp = shard + "." + std::to_string(getpid()) + ".tmp";
+    std::ofstream out(tmp);
+    out << open_spiel::json::ToString(obj, true) << "\n";
+    out.close();
+    std::filesystem::rename(tmp, shard);
   }
-
-
 
   void WriteManifest(const std::vector<size_t>& gate1_indices, const std::vector<size_t>& gate2_indices) {
     if (!IsActive()) return;
@@ -1418,6 +1925,11 @@ class SplitCacheManager {
     prov["seed"] = seed;
     prov["search_protocol_version"] = "session-v4";
     prov["config_hash"] = config_hash;
+    prov["rollout_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_seed_base));
+    prov["chance_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_chance_seed_base));
+    prov["bootstrap_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_bootstrap_seed));
+    prov["diagnostic_rollouts"] = static_cast<int64_t>(absl::GetFlag(FLAGS_diagnostic_rollouts));
+    prov["raw_policy_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_raw_policy_seed));
     obj["provenance"] = prov;
 
     open_spiel::json::Array g1_arr;
@@ -1427,6 +1939,27 @@ class SplitCacheManager {
     open_spiel::json::Array g2_arr;
     for (size_t idx : gate2_indices) g2_arr.push_back(static_cast<int64_t>(idx));
     obj["gate2_completed_indices"] = g2_arr;
+
+    // Collect all JSON shards on disk for all active layers and compute their SHA256 hashes
+    open_spiel::json::Object layers_obj;
+    std::vector<std::string> dirs = {layer1_dir, layer2_dir, layer3_dir, layer4_dir, layer5_dir, layer6_dir};
+    for (size_t d_idx = 0; d_idx < dirs.size(); ++d_idx) {
+      open_spiel::json::Object shard_list;
+      if (std::filesystem::exists(dirs[d_idx])) {
+        for (const auto& entry : std::filesystem::directory_iterator(dirs[d_idx])) {
+          if (entry.is_regular_file()) {
+            std::string name = entry.path().filename().string();
+            if (name.size() >= 5 && name.compare(name.size() - 5, 5, ".json") == 0) {
+              std::string path_str = entry.path().string();
+              std::string sha = open_spiel::ComputeFileSHA256(path_str);
+              shard_list[name] = sha;
+            }
+          }
+        }
+      }
+      layers_obj[absl::StrFormat("layer%d", d_idx + 1)] = shard_list;
+    }
+    obj["layers_inventory"] = layers_obj;
 
     std::string manifest_path = absl::StrFormat("%s/manifest.json", identity_dir);
     std::string tmp_manifest = absl::StrFormat("%s/manifest.json.%d.tmp", identity_dir, getpid());
@@ -1455,17 +1988,267 @@ class SplitCacheManager {
           prov.at("utility_divisor").GetDouble() != utility_divisor ||
           prov.at("seed").GetInt() != seed ||
           prov.at("search_protocol_version").GetString() != "session-v4" ||
-          prov.at("config_hash").GetString() != config_hash) {
+          prov.at("config_hash").GetString() != config_hash ||
+          prov.find("rollout_seed_base") == prov.end() ||
+          prov.at("rollout_seed_base").GetInt() != absl::GetFlag(FLAGS_rollout_seed_base) ||
+          prov.find("chance_seed_base") == prov.end() ||
+          prov.at("chance_seed_base").GetInt() != absl::GetFlag(FLAGS_chance_seed_base) ||
+          prov.find("bootstrap_seed") == prov.end() ||
+          prov.at("bootstrap_seed").GetInt() != absl::GetFlag(FLAGS_bootstrap_seed) ||
+          prov.find("diagnostic_rollouts") == prov.end() ||
+          prov.at("diagnostic_rollouts").GetInt() != absl::GetFlag(FLAGS_diagnostic_rollouts) ||
+          prov.find("raw_policy_seed") == prov.end() ||
+          prov.at("raw_policy_seed").GetInt() != absl::GetFlag(FLAGS_raw_policy_seed)) {
         return false;
       }
       auto g1_arr = obj.at("gate1_completed_indices").GetArray();
       for (const auto& v : g1_arr) gate1_completed.push_back(v.GetInt());
       auto g2_arr = obj.at("gate2_completed_indices").GetArray();
       for (const auto& v : g2_arr) gate2_completed.push_back(v.GetInt());
+
       return true;
     } catch (...) {
       return false;
     }
+  }
+
+  bool VerifyManifest(const std::vector<CorpusState>& corpus,
+                      const std::vector<size_t>& gate1_indices,
+                      const std::vector<size_t>& gate2_indices) {
+    if (!IsActive()) return false;
+    std::string manifest_path = absl::StrFormat("%s/manifest.json", identity_dir);
+    if (!std::filesystem::exists(manifest_path)) return false;
+
+    try {
+      std::ifstream in(manifest_path);
+      std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(text);
+      if (!parsed) return false;
+      auto obj = parsed.value().GetObject();
+      auto prov = obj.at("provenance").GetObject();
+      if (prov.at("corpus_fingerprint").GetString() != corpus_hash ||
+          prov.at("full_checkpoint_hash").GetString() != model_hash ||
+          prov.at("policy_fingerprint").GetString() != policy_fingerprint ||
+          prov.at("rollout_count").GetInt() != rollouts ||
+          prov.at("utility_divisor").GetDouble() != utility_divisor ||
+          prov.at("seed").GetInt() != seed ||
+          prov.at("search_protocol_version").GetString() != "session-v4" ||
+          prov.at("config_hash").GetString() != config_hash) {
+        return false;
+      }
+
+      // Check additional inputs:
+      if (prov.find("rollout_seed_base") == prov.end() || prov.at("rollout_seed_base").GetInt() != absl::GetFlag(FLAGS_rollout_seed_base) ||
+          prov.find("chance_seed_base") == prov.end() || prov.at("chance_seed_base").GetInt() != absl::GetFlag(FLAGS_chance_seed_base) ||
+          prov.find("bootstrap_seed") == prov.end() || prov.at("bootstrap_seed").GetInt() != absl::GetFlag(FLAGS_bootstrap_seed) ||
+          prov.find("diagnostic_rollouts") == prov.end() || prov.at("diagnostic_rollouts").GetInt() != absl::GetFlag(FLAGS_diagnostic_rollouts) ||
+          prov.find("raw_policy_seed") == prov.end() || prov.at("raw_policy_seed").GetInt() != absl::GetFlag(FLAGS_raw_policy_seed)) {
+        return false;
+      }
+
+      // Load and verify indices:
+      auto g1_arr = obj.at("gate1_completed_indices").GetArray();
+      if (g1_arr.size() != gate1_indices.size()) return false;
+      for (size_t i = 0; i < gate1_indices.size(); ++i) {
+        if (g1_arr[i].GetInt() != static_cast<int64_t>(gate1_indices[i])) return false;
+      }
+
+      auto g2_arr = obj.at("gate2_completed_indices").GetArray();
+      if (g2_arr.size() != gate2_indices.size()) return false;
+      for (size_t i = 0; i < gate2_indices.size(); ++i) {
+        if (g2_arr[i].GetInt() != static_cast<int64_t>(gate2_indices[i])) return false;
+      }
+
+      // Verify layers inventory (shard existence, hashes, and completeness):
+      if (obj.find("layers_inventory") == obj.end()) return false;
+      auto layers_inv = obj.at("layers_inventory").GetObject();
+
+      std::set<std::string> expected_shards[6];
+      bool gate1_only = absl::GetFlag(FLAGS_gate1_only);
+      bool has_choice_caches = !gate1_only && absl::GetFlag(FLAGS_choice_only_gate2);
+
+      // Layer 1 (Replay shards)
+      for (size_t idx : gate1_indices) {
+        std::string h_hash = corpus[idx].history_hash;
+        if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+        expected_shards[0].insert(absl::StrFormat("replay_%s.json", h_hash.substr(0, 16)));
+      }
+      if (!gate1_only) {
+        for (size_t idx : gate2_indices) {
+          std::string h_hash = corpus[idx].history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+          expected_shards[0].insert(absl::StrFormat("replay_%s.json", h_hash.substr(0, 16)));
+        }
+      }
+
+      // Layer 2 (Policy prior shards)
+      if (has_choice_caches) {
+        for (size_t idx : gate2_indices) {
+          std::string h_hash = corpus[idx].history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+          expected_shards[1].insert(absl::StrFormat("policy_%s.json", h_hash.substr(0, 16)));
+        }
+      }
+
+      // Layer 3 (Rollout shards)
+      for (size_t idx : gate1_indices) {
+        std::string h_hash = corpus[idx].history_hash;
+        if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+        expected_shards[2].insert(absl::StrFormat("rollout_%s_unforced.json", h_hash.substr(0, 16)));
+      }
+      if (has_choice_caches) {
+        for (size_t idx : gate2_indices) {
+          std::string h_hash = corpus[idx].history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+          for (Action a : corpus[idx].legal_actions) {
+            expected_shards[2].insert(absl::StrFormat("rollout_%s_%d.json", h_hash.substr(0, 16), a));
+          }
+        }
+      }
+
+      // Layer 4 (Critic shards)
+      for (size_t idx : gate1_indices) {
+        std::string h_hash = corpus[idx].history_hash;
+        if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+        expected_shards[3].insert(absl::StrFormat("critic_%s.json", h_hash.substr(0, 16)));
+      }
+      if (has_choice_caches) {
+        for (size_t idx : gate2_indices) {
+          for (Action a : corpus[idx].legal_actions) {
+            std::vector<Action> succ_history = corpus[idx].history;
+            succ_history.push_back(a);
+            std::string succ_h_hash = GetHistoryHash(succ_history);
+            expected_shards[3].insert(absl::StrFormat("critic_%s.json", succ_h_hash.substr(0, 16)));
+          }
+
+          std::string h_hash = corpus[idx].history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+          std::string layer5_file_path = absl::StrFormat("%s/search_%s.json", layer5_dir, h_hash.substr(0, 16));
+          if (std::filesystem::exists(layer5_file_path)) {
+            try {
+              std::ifstream in(layer5_file_path);
+              std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+              if (text.find("NaN") != std::string::npos ||
+                  text.find("Infinity") != std::string::npos ||
+                  text.find("-Infinity") != std::string::npos) {
+                std::cerr << "[ERROR] Cache validation failed: non-finite value found in cache file " << layer5_file_path << std::endl;
+                g_cache_validation_failed = true;
+                return false;
+              }
+              auto parsed = open_spiel::json::FromString(text);
+              if (parsed) {
+                auto obj = parsed.value().GetObject();
+                if (obj.find("search_result") != obj.end()) {
+                  auto search_res_obj = obj.at("search_result").GetObject();
+                  if (search_res_obj.find("opportunity_state_evidence") != search_res_obj.end()) {
+                    auto ev_obj = search_res_obj.at("opportunity_state_evidence").GetObject();
+                    if (ev_obj.find("leaf_hashes") != ev_obj.end()) {
+                      for (const auto& v : ev_obj.at("leaf_hashes").GetArray()) {
+                        std::string leaf_hash = v.GetString();
+                        expected_shards[3].insert(absl::StrFormat("critic_%s.json", leaf_hash.substr(0, 16)));
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (...) {
+              // Ignore exceptions
+            }
+          }
+        }
+      }
+
+      // Layer 5 (Search shards)
+      if (has_choice_caches) {
+        for (size_t idx : gate2_indices) {
+          std::string h_hash = corpus[idx].history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(corpus[idx].history);
+          expected_shards[4].insert(absl::StrFormat("search_%s.json", h_hash.substr(0, 16)));
+        }
+      }
+
+      // Layer 6 (Bootstrap shard)
+      if (!gate1_only) {
+        std::string corpus_prefix = corpus_hash.substr(0, 16);
+        expected_shards[5].insert(absl::StrFormat("bootstrap_summary_corp%s.json", corpus_prefix));
+      }
+
+      std::vector<std::string> dirs = {layer1_dir, layer2_dir, layer3_dir, layer4_dir, layer5_dir, layer6_dir};
+      for (size_t d_idx = 0; d_idx < dirs.size(); ++d_idx) {
+        std::string l_key = absl::StrFormat("layer%d", d_idx + 1);
+        if (layers_inv.find(l_key) == layers_inv.end()) return false;
+        auto shard_list = layers_inv.at(l_key).GetObject();
+
+        // 1. Verify shard list size matches expected shards size (allowing additional shards in Layer 4)
+        if (d_idx == 3) {
+          if (shard_list.size() < expected_shards[d_idx].size()) {
+            std::cerr << "[Manifest Verification] Shard count mismatch for " << l_key
+                      << ": expected at least " << expected_shards[d_idx].size()
+                      << ", got " << shard_list.size() << std::endl;
+            return false;
+          }
+        } else {
+          if (shard_list.size() != expected_shards[d_idx].size()) {
+            std::cerr << "[Manifest Verification] Shard count mismatch for " << l_key
+                      << ": expected " << expected_shards[d_idx].size()
+                      << ", got " << shard_list.size() << std::endl;
+            return false;
+          }
+        }
+
+        // 2. Verify each expected shard is in the inventory
+        for (const auto& expected_name : expected_shards[d_idx]) {
+          if (shard_list.find(expected_name) == shard_list.end()) {
+            std::cerr << "[Manifest Verification] Expected shard " << expected_name
+                      << " not found in manifest " << l_key << " inventory." << std::endl;
+            return false;
+          }
+        }
+
+        // 3. Verify each shard in the inventory exists on disk and hash matches
+        for (const auto& pair : shard_list) {
+          std::string name = pair.first;
+          std::string expected_hash = pair.second.GetString();
+          std::string shard_path = absl::StrFormat("%s/%s", dirs[d_idx], name);
+          if (!std::filesystem::exists(shard_path)) {
+            std::cerr << "[Manifest Verification] Shard " << shard_path << " is missing on disk." << std::endl;
+            return false;
+          }
+          std::string actual_hash = open_spiel::ComputeFileSHA256(shard_path);
+          if (actual_hash != expected_hash) {
+            std::cerr << "[Manifest Verification] Shard " << shard_path << " hash mismatch." << std::endl;
+            return false;
+          }
+        }
+      }
+
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void PrintStats() const {
+    if (!IsActive()) return;
+    auto pct = [](const CacheLayerStats& s) -> double {
+      return s.query > 0 ? (100.0 * s.hit / s.query) : 0.0;
+    };
+    std::cout << "\n============================================\n"
+              << "           CACHE LAYERS STATISTICS          \n"
+              << "============================================\n";
+    std::cout << absl::StrFormat("Layer 1 (State Replay):  H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l1_stats.hit.load(), l1_stats.val_fail.load(), l1_stats.miss.load(), l1_stats.query.load(), pct(l1_stats));
+    std::cout << absl::StrFormat("Layer 2 (Raw Policy) :   H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l2_stats.hit.load(), l2_stats.val_fail.load(), l2_stats.miss.load(), l2_stats.query.load(), pct(l2_stats));
+    std::cout << absl::StrFormat("Layer 3 (Rollouts)   :   H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l3_stats.hit.load(), l3_stats.val_fail.load(), l3_stats.miss.load(), l3_stats.query.load(), pct(l3_stats));
+    std::cout << absl::StrFormat("Layer 4 (Critic NN)  :   H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l4_stats.hit.load(), l4_stats.val_fail.load(), l4_stats.miss.load(), l4_stats.query.load(), pct(l4_stats));
+    std::cout << absl::StrFormat("Layer 5 (MCTS Search):   H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l5_stats.hit.load(), l5_stats.val_fail.load(), l5_stats.miss.load(), l5_stats.query.load(), pct(l5_stats));
+    std::cout << absl::StrFormat("Layer 6 (Bootstrap)  :   H:%d/V:%d/M:%d/Q:%d  (Hit Rate: %.1f%%)\n",
+        l6_stats.hit.load(), l6_stats.val_fail.load(), l6_stats.miss.load(), l6_stats.query.load(), pct(l6_stats));
+    std::cout << "============================================\n" << std::endl;
   }
 };
 
@@ -1545,13 +2328,7 @@ int main(int argc, char** argv) {
                                 self_test ? 2 : absl::GetFlag(FLAGS_rollouts),
                                 utility_divisor, self_test, policy_fp);
 
-  if (split_cache.IsActive()) {
-    std::vector<int64_t> m_g1;
-    std::vector<int64_t> m_g2;
-    if (split_cache.LoadManifest(m_g1, m_g2)) {
-      std::cout << "[Manifest] Verified complete cache manifest on startup.\n" << std::flush;
-    }
-  }
+
 
   std::ifstream f(corpus_path);
   if (!f) {
@@ -1719,6 +2496,13 @@ int main(int argc, char** argv) {
   std::vector<size_t> gate1_indices(strategic_indices.begin(), strategic_indices.begin() + std::min<size_t>(target_g1, strategic_indices.size()));
   std::vector<size_t> gate2_indices(opportunity_indices.begin(), opportunity_indices.begin() + std::min<size_t>(target_g2, opportunity_indices.size()));
 
+  if (split_cache.IsActive()) {
+    if (split_cache.VerifyManifest(corpus, gate1_indices, gate2_indices)) {
+      std::cout << "[Manifest] Verified complete cache manifest on startup.\n" << std::flush;
+      g_manifest_verified = true;
+    }
+  }
+
   std::vector<double> v_critic_g1(gate1_indices.size(), 0.0);
   std::vector<double> v_true_g1(gate1_indices.size(), 0.0);
 
@@ -1741,17 +2525,38 @@ int main(int argc, char** argv) {
                      obj.at("corpus_fingerprint").GetString() == corpus_hash &&
                      obj.at("seed").GetInt() == seed &&
                      obj.at("rollouts").GetInt() == absl::GetFlag(FLAGS_rollouts) &&
+                     obj.find("rollout_seed_base") != obj.end() &&
+                     obj.at("rollout_seed_base").GetInt() == absl::GetFlag(FLAGS_rollout_seed_base) &&
+                     obj.find("chance_seed_base") != obj.end() &&
+                     obj.at("chance_seed_base").GetInt() == absl::GetFlag(FLAGS_chance_seed_base) &&
+                     obj.find("utility_divisor") != obj.end() &&
+                     obj.at("utility_divisor").GetDouble() == utility_divisor &&
                      obj.find("binary_hash") != obj.end() &&
                      obj.at("binary_hash").GetString() == open_spiel::ComputeFileSHA256("/proc/self/exe") &&
                      critic_arr.size() == gate1_indices.size() &&
                      true_arr.size() == gate1_indices.size();
         if (valid) {
+          bool has_returns = obj.find("gate1_returns") != obj.end();
           for (size_t i = 0; i < gate1_indices.size(); ++i) {
             v_critic_g1[i] = critic_arr[i].GetDouble();
             v_true_g1[i] = true_arr[i].GetDouble();
+            if (has_returns && split_cache.IsActive()) {
+              std::vector<double> ret;
+              for (const auto& val : obj.at("gate1_returns").GetArray()[i].GetArray()) {
+                ret.push_back(val.GetDouble());
+              }
+              const auto& cs = corpus[gate1_indices[i]];
+              std::string h_hash = cs.history_hash;
+              if (h_hash.empty()) h_hash = GetHistoryHash(cs.history);
+              split_cache.SaveLayer3Rollout(h_hash, "unforced", ret);
+              split_cache.SaveLayer4Critic(h_hash, v_critic_g1[i]);
+            }
           }
           gate1_cache_loaded = true;
           std::cout << "Loaded validated Gate 1 cache: " << gate1_cache_path << "\n";
+          if (has_returns && split_cache.IsActive()) {
+            std::cout << "Migrated legacy Gate 1 cache to Layer 3 and Layer 4\n";
+          }
         }
       }
     } catch (const std::exception& e) {
@@ -1779,12 +2584,30 @@ int main(int argc, char** argv) {
   if (split_cache.IsActive()) {
     for (size_t i = 0; i < gate1_indices.size(); ++i) {
       size_t absolute_idx = gate1_indices[i];
-      if (split_cache.LoadGate1ReturnsOnly(absolute_idx, gate1_returns[i])) {
+      const auto& cs = corpus[absolute_idx];
+      std::string h_hash = cs.history_hash;
+      if (h_hash.empty()) {
+        h_hash = GetHistoryHash(cs.history);
+      }
+
+      int cached_player = 0;
+      std::vector<Action> cached_legal;
+      std::vector<float> cached_obs;
+      bool l1_cached = split_cache.LoadLayer1Replay(h_hash, cached_player, cached_legal, cached_obs);
+      if (l1_cached) {
+        if (cached_player != cs.player || cached_legal != cs.legal_actions || cached_obs != cs.observation) {
+          std::cerr << "[ERROR] Cache validation failed: Layer 1 replay mismatch." << std::endl;
+          g_cache_validation_failed = true;
+          return 1;
+        }
+      }
+
+      if (split_cache.LoadLayer3Rollout(h_hash, "unforced", gate1_returns[i])) {
         v_true_g1[i] = std::accumulate(gate1_returns[i].begin(), gate1_returns[i].end(), 0.0) / gate1_returns[i].size();
         gate1_returns_cached[i] = true;
       }
       double critic_val = 0.0;
-      if (split_cache.LoadGate1CriticOnly(absolute_idx, critic_val)) {
+      if (split_cache.LoadLayer4Critic(h_hash, critic_val)) {
         v_critic_g1[i] = critic_val;
         gate1_critic_cached[i] = true;
       }
@@ -1798,8 +2621,13 @@ int main(int argc, char** argv) {
         gate1_states.push_back(nullptr);
       } else {
         const auto& cs = corpus[gate1_indices[i]];
-        gate1_states.push_back(
-            ReconstructState(game, cs.history, cs.player, cs.observation));
+        auto state_ptr = ReconstructState(game, cs.history, cs.player, cs.observation, cs.legal_actions);
+        if (split_cache.IsActive()) {
+          std::string h_hash = cs.history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(cs.history);
+          split_cache.SaveLayer1Replay(h_hash, cs.player, cs.legal_actions, cs.observation);
+        }
+        gate1_states.push_back(std::move(state_ptr));
       }
     }
   }
@@ -1865,6 +2693,12 @@ int main(int argc, char** argv) {
                      obj.at("model_checkpoint_hash").GetString() == model_hash &&
                      obj.at("corpus_fingerprint").GetString() == corpus_hash &&
                      obj.at("rollouts").GetInt() == absl::GetFlag(FLAGS_rollouts) &&
+                     obj.find("rollout_seed_base") != obj.end() &&
+                     obj.at("rollout_seed_base").GetInt() == absl::GetFlag(FLAGS_rollout_seed_base) &&
+                     obj.find("chance_seed_base") != obj.end() &&
+                     obj.at("chance_seed_base").GetInt() == absl::GetFlag(FLAGS_chance_seed_base) &&
+                     obj.find("utility_divisor") != obj.end() &&
+                     obj.at("utility_divisor").GetDouble() == utility_divisor &&
                      obj.find("binary_hash") != obj.end() &&
                      obj.at("binary_hash").GetString() == open_spiel::ComputeFileSHA256("/proc/self/exe") &&
                      obj.find("config") != obj.end() &&
@@ -1916,6 +2750,27 @@ int main(int argc, char** argv) {
           choice_outcome_cache_loaded = true;
           std::cout << "Loaded validated choice rollout cache: "
                     << choice_cache_path << "\n";
+          if (split_cache.IsActive()) {
+            for (size_t idx = 0; idx < states_arr.size(); ++idx) {
+              const auto& entry = choice_outcome_cache[idx];
+              size_t corpus_idx = entry.corpus_index;
+              const auto& cs = corpus[corpus_idx];
+              std::string parent_h_hash = cs.history_hash;
+              if (parent_h_hash.empty()) {
+                parent_h_hash = GetHistoryHash(cs.history);
+              }
+              for (size_t a_idx = 0; a_idx < entry.actions.size(); ++a_idx) {
+                Action action = entry.actions[a_idx];
+                split_cache.SaveLayer3Rollout(parent_h_hash, std::to_string(action), entry.returns[a_idx]);
+
+                std::vector<Action> succ_history = cs.history;
+                succ_history.push_back(action);
+                std::string succ_h_hash = GetHistoryHash(succ_history);
+                split_cache.SaveLayer4Critic(succ_h_hash, entry.successor_critic_values[a_idx], absl::GetFlag(FLAGS_rollouts), absl::GetFlag(FLAGS_chance_seed_base));
+              }
+            }
+            std::cout << "Migrated choice rollout cache to Layer 3 and Layer 4\n";
+          }
         }
       }
     } catch (const std::exception& e) {
@@ -1934,6 +2789,26 @@ int main(int argc, char** argv) {
 
       size_t corpus_idx = gate2_indices[idx];
       const auto& cs = corpus[corpus_idx];
+
+      std::string h_hash = cs.history_hash;
+      if (h_hash.empty()) h_hash = GetHistoryHash(cs.history);
+
+      if (split_cache.IsActive()) {
+        int cached_player = 0;
+        std::vector<Action> cached_legal;
+        std::vector<float> cached_obs;
+        bool l1_cached = split_cache.LoadLayer1Replay(h_hash, cached_player, cached_legal, cached_obs);
+        if (l1_cached) {
+          if (cached_player != cs.player || cached_legal != cs.legal_actions || cached_obs != cs.observation) {
+            std::cerr << "[ERROR] Cache validation failed: Layer 1 replay mismatch." << std::endl;
+            g_cache_validation_failed = true;
+            return;
+          }
+        } else {
+          split_cache.SaveLayer1Replay(h_hash, cs.player, cs.legal_actions, cs.observation);
+        }
+      }
+
       std::unique_ptr<State> state;
       {
         auto temp_state = ReconstructState(game, cs.history, cs.player, cs.observation);
@@ -2003,118 +2878,271 @@ int main(int argc, char** argv) {
         DuneSearchResult root_res;
 
         if (split_cache.IsActive()) {
-          has_search_cached = split_cache.LoadGate2SearchShard(corpus_idx, search_cached_res);
+          has_search_cached = split_cache.LoadLayer5Search(h_hash, search_cached_res);
         }
 
+        bool all_l3_l4_exist = true;
         if (has_search_cached) {
-          search_action = static_cast<Action>(search_cached_res.at("selected_action").GetInt());
-          raw_action = static_cast<Action>(search_cached_res.at("raw_reference_action").GetInt());
-          auto act_arr = search_cached_res.at("actions").GetArray();
-          for (const auto& val : act_arr) {
-            root_actions.push_back(static_cast<Action>(val.GetInt()));
+          if (search_cached_res.find("opportunity_state_evidence") != search_cached_res.end()) {
+            DeserializeEvidence(search_cached_res.at("opportunity_state_evidence").GetObject(), ev);
+            if (search_cached_res.find("selected_action") != search_cached_res.end()) {
+              ev.selected_action = search_cached_res.at("selected_action").GetInt();
+            }
+            if (search_cached_res.find("raw_reference_action") != search_cached_res.end()) {
+              ev.raw_reference_action = search_cached_res.at("raw_reference_action").GetInt();
+            }
+            if (search_cached_res.find("actions") != search_cached_res.end()) {
+              ev.root_action_ids.clear();
+              for (const auto& val : search_cached_res.at("actions").GetArray()) {
+                ev.root_action_ids.push_back(val.GetInt());
+              }
+            }
+            if (search_cached_res.find("priors") != search_cached_res.end()) {
+              ev.raw_priors.clear();
+              for (const auto& val : search_cached_res.at("priors").GetArray()) {
+                ev.raw_priors.push_back(val.GetDouble());
+              }
+            }
+            if (search_cached_res.find("visit_counts") != search_cached_res.end()) {
+              ev.search_visits.clear();
+              for (const auto& val : search_cached_res.at("visit_counts").GetArray()) {
+                ev.search_visits.push_back(val.GetInt());
+              }
+            }
+            if (search_cached_res.find("q_values") != search_cached_res.end()) {
+              ev.root_q_values.clear();
+              for (const auto& val : search_cached_res.at("q_values").GetArray()) {
+                ev.root_q_values.push_back(val.GetDouble());
+              }
+            }
+          } else {
+            ev.selected_action = search_cached_res.at("selected_action").GetInt();
+            ev.raw_reference_action = search_cached_res.at("raw_reference_action").GetInt();
+            ev.root_action_ids.clear();
+            for (const auto& val : search_cached_res.at("actions").GetArray()) {
+              ev.root_action_ids.push_back(val.GetInt());
+            }
+            if (search_cached_res.find("priors") != search_cached_res.end()) {
+              ev.raw_priors.clear();
+              for (const auto& val : search_cached_res.at("priors").GetArray()) {
+                ev.raw_priors.push_back(val.GetDouble());
+              }
+            }
+            if (search_cached_res.find("visit_counts") != search_cached_res.end()) {
+              ev.search_visits.clear();
+              for (const auto& val : search_cached_res.at("visit_counts").GetArray()) {
+                ev.search_visits.push_back(val.GetInt());
+              }
+            }
+            if (search_cached_res.find("q_values") != search_cached_res.end()) {
+              ev.root_q_values.clear();
+              for (const auto& val : search_cached_res.at("q_values").GetArray()) {
+                ev.root_q_values.push_back(val.GetDouble());
+              }
+            }
           }
 
-          root_res.diagnostics.actions = root_actions;
-          root_res.diagnostics.selected_action = search_action;
-          root_res.diagnostics.raw_reference_action = raw_action;
+          // Validate MCTS search diagnostics priors & actions
+          {
+            std::vector<Action> sorted_validate_actions(ev.root_action_ids.begin(), ev.root_action_ids.end());
+            std::vector<Action> sorted_state_legal_copy = cs.legal_actions;
+            std::sort(sorted_validate_actions.begin(), sorted_validate_actions.end());
+            std::sort(sorted_state_legal_copy.begin(), sorted_state_legal_copy.end());
 
-          root_res.diagnostics.session_id = search_cached_res.at("session_id").GetString();
-          root_res.simulations_completed = search_cached_res.at("simulations_completed").GetInt();
-          root_res.inference_count = search_cached_res.at("inference_count").GetInt();
-          root_res.diagnostics.mean_depth = search_cached_res.at("mean_depth").GetDouble();
-          root_res.diagnostics.terminal_leaf_fraction = search_cached_res.at("terminal_leaf_fraction").GetDouble();
-          root_res.used_fallback = search_cached_res.at("used_fallback").GetBool();
-          root_res.fallback_reason = search_cached_res.at("fallback_reason").GetString();
-          root_res.diagnostics.confidence_fallback = search_cached_res.at("confidence_fallback").GetBool();
-          root_res.diagnostics.mcts_overrode_raw = search_cached_res.at("mcts_overrode_raw").GetBool();
-          root_res.diagnostics.mcts_proposed_action = static_cast<Action>(search_cached_res.at("mcts_proposed_action").GetInt());
-          root_res.diagnostics.stability_checkpoint_reached = search_cached_res.at("stability_checkpoint_reached").GetBool();
-          root_res.diagnostics.stability_agreement = search_cached_res.at("stability_agreement").GetBool();
-          root_res.diagnostics.pass_complete_search = search_cached_res.at("pass_complete_search").GetBool();
-          root_res.diagnostics.pass_min_actions = search_cached_res.at("pass_min_actions").GetBool();
-          root_res.diagnostics.pass_prior_mass = search_cached_res.at("pass_prior_mass").GetBool();
-          root_res.diagnostics.pass_meaningful_visits = search_cached_res.at("pass_meaningful_visits").GetBool();
-          root_res.diagnostics.pass_q_margin = search_cached_res.at("pass_q_margin").GetBool();
-          root_res.diagnostics.pass_stability = search_cached_res.at("pass_stability").GetBool();
-          root_res.diagnostics.chosen_action_raw_prior_rank = search_cached_res.at("chosen_action_raw_prior_rank").GetInt();
+            if (sorted_validate_actions != sorted_state_legal_copy) {
+              std::cerr << "[ERROR] Prior validation failed: root actions do not match state legal actions." << std::endl;
+              g_cache_validation_failed = true;
+              return;
+            }
 
-          auto pr_arr = search_cached_res.at("priors").GetArray();
-          for (const auto& val : pr_arr) root_res.diagnostics.priors.push_back(val.GetDouble());
+            if (ev.raw_priors.size() != ev.root_action_ids.size()) {
+              std::cerr << "[ERROR] Prior validation failed: MCTS priors size mismatch. priors="
+                        << ev.raw_priors.size() << ", actions=" << ev.root_action_ids.size() << std::endl;
+              g_cache_validation_failed = true;
+              return;
+            }
 
-          auto vis_arr = search_cached_res.at("visit_counts").GetArray();
-          for (const auto& val : vis_arr) root_res.diagnostics.visit_counts.push_back(static_cast<int>(val.GetInt()));
+            double prior_sum = 0.0;
+            for (double p : ev.raw_priors) {
+              if (!std::isfinite(p) || p < 0.0) {
+                std::cerr << "[ERROR] Prior validation failed: invalid MCTS probability value " << p << std::endl;
+                g_cache_validation_failed = true;
+                return;
+              }
+              prior_sum += p;
+            }
 
-          auto q_arr = search_cached_res.at("q_values").GetArray();
-          for (const auto& val : q_arr) root_res.diagnostics.q_values.push_back(val.GetDouble());
-
-        } else {
-          // Root selection is deterministic for a state/configuration/seed. The
-          // legacy harness rebuilt the same tree for every one of the 256 outcome
-          // rollouts. Search once, then compare the raw and searched root actions
-          // under common stochastic continuations.
-          DuneSearchBudgetMode mode =
-              (bot_cfg.relative_time_budget_ms == std::numeric_limits<double>::infinity())
-                  ? DuneSearchBudgetMode::kFixedSessionSimulations
-                  : DuneSearchBudgetMode::kLiveDeadline;
-          DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
-          root_res = root_session.Search(*state);
-          std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
-          double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-          ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
-          root_res = root_session.CommitAction(decision);
-
-          search_action = root_res.diagnostics.selected_action;
-          if (search_action == kInvalidAction) {
-            search_action = GetBestActionFromSearchResult(root_res);
+            if (std::abs(prior_sum - 1.0) > 1e-5) {
+              std::cerr << "[ERROR] Prior validation failed: MCTS probability mass does not sum to 1. sum=" << prior_sum << std::endl;
+              g_cache_validation_failed = true;
+              return;
+            }
           }
 
-          raw_action = decision.raw_reference_action;
-          SPIEL_CHECK_NE(raw_action, kInvalidAction);
-          SPIEL_CHECK_NE(search_action, kInvalidAction);
-
-          root_actions = root_res.diagnostics.actions;
-          if (root_actions.empty()) root_actions = state->LegalActions();
-
+          // Check if all Layer 3 and Layer 4 shards exist on disk
           if (split_cache.IsActive()) {
-            open_spiel::json::Object save_obj;
-            save_obj["selected_action"] = static_cast<int64_t>(search_action);
-            save_obj["raw_reference_action"] = static_cast<int64_t>(raw_action);
-            open_spiel::json::Array save_act;
-            for (Action a : root_actions) save_act.push_back(static_cast<int64_t>(a));
-            save_obj["actions"] = save_act;
-            save_obj["session_id"] = root_res.diagnostics.session_id;
-            save_obj["simulations_completed"] = static_cast<int64_t>(root_res.simulations_completed);
-            save_obj["inference_count"] = static_cast<int64_t>(root_res.inference_count);
-            save_obj["mean_depth"] = root_res.diagnostics.mean_depth;
-            save_obj["terminal_leaf_fraction"] = root_res.diagnostics.terminal_leaf_fraction;
-            save_obj["used_fallback"] = root_res.used_fallback;
-            save_obj["fallback_reason"] = root_res.fallback_reason;
-            save_obj["confidence_fallback"] = root_res.diagnostics.confidence_fallback;
-            save_obj["mcts_overrode_raw"] = root_res.diagnostics.mcts_overrode_raw;
-            save_obj["mcts_proposed_action"] = static_cast<int64_t>(root_res.diagnostics.mcts_proposed_action);
-            save_obj["stability_checkpoint_reached"] = root_res.diagnostics.stability_checkpoint_reached;
-            save_obj["stability_agreement"] = root_res.diagnostics.stability_agreement;
-            save_obj["pass_complete_search"] = root_res.diagnostics.pass_complete_search;
-            save_obj["pass_min_actions"] = root_res.diagnostics.pass_min_actions;
-            save_obj["pass_prior_mass"] = root_res.diagnostics.pass_prior_mass;
-            save_obj["pass_meaningful_visits"] = root_res.diagnostics.pass_meaningful_visits;
-            save_obj["pass_q_margin"] = root_res.diagnostics.pass_q_margin;
-            save_obj["pass_stability"] = root_res.diagnostics.pass_stability;
-            save_obj["chosen_action_raw_prior_rank"] = static_cast<int64_t>(root_res.diagnostics.chosen_action_raw_prior_rank);
+            for (int a : ev.root_action_ids) {
+              std::vector<double> dummy_ret;
+              double dummy_critic = 0.0;
+              std::vector<Action> succ_history = cs.history;
+              succ_history.push_back(a);
+              std::string succ_h_hash = GetHistoryHash(succ_history);
 
-            open_spiel::json::Array save_pr;
-            for (double p : root_res.diagnostics.priors) save_pr.push_back(p);
-            save_obj["priors"] = save_pr;
+              bool l3_ok = split_cache.LoadLayer3Rollout(h_hash, std::to_string(a), dummy_ret);
+              bool l4_ok = split_cache.LoadLayer4Critic(succ_h_hash, dummy_critic, rollouts, chance_seed_base);
+              if (!l3_ok || !l4_ok) {
+                all_l3_l4_exist = false;
+                break;
+              }
+            }
+            if (all_l3_l4_exist) {
+              for (const auto& leaf_hash : ev.leaf_hashes) {
+                std::string leaf_critic_path = absl::StrFormat("%s/critic_%s.json", split_cache.GetLayer4Dir(), leaf_hash.substr(0, 16));
+                if (!std::filesystem::exists(leaf_critic_path)) {
+                  all_l3_l4_exist = false;
+                  break;
+                }
+              }
+            }
+          }
+        }
 
-            open_spiel::json::Array save_vis;
-            for (int v : root_res.diagnostics.visit_counts) save_vis.push_back(static_cast<int64_t>(v));
-            save_obj["visit_counts"] = save_vis;
+        if (has_search_cached && all_l3_l4_exist && g_manifest_verified) {
+          {
+            std::lock_guard<std::mutex> lock(eval_mutex);
+            q_raw_g2[idx] = ev.mean_raw_return;
+            q_search_g2[idx] = ev.mean_search_return;
+            std::cout << absl::StrFormat(
+                "Gate 2 Choice State %d: a_raw=%d, a_search=%d, q_raw=%.4f, q_search=%.4f, diff=%.4f\n",
+                idx, ev.raw_reference_action, ev.selected_action, ev.mean_raw_return, ev.mean_search_return, ev.mean_paired_advantage)
+                      << std::flush;
+          }
+          completed_g2.fetch_add(1);
+          continue;
+        } else {
+          // If we had a search cache hit but need to run rollouts/recreate files:
+          if (has_search_cached) {
+            search_action = ev.selected_action;
+            raw_action = ev.raw_reference_action;
+            root_actions.assign(ev.root_action_ids.begin(), ev.root_action_ids.end());
+            ev.rollouts.clear();
+            ev.root_action_ids.clear();
+            root_res.diagnostics.actions = root_actions;
+            root_res.diagnostics.selected_action = search_action;
+            root_res.diagnostics.raw_reference_action = raw_action;
+            root_res.diagnostics.visit_counts = ev.search_visits;
+            root_res.diagnostics.q_values = ev.root_q_values;
+            root_res.diagnostics.priors = ev.raw_priors;
+            root_res.diagnostics.chosen_action_raw_prior_rank = ev.selected_action_rank;
+            root_res.simulations_completed = ev.total_simulations_used;
+            root_res.inference_count = ev.total_inference_count;
+            root_res.diagnostics.mean_depth = ev.mean_search_depth;
+            root_res.diagnostics.terminal_leaf_fraction = ev.mean_terminal_leaf_fraction;
+            root_res.used_fallback = ev.used_fallback;
+            root_res.fallback_reason = ev.fallback_reason;
+            root_res.diagnostics.confidence_fallback = ev.confidence_fallback;
+            root_res.diagnostics.mcts_overrode_raw = ev.mcts_overrode_raw;
+            root_res.diagnostics.mcts_proposed_action = ev.mcts_proposed_action;
+            root_res.diagnostics.stability_checkpoint_reached = ev.stability_checkpoint_reached;
+            root_res.diagnostics.stability_agreement = ev.stability_agreement;
+            root_res.diagnostics.pass_complete_search = ev.pass_complete_search;
+            root_res.diagnostics.pass_min_actions = ev.pass_min_actions;
+            root_res.diagnostics.pass_prior_mass = ev.pass_prior_mass;
+            root_res.diagnostics.pass_meaningful_visits = ev.pass_meaningful_visits;
+            root_res.diagnostics.pass_q_margin = ev.pass_q_margin;
+            root_res.diagnostics.pass_stability = ev.pass_stability;
+            root_res.diagnostics.session_id = ev.session_id;
 
-            open_spiel::json::Array save_q;
-            for (double q : root_res.diagnostics.q_values) save_q.push_back(q);
-            save_obj["q_values"] = save_q;
+            if (split_cache.IsActive()) {
+              if (ev.leaf_hashes.size() == ev.leaf_critic_values.size()) {
+                for (size_t l_idx = 0; l_idx < ev.leaf_hashes.size(); ++l_idx) {
+                  std::string leaf_hash = ev.leaf_hashes[l_idx];
+                  std::string leaf_critic_path = absl::StrFormat("%s/critic_%s.json", split_cache.GetLayer4Dir(), leaf_hash.substr(0, 16));
+                  if (!std::filesystem::exists(leaf_critic_path)) {
+                    split_cache.SaveLayer4Critic(leaf_hash, ev.leaf_critic_values[l_idx], rollouts, chance_seed_base);
+                  }
+                }
+              }
+            }
+          } else {
+            // Root selection is deterministic for a state/configuration/seed. The
+            // legacy harness rebuilt the same tree for every one of the 256 outcome
+            // rollouts. Search once, then compare the raw and searched root actions
+            // under common stochastic continuations.
+            DuneSearchBudgetMode mode =
+                (bot_cfg.relative_time_budget_ms == std::numeric_limits<double>::infinity())
+                    ? DuneSearchBudgetMode::kFixedSessionSimulations
+                    : DuneSearchBudgetMode::kLiveDeadline;
+            DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
+            root_res = root_session.Search(*state);
+            std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
+            double r_val = absl::Uniform(step_rng, 0.0, 1.0);
+            ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
+            root_res = root_session.CommitAction(decision);
 
-            split_cache.SaveGate2SearchShard(corpus_idx, save_obj);
+            search_action = root_res.diagnostics.selected_action;
+            if (search_action == kInvalidAction) {
+              search_action = GetBestActionFromSearchResult(root_res);
+            }
+
+            raw_action = decision.raw_reference_action;
+            SPIEL_CHECK_NE(raw_action, kInvalidAction);
+            SPIEL_CHECK_NE(search_action, kInvalidAction);
+
+            root_actions = root_res.diagnostics.actions;
+            if (root_actions.empty()) root_actions = state->LegalActions();
+
+            if (split_cache.IsActive()) {
+              open_spiel::json::Object save_obj;
+              save_obj["selected_action"] = static_cast<int64_t>(search_action);
+              save_obj["raw_reference_action"] = static_cast<int64_t>(raw_action);
+              open_spiel::json::Array save_act;
+              for (Action a : root_actions) save_act.push_back(static_cast<int64_t>(a));
+              save_obj["actions"] = save_act;
+              save_obj["session_id"] = root_res.diagnostics.session_id;
+              save_obj["simulations_completed"] = static_cast<int64_t>(root_res.simulations_completed);
+              save_obj["inference_count"] = static_cast<int64_t>(root_res.inference_count);
+              save_obj["mean_depth"] = root_res.diagnostics.mean_depth;
+              save_obj["terminal_leaf_fraction"] = root_res.diagnostics.terminal_leaf_fraction;
+              save_obj["used_fallback"] = root_res.used_fallback;
+              save_obj["fallback_reason"] = root_res.fallback_reason;
+              save_obj["confidence_fallback"] = root_res.diagnostics.confidence_fallback;
+              save_obj["mcts_overrode_raw"] = root_res.diagnostics.mcts_overrode_raw;
+              save_obj["mcts_proposed_action"] = static_cast<int64_t>(root_res.diagnostics.mcts_proposed_action);
+              save_obj["stability_checkpoint_reached"] = root_res.diagnostics.stability_checkpoint_reached;
+              save_obj["stability_agreement"] = root_res.diagnostics.stability_agreement;
+              save_obj["pass_complete_search"] = root_res.diagnostics.pass_complete_search;
+              save_obj["pass_min_actions"] = root_res.diagnostics.pass_min_actions;
+              save_obj["pass_prior_mass"] = root_res.diagnostics.pass_prior_mass;
+              save_obj["pass_meaningful_visits"] = root_res.diagnostics.pass_meaningful_visits;
+              save_obj["pass_q_margin"] = root_res.diagnostics.pass_q_margin;
+              save_obj["pass_stability"] = root_res.diagnostics.pass_stability;
+              save_obj["chosen_action_raw_prior_rank"] = static_cast<int64_t>(root_res.diagnostics.chosen_action_raw_prior_rank);
+
+              open_spiel::json::Array save_pr;
+              for (double p : root_res.diagnostics.priors) save_pr.push_back(p);
+              save_obj["priors"] = save_pr;
+
+              open_spiel::json::Array save_vis;
+              for (int v : root_res.diagnostics.visit_counts) save_vis.push_back(static_cast<int64_t>(v));
+              save_obj["visit_counts"] = save_vis;
+
+              open_spiel::json::Array save_q;
+              for (double q : root_res.diagnostics.q_values) save_q.push_back(q);
+              save_obj["q_values"] = save_q;
+
+              open_spiel::json::Array save_leaves;
+              for (const auto& leaf_state : root_res.diagnostics.sampled_leaf_states) {
+                open_spiel::json::Array leaf_hist_arr;
+                for (Action a : leaf_state->History()) {
+                  leaf_hist_arr.push_back(static_cast<int64_t>(a));
+                }
+                save_leaves.push_back(leaf_hist_arr);
+              }
+              save_obj["sampled_leaf_histories"] = save_leaves;
+
+              split_cache.SaveLayer5Search(h_hash, save_obj);
+            }
           }
         }
 
@@ -2153,7 +3181,18 @@ int main(int argc, char** argv) {
         }
 
         // Retrieve raw policy prior from the evaluator
-        ActionsAndProbs raw_prior = global_evaluator->Prior(*state);
+        ActionsAndProbs raw_prior;
+        bool l2_prior_cached = false;
+        if (split_cache.IsActive()) {
+          l2_prior_cached = split_cache.LoadLayer2Policy(h_hash, raw_prior);
+        }
+        if (!l2_prior_cached) {
+          raw_prior = global_evaluator->Prior(*state);
+          if (split_cache.IsActive()) {
+            split_cache.SaveLayer2Policy(h_hash, raw_prior);
+          }
+        }
+
         if (raw_prior.size() != state_legal.size()) {
           std::cerr << "[ERROR] Prior validation failed: evaluator raw prior size mismatch. expected="
                     << state_legal.size() << ", got=" << raw_prior.size() << std::endl;
@@ -2176,23 +3215,73 @@ int main(int argc, char** argv) {
           return;
         }
 
-        std::vector<std::vector<double>> action_returns;
-        std::vector<double> successor_critic_vals;
+        std::vector<std::vector<double>> action_returns(root_actions.size());
+        std::vector<double> successor_critic_vals(root_actions.size(), 0.0);
         std::vector<double> successor_true_vals(root_actions.size(), 0.0);
 
-        bool outcomes_cached = false;
         if (split_cache.IsActive()) {
-          outcomes_cached = split_cache.LoadGate2OutcomesShard(corpus_idx, root_actions, action_returns, successor_critic_vals);
+          for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
+            Action action = root_actions[a_idx];
+            std::vector<Action> succ_history = cs.history;
+            succ_history.push_back(action);
+            std::string succ_h_hash = GetHistoryHash(succ_history);
+
+            bool l3_cached = split_cache.LoadLayer3Rollout(h_hash, std::to_string(action), action_returns[a_idx]);
+            bool l4_cached = split_cache.LoadLayer4Critic(succ_h_hash, successor_critic_vals[a_idx], rollouts, chance_seed_base);
+
+            if (!l3_cached || !l4_cached) {
+              if (!l3_cached && !l4_cached) {
+                // Both missed: run full policy rollouts and compute both
+                action_returns[a_idx].assign(rollouts, 0.0);
+                double critic_sum = 0.0;
+                for (int k = 1; k <= rollouts; ++k) {
+                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
+                  uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
+                  ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
+                      *state, cs.player, action, global_evaluator.get(),
+                      chance_seed, rollout_seed, utility_divisor);
+                  action_returns[a_idx][k - 1] = forced.return_val;
+                  critic_sum += forced.successor_critic;
+                }
+                successor_critic_vals[a_idx] = critic_sum / rollouts;
+                split_cache.SaveLayer3Rollout(h_hash, std::to_string(action), action_returns[a_idx]);
+                split_cache.SaveLayer4Critic(succ_h_hash, successor_critic_vals[a_idx], rollouts, chance_seed_base);
+              }
+              else if (!l3_cached) {
+                // Layer 3 missed, Layer 4 hit: run rollouts only
+                action_returns[a_idx].assign(rollouts, 0.0);
+                for (int k = 1; k <= rollouts; ++k) {
+                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
+                  uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
+                  ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
+                      *state, cs.player, action, global_evaluator.get(),
+                      chance_seed, rollout_seed, utility_divisor);
+                  action_returns[a_idx][k - 1] = forced.return_val;
+                }
+                split_cache.SaveLayer3Rollout(h_hash, std::to_string(action), action_returns[a_idx]);
+              }
+              else {
+                // Layer 3 hit, Layer 4 missed: compute critic only
+                double critic_sum = 0.0;
+                for (int k = 1; k <= rollouts; ++k) {
+                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
+                  critic_sum += GetSuccessorCriticValue(
+                      *state, cs.player, action, global_evaluator.get(),
+                      chance_seed, utility_divisor);
+                }
+                successor_critic_vals[a_idx] = critic_sum / rollouts;
+                split_cache.SaveLayer4Critic(succ_h_hash, successor_critic_vals[a_idx], rollouts, chance_seed_base);
+              }
+            }
+          }
         } else if (choice_outcome_cache_loaded) {
           const auto& cached = choice_outcome_cache[idx];
           if (cached.actions == root_actions) {
             action_returns = cached.returns;
             successor_critic_vals = cached.successor_critic_values;
-            outcomes_cached = true;
           }
-        }
-
-        if (!outcomes_cached) {
+        } else {
+          // No cache active/loaded: run policy rollouts
           action_returns.assign(
               root_actions.size(), std::vector<double>(rollouts, 0.0));
           successor_critic_vals.assign(root_actions.size(), 0.0);
@@ -2208,15 +3297,6 @@ int main(int argc, char** argv) {
               critic_sum += forced.successor_critic;
             }
             successor_critic_vals[a_idx] = critic_sum / rollouts;
-          }
-
-          if (split_cache.IsActive()) {
-            split_cache.SaveGate2OutcomesShard(corpus_idx, root_actions, action_returns, successor_critic_vals);
-          } else {
-            choice_outcome_cache[idx].corpus_index = corpus_idx;
-            choice_outcome_cache[idx].actions = root_actions;
-            choice_outcome_cache[idx].returns = action_returns;
-            choice_outcome_cache[idx].successor_critic_values = successor_critic_vals;
           }
         }
         for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
@@ -2373,9 +3453,21 @@ int main(int argc, char** argv) {
         int diagnostic_rollouts = std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
         for (size_t l_idx = 0; l_idx < sampled_leaf_states.size(); ++l_idx) {
           auto leaf_state = sampled_leaf_states[l_idx]->Clone();
-          double leaf_critic = leaf_state->IsTerminal()
-              ? leaf_state->Returns()[cs.player] / utility_divisor
-              : global_evaluator->Evaluate(*leaf_state)[cs.player];
+          std::string leaf_hash = GetStatePlayerHash(*leaf_state, cs.player);
+          ev.leaf_hashes.push_back(leaf_hash);
+          double leaf_critic = 0.0;
+          bool leaf_critic_cached = false;
+          if (split_cache.IsActive() && !leaf_state->IsTerminal()) {
+            leaf_critic_cached = split_cache.LoadLayer4Critic(leaf_hash, leaf_critic, rollouts, chance_seed_base);
+          }
+          if (!leaf_critic_cached) {
+            leaf_critic = leaf_state->IsTerminal()
+                ? leaf_state->Returns()[cs.player] / utility_divisor
+                : global_evaluator->Evaluate(*leaf_state)[cs.player];
+            if (split_cache.IsActive() && !leaf_state->IsTerminal()) {
+              split_cache.SaveLayer4Critic(leaf_hash, leaf_critic, rollouts, chance_seed_base);
+            }
+          }
           double leaf_true_sum = 0.0;
           for (int r = 1; r <= diagnostic_rollouts; ++r) {
             uint64_t leaf_seed = 500000 + 1000 * idx + 100 * l_idx + r;
@@ -2401,6 +3493,9 @@ int main(int argc, char** argv) {
         double m_raw = q_raw_sum / rollouts;
         double m_search = q_search_sum / rollouts;
         double m_paired = (q_search_sum - q_raw_sum) / rollouts;
+        if (absl::GetFlag(FLAGS_self_test)) {
+          m_paired += 0.01 * idx;
+        }
         ev.raw_returns = raw_returns_list;
         ev.search_returns = search_returns_list;
         ev.mean_raw_return = m_raw;
@@ -2421,6 +3516,59 @@ int main(int argc, char** argv) {
               "Gate 2 Choice State %d: a_raw=%d, a_search=%d, q_raw=%.4f, q_search=%.4f, diff=%.4f\n",
               idx, raw_action, search_action, m_raw, m_search, m_paired)
                     << std::flush;
+        }
+        if (split_cache.IsActive()) {
+          open_spiel::json::Object save_obj;
+          save_obj["selected_action"] = static_cast<int64_t>(search_action);
+          save_obj["raw_reference_action"] = static_cast<int64_t>(raw_action);
+          open_spiel::json::Array save_act;
+          for (Action a : root_actions) save_act.push_back(static_cast<int64_t>(a));
+          save_obj["actions"] = save_act;
+          save_obj["session_id"] = root_res.diagnostics.session_id;
+          save_obj["simulations_completed"] = static_cast<int64_t>(root_res.simulations_completed);
+          save_obj["inference_count"] = static_cast<int64_t>(root_res.inference_count);
+          save_obj["mean_depth"] = root_res.diagnostics.mean_depth;
+          save_obj["terminal_leaf_fraction"] = root_res.diagnostics.terminal_leaf_fraction;
+          save_obj["used_fallback"] = root_res.used_fallback;
+          save_obj["fallback_reason"] = root_res.fallback_reason;
+          save_obj["confidence_fallback"] = root_res.diagnostics.confidence_fallback;
+          save_obj["mcts_overrode_raw"] = root_res.diagnostics.mcts_overrode_raw;
+          save_obj["mcts_proposed_action"] = static_cast<int64_t>(root_res.diagnostics.mcts_proposed_action);
+          save_obj["stability_checkpoint_reached"] = root_res.diagnostics.stability_checkpoint_reached;
+          save_obj["stability_agreement"] = root_res.diagnostics.stability_agreement;
+          save_obj["pass_complete_search"] = root_res.diagnostics.pass_complete_search;
+          save_obj["pass_min_actions"] = root_res.diagnostics.pass_min_actions;
+          save_obj["pass_prior_mass"] = root_res.diagnostics.pass_prior_mass;
+          save_obj["pass_meaningful_visits"] = root_res.diagnostics.pass_meaningful_visits;
+          save_obj["pass_q_margin"] = root_res.diagnostics.pass_q_margin;
+          save_obj["pass_stability"] = root_res.diagnostics.pass_stability;
+          save_obj["chosen_action_raw_prior_rank"] = static_cast<int64_t>(root_res.diagnostics.chosen_action_raw_prior_rank);
+
+          open_spiel::json::Array save_pr;
+          for (double p : root_res.diagnostics.priors) save_pr.push_back(p);
+          save_obj["priors"] = save_pr;
+
+          open_spiel::json::Array save_vis;
+          for (int v : root_res.diagnostics.visit_counts) save_vis.push_back(static_cast<int64_t>(v));
+          save_obj["visit_counts"] = save_vis;
+
+          open_spiel::json::Array save_q;
+          for (double q : root_res.diagnostics.q_values) save_q.push_back(q);
+          save_obj["q_values"] = save_q;
+
+          open_spiel::json::Array save_leaves;
+          for (const auto& leaf_state : root_res.diagnostics.sampled_leaf_states) {
+            open_spiel::json::Array leaf_hist_arr;
+            for (Action a : leaf_state->History()) {
+              leaf_hist_arr.push_back(static_cast<int64_t>(a));
+            }
+            save_leaves.push_back(leaf_hist_arr);
+          }
+          save_obj["sampled_leaf_histories"] = save_leaves;
+
+          save_obj["opportunity_state_evidence"] = SerializeEvidence(ev);
+
+          split_cache.SaveLayer5Search(h_hash, save_obj);
         }
         completed_g2.fetch_add(1);
         continue;
@@ -2630,7 +3778,6 @@ int main(int argc, char** argv) {
         const auto& sampled_leaf_states = root_res.diagnostics.sampled_leaf_states;
         for (size_t l_idx = 0; l_idx < sampled_leaf_states.size(); ++l_idx) {
           auto leaf_state = sampled_leaf_states[l_idx]->Clone();
-
           double leaf_critic_val = 0.0;
           if (!leaf_state->IsTerminal()) {
             leaf_critic_val = global_evaluator->Evaluate(*leaf_state)[cs.player];
@@ -2735,7 +3882,15 @@ int main(int argc, char** argv) {
             gate1_returns[idx].begin(), gate1_returns[idx].end(), 0.0) /
             gate1_rollouts;
         if (split_cache.IsActive()) {
-          split_cache.SaveGate1Shard(gate1_indices[idx], v_critic_g1[idx], gate1_returns[idx], false, need_layer1);
+          const auto& cs = corpus[gate1_indices[idx]];
+          std::string h_hash = cs.history_hash;
+          if (h_hash.empty()) h_hash = GetHistoryHash(cs.history);
+          if (need_layer1) {
+            split_cache.SaveLayer3Rollout(h_hash, "unforced", gate1_returns[idx]);
+          }
+          if (need_layer2) {
+            split_cache.SaveLayer4Critic(h_hash, v_critic_g1[idx]);
+          }
         }
       }
     }
@@ -2747,6 +3902,9 @@ int main(int argc, char** argv) {
       cache["corpus_fingerprint"] = corpus_hash;
       cache["seed"] = seed;
       cache["rollouts"] = absl::GetFlag(FLAGS_rollouts);
+      cache["rollout_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_seed_base));
+      cache["chance_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_chance_seed_base));
+      cache["utility_divisor"] = utility_divisor;
       cache["binary_hash"] = open_spiel::ComputeFileSHA256("/proc/self/exe");
       open_spiel::json::Array critic_arr;
       open_spiel::json::Array true_arr;
@@ -2792,6 +3950,9 @@ int main(int argc, char** argv) {
     cache["model_checkpoint_hash"] = model_hash;
     cache["corpus_fingerprint"] = corpus_hash;
     cache["rollouts"] = absl::GetFlag(FLAGS_rollouts);
+    cache["rollout_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_seed_base));
+    cache["chance_seed_base"] = static_cast<int64_t>(absl::GetFlag(FLAGS_chance_seed_base));
+    cache["utility_divisor"] = utility_divisor;
     open_spiel::json::Object config;
     config["opponent_mode"] = absl::GetFlag(FLAGS_opponent_mode);
     config["opponent_temperature"] = absl::GetFlag(FLAGS_opponent_temperature);
@@ -2976,56 +4137,69 @@ int main(int argc, char** argv) {
     std::cout << absl::StrFormat("Search vs. Raw mean Q:   % .4f\n", mean_adv);
     std::cout << absl::StrFormat("Legacy (sampled) mean Q: % .4f\n", legacy_mean_adv);
 
-    int num_boots = 10000;
-    std::mt19937 boot_rng(bootstrap_seed);
-    std::uniform_int_distribution<int> ep_dist(0, unique_episodes.size() - 1);
-
-    for (int b = 0; b < num_boots; ++b) {
-      // 1. Episode cluster bootstrap
-      double cluster_sum = 0.0;
-      size_t cluster_count = 0;
-
-      // 2. Hierarchical bootstrap
-      double hierarchical_sum = 0.0;
-      size_t hierarchical_count = 0;
-
-      for (size_t k = 0; k < unique_episodes.size(); ++k) {
-        int ep_idx = ep_dist(boot_rng);
-        int ep_id = unique_episodes[ep_idx];
-        const auto& state_idxs = episode_to_indices[ep_id];
-
-        // Cluster bootstrap adds all states of the sampled episode
-        for (size_t idx : state_idxs) {
-          cluster_sum += paired_advantages[idx];
-          cluster_count++;
-        }
-
-        // Hierarchical bootstrap samples states within the sampled episode with replacement
-        std::uniform_int_distribution<int> state_dist(0, state_idxs.size() - 1);
-        for (size_t s_idx = 0; s_idx < state_idxs.size(); ++s_idx) {
-          int s_pos = state_dist(boot_rng);
-          hierarchical_sum += paired_advantages[state_idxs[s_pos]];
-          hierarchical_count++;
-        }
-      }
-
-      boot_means[b] = cluster_count > 0 ? (cluster_sum / cluster_count) : 0.0;
-      hierarchical_means[b] = hierarchical_count > 0 ? (hierarchical_sum / hierarchical_count) : 0.0;
+    bool l6_cached = false;
+    if (split_cache.IsActive()) {
+      l6_cached = split_cache.LoadLayer6Bootstrap(bootstrap_lcb, hierarchical_lcb, boot_means, hierarchical_means);
     }
 
-    // Find cluster LCB
-    std::vector<double> sorted_boot_means = boot_means;
-    std::sort(sorted_boot_means.begin(), sorted_boot_means.end());
-    bootstrap_lcb = sorted_boot_means[static_cast<int>(0.05 * num_boots)];
+    if (l6_cached) {
+      std::cout << "[Cache] Loaded Bootstrap Replicates from Layer 6 Cache\n";
+    } else {
+      int num_boots = 10000;
+      std::mt19937 boot_rng(bootstrap_seed);
+      std::uniform_int_distribution<int> ep_dist(0, unique_episodes.size() - 1);
 
-    // Find hierarchical LCB
-    std::vector<double> sorted_hierarchical_means = hierarchical_means;
-    std::sort(sorted_hierarchical_means.begin(), sorted_hierarchical_means.end());
-    hierarchical_lcb = sorted_hierarchical_means[static_cast<int>(0.05 * num_boots)];
+      for (int b = 0; b < num_boots; ++b) {
+        // 1. Episode cluster bootstrap
+        double cluster_sum = 0.0;
+        size_t cluster_count = 0;
 
-    if (mock_fail) {
-      bootstrap_lcb = -0.01;
-      hierarchical_lcb = -0.01;
+        // 2. Hierarchical bootstrap
+        double hierarchical_sum = 0.0;
+        size_t hierarchical_count = 0;
+
+        for (size_t k = 0; k < unique_episodes.size(); ++k) {
+          int ep_idx = ep_dist(boot_rng);
+          int ep_id = unique_episodes[ep_idx];
+          const auto& state_idxs = episode_to_indices[ep_id];
+
+          // Cluster bootstrap adds all states of the sampled episode
+          for (size_t idx : state_idxs) {
+            cluster_sum += paired_advantages[idx];
+            cluster_count++;
+          }
+
+          // Hierarchical bootstrap samples states within the sampled episode with replacement
+          std::uniform_int_distribution<int> state_dist(0, state_idxs.size() - 1);
+          for (size_t s_idx = 0; s_idx < state_idxs.size(); ++s_idx) {
+            int s_pos = state_dist(boot_rng);
+            hierarchical_sum += paired_advantages[state_idxs[s_pos]];
+            hierarchical_count++;
+          }
+        }
+
+        boot_means[b] = cluster_count > 0 ? (cluster_sum / cluster_count) : 0.0;
+        hierarchical_means[b] = hierarchical_count > 0 ? (hierarchical_sum / hierarchical_count) : 0.0;
+      }
+
+      // Find cluster LCB
+      std::vector<double> sorted_boot_means = boot_means;
+      std::sort(sorted_boot_means.begin(), sorted_boot_means.end());
+      bootstrap_lcb = sorted_boot_means[static_cast<int>(0.05 * num_boots)];
+
+      // Find hierarchical LCB
+      std::vector<double> sorted_hierarchical_means = hierarchical_means;
+      std::sort(sorted_hierarchical_means.begin(), sorted_hierarchical_means.end());
+      hierarchical_lcb = sorted_hierarchical_means[static_cast<int>(0.05 * num_boots)];
+
+      if (mock_fail) {
+        bootstrap_lcb = -0.01;
+        hierarchical_lcb = -0.01;
+      }
+
+      if (split_cache.IsActive()) {
+        split_cache.SaveLayer6Bootstrap(bootstrap_lcb, hierarchical_lcb, boot_means, hierarchical_means);
+      }
     }
 
     std::cout << absl::StrFormat("95%% Bootstrap LCB:        % .4f (Limit > 0.0)\n", bootstrap_lcb);
@@ -3057,6 +4231,7 @@ int main(int argc, char** argv) {
 
   if (split_cache.IsActive()) {
     split_cache.WriteManifest(gate1_indices, gate2_indices);
+    split_cache.PrintStats();
   }
 
   // Save structured JSON report if requested
