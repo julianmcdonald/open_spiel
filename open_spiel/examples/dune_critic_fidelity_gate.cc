@@ -42,6 +42,11 @@
 ABSL_FLAG(std::string, model_checkpoint, "artifacts/branch_a_frozen/branch_a_seed11_model_update_2450.pt", "Path to the model checkpoint");
 ABSL_FLAG(std::string, corpus_path, "data/dune_diagnostic_corpus.json", "Path to the corpus JSON file");
 ABSL_FLAG(int, seed, 42, "RNG seed");
+ABSL_FLAG(int, search_seed, 42, "MCTS Search RNG seed");
+ABSL_FLAG(int, raw_policy_seed, 42, "Raw policy RNG seed");
+ABSL_FLAG(int, rollout_seed_base, 100000, "Rollout seed base");
+ABSL_FLAG(int, chance_seed_base, 200000, "Chance seed base");
+ABSL_FLAG(int, bootstrap_seed, 109999, "Bootstrap RNG seed");
 ABSL_FLAG(int, hidden_dim, 2048, "Hidden dimension");
 ABSL_FLAG(int, num_blocks, 8, "Block count");
 ABSL_FLAG(int, max_simulations, 200, "MCTS simulations count");
@@ -74,6 +79,7 @@ ABSL_FLAG(std::string, choice_rollout_cache_path, "",
 ABSL_FLAG(std::string, cache_dir, "", "Directory for multi-layer cache storage.");
 
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
+std::atomic<bool> g_cache_validation_failed{false};
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
 ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits required for raw and argmax actions");
 ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
@@ -110,6 +116,15 @@ class MockEvaluator : public algorithms::Evaluator {
     ActionsAndProbs prior;
     std::vector<Action> legal = state.LegalActions();
     if (legal.empty()) return {};
+
+    const char* env_one_hot = std::getenv("MOCK_ONE_HOT_PRIOR");
+    if (env_one_hot && std::string(env_one_hot) == "1") {
+      for (size_t i = 0; i < legal.size(); ++i) {
+        prior.push_back({legal[i], (i == 0 ? 1.0 : 0.0)});
+      }
+      return prior;
+    }
+
     double p = 1.0 / legal.size();
     for (Action a : legal) {
       prior.push_back({a, p});
@@ -288,14 +303,14 @@ struct ForcedActionRolloutResult {
 // This isolates action quality from repeated, identical root searches.
 ForcedActionRolloutResult RunForcedActionPolicyRollout(
     const State& start_state, Player owner, Action root_action,
-    algorithms::Evaluator* evaluator, uint64_t seed,
-    double utility_divisor) {
+    algorithms::Evaluator* evaluator, uint64_t chance_seed,
+    uint64_t rollout_seed, double utility_divisor) {
   auto state = start_state.Clone();
   std::vector<Action> legal = state->LegalActions();
   SPIEL_CHECK_TRUE(std::find(legal.begin(), legal.end(), root_action) != legal.end());
   state->ApplyAction(root_action);
 
-  std::mt19937 chance_rng(seed);
+  std::mt19937 chance_rng(chance_seed);
   while (state->IsChanceNode()) {
     auto outcomes = state->ChanceOutcomes();
     if (outcomes.empty()) break;
@@ -307,7 +322,7 @@ ForcedActionRolloutResult RunForcedActionPolicyRollout(
       ? state->Returns()[owner] / utility_divisor
       : evaluator->Evaluate(*state)[owner];
   double final_return = RunRawPolicyRollout(
-      *state, owner, evaluator, seed, utility_divisor);
+      *state, owner, evaluator, rollout_seed, utility_divisor);
   return {final_return, critic};
 }
 
@@ -359,6 +374,7 @@ struct RolloutEvidence {
 
 struct OpportunityStateEvidence {
   int corpus_index = 0;
+  int episode_id = -1;
   std::string history_hash = "";
   int seat = -1;
   int round = -1;
@@ -381,6 +397,8 @@ struct OpportunityStateEvidence {
   double search_return_std_err = 0.0;
   double mean_paired_advantage = 0.0;
   double paired_advantage_std_err = 0.0;
+  double diagnostic_legacy_raw_return = 0.0;
+  double diagnostic_legacy_paired_advantage = 0.0;
   int total_simulations_used = 0;
   int total_re_root_hits = 0;
   int total_re_root_misses = 0;
@@ -1137,8 +1155,19 @@ class SplitCacheManager {
     try {
       std::ifstream in3(shard3);
       std::string text3((std::istreambuf_iterator<char>(in3)), std::istreambuf_iterator<char>());
+      if (text3.find("NaN") != std::string::npos ||
+          text3.find("Infinity") != std::string::npos ||
+          text3.find("-Infinity") != std::string::npos) {
+        std::cerr << "[ERROR] Cache validation failed: non-finite value found in cache file " << shard3 << std::endl;
+        g_cache_validation_failed = true;
+        return false;
+      }
       auto parsed3 = open_spiel::json::FromString(text3);
-      if (!parsed3) return false;
+      if (!parsed3) {
+        std::cerr << "[ERROR] Cache search shard parsing failed for " << shard3 << std::endl;
+        g_cache_validation_failed = true;
+        return false;
+      }
       auto obj3 = parsed3.value().GetObject();
       auto prov3 = obj3.at("provenance").GetObject();
       if (prov3.at("corpus_fingerprint").GetString() != corpus_hash ||
@@ -1150,7 +1179,13 @@ class SplitCacheManager {
       }
       search_result = obj3.at("search_result").GetObject();
       return true;
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR] Exception loading search shard: " << e.what() << std::endl;
+      g_cache_validation_failed = true;
+      return false;
     } catch (...) {
+      std::cerr << "[ERROR] Unknown exception loading search shard" << std::endl;
+      g_cache_validation_failed = true;
       return false;
     }
   }
@@ -1441,6 +1476,22 @@ int main(int argc, char** argv) {
   std::string model_checkpoint = absl::GetFlag(FLAGS_model_checkpoint);
   std::string corpus_path = absl::GetFlag(FLAGS_corpus_path);
   int seed = absl::GetFlag(FLAGS_seed);
+  bool has_search_seed = false;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if ((arg.size() >= 14 && arg.substr(0, 14) == "--search_seed=") || arg == "--search_seed") {
+      has_search_seed = true;
+      break;
+    }
+  }
+  int search_seed = absl::GetFlag(FLAGS_search_seed);
+  if (!has_search_seed && seed != 42) {
+    search_seed = seed;
+  }
+  int raw_policy_seed = absl::GetFlag(FLAGS_raw_policy_seed);
+  int rollout_seed_base = absl::GetFlag(FLAGS_rollout_seed_base);
+  int chance_seed_base = absl::GetFlag(FLAGS_chance_seed_base);
+  int bootstrap_seed = absl::GetFlag(FLAGS_bootstrap_seed);
   int num_threads = absl::GetFlag(FLAGS_threads);
   double utility_divisor = absl::GetFlag(FLAGS_utility_divisor);
   bool mock_fail = absl::GetFlag(FLAGS_mock_miscalibrated_critic);
@@ -1490,7 +1541,7 @@ int main(int argc, char** argv) {
   }
 
   std::string cache_dir = absl::GetFlag(FLAGS_cache_dir);
-  SplitCacheManager split_cache(cache_dir, model_checkpoint, corpus_path, seed,
+  SplitCacheManager split_cache(cache_dir, model_checkpoint, corpus_path, search_seed,
                                 self_test ? 2 : absl::GetFlag(FLAGS_rollouts),
                                 utility_divisor, self_test, policy_fp);
 
@@ -1877,6 +1928,7 @@ int main(int argc, char** argv) {
   auto worker_g2 = [&]() {
     int total_g2 = gate2_indices.size();
     while (true) {
+      if (g_cache_validation_failed) break;
       int idx = next_gate2_idx.fetch_add(1);
       if (idx >= total_g2) break;
 
@@ -1908,7 +1960,7 @@ int main(int argc, char** argv) {
         double t_budget = absl::GetFlag(FLAGS_relative_time_budget_ms);
         bot_cfg.relative_time_budget_ms = (t_budget > 0.0) ? t_budget : std::numeric_limits<double>::infinity();
       }
-      bot_cfg.seed = seed + 200000 + 1000 * idx;
+      bot_cfg.seed = search_seed + 200000 + 1000 * idx;
       bot_cfg.fixed_session_limit = bot_cfg.max_simulations;
       bot_cfg.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
       bot_cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
@@ -1932,6 +1984,7 @@ int main(int argc, char** argv) {
 
       OpportunityStateEvidence& ev = gate2_evidence[idx];
       ev.corpus_index = corpus_idx;
+      ev.episode_id = cs.episode_id;
       ev.history_hash = cs.history_hash;
       ev.seat = cs.seat;
       ev.round = cs.round;
@@ -2005,7 +2058,7 @@ int main(int argc, char** argv) {
                   : DuneSearchBudgetMode::kLiveDeadline;
           DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
           root_res = root_session.Search(*state);
-          std::mt19937 step_rng(bot_cfg.seed);
+          std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
           double r_val = absl::Uniform(step_rng, 0.0, 1.0);
           ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
           root_res = root_session.CommitAction(decision);
@@ -2065,6 +2118,64 @@ int main(int argc, char** argv) {
           }
         }
 
+        // Exact Legal Action coverage validation
+        std::vector<Action> state_legal = state->LegalActions();
+        std::vector<Action> sorted_state_legal = state_legal;
+        std::vector<Action> sorted_root_actions = root_actions;
+        std::sort(sorted_state_legal.begin(), sorted_state_legal.end());
+        std::sort(sorted_root_actions.begin(), sorted_root_actions.end());
+        if (sorted_root_actions != sorted_state_legal) {
+          std::cerr << "[ERROR] Prior validation failed: root actions do not match state legal actions." << std::endl;
+          g_cache_validation_failed = true;
+          return;
+        }
+
+        // Validate MCTS search diagnostics priors
+        if (root_res.diagnostics.priors.size() != root_actions.size()) {
+          std::cerr << "[ERROR] Prior validation failed: MCTS priors size mismatch. priors="
+                    << root_res.diagnostics.priors.size() << ", actions=" << root_actions.size() << std::endl;
+          g_cache_validation_failed = true;
+          return;
+        }
+        double prior_sum = 0.0;
+        for (double p : root_res.diagnostics.priors) {
+          if (!std::isfinite(p) || p < 0.0) {
+            std::cerr << "[ERROR] Prior validation failed: invalid MCTS probability value " << p << std::endl;
+            g_cache_validation_failed = true;
+            return;
+          }
+          prior_sum += p;
+        }
+        if (std::abs(prior_sum - 1.0) > 1e-5) {
+          std::cerr << "[ERROR] Prior validation failed: MCTS probability mass does not sum to 1. sum=" << prior_sum << std::endl;
+          g_cache_validation_failed = true;
+          return;
+        }
+
+        // Retrieve raw policy prior from the evaluator
+        ActionsAndProbs raw_prior = global_evaluator->Prior(*state);
+        if (raw_prior.size() != state_legal.size()) {
+          std::cerr << "[ERROR] Prior validation failed: evaluator raw prior size mismatch. expected="
+                    << state_legal.size() << ", got=" << raw_prior.size() << std::endl;
+          g_cache_validation_failed = true;
+          return;
+        }
+        double raw_prior_sum = 0.0;
+        for (const auto& ap : raw_prior) {
+          double p = ap.second;
+          if (!std::isfinite(p) || p < 0.0) {
+            std::cerr << "[ERROR] Prior validation failed: invalid evaluator probability value " << p << std::endl;
+            g_cache_validation_failed = true;
+            return;
+          }
+          raw_prior_sum += p;
+        }
+        if (std::abs(raw_prior_sum - 1.0) > 1e-5) {
+          std::cerr << "[ERROR] Prior validation failed: evaluator probability mass does not sum to 1. sum=" << raw_prior_sum << std::endl;
+          g_cache_validation_failed = true;
+          return;
+        }
+
         std::vector<std::vector<double>> action_returns;
         std::vector<double> successor_critic_vals;
         std::vector<double> successor_true_vals(root_actions.size(), 0.0);
@@ -2088,10 +2199,11 @@ int main(int argc, char** argv) {
           for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
             double critic_sum = 0.0;
             for (int k = 1; k <= rollouts; ++k) {
-              uint64_t paired_seed = 100000 + 1000 * idx + k;
+              uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
+              uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
               ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                   *state, cs.player, root_actions[a_idx], global_evaluator.get(),
-                  paired_seed, utility_divisor);
+                  chance_seed, rollout_seed, utility_divisor);
               action_returns[a_idx][k - 1] = forced.return_val;
               critic_sum += forced.successor_critic;
             }
@@ -2120,13 +2232,53 @@ int main(int argc, char** argv) {
         };
         size_t raw_idx = action_index(raw_action);
         size_t search_idx = action_index(search_action);
-        raw_returns_list = action_returns[raw_idx];
-        search_returns_list = action_returns[search_idx];
-        paired_diffs.resize(rollouts);
+
+        bool used_fallback = root_res.used_fallback || root_res.diagnostics.confidence_fallback;
+
+        std::vector<double> raw_probs(root_actions.size(), 0.0);
+        for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
+          Action act = root_actions[a_idx];
+          double prob = 0.0;
+          bool found = false;
+          for (const auto& ap : raw_prior) {
+            if (ap.first == act) {
+              prob = ap.second;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            std::cerr << "[ERROR] Prior validation failed: evaluator raw prior missing action " << act << std::endl;
+            g_cache_validation_failed = true;
+            return;
+          }
+          raw_probs[a_idx] = prob;
+        }
+
+        std::vector<double> v_raw_hat_rollouts(rollouts, 0.0);
         for (int k = 0; k < rollouts; ++k) {
+          double sum_probs = 0.0;
+          for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
+            sum_probs += raw_probs[a_idx] * action_returns[a_idx][k];
+          }
+          v_raw_hat_rollouts[k] = sum_probs;
+        }
+
+        raw_returns_list.resize(rollouts);
+        search_returns_list.resize(rollouts);
+        paired_diffs.resize(rollouts);
+
+        for (int k = 0; k < rollouts; ++k) {
+          if (used_fallback) {
+            search_returns_list[k] = v_raw_hat_rollouts[k];
+            raw_returns_list[k] = v_raw_hat_rollouts[k];
+          } else {
+            search_returns_list[k] = action_returns[search_idx][k];
+            raw_returns_list[k] = v_raw_hat_rollouts[k];
+          }
+          paired_diffs[k] = search_returns_list[k] - raw_returns_list[k];
           q_raw_sum += raw_returns_list[k];
           q_search_sum += search_returns_list[k];
-          paired_diffs[k] = search_returns_list[k] - raw_returns_list[k];
 
           RolloutEvidence rev;
           rev.rollout_index = k + 1;
@@ -2139,7 +2291,7 @@ int main(int argc, char** argv) {
           rev.raw_decision_roles = {"AGENT_PRIMARY"};
           rev.search_legal_actions = {root_acts_int};
           rev.search_decision_roles = {"AGENT_PRIMARY"};
-          rev.raw_priors = root_res.diagnostics.priors;
+          rev.raw_priors = raw_probs;
           rev.search_visits = root_res.diagnostics.visit_counts;
           rev.root_q_values = root_res.diagnostics.q_values;
           rev.selected_action_rank = root_res.diagnostics.chosen_action_raw_prior_rank;
@@ -2171,7 +2323,7 @@ int main(int argc, char** argv) {
         ev.raw_decision_roles = {"AGENT_PRIMARY"};
         ev.search_legal_actions = {root_acts_int};
         ev.search_decision_roles = {"AGENT_PRIMARY"};
-        ev.raw_priors = root_res.diagnostics.priors;
+        ev.raw_priors = raw_probs;
         ev.search_visits = root_res.diagnostics.visit_counts;
         ev.root_q_values = root_res.diagnostics.q_values;
         ev.selected_action_rank = root_res.diagnostics.chosen_action_raw_prior_rank;
@@ -2257,6 +2409,9 @@ int main(int argc, char** argv) {
         ev.search_return_std_err = CalculateStdErr(search_returns_list, m_search);
         ev.mean_paired_advantage = m_paired;
         ev.paired_advantage_std_err = CalculateStdErr(paired_diffs, m_paired);
+
+        ev.diagnostic_legacy_raw_return = std::accumulate(action_returns[raw_idx].begin(), action_returns[raw_idx].end(), 0.0) / rollouts;
+        ev.diagnostic_legacy_paired_advantage = std::accumulate(action_returns[search_idx].begin(), action_returns[search_idx].end(), 0.0) / rollouts - ev.diagnostic_legacy_raw_return;
 
         {
           std::lock_guard<std::mutex> lock(eval_mutex);
@@ -2379,7 +2534,7 @@ int main(int argc, char** argv) {
             : DuneSearchBudgetMode::kLiveDeadline;
         DuneSearchSession temp_session(bot_cfg, global_evaluator, mode);
         DuneSearchResult root_res = temp_session.Search(*state);
-        std::mt19937 step_rng(bot_cfg.seed);
+        std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
         double r_val = absl::Uniform(step_rng, 0.0, 1.0);
         ControllerDecision decision = temp_session.SelectControllerAction(*state, root_res, r_val);
         root_res = temp_session.CommitAction(decision);
@@ -2625,6 +2780,11 @@ int main(int argc, char** argv) {
     w.join();
   }
 
+  if (g_cache_validation_failed) {
+    std::cerr << "[ERROR] Cache validation failed cleanly (e.g. malformed JSON or NaN values in cache)." << std::endl;
+    std::exit(2);
+  }
+
   if (!self_test && absl::GetFlag(FLAGS_choice_only_gate2) &&
       !choice_outcome_cache_loaded && !choice_cache_path.empty()) {
     open_spiel::json::Object cache;
@@ -2776,47 +2936,100 @@ int main(int argc, char** argv) {
   // Report Gate 2 (Choice Advantages)
   // ==========================================
   double mean_adv = 0.0;
+  double legacy_mean_adv = 0.0;
   double bootstrap_lcb = 0.0;
+  double hierarchical_lcb = 0.0;
   bool bootstrap_passed = true;
+  std::vector<double> boot_means(10000, 0.0);
+  std::vector<double> hierarchical_means(10000, 0.0);
+  std::vector<int> unique_episodes;
 
   if (!gate2_indices.empty()) {
     std::vector<double> paired_advantages(gate2_indices.size(), 0.0);
     double total_adv = 0.0;
+    double total_legacy_adv = 0.0;
 
     for (size_t i = 0; i < gate2_indices.size(); ++i) {
-      double adv = q_search_g2[i] - q_raw_g2[i];
-      paired_advantages[i] = adv;
-      total_adv += adv;
+      paired_advantages[i] = gate2_evidence[i].mean_paired_advantage;
+      total_adv += paired_advantages[i];
+      total_legacy_adv += gate2_evidence[i].diagnostic_legacy_paired_advantage;
     }
     mean_adv = total_adv / gate2_indices.size();
+    legacy_mean_adv = total_legacy_adv / gate2_indices.size();
+
+    // Group opportunity states by cs.episode_id with deterministic sorting
+    std::unordered_map<int, std::vector<size_t>> episode_to_indices;
+    for (size_t i = 0; i < gate2_indices.size(); ++i) {
+      int ep_id = gate2_evidence[i].episode_id;
+      if (episode_to_indices.find(ep_id) == episode_to_indices.end()) {
+        unique_episodes.push_back(ep_id);
+      }
+      episode_to_indices[ep_id].push_back(i);
+    }
+    std::sort(unique_episodes.begin(), unique_episodes.end());
 
     std::cout << "\n============================================\n";
     std::cout << "      GATE 2: CHOICE ADVANTAGES REPORT      \n";
     std::cout << "============================================\n";
-    std::cout << absl::StrFormat("Opportunity States:    %d\n", gate2_indices.size());
-    std::cout << absl::StrFormat("Search vs. Raw mean Q: % .4f\n", mean_adv);
+    std::cout << absl::StrFormat("Opportunity States:      %d\n", gate2_indices.size());
+    std::cout << absl::StrFormat("Effective Episodes:      %d\n", unique_episodes.size());
+    std::cout << absl::StrFormat("Search vs. Raw mean Q:   % .4f\n", mean_adv);
+    std::cout << absl::StrFormat("Legacy (sampled) mean Q: % .4f\n", legacy_mean_adv);
 
     int num_boots = 10000;
-    std::vector<double> boot_means(num_boots, 0.0);
-    std::mt19937 boot_rng(109999);
-    std::uniform_int_distribution<int> boot_dist(0, gate2_indices.size() - 1);
+    std::mt19937 boot_rng(bootstrap_seed);
+    std::uniform_int_distribution<int> ep_dist(0, unique_episodes.size() - 1);
 
     for (int b = 0; b < num_boots; ++b) {
-      double sum = 0.0;
-      for (size_t i = 0; i < gate2_indices.size(); ++i) {
-        int idx = boot_dist(boot_rng);
-        sum += paired_advantages[idx];
-      }
-      boot_means[b] = sum / gate2_indices.size();
-    }
-    std::sort(boot_means.begin(), boot_means.end());
+      // 1. Episode cluster bootstrap
+      double cluster_sum = 0.0;
+      size_t cluster_count = 0;
 
-    bootstrap_lcb = boot_means[static_cast<int>(0.05 * num_boots)];
+      // 2. Hierarchical bootstrap
+      double hierarchical_sum = 0.0;
+      size_t hierarchical_count = 0;
+
+      for (size_t k = 0; k < unique_episodes.size(); ++k) {
+        int ep_idx = ep_dist(boot_rng);
+        int ep_id = unique_episodes[ep_idx];
+        const auto& state_idxs = episode_to_indices[ep_id];
+
+        // Cluster bootstrap adds all states of the sampled episode
+        for (size_t idx : state_idxs) {
+          cluster_sum += paired_advantages[idx];
+          cluster_count++;
+        }
+
+        // Hierarchical bootstrap samples states within the sampled episode with replacement
+        std::uniform_int_distribution<int> state_dist(0, state_idxs.size() - 1);
+        for (size_t s_idx = 0; s_idx < state_idxs.size(); ++s_idx) {
+          int s_pos = state_dist(boot_rng);
+          hierarchical_sum += paired_advantages[state_idxs[s_pos]];
+          hierarchical_count++;
+        }
+      }
+
+      boot_means[b] = cluster_count > 0 ? (cluster_sum / cluster_count) : 0.0;
+      hierarchical_means[b] = hierarchical_count > 0 ? (hierarchical_sum / hierarchical_count) : 0.0;
+    }
+
+    // Find cluster LCB
+    std::vector<double> sorted_boot_means = boot_means;
+    std::sort(sorted_boot_means.begin(), sorted_boot_means.end());
+    bootstrap_lcb = sorted_boot_means[static_cast<int>(0.05 * num_boots)];
+
+    // Find hierarchical LCB
+    std::vector<double> sorted_hierarchical_means = hierarchical_means;
+    std::sort(sorted_hierarchical_means.begin(), sorted_hierarchical_means.end());
+    hierarchical_lcb = sorted_hierarchical_means[static_cast<int>(0.05 * num_boots)];
+
     if (mock_fail) {
       bootstrap_lcb = -0.01;
+      hierarchical_lcb = -0.01;
     }
 
-    std::cout << absl::StrFormat("95%% Bootstrap LCB:      % .4f (Limit > 0.0)\n", bootstrap_lcb);
+    std::cout << absl::StrFormat("95%% Bootstrap LCB:        % .4f (Limit > 0.0)\n", bootstrap_lcb);
+    std::cout << absl::StrFormat("95%% Hierarchical LCB:     % .4f\n", hierarchical_lcb);
     std::cout << "============================================\n";
     bootstrap_passed = (bootstrap_lcb > 0.0);
   } else {
@@ -2861,6 +3074,11 @@ int main(int argc, char** argv) {
       config["model_checkpoint"] = model_checkpoint;
       config["corpus_path"] = corpus_path;
       config["seed"] = absl::GetFlag(FLAGS_seed);
+      config["search_seed"] = static_cast<int64_t>(search_seed);
+      config["raw_policy_seed"] = static_cast<int64_t>(raw_policy_seed);
+      config["rollout_seed_base"] = static_cast<int64_t>(rollout_seed_base);
+      config["chance_seed_base"] = static_cast<int64_t>(chance_seed_base);
+      config["bootstrap_seed"] = static_cast<int64_t>(bootstrap_seed);
       config["hidden_dim"] = absl::GetFlag(FLAGS_hidden_dim);
       config["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
       config["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
@@ -2940,12 +3158,25 @@ int main(int argc, char** argv) {
       open_spiel::json::Object g2;
       g2["opportunity_states"] = static_cast<int64_t>(gate2_indices.size());
       g2["search_vs_raw_mean_q"] = mean_adv;
+      g2["point_estimate"] = mean_adv;
       g2["bootstrap_lcb"] = bootstrap_lcb;
+      g2["legacy_search_vs_raw_mean_q"] = legacy_mean_adv;
+      g2["effective_episode_count"] = static_cast<int64_t>(unique_episodes.size());
+      g2["hierarchical_lcb"] = hierarchical_lcb;
+
+      open_spiel::json::Array boot_reps_arr;
+      for (double val : boot_means) boot_reps_arr.push_back(val);
+      g2["bootstrap_replicates"] = boot_reps_arr;
+
+      open_spiel::json::Array hier_reps_arr;
+      for (double val : hierarchical_means) hier_reps_arr.push_back(val);
+      g2["hierarchical_replicates"] = hier_reps_arr;
 
       open_spiel::json::Array evidence_arr;
       for (const auto& ev : gate2_evidence) {
         open_spiel::json::Object ev_obj;
         ev_obj["corpus_index"] = static_cast<int64_t>(ev.corpus_index);
+        ev_obj["episode_id"] = static_cast<int64_t>(ev.episode_id);
         ev_obj["history_hash"] = ev.history_hash;
         ev_obj["seat"] = static_cast<int64_t>(ev.seat);
         ev_obj["round"] = static_cast<int64_t>(ev.round);
@@ -3011,6 +3242,8 @@ int main(int argc, char** argv) {
         ev_obj["search_return_std_err"] = ev.search_return_std_err;
         ev_obj["mean_paired_advantage"] = ev.mean_paired_advantage;
         ev_obj["paired_advantage_std_err"] = ev.paired_advantage_std_err;
+        ev_obj["diagnostic_legacy_raw_return"] = ev.diagnostic_legacy_raw_return;
+        ev_obj["diagnostic_legacy_paired_advantage"] = ev.diagnostic_legacy_paired_advantage;
 
         ev_obj["total_simulations_used"] = static_cast<int64_t>(ev.total_simulations_used);
         ev_obj["total_re_root_hits"] = static_cast<int64_t>(ev.total_re_root_hits);
@@ -3174,6 +3407,6 @@ int main(int argc, char** argv) {
     return 0;
   } else {
     std::cerr << "\nFAILURE: Gating checks FAILED. Do not begin search training.\n";
-    return 1;
+    return 2;
   }
 }
