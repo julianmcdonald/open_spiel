@@ -678,15 +678,18 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   double check_elapsed_ms = std::chrono::duration<double, std::milli>(check_time - start_time).count();
   double safety_margin = std::min(50.0, std::max(5.0, actual_max_time_ms - 10.0));
   if (check_elapsed_ms + safety_margin >= actual_max_time_ms) {
-    ActionsAndProbs uniform_policy;
-    double prob = 1.0 / legal_actions.size();
-    for (Action a : legal_actions) {
-      uniform_policy.push_back({a, prob});
-    }
-    result.policy = uniform_policy;
+    // Defense in depth: an already-expired deadline must NOT yield a uniform
+    // policy. Uniform-over-legal-actions was played verbatim by callers and,
+    // even under argmax selection, collapses to "always the lowest legal
+    // action id". Degrade instead to the raw network prior on the true current
+    // state (one inference, identical to the session-level policy-only
+    // fallback) and set used_fallback so callers can see the search never ran.
+    result.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    inference_count_this_search_++;
     result.simulations_completed = 0;
     result.elapsed_time_ms = check_elapsed_ms;
     result.timeout_status = true;
+    result.used_fallback = true;
     result.fallback_reason = "timeout";
     result.inference_count = inference_count_this_search_;
     last_search_result_ = result;

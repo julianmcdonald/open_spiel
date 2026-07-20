@@ -2308,7 +2308,13 @@ void TestMoreRoutingAndScenarioInvariants() {
     assert(session.GetBot()->nodes().find(other_key) == session.GetBot()->nodes().end());
   }
 
-  // Case 2.7: Role transition bot mismatch (Placement to Short-Window)
+  // Case 2.7: Role transition (Placement to Short-Window) with the fixed
+  // session budget already consumed by the primary (reserve == 0). The short
+  // window is therefore correctly routed to the policy-only fallback before the
+  // search-path re-root matching check runs, so last_re_root_status keeps the
+  // "hit" set by the descendant-validation step rather than being overwritten
+  // to the short-bot cache "miss". The exhausted-budget fallback itself is
+  // covered in depth by TestShortWindowExhaustedBudgetFallsBackToPrior.
   {
     DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kFixedSessionSimulations);
 
@@ -2332,7 +2338,12 @@ void TestMoreRoutingAndScenarioInvariants() {
 
     DuneSearchResult res2 = RunSessionSearch(session, state2);
     assert(session.intermediate_re_root_status() == "hit");
-    assert(session.last_re_root_status() == "miss"); // Overwritten to miss since short bot cache is empty
+    // The primary consumed the whole fixed session budget (reserve == 0), so
+    // the short window is exhausted and returns the policy-only fallback before
+    // the search-path re-root matching check. last_re_root_status therefore
+    // keeps the descendant-validation "hit" instead of the short-bot "miss".
+    assert(session.last_re_root_status() == "hit");
+    assert(res2.fallback_reason == "short_window_budget_exceeded");
   }
 
   // Case 3: Non-descendant history mismatch (Continuation/Optional Role)
@@ -2739,6 +2750,126 @@ void TestShortWindowRNGSeedContinuity() {
   std::cout << "TestShortWindowRNGSeedContinuity Passed!\n\n";
 }
 
+// Regression test for the Phase 18A Step 2 short-window uniform-policy defect.
+// When the fixed session budget is already exhausted, a multi-action
+// short-window decision (kPurchase/kCombatIntrigue/kOtherOptional) must NOT be
+// routed into RunSearch with zeroed limits (max_time_ms == 0 there returned a
+// UNIFORM policy). It must degrade to the raw network prior on the true current
+// state, mark used_fallback, and — at temperature 0 — select the prior argmax,
+// NOT the lowest legal action id that a uniform policy collapses to under argmax.
+void TestShortWindowExhaustedBudgetFallsBackToPrior() {
+  std::cout << "Running TestShortWindowExhaustedBudgetFallsBackToPrior...\n";
+  auto game = open_spiel::LoadGame("dune_imperium");
+  TestRoutingState state(game);
+
+  // A multi-action kPurchase short-window state (all purchase actions).
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kRevealTurns);
+  state.SetPlayerAgentsRemainingForTesting(0, 0);
+  const Action a0 = dune_imperium::kActionBuyImperiumRow0 + 0;
+  const Action a1 = dune_imperium::kActionBuyImperiumRow0 + 1;
+  const Action a2 = dune_imperium::kActionBuyImperiumRow0 + 2;
+  state.SetMockLegalActions({a0, a1, a2});
+  assert(ClassifyDuneDecisionRole(state, 0, false) == DuneDecisionRole::kPurchase);
+
+  // Deliberately non-uniform prior whose argmax is the HIGHEST action id, so a
+  // uniform-policy bug (argmax -> lowest id a0) is distinguishable from the
+  // correct prior argmax (a2).
+  ActionsAndProbs priors = {{a0, 0.2}, {a1, 0.3}, {a2, 0.5}};
+  std::vector<double> mock_vals(4, 0.0);
+  auto evaluator = std::make_shared<MockEvaluator>(priors, mock_vals);
+
+  DuneSearchConfig config;
+  config.temperature = 0.0;  // temp 0 == greedy/argmax on candidate paths
+  config.purchase_combat_budget = 16;
+  config.fixed_continuation_reserve = 0;
+  // Zero session budget == "the primary already consumed the whole budget":
+  // every subsequent short-window decision computes overall_remaining == 0.
+  config.fixed_session_limit = 0;
+
+  DuneSearchSession session(config, evaluator,
+                            DuneSearchBudgetMode::kFixedSessionSimulations);
+
+  DuneSearchResult res = session.Search(state);
+
+  // 1. No search ran; this is an explicit fallback with the budget reason.
+  assert(res.simulations_completed == 0);
+  assert(res.used_fallback == true);
+  assert(res.fallback_reason == "short_window_budget_exceeded");
+
+  // 2. Returned policy is the evaluator prior over legal actions, NOT uniform.
+  ActionsAndProbs expected_prior = evaluator->Prior(state);
+  assert(res.policy.size() == expected_prior.size());
+  assert(res.policy.size() == 3u);
+  bool is_uniform = true;
+  const double uniform_p = 1.0 / res.policy.size();
+  for (size_t i = 0; i < res.policy.size(); ++i) {
+    assert(res.policy[i].first == expected_prior[i].first);
+    AssertAlmostEqual(res.policy[i].second, expected_prior[i].second);
+    if (std::abs(res.policy[i].second - uniform_p) > 1e-9) is_uniform = false;
+  }
+  assert(!is_uniform);  // guards against the RunSearch(0 sims, 0 ms) uniform poison
+
+  // 3. At temperature 0, selection is the prior argmax (a2), not the lowest
+  //    legal action id (a0) that a uniform policy collapses to under argmax.
+  double r_val = 0.5;
+  ControllerDecision dec = session.SelectControllerAction(state, res, r_val);
+  assert(dec.raw_reference_action == a2);
+  assert(dec.selected_action == a2);
+  assert(dec.selected_action != a0);
+  assert(dec.confidence_fallback == true);  // used_fallback propagated
+
+  // Close the commit lifecycle cleanly.
+  DuneSearchResult committed = session.CommitAction(dec);
+  assert(committed.diagnostics.selected_action == a2);
+
+  std::cout << "TestShortWindowExhaustedBudgetFallsBackToPrior Passed!\n\n";
+}
+
+// Companion regression test for the telemetry-honesty half of the fix. On a
+// PRIMARY decision whose fixed session budget is exhausted, max_sims is clamped
+// to 0 and RunSearch degrades to its own low-coverage prior fallback. The
+// session must NOT clobber RunSearch's fallback_reason; it records the session
+// limit separately in budget_limit_reason and keeps used_fallback set.
+void TestExhaustedPrimaryPreservesRunSearchFallbackReason() {
+  std::cout << "Running TestExhaustedPrimaryPreservesRunSearchFallbackReason...\n";
+  auto game = open_spiel::LoadGame("dune_imperium");
+  TestRoutingState state(game);
+
+  // A multi-action kAgentPrimary state.
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+  state.SetPlayerAgentsRemainingForTesting(0, 1);
+  const Action card = dune_imperium::kActionSelectAgentCard0 + 10;
+  const Action reveal = dune_imperium::kActionReveal;
+  state.SetMockLegalActions({card, reveal});
+  assert(ClassifyDuneDecisionRole(state, 0, false) ==
+         DuneDecisionRole::kAgentPrimary);
+
+  ActionsAndProbs priors = {{card, 0.7}, {reveal, 0.3}};
+  std::vector<double> mock_vals(4, 0.0);
+  auto evaluator = std::make_shared<MockEvaluator>(priors, mock_vals);
+
+  DuneSearchConfig config;
+  config.temperature = 0.0;
+  config.fixed_continuation_reserve = 0;
+  config.fixed_session_limit = 0;  // exhausted before any simulation runs
+
+  DuneSearchSession session(config, evaluator,
+                            DuneSearchBudgetMode::kFixedSessionSimulations);
+  DuneSearchResult res = session.Search(state);
+
+  assert(res.simulations_completed == 0);
+  assert(res.used_fallback == true);
+  // RunSearch's own reason is preserved (0 covered actions -> low_coverage),
+  // NOT overwritten by the session-level limit.
+  assert(res.fallback_reason == "low_coverage");
+  assert(res.diagnostics.fallback_reason == "low_coverage");
+  // The session limit is recorded in the dedicated field instead.
+  assert(res.diagnostics.budget_limit_reason == "fixed_session_limit_exceeded");
+
+  session.DiscardPendingAction();
+  std::cout << "TestExhaustedPrimaryPreservesRunSearchFallbackReason Passed!\n\n";
+}
+
 std::unique_ptr<State> FirstMultiActionDecision(
     const std::shared_ptr<const Game>& game) {
   std::unique_ptr<State> state = game->NewInitialState();
@@ -2865,6 +2996,8 @@ int main() {
   open_spiel::TestCommitLifecycle();
   open_spiel::TestConservativeOverrideCriteria();
   open_spiel::TestShortWindowRNGSeedContinuity();
+  open_spiel::TestShortWindowExhaustedBudgetFallsBackToPrior();
+  open_spiel::TestExhaustedPrimaryPreservesRunSearchFallbackReason();
   open_spiel::TestDefaultDecisionDepthIsUnchanged();
   open_spiel::TestDecisionDepthCapsOneAndTwo();
   open_spiel::TestDecisionDepthSimulationAccounting();

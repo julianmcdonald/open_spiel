@@ -133,6 +133,10 @@ struct SearchDiagnostics {
   Action selected_action = -1;
   bool legality_result = true;
   std::string fallback_reason = "none";
+  // Session-level budget/deadline limit that was hit (if any), kept SEPARATE
+  // from fallback_reason so the session no longer destroys RunSearch's own
+  // reason (e.g. "low_coverage") when clamping simulations to zero.
+  std::string budget_limit_reason = "none";
 
   // Centralized controller selection and conservative override telemetry
   Action raw_reference_action = -1;

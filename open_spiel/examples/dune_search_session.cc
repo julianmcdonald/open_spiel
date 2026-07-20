@@ -29,6 +29,34 @@ std::string LocalPhaseToString(dune_imperium::GamePhase phase) {
     default: return "Unknown";
   }
 }
+
+// Greedy (argmax) when temperature == 0, else sample at r_val. Honors the eval
+// semantics of FLAGS_temperature ("0.0 = greedy") on EVERY candidate selection
+// path — in particular the low-coverage / starved-continuation fallback, where
+// the search policy is the flat network prior rather than a one-hot
+// GetFinalPolicy output. Sampling that flat prior (the Phase 18A Step 2
+// regression) played the candidate stochastically against greedy opponents;
+// taking the argmax restores parity. Training self-play uses temperature > 0 and
+// is unaffected: the non-greedy branch delegates to SampleActionFromPrior, the
+// session's own inverse-CDF sampler that the raw-reference path already used, so
+// temperature > 0 reproduces the pre-existing sampling exactly (openspiel's
+// SampleAction differs at cumulative boundaries and hard-asserts r_val < 1).
+Action PickActionRespectingTemperature(const ActionsAndProbs& policy,
+                                       double temperature, double r_val) {
+  if (policy.empty()) return kInvalidAction;
+  if (temperature == 0.0) {
+    Action best = policy.front().first;
+    double best_p = policy.front().second;
+    for (const auto& ap : policy) {
+      if (ap.second > best_p) {
+        best_p = ap.second;
+        best = ap.first;
+      }
+    }
+    return best;
+  }
+  return SampleActionFromPrior(policy, r_val);
+}
 } // namespace
 
 DuneSearchSession::DuneSearchSession(
@@ -193,6 +221,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     res.diagnostics.inherited_root_visits = 0;
     res.diagnostics.newly_completed_simulations = 0;
     res.diagnostics.session_cumulative_simulations = session_new_simulations_completed_;
+    res.diagnostics.short_window_cumulative_simulations = short_sims_completed_;
     res.diagnostics.session_cumulative_search_time_ms = session_elapsed_time_ms_;
     res.diagnostics.long_agent_session_cumulative_time_ms = long_agent_elapsed_time_ms_;
     res.diagnostics.re_root_status = last_re_root_status_;
@@ -260,10 +289,15 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         : (500.0 - elapsed_ms);
 
     if (max_sims <= 0 || max_time_ms <= 0.0) {
-      max_sims = 0;
-      max_time_ms = 0.0;
-      limit_exceeded = true;
-      limit_reason = "short_window_budget_exceeded";
+      // Budget exhausted for this short window (e.g. the primary decision
+      // consumed the whole fixed session budget with reserve == 0). Do NOT
+      // fall through to RunSearch with zeroed limits: max_time_ms == 0 trips
+      // RunSearch's expired-deadline pre-loop check, which returned a UNIFORM
+      // policy that then got played verbatim at ~32% of decisions (the
+      // Phase 18A Step 2 regression). Degrade to the raw network prior on the
+      // true current state instead — identical to the purchase_combat_budget
+      // <= 0 routing whose diagnostic run validated this behavior.
+      return get_policy_only_result("short_window_budget_exceeded");
     }
   } else if (role == DuneDecisionRole::kAgentPrimary || role == DuneDecisionRole::kAgentContinuation) {
     if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly) {
@@ -319,9 +353,11 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       double remaining_sec = std::chrono::duration<double>(absolute_live_deadline_ - now).count() - reserve_sec;
       max_time_ms = remaining_sec * 1000.0;
       if (max_time_ms <= 0.0) {
-        max_time_ms = 0.0;
-        limit_exceeded = true;
-        limit_reason = "live_deadline_reached";
+        // Live deadline reached: calling RunSearch with max_time_ms == 0 trips
+        // the expired-deadline pre-loop check and returns a uniform policy (the
+        // same poison as the short-window path, but in live play). Degrade to
+        // the raw network prior on the true current state instead.
+        return get_policy_only_result("live_deadline_reached");
       }
       max_sims = config_.max_simulations;
     }
@@ -351,9 +387,14 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   int start_sim_index = is_short_window_role ? short_cumulative_counter_ : cumulative_simulations_;
   DuneSearchResult result = active_bot->RunSearch(state, max_sims, max_time_ms, start_sim_index);
 
-  if (limit_exceeded && result.used_fallback) {
-    result.fallback_reason = limit_reason;
-    result.diagnostics.fallback_reason = limit_reason;
+  if (limit_exceeded) {
+    // The session-level budget was exhausted, so max_sims was clamped to 0 and
+    // RunSearch could only degrade to a low-coverage/zero-visit fallback.
+    // Record WHICH session limit was hit in a separate field and mark the
+    // fallback, but do NOT overwrite RunSearch's own fallback_reason (e.g.
+    // "low_coverage"): clobbering it here hid the real search behavior for days.
+    result.diagnostics.budget_limit_reason = limit_reason;
+    result.used_fallback = true;
   }
 
   // Update session counters
@@ -563,7 +604,8 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
       }
     }
   }
-  decision.raw_reference_action = SampleActionFromPrior(raw_prior, r_val);
+  decision.raw_reference_action =
+      PickActionRespectingTemperature(raw_prior, config_.temperature, r_val);
 
   // 2. MCTS Proposed Action
   decision.mcts_proposed_action = ArgmaxVisitAction(search_result.diagnostics);
@@ -616,7 +658,8 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
       if (search_result.policy.empty()) {
         decision.selected_action = decision.raw_reference_action;
       } else {
-        decision.selected_action = SampleAction(search_result.policy, r_val).first;
+        decision.selected_action = PickActionRespectingTemperature(
+            search_result.policy, config_.temperature, r_val);
       }
       decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
       decision.confidence_fallback = search_result.used_fallback;
@@ -632,7 +675,8 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
       if (search_result.policy.empty()) {
         decision.selected_action = decision.raw_reference_action;
       } else {
-        decision.selected_action = SampleAction(search_result.policy, r_val).first;
+        decision.selected_action = PickActionRespectingTemperature(
+            search_result.policy, config_.temperature, r_val);
       }
       decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
       decision.confidence_fallback = search_result.used_fallback;
@@ -653,7 +697,8 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
     if (search_result.policy.empty()) {
       decision.selected_action = decision.raw_reference_action;
     } else {
-      decision.selected_action = SampleAction(search_result.policy, r_val).first;
+      decision.selected_action = PickActionRespectingTemperature(
+          search_result.policy, config_.temperature, r_val);
     }
     decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
     decision.confidence_fallback = search_result.used_fallback;
