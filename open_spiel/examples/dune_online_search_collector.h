@@ -16,12 +16,17 @@
 #define OPEN_SPIEL_EXAMPLES_DUNE_ONLINE_SEARCH_COLLECTOR_H_
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "open_spiel/spiel.h"
 
 namespace open_spiel {
+
+namespace algorithms {
+class Evaluator;  // frozen inference snapshot; defined in algorithms/mcts.h
+}  // namespace algorithms
 
 // One accepted online search example. Policy target is the normalized visit
 // distribution over legal_actions (cross-entropy); value target is the terminal
@@ -119,10 +124,25 @@ class OnlineSearchCollector {
 
   // Collects `config.auxiliary_games` games starting at
   // `config.next_auxiliary_episode_id`, appends accepted examples to `out`,
-  // fills `stats`, and advances the episode cursor. `update_id` stamps the
-  // emitted examples. Requires the frozen inference model/evaluator to be wired
-  // (see the .cc); non-search seats and rejected roots execute the raw policy.
+  // fills `stats`, and advances the episode cursor (both `stats->next_episode_id`
+  // and the collector's own `config_.next_auxiliary_episode_id`). `update_id`
+  // stamps the emitted examples.
+  //
+  // `game` is the environment (e.g. dune_imperium); `evaluator` is the FROZEN
+  // pre-update inference snapshot, shared by all seats (self-play) and handed to
+  // the search session. Both are injected so unit tests can drive the collector
+  // with a mock evaluator and never touch the GPU.
+  //
+  // Semantics (see docs/PHASE_18B_ONLINE_COLLECTOR_DESIGN.md "CollectUpdate
+  // wiring"): the searched seat runs a fresh frozen-config search session only at
+  // its strategic ROOTS (ClassifyDuneDecisionRole == kAgentPrimary) selected by
+  // the 0.25 Bernoulli; accepted searches emit one example (normalized visits as
+  // CE target, terminal value attached at game end) and execute a visit-sampled
+  // action. Non-searched seats, non-strategic decisions, unselected roots, and
+  // rejected searches all execute the raw stochastic policy.
   void CollectUpdate(int update_id,
+                     const std::shared_ptr<const Game>& game,
+                     const std::shared_ptr<algorithms::Evaluator>& evaluator,
                      std::vector<SearchTrainingExample>* out,
                      OnlineSearchCollectionStats* stats);
 

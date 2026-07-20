@@ -161,18 +161,11 @@ struct DuneSearchResult {
   int inference_count = 0; // Track NN evaluator inferences
 };
 
-struct SearchTrainingExample {
-  std::vector<float> observation;
-  Player player = kInvalidPlayer;
-  std::vector<Action> legal_actions;
-  std::vector<double> normalized_visit_target;
-  double normalized_terminal_target = 0.0;
-  std::string checkpoint_hash;
-  int64_t update_id = 0;
-  int64_t episode_id = 0;
-  int64_t decision_id = 0;
-  SearchDiagnostics diagnostics;
-};
+// NOTE: A vestigial `SearchTrainingExample` struct used to live here but was
+// never constructed or read anywhere. It was removed to avoid a name collision
+// with the live, documented `open_spiel::SearchTrainingExample` emitted by the
+// Phase 18B online collector (see dune_online_search_collector.h), which any
+// translation unit wiring CollectUpdate must include alongside this header.
 
 // Strategic-state classification function declarations
 bool IsStrategicAction(const std::string& action_str);
