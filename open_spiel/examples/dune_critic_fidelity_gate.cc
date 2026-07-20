@@ -3574,7 +3574,7 @@ int main(int argc, char** argv) {
         }
 
         const auto& sampled_leaf_states = root_res.diagnostics.sampled_leaf_states;
-        int diagnostic_rollouts = std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
+        int diagnostic_rollouts = effective_diagnostic_rollouts;
         for (size_t l_idx = 0; l_idx < sampled_leaf_states.size(); ++l_idx) {
           auto leaf_state = sampled_leaf_states[l_idx]->Clone();
           std::string leaf_hash = GetStatePlayerHash(*leaf_state, cs.player);
