@@ -153,6 +153,7 @@ std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state
       "|model=", config_.model_checkpoint_path,
       "|utility=", config_.utility_divisor,
       "|puct_c=", config_.puct_c,
+      "|decision_depth_cap=", config_.max_search_decision_depth,
       "|actions=", actions_sig
   );
   return {state.CurrentPlayer(), full_key};
@@ -222,22 +223,7 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   Player cur_player = state.CurrentPlayer();
   auto eval_res = evaluators_[cur_player]->PriorAndEvaluate(state);
   inference_count_this_search_++;
-  current_search_leaf_histories_.push_back(state.History());
-  ++diagnostic_leaf_states_seen_;
-  auto leaf_clone = std::shared_ptr<State>(state.Clone().release());
-  if (current_search_sampled_leaf_states_.size() < 16) {
-    current_search_sampled_leaf_states_.push_back(std::move(leaf_clone));
-  } else {
-    // Deterministic reservoir sampling keeps representative leaves without
-    // perturbing the search RNG or retaining up to 100,000 cloned states.
-    uint64_t sample_seed = dune_seed::Combine(
-        config_.seed, dune_seed::kStreamSearchSampling,
-        diagnostic_leaf_states_seen_ + 0x4c454146ULL);
-    size_t slot = sample_seed % diagnostic_leaf_states_seen_;
-    if (slot < current_search_sampled_leaf_states_.size()) {
-      current_search_sampled_leaf_states_[slot] = std::move(leaf_clone);
-    }
-  }
+  RecordSampledLeaf(state);
 
   // Initialize all legal actions with 0.0 prior first
   for (Action a : state.LegalActions()) {
@@ -296,6 +282,53 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   }
 
   node->priors_initialized = true;
+}
+
+void DunePUCTISMCTSBot::RecordSampledLeaf(const State& state) {
+  current_search_leaf_histories_.push_back(state.History());
+  ++diagnostic_leaf_states_seen_;
+  auto leaf_clone = std::shared_ptr<State>(state.Clone().release());
+  if (current_search_sampled_leaf_states_.size() < 16) {
+    current_search_sampled_leaf_states_.push_back(std::move(leaf_clone));
+  } else {
+    // Deterministic reservoir sampling keeps representative leaves without
+    // perturbing the search RNG or retaining up to 100,000 cloned states.
+    uint64_t sample_seed = dune_seed::Combine(
+        config_.seed, dune_seed::kStreamSearchSampling,
+        diagnostic_leaf_states_seen_ + 0x4c454146ULL);
+    size_t slot = sample_seed % diagnostic_leaf_states_seen_;
+    if (slot < current_search_sampled_leaf_states_.size()) {
+      current_search_sampled_leaf_states_[slot] = std::move(leaf_clone);
+    }
+  }
+}
+
+std::vector<double> DunePUCTISMCTSBot::EvaluateCappedLeaf(
+    const State& state, int depth, int decision_depth) {
+  Player cur_player = state.CurrentPlayer();
+  std::vector<double> values = evaluators_[cur_player]->Evaluate(state);
+  inference_count_this_search_++;
+  for (int player = 0; player < state.NumPlayers(); ++player) {
+    if (evaluators_[player] != evaluators_[cur_player]) {
+      values[player] = evaluators_[player]->Evaluate(state)[player];
+      inference_count_this_search_++;
+    }
+  }
+  RecordSampledLeaf(state);
+  max_depth_this_search_ = std::max(max_depth_this_search_, depth);
+  max_decision_depth_this_search_ =
+      std::max(max_decision_depth_this_search_, decision_depth);
+  sum_depth_this_search_ += depth;
+  sum_decision_depth_this_search_ += decision_depth;
+  num_sims_this_search_++;
+  simulation_depths_this_search_.push_back(depth);
+  const auto* dune_state =
+      dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  if (dune_state) {
+    max_round_this_search_ =
+        std::max(max_round_this_search_, dune_state->GetCurrentRound());
+  }
+  return values;
 }
 
 ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
@@ -372,8 +405,11 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
   }
 }
 
-std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, int sim_index) {
+std::vector<double> DunePUCTISMCTSBot::RunSimulation(
+    State* state, int depth, int decision_depth, int sim_index) {
   max_depth_this_search_ = std::max(max_depth_this_search_, depth);
+  max_decision_depth_this_search_ =
+      std::max(max_decision_depth_this_search_, decision_depth);
 
   if (state->IsTerminal()) {
     std::vector<double> returns = state->Returns();
@@ -381,6 +417,7 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
       r /= config_.utility_divisor;
     }
     sum_depth_this_search_ += depth;
+    sum_decision_depth_this_search_ += decision_depth;
     num_sims_this_search_++;
     simulation_depths_this_search_.push_back(depth);
     terminal_leaf_simulations_count_++;
@@ -396,15 +433,20 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
     double r_num = absl::Uniform(chance_rng, 0.0, 1.0);
     Action chance_action = SampleAction(state->ChanceOutcomes(), r_num).first;
     state->ApplyAction(chance_action);
-    return RunSimulation(state, depth + 1, sim_index);
+    return RunSimulation(state, depth + 1, decision_depth, sim_index);
   }
 
   std::vector<Action> legal_actions = state->LegalActions();
   if (legal_actions.size() == 1) {
     state->ApplyAction(legal_actions[0]);
-    return RunSimulation(state, depth + 1, sim_index);
+    return RunSimulation(state, depth + 1, decision_depth, sim_index);
   }
   Player cur_player = state->CurrentPlayer();
+
+  if (config_.max_search_decision_depth >= 0 &&
+      decision_depth >= config_.max_search_decision_depth) {
+    return EvaluateCappedLeaf(*state, depth, decision_depth);
+  }
 
   if (config_.opponent_mode == SearchOpponentMode::kPolicy && cur_player != searching_player_) {
     auto key = GetStateKey(*state);
@@ -477,7 +519,8 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
 
     if (chosen_action != kInvalidAction) {
       state->ApplyAction(chosen_action);
-      std::vector<double> returns = RunSimulation(state, depth + 1, sim_index);
+      std::vector<double> returns =
+          RunSimulation(state, depth + 1, decision_depth + 1, sim_index);
       if (returns.empty()) {
         return {};
       }
@@ -488,6 +531,7 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
         r /= config_.utility_divisor;
       }
       sum_depth_this_search_ += depth;
+      sum_decision_depth_this_search_ += decision_depth;
       num_sims_this_search_++;
       simulation_depths_this_search_.push_back(depth);
       const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state);
@@ -514,6 +558,7 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
   if (node->total_visits == -1) {
     node->total_visits = 0;
     sum_depth_this_search_ += depth;
+    sum_decision_depth_this_search_ += decision_depth;
     num_sims_this_search_++;
     simulation_depths_this_search_.push_back(depth);
     const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state);
@@ -530,7 +575,8 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(State* state, int depth, in
   node->child_info[chosen_action].visits++;
 
   state->ApplyAction(chosen_action);
-  std::vector<double> returns = RunSimulation(state, depth + 1, sim_index);
+  std::vector<double> returns =
+      RunSimulation(state, depth + 1, decision_depth + 1, sim_index);
   if (returns.empty()) {
     node->total_visits--;
     node->child_info[chosen_action].visits--;
@@ -575,6 +621,8 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   max_depth_this_search_ = 0;
   sum_depth_this_search_ = 0.0;
   num_sims_this_search_ = 0;
+  max_decision_depth_this_search_ = 0;
+  sum_decision_depth_this_search_ = 0.0;
   is_continuation_ = (start_sim_index > 0);
   if (!in_session_) {
     if (evaluators_ != last_evaluators_ ||
@@ -700,7 +748,9 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
 
     auto sim_start = std::chrono::steady_clock::now();
     std::unique_ptr<State> sampled_root_state = SampleRootState(state, start_sim_index + sim);
-    std::vector<double> returns = RunSimulation(sampled_root_state.get(), 0, start_sim_index + sim);
+    std::vector<double> returns =
+        RunSimulation(sampled_root_state.get(), 0, 0,
+                      start_sim_index + sim);
     auto sim_end = std::chrono::steady_clock::now();
 
     if (returns.empty()) {
@@ -968,6 +1018,10 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
   }
 
   diag.deepest_simulated_round = max_round_this_search_;
+  diag.max_decision_depth = max_decision_depth_this_search_;
+  diag.mean_decision_depth = num_sims_this_search_ > 0
+      ? sum_decision_depth_this_search_ / num_sims_this_search_
+      : 0.0;
   diag.terminal_leaf_fraction = num_sims_this_search_ > 0
       ? static_cast<double>(terminal_leaf_simulations_count_) / num_sims_this_search_
       : 0.0;

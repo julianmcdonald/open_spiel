@@ -67,6 +67,10 @@ struct DuneSearchConfig {
   double conservative_q_margin_threshold = 0.03;
   double conservative_stability_checkpoint_fraction = 0.5;
   bool conservative_continuation_overrides_disabled = true;
+
+  // Maximum multi-action player decisions traversed from the root. Negative
+  // preserves uncapped behavior; chance and forced transitions do not count.
+  int max_search_decision_depth = -1;
 };
 
 struct SearchDiagnostics {
@@ -85,6 +89,8 @@ struct SearchDiagnostics {
   double p95_depth = 0.0;
   int deepest_simulated_round = 0;
   double terminal_leaf_fraction = 0.0;
+  int max_decision_depth = 0;
+  double mean_decision_depth = 0.0;
   int unique_nodes = 0;
   int inference_count = 0;
   double raw_to_search_policy_kl = 0.0;
@@ -248,7 +254,11 @@ class DunePUCTISMCTSBot : public Bot {
   DuneISMCTSNode* LookupNode(const State& state);
 
   // Core search procedures
-  std::vector<double> RunSimulation(State* state, int depth, int sim_index);
+  std::vector<double> RunSimulation(State* state, int depth,
+                                    int decision_depth, int sim_index);
+  std::vector<double> EvaluateCappedLeaf(const State& state, int depth,
+                                         int decision_depth);
+  void RecordSampledLeaf(const State& state);
   Action SelectActionTreePolicy(DuneISMCTSNode* node, const std::vector<Action>& legal_actions);
   void InitializePriorsAndValue(DuneISMCTSNode* node, const State& state);
   ActionsAndProbs FilterAndNormalizePriors(DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const;
@@ -262,6 +272,8 @@ class DunePUCTISMCTSBot : public Bot {
   int max_depth_this_search_ = 0;
   double sum_depth_this_search_ = 0.0;
   int num_sims_this_search_ = 0;
+  int max_decision_depth_this_search_ = 0;
+  double sum_decision_depth_this_search_ = 0.0;
   int total_lookups_ = 0;
   int reused_lookups_ = 0;
   int search_count_ = 0;

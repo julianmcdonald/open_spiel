@@ -33,7 +33,7 @@ struct TestBotAccessor {
     return b.root_node_;
   }
   static std::vector<double> Simulate(DunePUCTISMCTSBot& b, State* s) {
-    return b.RunSimulation(s, 0, 0);
+    return b.RunSimulation(s, 0, 0, 0);
   }
   static double CallRandomNumber(DunePUCTISMCTSBot& b) {
     return b.RandomNumber();
@@ -2739,6 +2739,93 @@ void TestShortWindowRNGSeedContinuity() {
   std::cout << "TestShortWindowRNGSeedContinuity Passed!\n\n";
 }
 
+std::unique_ptr<State> FirstMultiActionDecision(
+    const std::shared_ptr<const Game>& game) {
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode() || state->LegalActions().size() <= 1) {
+    if (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    } else {
+      state->ApplyAction(state->LegalActions().front());
+    }
+  }
+  return state;
+}
+
+std::shared_ptr<MockEvaluator> MakeUniformMockEvaluator(const State& state) {
+  ActionsAndProbs priors;
+  for (Action action : state.LegalActions()) {
+    priors.push_back({action, 1.0 / state.LegalActions().size()});
+  }
+  return std::make_shared<MockEvaluator>(
+      priors, std::vector<double>(state.NumPlayers(), 0.0));
+}
+
+void TestDefaultDecisionDepthIsUnchanged() {
+  std::cout << "Running TestDefaultDecisionDepthIsUnchanged...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = FirstMultiActionDecision(game);
+
+  DuneSearchConfig default_config;
+  default_config.max_simulations = 30;
+  default_config.relative_time_budget_ms =
+      std::numeric_limits<double>::infinity();
+  DuneSearchConfig explicit_uncapped = default_config;
+  explicit_uncapped.max_search_decision_depth = -1;
+
+  DunePUCTISMCTSBot default_bot(default_config,
+                                MakeUniformMockEvaluator(*state));
+  DunePUCTISMCTSBot explicit_bot(explicit_uncapped,
+                                 MakeUniformMockEvaluator(*state));
+  DuneSearchResult default_result = default_bot.RunSearch(*state);
+  DuneSearchResult explicit_result = explicit_bot.RunSearch(*state);
+
+  assert(default_config.max_search_decision_depth == -1);
+  assert(default_result.simulations_completed ==
+         explicit_result.simulations_completed);
+  assert(default_result.diagnostics.visit_counts ==
+         explicit_result.diagnostics.visit_counts);
+  assert(default_result.diagnostics.q_values ==
+         explicit_result.diagnostics.q_values);
+  std::cout << "TestDefaultDecisionDepthIsUnchanged Passed!\n\n";
+}
+
+void TestDecisionDepthCapsOneAndTwo() {
+  std::cout << "Running TestDecisionDepthCapsOneAndTwo...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = FirstMultiActionDecision(game);
+
+  for (int cap : {1, 2}) {
+    DuneSearchConfig config;
+    config.max_simulations = 40;
+    config.relative_time_budget_ms =
+        std::numeric_limits<double>::infinity();
+    config.max_search_decision_depth = cap;
+    DunePUCTISMCTSBot bot(config, MakeUniformMockEvaluator(*state));
+    DuneSearchResult result = bot.RunSearch(*state);
+    assert(result.simulations_completed == config.max_simulations);
+    assert(result.diagnostics.max_decision_depth <= cap);
+    assert(result.diagnostics.mean_decision_depth <= cap);
+  }
+  std::cout << "TestDecisionDepthCapsOneAndTwo Passed!\n\n";
+}
+
+void TestDecisionDepthSimulationAccounting() {
+  std::cout << "Running TestDecisionDepthSimulationAccounting...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = FirstMultiActionDecision(game);
+
+  DuneSearchConfig config;
+  config.max_simulations = 200;
+  config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+  config.max_search_decision_depth = 2;
+  DunePUCTISMCTSBot bot(config, MakeUniformMockEvaluator(*state));
+  DuneSearchResult result = bot.RunSearch(*state);
+  assert(result.simulations_completed <= 200);
+  assert(result.simulations_completed == config.max_simulations);
+  std::cout << "TestDecisionDepthSimulationAccounting Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -2778,6 +2865,9 @@ int main() {
   open_spiel::TestCommitLifecycle();
   open_spiel::TestConservativeOverrideCriteria();
   open_spiel::TestShortWindowRNGSeedContinuity();
+  open_spiel::TestDefaultDecisionDepthIsUnchanged();
+  open_spiel::TestDecisionDepthCapsOneAndTwo();
+  open_spiel::TestDecisionDepthSimulationAccounting();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

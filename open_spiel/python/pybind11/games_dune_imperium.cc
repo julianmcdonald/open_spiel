@@ -567,7 +567,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readwrite("conservative_meaningful_visit_threshold", &open_spiel::DuneSearchConfig::conservative_meaningful_visit_threshold)
       .def_readwrite("conservative_q_margin_threshold", &open_spiel::DuneSearchConfig::conservative_q_margin_threshold)
       .def_readwrite("conservative_stability_checkpoint_fraction", &open_spiel::DuneSearchConfig::conservative_stability_checkpoint_fraction)
-      .def_readwrite("conservative_continuation_overrides_disabled", &open_spiel::DuneSearchConfig::conservative_continuation_overrides_disabled);
+      .def_readwrite("conservative_continuation_overrides_disabled", &open_spiel::DuneSearchConfig::conservative_continuation_overrides_disabled)
+      .def_readwrite("max_search_decision_depth", &open_spiel::DuneSearchConfig::max_search_decision_depth);
 
   py::class_<open_spiel::SearchDiagnostics>(di, "SearchDiagnostics")
       .def_readonly("actions", &open_spiel::SearchDiagnostics::actions)
@@ -578,6 +579,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("total_root_visits", &open_spiel::SearchDiagnostics::total_root_visits)
       .def_readonly("num_covered_actions", &open_spiel::SearchDiagnostics::num_covered_actions)
       .def_readonly("covered_prior_mass", &open_spiel::SearchDiagnostics::covered_prior_mass)
+      .def_readonly("max_decision_depth", &open_spiel::SearchDiagnostics::max_decision_depth)
+      .def_readonly("mean_decision_depth", &open_spiel::SearchDiagnostics::mean_decision_depth)
       .def_readonly("protocol_version", &open_spiel::SearchDiagnostics::protocol_version)
       .def_readonly("session_id", &open_spiel::SearchDiagnostics::session_id)
       .def_readonly("searched_seat", &open_spiel::SearchDiagnostics::searched_seat)

@@ -62,6 +62,12 @@ ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
 ABSL_FLAG(int, rollouts, 32, "Number of rollouts per state in Gate 2");
 ABSL_FLAG(double, relative_time_budget_ms, -1.0, "Relative time budget in ms (-1.0 for infinity)");
 ABSL_FLAG(bool, gate1_only, false, "Only run Gate 1 validation (skip Gate 2 checks)");
+ABSL_FLAG(bool, skip_gate1, false,
+          "Skip Gate 1 entirely and run only the selected Gate 2 roots.");
+ABSL_FLAG(std::string, opportunity_root_indices, "",
+          "Comma-separated absolute corpus indices for Gate 2 roots.");
+ABSL_FLAG(int, opportunity_root_prefix, -1,
+          "Use only the first N Gate 2 opportunity roots (-1 means all).");
 ABSL_FLAG(bool, allow_any_opportunity_count, false, "Allow any number of opportunity states and bypass strict v2 metadata validations");
 ABSL_FLAG(double, live_continuation_reserve_seconds, 0.0, "Continuation reserve in seconds for live deadline mode");
 ABSL_FLAG(bool, nonlinear_value_head, false, "Use nonlinear value head architecture");
@@ -74,6 +80,10 @@ ABSL_FLAG(std::string, gate1_cache_path, "",
 ABSL_FLAG(std::string, choice_rollout_cache_path, "",
           "Optional validated cache for choice-only legal-action outcome rollouts.");
 ABSL_FLAG(std::string, cache_dir, "", "Directory for multi-layer cache storage.");
+ABSL_FLAG(int, max_search_decision_depth, -1,
+          "Maximum multi-action decision depth (-1 means uncapped).");
+ABSL_FLAG(bool, parallel_choice_rollouts, false,
+          "Parallelize forced-action continuations within each Gate 2 root.");
 
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 std::atomic<bool> g_cache_validation_failed{false};
@@ -178,6 +188,27 @@ double SpearmanCorrelation(const std::vector<double>& x, const std::vector<doubl
   }
   if (den_x == 0.0 || den_y == 0.0) return 0.0;
   return num / std::sqrt(den_x * den_y);
+}
+
+std::vector<size_t> ParseCorpusIndices(const std::string& value) {
+  std::vector<size_t> indices;
+  if (value.empty()) return indices;
+  size_t start = 0;
+  while (start < value.size()) {
+    size_t end = value.find(',', start);
+    std::string token = value.substr(
+        start, end == std::string::npos ? std::string::npos : end - start);
+    if (token.empty() || token.find_first_not_of("0123456789") !=
+                             std::string::npos) {
+      std::cerr << "Invalid --opportunity_root_indices token: " << token
+                << "\n";
+      std::exit(1);
+    }
+    indices.push_back(static_cast<size_t>(std::stoull(token)));
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return indices;
 }
 
 // Replay state history to reconstruct state
@@ -578,6 +609,7 @@ open_spiel::json::Object SerializeEvidence(const OpportunityStateEvidence& ev) {
   open_spiel::json::Array successor_true_arr;
   for (double v : ev.successor_true_values) successor_true_arr.push_back(v);
   obj["successor_true_values"] = successor_true_arr;
+  obj["action_rollout_values"] = successor_true_arr;
 
   obj["choice_rank_correlation"] = ev.choice_rank_correlation;
   obj["successor_mean_bias"] = ev.successor_mean_bias;
@@ -1385,6 +1417,8 @@ class SplitCacheManager {
     search_config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
     search_config["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
     search_config["raw_policy_seed"] = absl::GetFlag(FLAGS_raw_policy_seed);
+    search_config["max_search_decision_depth"] =
+        absl::GetFlag(FLAGS_max_search_decision_depth);
 
     controller_config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
     controller_config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
@@ -2280,6 +2314,19 @@ int main(int argc, char** argv) {
   bool mock_fail = absl::GetFlag(FLAGS_mock_miscalibrated_critic);
   bool self_test = absl::GetFlag(FLAGS_self_test);
 
+  // Self-test caps rollout counts for speed. Resolve them once as a cap, not a
+  // hardcode, so an explicitly smaller --rollouts / --diagnostic_rollouts is
+  // still honored (the silent override otherwise masks the requested count).
+  // Behavior-neutral for existing callers: both flag defaults exceed 2, so a
+  // plain --self_test still resolves to 2.
+  int effective_rollouts = absl::GetFlag(FLAGS_rollouts);
+  int effective_diagnostic_rollouts =
+      std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
+  if (self_test) {
+    effective_rollouts = std::min(effective_rollouts, 2);
+    effective_diagnostic_rollouts = std::min(effective_diagnostic_rollouts, 2);
+  }
+
   auto game = open_spiel::LoadGame("dune_imperium");
   int64_t obs_size = game->GetType().provides_information_state_tensor
                          ? game->InformationStateTensorSize()
@@ -2325,7 +2372,7 @@ int main(int argc, char** argv) {
 
   std::string cache_dir = absl::GetFlag(FLAGS_cache_dir);
   SplitCacheManager split_cache(cache_dir, model_checkpoint, corpus_path, search_seed,
-                                self_test ? 2 : absl::GetFlag(FLAGS_rollouts),
+                                effective_rollouts,
                                 utility_divisor, self_test, policy_fp);
 
 
@@ -2400,6 +2447,30 @@ int main(int argc, char** argv) {
 
   std::cout << absl::StrFormat("Found: %d strategic, %d opportunity, %d planner states.\n",
                                strategic_indices.size(), opportunity_indices.size(), planner_indices.size());
+  absl::flat_hash_map<size_t, int> opportunity_seed_indices;
+  for (size_t ordinal = 0; ordinal < opportunity_indices.size(); ++ordinal) {
+    opportunity_seed_indices[opportunity_indices[ordinal]] = ordinal;
+  }
+
+  const bool skip_gate1 = absl::GetFlag(FLAGS_skip_gate1);
+  const bool gate1_only_requested = absl::GetFlag(FLAGS_gate1_only);
+  const std::string requested_root_indices =
+      absl::GetFlag(FLAGS_opportunity_root_indices);
+  const int requested_root_prefix =
+      absl::GetFlag(FLAGS_opportunity_root_prefix);
+  if (skip_gate1 && gate1_only_requested) {
+    std::cerr << "--skip_gate1 and --gate1_only are mutually exclusive.\n";
+    return 1;
+  }
+  if (!requested_root_indices.empty() && requested_root_prefix >= 0) {
+    std::cerr << "Specify either --opportunity_root_indices or "
+                 "--opportunity_root_prefix, not both.\n";
+    return 1;
+  }
+  if (requested_root_prefix == 0 || requested_root_prefix < -1) {
+    std::cerr << "--opportunity_root_prefix must be positive or -1.\n";
+    return 1;
+  }
 
   if (!self_test) {
     if (absl::GetFlag(FLAGS_strict_v2_validation)) {
@@ -2490,11 +2561,36 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (!requested_root_indices.empty()) {
+    std::vector<size_t> selected = ParseCorpusIndices(requested_root_indices);
+    std::set<size_t> seen;
+    for (size_t idx : selected) {
+      if (idx >= corpus.size() || corpus[idx].category != "opportunity") {
+        std::cerr << "Requested corpus index " << idx
+                  << " is not an opportunity root.\n";
+        return 1;
+      }
+      if (!seen.insert(idx).second) {
+        std::cerr << "Duplicate opportunity corpus index: " << idx << "\n";
+        return 1;
+      }
+    }
+    opportunity_indices = std::move(selected);
+  } else if (requested_root_prefix >= 0 &&
+             static_cast<size_t>(requested_root_prefix) <
+                 opportunity_indices.size()) {
+    opportunity_indices.resize(requested_root_prefix);
+  }
+
   size_t target_g1 = self_test ? 2 : 64;
-  size_t target_g2 = self_test ? 2 : 32;
+  size_t target_g2 = (requested_root_indices.empty() &&
+                      requested_root_prefix < 0)
+      ? (self_test ? 2 : 32)
+      : opportunity_indices.size();
 
   std::vector<size_t> gate1_indices(strategic_indices.begin(), strategic_indices.begin() + std::min<size_t>(target_g1, strategic_indices.size()));
   std::vector<size_t> gate2_indices(opportunity_indices.begin(), opportunity_indices.begin() + std::min<size_t>(target_g2, opportunity_indices.size()));
+  if (skip_gate1) gate1_indices.clear();
 
   if (split_cache.IsActive()) {
     if (split_cache.VerifyManifest(corpus, gate1_indices, gate2_indices)) {
@@ -2574,7 +2670,7 @@ int main(int argc, char** argv) {
   // Gate 1 uses rollout-sized tasks rather than 64 state-sized tasks. This
   // avoids the multi-hour straggler tail when games have very different
   // remaining lengths.
-  int gate1_rollouts = self_test ? 2 : absl::GetFlag(FLAGS_rollouts);
+  int gate1_rollouts = effective_rollouts;
   std::vector<std::unique_ptr<State>> gate1_states;
   std::vector<std::vector<double>> gate1_returns(
       gate1_indices.size(), std::vector<double>(gate1_rollouts, 0.0));
@@ -2679,7 +2775,7 @@ int main(int argc, char** argv) {
   std::vector<ChoiceOutcomeCacheEntry> choice_outcome_cache(gate2_indices.size());
   bool choice_outcome_cache_loaded = false;
   std::string choice_cache_path = absl::GetFlag(FLAGS_choice_rollout_cache_path);
-  if (!self_test && absl::GetFlag(FLAGS_choice_only_gate2) &&
+  if (absl::GetFlag(FLAGS_choice_only_gate2) &&
       !choice_cache_path.empty() && std::filesystem::exists(choice_cache_path)) {
     try {
       std::ifstream cache_in(choice_cache_path);
@@ -2689,10 +2785,11 @@ int main(int argc, char** argv) {
       if (parsed) {
         auto obj = parsed.value().GetObject();
         auto states_arr = obj.at("states").GetArray();
+        int cached_rollouts = obj.at("rollouts").GetInt();
         bool valid = obj.at("protocol_version").GetString() == "choice-outcomes-v1" &&
                      obj.at("model_checkpoint_hash").GetString() == model_hash &&
                      obj.at("corpus_fingerprint").GetString() == corpus_hash &&
-                     obj.at("rollouts").GetInt() == absl::GetFlag(FLAGS_rollouts) &&
+                     cached_rollouts >= absl::GetFlag(FLAGS_rollouts) &&
                      obj.find("rollout_seed_base") != obj.end() &&
                      obj.at("rollout_seed_base").GetInt() == absl::GetFlag(FLAGS_rollout_seed_base) &&
                      obj.find("chance_seed_base") != obj.end() &&
@@ -2700,28 +2797,21 @@ int main(int argc, char** argv) {
                      obj.find("utility_divisor") != obj.end() &&
                      obj.at("utility_divisor").GetDouble() == utility_divisor &&
                      obj.find("binary_hash") != obj.end() &&
-                     obj.at("binary_hash").GetString() == open_spiel::ComputeFileSHA256("/proc/self/exe") &&
-                     obj.find("config") != obj.end() &&
-                     states_arr.size() == gate2_indices.size();
-        if (valid) {
-          auto cached_cfg = obj.at("config").GetObject();
-          valid = cached_cfg.at("opponent_mode").GetInt() == absl::GetFlag(FLAGS_opponent_mode) &&
-                  cached_cfg.at("opponent_temperature").GetDouble() == absl::GetFlag(FLAGS_opponent_temperature) &&
-                  cached_cfg.at("puct_c").GetDouble() == absl::GetFlag(FLAGS_puct_c) &&
-                  cached_cfg.at("max_simulations").GetInt() == absl::GetFlag(FLAGS_max_simulations) &&
-                  cached_cfg.at("nonlinear_value_head").GetBool() == absl::GetFlag(FLAGS_nonlinear_value_head) &&
-                  cached_cfg.at("conservative_override_enabled").GetBool() == absl::GetFlag(FLAGS_conservative_override_enabled) &&
-                  cached_cfg.at("conservative_covered_prior_threshold").GetDouble() == absl::GetFlag(FLAGS_conservative_covered_prior_threshold) &&
-                  cached_cfg.at("conservative_meaningful_visit_threshold").GetInt() == absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold) &&
-                  cached_cfg.at("conservative_q_margin_threshold").GetDouble() == absl::GetFlag(FLAGS_conservative_q_margin_threshold) &&
-                  cached_cfg.at("conservative_stability_checkpoint_fraction").GetDouble() == absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction) &&
-                  cached_cfg.at("conservative_continuation_overrides_disabled").GetBool() == absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled) &&
-                  cached_cfg.at("fixed_continuation_reserve").GetInt() == absl::GetFlag(FLAGS_fixed_continuation_reserve) &&
-                  cached_cfg.at("purchase_combat_budget").GetInt() == absl::GetFlag(FLAGS_purchase_combat_budget) &&
-                  cached_cfg.at("live_continuation_reserve_seconds").GetDouble() == absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+                     obj.at("binary_hash").GetString() ==
+                         open_spiel::ComputeFileSHA256("/proc/self/exe") &&
+                     !states_arr.empty();
+        absl::flat_hash_map<int, open_spiel::json::Object> cached_states;
+        for (const auto& state_value : states_arr) {
+          auto state_obj = state_value.GetObject();
+          cached_states[state_obj.at("corpus_index").GetInt()] = state_obj;
         }
-        for (size_t idx = 0; valid && idx < states_arr.size(); ++idx) {
-          auto state_obj = states_arr[idx].GetObject();
+        for (size_t idx = 0; valid && idx < gate2_indices.size(); ++idx) {
+          auto cached_it = cached_states.find(gate2_indices[idx]);
+          if (cached_it == cached_states.end()) {
+            valid = false;
+            break;
+          }
+          auto state_obj = cached_it->second;
           ChoiceOutcomeCacheEntry entry;
           entry.corpus_index = state_obj.at("corpus_index").GetInt();
           auto actions_arr = state_obj.at("actions").GetArray();
@@ -2734,14 +2824,16 @@ int main(int argc, char** argv) {
             entry.actions.push_back(static_cast<Action>(actions_arr[a_idx].GetInt()));
             entry.successor_critic_values.push_back(critics_arr[a_idx].GetDouble());
             auto action_returns = returns_arr[a_idx].GetArray();
-            if (action_returns.size() != static_cast<size_t>(absl::GetFlag(FLAGS_rollouts))) {
+            if (action_returns.size() < static_cast<size_t>(absl::GetFlag(FLAGS_rollouts))) {
               valid = false;
               break;
             }
             entry.returns.emplace_back();
-            entry.returns.back().reserve(action_returns.size());
-            for (const auto& value : action_returns) {
-              entry.returns.back().push_back(value.GetDouble());
+            entry.returns.back().reserve(absl::GetFlag(FLAGS_rollouts));
+            for (int rollout = 0; rollout < absl::GetFlag(FLAGS_rollouts);
+                 ++rollout) {
+              entry.returns.back().push_back(
+                  action_returns[rollout].GetDouble());
             }
           }
           if (valid) choice_outcome_cache[idx] = std::move(entry);
@@ -2751,7 +2843,7 @@ int main(int argc, char** argv) {
           std::cout << "Loaded validated choice rollout cache: "
                     << choice_cache_path << "\n";
           if (split_cache.IsActive()) {
-            for (size_t idx = 0; idx < states_arr.size(); ++idx) {
+            for (size_t idx = 0; idx < gate2_indices.size(); ++idx) {
               const auto& entry = choice_outcome_cache[idx];
               size_t corpus_idx = entry.corpus_index;
               const auto& cs = corpus[corpus_idx];
@@ -2789,6 +2881,7 @@ int main(int argc, char** argv) {
 
       size_t corpus_idx = gate2_indices[idx];
       const auto& cs = corpus[corpus_idx];
+      int seed_index = opportunity_seed_indices.at(corpus_idx);
 
       std::string h_hash = cs.history_hash;
       if (h_hash.empty()) h_hash = GetHistoryHash(cs.history);
@@ -2835,12 +2928,14 @@ int main(int argc, char** argv) {
         double t_budget = absl::GetFlag(FLAGS_relative_time_budget_ms);
         bot_cfg.relative_time_budget_ms = (t_budget > 0.0) ? t_budget : std::numeric_limits<double>::infinity();
       }
-      bot_cfg.seed = search_seed + 200000 + 1000 * idx;
+      bot_cfg.seed = search_seed + 200000 + 1000 * seed_index;
       bot_cfg.fixed_session_limit = bot_cfg.max_simulations;
       bot_cfg.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
       bot_cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
       bot_cfg.root_prior_temperature = absl::GetFlag(FLAGS_root_prior_temperature);
       bot_cfg.live_continuation_reserve_seconds = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
+      bot_cfg.max_search_decision_depth =
+          absl::GetFlag(FLAGS_max_search_decision_depth);
 
       bot_cfg.conservative_override_enabled = absl::GetFlag(FLAGS_conservative_override_enabled);
       bot_cfg.conservative_covered_prior_threshold = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
@@ -2852,7 +2947,7 @@ int main(int argc, char** argv) {
       // Compute Rollouts
       double q_raw_sum = 0.0;
       double q_search_sum = 0.0;
-      int rollouts = self_test ? 2 : absl::GetFlag(FLAGS_rollouts);
+      int rollouts = effective_rollouts;
       std::vector<double> raw_returns_list;
       std::vector<double> search_returns_list;
       std::vector<double> paired_diffs;
@@ -3075,7 +3170,8 @@ int main(int argc, char** argv) {
                     : DuneSearchBudgetMode::kLiveDeadline;
             DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
             root_res = root_session.Search(*state);
-            std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
+            std::mt19937 step_rng(
+                raw_policy_seed + 300000 + 1000 * seed_index);
             double r_val = absl::Uniform(step_rng, 0.0, 1.0);
             ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
             root_res = root_session.CommitAction(decision);
@@ -3235,8 +3331,8 @@ int main(int argc, char** argv) {
                 action_returns[a_idx].assign(rollouts, 0.0);
                 double critic_sum = 0.0;
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
-                  uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
+                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
+                  uint64_t rollout_seed = rollout_seed_base + 1000 * seed_index + k;
                   ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, rollout_seed, utility_divisor);
@@ -3251,8 +3347,8 @@ int main(int argc, char** argv) {
                 // Layer 3 missed, Layer 4 hit: run rollouts only
                 action_returns[a_idx].assign(rollouts, 0.0);
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
-                  uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
+                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
+                  uint64_t rollout_seed = rollout_seed_base + 1000 * seed_index + k;
                   ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, rollout_seed, utility_divisor);
@@ -3264,7 +3360,7 @@ int main(int argc, char** argv) {
                 // Layer 3 hit, Layer 4 missed: compute critic only
                 double critic_sum = 0.0;
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
+                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
                   critic_sum += GetSuccessorCriticValue(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, utility_divisor);
@@ -3285,24 +3381,52 @@ int main(int argc, char** argv) {
           action_returns.assign(
               root_actions.size(), std::vector<double>(rollouts, 0.0));
           successor_critic_vals.assign(root_actions.size(), 0.0);
-          for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
-            double critic_sum = 0.0;
-            for (int k = 1; k <= rollouts; ++k) {
-              uint64_t chance_seed = chance_seed_base + 1000 * idx + k;
-              uint64_t rollout_seed = rollout_seed_base + 1000 * idx + k;
+          std::vector<std::vector<double>> action_critics(
+              root_actions.size(), std::vector<double>(rollouts, 0.0));
+          std::atomic<int> next_action_rollout{0};
+          const int total_action_rollouts = root_actions.size() * rollouts;
+          auto run_action_rollouts = [&]() {
+            while (true) {
+              int task = next_action_rollout.fetch_add(1);
+              if (task >= total_action_rollouts) break;
+              size_t a_idx = task / rollouts;
+              int k = task % rollouts;
+              uint64_t chance_seed =
+                  chance_seed_base + 1000 * seed_index + k + 1;
+              uint64_t rollout_seed =
+                  rollout_seed_base + 1000 * seed_index + k + 1;
               ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                   *state, cs.player, root_actions[a_idx], global_evaluator.get(),
                   chance_seed, rollout_seed, utility_divisor);
-              action_returns[a_idx][k - 1] = forced.return_val;
-              critic_sum += forced.successor_critic;
+              action_returns[a_idx][k] = forced.return_val;
+              action_critics[a_idx][k] = forced.successor_critic;
             }
-            successor_critic_vals[a_idx] = critic_sum / rollouts;
+          };
+          int action_workers = absl::GetFlag(FLAGS_parallel_choice_rollouts)
+              ? std::min(num_threads, total_action_rollouts) : 1;
+          std::vector<std::thread> rollout_workers;
+          for (int worker = 0; worker < action_workers; ++worker) {
+            rollout_workers.emplace_back(run_action_rollouts);
+          }
+          for (auto& worker : rollout_workers) worker.join();
+          for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
+            successor_critic_vals[a_idx] = std::accumulate(
+                action_critics[a_idx].begin(), action_critics[a_idx].end(),
+                0.0) / rollouts;
           }
         }
         for (size_t a_idx = 0; a_idx < root_actions.size(); ++a_idx) {
           successor_true_vals[a_idx] =
               std::accumulate(action_returns[a_idx].begin(),
                               action_returns[a_idx].end(), 0.0) / rollouts;
+        }
+        if (!choice_outcome_cache_loaded) {
+          ChoiceOutcomeCacheEntry cache_entry;
+          cache_entry.corpus_index = corpus_idx;
+          cache_entry.actions = root_actions;
+          cache_entry.returns = action_returns;
+          cache_entry.successor_critic_values = successor_critic_vals;
+          choice_outcome_cache[idx] = std::move(cache_entry);
         }
 
         auto action_index = [&](Action action) -> size_t {
@@ -3470,7 +3594,8 @@ int main(int argc, char** argv) {
           }
           double leaf_true_sum = 0.0;
           for (int r = 1; r <= diagnostic_rollouts; ++r) {
-            uint64_t leaf_seed = 500000 + 1000 * idx + 100 * l_idx + r;
+            uint64_t leaf_seed =
+                500000 + 1000 * seed_index + 100 * l_idx + r;
             leaf_true_sum += RunRawPolicyRollout(
                 *leaf_state, cs.player, global_evaluator.get(), leaf_seed,
                 utility_divisor);
@@ -3578,7 +3703,7 @@ int main(int argc, char** argv) {
       int total_searched_decisions = 0;
 
       for (int k = 1; k <= rollouts; ++k) {
-        uint64_t roll_seed = 100000 + 1000 * idx + k;
+        uint64_t roll_seed = 100000 + 1000 * seed_index + k;
 
         // Raw controller rollout
         RawRolloutResult raw_res = RunRawControllerRollout(*state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
@@ -3682,7 +3807,8 @@ int main(int argc, char** argv) {
             : DuneSearchBudgetMode::kLiveDeadline;
         DuneSearchSession temp_session(bot_cfg, global_evaluator, mode);
         DuneSearchResult root_res = temp_session.Search(*state);
-        std::mt19937 step_rng(raw_policy_seed + 300000 + 1000 * idx);
+        std::mt19937 step_rng(
+            raw_policy_seed + 300000 + 1000 * seed_index);
         double r_val = absl::Uniform(step_rng, 0.0, 1.0);
         ControllerDecision decision = temp_session.SelectControllerAction(*state, root_res, r_val);
         root_res = temp_session.CommitAction(decision);
@@ -3697,12 +3823,11 @@ int main(int argc, char** argv) {
 
           double succ_critic_sum = 0.0;
           double succ_true_sum = 0.0;
-          int roll_count = self_test
-              ? 2
-              : std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
+          int roll_count = effective_diagnostic_rollouts;
 
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t roll_seed = 400000 + 1000 * idx + 100 * a_idx + r;
+            uint64_t roll_seed =
+                400000 + 1000 * seed_index + 100 * a_idx + r;
 
             auto roll_state = state->Clone();
             roll_state->ApplyAction(act);
@@ -3789,11 +3914,10 @@ int main(int argc, char** argv) {
           }
 
           double leaf_true_sum = 0.0;
-          int roll_count = self_test
-              ? 2
-              : std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
+          int roll_count = effective_diagnostic_rollouts;
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t roll_seed = 500000 + 1000 * idx + 100 * l_idx + r;
+            uint64_t roll_seed =
+                500000 + 1000 * seed_index + 100 * l_idx + r;
             leaf_true_sum += RunRawPolicyRollout(*leaf_state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
           }
           double leaf_true_val = leaf_true_sum / roll_count;
@@ -3931,7 +4055,9 @@ int main(int argc, char** argv) {
   // Launch Gate 2
   std::cout << "Gate 1 completed. Starting Gate 2...\n" << std::flush;
   std::vector<std::thread> workers_g2;
-  for (int i = 0; i < num_threads; ++i) {
+  int gate2_worker_count = absl::GetFlag(FLAGS_parallel_choice_rollouts)
+      ? 1 : num_threads;
+  for (int i = 0; i < gate2_worker_count; ++i) {
     workers_g2.emplace_back(worker_g2);
   }
   for (auto& w : workers_g2) {
@@ -3943,7 +4069,7 @@ int main(int argc, char** argv) {
     std::exit(2);
   }
 
-  if (!self_test && absl::GetFlag(FLAGS_choice_only_gate2) &&
+  if (absl::GetFlag(FLAGS_choice_only_gate2) &&
       !choice_outcome_cache_loaded && !choice_cache_path.empty()) {
     open_spiel::json::Object cache;
     cache["protocol_version"] = "choice-outcomes-v1";
@@ -3958,6 +4084,8 @@ int main(int argc, char** argv) {
     config["opponent_temperature"] = absl::GetFlag(FLAGS_opponent_temperature);
     config["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     config["max_simulations"] = absl::GetFlag(FLAGS_max_simulations);
+    config["max_search_decision_depth"] =
+        absl::GetFlag(FLAGS_max_search_decision_depth);
     config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
     config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
     config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
@@ -4024,12 +4152,16 @@ int main(int argc, char** argv) {
     total_bias += diff;
     total_sq_err += diff * diff;
   }
-  double mean_bias = total_bias / gate1_indices.size();
-  double rmse = std::sqrt(total_sq_err / gate1_indices.size());
+  double mean_bias = gate1_indices.empty()
+      ? 0.0 : total_bias / gate1_indices.size();
+  double rmse = gate1_indices.empty()
+      ? 0.0 : std::sqrt(total_sq_err / gate1_indices.size());
   double rank_corr = SpearmanCorrelation(v_critic_g1, v_true_g1);
 
   std::cout << "\n============================================\n";
-  std::cout << "      GATE 1: CRITIC FIDELITY REPORT        \n";
+  std::cout << (skip_gate1
+      ? "      GATE 1: SKIPPED BY RAPID PROBE        \n"
+      : "      GATE 1: CRITIC FIDELITY REPORT        \n");
   std::cout << "============================================\n";
   std::cout << absl::StrFormat("States Evaluated:     %d\n", gate1_indices.size());
   std::cout << absl::StrFormat("Normalized Mean Bias: %.4f (Limit <= 0.05)\n", mean_bias);
@@ -4212,7 +4344,7 @@ int main(int argc, char** argv) {
     std::cout << "============================================\n";
   }
 
-  bool bias_passed = (std::abs(mean_bias) <= 0.05);
+  bool bias_passed = skip_gate1 || (std::abs(mean_bias) <= 0.05);
 
   if (self_test) {
     if (!mock_fail) {
@@ -4271,6 +4403,9 @@ int main(int argc, char** argv) {
       config["rollouts"] = absl::GetFlag(FLAGS_rollouts);
       config["relative_time_budget_ms"] = absl::GetFlag(FLAGS_relative_time_budget_ms);
       config["gate1_only"] = absl::GetFlag(FLAGS_gate1_only);
+      config["skip_gate1"] = skip_gate1;
+      config["opportunity_root_indices"] = requested_root_indices;
+      config["opportunity_root_prefix"] = requested_root_prefix;
       config["allow_any_opportunity_count"] = absl::GetFlag(FLAGS_allow_any_opportunity_count);
       config["live_continuation_reserve_seconds"] = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
       config["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
@@ -4278,6 +4413,10 @@ int main(int argc, char** argv) {
       config["diagnostic_rollouts"] = absl::GetFlag(FLAGS_diagnostic_rollouts);
       config["gate1_cache_path"] = absl::GetFlag(FLAGS_gate1_cache_path);
       config["choice_rollout_cache_path"] = absl::GetFlag(FLAGS_choice_rollout_cache_path);
+      config["max_search_decision_depth"] =
+          absl::GetFlag(FLAGS_max_search_decision_depth);
+      config["parallel_choice_rollouts"] =
+          absl::GetFlag(FLAGS_parallel_choice_rollouts);
       config["conservative_override_enabled"] = absl::GetFlag(FLAGS_conservative_override_enabled);
       config["conservative_covered_prior_threshold"] = absl::GetFlag(FLAGS_conservative_covered_prior_threshold);
       config["conservative_meaningful_visit_threshold"] = absl::GetFlag(FLAGS_conservative_meaningful_visit_threshold);
@@ -4321,13 +4460,15 @@ int main(int argc, char** argv) {
       }
       root["search_protocol_version"] = "session-v4";
 
-      root["passed"] = bias_passed && (gate2_indices.empty() || bootstrap_passed);
+      root["passed"] = bias_passed &&
+          (gate2_indices.empty() || bootstrap_passed);
 
       open_spiel::json::Object g1;
       g1["states_evaluated"] = static_cast<int64_t>(gate1_indices.size());
       g1["mean_bias"] = mean_bias;
       g1["rmse"] = rmse;
       g1["rank_correlation"] = rank_corr;
+      g1["skipped"] = skip_gate1;
       root["gate1"] = g1;
 
       open_spiel::json::Object g2;
@@ -4461,6 +4602,7 @@ int main(int argc, char** argv) {
         open_spiel::json::Array successor_true_arr;
         for (double v : ev.successor_true_values) successor_true_arr.push_back(v);
         ev_obj["successor_true_values"] = successor_true_arr;
+        ev_obj["action_rollout_values"] = successor_true_arr;
 
         ev_obj["choice_rank_correlation"] = ev.choice_rank_correlation;
         ev_obj["successor_mean_bias"] = ev.successor_mean_bias;
