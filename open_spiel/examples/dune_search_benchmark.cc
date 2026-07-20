@@ -69,6 +69,8 @@ ABSL_FLAG(int, fixed_continuation_reserve, 0, "Continuation reserve simulations.
 ABSL_FLAG(int, purchase_combat_budget, 16, "Purchase/combat short-window simulation budget.");
 ABSL_FLAG(double, live_continuation_reserve_seconds, 10.0, "Live continuation reserve seconds.");
 ABSL_FLAG(bool, live_deadline, false, "Use live deadline budget mode instead of fixed simulations.");
+ABSL_FLAG(bool, use_session, true, "If true (default), drive the search seat through the persistent DuneSearchSession. If false, reproduce the July-14 reference protocol: a fresh full search per decision via DunePUCTISMCTSBot::Step() (bot->Step(), including its sample-on-fallback selection), with no shared session budget.");
+ABSL_FLAG(bool, policy_only, false, "Policy-only control arm: run the session in kPolicyOnly budget mode so the candidate plays the raw network policy on every decision (no search). Pair with --purchase_combat_budget=0 and --temperature=0 for a pure greedy-policy baseline vs the greedy opponents.");
 ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
@@ -295,6 +297,9 @@ void WorkerThread(
         search_model, device, 10.0f);
 
     std::unique_ptr<DuneSearchSession> search_session;
+    // Path B (--use_session=false): a plain search bot driven by Step() per
+    // decision, reproducing the July-14 reference protocol verbatim.
+    std::unique_ptr<DunePUCTISMCTSBot> search_bot;
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
       if (p == search_seat) {
@@ -330,10 +335,17 @@ void WorkerThread(
         config.conservative_q_margin_threshold = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
         config.conservative_stability_checkpoint_fraction = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
         config.conservative_continuation_overrides_disabled = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
-        DuneSearchBudgetMode budget_mode = absl::GetFlag(FLAGS_live_deadline)
-            ? DuneSearchBudgetMode::kLiveDeadline
-            : DuneSearchBudgetMode::kFixedSessionSimulations;
-        search_session = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
+        DuneSearchBudgetMode budget_mode = absl::GetFlag(FLAGS_policy_only)
+            ? DuneSearchBudgetMode::kPolicyOnly
+            : (absl::GetFlag(FLAGS_live_deadline)
+                ? DuneSearchBudgetMode::kLiveDeadline
+                : DuneSearchBudgetMode::kFixedSessionSimulations);
+        if (absl::GetFlag(FLAGS_use_session)) {
+          search_session = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
+        } else {
+          // Reference protocol: fresh full search per decision, no session.
+          search_bot = std::make_unique<DunePUCTISMCTSBot>(config, search_evaluator);
+        }
       } else {
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
@@ -393,12 +405,22 @@ void WorkerThread(
       Action chosen_action = -1;
 
       if (current_player == search_seat) {
-        open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, search_session->HasActiveSession());
+        bool has_active = search_session ? search_session->HasActiveSession() : false;
+        open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, has_active);
         game_role_counts[static_cast<int>(role)]++;
         bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
-        DuneSearchResult last_res = search_session->SearchAndSelect(*state);
-        chosen_action = last_res.diagnostics.selected_action;
+        DuneSearchResult last_res;
+        if (search_session) {
+          last_res = search_session->SearchAndSelect(*state);
+          chosen_action = last_res.diagnostics.selected_action;
+        } else {
+          // Path B: fresh full search per decision, sample-on-fallback (verbatim
+          // July-14 reference selection). GetLastSearchResult exposes diagnostics.
+          chosen_action = search_bot->Step(*state);
+          last_res = search_bot->GetLastSearchResult();
+          last_res.diagnostics.selected_action = chosen_action;
+        }
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
 
@@ -443,7 +465,7 @@ void WorkerThread(
           int target_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary)
               ? (absl::GetFlag(FLAGS_max_simulations) - reserve)
               : absl::GetFlag(FLAGS_max_simulations);
-          int completed_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary)
+          int completed_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary || !search_session)
               ? last_res.simulations_completed
               : search_session->session_new_simulations_completed();
 
