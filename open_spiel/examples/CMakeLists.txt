@@ -28,6 +28,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_online_search_collector_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_online_search_collector_test COMMAND dune_online_search_collector_test)
 
+  add_executable(dune_collector_smoke
+    dune_collector_smoke.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_collector_smoke dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 

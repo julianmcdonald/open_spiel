@@ -493,9 +493,13 @@ void TestCollectUpdateSwordmasterGrantAll() {
   std::cout << "TestCollectUpdateSwordmasterGrantAll Passed!\n\n";
 }
 
-// fraction=0.0 is structurally inert: both new counters are 0, and running with
-// two different grant_round values but everything else identical yields
-// byte-identical example streams (the round knob does nothing at fraction 0).
+// fraction=0.0 is structurally inert for the GRANT path: no grant fires, and
+// running with two different grant_round values but everything else identical
+// yields byte-identical example streams AND an identical measured organic count
+// (the round knob does nothing at fraction 0). NOTE: after the step-0 ungate the
+// organic counter is measured for EVERY game, so at fraction 0 it is a real
+// uniform-mock baseline that need NOT be 0 (random play sometimes buys a
+// Swordmaster) — we assert it is inert to grant_round, not that it is zero.
 void TestCollectUpdateSwordmasterInert() {
   std::cout << "Running TestCollectUpdateSwordmasterInert...\n";
   auto game = LoadGame("dune_imperium");
@@ -512,8 +516,7 @@ void TestCollectUpdateSwordmasterInert() {
   std::vector<SearchTrainingExample> o1;
   OnlineSearchCollectionStats s1;
   OnlineSearchCollector(c, "h").CollectUpdate(4, game, eval, &o1, &s1);
-  assert(s1.swordmaster_granted_games == 0);
-  assert(s1.swordmaster_organic_games == 0);
+  assert(s1.swordmaster_granted_games == 0);  // fraction 0 -> no grant fires
 
   // Same config but a different grant_round: at fraction 0 the knob is inert, so
   // the emitted example stream (episode/decision/legal_actions/visits) and stats
@@ -524,7 +527,8 @@ void TestCollectUpdateSwordmasterInert() {
   OnlineSearchCollectionStats s2;
   OnlineSearchCollector(c2, "h").CollectUpdate(4, game, eval, &o2, &s2);
   assert(s2.swordmaster_granted_games == 0);
-  assert(s2.swordmaster_organic_games == 0);
+  // Organic is inert to grant_round at fraction 0 (measured, not necessarily 0).
+  assert(s1.swordmaster_organic_games == s2.swordmaster_organic_games);
   assert(RunSignature(o1, s1) == RunSignature(o2, s2));  // round inert @ frac 0
 
   std::cout << "  frac0 granted=" << s1.swordmaster_granted_games
@@ -564,6 +568,8 @@ void TestCollectUpdateSwordmasterPartial() {
   // Exact count is seed-deterministic (the 0.5 selection draw over episodes
   // 0..7 selects 5): observed once, then hard-coded.
   assert(s1.swordmaster_granted_games == 5);
+  // Measured organic baseline (step-0 ungate): 0 here — none of the 3 non-granted
+  // games' searched seats hold a Swordmaster at terminal. Seed-deterministic.
   assert(s1.swordmaster_organic_games == 0);
   std::cout << "TestCollectUpdateSwordmasterPartial Passed!\n\n";
 }

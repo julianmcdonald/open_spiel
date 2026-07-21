@@ -576,14 +576,15 @@ void OnlineSearchCollector::CollectUpdate(
 
     // Swordmaster endowment curriculum ignition metric: the searched seat owns
     // Swordmaster at terminal WITHOUT a grant firing this game (organic
-    // acquisition). Read-only; gated on the feature being active so at fraction
-    // 0.0 no engine call is made and behavior is byte-identical to today.
-    if (config_.swordmaster_grant_fraction > 0.0) {
-      if (auto* gr_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(
-              state.get())) {
-        if (gr_state->HasSwordmaster(searched_seat) && !grant_fired) {
-          ++stats->swordmaster_organic_games;
-        }
+    // acquisition). Runs for EVERY game regardless of grant fraction so a
+    // fraction-0 run reports organic buys as a measured 0, not a never-ran 0.
+    // Read-only const dynamic_cast + HasSwordmaster: no stream draw, no
+    // mutation, so fraction-0 behavior stays byte-identical to today. (The grant
+    // DRAW and grant HOOK above remain gated on the fraction being > 0.)
+    if (auto* gr_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(
+            state.get())) {
+      if (gr_state->HasSwordmaster(searched_seat) && !grant_fired) {
+        ++stats->swordmaster_organic_games;
       }
     }
   }
