@@ -90,6 +90,13 @@ ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu levels 5/6 breadcrumbs.");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
+ABSL_FLAG(double, specimen_exchange_penalty, 0.0,
+          "Magnitude of the negative shaping SUBTRACTED from a transition that "
+          "takes a ConvertSpecimenToTroop action (IDs 740-752). Training-only "
+          "anti-breadcrumb (never eval). Apply the SAME value to BOTH pilot and "
+          "control arms so the search-distillation contrast stays a pure "
+          "experiment. Typical 0.02 (terminal win utility is 2.25). Requires "
+          "--allow_shaping.");
 ABSL_FLAG(bool, allow_shaping, false,
           "Allow experimental reward shaping flags to be non-zero.");
 ABSL_FLAG(double, reward_scale, 4.0,
@@ -763,6 +770,7 @@ std::string ComputeLegacyConfigFingerprint() {
   config_obj["shaped_reward_weight"] = absl::GetFlag(FLAGS_shaped_reward_weight);
   config_obj["tleilaxu_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   config_obj["tleilaxu_level7_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  config_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
   config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
   config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
   config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
@@ -802,6 +810,7 @@ std::string ComputeConfigFingerprint() {
   config_obj["shaped_reward_weight"] = absl::GetFlag(FLAGS_shaped_reward_weight);
   config_obj["tleilaxu_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
   config_obj["tleilaxu_level7_breadcrumb_weight"] = absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+  config_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
   config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
   config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
   config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
@@ -1029,6 +1038,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
     double tleilaxu_level7_breadcrumb_weight =
         absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    double specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
 
     torch::NoGradGuard no_grad;
     int game_length = 0;
@@ -1277,6 +1288,22 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
           int strength_delta = post_strength - pre_combat_strength[current_player];
           if (strength_delta > 0) {
             combat_accumulator.RecordDeployment(current_player, trajectory->size() - 1, strength_delta);
+          }
+        }
+
+        // Specimen-exchange anti-breadcrumb (Item 3): a small negative shaping on
+        // the transition that takes a ConvertSpecimenToTroop action (IDs 740-752),
+        // to discourage the over-used specimen->troop breadcrumb behavior.
+        // Training-only (never eval). Must be set to the SAME value on both the
+        // pilot and control arms so the search-distillation contrast stays pure.
+        if (specimen_exchange_penalty != 0.0 &&
+            current_player >= 0 && current_player < game.NumPlayers() &&
+            action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
+            action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12) {
+          int idx = last_transition_index[current_player];
+          if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+            (*trajectory)[idx].reward -=
+                static_cast<float>(specimen_exchange_penalty) * reward_lambda;
           }
         }
 
@@ -1542,7 +1569,8 @@ int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
   if (absl::GetFlag(FLAGS_shaped_reward_weight) != 0.0 ||
       absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight) != 0.0 ||
-      absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight) != 0.0) {
+      absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight) != 0.0 ||
+      absl::GetFlag(FLAGS_specimen_exchange_penalty) != 0.0) {
     if (!absl::GetFlag(FLAGS_allow_shaping)) {
       std::cerr << "Fatal: Reward shaping weights are non-zero but --allow_shaping is not set. "
                 << "To run with reward shaping, pass --allow_shaping=true." << std::endl;
