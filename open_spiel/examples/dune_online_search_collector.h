@@ -61,9 +61,17 @@ struct OnlineSearchConfig {
   double search_probability = 0.25;     // deterministic Bernoulli at strategic roots
   int workers = 1;                      // auxiliary games collected sequentially
 
-  // --- Frozen teacher search budget (64 primary / 8 continuation) ---
-  int max_simulations = 72;             // fixed_session_limit; primary = limit - reserve
-  int fixed_continuation_reserve = 8;   // -> 64 primary simulations
+  // --- Frozen teacher search budget: a UNIFORM 64 sims at every searched root. ---
+  // The collector builds one cold session per root and discards it, so the
+  // continuation reserve was dead weight (never spent) and purchases would
+  // otherwise inherit the 16-sim short-window default. Reserve 0 + a 64-sim
+  // short-window budget give primary, continuation, AND purchase roots exactly 64
+  // sims each (see dune_search_session.cc:264-344). Item-4 telemetry monitors
+  // per-role KL vs the 200-sim baselines; if a role teaches far below, raise ITS
+  // budget (for purchases that means purchase_combat_budget, not max_simulations).
+  int max_simulations = 64;             // fixed_session_limit
+  int fixed_continuation_reserve = 0;   // reserve unused (one cold session per root)
+  int purchase_combat_budget = 64;      // short-window (purchase) roots also get 64
   int max_search_decision_depth = -1;   // UNCAPPED (Step 1 winner). Do not cap.
   double puct_c = 0.30;                 // calibrated (Stage 3 / Step 1 winner)
   bool use_opponent_model = true;       // policy opponent model
@@ -71,6 +79,19 @@ struct OnlineSearchConfig {
   double root_prior_temperature = 1.0;
   double utility_divisor = 4.0;
   bool nonlinear_value_head = false;    // baseline critic. Do not swap.
+
+  // --- KataGo root-exploration package (Phase 18B; §3.1-3.2 of 1902.10565). ---
+  // A UNIT: root Dirichlet noise + forced playouts + FPU=0 at the noised root
+  // (in the search core), paired with visit-target pruning in the collector
+  // (noise without pruning pollutes the CE target at the 64-sim budget). Active
+  // ONLY when dirichlet_epsilon > 0. Default OFF: the frozen Step-2 teacher is
+  // noise-free, so this matches it (and the Step-3 probe, which runs noise-off).
+  // The pilot opts in by setting dirichlet_epsilon = 0.25. The other three fields
+  // hold pilot-ready values but are inert while dirichlet_epsilon == 0.
+  double dirichlet_epsilon = 0.0;        // root Dirichlet noise weight (pilot: 0.25)
+  double dirichlet_alpha_total = 10.83;  // per-root alpha = total / N_legal
+  double forced_playouts_k = 2.0;        // n_forced(c) = sqrt(k * P_noised(c) * N_root)
+  bool root_noise_fpu_zero = true;       // FPU = 0 at the noised root (footnote 3)
 
   // --- Non-search seats (in-game opponents during auxiliary games) ---
   double non_search_temperature = 1.0;  // stochastic policy at temperature 1.0
@@ -95,12 +116,26 @@ struct OnlineSearchConfig {
 };
 
 // Aggregate collection diagnostics for one update (persisted + logged).
+// Item-4 per-role search telemetry: KL(normalized_visits || prior) and the
+// prior-argmax override rate, compared against the 200-sim role baselines
+// (primary 0.43/24%, continuation 0.51/25%, purchase 0.62/29%). Accumulated over
+// every SEARCHED root of that role (not only accepted ones), for comparability.
+struct PerRoleSearchStats {
+  int roots_seen = 0;              // search-target roots of this role encountered
+  int searches = 0;               // Bernoulli-selected (a search ran)
+  int accepted = 0;               // passed acceptance -> emitted as a CE target
+  double sum_kl = 0.0;            // sum over `searches` of KL(visits || prior)
+  int prior_argmax_overrides = 0; // searches where argmax(visits) != argmax(prior)
+};
+
 struct OnlineSearchCollectionStats {
   int auxiliary_games = 0;
-  int strategic_roots_seen = 0;
+  int strategic_roots_seen = 0;         // search-target roots (primary+cont+purchase)
   int searches_selected = 0;            // Bernoulli(0.25) selected
   int accepted_targets = 0;
   int rejected_incomplete = 0;          // searched but failed acceptance
+  // Per-role telemetry, index 0=primary, 1=continuation, 2=purchase.
+  PerRoleSearchStats by_role[3];
   int64_t first_episode_id = -1;
   int64_t next_episode_id = -1;         // to persist for resume
 
@@ -168,6 +203,19 @@ class OnlineSearchCollector {
 // `target` on `warmup_update`, held at `target` thereafter. Free function so
 // the trainer and its tests share one definition.
 double SearchLossCoefForUpdate(int update_id, double target, int warmup_update);
+
+// KataGo policy-target pruning (§3.2 of 1902.10565), exposed for unit testing.
+// Given FINAL root stats, returns pruned visit counts to renormalize into the CE
+// target: for every child except the most-visited c*, remove up to
+// n_forced(c) = floor(sqrt(forced_k * priors[c] * total_root_visits)) visits, but
+// never so many that the child's PUCT value would reach c*'s at the final stats;
+// then drop any non-c* child left with a single visit. `priors` are the tree
+// (post-noise) priors, aligned with `visits` and `q_values`.
+std::vector<int> PruneForcedPlayouts(const std::vector<int>& visits,
+                                     const std::vector<double>& priors,
+                                     const std::vector<double>& q_values,
+                                     int total_root_visits, double puct_c,
+                                     double forced_k);
 
 }  // namespace open_spiel
 

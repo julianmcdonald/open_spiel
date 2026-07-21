@@ -342,6 +342,120 @@ void TestCollectUpdatePpoOnlyNoLeakage() {
   std::cout << "TestCollectUpdatePpoOnlyNoLeakage Passed!\n\n";
 }
 
+// KataGo visit-target pruning (Item 2d). Hand-computed expected outcomes.
+void TestPruneForcedPlayouts() {
+  std::cout << "Running TestPruneForcedPlayouts...\n";
+
+  // n <= 1 is an identity.
+  assert((PruneForcedPlayouts({7}, {1.0}, {0.2}, 7, 0.3, 2.0) == std::vector<int>{7}));
+
+  // A: c* (index 0) is never pruned; two weak, forced children collapse to a
+  // single visit and are then dropped. Verified by hand against the formula:
+  //   n_forced=floor(sqrt(k*P*N)); remove while PUCT(c,v-1) < PUCT(c*); drop v==1.
+  {
+    std::vector<int> pruned = PruneForcedPlayouts(
+        /*visits=*/{40, 5, 3}, /*priors=*/{0.6, 0.3, 0.1},
+        /*q=*/{0.5, -0.5, -0.8}, /*N=*/48, /*puct_c=*/0.3, /*k=*/2.0);
+    assert((pruned == std::vector<int>{40, 0, 0}));
+  }
+
+  // B: a genuinely competitive runner-up (high Q, PUCT already >= c*'s at full
+  // visits) is protected from pruning; only the weak child is dropped.
+  {
+    std::vector<int> pruned = PruneForcedPlayouts(
+        /*visits=*/{25, 20, 3}, /*priors=*/{0.4, 0.4, 0.2},
+        /*q=*/{0.30, 0.40, -0.5}, /*N=*/48, /*puct_c=*/0.3, /*k=*/2.0);
+    assert((pruned == std::vector<int>{25, 20, 0}));
+  }
+
+  std::cout << "TestPruneForcedPlayouts Passed!\n\n";
+}
+
+// Integration smoke: the collector runs end-to-end with the exploration package
+// (noise + forced playouts + FPU=0 + pruning) enabled, emits well-formed pruned
+// CE targets, and stays deterministic.
+void TestCollectUpdateExplorationPackage() {
+  std::cout << "Running TestCollectUpdateExplorationPackage...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig c = FastCollectConfig();
+  c.dirichlet_epsilon = 0.25;        // activate the package
+  c.dirichlet_alpha_total = 10.83;
+  c.forced_playouts_k = 2.0;
+  c.root_noise_fpu_zero = true;
+
+  OnlineSearchCollector col1(c, "ckpt");
+  std::vector<SearchTrainingExample> ex1;
+  OnlineSearchCollectionStats s1;
+  col1.CollectUpdate(1, game, eval, &ex1, &s1);
+
+  // Every emitted CE target is a valid distribution over its legal actions.
+  for (const auto& e : ex1) {
+    assert(e.normalized_visits.size() == e.legal_actions.size());
+    double sum = 0.0;
+    for (double v : e.normalized_visits) {
+      assert(v >= 0.0);
+      sum += v;
+    }
+    assert(std::abs(sum - 1.0) < 1e-9);
+  }
+
+  // Determinism: an identical config/seed reproduces the run bit-for-bit.
+  OnlineSearchCollector col2(c, "ckpt");
+  std::vector<SearchTrainingExample> ex2;
+  OnlineSearchCollectionStats s2;
+  col2.CollectUpdate(1, game, eval, &ex2, &s2);
+  assert(RunSignature(ex1, s1) == RunSignature(ex2, s2));
+
+  std::cout << "  accepted=" << s1.accepted_targets
+            << " emitted=" << ex1.size() << " (package on)\n";
+  std::cout << "TestCollectUpdateExplorationPackage Passed!\n\n";
+}
+
+// Item 1 (surface extension) + Item 4 (per-role telemetry): the collector now
+// searches primary, continuation, AND purchase roots (the strategic-state gate
+// does NOT bypass continuation/purchase), and the per-role counters + KL are
+// populated and partition the aggregates exactly.
+void TestCollectUpdateSurfaceAndTelemetry() {
+  std::cout << "Running TestCollectUpdateSurfaceAndTelemetry...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+  OnlineSearchConfig c = FastCollectConfig();
+  c.search_probability = 1.0;  // search every target root
+  OnlineSearchCollector col(c, "ckpt");
+  std::vector<SearchTrainingExample> ex;
+  OnlineSearchCollectionStats s;
+  col.CollectUpdate(3, game, eval, &ex, &s);
+
+  // All three surface roles are actually searched (empirically confirms the
+  // strategic-state gate covers continuation + purchase, not just primary).
+  assert(s.by_role[0].searches > 0);  // primary
+  assert(s.by_role[1].searches > 0);  // continuation
+  assert(s.by_role[2].searches > 0);  // purchase
+
+  // Per-role counters partition the aggregates exactly.
+  int sum_searches = s.by_role[0].searches + s.by_role[1].searches + s.by_role[2].searches;
+  int sum_accept = s.by_role[0].accepted + s.by_role[1].accepted + s.by_role[2].accepted;
+  assert(sum_searches == s.searches_selected);
+  assert(sum_accept == s.accepted_targets);
+
+  // KL non-negative + finite; override in [0, searches]; accepted/searches sane.
+  for (int r = 0; r < 3; ++r) {
+    assert(s.by_role[r].sum_kl >= -1e-9);
+    assert(std::isfinite(s.by_role[r].sum_kl));
+    assert(s.by_role[r].prior_argmax_overrides >= 0);
+    assert(s.by_role[r].prior_argmax_overrides <= s.by_role[r].searches);
+    assert(s.by_role[r].accepted <= s.by_role[r].searches);
+    assert(s.by_role[r].searches <= s.by_role[r].roots_seen);
+  }
+  std::cout << "  searched primary/cont/purchase = " << s.by_role[0].searches << "/"
+            << s.by_role[1].searches << "/" << s.by_role[2].searches
+            << "  accepted = " << s.by_role[0].accepted << "/" << s.by_role[1].accepted
+            << "/" << s.by_role[2].accepted << "\n";
+  std::cout << "TestCollectUpdateSurfaceAndTelemetry Passed!\n\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -354,6 +468,9 @@ int main() {
   open_spiel::TestCollectUpdateRejectPath();
   open_spiel::TestCollectUpdateDeterminismAndSeedDomain();
   open_spiel::TestCollectUpdatePpoOnlyNoLeakage();
+  open_spiel::TestPruneForcedPlayouts();
+  open_spiel::TestCollectUpdateExplorationPackage();
+  open_spiel::TestCollectUpdateSurfaceAndTelemetry();
   std::cout << "All Dune online search collector tests passed!\n";
   return 0;
 }

@@ -121,7 +121,87 @@ Action SampleRawPolicyAction(const ActionsAndProbs& prior, double temperature,
   return a;
 }
 
+// Item-4 telemetry: KL(normalized visits || prior) and whether the search's most
+// visited action differs from the prior's argmax. `visits` and `priors` aligned.
+struct VisitPriorDivergence {
+  double kl = 0.0;
+  bool prior_argmax_override = false;
+};
+VisitPriorDivergence ComputeVisitPriorDivergence(const std::vector<int>& visits,
+                                                 const std::vector<double>& priors) {
+  VisitPriorDivergence d;
+  if (visits.empty() || visits.size() != priors.size()) return d;
+  double total = 0.0;
+  for (int v : visits) total += v;
+  if (total <= 0.0) return d;
+  size_t vmax = 0, pmax = 0;
+  for (size_t i = 0; i < visits.size(); ++i) {
+    double p = static_cast<double>(visits[i]) / total;
+    if (p > 0.0) d.kl += p * std::log(p / std::max(priors[i], 1e-12));
+    if (visits[i] > visits[vmax]) vmax = i;
+    if (priors[i] > priors[pmax]) pmax = i;
+  }
+  d.prior_argmax_override = (vmax != pmax);
+  return d;
+}
+
 }  // namespace
+
+// KataGo policy-target pruning (§3.2 of 1902.10565). Returns pruned root visit
+// counts to renormalize into the CE target. For every child except the
+// most-visited c*, remove up to n_forced(c) = floor(sqrt(k * P_noised(c) *
+// N_root)) visits, but never so many that the child's PUCT value would reach
+// c*'s at the final stats (those visits were earned, not forced); then drop any
+// non-c* child left with a single visit. `priors` are the tree (post-noise)
+// priors, aligned with `visits` and `q_values`. Only meaningful when the
+// exploration package ran (forced_k > 0); callers gate on that.
+std::vector<int> PruneForcedPlayouts(const std::vector<int>& visits,
+                                     const std::vector<double>& priors,
+                                     const std::vector<double>& q_values,
+                                     int total_root_visits, double puct_c,
+                                     double forced_k) {
+  const size_t n = visits.size();
+  std::vector<int> pruned = visits;
+  if (n <= 1) return pruned;
+
+  int cstar = 0;
+  double sum_v = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    sum_v += visits[i];
+    if (visits[i] > visits[cstar]) cstar = static_cast<int>(i);
+  }
+  double N = (total_root_visits > 0) ? static_cast<double>(total_root_visits) : sum_v;
+  const double sqrtN = std::sqrt(std::max(1.0, N));
+
+  auto puct = [&](int idx, int v) {
+    return q_values[idx] +
+           puct_c * priors[idx] * sqrtN / (1.0 + static_cast<double>(v));
+  };
+  const double puct_cstar = puct(cstar, visits[cstar]);
+
+  for (size_t c = 0; c < n; ++c) {
+    if (static_cast<int>(c) == cstar || visits[c] <= 0) continue;
+    const int n_forced =
+        static_cast<int>(std::floor(std::sqrt(forced_k * priors[c] * N)));
+    int v = visits[c];
+    int removed = 0;
+    // Remove forced playouts one at a time; stop before the child would become
+    // PUCT-competitive with c* (removing a visit shrinks the denominator, raising
+    // U and hence PUCT).
+    while (removed < n_forced && v > 1 &&
+           puct(static_cast<int>(c), v - 1) < puct_cstar) {
+      --v;
+      ++removed;
+    }
+    pruned[c] = v;
+  }
+  // Drop non-c* children reduced to a single visit (single-playout children are
+  // exploration noise, not signal).
+  for (size_t c = 0; c < n; ++c) {
+    if (static_cast<int>(c) != cstar && pruned[c] == 1) pruned[c] = 0;
+  }
+  return pruned;
+}
 
 OnlineSearchCollector::OnlineSearchCollector(const OnlineSearchConfig& config,
                                              std::string checkpoint_hash)
@@ -204,9 +284,9 @@ void OnlineSearchCollector::CollectUpdate(
   // do NOT call LoadCalibratedParameters(): the frozen benchmark sets every
   // field explicitly and so do we, so no manifest can silently move puct etc.
   DuneSearchConfig base_cfg;
-  base_cfg.max_simulations = config_.max_simulations;                 // 72
-  base_cfg.fixed_session_limit = config_.max_simulations;            // 72
-  base_cfg.fixed_continuation_reserve = config_.fixed_continuation_reserve;  // 8 -> 64 primary
+  base_cfg.max_simulations = config_.max_simulations;                 // 64
+  base_cfg.fixed_session_limit = config_.max_simulations;            // 64
+  base_cfg.fixed_continuation_reserve = config_.fixed_continuation_reserve;  // 0 (uniform 64)
   base_cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
   base_cfg.max_nodes = 50000;
   base_cfg.puct_c = config_.puct_c;                                  // 0.30
@@ -228,8 +308,14 @@ void OnlineSearchCollector::CollectUpdate(
   base_cfg.check_strategic_state = true;
   base_cfg.root_prior_temperature = config_.root_prior_temperature;  // 1.0
   base_cfg.max_search_decision_depth = config_.max_search_decision_depth;  // -1 (uncapped)
-  base_cfg.purchase_combat_budget = 16;
+  base_cfg.purchase_combat_budget = config_.purchase_combat_budget;   // 64 (uniform)
   base_cfg.conservative_override_enabled = false;
+  // KataGo root-exploration package (Phase 18B). A unit with the collector-side
+  // visit-target pruning below. Disabled when dirichlet_epsilon == 0 (Step-3 probe).
+  base_cfg.dirichlet_epsilon = config_.dirichlet_epsilon;          // 0.25
+  base_cfg.dirichlet_alpha_total = config_.dirichlet_alpha_total;  // 10.83 -> alpha=total/N_legal
+  base_cfg.forced_playouts_k = config_.forced_playouts_k;          // 2.0
+  base_cfg.root_noise_fpu_zero = config_.root_noise_fpu_zero;      // true
 
   double sum_sims = 0.0;
   double sum_covered_mass = 0.0;
@@ -279,20 +365,36 @@ void OnlineSearchCollector::CollectUpdate(
       // --- Searched seat. ---
       const DuneDecisionRole role =
           ClassifyDuneDecisionRole(*state, cur, /*has_active_session=*/false);
-      const bool is_strategic_root = (role == DuneDecisionRole::kAgentPrimary);
+      // Phase 18B search surface: agent-phase primaries + continuations AND
+      // purchases. The arm-4 decomposition (25.0% = policy-only, 0% of the
+      // policy->full gap recovered) showed the search lever lives in the
+      // non-agent-phase decisions, so purchases stay in. Combat/other-optional
+      // are a later tranche, not this pilot.
+      const bool is_search_target =
+          role == DuneDecisionRole::kAgentPrimary ||
+          role == DuneDecisionRole::kAgentContinuation ||
+          role == DuneDecisionRole::kPurchase;
+      // Per-role telemetry index: 0=primary, 1=continuation, 2=purchase, else -1.
+      const int role_idx =
+          role == DuneDecisionRole::kAgentPrimary      ? 0
+          : role == DuneDecisionRole::kAgentContinuation ? 1
+          : role == DuneDecisionRole::kPurchase          ? 2
+                                                         : -1;
 
       Action chosen = kInvalidAction;  // set by an accepted search; else raw below.
 
-      if (is_strategic_root) {
+      if (is_search_target) {
         ++stats->strategic_roots_seen;
+        if (role_idx >= 0) ++stats->by_role[role_idx].roots_seen;
         if (ShouldSearchAtRoot(episode_id, this_decision)) {
           ++stats->searches_selected;
+          if (role_idx >= 0) ++stats->by_role[role_idx].searches;
 
-          // Fresh, cold session per root: one primary (limit - reserve == 64)
-          // simulation search. This reproduces the teacher's PRIMARY-root search
-          // exactly (a primary decision inherits nothing) while keeping the
-          // Bernoulli-sampled roots independent — no persistent-session re-root
-          // state to corrupt across skipped roots.
+          // Fresh, cold session per root: one UNIFORM 64-sim search regardless of
+          // role (reserve 0, purchase_combat_budget 64). A cold session inherits
+          // nothing, so this reproduces the teacher's search at that root exactly
+          // while keeping the Bernoulli-sampled roots independent — no
+          // persistent-session re-root state to corrupt across skipped roots.
           DuneSearchConfig cfg = base_cfg;
           cfg.seed = DeriveStream(config_.auxiliary_search_seed_domain, episode_id,
                                   this_decision, kStreamSearchSeed);
@@ -311,6 +413,25 @@ void OnlineSearchCollector::CollectUpdate(
           if (res.timeout_status) ++stats->timeouts;
           sum_sims += res.simulations_completed;
 
+          // Item-4 per-role telemetry: KL(visits||prior) + prior-argmax override,
+          // over every searched root (accepted or not) for comparability with the
+          // 200-sim role baselines (primary 0.43/24%, cont 0.51/25%, purch 0.62/29%).
+          // The baselines are vs the RAW network prior, so compare against the
+          // pre-noise prior (diag.raw_priors) when the exploration package noised
+          // the root; diag.priors (post-noise) would inflate KL and corrupt the
+          // budget decision in item 4. Falls back to diag.priors when no noise ran
+          // (then priors already equals the raw prior).
+          if (role_idx >= 0) {
+            const std::vector<double>& telemetry_priors =
+                diag.raw_priors.empty() ? diag.priors : diag.raw_priors;
+            VisitPriorDivergence d =
+                ComputeVisitPriorDivergence(diag.visit_counts, telemetry_priors);
+            stats->by_role[role_idx].sum_kl += d.kl;
+            if (d.prior_argmax_override) {
+              ++stats->by_role[role_idx].prior_argmax_overrides;
+            }
+          }
+
           // Acceptance is recomputed from the visit counts + root priors so the
           // collector, not the controller, owns the accept/reject decision.
           const int legal_count = static_cast<int>(diag.actions.size());
@@ -325,12 +446,33 @@ void OnlineSearchCollector::CollectUpdate(
           sum_covered_mass += covered_mass;
 
           if (accept) {
+            // Raw normalized visit distribution: used to EXECUTE the auxiliary-game
+            // move (faithful to the search's actual policy).
             double total = 0.0;
             for (int v : diag.visit_counts) total += v;
             SPIEL_CHECK_GT(total, 0.0);  // acceptance implies visited actions.
-            std::vector<double> normalized(diag.visit_counts.size());
+            std::vector<double> raw_normalized(diag.visit_counts.size());
             for (size_t i = 0; i < diag.visit_counts.size(); ++i) {
-              normalized[i] = static_cast<double>(diag.visit_counts[i]) / total;
+              raw_normalized[i] = static_cast<double>(diag.visit_counts[i]) / total;
+            }
+
+            // CE target: KataGo visit-target pruning when the exploration package
+            // ran (forced playouts present); otherwise the raw visit distribution.
+            std::vector<double> target = raw_normalized;
+            const bool package_active =
+                config_.forced_playouts_k > 0.0 && config_.dirichlet_epsilon > 0.0 &&
+                diag.q_values.size() == diag.visit_counts.size();
+            if (package_active) {
+              std::vector<int> pruned = PruneForcedPlayouts(
+                  diag.visit_counts, diag.priors, diag.q_values,
+                  diag.total_root_visits, config_.puct_c, config_.forced_playouts_k);
+              double ptot = 0.0;
+              for (int v : pruned) ptot += v;
+              if (ptot > 0.0) {
+                for (size_t i = 0; i < pruned.size(); ++i) {
+                  target[i] = static_cast<double>(pruned[i]) / ptot;
+                }
+              }
             }
 
             SearchTrainingExample ex;
@@ -338,7 +480,7 @@ void OnlineSearchCollector::CollectUpdate(
                                              : state->ObservationTensor(cur);
             ex.player = cur;
             ex.legal_actions = diag.actions;      // aligned to normalized_visits
-            ex.normalized_visits = normalized;    // CE target
+            ex.normalized_visits = target;        // CE target (pruned when noised)
             ex.value_target = 0.0;                // attached at terminal
             ex.value_target_attached = false;
             ex.checkpoint_hash = checkpoint_hash_;
@@ -354,13 +496,15 @@ void OnlineSearchCollector::CollectUpdate(
             emitted_indices.push_back(out->size());
             out->push_back(std::move(ex));
             ++stats->accepted_targets;
+            if (role_idx >= 0) ++stats->by_role[role_idx].accepted;
 
-            // Execute an action sampled from the normalized visit distribution.
+            // Execute an action sampled from the RAW visit distribution (the
+            // search's actual policy), independent of the target pruning above.
             double r_act = UnitDouble(DeriveStream(config_.auxiliary_search_seed_domain,
                                                   episode_id, this_decision,
                                                   kStreamAcceptedAction));
             int idx = SampleIndexWithTemperature(
-                normalized, config_.accepted_action_temperature, r_act);
+                raw_normalized, config_.accepted_action_temperature, r_act);
             chosen = diag.actions[idx];
           } else {
             ++stats->rejected_incomplete;
