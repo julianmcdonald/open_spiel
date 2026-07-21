@@ -86,6 +86,13 @@ ABSL_FLAG(int, force_swordmaster_rounds, 0,
           "decision while GetCurrentRound() <= this value AND it does not yet own "
           "Swordmaster; afterwards it plays normally. 0 (default) = arm A (no "
           "forcing). Uses a separate rng so paired seeds stay aligned with arm A.");
+ABSL_FLAG(int, grant_swordmaster_round, 0,
+          "Swordmaster endowment probe (arm B-endow): if > 0, at the searched "
+          "seat's FIRST decision of this round (before it places any agent) the "
+          "seat is GRANTED Swordmaster free via SetSwordmasterForTesting -- no "
+          "solari cost, no forcing of any action. Persistence across later rounds "
+          "is handled by the engine (permanent third agent, commit c8b3bf6); the "
+          "probe adds NO persistence logic. 0 (default) = off (= arm A).");
 ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
@@ -350,6 +357,9 @@ void WorkerThread(
       ParseFreshSearchRoles(absl::GetFlag(FLAGS_fresh_search_roles));
   // Swordmaster probe (arm B): rounds through which to force acquisition (0 = off).
   const int force_swordmaster_rounds = absl::GetFlag(FLAGS_force_swordmaster_rounds);
+  // Swordmaster endowment probe (arm B-endow): round at which to grant the
+  // searched seat a free Swordmaster (0 = off). Persistence is the engine's job.
+  const int grant_swordmaster_round = absl::GetFlag(FLAGS_grant_swordmaster_round);
 
   while (true) {
     int offset = next_game_id++;
@@ -454,6 +464,13 @@ void WorkerThread(
     // the search log, so this in-loop sampling is the only place they surface.
     int sm_acquire_round = -1;
     std::map<int, int> search_seat_solari_by_round;
+    // Third-agent utilization (arm B-endow diagnostic): per round, the agents the
+    // searched seat DEPLOYED (counted as agents_remaining decrements) and its peak
+    // available agents that round. Utilization = placements / available; a
+    // stranded third agent shows up as placements < available.
+    std::map<int, int> search_seat_placements_by_round;
+    std::map<int, int> search_seat_agents_avail_by_round;
+    int prev_search_agents = -1;
 
     while (!state->IsTerminal()) {
       Player current_player = state->CurrentPlayer();
@@ -462,6 +479,33 @@ void WorkerThread(
         search_seat_solari_by_round[trk_round] = trk->GetPlayerSolari(search_seat);
         if (sm_acquire_round < 0 && trk->HasSwordmaster(search_seat)) {
           sm_acquire_round = trk_round;
+        }
+        // Per-round third-agent utilization: track peak available agents and
+        // count deployments as decrements in agents_remaining. A grant/round
+        // reset raises the count (not a deployment) and is ignored here.
+        const int cur_agents =
+            trk->GetPlayerAgentsRemainingForTesting(search_seat);
+        if (cur_agents > search_seat_agents_avail_by_round[trk_round]) {
+          search_seat_agents_avail_by_round[trk_round] = cur_agents;
+        }
+        if (prev_search_agents >= 0 && cur_agents < prev_search_agents) {
+          search_seat_placements_by_round[trk_round] +=
+              (prev_search_agents - cur_agents);
+        }
+        prev_search_agents = cur_agents;
+      }
+      // Swordmaster endowment (arm B-endow): grant the searched seat a free
+      // Swordmaster at its FIRST decision of the grant round, before it places
+      // any agent that round. Fires once (HasSwordmaster gates re-entry);
+      // persistence across later rounds is the engine's permanent third agent.
+      // No solari deducted, no action forced.
+      if (grant_swordmaster_round > 0 && current_player == search_seat) {
+        if (auto* gr_state =
+                dynamic_cast<dune_imperium::DuneImperiumState*>(state.get())) {
+          if (gr_state->GetCurrentRound() == grant_swordmaster_round &&
+              !gr_state->HasSwordmaster(search_seat)) {
+            gr_state->SetSwordmasterForTesting(search_seat, true);
+          }
         }
       }
       if (in_search_turn && current_player != search_seat && current_player != kChancePlayerId) {
@@ -895,6 +939,20 @@ void WorkerThread(
         }
         game_obj["search_seat_solari_rounds"] = sbr_rounds;
         game_obj["search_seat_solari_values"] = sbr_solari;
+        // Third-agent utilization: per round, agents available (peak) vs placed
+        // (deployed) by the searched seat. Iterate the availability map so every
+        // observed round appears; placements default to 0 when none were used.
+        open_spiel::json::Array spr_rounds, spr_placed, spr_avail;
+        for (const auto& kv : search_seat_agents_avail_by_round) {
+          spr_rounds.push_back(static_cast<int64_t>(kv.first));
+          spr_avail.push_back(static_cast<int64_t>(kv.second));
+          auto it = search_seat_placements_by_round.find(kv.first);
+          spr_placed.push_back(static_cast<int64_t>(
+              it == search_seat_placements_by_round.end() ? 0 : it->second));
+        }
+        game_obj["search_seat_placement_rounds"] = spr_rounds;
+        game_obj["search_seat_placements_used"] = spr_placed;
+        game_obj["search_seat_agents_available"] = spr_avail;
 
         open_spiel::json::Array opp_sm_arr;
         for (int p = 0; p < 4; ++p) {
@@ -1289,6 +1347,7 @@ int main(int argc, char* argv[]) {
     agg_obj["use_session"] = absl::GetFlag(FLAGS_use_session);
     agg_obj["fresh_search_roles"] = absl::GetFlag(FLAGS_fresh_search_roles);
     agg_obj["force_swordmaster_rounds"] = static_cast<int64_t>(absl::GetFlag(FLAGS_force_swordmaster_rounds));
+    agg_obj["grant_swordmaster_round"] = static_cast<int64_t>(absl::GetFlag(FLAGS_grant_swordmaster_round));
     agg_obj["max_simulations"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_simulations));
     agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     agg_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
