@@ -13,6 +13,7 @@
 #include <functional>
 #include <mutex>
 #include <map>
+#include <set>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -30,6 +31,7 @@
 #include "dune_search_session.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_warmstart_helpers.h"  // ChooseHeuristicAcquisitionAction (swordmaster probe)
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include <fstream>
 
@@ -71,6 +73,19 @@ ABSL_FLAG(double, live_continuation_reserve_seconds, 10.0, "Live continuation re
 ABSL_FLAG(bool, live_deadline, false, "Use live deadline budget mode instead of fixed simulations.");
 ABSL_FLAG(bool, use_session, true, "If true (default), drive the search seat through the persistent DuneSearchSession. If false, reproduce the July-14 reference protocol: a fresh full search per decision via DunePUCTISMCTSBot::Step() (bot->Step(), including its sample-on-fallback selection), with no shared session budget.");
 ABSL_FLAG(bool, policy_only, false, "Policy-only control arm: run the session in kPolicyOnly budget mode so the candidate plays the raw network policy on every decision (no search). Pair with --purchase_combat_budget=0 and --temperature=0 for a pure greedy-policy baseline vs the greedy opponents.");
+ABSL_FLAG(std::string, fresh_search_roles, "",
+          "Decomposition arm 4 (Path B only, requires --use_session=false): "
+          "comma-separated decision roles that receive a fresh full search; every "
+          "OTHER searched-seat decision plays the raw-prior argmax (identical to the "
+          "policy-only arm's selection). Empty (default) = search every decision "
+          "(unchanged full-search behavior). Recognized tokens: primary, "
+          "continuation, purchase, combat, other, leader, forced.");
+ABSL_FLAG(int, force_swordmaster_rounds, 0,
+          "Swordmaster probe (arm B): if > 0, the searched seat is forced toward "
+          "legal Swordmaster acquisition (Task-10 acquisition heuristic) on every "
+          "decision while GetCurrentRound() <= this value AND it does not yet own "
+          "Swordmaster; afterwards it plays normally. 0 (default) = arm A (no "
+          "forcing). Uses a separate rng so paired seeds stay aligned with arm A.");
 ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
@@ -261,6 +276,58 @@ struct GameStats {
 };
 
 
+// Parses --fresh_search_roles (comma-separated role tokens) into a role set.
+// Empty input -> empty set, which the driver treats as "search every role"
+// (unchanged full-search behavior). Unknown tokens are a fatal misconfiguration.
+std::set<DuneDecisionRole> ParseFreshSearchRoles(const std::string& csv) {
+  std::set<DuneDecisionRole> roles;
+  std::stringstream ss(csv);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    size_t b = tok.find_first_not_of(" \t");
+    size_t e = tok.find_last_not_of(" \t");
+    if (b == std::string::npos) continue;  // skip empty/whitespace token
+    tok = tok.substr(b, e - b + 1);
+    if (tok == "primary") roles.insert(DuneDecisionRole::kAgentPrimary);
+    else if (tok == "continuation") roles.insert(DuneDecisionRole::kAgentContinuation);
+    else if (tok == "purchase") roles.insert(DuneDecisionRole::kPurchase);
+    else if (tok == "combat") roles.insert(DuneDecisionRole::kCombatIntrigue);
+    else if (tok == "other") roles.insert(DuneDecisionRole::kOtherOptional);
+    else if (tok == "leader") roles.insert(DuneDecisionRole::kLeaderSelection);
+    else if (tok == "forced") roles.insert(DuneDecisionRole::kForcedOrBookkeeping);
+    else SpielFatalError("Unrecognized --fresh_search_roles token: '" + tok + "'");
+  }
+  return roles;
+}
+
+// Raw-prior action selection for roles filtered OUT of fresh search in arm 4.
+// Matches the policy-only arm's PickActionRespectingTemperature exactly: at
+// temperature 0 the first strictly-max-prior action (argmax, first-max
+// tie-break); at temperature > 0, an inverse-CDF sample from the prior. Empty
+// prior degrades to the first legal action.
+Action SelectRawPriorAction(DuneNNEvaluator& evaluator, const State& state,
+                            double temperature, std::mt19937& rng) {
+  ActionsAndProbs prior = evaluator.Prior(state);
+  if (prior.empty()) {
+    std::vector<Action> legals = state.LegalActions();
+    return legals.empty() ? kInvalidAction : legals.front();
+  }
+  if (temperature == 0.0) {
+    Action best = prior.front().first;
+    double best_p = prior.front().second;
+    for (const auto& ap : prior) {
+      if (ap.second > best_p) {
+        best_p = ap.second;
+        best = ap.first;
+      }
+    }
+    return best;
+  }
+  double r = absl::Uniform(rng, 0.0, 1.0);
+  return SampleActionFromPrior(prior, r);
+}
+
+
 void WorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
@@ -278,6 +345,12 @@ void WorkerThread(
   // Local thread stats accumulation to reduce lock contention
   GameStats thread_stats;
 
+  // Arm-4 decomposition role filter (Path B only). Empty set = search every role.
+  const std::set<DuneDecisionRole> fresh_search_roles =
+      ParseFreshSearchRoles(absl::GetFlag(FLAGS_fresh_search_roles));
+  // Swordmaster probe (arm B): rounds through which to force acquisition (0 = off).
+  const int force_swordmaster_rounds = absl::GetFlag(FLAGS_force_swordmaster_rounds);
+
   while (true) {
     int offset = next_game_id++;
     if (offset >= total_games) break;
@@ -285,6 +358,10 @@ void WorkerThread(
 
     uint64_t game_seed = dune_seed::DeriveSeed(absl::GetFlag(FLAGS_seed), dune_seed::kStreamBlueprint, g);
     std::mt19937 game_rng(game_seed);
+    // Separate stream for the swordmaster-acquisition heuristic (arm B), so
+    // forcing does not consume game_rng and the chance/opponent realizations stay
+    // aligned with arm A until the game paths themselves diverge.
+    std::mt19937 force_rng(dune_seed::DeriveSeed(absl::GetFlag(FLAGS_seed), dune_seed::kStreamSearchGate, g));
     auto game_start_time = std::chrono::steady_clock::now();
 
     bool rotate_seat = absl::GetFlag(FLAGS_rotate_seat);
@@ -404,7 +481,32 @@ void WorkerThread(
 
       Action chosen_action = -1;
 
-      if (current_player == search_seat) {
+      // Swordmaster probe (arm B): before the searched seat searches, force it
+      // toward legal Swordmaster acquisition in the early rounds. Bypasses the
+      // search machinery entirely (no simulations, no search-stats pollution).
+      bool forced_swordmaster = false;
+      if (force_swordmaster_rounds > 0 && current_player == search_seat) {
+        const auto* sm_state =
+            dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+        if (sm_state != nullptr &&
+            sm_state->GetCurrentRound() <= force_swordmaster_rounds &&
+            !sm_state->HasSwordmaster(search_seat)) {
+          // Probe validity: force acquisition ONLY at decisions where a legal
+          // swordmaster/smuggling/shipping move exists. When none does the helper
+          // returns kInvalidAction and we fall through to the normal search path
+          // below (forced_swordmaster stays false). A uniform-random fallback here
+          // would randomize purchases/combat/reveals in rounds 1-3 (the 18A
+          // uniform-policy poison) and misattribute the loss to swordmaster.
+          chosen_action = ChooseHeuristicAcquisitionAction(
+              *state, state->LegalActions(), search_seat, &force_rng,
+              /*return_invalid_on_no_acquisition=*/true);
+          forced_swordmaster = (chosen_action != kInvalidAction);
+        }
+      }
+
+      if (forced_swordmaster) {
+        // chosen_action already set by the acquisition heuristic; skip search.
+      } else if (current_player == search_seat) {
         bool has_active = search_session ? search_session->HasActiveSession() : false;
         open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, has_active);
         game_role_counts[static_cast<int>(role)]++;
@@ -417,9 +519,26 @@ void WorkerThread(
         } else {
           // Path B: fresh full search per decision, sample-on-fallback (verbatim
           // July-14 reference selection). GetLastSearchResult exposes diagnostics.
-          chosen_action = search_bot->Step(*state);
-          last_res = search_bot->GetLastSearchResult();
-          last_res.diagnostics.selected_action = chosen_action;
+          // Arm-4 role filter: with a non-empty --fresh_search_roles set, only the
+          // listed roles are searched; every other searched-seat decision plays the
+          // raw-prior argmax, identical to the policy-only arm. This decomposes the
+          // full-search arm into "policy-only + search at the listed roles".
+          const bool search_this_role =
+              fresh_search_roles.empty() || fresh_search_roles.count(role) > 0;
+          if (search_this_role) {
+            chosen_action = search_bot->Step(*state);
+            last_res = search_bot->GetLastSearchResult();
+            last_res.diagnostics.selected_action = chosen_action;
+          } else {
+            chosen_action = SelectRawPriorAction(
+                *search_evaluator, *state, absl::GetFlag(FLAGS_temperature), game_rng);
+            last_res = DuneSearchResult();
+            last_res.simulations_completed = 0;
+            last_res.used_fallback = true;
+            last_res.fallback_reason = "role_filtered_raw_prior";
+            last_res.diagnostics.selected_action = chosen_action;
+            last_res.diagnostics.decision_role = std::to_string(static_cast<int>(role));
+          }
         }
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
@@ -908,6 +1027,17 @@ int main(int argc, char* argv[]) {
   auto run_start_time = std::chrono::steady_clock::now();
   absl::ParseCommandLine(argc, argv);
 
+  // Arm-4 (agent-phase decomposition): the --fresh_search_roles filter is only
+  // defined for the Path B fresh-search driver. Fail fast on misuse or typos,
+  // before any threads spawn.
+  if (!absl::GetFlag(FLAGS_fresh_search_roles).empty()) {
+    if (absl::GetFlag(FLAGS_use_session)) {
+      open_spiel::SpielFatalError(
+          "--fresh_search_roles requires --use_session=false (Path B fresh search).");
+    }
+    (void)open_spiel::ParseFreshSearchRoles(absl::GetFlag(FLAGS_fresh_search_roles));
+  }
+
   // Set PyTorch thread limit to 1 to avoid thread contention across CPU-bound forward runs
   at::set_num_threads(1);
   at::set_num_interop_threads(1);
@@ -1134,6 +1264,9 @@ int main(int argc, char* argv[]) {
     agg_obj["start_episode_id"] = static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id));
     agg_obj["games_played"] = static_cast<int64_t>(total_games);
     agg_obj["threads"] = static_cast<int64_t>(num_threads);
+    agg_obj["use_session"] = absl::GetFlag(FLAGS_use_session);
+    agg_obj["fresh_search_roles"] = absl::GetFlag(FLAGS_fresh_search_roles);
+    agg_obj["force_swordmaster_rounds"] = static_cast<int64_t>(absl::GetFlag(FLAGS_force_swordmaster_rounds));
     agg_obj["max_simulations"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_simulations));
     agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     agg_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);

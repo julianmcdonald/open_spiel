@@ -263,13 +263,22 @@ inline Action FindActionOrCardPathToSpace(
   return compatible_cards[dis(*rng)];
 }
 
-// Heuristic goal-biased action selection for owner when policy is bypassed
+// Heuristic goal-biased action selection for owner when policy is bypassed.
+//
+// `return_invalid_on_no_acquisition` (default false preserves Task-10 behavior):
+// when true, if NO acquisition-relevant move (swordmaster/smuggling/shipping) is
+// legal at this state, return kInvalidAction instead of a uniform-random legal
+// action. Probe callers (swordmaster arm B) MUST set this true and fall through
+// to normal play/search on kInvalidAction — a random fallback would randomize
+// unrelated purchase/combat/reveal decisions (the Phase-18A uniform-policy poison
+// class) and misattribute that damage to the swordmaster hypothesis.
 inline Action ChooseHeuristicAcquisitionAction(
     const State& state,
     const std::vector<Action>& actions,
     Player owner,
-    std::mt19937* rng) {
-  
+    std::mt19937* rng,
+    bool return_invalid_on_no_acquisition = false) {
+
   if (std::find(actions.begin(), actions.end(), dune_imperium::kActionAgentSpaceSwordmaster) != actions.end()) {
     return dune_imperium::kActionAgentSpaceSwordmaster;
   }
@@ -302,6 +311,13 @@ inline Action ChooseHeuristicAcquisitionAction(
 
   if (std::find(actions.begin(), actions.end(), dune_imperium::kActionShippingLevel1Dividends) != actions.end()) {
     return dune_imperium::kActionShippingLevel1Dividends;
+  }
+
+  // No acquisition-relevant move is legal here. Probe callers must NOT play a
+  // random move at such decisions (see the flag doc above); signal "not an
+  // acquisition decision" so the driver can route it to the normal path.
+  if (return_invalid_on_no_acquisition) {
+    return kInvalidAction;
   }
 
   std::uniform_int_distribution<int> dis(0, actions.size() - 1);
