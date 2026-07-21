@@ -21,6 +21,10 @@
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
+// DuneImperiumState + SetSwordmasterForTesting/HasSwordmaster/GetCurrentRound
+// for the Swordmaster endowment curriculum (engine is symlinked into the tree;
+// same path dune_search_benchmark.cc uses).
+#include "open_spiel/games/dune_imperium/dune_imperium.h"
 // Pulls in DuneSearchSession/DuneSearchConfig/DuneSearchResult/SearchDiagnostics,
 // IsStrategicState, SampleActionFromPrior, DuneDecisionRole/ClassifyDuneDecisionRole,
 // and (transitively) open_spiel::algorithms::Evaluator.
@@ -50,6 +54,7 @@ constexpr uint64_t kStreamRawPolicy = 0x22;
 constexpr uint64_t kStreamSearchSeed = 0x33;
 constexpr uint64_t kStreamControllerR = 0x44;
 constexpr uint64_t kStreamAcceptedAction = 0x55;
+constexpr uint64_t kStreamSwordmasterGrant = 0x66;
 
 // Deterministic 64-bit draw for (seed_domain, episode_id, index, stream).
 uint64_t DeriveStream(uint64_t seed_domain, int64_t episode_id, int64_t index,
@@ -213,6 +218,9 @@ OnlineSearchCollector::OnlineSearchCollector(const OnlineSearchConfig& config,
   SPIEL_CHECK_GT(config_.max_simulations, config_.fixed_continuation_reserve);
   SPIEL_CHECK_LT(config_.max_search_decision_depth, 0);  // 18B is uncapped
   SPIEL_CHECK_EQ(config_.nonlinear_value_head, false);   // 18B uses baseline critic
+  SPIEL_CHECK_GE(config_.swordmaster_grant_fraction, 0.0);
+  SPIEL_CHECK_LE(config_.swordmaster_grant_fraction, 1.0);
+  SPIEL_CHECK_GE(config_.swordmaster_grant_round, 1);
 }
 
 Player OnlineSearchCollector::SearchedSeatForEpisode(int64_t episode_id,
@@ -324,6 +332,20 @@ void OnlineSearchCollector::CollectUpdate(
     const int64_t episode_id = first_episode_id + g;
     const Player searched_seat = SearchedSeatForEpisode(episode_id, num_players);
 
+    // Swordmaster endowment curriculum: deterministic per-episode selection on
+    // its own stream (no draw at all when the fraction is 0, so the existing
+    // chance/raw-policy/search/controller/accepted-action streams and the whole
+    // collection are byte-identical to today). Selected games grant the searched
+    // seat a free Swordmaster once, at the hook below.
+    bool grant_selected = false;
+    bool grant_fired = false;
+    if (config_.swordmaster_grant_fraction > 0.0) {
+      grant_selected =
+          UnitDouble(DeriveStream(config_.auxiliary_search_seed_domain, episode_id,
+                                  /*index=*/0, kStreamSwordmasterGrant)) <
+          config_.swordmaster_grant_fraction;
+    }
+
     std::unique_ptr<State> state = game->NewInitialState();
     int64_t decision_index = 0;  // global index over non-chance decisions (any seat)
     int64_t chance_index = 0;
@@ -350,6 +372,22 @@ void OnlineSearchCollector::CollectUpdate(
       const Player cur = state->CurrentPlayer();
       SPIEL_CHECK_GE(cur, 0);  // Dune is sequential: no simultaneous nodes.
       const int64_t this_decision = decision_index++;
+
+      // Swordmaster endowment curriculum: grant the searched seat a free
+      // Swordmaster at its FIRST decision of the grant round, before it places
+      // any agent that round. Fires once; persistence is the engine's permanent
+      // third agent (c8b3bf6). No solari deducted, no action forced.
+      if (grant_selected && !grant_fired && cur == searched_seat) {
+        if (auto* gr_state =
+                dynamic_cast<dune_imperium::DuneImperiumState*>(state.get())) {
+          if (gr_state->GetCurrentRound() == config_.swordmaster_grant_round &&
+              !gr_state->HasSwordmaster(searched_seat)) {
+            gr_state->SetSwordmasterForTesting(searched_seat, true);
+            grant_fired = true;
+            ++stats->swordmaster_granted_games;
+          }
+        }
+      }
 
       // --- Non-searched seat: raw stochastic policy @ non_search_temperature. ---
       if (cur != searched_seat) {
@@ -534,6 +572,19 @@ void OnlineSearchCollector::CollectUpdate(
       SPIEL_CHECK_LT(ex.player, static_cast<int>(returns.size()));
       ex.value_target = returns[ex.player] / config_.utility_divisor;
       ex.value_target_attached = true;
+    }
+
+    // Swordmaster endowment curriculum ignition metric: the searched seat owns
+    // Swordmaster at terminal WITHOUT a grant firing this game (organic
+    // acquisition). Read-only; gated on the feature being active so at fraction
+    // 0.0 no engine call is made and behavior is byte-identical to today.
+    if (config_.swordmaster_grant_fraction > 0.0) {
+      if (auto* gr_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(
+              state.get())) {
+        if (gr_state->HasSwordmaster(searched_seat) && !grant_fired) {
+          ++stats->swordmaster_organic_games;
+        }
+      }
     }
   }
 

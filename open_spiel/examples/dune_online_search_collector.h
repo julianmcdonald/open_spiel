@@ -93,6 +93,19 @@ struct OnlineSearchConfig {
   double forced_playouts_k = 2.0;        // n_forced(c) = sqrt(k * P_noised(c) * N_root)
   bool root_noise_fpu_zero = true;       // FPU = 0 at the noised root (footnote 3)
 
+  // --- Swordmaster endowment curriculum (Phase 18B follow-on to the arm-B-endow
+  // probe). If swordmaster_grant_fraction > 0, a deterministic per-episode draw
+  // (domain-separated stream; no draw at all when the fraction is 0) selects
+  // that fraction of games; in selected games the SEARCHED seat is granted
+  // Swordmaster free via SetSwordmasterForTesting at its first decision of
+  // swordmaster_grant_round. Purpose: the critic was trained pre-c8b3bf6 and
+  // has never seen third-agent states, so search cannot credit the buy; granted
+  // games carry honest terminal value targets for those states. Persistence
+  // across rounds is the engine's permanent third agent — no logic here.
+  // Default 0.0 = structurally inert.
+  double swordmaster_grant_fraction = 0.0;
+  int swordmaster_grant_round = 2;  // matches the endowment probe (arm B-endow)
+
   // --- Non-search seats (in-game opponents during auxiliary games) ---
   double non_search_temperature = 1.0;  // stochastic policy at temperature 1.0
 
@@ -136,6 +149,11 @@ struct OnlineSearchCollectionStats {
   int rejected_incomplete = 0;          // searched but failed acceptance
   // Per-role telemetry, index 0=primary, 1=continuation, 2=purchase.
   PerRoleSearchStats by_role[3];
+  // Swordmaster endowment curriculum telemetry.
+  int64_t swordmaster_granted_games = 0;  // grants that actually fired
+  int64_t swordmaster_organic_games = 0;  // searched seat owns SM at terminal
+                                          // WITHOUT a grant — the curriculum
+                                          // ignition metric
   int64_t first_episode_id = -1;
   int64_t next_episode_id = -1;         // to persist for resume
 

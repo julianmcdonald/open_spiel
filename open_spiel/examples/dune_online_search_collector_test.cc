@@ -456,6 +456,118 @@ void TestCollectUpdateSurfaceAndTelemetry() {
   std::cout << "TestCollectUpdateSurfaceAndTelemetry Passed!\n\n";
 }
 
+// --- Swordmaster endowment curriculum (Phase 18B follow-on to arm B-endow). ---
+
+// fraction=1.0 selects every game; round=2 grants the searched seat a free
+// Swordmaster at its first round-2 decision. Every selected game that reaches
+// round 2 grants once, organic stays 0 (a fired grant suppresses the organic
+// count), and search still accepts targets (the grant does not break search).
+void TestCollectUpdateSwordmasterGrantAll() {
+  std::cout << "Running TestCollectUpdateSwordmasterGrantAll...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig c = FastCollectConfig();  // auxiliary_games = 4 (%4 guard)
+  c.search_probability = 1.0;                  // exercise search at every root
+  c.min_coverage = 1;                          // relaxed acceptance
+  c.min_visits_per_action = 1;
+  c.min_prior_mass = 0.0;
+  c.swordmaster_grant_fraction = 1.0;          // every game selected
+  c.swordmaster_grant_round = 2;
+
+  OnlineSearchCollector col(c, "ckpt-sm");
+  std::vector<SearchTrainingExample> out;
+  OnlineSearchCollectionStats s;
+  col.CollectUpdate(/*update_id=*/9, game, eval, &out, &s);
+
+  std::cout << "  granted=" << s.swordmaster_granted_games
+            << " organic=" << s.swordmaster_organic_games
+            << " accepted=" << s.accepted_targets << std::endl;
+  // auxiliary_games is %4-constrained by the ctor guard, so this window is 4
+  // (the spec's "~3" is illustrative); at fraction 1.0 every game reaches its
+  // round-2 decision and grants exactly once. Seed-deterministic: observed once,
+  // then hard-coded.
+  assert(s.swordmaster_granted_games == 4);
+  assert(s.swordmaster_organic_games == 0);  // a fired grant suppresses organic
+  assert(s.accepted_targets > 0);            // grant did not break search
+  std::cout << "TestCollectUpdateSwordmasterGrantAll Passed!\n\n";
+}
+
+// fraction=0.0 is structurally inert: both new counters are 0, and running with
+// two different grant_round values but everything else identical yields
+// byte-identical example streams (the round knob does nothing at fraction 0).
+void TestCollectUpdateSwordmasterInert() {
+  std::cout << "Running TestCollectUpdateSwordmasterInert...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig c = FastCollectConfig();
+  c.search_probability = 0.5;  // a mix of searched/skipped roots -> real stream
+  c.min_coverage = 1;
+  c.min_visits_per_action = 1;
+  c.min_prior_mass = 0.0;
+  c.swordmaster_grant_fraction = 0.0;  // inert
+  c.swordmaster_grant_round = 2;
+
+  std::vector<SearchTrainingExample> o1;
+  OnlineSearchCollectionStats s1;
+  OnlineSearchCollector(c, "h").CollectUpdate(4, game, eval, &o1, &s1);
+  assert(s1.swordmaster_granted_games == 0);
+  assert(s1.swordmaster_organic_games == 0);
+
+  // Same config but a different grant_round: at fraction 0 the knob is inert, so
+  // the emitted example stream (episode/decision/legal_actions/visits) and stats
+  // are byte-identical.
+  OnlineSearchConfig c2 = c;
+  c2.swordmaster_grant_round = 7;
+  std::vector<SearchTrainingExample> o2;
+  OnlineSearchCollectionStats s2;
+  OnlineSearchCollector(c2, "h").CollectUpdate(4, game, eval, &o2, &s2);
+  assert(s2.swordmaster_granted_games == 0);
+  assert(s2.swordmaster_organic_games == 0);
+  assert(RunSignature(o1, s1) == RunSignature(o2, s2));  // round inert @ frac 0
+
+  std::cout << "  frac0 granted=" << s1.swordmaster_granted_games
+            << " organic=" << s1.swordmaster_organic_games
+            << " (round 2 vs 7 streams identical)" << std::endl;
+  std::cout << "TestCollectUpdateSwordmasterInert Passed!\n\n";
+}
+
+// fraction=0.5: the per-episode selection stream is deterministic, so two runs
+// with identical config produce identical grant counts and identical example
+// streams. The exact granted count is seed-deterministic (hard-coded below).
+void TestCollectUpdateSwordmasterPartial() {
+  std::cout << "Running TestCollectUpdateSwordmasterPartial...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig c = FastCollectConfig();
+  c.auxiliary_games = 8;  // %4 guard; a larger window for the 0.5 selection
+  c.search_probability = 0.5;
+  c.min_coverage = 1;
+  c.min_visits_per_action = 1;
+  c.min_prior_mass = 0.0;
+  c.swordmaster_grant_fraction = 0.5;
+  c.swordmaster_grant_round = 2;
+
+  std::vector<SearchTrainingExample> o1, o2;
+  OnlineSearchCollectionStats s1, s2;
+  OnlineSearchCollector(c, "h").CollectUpdate(2, game, eval, &o1, &s1);
+  OnlineSearchCollector(c, "h").CollectUpdate(2, game, eval, &o2, &s2);
+
+  std::cout << "  granted=" << s1.swordmaster_granted_games
+            << " organic=" << s1.swordmaster_organic_games
+            << " (of " << c.auxiliary_games << " games)" << std::endl;
+  assert(s1.swordmaster_granted_games == s2.swordmaster_granted_games);
+  assert(s1.swordmaster_organic_games == s2.swordmaster_organic_games);
+  assert(RunSignature(o1, s1) == RunSignature(o2, s2));  // deterministic stream
+  // Exact count is seed-deterministic (the 0.5 selection draw over episodes
+  // 0..7 selects 5): observed once, then hard-coded.
+  assert(s1.swordmaster_granted_games == 5);
+  assert(s1.swordmaster_organic_games == 0);
+  std::cout << "TestCollectUpdateSwordmasterPartial Passed!\n\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -471,6 +583,9 @@ int main() {
   open_spiel::TestPruneForcedPlayouts();
   open_spiel::TestCollectUpdateExplorationPackage();
   open_spiel::TestCollectUpdateSurfaceAndTelemetry();
+  open_spiel::TestCollectUpdateSwordmasterGrantAll();
+  open_spiel::TestCollectUpdateSwordmasterInert();
+  open_spiel::TestCollectUpdateSwordmasterPartial();
   std::cout << "All Dune online search collector tests passed!\n";
   return 0;
 }
