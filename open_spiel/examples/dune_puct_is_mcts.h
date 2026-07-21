@@ -47,6 +47,21 @@ struct DuneSearchConfig {
   // Dirichlet noise parameters (legacy/optional)
   double dirichlet_epsilon = 0.0;
   double dirichlet_alpha = 0.3;
+
+  // --- KataGo root-exploration package (Phase 18B; §3.1-3.2 of 1902.10565). ---
+  // Activated only when dirichlet_epsilon > 0 (i.e. at "noised roots"). Implement
+  // as a UNIT: noise without target pruning pollutes CE targets at low budgets.
+  // Per-root Dirichlet concentration: when > 0, the effective alpha at a root is
+  // dirichlet_alpha_total / N_legal (KataGo's inverse-legal-count scaling),
+  // overriding the fixed dirichlet_alpha. 0 keeps the legacy fixed alpha.
+  double dirichlet_alpha_total = 0.0;
+  // Forced-playout coefficient k: when > 0, each root child c is forced to at
+  // least sqrt(k * P_noised(c) * N_root) visits by treating its PUCT urgency as
+  // infinite while under quota. 0 disables forced playouts. KataGo uses k = 2.
+  double forced_playouts_k = 0.0;
+  // First-play-urgency at the noised root: when true, unvisited root children use
+  // FPU = 0 instead of the node's cached value (KataGo footnote 3). Root only.
+  bool root_noise_fpu_zero = false;
   bool use_observation_string = true;
   bool verbose_diagnostics = false;
   bool check_strategic_state = false;
@@ -77,7 +92,12 @@ struct SearchDiagnostics {
   std::vector<Action> actions;       // All legal actions at root
   std::vector<int> visit_counts;     // N(a) per action
   std::vector<double> q_values;      // Empirical Q for covered, root_value for unsupported
-  std::vector<double> priors;        // Neural prior π(a)
+  std::vector<double> priors;        // Tree prior π(a) at root — POST-noise when noised
+  // Pre-noise (raw network) prior, aligned to `actions`. Populated ONLY when
+  // Dirichlet noise was applied at this root; empty otherwise. Consumers that
+  // need a noise-free baseline (item-4 per-role KL telemetry) use this and fall
+  // back to `priors` when empty (no noise ⇒ priors already equal the raw prior).
+  std::vector<double> raw_priors;
   double root_value = 0.0;           // Cached V(s) at root
   int total_root_visits = 0;
   int num_covered_actions = 0;       // Actions with visits >= min_visit_threshold
@@ -175,6 +195,14 @@ struct DuneSearchResult {
 bool IsStrategicAction(const std::string& action_str);
 bool IsStrategicState(const State& state, Player searched_player);
 
+// Per-root Dirichlet-noise stream seed (Phase 18B bug fix). Mixes the search
+// seed with the root's identity (player + state key) and the per-bot search
+// counter so noise does not repeat across roots handled by one bot instance (the
+// old code passed a constant position, seeding every root identically). Exposed
+// for unit testing. Distinct roots => distinct seeds; identical inputs => equal.
+uint64_t DeriveRootNoiseSeed(uint64_t config_seed, uint64_t search_count,
+                             int root_player, const std::string& root_key_str);
+
 // ---------------------------------------------------------------------------
 // Bot structures
 // ---------------------------------------------------------------------------
@@ -183,6 +211,11 @@ struct DuneChildInfo {
   int visits = 0;
   double return_sum = 0.0;
   double prior = 0.0;
+  // Pre-noise network prior, snapshotted at the root exactly before Dirichlet
+  // noise mixes into `prior`. Only meaningful when the root's
+  // `dirichlet_noise_applied` is set; used for noise-free telemetry baselines
+  // (item-4 KL). `prior` itself carries the post-noise tree prior the search uses.
+  double raw_prior = 0.0;
   double value() const { return visits > 0 ? return_sum / visits : 0.0; }
 };
 

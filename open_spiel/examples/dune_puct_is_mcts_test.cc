@@ -2957,6 +2957,97 @@ void TestDecisionDepthSimulationAccounting() {
   std::cout << "TestDecisionDepthSimulationAccounting Passed!\n\n";
 }
 
+// Item 2a: per-root Dirichlet-noise seed. Distinct roots -> distinct seeds (the
+// bug was a constant position argument that seeded every root identically);
+// identical inputs -> identical seed; each input dimension perturbs the stream.
+void TestDeriveRootNoiseSeed() {
+  std::cout << "Running TestDeriveRootNoiseSeed...\n";
+  const uint64_t s = 12345;
+  assert(DeriveRootNoiseSeed(s, 0, 0, "rootA") == DeriveRootNoiseSeed(s, 0, 0, "rootA"));
+  // The fix: same seed/counter/player, DIFFERENT state key -> different stream.
+  assert(DeriveRootNoiseSeed(s, 0, 0, "rootA") != DeriveRootNoiseSeed(s, 0, 0, "rootB"));
+  assert(DeriveRootNoiseSeed(s, 0, 0, "rootA") != DeriveRootNoiseSeed(s, 1, 0, "rootA"));      // search_count
+  assert(DeriveRootNoiseSeed(s, 0, 0, "rootA") != DeriveRootNoiseSeed(s, 0, 1, "rootA"));      // player
+  assert(DeriveRootNoiseSeed(s, 0, 0, "rootA") != DeriveRootNoiseSeed(s + 1, 0, 0, "rootA"));  // config seed
+  std::cout << "TestDeriveRootNoiseSeed Passed!\n\n";
+}
+
+// Item 1b (telemetry comparability): when Dirichlet noise perturbs the root tree
+// priors, SearchDiagnostics must expose the PRE-noise network prior in
+// `raw_priors` (so item-4 KL is measured against the same baseline as the
+// noise-free 200-sim references), while `priors` carries the post-noise tree
+// prior. With noise OFF, `raw_priors` is empty and `priors` already equals the
+// raw prior.
+void TestRawPriorsCapturedUnderNoise() {
+  std::cout << "Running TestRawPriorsCapturedUnderNoise...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() >= 2);
+
+  // Distinct, normalized network priors over exactly the legal actions, so the
+  // pre-noise baseline is unambiguous and differs from any post-noise mixture.
+  ActionsAndProbs mock_priors;
+  double sum = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    double p = 0.1 + 0.1 * i;
+    mock_priors.push_back({legal_actions[i], p});
+    sum += p;
+  }
+  for (auto& ap : mock_priors) ap.second /= sum;
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  // --- Noise ON: pilot exploration package. ---
+  DuneSearchConfig noised;
+  noised.seed = 7;
+  noised.max_simulations = 32;
+  noised.dirichlet_epsilon = 0.25;
+  noised.dirichlet_alpha_total = 10.83;
+  noised.check_strategic_state = false;
+  DunePUCTISMCTSBot bot_noised(noised, evaluator);
+  SearchDiagnostics d = bot_noised.RunSearch(*state).diagnostics;
+
+  // raw_priors is populated, aligned to actions, and a valid distribution.
+  assert(d.raw_priors.size() == d.actions.size());
+  assert(d.priors.size() == d.actions.size());
+  double raw_sum = 0.0;
+  for (double rp : d.raw_priors) { assert(rp >= 0.0); raw_sum += rp; }
+  assert(std::abs(raw_sum - 1.0) < 1e-6);
+
+  // raw_priors equals the noise-free network prior (what `priors` would be with
+  // noise off), NOT the post-noise tree prior.
+  for (size_t i = 0; i < d.actions.size(); ++i) {
+    assert(std::abs(d.raw_priors[i] - mock_priors[i].second) < 1e-6);
+  }
+  // The tree prior actually WAS perturbed (so measuring KL against `priors`
+  // would be the bug this fix corrects): L1(priors, raw_priors) is non-trivial.
+  double l1 = 0.0;
+  for (size_t i = 0; i < d.actions.size(); ++i) {
+    l1 += std::abs(d.priors[i] - d.raw_priors[i]);
+  }
+  assert(l1 > 1e-6);
+
+  // --- Noise OFF: raw_priors stays empty; priors == raw network prior. ---
+  DuneSearchConfig plain;
+  plain.seed = 7;
+  plain.max_simulations = 32;
+  plain.check_strategic_state = false;  // dirichlet_epsilon defaults to 0.0
+  DunePUCTISMCTSBot bot_plain(plain, evaluator);
+  SearchDiagnostics d0 = bot_plain.RunSearch(*state).diagnostics;
+  assert(d0.raw_priors.empty());
+  for (size_t i = 0; i < d0.actions.size(); ++i) {
+    assert(std::abs(d0.priors[i] - mock_priors[i].second) < 1e-6);
+  }
+
+  std::cout << "  noised L1(priors,raw)=" << l1
+            << "  (raw_priors matches the network prior)\n";
+  std::cout << "TestRawPriorsCapturedUnderNoise Passed!\n\n";
+}
+
 } // namespace
 } // namespace open_spiel
 
@@ -3001,6 +3092,8 @@ int main() {
   open_spiel::TestDefaultDecisionDepthIsUnchanged();
   open_spiel::TestDecisionDepthCapsOneAndTwo();
   open_spiel::TestDecisionDepthSimulationAccounting();
+  open_spiel::TestDeriveRootNoiseSeed();
+  open_spiel::TestRawPriorsCapturedUnderNoise();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

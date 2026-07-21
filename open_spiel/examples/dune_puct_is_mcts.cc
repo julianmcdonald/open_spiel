@@ -70,6 +70,21 @@ bool IsStrategicState(const State& state, Player searched_player) {
   return false;
 }
 
+uint64_t DeriveRootNoiseSeed(uint64_t config_seed, uint64_t search_count,
+                             int root_player, const std::string& root_key_str) {
+  // FNV-1a hash of the root state key gives a stable per-root identity so noise
+  // varies by root regardless of caller (fresh-per-root sessions, persistent
+  // sessions, or Path B bots that reuse one config seed across many roots).
+  uint64_t key_hash = 1469598103934665603ULL;  // FNV-1a offset basis
+  for (char ch : root_key_str) {
+    key_hash ^= static_cast<uint64_t>(static_cast<unsigned char>(ch));
+    key_hash *= 1099511628211ULL;              // FNV-1a prime
+  }
+  return dune_seed::DeriveSeed(config_seed, dune_seed::kStreamBlueprint,
+                               search_count, static_cast<uint64_t>(root_player),
+                               key_hash);
+}
+
 // ---------------------------------------------------------------------------
 // DunePUCTISMCTSBot Implementation
 // ---------------------------------------------------------------------------
@@ -364,7 +379,34 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
     DuneISMCTSNode* node, const std::vector<Action>& legal_actions) {
   ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
 
-  double fpu_val = node->cached_value;
+  // KataGo root-exploration behaviors apply only at the noised root node.
+  const bool at_noised_root = (node == root_node_) && node->dirichlet_noise_applied;
+
+  // Forced playouts (KataGo §3.2): at the noised root, any child under its quota
+  // n_forced(c) = sqrt(k * P_noised(c) * N_root) has infinite PUCT urgency. Pick
+  // the most-deficient such child so enforcement is deterministic and
+  // self-limiting as N_root grows. P_noised(c) is the tree prior (post-noise).
+  if (at_noised_root && config_.forced_playouts_k > 0.0) {
+    double n_root = static_cast<double>(std::max(0, node->total_visits));
+    Action forced_action = kInvalidAction;
+    double best_deficit = 0.0;
+    for (const auto& action_prob : normalized) {
+      auto ci = node->child_info.find(action_prob.first);
+      int cv = (ci != node->child_info.end()) ? ci->second.visits : 0;
+      if (cv <= 0) continue;  // forcing applies only after a child's first visit
+      double quota = std::sqrt(config_.forced_playouts_k * action_prob.second * n_root);
+      double deficit = quota - cv;
+      if (deficit > best_deficit) {
+        best_deficit = deficit;
+        forced_action = action_prob.first;
+      }
+    }
+    if (forced_action != kInvalidAction) return forced_action;
+  }
+
+  // FPU = 0 at the noised root (KataGo footnote 3); otherwise the node's value.
+  double fpu_val = (at_noised_root && config_.root_noise_fpu_zero) ? 0.0
+                                                                   : node->cached_value;
 
   Action best_action = kInvalidAction;
   double best_puct_val = -std::numeric_limits<double>::infinity();
@@ -699,25 +741,43 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   root_node_ = LookupOrCreateNode(state);
   InitializePriorsAndValue(root_node_, state);
 
-  // Apply Dirichlet noise exactly once at the root node's priors (if enabled)
-  if (config_.dirichlet_epsilon > 0.0 && config_.dirichlet_alpha > 0.0 && !is_continuation_ && !root_node_->dirichlet_noise_applied) {
+  // Apply Dirichlet noise exactly once at the root node's priors (if enabled).
+  if (config_.dirichlet_epsilon > 0.0 && !is_continuation_ && !root_node_->dirichlet_noise_applied) {
     if (legal_actions.size() > 1) {
-      uint64_t noise_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, 0);
-      std::mt19937 noise_rng(noise_seed);
-      std::gamma_distribution<double> gamma_dist(config_.dirichlet_alpha, 1.0);
-      std::vector<double> noise(legal_actions.size());
-      double sum_noise = 0.0;
-      for (size_t i = 0; i < legal_actions.size(); ++i) {
-        noise[i] = gamma_dist(noise_rng);
-        sum_noise += noise[i];
+      // Per-root Dirichlet concentration (KataGo inverse-legal-count scaling):
+      // alpha = dirichlet_alpha_total / N_legal when configured, else the fixed
+      // legacy alpha. alpha <= 0 disables the draw (matches the old alpha>0 guard).
+      double alpha = config_.dirichlet_alpha_total > 0.0
+          ? config_.dirichlet_alpha_total / static_cast<double>(legal_actions.size())
+          : config_.dirichlet_alpha;
+      if (alpha > 0.0) {
+        // Per-root noise stream (bug fix): key the stream on this root's identity
+        // (player + state key) plus the search counter, so noise no longer repeats
+        // across roots handled by one bot instance. The previous constant position
+        // argument (0) seeded every root identically.
+        std::pair<Player, std::string> root_key = GetStateKey(state);
+        uint64_t noise_seed = DeriveRootNoiseSeed(
+            config_.seed, static_cast<uint64_t>(search_count_), root_key.first,
+            root_key.second);
+        std::mt19937 noise_rng(noise_seed);
+        std::gamma_distribution<double> gamma_dist(alpha, 1.0);
+        std::vector<double> noise(legal_actions.size());
+        double sum_noise = 0.0;
+        for (size_t i = 0; i < legal_actions.size(); ++i) {
+          noise[i] = gamma_dist(noise_rng);
+          sum_noise += noise[i];
+        }
+        for (size_t i = 0; i < legal_actions.size(); ++i) {
+          Action action = legal_actions[i];
+          double d_noise = sum_noise > 0.0 ? (noise[i] / sum_noise) : (1.0 / legal_actions.size());
+          auto& child = root_node_->child_info[action];
+          // Snapshot the pre-noise network prior BEFORE mixing, so item-4
+          // telemetry can compare visits against the noise-free baseline.
+          child.raw_prior = child.prior;
+          child.prior = (1.0 - config_.dirichlet_epsilon) * child.prior + config_.dirichlet_epsilon * d_noise;
+        }
+        root_node_->dirichlet_noise_applied = true;
       }
-      for (size_t i = 0; i < legal_actions.size(); ++i) {
-        Action action = legal_actions[i];
-        double d_noise = sum_noise > 0.0 ? (noise[i] / sum_noise) : (1.0 / legal_actions.size());
-        auto& child = root_node_->child_info[action];
-        child.prior = (1.0 - config_.dirichlet_epsilon) * child.prior + config_.dirichlet_epsilon * d_noise;
-      }
-      root_node_->dirichlet_noise_applied = true;
     }
   }
 
@@ -970,6 +1030,28 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
         diag.covered_prior_mass += prior;
       }
       diag.q_values.push_back(q_value);
+    }
+
+    // Item-4 telemetry baseline: when Dirichlet noise perturbed this root's tree
+    // priors, expose the PRE-noise network prior (normalized identically to
+    // `priors`, over the same legal-action set) so KL(visits‖raw_prior) is
+    // comparable to the noise-free 200-sim role baselines. Left empty when no
+    // noise ran, in which case `priors` already equals the raw network prior.
+    if (node->dirichlet_noise_applied) {
+      diag.raw_priors.reserve(legal_actions.size());
+      double raw_sum = 0.0;
+      for (Action action : legal_actions) {
+        double rp = 1e-5;  // matches FilterAndNormalizePriors' missing-child fallback
+        auto child_iter = node->child_info.find(action);
+        if (child_iter != node->child_info.end()) rp = child_iter->second.raw_prior;
+        diag.raw_priors.push_back(rp);
+        raw_sum += rp;
+      }
+      if (raw_sum > 0.0) {
+        for (double& rp : diag.raw_priors) rp /= raw_sum;
+      } else {
+        for (double& rp : diag.raw_priors) rp = 1.0 / legal_actions.size();
+      }
     }
   } else {
     ActionsAndProbs raw_priors = evaluators_[state.CurrentPlayer()]->Prior(state);
