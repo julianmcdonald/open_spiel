@@ -266,12 +266,25 @@ inline Action FindActionOrCardPathToSpace(
 // Heuristic goal-biased action selection for owner when policy is bypassed.
 //
 // `return_invalid_on_no_acquisition` (default false preserves Task-10 behavior):
-// when true, if NO acquisition-relevant move (swordmaster/smuggling/shipping) is
-// legal at this state, return kInvalidAction instead of a uniform-random legal
-// action. Probe callers (swordmaster arm B) MUST set this true and fall through
-// to normal play/search on kInvalidAction — a random fallback would randomize
-// unrelated purchase/combat/reveal decisions (the Phase-18A uniform-policy poison
-// class) and misattribute that damage to the swordmaster hypothesis.
+// when true this is the SWORDMASTER PROBE ladder; the caller (arm B) MUST fall
+// through to normal play/search on kInvalidAction. It exists ONLY to fund and
+// reach Swordmaster, and is fully probe-gated so Task-10 call sites are unchanged:
+//   * Tier 1: buy Swordmaster (direct or card path) whenever reachable.
+//   * While the seat CANNOT afford it (solari < 8, or 7 for Leto): climb the
+//     funding ladder — Interstellar Shipping (2 freighter moves) > Smuggling
+//     (1 move) > Wealth (+2 solari); resolve the shipping track by advancing
+//     while >1 movement remains (or at level 0), else recalling; force 5 solari
+//     (Dividends) at the tier-1 recall reward and leave tier-2+ rewards to
+//     policy. EXCEPTION: when exactly 2 solari short AND at freighter level 0,
+//     take Wealth first (its immediate +2 beats an unfinished freighter path).
+//   * Once the seat CAN afford it but Swordmaster is not reachable this decision
+//     (blocked / no access): if a 2nd agent turn remains, draw a card via
+//     Arrakeen (different access than Swordmaster) to fish for access; otherwise
+//     stop chasing solari and play the best move.
+// At any decision with no forced move, return kInvalidAction instead of a
+// uniform-random legal action — a random fallback would randomize unrelated
+// purchase/combat/reveal decisions (the Phase-18A uniform-policy poison class)
+// and misattribute that damage to the swordmaster hypothesis.
 inline Action ChooseHeuristicAcquisitionAction(
     const State& state,
     const std::vector<Action>& actions,
@@ -288,6 +301,91 @@ inline Action ChooseHeuristicAcquisitionAction(
     return sm_card;
   }
 
+  if (return_invalid_on_no_acquisition) {
+    // ===================== SWORDMASTER PROBE ladder =====================
+    // Everything below exists ONLY to fund and reach Swordmaster. Tier 1 above
+    // already buys it when reachable. Any decision with no forced move returns
+    // kInvalidAction so the arm-B driver routes it to the normal search path.
+    const auto* ds = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    if (ds == nullptr) return kInvalidAction;
+
+    auto has = [&](Action a) {
+      return std::find(actions.begin(), actions.end(), a) != actions.end();
+    };
+    auto reach_space = [&](Action space) -> Action {
+      if (has(space)) return space;
+      Action c = FindActionOrCardPathToSpace(state, owner, space, rng);
+      if (c != kInvalidAction && has(c)) return c;
+      return kInvalidAction;
+    };
+
+    const int solari = ds->GetPlayerSolari(owner);
+    const int cost = (ds->PlayerLeader(owner) == 4) ? 7 : 8;  // Leto 7, else 8
+
+    if (solari < cost) {
+      // ---- Cannot afford yet: climb the funding ladder. ----
+      const int level = ds->PlayerShippingLevelForTesting(owner);
+
+      // Freighter-move spaces (Interstellar > Smuggling) outrank Wealth, EXCEPT
+      // when the seat is exactly 2 solari short AND the freighter is at level 0:
+      // from level 0 a freighter path needs >=2 movements to yield solari (so it
+      // may not complete), whereas Wealth's immediate +2 secures the buy. Then
+      // prefer Wealth. Interstellar grants 2 movements, Smuggling 1.
+      const bool wealth_first = (solari == cost - 2) && (level == 0);
+      Action a;
+      if (wealth_first) {
+        a = reach_space(dune_imperium::kActionAgentSpaceWealth);               if (a != kInvalidAction) return a;
+        a = reach_space(dune_imperium::kActionAgentSpaceInterstellarShipping); if (a != kInvalidAction) return a;
+        a = reach_space(dune_imperium::kActionAgentSpaceSmuggling);            if (a != kInvalidAction) return a;
+      } else {
+        a = reach_space(dune_imperium::kActionAgentSpaceInterstellarShipping); if (a != kInvalidAction) return a;
+        a = reach_space(dune_imperium::kActionAgentSpaceSmuggling);            if (a != kInvalidAction) return a;
+        a = reach_space(dune_imperium::kActionAgentSpaceWealth);               if (a != kInvalidAction) return a;
+      }
+
+      // Shipping-track resolution (spend queued freighter movements for solari).
+      // (a) Start the next queued movement.
+      if (has(dune_imperium::kActionAgentRewardShipping)) return dune_imperium::kActionAgentRewardShipping;
+      // (b) Advance while more than one movement remains (or forced at level 0);
+      // else recall to bank the reward. pending_reward_shipping()[owner] counts
+      // movements queued AFTER the current one, so >=1 means "more than one
+      // remaining". Recalling from a higher level also collects the lower
+      // levels' rewards on the way back to 0.
+      const bool can_advance = has(dune_imperium::kActionShippingAdvance);
+      const bool can_recall = has(dune_imperium::kActionShippingRecall);
+      if (can_advance || can_recall) {
+        const int queued = ds->pending_reward_shipping()[owner];
+        if (level == 0 && can_advance) return dune_imperium::kActionShippingAdvance;
+        if (queued >= 1 && can_advance) return dune_imperium::kActionShippingAdvance;
+        if (can_recall) return dune_imperium::kActionShippingRecall;
+        if (can_advance) return dune_imperium::kActionShippingAdvance;
+      }
+      // (c) Tier-1 recall reward: FORCE 5 solari (Dividends), never 2 spice.
+      // Tier-2+ reward choices are left to policy (fall through to kInvalidAction).
+      if (has(dune_imperium::kActionShippingLevel1Dividends)) return dune_imperium::kActionShippingLevel1Dividends;
+
+      return kInvalidAction;
+    }
+
+    // ---- Can afford Swordmaster, but Tier 1 could not reach it this decision. ----
+    // Blocked, or the seat lacks Swordmaster access. If the seat still has a 2nd
+    // agent turn AFTER this placement, draw a card now (it may draw access): use
+    // Arrakeen, a card-draw space whose access DIFFERS from Swordmaster's (Mentat
+    // is excluded — it gates the same as Swordmaster, so it would be unreachable
+    // for the same reason). GetPlayerAgentsRemainingForTesting counts the agent
+    // about to be placed, so >= 2 means "a 2nd agent turn remains after this".
+    // With only one agent left, or if Arrakeen is unavailable, play the best move
+    // and take Swordmaster next round. Rare (the RL agent almost never races it).
+    if (ds->GetPlayerAgentsRemainingForTesting(owner) >= 2 &&
+        has(dune_imperium::kActionAgentSpaceArrakeen)) {
+      return dune_imperium::kActionAgentSpaceArrakeen;
+    }
+    // Other card-draw mechanics the seat may hold (Paul's signet ring, a
+    // card-drawing intrigue) are left to policy for now (see the probe design).
+    return kInvalidAction;
+  }
+
+  // ===================== Task-10 legacy ladder (UNCHANGED) =====================
   if (std::find(actions.begin(), actions.end(), dune_imperium::kActionAgentSpaceSmuggling) != actions.end()) {
     return dune_imperium::kActionAgentSpaceSmuggling;
   }
@@ -311,13 +409,6 @@ inline Action ChooseHeuristicAcquisitionAction(
 
   if (std::find(actions.begin(), actions.end(), dune_imperium::kActionShippingLevel1Dividends) != actions.end()) {
     return dune_imperium::kActionShippingLevel1Dividends;
-  }
-
-  // No acquisition-relevant move is legal here. Probe callers must NOT play a
-  // random move at such decisions (see the flag doc above); signal "not an
-  // acquisition decision" so the driver can route it to the normal path.
-  if (return_invalid_on_no_acquisition) {
-    return kInvalidAction;
   }
 
   std::uniform_int_distribution<int> dis(0, actions.size() - 1);

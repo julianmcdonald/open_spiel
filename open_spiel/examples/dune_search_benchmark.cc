@@ -449,8 +449,21 @@ void WorkerThread(
     bool turn_had_fallback = false;
     std::string turn_fallback_reason = "none";
 
+    // Probe telemetry (3b): the searched seat's Swordmaster-acquisition round and
+    // its solari trajectory by round. Forced funding/acquisition decisions bypass
+    // the search log, so this in-loop sampling is the only place they surface.
+    int sm_acquire_round = -1;
+    std::map<int, int> search_seat_solari_by_round;
+
     while (!state->IsTerminal()) {
       Player current_player = state->CurrentPlayer();
+      if (const auto* trk = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get())) {
+        const int trk_round = trk->GetCurrentRound();
+        search_seat_solari_by_round[trk_round] = trk->GetPlayerSolari(search_seat);
+        if (sm_acquire_round < 0 && trk->HasSwordmaster(search_seat)) {
+          sm_acquire_round = trk_round;
+        }
+      }
       if (in_search_turn && current_player != search_seat && current_player != kChancePlayerId) {
         std::cout << "--- End of Agent Turn Audit Summary ---\n"
                   << "Decisions: " << turn_decisions << " (Primary: 1, Continuations: " << (turn_decisions - 1) << ")\n"
@@ -873,6 +886,15 @@ void WorkerThread(
         game_obj["rounds_played"] = static_cast<int64_t>(corrected_round);
         game_obj["search_steps"] = static_cast<int64_t>(thread_stats.search_steps_count);
         game_obj["search_swordmasters"] = dune_state->HasSwordmaster(search_seat);
+        game_obj["search_seat_leader"] = static_cast<int64_t>(dune_state->PlayerLeader(search_seat));
+        game_obj["search_seat_swordmaster_round"] = static_cast<int64_t>(sm_acquire_round);
+        open_spiel::json::Array sbr_rounds, sbr_solari;
+        for (const auto& kv : search_seat_solari_by_round) {
+          sbr_rounds.push_back(static_cast<int64_t>(kv.first));
+          sbr_solari.push_back(static_cast<int64_t>(kv.second));
+        }
+        game_obj["search_seat_solari_rounds"] = sbr_rounds;
+        game_obj["search_seat_solari_values"] = sbr_solari;
 
         open_spiel::json::Array opp_sm_arr;
         for (int p = 0; p < 4; ++p) {
