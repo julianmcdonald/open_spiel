@@ -117,6 +117,100 @@ void WriteMockFile(const std::string& filepath, const std::string& data) {
 }
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+// SHA-256 over all model parameters (registration order, native float32 bytes,
+// CPU). Deterministic given deterministic init + a deterministic update.
+static std::string HashModelParams(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  torch::NoGradGuard ng;
+  std::string data;
+  for (const auto& p : model->parameters()) {
+    torch::Tensor f = p.detach().to(torch::kCPU).to(torch::kFloat32).contiguous().view({-1});
+    const float* ptr = f.data_ptr<float>();
+    data.append(reinterpret_cast<const char*>(ptr), f.numel() * sizeof(float));
+  }
+  return open_spiel::ComputeStringSHA256(data);
+}
+
+// Builds the fixed, deterministic parity fixture (model+optimizer+batch+flags)
+// used by the golden-hash parity test. Seeding is manual so the run is bit-exact
+// across builds on this machine (CPU, no AMP). Kept in one place so step-5a can
+// call the SAME fixture against the post-integration TrainPpoUpdate.
+static std::string RunParityFixtureAndHash() {
+  const int64_t obs_size = 12;
+  const int64_t action_dim = 5;
+  torch::manual_seed(0x18B0FACEULL);
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/2);
+  model->to(torch::kCPU);
+  torch::optim::AdamW optimizer(model->parameters(),
+                                torch::optim::AdamWOptions(1e-4));
+
+  // 8 fixed transitions, all nontrivial (>=2 legal actions) so the policy path,
+  // advantage normalization, and value path are all exercised deterministically.
+  std::vector<PpoTransition> batch(8);
+  for (int i = 0; i < 8; ++i) {
+    batch[i].state = std::vector<float>(obs_size, 0.05f * (i + 1));
+    batch[i].legal_actions = (i % 2 == 0)
+        ? std::vector<Action>{0, 1, 2}
+        : std::vector<Action>{1, 3, 4};
+    batch[i].action = batch[i].legal_actions[i % 3];
+    batch[i].old_log_prob = 0.0f;  // set from the model below
+    batch[i].reward = 0.1f * i;
+    batch[i].value = 0.02f * i - 0.05f;
+    batch[i].advantage = (i % 2 == 0) ? 0.3f : -0.4f;
+    batch[i].return_value = 0.1f * i - 0.2f;
+    batch[i].player_id = i % 4;
+    batch[i].episode_id = 100 + i;
+  }
+  {  // deterministic old_log_probs from the freshly-initialized model
+    torch::NoGradGuard ng;
+    for (auto& t : batch) {
+      torch::Tensor state_t = torch::tensor(t.state).unsqueeze(0);
+      auto out = model->forward(state_t);
+      torch::Tensor mask = torch::zeros({1, action_dim}, torch::kBool);
+      for (Action a : t.legal_actions) mask[0][a] = true;
+      torch::Tensor logits = CenterAndCapLogitsTensor(out.logits, mask, 10.0f);
+      torch::Tensor masked = logits.masked_fill(mask.logical_not(), -1e9f);
+      torch::Tensor logp = torch::log_softmax(masked, -1);
+      t.old_log_prob = logp[0][t.action].item<float>();
+    }
+  }
+
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);   // 2 minibatches/epoch
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 3);
+  absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+  absl::SetFlag(&FLAGS_normalize_advantages, true);
+  absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+  absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+  absl::SetFlag(&FLAGS_value_coef, 0.5);
+  absl::SetFlag(&FLAGS_logit_cap, 10.0);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);   // no early stop -> all epochs run
+  absl::SetFlag(&FLAGS_train_amp, false);
+  absl::SetFlag(&FLAGS_grad_clip_norm, 0.5);
+  absl::SetFlag(&FLAGS_diagnostics_only, false);
+  absl::SetFlag(&FLAGS_train_value_only, false);
+
+  torch::manual_seed(20240718);  // fix any in-update RNG (e.g. dropout) too
+  TrainPpoUpdate(model, optimizer, batch, obs_size, action_dim, torch::kCPU,
+                 /*master=*/0xC0FFEEULL, /*global_update=*/7);
+  return HashModelParams(model);
+}
+
+// GOLDEN PARITY HASH — recorded pre-integration (step 1). Step 5a re-runs the
+// SAME fixture through the post-integration TrainPpoUpdate (collection OFF /
+// empty examples, coef 0) and asserts this EXACT value: proof that turning
+// online collection off leaves the trainer numerically identical to today.
+static const char* kParityGoldenHash =
+    "e74c27c33076fd5fe51ea0e2d2f39ab4384e14b7c833b89cb427c34bac20419c";
+
+void TestTrainPpoUpdateParityGoldenHash() {
+  TEST_BEGIN("TrainPpoUpdate collection-off parity (golden weight hash)") {
+    std::string h = RunParityFixtureAndHash();
+    std::cout << "\n  parity_weight_hash=" << h << "\n  " << std::flush;
+    UTILS_CHECK(std::string(kParityGoldenHash) == h);
+  } TEST_END();
+}
+
 void TestTrainPpoUpdateMasking() {
   TEST_BEGIN("TrainPpoUpdate NaN safety with 0 nontrivial transitions") {
     int64_t obs_size = 10;
@@ -471,6 +565,7 @@ int main() {
 
   // Run the new test functions
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+  TestTrainPpoUpdateParityGoldenHash();
   TestTrainPpoUpdateMasking();
   TestGradientMatching();
   TestCriticOnlyParameterMovement();
