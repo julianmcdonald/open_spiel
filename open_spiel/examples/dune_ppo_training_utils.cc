@@ -250,6 +250,127 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
   return true;
 }
 
+std::vector<std::pair<int64_t, int64_t>> ComputeAuxSlices(
+    int64_t num_examples, int64_t num_minibatches) {
+  std::vector<std::pair<int64_t, int64_t>> out;
+  if (num_minibatches <= 0) return out;
+  int64_t base = num_examples / num_minibatches;
+  int64_t rem = num_examples % num_minibatches;
+  int64_t cursor = 0;
+  for (int64_t k = 0; k < num_minibatches; ++k) {
+    int64_t len = base + (k < rem ? 1 : 0);
+    out.push_back({cursor, len});
+    cursor += len;
+  }
+  return out;
+}
+
+void WriteOnlineCollectionState(json::Object& manifest_obj,
+                                const OnlineCollectionState& st) {
+  json::Object o;
+  o["auxiliary_games"] = static_cast<int64_t>(st.auxiliary_games);
+  o["auxiliary_search_seed_domain"] =
+      static_cast<int64_t>(st.auxiliary_search_seed_domain);
+  o["collector_dirichlet_epsilon"] = st.collector_dirichlet_epsilon;
+  o["swordmaster_grant_fraction"] = st.swordmaster_grant_fraction;
+  o["swordmaster_grant_round"] = static_cast<int64_t>(st.swordmaster_grant_round);
+  o["search_loss_coef_target"] = st.search_loss_coef_target;
+  o["search_loss_warmup_update"] =
+      static_cast<int64_t>(st.search_loss_warmup_update);
+  o["abort_grad_norm_ratio"] = st.abort_grad_norm_ratio;
+  o["next_auxiliary_episode_id"] =
+      static_cast<int64_t>(st.next_auxiliary_episode_id);
+  o["cum_accepted"] = static_cast<int64_t>(st.cum_accepted);
+  o["cum_rejected"] = static_cast<int64_t>(st.cum_rejected);
+  json::Array rs, ra;
+  for (int i = 0; i < 3; ++i) {
+    rs.push_back(static_cast<int64_t>(st.cum_role_searches[i]));
+    ra.push_back(static_cast<int64_t>(st.cum_role_accepted[i]));
+  }
+  o["cum_role_searches"] = rs;
+  o["cum_role_accepted"] = ra;
+  o["cum_granted"] = static_cast<int64_t>(st.cum_granted);
+  o["cum_organic"] = static_cast<int64_t>(st.cum_organic);
+  o["accepted_hash_chain"] = st.accepted_hash_chain;
+  manifest_obj["online_collection"] = o;
+}
+
+bool ReadOnlineCollectionState(const std::string& manifest_path,
+                               OnlineCollectionState& out,
+                               std::string& error_msg) {
+  if (!std::filesystem::exists(manifest_path)) {
+    error_msg = "manifest file not found: " + manifest_path;
+    return false;
+  }
+  std::ifstream ifs(manifest_path);
+  if (!ifs) {
+    error_msg = "could not open manifest: " + manifest_path;
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(ifs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = json::FromString(content);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    error_msg = "malformed manifest JSON: " + manifest_path;
+    return false;
+  }
+  const auto& mo = val_opt->GetObject();
+  auto it = mo.find("online_collection");
+  if (it == mo.end()) {  // absent is fine (collection was off)
+    out.present = false;
+    return true;
+  }
+  if (!it->second.IsObject()) {
+    error_msg = "manifest online_collection is not an object";
+    return false;
+  }
+  const auto& o = it->second.GetObject();
+  auto gi = [&](const char* k, int64_t def) -> int64_t {
+    auto f = o.find(k);
+    return (f != o.end() && f->second.IsInt()) ? f->second.GetInt() : def;
+  };
+  auto gd = [&](const char* k, double def) -> double {
+    auto f = o.find(k);
+    if (f == o.end()) return def;
+    if (f->second.IsDouble()) return f->second.GetDouble();
+    if (f->second.IsInt()) return static_cast<double>(f->second.GetInt());
+    return def;
+  };
+  auto ga = [&](const char* k, int64_t* arr) {
+    auto f = o.find(k);
+    if (f != o.end() && f->second.IsArray()) {
+      const auto& a = f->second.GetArray();
+      for (int i = 0; i < 3 && i < static_cast<int>(a.size()); ++i) {
+        if (a[i].IsInt()) arr[i] = a[i].GetInt();
+      }
+    }
+  };
+  out.auxiliary_games = static_cast<int>(gi("auxiliary_games", 0));
+  out.auxiliary_search_seed_domain =
+      static_cast<uint64_t>(gi("auxiliary_search_seed_domain", 0));
+  out.collector_dirichlet_epsilon = gd("collector_dirichlet_epsilon", 0.0);
+  out.swordmaster_grant_fraction = gd("swordmaster_grant_fraction", 0.0);
+  out.swordmaster_grant_round = static_cast<int>(gi("swordmaster_grant_round", 0));
+  out.search_loss_coef_target = gd("search_loss_coef_target", 0.0);
+  out.search_loss_warmup_update =
+      static_cast<int>(gi("search_loss_warmup_update", 0));
+  out.abort_grad_norm_ratio = gd("abort_grad_norm_ratio", 0.0);
+  out.next_auxiliary_episode_id =
+      static_cast<uint64_t>(gi("next_auxiliary_episode_id", 0));
+  out.cum_accepted = gi("cum_accepted", 0);
+  out.cum_rejected = gi("cum_rejected", 0);
+  ga("cum_role_searches", out.cum_role_searches);
+  ga("cum_role_accepted", out.cum_role_accepted);
+  out.cum_granted = gi("cum_granted", 0);
+  out.cum_organic = gi("cum_organic", 0);
+  auto fs = o.find("accepted_hash_chain");
+  if (fs != o.end() && fs->second.IsString()) {
+    out.accepted_hash_chain = fs->second.GetString();
+  }
+  out.present = true;
+  return true;
+}
+
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps) {
   if (decay_steps == 0) {
@@ -288,7 +409,9 @@ PpoUpdateStats TrainPpoUpdate(
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
     uint64_t master, int global_update,
-    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model) {
+    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model,
+    const std::vector<SearchTrainingExample>& search_examples,
+    double search_loss_coef, double abort_grad_norm_ratio) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
   stats.rollout_hash = ComputeRolloutHash(batch);
@@ -457,6 +580,69 @@ PpoUpdateStats TrainPpoUpdate(
     return stats;
   }
 
+  // --- Phase 18B online-search auxiliary examples (combined optimization) ---
+  // Active only with non-empty examples AND a positive coefficient (and not in
+  // value-only mode, whose whole point is a frozen policy). When INACTIVE every
+  // line below is skipped and the update is numerically identical to today.
+  const bool aux_active = !search_examples.empty() && search_loss_coef > 0.0 &&
+                          !::absl::GetFlag(::FLAGS_train_value_only);
+  const int64_t aux_n =
+      aux_active ? static_cast<int64_t>(search_examples.size()) : 0;
+  torch::Tensor aux_states, aux_masks, aux_targets, aux_values;
+  std::vector<int64_t> aux_slice_start, aux_slice_len;  // by minibatch index/epoch
+  double aux_ce_sum = 0.0, aux_vmse_sum = 0.0;
+  int64_t aux_slice_uses = 0;                 // (epoch,minibatch) slices actually run
+  double aux_norm_sum = 0.0, ppo_only_norm_sum = 0.0;
+  int64_t aux_norm_count = 0;
+  if (aux_active) {
+    stats.aux_examples_used = static_cast<int>(aux_n);
+    auto af = torch::TensorOptions().dtype(torch::kFloat32);
+    auto ab = torch::TensorOptions().dtype(torch::kBool);
+    torch::Tensor s = torch::zeros({aux_n, obs_size}, af);
+    torch::Tensor m = torch::zeros({aux_n, action_dim}, ab);
+    torch::Tensor t = torch::zeros({aux_n, action_dim}, af);
+    torch::Tensor v = torch::zeros({aux_n}, af);
+    float* sp = s.data_ptr<float>();
+    bool* mp = m.data_ptr<bool>();
+    float* tp = t.data_ptr<float>();
+    float* vp = v.data_ptr<float>();
+    for (int64_t i = 0; i < aux_n; ++i) {
+      const SearchTrainingExample& ex = search_examples[i];
+      int64_t copy = std::min<int64_t>(
+          obs_size, static_cast<int64_t>(ex.observation.size()));
+      if (copy > 0) {
+        std::memcpy(sp + i * obs_size, ex.observation.data(),
+                    copy * sizeof(float));
+      }
+      // Legal mask + normalized-visit CE targets, aligned to legal_actions.
+      for (size_t j = 0; j < ex.legal_actions.size(); ++j) {
+        Action a = ex.legal_actions[j];
+        if (a >= 0 && a < action_dim) {
+          mp[i * action_dim + a] = true;
+          tp[i * action_dim + a] = static_cast<float>(
+              (j < ex.normalized_visits.size()) ? ex.normalized_visits[j] : 0.0);
+        }
+      }
+      vp[i] = static_cast<float>(ex.value_target);
+    }
+    aux_states = s.to(device);
+    aux_masks = m.to(device);
+    aux_targets = t.to(device);
+    aux_values = v.to(device);
+    // Deterministic contiguous partition of the E examples across the
+    // num_minibatches PPO steps of one epoch (base each; remainder spread to the
+    // first `rem`). Identical every epoch => each example is used exactly once
+    // per PPO epoch that fully runs (KL early-stop may cut the tail — expected).
+    int64_t num_mb = (n + minibatch_size - 1) / minibatch_size;
+    auto slices = ComputeAuxSlices(aux_n, num_mb);
+    aux_slice_start.assign(num_mb, 0);
+    aux_slice_len.assign(num_mb, 0);
+    for (int64_t k = 0; k < num_mb && k < static_cast<int64_t>(slices.size()); ++k) {
+      aux_slice_start[k] = slices[k].first;
+      aux_slice_len[k] = slices[k].second;
+    }
+  }
+
   // --- PPO Loss Loop ---
   double weighted_policy_loss_sum = 0.0;
   double weighted_entropy_sum = 0.0;
@@ -476,6 +662,7 @@ PpoUpdateStats TrainPpoUpdate(
 
     for (int64_t start = 0; start < n; start += minibatch_size) {
       int64_t end = std::min(start + minibatch_size, n);
+      const int64_t mb_index = start / minibatch_size;  // minibatch # within epoch
       torch::Tensor mb_idx = permutation.narrow(0, start, end - start);
 
       torch::Tensor mb_states = states.index_select(0, mb_idx);
@@ -490,6 +677,69 @@ PpoUpdateStats TrainPpoUpdate(
       int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
 
       optimizer.zero_grad();
+
+      // --- Phase 18B auxiliary search loss (disjoint graph via a separate
+      // forward). Backward the SCALED aux loss FIRST so the aux-only grads can be
+      // snapshotted; the PPO backward below then accumulates on top, and
+      // ppo_grad = total_grad - aux_grad exactly (grads add). Entirely skipped
+      // when aux is inactive or this minibatch's slice is empty -> identical to
+      // today. Aux terms never touch PPO ratios/clip/entropy/adv/KL. ---
+      std::vector<torch::Tensor> aux_grad_snapshot;
+      bool this_mb_has_aux = false;
+      double this_aux_norm = 0.0;
+      if (aux_active) {
+        const int64_t as = aux_slice_start[mb_index];
+        const int64_t al = aux_slice_len[mb_index];
+        if (al > 0) {
+          this_mb_has_aux = true;
+          torch::Tensor a_states = aux_states.narrow(0, as, al);
+          torch::Tensor a_masks = aux_masks.narrow(0, as, al);
+          torch::Tensor a_targets = aux_targets.narrow(0, as, al);
+          torch::Tensor a_values = aux_values.narrow(0, as, al);
+          torch::Tensor scaled_aux;
+          double ce_val = 0.0, vmse_val = 0.0;
+          auto compute_aux = [&]() {
+            auto ao = model->forward(a_states);
+            torch::Tensor alogits =
+                CenterAndCapLogitsTensor(ao.logits, a_masks, logit_cap);
+            torch::Tensor amasked =
+                alogits.masked_fill(a_masks.logical_not(), -1e9f);
+            torch::Tensor alogp = torch::log_softmax(amasked, -1);
+            // Legal-action cross-entropy: targets are 0 at illegal actions, so
+            // 0 * (finite masked logprob) = 0 there (no NaN).
+            torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
+            torch::Tensor av = ao.values.squeeze(1);
+            torch::Tensor vmse = (av - a_values).pow(2).mean();
+            ce_val = ce.item<double>();
+            vmse_val = vmse.item<double>();
+            scaled_aux =
+                static_cast<float>(search_loss_coef) * (ce + value_coef * vmse);
+          };
+          if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
+            AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+            compute_aux();
+          } else {
+            compute_aux();
+          }
+          scaled_aux.backward();
+          // Snapshot aux-only grads (clone) and their flattened 2-norm.
+          auto params = model->parameters();
+          aux_grad_snapshot.resize(params.size());
+          double aux_sq = 0.0;
+          for (size_t pi = 0; pi < params.size(); ++pi) {
+            auto g = params[pi].grad();
+            if (g.defined()) {
+              aux_grad_snapshot[pi] = g.detach().clone();
+              aux_sq += aux_grad_snapshot[pi].pow(2).sum().item<double>();
+            }
+          }
+          this_aux_norm = std::sqrt(aux_sq);
+          aux_ce_sum += ce_val;
+          aux_vmse_sum += vmse_val;
+          ++aux_slice_uses;
+        }
+      }
+
       torch::Tensor policy_loss, value_loss, entropy, approx_kl, clip_fraction;
       torch::Tensor total_loss;
 
@@ -603,6 +853,26 @@ PpoUpdateStats TrainPpoUpdate(
       }
 
       total_loss.backward();
+
+      // Phase 18B unclipped norm accounting (before the shared clip): the
+      // accumulated grad now holds aux+ppo; ppo-only = total - aux (snapshot).
+      if (this_mb_has_aux) {
+        auto params = model->parameters();
+        double ppo_sq = 0.0;
+        for (size_t pi = 0; pi < params.size(); ++pi) {
+          auto tot = params[pi].grad();
+          if (!tot.defined()) continue;
+          torch::Tensor ppo_g =
+              (pi < aux_grad_snapshot.size() && aux_grad_snapshot[pi].defined())
+                  ? (tot - aux_grad_snapshot[pi])
+                  : tot;
+          ppo_sq += ppo_g.pow(2).sum().item<double>();
+        }
+        aux_norm_sum += this_aux_norm;
+        ppo_only_norm_sum += std::sqrt(ppo_sq);
+        ++aux_norm_count;
+      }
+
       double grad_norm =
           torch::nn::utils::clip_grad_norm_(
               model->parameters(), ::absl::GetFlag(::FLAGS_grad_clip_norm));
@@ -639,6 +909,28 @@ PpoUpdateStats TrainPpoUpdate(
     stats.epoch_kls.push_back(ep_kl);
 
     if (stats.early_stopped) break;
+  }
+
+  // Phase 18B combined-optimization diagnostics + per-update abort decision.
+  if (aux_slice_uses > 0) {
+    stats.aux_ce = aux_ce_sum / static_cast<double>(aux_slice_uses);
+    stats.aux_value_mse = aux_vmse_sum / static_cast<double>(aux_slice_uses);
+  }
+  if (aux_norm_count > 0) {
+    stats.aux_grad_norm_mean =
+        aux_norm_sum / static_cast<double>(aux_norm_count);
+    stats.ppo_grad_norm_mean =
+        ppo_only_norm_sum / static_cast<double>(aux_norm_count);
+    stats.aux_ppo_norm_ratio =
+        (stats.ppo_grad_norm_mean > 0.0)
+            ? (stats.aux_grad_norm_mean / stats.ppo_grad_norm_mean)
+            : 0.0;
+    // The caller (trainer) performs the clean abort at the latest valid
+    // checkpoint; TrainPpoUpdate only flags it (so tests can assert the path).
+    if (abort_grad_norm_ratio > 0.0 &&
+        stats.aux_ppo_norm_ratio > abort_grad_norm_ratio) {
+      stats.aux_ratio_abort = true;
+    }
   }
 
   if (stats.minibatches > 0) {

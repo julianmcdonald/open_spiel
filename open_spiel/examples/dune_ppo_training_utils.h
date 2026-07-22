@@ -7,11 +7,14 @@
 #include <cstring>
 #include <cstdint>
 
+#include "open_spiel/utils/json.h"  // json::Object for manifest online-collection state
+
 
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
 #include "dune_network.h"
+#include "dune_online_search_collector.h"  // SearchTrainingExample (18B combined opt)
 #endif
 
 namespace open_spiel {
@@ -59,6 +62,17 @@ struct PpoUpdateStats {
   int64_t forced_transitions = 0;
   std::vector<double> epoch_kls;
   std::string rollout_hash;
+
+  // --- Phase 18B combined optimization (online search aux loss) diagnostics ---
+  // All zero / false unless online collection fed non-empty examples with a
+  // positive search-loss coefficient this update.
+  int aux_examples_used = 0;          // # search examples folded in this update
+  double aux_ce = 0.0;                // mean legal-action cross-entropy over aux slices
+  double aux_value_mse = 0.0;         // mean critic MSE over aux slices
+  double aux_grad_norm_mean = 0.0;    // per-update mean unclipped aux-only grad norm
+  double ppo_grad_norm_mean = 0.0;    // per-update mean unclipped ppo-only grad norm
+  double aux_ppo_norm_ratio = 0.0;    // aux_grad_norm_mean / ppo_grad_norm_mean
+  bool aux_ratio_abort = false;       // ratio exceeded abort_grad_norm_ratio (caller aborts)
 };
 
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch);
@@ -80,7 +94,12 @@ PpoUpdateStats TrainPpoUpdate(
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
     uint64_t master, int global_update,
-    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model = nullptr);
+    std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model = nullptr,
+    // Phase 18B combined optimization. Default-empty / coef 0 => aux machinery is
+    // skipped entirely and the update is numerically identical to today.
+    const std::vector<SearchTrainingExample>& search_examples = {},
+    double search_loss_coef = 0.0,
+    double abort_grad_norm_ratio = 0.0);
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
@@ -149,6 +168,47 @@ struct CheckpointManifest {
   int hidden_dim;
   int num_blocks;
 };
+
+// Deterministic contiguous partition of `num_examples` aux examples across
+// `num_minibatches` PPO minibatch steps in one epoch: base each, remainder to
+// the first slices. Same partition every epoch => each example used exactly once
+// per epoch that fully runs. Returns {start, len} per minibatch. Exposed for
+// unit testing the each-example-once schedule.
+std::vector<std::pair<int64_t, int64_t>> ComputeAuxSlices(int64_t num_examples,
+                                                          int64_t num_minibatches);
+
+// Phase 18B online-collection state persisted in the checkpoint manifest for
+// exact resume (plan §18C). All fields are OPTIONAL in the manifest (absent
+// entirely when online collection is off), so reading tolerates their absence.
+struct OnlineCollectionState {
+  bool present = false;              // true once read from a manifest that had it
+  // Effective config echo (audit).
+  int auxiliary_games = 0;
+  uint64_t auxiliary_search_seed_domain = 0;
+  double collector_dirichlet_epsilon = 0.0;
+  double swordmaster_grant_fraction = 0.0;
+  int swordmaster_grant_round = 0;
+  double search_loss_coef_target = 0.0;
+  int search_loss_warmup_update = 0;   // warmup position (updates 1 -> this)
+  double abort_grad_norm_ratio = 0.0;
+  // Exact-resume cursor + cumulative counters + chained accepted-target hash.
+  uint64_t next_auxiliary_episode_id = 0;
+  int64_t cum_accepted = 0, cum_rejected = 0;
+  int64_t cum_role_searches[3] = {0, 0, 0};
+  int64_t cum_role_accepted[3] = {0, 0, 0};
+  int64_t cum_granted = 0, cum_organic = 0;
+  std::string accepted_hash_chain;
+};
+
+// Adds the online-collection fields to a manifest object under "online_collection".
+void WriteOnlineCollectionState(json::Object& manifest_obj,
+                                const OnlineCollectionState& st);
+// Reads them back from a manifest file. Returns true and sets out.present=true
+// iff the "online_collection" object was present and well-formed; returns true
+// with out.present=false if simply absent (not an error); false on malformed.
+bool ReadOnlineCollectionState(const std::string& manifest_path,
+                               OnlineCollectionState& out,
+                               std::string& error_msg);
 
 // Returns true on success. Populates out_manifest.
 // Populates error_msg and returns false on failure.

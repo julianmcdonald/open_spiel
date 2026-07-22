@@ -5,7 +5,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
 
-  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
@@ -66,8 +66,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_seed_utils_test dune_seed_utils_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_seed_utils_test ${TORCH_LIBRARIES})
 
-  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_ppo_training_utils_test ${TORCH_LIBRARIES})
+  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_ppo_training_utils_test dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_sha256_test dune_sha256_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_sha256_test ${TORCH_LIBRARIES})

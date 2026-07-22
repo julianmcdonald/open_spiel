@@ -41,6 +41,7 @@
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
 #include "dune_search_routing.h"
+#include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
 #endif
 
@@ -121,13 +122,43 @@ ABSL_FLAG(bool, pipeline, false,
           "both workloads compete for compute and pipelining may be slower.");
 
 ABSL_FLAG(std::string, search_label_dir, "",
-          "Directory containing search teacher labels. Empty disables.");
+          "[LEGACY offline-distillation mode] Directory containing precomputed "
+          "search teacher labels. Empty disables. Mutually exclusive with "
+          "--online_search_collection (the Phase 18B online path).");
 ABSL_FLAG(double, search_lambda, 0.5,
-          "Weight for search teacher KL distillation loss.");
+          "[LEGACY offline-distillation] Weight for the static search teacher KL "
+          "distillation loss.");
 ABSL_FLAG(int, search_minibatches_per_update, 2,
-          "Search distillation minibatches per PPO update.");
+          "[LEGACY offline-distillation] Search distillation minibatches per PPO update.");
 ABSL_FLAG(int, search_minibatch_size, 512,
-          "Size of each search distillation minibatch.");
+          "[LEGACY offline-distillation] Size of each search distillation minibatch.");
+
+// --- Phase 18B online auxiliary-search collection (combined optimization) ---
+// Treatment-arm switch. When true, each update collects search examples online
+// from the frozen pre-update snapshot and folds them into TrainPpoUpdate as an
+// auxiliary CE+value loss. Mutually exclusive with --search_label_dir. Every
+// other OnlineSearchConfig field keeps its library default (the frozen pilot
+// values) and is NOT restated as a flag.
+ABSL_FLAG(bool, online_search_collection, false,
+          "Enable Phase 18B online auxiliary-search collection + combined optimization.");
+ABSL_FLAG(int, auxiliary_games, 16,
+          "Online collector auxiliary games per update (must be a multiple of 4).");
+ABSL_FLAG(uint64_t, auxiliary_search_seed_domain, 0,
+          "Isolated seed domain for online collection. REQUIRED nonzero when "
+          "--online_search_collection is set (no silent default).");
+ABSL_FLAG(double, collector_dirichlet_epsilon, 0.25,
+          "Root Dirichlet noise weight for online collection (pilot 0.25; probe used 0).");
+ABSL_FLAG(double, search_loss_coef, 0.10,
+          "Target auxiliary search-loss coefficient (warms 0 -> target).");
+ABSL_FLAG(int, search_loss_warmup_update, 25,
+          "Update at which the search-loss coefficient reaches its target.");
+ABSL_FLAG(double, abort_grad_norm_ratio, 0.50,
+          "Abort the run if the per-update aux/PPO grad-norm ratio exceeds this.");
+ABSL_FLAG(double, swordmaster_grant_fraction, 0.0,
+          "Endowment-curriculum: fraction of collector games granting the searched "
+          "seat a free Swordmaster.");
+ABSL_FLAG(int, swordmaster_grant_round, 2,
+          "Round at which a selected game's Swordmaster grant fires.");
 
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
@@ -782,6 +813,17 @@ std::string ComputeLegacyConfigFingerprint() {
   config_obj["search_minibatches_per_update"] = absl::GetFlag(FLAGS_search_minibatches_per_update);
   config_obj["search_minibatch_size"] = absl::GetFlag(FLAGS_search_minibatch_size);
 
+  // Phase 18B online auxiliary-search collection (combined optimization).
+  config_obj["online_search_collection"] = absl::GetFlag(FLAGS_online_search_collection);
+  config_obj["auxiliary_games"] = absl::GetFlag(FLAGS_auxiliary_games);
+  config_obj["auxiliary_search_seed_domain"] = static_cast<int64_t>(absl::GetFlag(FLAGS_auxiliary_search_seed_domain));
+  config_obj["collector_dirichlet_epsilon"] = absl::GetFlag(FLAGS_collector_dirichlet_epsilon);
+  config_obj["search_loss_coef"] = absl::GetFlag(FLAGS_search_loss_coef);
+  config_obj["search_loss_warmup_update"] = absl::GetFlag(FLAGS_search_loss_warmup_update);
+  config_obj["abort_grad_norm_ratio"] = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
+  config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
+  config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
+
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
 }
@@ -821,6 +863,17 @@ std::string ComputeConfigFingerprint() {
   config_obj["search_lambda"] = absl::GetFlag(FLAGS_search_lambda);
   config_obj["search_minibatches_per_update"] = absl::GetFlag(FLAGS_search_minibatches_per_update);
   config_obj["search_minibatch_size"] = absl::GetFlag(FLAGS_search_minibatch_size);
+
+  // Phase 18B online auxiliary-search collection (combined optimization).
+  config_obj["online_search_collection"] = absl::GetFlag(FLAGS_online_search_collection);
+  config_obj["auxiliary_games"] = absl::GetFlag(FLAGS_auxiliary_games);
+  config_obj["auxiliary_search_seed_domain"] = static_cast<int64_t>(absl::GetFlag(FLAGS_auxiliary_search_seed_domain));
+  config_obj["collector_dirichlet_epsilon"] = absl::GetFlag(FLAGS_collector_dirichlet_epsilon);
+  config_obj["search_loss_coef"] = absl::GetFlag(FLAGS_search_loss_coef);
+  config_obj["search_loss_warmup_update"] = absl::GetFlag(FLAGS_search_loss_warmup_update);
+  config_obj["abort_grad_norm_ratio"] = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
+  config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
+  config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
 
   // New flags added for complete config fingerprint validation
   config_obj["deterministic"] = absl::GetFlag(FLAGS_deterministic);
@@ -883,7 +936,8 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     int seed_scheme_version,
                     const std::string& config_fingerprint,
                     const std::string& search_label_fingerprint,
-                    const std::string& run_uuid) {
+                    const std::string& run_uuid,
+                    const open_spiel::OnlineCollectionState* aux_state = nullptr) {
   std::string model_tmp = model_path + ".tmp";
   std::string optim_tmp = optim_path + ".tmp";
 
@@ -923,6 +977,10 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["optimizer_sha256"] = optim_hash;
     manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
+    // Phase 18B: persist online-collection state for exact resume (plan §18C).
+    if (aux_state != nullptr) {
+      open_spiel::WriteOnlineCollectionState(manifest_obj, *aux_state);
+    }
 
     {
       std::ofstream ofs(manifest_tmp);
@@ -1484,6 +1542,12 @@ struct CollectResult {
   double raw_conflict_vp = 0.0;
   double raw_noncombat_vp = 0.0;
   double raw_total_vp = 0.0;
+
+  // Phase 18B: online auxiliary-search examples collected from the SAME frozen
+  // snapshot as `rollout`, so they travel together and are consumed by the same
+  // TrainPpoUpdate. Empty unless --online_search_collection.
+  std::vector<open_spiel::SearchTrainingExample> aux_examples;
+  open_spiel::OnlineSearchCollectionStats aux_stats;
 };
 
 
@@ -1702,6 +1766,17 @@ int main(int argc, char** argv) {
 
   std::atomic<uint64_t> total_env_steps{0};
   std::atomic<uint64_t> next_episode_id{0};
+  // Phase 18B online-collection persistent state (restored from the manifest on
+  // resume, persisted at every checkpoint). aux_next_episode_id_persist TRAILS
+  // the collector's live cursor by one pipeline step: it is the next-episode-id
+  // as of the LAST CONSUMED update, which is exactly what a resume must continue
+  // from so episode ids neither repeat nor skip.
+  uint64_t aux_next_episode_id_persist = 0;
+  int64_t aux_cum_accepted = 0, aux_cum_rejected = 0;
+  int64_t aux_cum_role_searches[3] = {0, 0, 0};
+  int64_t aux_cum_role_accepted[3] = {0, 0, 0};
+  int64_t aux_cum_granted = 0, aux_cum_organic = 0;
+  std::string aux_hash_chain = "";
   int start_update = 1;
   int target_end_update = absl::GetFlag(FLAGS_target_end_update);
 
@@ -1753,6 +1828,34 @@ int main(int argc, char** argv) {
     uint64_t manifest_env_steps = manifest.total_env_steps;
     uint64_t manifest_episode_id = manifest.next_episode_id;
     std::string manifest_run_uuid = manifest.run_uuid;
+
+    // Phase 18B exact resume: restore online-collection cursor + cumulative
+    // counters + accepted-target hash chain from the manifest (if present).
+    {
+      open_spiel::OnlineCollectionState restored;
+      std::string oc_err;
+      if (!open_spiel::ReadOnlineCollectionState(manifest_path, restored, oc_err)) {
+        SpielFatalError("Failed to read online_collection manifest state: " + oc_err);
+      }
+      if (restored.present) {
+        aux_next_episode_id_persist = restored.next_auxiliary_episode_id;
+        aux_cum_accepted = restored.cum_accepted;
+        aux_cum_rejected = restored.cum_rejected;
+        aux_cum_granted = restored.cum_granted;
+        aux_cum_organic = restored.cum_organic;
+        for (int r = 0; r < 3; ++r) {
+          aux_cum_role_searches[r] = restored.cum_role_searches[r];
+          aux_cum_role_accepted[r] = restored.cum_role_accepted[r];
+        }
+        aux_hash_chain = restored.accepted_hash_chain;
+        std::cout << absl::StrFormat(
+            "[18B] Restored online-collection state: next_aux_episode_id=%llu "
+            "cum_accepted=%lld cum_granted=%lld cum_organic=%lld\n",
+            (unsigned long long)aux_next_episode_id_persist,
+            (long long)aux_cum_accepted, (long long)aux_cum_granted,
+            (long long)aux_cum_organic);
+      }
+    }
 
     try {
       LoadModelCheckpoint(training_model, model_path, device);
@@ -2024,6 +2127,121 @@ int main(int argc, char** argv) {
         absl::GetFlag(FLAGS_evaluator_device_synchronize));
   }
 
+  // --- Phase 18B online auxiliary-search collection setup ---
+  // The collector runs its 64-sim searches through a DuneNNEvaluator over the
+  // FROZEN inference_model snapshot (never the training model, never post-update
+  // weights). Collection is placed alongside each rollout (below) so aux and PPO
+  // examples always come from the same snapshot. SyncModels only runs on the main
+  // thread after the bg collection joins, so the snapshot is stable during a
+  // collection even without the evaluator's sync_mutex.
+  const bool online_search_collection = absl::GetFlag(FLAGS_online_search_collection);
+  if (online_search_collection && !absl::GetFlag(FLAGS_search_label_dir).empty()) {
+    SpielFatalError(
+        "--online_search_collection and --search_label_dir are mutually "
+        "exclusive (online collection vs legacy offline distillation).");
+  }
+  std::shared_ptr<open_spiel::OnlineSearchCollector> aux_collector;
+  std::shared_ptr<open_spiel::DuneNNEvaluator> aux_evaluator;
+  double aux_search_loss_coef_target = absl::GetFlag(FLAGS_search_loss_coef);
+  int aux_search_loss_warmup = absl::GetFlag(FLAGS_search_loss_warmup_update);
+  double aux_abort_ratio = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
+  open_spiel::OnlineSearchConfig aux_config;  // effective echo (persisted in manifest)
+  if (online_search_collection) {
+    if (absl::GetFlag(FLAGS_auxiliary_search_seed_domain) == 0) {
+      SpielFatalError(
+          "--auxiliary_search_seed_domain must be set nonzero when "
+          "--online_search_collection is enabled (no silent default).");
+    }
+    aux_config.auxiliary_games = absl::GetFlag(FLAGS_auxiliary_games);
+    aux_config.auxiliary_search_seed_domain =
+        absl::GetFlag(FLAGS_auxiliary_search_seed_domain);
+    aux_config.dirichlet_epsilon = absl::GetFlag(FLAGS_collector_dirichlet_epsilon);
+    aux_config.swordmaster_grant_fraction =
+        absl::GetFlag(FLAGS_swordmaster_grant_fraction);
+    aux_config.swordmaster_grant_round =
+        absl::GetFlag(FLAGS_swordmaster_grant_round);
+    // Exact resume: continue the aux episode cursor from the manifest.
+    aux_config.next_auxiliary_episode_id =
+        static_cast<int64_t>(aux_next_episode_id_persist);
+    aux_evaluator =
+        std::make_shared<open_spiel::DuneNNEvaluator>(inference_model, device, 10.0f);
+    aux_collector = std::make_shared<open_spiel::OnlineSearchCollector>(
+        aux_config, config_fingerprint);
+    std::cout << absl::StrFormat(
+        "[18B] Online collection ON | aux_games=%d seed_domain=%llu "
+        "dirichlet_eps=%.3f grant_frac=%.3f grant_round=%d loss_coef=%.3f/warmup%d "
+        "abort_ratio=%.3f resume_ep=%llu\n",
+        aux_config.auxiliary_games,
+        (unsigned long long)aux_config.auxiliary_search_seed_domain,
+        aux_config.dirichlet_epsilon, aux_config.swordmaster_grant_fraction,
+        aux_config.swordmaster_grant_round, aux_search_loss_coef_target,
+        aux_search_loss_warmup, aux_abort_ratio,
+        (unsigned long long)aux_next_episode_id_persist);
+  }
+
+  // Collect one update's aux examples into `cr`, from the frozen snapshot. Runs
+  // in whatever thread collects the paired PPO rollout (pre-loop main thread or
+  // the bg pipeline thread), advancing the collector's private episode cursor.
+  auto run_aux_collection = [&](int update_id, open_spiel::CollectResult& cr) {
+    if (!online_search_collection) return;
+    aux_collector->CollectUpdate(update_id, game, aux_evaluator, &cr.aux_examples,
+                                 &cr.aux_stats);
+  };
+  // Fold a CONSUMED update's collection into the persisted cumulative counters,
+  // the chained accepted-target hash, and the resume cursor (main thread only,
+  // so no race with the bg collector).
+  auto account_aux_consumed = [&](const open_spiel::CollectResult& cr) {
+    if (!online_search_collection) return;
+    const open_spiel::OnlineSearchCollectionStats& st = cr.aux_stats;
+    aux_cum_accepted += st.accepted_targets;
+    aux_cum_rejected += st.rejected_incomplete;
+    aux_cum_granted += st.swordmaster_granted_games;
+    aux_cum_organic += st.swordmaster_organic_games;
+    for (int r = 0; r < 3; ++r) {
+      aux_cum_role_searches[r] += st.by_role[r].searches;
+      aux_cum_role_accepted[r] += st.by_role[r].accepted;
+    }
+    aux_next_episode_id_persist = static_cast<uint64_t>(st.next_episode_id);
+    std::string digest;
+    for (const auto& ex : cr.aux_examples) {
+      digest.append(reinterpret_cast<const char*>(&ex.episode_id), sizeof(ex.episode_id));
+      int64_t did = ex.decision_id;
+      digest.append(reinterpret_cast<const char*>(&did), sizeof(did));
+      int32_t pl = ex.player;
+      digest.append(reinterpret_cast<const char*>(&pl), sizeof(pl));
+      for (Action a : ex.legal_actions)
+        digest.append(reinterpret_cast<const char*>(&a), sizeof(a));
+      for (double v : ex.normalized_visits)
+        digest.append(reinterpret_cast<const char*>(&v), sizeof(v));
+      digest.append(reinterpret_cast<const char*>(&ex.value_target), sizeof(ex.value_target));
+    }
+    aux_hash_chain = open_spiel::ComputeStringSHA256(aux_hash_chain + digest);
+  };
+  // Snapshot the persisted online-collection state for a checkpoint manifest.
+  auto build_aux_state = [&]() {
+    open_spiel::OnlineCollectionState s;
+    s.present = true;
+    s.auxiliary_games = aux_config.auxiliary_games;
+    s.auxiliary_search_seed_domain = aux_config.auxiliary_search_seed_domain;
+    s.collector_dirichlet_epsilon = aux_config.dirichlet_epsilon;
+    s.swordmaster_grant_fraction = aux_config.swordmaster_grant_fraction;
+    s.swordmaster_grant_round = aux_config.swordmaster_grant_round;
+    s.search_loss_coef_target = aux_search_loss_coef_target;
+    s.search_loss_warmup_update = aux_search_loss_warmup;
+    s.abort_grad_norm_ratio = aux_abort_ratio;
+    s.next_auxiliary_episode_id = aux_next_episode_id_persist;
+    s.cum_accepted = aux_cum_accepted;
+    s.cum_rejected = aux_cum_rejected;
+    for (int r = 0; r < 3; ++r) {
+      s.cum_role_searches[r] = aux_cum_role_searches[r];
+      s.cum_role_accepted[r] = aux_cum_role_accepted[r];
+    }
+    s.cum_granted = aux_cum_granted;
+    s.cum_organic = aux_cum_organic;
+    s.accepted_hash_chain = aux_hash_chain;
+    return s;
+  };
+
   std::cout << absl::StrFormat(
       "Initialized dune_ppo_train | obs=%d actions=%d hidden=%d blocks=%d "
       "rollout_transitions=%d rollout_games=%d minibatch=%d epochs=%d clip=%.3f vf_coef=%.3f "
@@ -2093,6 +2311,10 @@ int main(int argc, char** argv) {
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
+  // Phase 18B: aux examples for the first update, from the same frozen snapshot
+  // the pre-loop rollout used (sequential, main thread).
+  run_aux_collection(start_update, current_collect);
+
   for (int update = start_update; update <= target_end_update; ++update) {
     if (absl::GetFlag(FLAGS_anneal_lr)) {
       double frac = 1.0 - static_cast<double>(update - 1) /
@@ -2117,14 +2339,42 @@ int main(int argc, char** argv) {
         next_collect = open_spiel::CollectRollout(
             game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
             rollout_games, next_reward_lambda);
+        // Phase 18B: aux for the NEXT update, from the same frozen snapshot, run
+        // sequentially AFTER the rollout (design: collect PPO first, then aux).
+        run_aux_collection(update + 1, next_collect);
       });
     }
 
     auto ppo_start = std::chrono::high_resolution_clock::now();
+    const double this_search_coef =
+        online_search_collection
+            ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
+                                                  aux_search_loss_warmup)
+            : 0.0;
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
-                                   obs_size, action_size, device, master, update, anchor_model);
+                                   obs_size, action_size, device, master, update, anchor_model,
+                                   current_collect.aux_examples, this_search_coef,
+                                   online_search_collection ? aux_abort_ratio : 0.0);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+
+    // Phase 18B clean abort at the latest valid checkpoint (plan §18C): a
+    // per-update aux/PPO grad-norm ratio over threshold stops the run; this
+    // update's mutated weights are discarded (never checkpointed) and we exit
+    // nonzero with a distinct message.
+    if (stats.aux_ratio_abort) {
+      if (have_bg && bg_collect_thread.joinable()) bg_collect_thread.join();
+      std::cerr << absl::StrFormat(
+          "ABORT[18B grad-ratio]: update %d aux/PPO norm ratio %.4f > %.4f "
+          "(aux_norm=%.4f ppo_norm=%.4f). Keeping last valid checkpoint; this "
+          "update is NOT saved.\n",
+          update, stats.aux_ppo_norm_ratio, aux_abort_ratio,
+          stats.aux_grad_norm_mean, stats.ppo_grad_norm_mean);
+      std::exit(3);
+    }
+    // Fold this consumed update's collection into the persisted cumulative
+    // counters / hash chain / resume cursor (main thread only).
+    account_aux_consumed(current_collect);
 
     if (absl::GetFlag(FLAGS_train_value_only)) {
       std::string current_non_value_hash = HashNonValueParameters(training_model);
@@ -2271,7 +2521,30 @@ int main(int argc, char** argv) {
         stats.clip_fraction, stats.explained_variance,
         stats.early_stopped ? " | early-stop" : "");
 
-
+    // Phase 18B combined-optimization + collector diagnostics.
+    if (online_search_collection) {
+      const open_spiel::OnlineSearchCollectionStats& cst = current_collect.aux_stats;
+      auto acc = [](const open_spiel::PerRoleSearchStats& r) {
+        return r.searches > 0 ? static_cast<double>(r.accepted) / r.searches : 0.0;
+      };
+      auto mkl = [](const open_spiel::PerRoleSearchStats& r) {
+        return r.searches > 0 ? r.sum_kl / r.searches : 0.0;
+      };
+      std::cout << absl::StrFormat(
+          "  [18B Aux] used=%d coef=%.4f ce=%.4f vmse=%.4f | aux_norm=%.4f "
+          "ppo_norm=%.4f ratio=%.3f\n",
+          stats.aux_examples_used, this_search_coef, stats.aux_ce,
+          stats.aux_value_mse, stats.aux_grad_norm_mean, stats.ppo_grad_norm_mean,
+          stats.aux_ppo_norm_ratio);
+      std::cout << absl::StrFormat(
+          "  [18B Collector] accepted=%d rejected=%d wall=%.1fs | acc/KL "
+          "primary %.2f/%.2f cont %.2f/%.2f purch %.2f/%.2f | SM granted=%d organic=%d\n",
+          cst.accepted_targets, cst.rejected_incomplete, cst.collection_wall_time_s,
+          acc(cst.by_role[0]), mkl(cst.by_role[0]), acc(cst.by_role[1]),
+          mkl(cst.by_role[1]), acc(cst.by_role[2]), mkl(cst.by_role[2]),
+          static_cast<int>(cst.swordmaster_granted_games),
+          static_cast<int>(cst.swordmaster_organic_games));
+    }
 
     std::cout << absl::StrFormat(
         "  [Conflict VP Stats] Generated: %.2f | Attributed: %.2f | Unattributed: %.2f\n",
@@ -2322,12 +2595,14 @@ int main(int argc, char** argv) {
           absl::StrCat(prefix, "_model_update_", update, ".pt");
       std::string optim_path =
           absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
+      open_spiel::OnlineCollectionState aux_ckpt = build_aux_state();
       open_spiel::SaveCheckpoint(training_model, *optimizer, model_path,
                                  optim_path, update, target_end_update,
                                  total_env_steps.load(), next_episode_id.load(),
                                  master, absl::GetFlag(FLAGS_seed_scheme_version),
                                  config_fingerprint, search_label_fingerprint,
-                                 run_uuid);
+                                 run_uuid,
+                                 online_search_collection ? &aux_ckpt : nullptr);
     }
 
     // Advance to next rollout.
@@ -2342,6 +2617,8 @@ int main(int argc, char** argv) {
           rollout_games, next_reward_lambda);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
+      // Phase 18B (non-pipelined path): aux for the next update, same snapshot.
+      run_aux_collection(update + 1, current_collect);
     }
   }
 
@@ -2362,6 +2639,7 @@ int main(int argc, char** argv) {
       static_cast<unsigned long long>(eval_stats.max_batch_size));
 
   if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
+    open_spiel::OnlineCollectionState aux_final = build_aux_state();
     open_spiel::SaveCheckpoint(training_model, *optimizer,
                                absl::GetFlag(FLAGS_model_checkpoint),
                                absl::GetFlag(FLAGS_optim_checkpoint),
@@ -2369,7 +2647,8 @@ int main(int argc, char** argv) {
                                total_env_steps.load(), next_episode_id.load(),
                                master, absl::GetFlag(FLAGS_seed_scheme_version),
                                config_fingerprint, search_label_fingerprint,
-                               run_uuid);
+                               run_uuid,
+                               online_search_collection ? &aux_final : nullptr);
   }
   return 0;
 #endif

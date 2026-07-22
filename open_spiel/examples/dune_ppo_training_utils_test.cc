@@ -211,6 +211,191 @@ void TestTrainPpoUpdateParityGoldenHash() {
   } TEST_END();
 }
 
+// Step 5b: deterministic each-example-once scheduling.
+void TestAuxSliceScheduling() {
+  TEST_BEGIN("Aux slices: contiguous, balanced, every example used exactly once/epoch") {
+    struct Case { int64_t E, M; };
+    Case cases[] = {{12, 4}, {10, 4}, {7, 3}, {0, 4}, {5, 1}, {3, 5}, {2048, 8}};
+    for (const Case& c : cases) {
+      auto slices = ComputeAuxSlices(c.E, c.M);
+      UTILS_CHECK(static_cast<int64_t>(slices.size()) == c.M);
+      int64_t total = 0, prev_end = 0, minlen = INT64_MAX, maxlen = 0;
+      for (int64_t k = 0; k < c.M; ++k) {
+        UTILS_CHECK(slices[k].first == prev_end);   // contiguous, no gap/overlap
+        UTILS_CHECK(slices[k].second >= 0);
+        prev_end = slices[k].first + slices[k].second;
+        total += slices[k].second;
+        minlen = std::min(minlen, slices[k].second);
+        maxlen = std::max(maxlen, slices[k].second);
+      }
+      UTILS_CHECK(total == c.E);              // union == [0,E): each used exactly once
+      UTILS_CHECK(maxlen - minlen <= 1);      // remainder spread evenly
+    }
+  } TEST_END();
+}
+
+// Builds a small deterministic fixture and runs TrainPpoUpdate with the given
+// aux configuration; returns the post-update model for inspection.
+static std::shared_ptr<SharedDunePolicyValueNetImpl> RunAuxFixture(
+    double coef, bool with_examples, double value_target = 0.5,
+    double abort_ratio = 0.0, PpoUpdateStats* out_stats = nullptr) {
+  const int64_t obs = 12, act = 5;
+  torch::manual_seed(777);
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 32, act, 2);
+  model->to(torch::kCPU);
+  torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+  std::vector<PpoTransition> batch(6);
+  for (int i = 0; i < 6; ++i) {
+    batch[i].state = std::vector<float>(obs, 0.1f * (i + 1));
+    batch[i].legal_actions = {0, 1, 2};
+    batch[i].action = i % 3;
+    batch[i].old_log_prob = 0.0f;
+    batch[i].reward = 0.1f;
+    batch[i].value = 0.0f;
+    batch[i].advantage = (i % 2) ? 0.5f : -0.5f;
+    batch[i].return_value = 0.2f;
+    batch[i].player_id = 0;
+    batch[i].episode_id = i;
+  }
+  std::vector<SearchTrainingExample> ex;
+  if (with_examples) {
+    for (int i = 0; i < 6; ++i) {
+      SearchTrainingExample e;
+      e.observation = std::vector<float>(obs, 0.2f * (i + 1));
+      e.player = 0;
+      e.legal_actions = {0, 1, 2};
+      e.normalized_visits = {0.7, 0.2, 0.1};
+      e.value_target = value_target;
+      e.value_target_attached = true;
+      ex.push_back(e);
+    }
+  }
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 3);
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+  absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+  absl::SetFlag(&FLAGS_normalize_advantages, true);
+  absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+  absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+  absl::SetFlag(&FLAGS_value_coef, 0.5);
+  absl::SetFlag(&FLAGS_logit_cap, 10.0);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_train_amp, false);
+  absl::SetFlag(&FLAGS_grad_clip_norm, 100.0);
+  absl::SetFlag(&FLAGS_diagnostics_only, false);
+  absl::SetFlag(&FLAGS_train_value_only, false);
+  torch::manual_seed(123);
+  PpoUpdateStats s = TrainPpoUpdate(model, opt, batch, obs, act, torch::kCPU,
+                                    /*master=*/5, /*global_update=*/3, nullptr, ex,
+                                    coef, abort_ratio);
+  if (out_stats) *out_stats = s;
+  return model;
+}
+
+// Step 5c: aux loss moves BOTH heads; coef 0 / empty examples are bit-inert.
+void TestAuxGradients() {
+  TEST_BEGIN("Aux loss moves policy AND value heads; coef 0 / empty vector inert") {
+    auto m_none = RunAuxFixture(/*coef=*/0.0, /*with_examples=*/false);
+    auto m_coef0 = RunAuxFixture(/*coef=*/0.0, /*with_examples=*/true);   // examples but coef 0
+    auto m_aux = RunAuxFixture(/*coef=*/0.1, /*with_examples=*/true);
+
+    // coef 0 (or empty) => bitwise identical to the no-aux path.
+    UTILS_CHECK(HashModelParams(m_none) == HashModelParams(m_coef0));
+    // aux with coef>0 => weights genuinely changed.
+    UTILS_CHECK(HashModelParams(m_none) != HashModelParams(m_aux));
+
+    auto l1diff = [](std::vector<torch::Tensor> a, std::vector<torch::Tensor> b) {
+      torch::NoGradGuard ng;
+      double d = 0.0;
+      for (size_t i = 0; i < a.size(); ++i) d += (a[i] - b[i]).abs().sum().item<double>();
+      return d;
+    };
+    // Both the policy head (from CE) and the value head (from MSE) moved.
+    UTILS_CHECK(l1diff(m_none->policy_head->parameters(),
+                       m_aux->policy_head->parameters()) > 1e-6);
+    UTILS_CHECK(l1diff(m_none->value_head->parameters(),
+                       m_aux->value_head->parameters()) > 1e-6);
+  } TEST_END();
+}
+
+// Step 5d: an artificially huge aux target set trips the ratio abort flag
+// (returned, not a crash/exit).
+void TestAuxRatioAbort() {
+  TEST_BEGIN("Aux/PPO grad-norm ratio over threshold sets aux_ratio_abort (no crash)") {
+    PpoUpdateStats s;
+    // Huge value targets -> huge aux value MSE -> aux grad >> ppo grad.
+    RunAuxFixture(/*coef=*/10.0, /*with_examples=*/true, /*value_target=*/1000.0,
+                  /*abort_ratio=*/0.5, &s);
+    UTILS_CHECK(s.aux_ratio_abort == true);
+    UTILS_CHECK(s.aux_ppo_norm_ratio > 0.5);
+    UTILS_CHECK(s.aux_examples_used == 6);
+  } TEST_END();
+}
+
+// Step 5e: online-collection manifest state round-trips exactly (exact resume).
+void TestOnlineCollectionResume() {
+  TEST_BEGIN("Online-collection manifest state round-trips exactly") {
+    OnlineCollectionState s;
+    s.present = true;
+    s.auxiliary_games = 16;
+    s.auxiliary_search_seed_domain = 1803ULL;
+    s.collector_dirichlet_epsilon = 0.25;
+    s.swordmaster_grant_fraction = 0.5;
+    s.swordmaster_grant_round = 2;
+    s.search_loss_coef_target = 0.10;
+    s.search_loss_warmup_update = 25;
+    s.abort_grad_norm_ratio = 0.5;
+    s.next_auxiliary_episode_id = 1234567ULL;
+    s.cum_accepted = 103;
+    s.cum_rejected = 5;
+    s.cum_role_searches[0] = 44; s.cum_role_searches[1] = 46; s.cum_role_searches[2] = 18;
+    s.cum_role_accepted[0] = 44; s.cum_role_accepted[1] = 41; s.cum_role_accepted[2] = 18;
+    s.cum_granted = 3;
+    s.cum_organic = 1;
+    s.accepted_hash_chain = "deadbeefcafef00d";
+
+    json::Object manifest;
+    manifest["schema_version"] = static_cast<int64_t>(2);
+    WriteOnlineCollectionState(manifest, s);
+    std::string path =
+        (std::filesystem::temp_directory_path() / "oc_manifest_roundtrip.json").string();
+    { std::ofstream ofs(path); ofs << json::ToString(manifest, true); }
+
+    OnlineCollectionState r;
+    std::string err;
+    UTILS_CHECK(ReadOnlineCollectionState(path, r, err));
+    UTILS_CHECK(r.present);
+    // Exact-resume fields (ints/uint/string): must match exactly.
+    UTILS_CHECK(r.next_auxiliary_episode_id == s.next_auxiliary_episode_id);
+    UTILS_CHECK(r.search_loss_warmup_update == s.search_loss_warmup_update);
+    UTILS_CHECK(r.auxiliary_games == s.auxiliary_games);
+    UTILS_CHECK(r.auxiliary_search_seed_domain == s.auxiliary_search_seed_domain);
+    UTILS_CHECK(r.swordmaster_grant_round == s.swordmaster_grant_round);
+    UTILS_CHECK(r.cum_accepted == s.cum_accepted);
+    UTILS_CHECK(r.cum_rejected == s.cum_rejected);
+    UTILS_CHECK(r.cum_granted == s.cum_granted);
+    UTILS_CHECK(r.cum_organic == s.cum_organic);
+    for (int i = 0; i < 3; ++i) {
+      UTILS_CHECK(r.cum_role_searches[i] == s.cum_role_searches[i]);
+      UTILS_CHECK(r.cum_role_accepted[i] == s.cum_role_accepted[i]);
+    }
+    UTILS_CHECK(r.accepted_hash_chain == s.accepted_hash_chain);
+
+    // A manifest WITHOUT online_collection reads back present=false, no error.
+    json::Object empty_manifest;
+    empty_manifest["schema_version"] = static_cast<int64_t>(2);
+    std::string path2 =
+        (std::filesystem::temp_directory_path() / "oc_manifest_absent.json").string();
+    { std::ofstream ofs(path2); ofs << json::ToString(empty_manifest, true); }
+    OnlineCollectionState r2;
+    std::string err2;
+    UTILS_CHECK(ReadOnlineCollectionState(path2, r2, err2));
+    UTILS_CHECK(!r2.present);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(path2);
+  } TEST_END();
+}
+
 void TestTrainPpoUpdateMasking() {
   TEST_BEGIN("TrainPpoUpdate NaN safety with 0 nontrivial transitions") {
     int64_t obs_size = 10;
@@ -566,6 +751,10 @@ int main() {
   // Run the new test functions
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   TestTrainPpoUpdateParityGoldenHash();
+  TestAuxSliceScheduling();
+  TestAuxGradients();
+  TestAuxRatioAbort();
+  TestOnlineCollectionResume();
   TestTrainPpoUpdateMasking();
   TestGradientMatching();
   TestCriticOnlyParameterMovement();
