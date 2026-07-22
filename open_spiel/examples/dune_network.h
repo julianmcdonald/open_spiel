@@ -202,31 +202,19 @@ public:
         EvalResult result;
         result.logits.resize(action_dim_);
 
-        struct ThreadLocalBuffers {
-            torch::Tensor input_tensor;
-            torch::Tensor device_tensor;
-        };
-        thread_local std::unordered_map<const DeterministicEvaluator*, ThreadLocalBuffers> tl_buffers;
-
-        auto& buffers = tl_buffers[this];
-        if (!buffers.input_tensor.defined()) {
-            auto options = torch::TensorOptions().dtype(torch::kFloat32);
-            if (device_.is_cuda()) {
-                options = options.pinned_memory(true);
-            }
-            buffers.input_tensor = torch::empty({1, model_input_dim_}, options);
-            if (device_.is_cuda()) {
-                buffers.device_tensor = torch::empty({1, model_input_dim_}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
-            }
-        }
-
-        float* data_ptr = buffers.input_tensor.data_ptr<float>();
-        int64_t copy_size = std::min<int64_t>(model_input_dim_, obs.size());
-        std::memcpy(data_ptr, obs.data(), copy_size * sizeof(float));
-        if (copy_size < model_input_dim_) {
-            std::memset(data_ptr + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
-        }
-
+        // Per-instance staging buffers (NOT thread_local). Previously these lived
+        // in a thread_local map keyed by `this`, so at end of run all 64 worker
+        // threads destroyed their pinned host tensor simultaneously; the pinned
+        // free path (CachingHostAllocator::free -> CUDAEvent::record ->
+        // cudaStreamIsCapturing) ran concurrently across the exiting threads and
+        // segfaulted libcuda inside __call_tls_dtors, right after the final game.
+        // Making them per-instance members frees each buffer exactly once, in the
+        // main thread at evaluator destruction, after the workers have joined.
+        //
+        // Staging now runs inside the global eval mutex because the buffers are
+        // shared across threads. `*mutex_` already serializes every Evaluate call
+        // (one mutex for the model + all opponents), so serializing the tiny
+        // memcpy/memset stage as well leaves throughput and numerics unchanged.
         SharedDunePolicyValueNetImpl::ModelOutputs outputs;
         {
             std::shared_lock<std::shared_mutex> sync_lock;
@@ -234,12 +222,31 @@ public:
                 sync_lock = std::shared_lock<std::shared_mutex>(*sync_mutex_);
             }
             std::lock_guard<std::mutex> lock(*mutex_);
+
+            if (!input_tensor_.defined()) {
+                auto options = torch::TensorOptions().dtype(torch::kFloat32);
+                if (device_.is_cuda()) {
+                    options = options.pinned_memory(true);
+                }
+                input_tensor_ = torch::empty({1, model_input_dim_}, options);
+                if (device_.is_cuda()) {
+                    device_tensor_ = torch::empty({1, model_input_dim_}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+                }
+            }
+
+            float* data_ptr = input_tensor_.data_ptr<float>();
+            int64_t copy_size = std::min<int64_t>(model_input_dim_, obs.size());
+            std::memcpy(data_ptr, obs.data(), copy_size * sizeof(float));
+            if (copy_size < model_input_dim_) {
+                std::memset(data_ptr + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
+            }
+
             if (device_.is_cuda()) {
-                buffers.device_tensor.copy_(buffers.input_tensor, /*non_blocking=*/true);
+                device_tensor_.copy_(input_tensor_, /*non_blocking=*/true);
                 AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
-                outputs = model_->forward(buffers.device_tensor);
+                outputs = model_->forward(device_tensor_);
             } else {
-                outputs = model_->forward(buffers.input_tensor);
+                outputs = model_->forward(input_tensor_);
             }
         }
 
@@ -269,6 +276,11 @@ private:
     std::shared_mutex* sync_mutex_;
     int64_t model_input_dim_;
     int64_t action_dim_;
+    // Per-instance staging buffers, allocated lazily under mutex_ and freed once
+    // by the owning (main) thread at destruction. Replaces the thread_local map
+    // whose 64-way concurrent pinned-tensor free at thread exit segfaulted libcuda.
+    torch::Tensor input_tensor_;   // CPU staging (pinned host memory when CUDA)
+    torch::Tensor device_tensor_;  // device-side input buffer (CUDA only)
     mutable std::atomic<uint64_t> requests_{0};
 };
 
