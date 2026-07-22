@@ -371,6 +371,49 @@ void TestPruneForcedPlayouts() {
   std::cout << "TestPruneForcedPlayouts Passed!\n\n";
 }
 
+// CE-target sharpening (Phase 18C consolidation). Hand-computed + invariants.
+void TestTargetSharpen() {
+  std::cout << "Running TestTargetSharpen...\n";
+
+  auto entropy = [](const std::vector<double>& v) {
+    double h = 0.0;
+    for (double p : v) if (p > 0.0) h -= p * std::log(p);
+    return h;
+  };
+  auto argmax = [](const std::vector<double>& v) {
+    size_t m = 0;
+    for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[m]) m = i;
+    return m;
+  };
+
+  // alpha == 1.0 is inert: returns the input byte-for-byte (identical to before).
+  {
+    std::vector<double> t = {0.5, 0.3, 0.2};
+    assert(SharpenVisitTarget(t, 1.0) == t);  // exact equality, not approximate
+  }
+
+  // alpha == 2.0 on a known visit vector 5:3:2 -> target [0.5, 0.3, 0.2]:
+  //   squares [0.25, 0.09, 0.04], sum 0.38 -> [0.25/0.38, 0.09/0.38, 0.04/0.38].
+  {
+    std::vector<double> out = SharpenVisitTarget({0.5, 0.3, 0.2}, 2.0);
+    assert(out.size() == 3);
+    assert(std::abs(out[0] - 0.25 / 0.38) < 1e-12);
+    assert(std::abs(out[1] - 0.09 / 0.38) < 1e-12);
+    assert(std::abs(out[2] - 0.04 / 0.38) < 1e-12);
+    assert(std::abs((out[0] + out[1] + out[2]) - 1.0) < 1e-12);  // still a distribution
+  }
+
+  // alpha == 2.0 preserves argmax and STRICTLY reduces entropy (non-uniform input).
+  {
+    std::vector<double> t = {0.5, 0.3, 0.2};
+    std::vector<double> s = SharpenVisitTarget(t, 2.0);
+    assert(argmax(s) == argmax(t));
+    assert(entropy(s) < entropy(t) - 1e-9);
+  }
+
+  std::cout << "TestTargetSharpen Passed!\n\n";
+}
+
 // Integration smoke: the collector runs end-to-end with the exploration package
 // (noise + forced playouts + FPU=0 + pruning) enabled, emits well-formed pruned
 // CE targets, and stays deterministic.
@@ -407,6 +450,40 @@ void TestCollectUpdateExplorationPackage() {
   OnlineSearchCollectionStats s2;
   col2.CollectUpdate(1, game, eval, &ex2, &s2);
   assert(RunSignature(ex1, s1) == RunSignature(ex2, s2));
+
+  // Wiring: target_sharpen_exponent=2.0 flows config -> emission. The executed
+  // action samples the RAW distribution (independent of alpha), so the run emits
+  // the SAME examples 1:1 with only the CE targets peaked. Each target keeps its
+  // argmax; every multi-support target has strictly lower entropy.
+  OnlineSearchConfig cs = c;
+  cs.target_sharpen_exponent = 2.0;
+  OnlineSearchCollector col3(cs, "ckpt");
+  std::vector<SearchTrainingExample> ex3;
+  OnlineSearchCollectionStats s3;
+  col3.CollectUpdate(1, game, eval, &ex3, &s3);
+  assert(ex3.size() == ex1.size());
+  auto ent = [](const std::vector<double>& v) {
+    double h = 0.0;
+    for (double p : v) if (p > 0.0) h -= p * std::log(p);
+    return h;
+  };
+  auto amax = [](const std::vector<double>& v) {
+    size_t m = 0;
+    for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[m]) m = i;
+    return m;
+  };
+  bool saw_change = false;
+  for (size_t i = 0; i < ex1.size(); ++i) {
+    const auto& a = ex1[i].normalized_visits;   // alpha=1.0
+    const auto& b = ex3[i].normalized_visits;   // alpha=2.0
+    assert(b.size() == a.size());
+    assert(amax(b) == amax(a));                 // monotone sharpening preserves argmax
+    assert(ent(b) <= ent(a) + 1e-9);            // sharpening never raises entropy
+    // Strict reduction only for NON-uniform support (a uniform target such as
+    // [0.5,0.5] is a power-map fixed point -- its entropy is unchanged).
+    if (ent(a) - ent(b) > 1e-9) saw_change = true;
+  }
+  assert(saw_change);  // >= 1 non-uniform target is visibly peaked (knob is wired)
 
   std::cout << "  accepted=" << s1.accepted_targets
             << " emitted=" << ex1.size() << " (package on)\n";
@@ -587,6 +664,7 @@ int main() {
   open_spiel::TestCollectUpdateDeterminismAndSeedDomain();
   open_spiel::TestCollectUpdatePpoOnlyNoLeakage();
   open_spiel::TestPruneForcedPlayouts();
+  open_spiel::TestTargetSharpen();
   open_spiel::TestCollectUpdateExplorationPackage();
   open_spiel::TestCollectUpdateSurfaceAndTelemetry();
   open_spiel::TestCollectUpdateSwordmasterGrantAll();

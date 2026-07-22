@@ -278,6 +278,7 @@ void WriteOnlineCollectionState(json::Object& manifest_obj,
   o["search_loss_warmup_update"] =
       static_cast<int64_t>(st.search_loss_warmup_update);
   o["abort_grad_norm_ratio"] = st.abort_grad_norm_ratio;
+  o["target_sharpen_exponent"] = st.target_sharpen_exponent;
   o["next_auxiliary_episode_id"] =
       static_cast<int64_t>(st.next_auxiliary_episode_id);
   o["cum_accepted"] = static_cast<int64_t>(st.cum_accepted);
@@ -355,6 +356,7 @@ bool ReadOnlineCollectionState(const std::string& manifest_path,
   out.search_loss_warmup_update =
       static_cast<int>(gi("search_loss_warmup_update", 0));
   out.abort_grad_norm_ratio = gd("abort_grad_norm_ratio", 0.0);
+  out.target_sharpen_exponent = gd("target_sharpen_exponent", 1.0);
   out.next_auxiliary_episode_id =
       static_cast<uint64_t>(gi("next_auxiliary_episode_id", 0));
   out.cum_accepted = gi("cum_accepted", 0);

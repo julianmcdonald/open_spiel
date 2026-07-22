@@ -93,6 +93,12 @@ struct OnlineSearchConfig {
   double forced_playouts_k = 2.0;        // n_forced(c) = sqrt(k * P_noised(c) * N_root)
   bool root_noise_fpu_zero = true;       // FPU = 0 at the noised root (footnote 3)
 
+  // --- CE-target sharpening (Phase 18C consolidation) ---
+  // Applied to the PRUNED root visit counts as p_i = v_i^alpha / sum_j v_j^alpha
+  // before emission as the CE target (execution still samples the raw visit
+  // distribution). 1.0 = today's behavior, inert.
+  double target_sharpen_exponent = 1.0;
+
   // --- Swordmaster endowment curriculum (Phase 18B follow-on to the arm-B-endow
   // probe). If swordmaster_grant_fraction > 0, a deterministic per-episode draw
   // (domain-separated stream; no draw at all when the fraction is 0) selects
@@ -234,6 +240,13 @@ std::vector<int> PruneForcedPlayouts(const std::vector<int>& visits,
                                      const std::vector<double>& q_values,
                                      int total_root_visits, double puct_c,
                                      double forced_k);
+
+// CE-target sharpening (Phase 18C consolidation), exposed for unit testing.
+// Peaks a normalized visit target as p_i = v_i^alpha / sum_j v_j^alpha. Scale
+// invariant, so passing raw counts or normalized visits gives the same result.
+// alpha == 1.0 returns the input unchanged (inert).
+std::vector<double> SharpenVisitTarget(const std::vector<double>& target,
+                                       double alpha);
 
 }  // namespace open_spiel
 

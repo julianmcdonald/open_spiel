@@ -208,6 +208,23 @@ std::vector<int> PruneForcedPlayouts(const std::vector<int>& visits,
   return pruned;
 }
 
+std::vector<double> SharpenVisitTarget(const std::vector<double>& target,
+                                       double alpha) {
+  // alpha == 1.0 is inert: return the input untouched so the pre-knob emission
+  // path stays byte-for-byte identical.
+  if (alpha == 1.0) return target;
+  std::vector<double> out(target.size());
+  double total = 0.0;
+  for (size_t i = 0; i < target.size(); ++i) {
+    out[i] = std::pow(target[i], alpha);
+    total += out[i];
+  }
+  if (total > 0.0) {
+    for (double& p : out) p /= total;
+  }
+  return out;
+}
+
 OnlineSearchCollector::OnlineSearchCollector(const OnlineSearchConfig& config,
                                              std::string checkpoint_hash)
     : config_(config), checkpoint_hash_(std::move(checkpoint_hash)) {
@@ -512,6 +529,12 @@ void OnlineSearchCollector::CollectUpdate(
                 }
               }
             }
+
+            // CE-target sharpening (Phase 18C consolidation): peak the emitted CE
+            // target as p_i = v_i^alpha / sum_j v_j^alpha over the (pruned) visit
+            // distribution. Applied to the TARGET only -- the executed action below
+            // still samples the raw visit distribution. alpha == 1.0 is inert.
+            target = SharpenVisitTarget(target, config_.target_sharpen_exponent);
 
             SearchTrainingExample ex;
             ex.observation = provides_istate ? state->InformationStateTensor(cur)

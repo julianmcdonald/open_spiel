@@ -191,6 +191,7 @@ struct OnlineCollectionState {
   double search_loss_coef_target = 0.0;
   int search_loss_warmup_update = 0;   // warmup position (updates 1 -> this)
   double abort_grad_norm_ratio = 0.0;
+  double target_sharpen_exponent = 1.0;  // CE-target peaking exponent (1.0 = inert)
   // Exact-resume cursor + cumulative counters + chained accepted-target hash.
   uint64_t next_auxiliary_episode_id = 0;
   int64_t cum_accepted = 0, cum_rejected = 0;

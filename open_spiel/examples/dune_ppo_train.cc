@@ -152,6 +152,10 @@ ABSL_FLAG(double, search_loss_coef, 0.10,
           "Target auxiliary search-loss coefficient (warms 0 -> target).");
 ABSL_FLAG(int, search_loss_warmup_update, 25,
           "Update at which the search-loss coefficient reaches its target.");
+ABSL_FLAG(double, target_sharpen_exponent, 1.0,
+          "CE-target sharpening exponent for online collection: the pruned root "
+          "visit target is peaked as p_i = v_i^alpha / sum_j v_j^alpha before "
+          "emission. 1.0 = inert (today's behavior).");
 ABSL_FLAG(double, abort_grad_norm_ratio, 0.50,
           "Abort the run if the per-update aux/PPO grad-norm ratio exceeds this.");
 ABSL_FLAG(double, swordmaster_grant_fraction, 0.0,
@@ -821,6 +825,7 @@ std::string ComputeLegacyConfigFingerprint() {
   config_obj["search_loss_coef"] = absl::GetFlag(FLAGS_search_loss_coef);
   config_obj["search_loss_warmup_update"] = absl::GetFlag(FLAGS_search_loss_warmup_update);
   config_obj["abort_grad_norm_ratio"] = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
+  config_obj["target_sharpen_exponent"] = absl::GetFlag(FLAGS_target_sharpen_exponent);
   config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
   config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
 
@@ -872,6 +877,7 @@ std::string ComputeConfigFingerprint() {
   config_obj["search_loss_coef"] = absl::GetFlag(FLAGS_search_loss_coef);
   config_obj["search_loss_warmup_update"] = absl::GetFlag(FLAGS_search_loss_warmup_update);
   config_obj["abort_grad_norm_ratio"] = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
+  config_obj["target_sharpen_exponent"] = absl::GetFlag(FLAGS_target_sharpen_exponent);
   config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
   config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
 
@@ -2156,6 +2162,8 @@ int main(int argc, char** argv) {
     aux_config.auxiliary_search_seed_domain =
         absl::GetFlag(FLAGS_auxiliary_search_seed_domain);
     aux_config.dirichlet_epsilon = absl::GetFlag(FLAGS_collector_dirichlet_epsilon);
+    aux_config.target_sharpen_exponent =
+        absl::GetFlag(FLAGS_target_sharpen_exponent);
     aux_config.swordmaster_grant_fraction =
         absl::GetFlag(FLAGS_swordmaster_grant_fraction);
     aux_config.swordmaster_grant_round =
@@ -2170,12 +2178,12 @@ int main(int argc, char** argv) {
     std::cout << absl::StrFormat(
         "[18B] Online collection ON | aux_games=%d seed_domain=%llu "
         "dirichlet_eps=%.3f grant_frac=%.3f grant_round=%d loss_coef=%.3f/warmup%d "
-        "abort_ratio=%.3f resume_ep=%llu\n",
+        "abort_ratio=%.3f sharpen=%.3f resume_ep=%llu\n",
         aux_config.auxiliary_games,
         (unsigned long long)aux_config.auxiliary_search_seed_domain,
         aux_config.dirichlet_epsilon, aux_config.swordmaster_grant_fraction,
         aux_config.swordmaster_grant_round, aux_search_loss_coef_target,
-        aux_search_loss_warmup, aux_abort_ratio,
+        aux_search_loss_warmup, aux_abort_ratio, aux_config.target_sharpen_exponent,
         (unsigned long long)aux_next_episode_id_persist);
   }
 
@@ -2224,6 +2232,7 @@ int main(int argc, char** argv) {
     s.auxiliary_games = aux_config.auxiliary_games;
     s.auxiliary_search_seed_domain = aux_config.auxiliary_search_seed_domain;
     s.collector_dirichlet_epsilon = aux_config.dirichlet_epsilon;
+    s.target_sharpen_exponent = aux_config.target_sharpen_exponent;
     s.swordmaster_grant_fraction = aux_config.swordmaster_grant_fraction;
     s.swordmaster_grant_round = aux_config.swordmaster_grant_round;
     s.search_loss_coef_target = aux_search_loss_coef_target;
