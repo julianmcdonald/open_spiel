@@ -4,8 +4,14 @@
 #include <memory>
 #include <cmath>
 #include <cassert>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
+#include <stdexcept>
+#include <thread>
 
 #include "open_spiel/spiel.h"
+#include "open_spiel/spiel_utils.h"
 #include <torch/torch.h>
 
 #include "dune_network.h"
@@ -18,6 +24,23 @@ void AssertAlmostEqual(double a, double b, double tol = 1e-5) {
     std::cerr << "Assertion failed: " << a << " != " << b << " (diff: " << std::abs(a - b) << ")\n";
     std::abort();
   }
+}
+
+// Compares two EvalResults (value + full logits vector) within a tolerance.
+void AssertResultsEqual(const open_spiel::EvalResult& a,
+                        const open_spiel::EvalResult& b, double tol = 1e-4) {
+  assert(a.logits.size() == b.logits.size());
+  AssertAlmostEqual(a.value, b.value, tol);
+  for (size_t i = 0; i < a.logits.size(); ++i) {
+    AssertAlmostEqual(a.logits[i], b.logits[i], tol);
+  }
+}
+
+// A stand-in for OpenSpiel's default (process-exiting) error handler, used to
+// restore normal fatal-error behavior after a scoped throwing handler.
+void ExitingErrorHandler(const std::string& msg) {
+  std::cerr << "Spiel Fatal Error: " << msg << std::endl;
+  std::exit(1);
 }
 
 int main(int argc, char* argv[]) {
@@ -223,6 +246,162 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Test 5 Passed!\n\n";
+  }
+
+  // Test 6: BatchedEvaluator mixed-size batch (WO-02, search finding 6).
+  // A batch mixing the two engine observation layouts must size every request
+  // from its OWN vector, not from batch[0]. Pre-fix, batch[0]'s length was used
+  // for all requests: a shorter obs behind a longer batch[0] was over-read, a
+  // longer obs behind a shorter batch[0] was truncated. Each request must yield
+  // the same result it gets when evaluated alone, regardless of batch position.
+  {
+    std::cout << "=== Test 6: Mixed-size batch per-request sizing ===\n";
+    const int64_t kInput = 16;                       // "5584" analog
+    const int64_t kShort = kInput - kObsSizeSlack;   // "5580" analog (within slack)
+    torch::manual_seed(20260723);
+    auto small_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kInput, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    small_model->eval();
+    torch::Device cpu(torch::kCPU);
+    small_model->to(cpu);
+    std::shared_mutex sync_mutex;
+    BatchedEvaluator be(small_model, /*target_batch_size=*/4, /*timeout_ms=*/20,
+                        cpu, &sync_mutex);
+
+    std::vector<float> obs_full(kInput), obs_short(kShort);
+    for (int64_t i = 0; i < kInput; ++i)
+      obs_full[i] = 0.13f * static_cast<float>(i + 1);
+    for (int64_t i = 0; i < kShort; ++i)
+      obs_short[i] = -0.21f * static_cast<float>(i + 1);
+
+    // Reference: each obs evaluated alone (a single-element batch sizes correctly
+    // in every version, so these are the ground-truth per-request results).
+    EvalResult ref_full = be.EvaluateBatch({obs_full})[0];
+    EvalResult ref_short = be.EvaluateBatch({obs_short})[0];
+
+    // Short first: pre-fix sizes the batch from the short obs and truncates
+    // obs_full (deterministic mismatch). Long first: pre-fix over-reads obs_short.
+    auto mixed_short_first = be.EvaluateBatch({obs_short, obs_full});
+    AssertResultsEqual(mixed_short_first[0], ref_short);
+    AssertResultsEqual(mixed_short_first[1], ref_full);
+
+    auto mixed_long_first = be.EvaluateBatch({obs_full, obs_short});
+    AssertResultsEqual(mixed_long_first[0], ref_full);
+    AssertResultsEqual(mixed_long_first[1], ref_short);
+
+    std::cout << "Test 6 Passed!\n\n";
+  }
+
+  // Test 7: Unsupported observation sizes are rejected explicitly (WO-02).
+  // An obs further than kObsSizeSlack from the model input must fail rather than
+  // be silently truncated/over-read. A throwing error handler makes the fatal
+  // error observable from the caller thread.
+  {
+    std::cout << "=== Test 7: Oversized observation rejected ===\n";
+    const int64_t kInput = 16;
+    torch::manual_seed(20260724);
+    auto small_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kInput, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    small_model->eval();
+    torch::Device cpu(torch::kCPU);
+    small_model->to(cpu);
+    std::mutex eval_mutex;
+    std::shared_mutex sync_mutex;
+
+    open_spiel::SetErrorHandler(
+        [](const std::string& msg) { throw std::runtime_error(msg); });
+    bool threw = false;
+    try {
+      DeterministicEvaluator de(small_model, cpu, &eval_mutex, &sync_mutex);
+      std::vector<float> oversized(kInput + kObsSizeSlack + 4, 1.0f);
+      de.Evaluate(oversized);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    assert(threw);
+    std::cout << "Test 7 Passed!\n\n";
+  }
+
+  // Test 8: CUDA deterministic-evaluator concurrency stress (WO-02 finding 1).
+  // Many threads share ONE DeterministicEvaluator (hence one pinned staging
+  // buffer). Each thread repeatedly evaluates its own distinct observation and
+  // must always get that observation's reference result. Pre-fix, the async H2D
+  // copy let the next thread overwrite the shared pinned buffer mid-DMA, handing
+  // one thread another game's logits/values. Skips clearly without CUDA.
+  {
+    std::cout << "=== Test 8: CUDA deterministic concurrency stress ===\n";
+    if (!torch::cuda::is_available()) {
+      std::cout << "SKIPPED: CUDA not available (cannot exercise the pinned "
+                   "staging-buffer race on CPU).\n\n";
+    } else {
+      torch::Device cuda(torch::kCUDA);
+      // A large observation makes each host->device copy slow enough (hundreds
+      // of KB over PCIe) that its DMA is still reading the shared pinned buffer
+      // when the next thread's memcpy overwrites it -- the exact window the
+      // finding-1 race exploits. A tiny obs completes the H2D faster than the
+      // mutex handoff and hides the bug. The forward is kept lean so the test
+      // stays fast; the race is about the staging copy, not model size.
+      const int64_t kInput = 65536;
+      torch::manual_seed(20260725);
+      auto stress_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kInput, /*hidden_dim=*/128, /*action_dim=*/32, /*num_blocks=*/1);
+      stress_model->eval();
+      stress_model->to(cuda);
+
+      std::mutex eval_mutex;
+      std::shared_mutex sync_mutex;
+      DeterministicEvaluator shared_eval(stress_model, cuda, &eval_mutex,
+                                         &sync_mutex);
+
+      const int num_threads = 32;
+      const int iters = 100;
+
+      // Distinct observation per thread (different sinusoid frequencies).
+      std::vector<std::vector<float>> obs(num_threads,
+                                          std::vector<float>(kInput));
+      for (int t = 0; t < num_threads; ++t) {
+        for (int64_t i = 0; i < kInput; ++i) {
+          obs[t][i] = std::sin(0.05f * static_cast<float>(t + 1) *
+                               static_cast<float>(i + 1));
+        }
+      }
+
+      // Uncontended reference result for each thread's observation.
+      std::vector<EvalResult> ref(num_threads);
+      for (int t = 0; t < num_threads; ++t) ref[t] = shared_eval.Evaluate(obs[t]);
+
+      // Sanity: references must be distinguishable, else contamination would be
+      // invisible to the comparison below.
+      double vmin = ref[0].value, vmax = ref[0].value;
+      for (int t = 1; t < num_threads; ++t) {
+        vmin = std::min<double>(vmin, ref[t].value);
+        vmax = std::max<double>(vmax, ref[t].value);
+      }
+      assert(vmax - vmin > 1e-2);
+
+      std::atomic<int> mismatches{0};
+      std::vector<std::thread> threads;
+      for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+          for (int it = 0; it < iters; ++it) {
+            EvalResult r = shared_eval.Evaluate(obs[t]);
+            bool ok = std::abs(r.value - ref[t].value) <= 1e-2;
+            for (size_t k = 0; ok && k < r.logits.size(); ++k) {
+              if (std::abs(r.logits[k] - ref[t].logits[k]) > 1e-2) ok = false;
+            }
+            if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+          }
+        });
+      }
+      for (auto& th : threads) th.join();
+
+      std::cout << "Concurrent evaluations: " << (num_threads * iters)
+                << ", cross-contamination mismatches: " << mismatches.load()
+                << "\n";
+      assert(mismatches.load() == 0);
+      std::cout << "Test 8 Passed!\n\n";
+    }
   }
 
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";

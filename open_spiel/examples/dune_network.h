@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 #include <deque>
 #include <mutex>
@@ -170,6 +171,25 @@ struct EvaluatorStats {
     double avg_batch_size = 0.0;
 };
 
+// Observation-size compatibility check shared by the evaluators (WO-02, search
+// finding 6). Two engine observation layouts differ by up to kObsSizeSlack
+// floats (the historical 5580 vs 5584 layouts), so a request whose length is
+// within that slack of the model input is accepted and clamped/zero-padded per
+// request. Anything further off is a genuine model/observation mismatch and is
+// rejected explicitly here rather than being silently truncated or over-read
+// deeper in the copy loop.
+inline constexpr int64_t kObsSizeSlack = 4;
+inline void CheckEvalObsSize(size_t obs_size, int64_t model_input_dim) {
+    const int64_t diff = static_cast<int64_t>(obs_size) - model_input_dim;
+    if (diff > kObsSizeSlack || diff < -kObsSizeSlack) {
+        SpielFatalError("Evaluator observation size " +
+                        std::to_string(obs_size) +
+                        " is incompatible with model input dim " +
+                        std::to_string(model_input_dim) + " (slack +/-" +
+                        std::to_string(kObsSizeSlack) + ").");
+    }
+}
+
 class IGameEvaluator {
 public:
     virtual ~IGameEvaluator() = default;
@@ -202,6 +222,10 @@ public:
         EvalResult result;
         result.logits.resize(action_dim_);
 
+        // Reject observation sizes incompatible with the model input rather than
+        // silently truncating/over-reading them (WO-02 finding 6).
+        CheckEvalObsSize(obs.size(), model_input_dim_);
+
         // Per-instance staging buffers (NOT thread_local). Previously these lived
         // in a thread_local map keyed by `this`, so at end of run all 64 worker
         // threads destroyed their pinned host tensor simultaneously; the pinned
@@ -215,7 +239,8 @@ public:
         // shared across threads. `*mutex_` already serializes every Evaluate call
         // (one mutex for the model + all opponents), so serializing the tiny
         // memcpy/memset stage as well leaves throughput and numerics unchanged.
-        SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+        torch::Tensor pred_logits;
+        torch::Tensor pred_values;
         {
             std::shared_lock<std::shared_mutex> sync_lock;
             if (sync_mutex_ != nullptr) {
@@ -241,17 +266,27 @@ public:
                 std::memset(data_ptr + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
             }
 
+            SharedDunePolicyValueNetImpl::ModelOutputs outputs;
             if (device_.is_cuda()) {
-                device_tensor_.copy_(input_tensor_, /*non_blocking=*/true);
+                // Blocking H2D (finding 1): the shared pinned input_tensor_ must
+                // not be reused by the next thread until this copy's DMA has
+                // finished reading it. non_blocking=false makes copy_ host-
+                // synchronous (Torch inserts a stream sync), so the pinned
+                // staging buffer is free the moment copy_ returns.
+                device_tensor_.copy_(input_tensor_, /*non_blocking=*/false);
                 AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
                 outputs = model_->forward(device_tensor_);
             } else {
                 outputs = model_->forward(input_tensor_);
             }
+            // Blocking device->host copy INSIDE the lock drains the stream before
+            // the mutex is released, so the next thread cannot overwrite the
+            // shared staging buffers while this request's async work may still be
+            // reading them (belt-and-suspenders for the finding-1 race). No
+            // numeric change: identical ops, just serialized under the lock.
+            pred_logits = outputs.logits.to(torch::kCPU).to(torch::kFloat32);
+            pred_values = outputs.values.to(torch::kCPU).to(torch::kFloat32);
         }
-
-        torch::Tensor pred_logits = outputs.logits.to(torch::kCPU).to(torch::kFloat32);
-        torch::Tensor pred_values = outputs.values.to(torch::kCPU).to(torch::kFloat32);
 
         std::memcpy(result.logits.data(), pred_logits.data_ptr<float>(), action_dim_ * sizeof(float));
         result.value = pred_values.data_ptr<float>()[0];
@@ -322,6 +357,9 @@ public:
 
     // Called by the actor threads
     EvalResult Evaluate(const std::vector<float>& obs) override {
+        // Validate size in the caller thread (finding 6) so the runner never
+        // over-reads/truncates and never faults on an unsupported request.
+        CheckEvalObsSize(obs.size(), model_input_dim_);
         EvalResult result; // Stack allocated!
         std::atomic<bool> ready{false};
 
@@ -364,6 +402,9 @@ public:
         const std::vector<std::vector<float>>& observations) override {
         std::vector<EvalResult> results(observations.size());
         if (observations.empty()) return results;
+        for (const auto& obs : observations) {
+            CheckEvalObsSize(obs.size(), model_input_dim_);
+        }
 
         auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
         {
@@ -489,7 +530,6 @@ private:
             if (batch.empty()) continue;
 
             size_t batch_size = batch.size();
-            size_t obs_size = batch[0].obs->size(); // Add pointer arrow
             total_batches_.fetch_add(1, std::memory_order_relaxed);
             total_requests_.fetch_add(static_cast<uint64_t>(batch_size), std::memory_order_relaxed);
             uint64_t observed_max = max_batch_size_seen_.load(std::memory_order_relaxed);
@@ -512,7 +552,11 @@ private:
 
             float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
             for (size_t i = 0; i < batch_size; ++i) {
-                const int64_t copy_size = std::min<int64_t>(model_input_dim_, obs_size);
+                // Per-request copy length (finding 6): sizing from batch[0] would
+                // over-read a shorter request's vector or truncate a longer one
+                // when the batch mixes the two engine observation layouts.
+                const int64_t this_obs_size = static_cast<int64_t>(batch[i].obs->size());
+                const int64_t copy_size = std::min<int64_t>(model_input_dim_, this_obs_size);
                 std::memcpy(dest_ptr + i * model_input_dim_, batch[i].obs->data(), copy_size * sizeof(float));
                 if (copy_size < model_input_dim_) {
                     std::memset(dest_ptr + i * model_input_dim_ + copy_size, 0, (model_input_dim_ - copy_size) * sizeof(float));
