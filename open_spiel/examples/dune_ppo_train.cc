@@ -91,6 +91,7 @@ ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu levels 5/6 breadcrumbs.");
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
+// Sign convention: the value is SUBTRACTED from reward — pass a POSITIVE value to penalize. (The phase-18 pilots passed -0.02, which was a +0.02 bonus.)
 ABSL_FLAG(double, specimen_exchange_penalty, 0.0,
           "Magnitude of the negative shaping SUBTRACTED from a transition that "
           "takes a ConvertSpecimenToTroop action (IDs 740-752). Training-only "

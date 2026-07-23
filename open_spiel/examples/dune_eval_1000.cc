@@ -32,8 +32,6 @@ struct ThreadStats {
   double model_return_by_seat[4] = {0.0, 0.0, 0.0, 0.0};
 };
 
-constexpr float kEvalLogitCap = 10.0f;
-
 // Batched worker: game threads submit observations to shared BatchedEvaluator(s).
 // The Runner thread inside BatchedEvaluator accumulates requests into batches,
 // runs one gemm (matrix-matrix multiply) using ALL CPU cores, then distributes
@@ -49,6 +47,7 @@ void BatchedWorkerThread(
     bool provides_observations_tensor,
     std::atomic<int>& next_game_id,
     int total_games,
+    float logit_cap,
     ThreadStats& stats) {
   std::random_device rd;
   std::mt19937 rng(rd() ^ thread_id);
@@ -115,7 +114,7 @@ void BatchedWorkerThread(
           evaluator = opponent_evaluators[opponent_index];
         }
         EvalResult result = evaluator->Evaluate(obs);
-        CenterAndCapLegalLogits(result.logits, legal_actions, kEvalLogitCap);
+        CenterAndCapLegalLogits(result.logits, legal_actions, logit_cap);
 
         // Argmax over legal actions
         chosen_action = legal_actions.front();
@@ -192,7 +191,8 @@ void RunEvaluation(const std::string& model_checkpoint,
                    int hidden_dim = 1024,
                    int num_blocks = 4,
                    int opp_hidden_dim = -1,
-                   int opp_num_blocks = -1) {
+                   int opp_num_blocks = -1,
+                   double logit_cap = 10.0) {
   // Default opponent architecture to same as eval model
   if (opp_hidden_dim < 0) opp_hidden_dim = hidden_dim;
   if (opp_num_blocks < 0) opp_num_blocks = num_blocks;
@@ -304,6 +304,7 @@ void RunEvaluation(const std::string& model_checkpoint,
   std::cout << "Starting evaluation of " << total_games << " games using " << num_threads
             << " game threads, batch_size=" << eval_batch_size 
             << ", timeout=" << eval_timeout_ms << "ms on " << device_name << "...\n";
+  std::cout << "Logit cap (legal-centered): " << logit_cap << "\n";
   auto start_time = std::chrono::steady_clock::now();
 
   // 4. Launch game worker threads
@@ -316,7 +317,8 @@ void RunEvaluation(const std::string& model_checkpoint,
         BatchedWorkerThread, t, game, model_a_evaluator,
         std::cref(opponent_evaluators),
         obs_size, provides_info_state_tensor, provides_observations_tensor,
-        std::ref(next_game_id), total_games, std::ref(thread_stats_vec[t]));
+        std::ref(next_game_id), total_games,
+        static_cast<float>(logit_cap), std::ref(thread_stats_vec[t]));
   }
 
   for (auto& th : threads) {
@@ -409,7 +411,7 @@ int main(int argc, char* argv[]) {
   }
   at::set_num_interop_threads(1);
 
-  // Usage: dune_eval_1000 <model_a> <num_games> [opponent|"random"] [threads] [hidden_dim] [num_blocks] [opp_hidden_dim] [opp_num_blocks]
+  // Usage: dune_eval_1000 <model_a> <num_games> [opponent|"random"] [threads] [hidden_dim] [num_blocks] [opp_hidden_dim] [opp_num_blocks] [logit_cap]
   std::string model_checkpoint = "/home/warcr/projects/dune_drl/dune_stage_a_run1_model.pt";
   int num_games = 1000;
   std::string opponent_checkpoint = "";
@@ -418,6 +420,7 @@ int main(int argc, char* argv[]) {
   int num_blocks = 8;
   int opp_hidden_dim = -1;  // -1 = same as eval model
   int opp_num_blocks = -1;
+  double logit_cap = 10.0;  // legal-centered logit cap (default preserves prior behavior)
 
   if (argc > 1) model_checkpoint = argv[1];
   if (argc > 2) {
@@ -451,7 +454,12 @@ int main(int argc, char* argv[]) {
       std::cerr << "Warning: invalid opponent block count. Using eval model's count.\n";
     }
   }
+  if (argc > 9) {
+    try { logit_cap = std::stod(argv[9]); } catch (...) {
+      std::cerr << "Warning: invalid logit cap. Defaulting to 10.0.\n";
+    }
+  }
 
-  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads, hidden_dim, num_blocks, opp_hidden_dim, opp_num_blocks);
+  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads, hidden_dim, num_blocks, opp_hidden_dim, opp_num_blocks, logit_cap);
   return 0;
 }

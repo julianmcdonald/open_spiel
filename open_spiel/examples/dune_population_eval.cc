@@ -12,6 +12,7 @@
 //   - Thread-count reproducibility (results identical regardless of --threads)
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -79,14 +80,24 @@ ABSL_FLAG(bool, nonlinear_value_head, false,
           "Use the versioned nonlinear value head for the evaluated model.");
 ABSL_FLAG(bool, opponent_nonlinear_value_head, false,
           "Use the versioned nonlinear value head for opponent checkpoints.");
+ABSL_FLAG(double, candidate_logit_cap, 10.0,
+          "Cap on legal-centered logits for the CANDIDATE (evaluated) model, "
+          "applied by CenterAndCapLegalLogits. Default 10.0 preserves prior "
+          "behavior (formerly the hard-coded kEvalLogitCap).");
+ABSL_FLAG(double, opponent_logit_cap, 10.0,
+          "Cap on legal-centered logits for OPPONENT models. Default 10.0 "
+          "preserves prior behavior (formerly the hard-coded kEvalLogitCap).");
+ABSL_FLAG(std::string, dump_logit_stats, "",
+          "If non-empty, append one CSV row per CANDIDATE decision with pre-cap "
+          "legal-centered logit statistics to this path (audit; off by default).");
 
 namespace open_spiel {
 namespace {
 
 using dune_imperium::DuneImperiumState;
 using dune_imperium::kNumPlayers;
-
-constexpr float kEvalLogitCap = 10.0f;
+using dune_imperium::kMaxRounds;
+using dune_imperium::kTargetVp;
 
 // ---------------------------------------------------------------------------
 // Domain resolution
@@ -134,7 +145,141 @@ struct GameResult {
   int ending_round;
   int current_vp;
   int final_scored_vp;
+  // --- Phase-3 pace/threshold telemetry (new keys only) ---
+  // vp_end_rN[p] = player p's running (track) VP at the end of round N.
+  // has_rN=false => the game ended before round N completed (emitted as null).
+  std::array<int, kNumPlayers> vp_end_r5{};
+  std::array<int, kNumPlayers> vp_end_r6{};
+  std::array<int, kNumPlayers> vp_end_r7{};
+  bool has_r5 = false;
+  bool has_r6 = false;
+  bool has_r7 = false;
+  int end_trigger_player = -1;  // -1 => null
+  int end_trigger_round = -1;   // -1 => null
+  int winner_triggered = -1;    // -1 => null, 0 => false, 1 => true
 };
+
+// ---------------------------------------------------------------------------
+// Phase-3 telemetry JSON helpers
+// ---------------------------------------------------------------------------
+std::string JsonVpArrayOrNull(bool has, const std::array<int, kNumPlayers>& v) {
+  if (!has) return "null";
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += std::to_string(v[p]);
+  }
+  s += "]";
+  return s;
+}
+std::string JsonIntOrNull(int x) {
+  return x < 0 ? std::string("null") : std::to_string(x);
+}
+std::string JsonBoolOrNull(int tri) {
+  if (tri < 0) return "null";
+  return tri ? "true" : "false";
+}
+
+// ---------------------------------------------------------------------------
+// Phase-4.2: optional per-candidate-decision logit-stat dump (CSV)
+// ---------------------------------------------------------------------------
+std::mutex g_logit_dump_mutex;
+
+const char* GamePhaseRole(dune_imperium::GamePhase ph) {
+  switch (ph) {
+    case dune_imperium::GamePhase::kLeaderOfferChance: return "leader_offer";
+    case dune_imperium::GamePhase::kLeaderDraft:        return "leader_draft";
+    case dune_imperium::GamePhase::kDeal:               return "deal";
+    case dune_imperium::GamePhase::kRoundStart:         return "round_start";
+    case dune_imperium::GamePhase::kAgentTurns:         return "agent";
+    case dune_imperium::GamePhase::kRevealTurns:        return "reveal";
+    case dune_imperium::GamePhase::kCombat:             return "combat";
+    case dune_imperium::GamePhase::kMakers:             return "makers";
+    case dune_imperium::GamePhase::kRecall:             return "recall";
+    case dune_imperium::GamePhase::kTerminal:           return "terminal";
+  }
+  return "unknown";
+}
+
+double LogitStatsPercentile(std::vector<double> v, double q) {
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  if (v.size() == 1) return v[0];
+  double idx = q / 100.0 * (static_cast<double>(v.size()) - 1.0);
+  size_t lo = static_cast<size_t>(std::floor(idx));
+  size_t hi = static_cast<size_t>(std::ceil(idx));
+  double frac = idx - static_cast<double>(lo);
+  return v[lo] * (1.0 - frac) + v[hi] * frac;
+}
+
+// Appends one CSV row of PRE-cap legal-centered logit statistics for a single
+// candidate decision. Center first (z = raw - legal_mean), then measure; caps
+// are applied only for the capped-variant columns (soft tanh, matching
+// CenterAndCapLegalLogits). Thread-safe (serialized on g_logit_dump_mutex).
+void AppendLogitStatsRow(std::ofstream& out, int episode_id, int round,
+                         const std::string& role,
+                         const std::vector<Action>& legal,
+                         const std::vector<float>& raw_logits) {
+  const int n = static_cast<int>(legal.size());
+  if (n == 0) return;
+  double sum = 0.0;
+  for (Action a : legal) sum += raw_logits[a];
+  const double mean = sum / n;
+  std::vector<double> z(n), absz(n), c10(n), c30(n);
+  for (int i = 0; i < n; ++i) {
+    z[i] = static_cast<double>(raw_logits[legal[i]]) - mean;
+    absz[i] = std::fabs(z[i]);
+    c10[i] = 10.0 * std::tanh(z[i] / 10.0);
+    c30[i] = 30.0 * std::tanh(z[i] / 30.0);
+  }
+  auto log_softmax = [](const std::vector<double>& x) {
+    double m = *std::max_element(x.begin(), x.end());
+    double s = 0.0;
+    for (double v : x) s += std::exp(v - m);
+    double lse = m + std::log(s);
+    std::vector<double> lp(x.size());
+    for (size_t i = 0; i < x.size(); ++i) lp[i] = x[i] - lse;
+    return lp;
+  };
+  auto entropy = [](const std::vector<double>& lp) {
+    double h = 0.0;
+    for (double l : lp) { double p = std::exp(l); if (p > 0.0) h -= p * l; }
+    return h;
+  };
+  auto kl = [](const std::vector<double>& lp, const std::vector<double>& lq) {
+    double d = 0.0;
+    for (size_t i = 0; i < lp.size(); ++i) {
+      double p = std::exp(lp[i]);
+      if (p > 0.0) d += p * (lp[i] - lq[i]);
+    }
+    return d;
+  };
+  std::vector<double> lp_unc = log_softmax(z);
+  std::vector<double> lp_10 = log_softmax(c10);
+  std::vector<double> lp_30 = log_softmax(c30);
+  double H_unc = entropy(lp_unc), H_10 = entropy(lp_10), H_30 = entropy(lp_30);
+  double kl_10_unc = kl(lp_10, lp_unc), kl_10_30 = kl(lp_10, lp_30);
+  double p90 = LogitStatsPercentile(absz, 90.0);
+  double max_abs = 0.0;
+  int ge5 = 0, ge10 = 0, ge20 = 0;
+  for (double a : absz) {
+    max_abs = std::max(max_abs, a);
+    if (a >= 5.0) ++ge5;
+    if (a >= 10.0) ++ge10;
+    if (a >= 20.0) ++ge20;
+  }
+  const double dn = static_cast<double>(n);
+  std::lock_guard<std::mutex> lock(g_logit_dump_mutex);
+  out << episode_id << ',' << round << ',' << role << ',' << n << ','
+      << absl::StrFormat("%.6f", max_abs) << ',' << absl::StrFormat("%.6f", p90)
+      << ',' << absl::StrFormat("%.6f", H_unc) << ','
+      << absl::StrFormat("%.6f", H_10) << ',' << absl::StrFormat("%.6f", H_30)
+      << ',' << absl::StrFormat("%.6f", kl_10_unc) << ','
+      << absl::StrFormat("%.6f", kl_10_30) << ','
+      << absl::StrFormat("%.6f", ge5 / dn) << ','
+      << absl::StrFormat("%.6f", ge10 / dn) << ','
+      << absl::StrFormat("%.6f", ge20 / dn) << '\n';
+}
 
 // ---------------------------------------------------------------------------
 // Comma-separated path splitting
@@ -266,6 +411,9 @@ void WorkerThread(
     uint64_t domain,
     bool greedy,
     float temperature,
+    float candidate_logit_cap,
+    float opponent_logit_cap,
+    std::ofstream* dump_out,
     std::vector<GameResult>& results) {
 
   // Pre-allocate observation buffer reused across all games
@@ -325,7 +473,28 @@ void WorkerThread(
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
 
+    // Phase-3: observe running VP at each round boundary via public accessors.
+    const DuneImperiumState* dune_state =
+        dynamic_cast<const DuneImperiumState*>(state.get());
+    std::array<std::array<int, kNumPlayers>, kMaxRounds + 2> vp_at_round_end{};
+    std::array<bool, kMaxRounds + 2> round_end_seen{};
+    int last_round = dune_state ? dune_state->GetCurrentRound() : -1;
+    auto snapshot_round_ends = [&]() {
+      if (!dune_state) return;
+      int cur = dune_state->GetCurrentRound();
+      while (last_round >= 0 && last_round < cur) {
+        if (last_round >= 1 && last_round <= kMaxRounds) {
+          for (int p = 0; p < kNumPlayers; ++p) {
+            vp_at_round_end[last_round][p] = dune_state->GetPlayerVp(p);
+          }
+          round_end_seen[last_round] = true;
+        }
+        ++last_round;
+      }
+    };
+
     while (!state->IsTerminal()) {
+      snapshot_round_ends();
       ++game_length;
       if (game_length > 5000) {
         std::cerr << "Possible infinite loop in episode " << episode_id
@@ -375,7 +544,15 @@ void WorkerThread(
         }
 
         EvalResult result = evaluator->Evaluate(obs);
-        CenterAndCapLegalLogits(result.logits, legal_actions, kEvalLogitCap);
+        if (use_model && dump_out != nullptr && dune_state != nullptr) {
+          AppendLogitStatsRow(*dump_out, episode_id,
+                              dune_state->GetCurrentRound(),
+                              GamePhaseRole(dune_state->phase()),
+                              legal_actions, result.logits);
+        }
+        const float logit_cap =
+            use_model ? candidate_logit_cap : opponent_logit_cap;
+        CenterAndCapLegalLogits(result.logits, legal_actions, logit_cap);
 
         if (greedy || legal_actions.size() == 1) {
           // Argmax
@@ -427,9 +604,11 @@ void WorkerThread(
       state->ApplyAction(chosen_action);
     }
 
+    // Phase-3: capture the final (terminal) round's VP snapshot.
+    snapshot_round_ends();
+
     // --- Collect results ---
     std::vector<double> returns = state->Returns();
-    auto* dune_state = dynamic_cast<const DuneImperiumState*>(state.get());
 
     // Map returns cleanly directly to placement:
     // 2.25 -> 1st, 0.25 -> 2nd, -0.75 -> 3rd, -1.75 -> 4th
@@ -475,6 +654,41 @@ void WorkerThread(
     gr.final_scored_vp = dune_state
                          ? dune_state->FinalScoredVp(model_player)
                          : -1;
+
+    // --- Phase-3 pace/threshold telemetry ---
+    gr.has_r5 = round_end_seen[5];
+    gr.has_r6 = round_end_seen[6];
+    gr.has_r7 = round_end_seen[7];
+    if (gr.has_r5) gr.vp_end_r5 = vp_at_round_end[5];
+    if (gr.has_r6) gr.vp_end_r6 = vp_at_round_end[6];
+    if (gr.has_r7) gr.vp_end_r7 = vp_at_round_end[7];
+    gr.end_trigger_player = -1;
+    gr.end_trigger_round = -1;
+    if (dune_state) {
+      // Game end is checked only at round boundaries: at the terminal round-end
+      // a player triggered the end iff running VP >= kTargetVp. Among crossers
+      // pick the leader (max VP; tie -> lowest seat).
+      int best_p = -1, best_vp = -1;
+      for (int p = 0; p < kNumPlayers; ++p) {
+        int v = dune_state->GetPlayerVp(p);
+        if (v >= kTargetVp && v > best_vp) {
+          best_vp = v;
+          best_p = p;
+        }
+      }
+      if (best_p >= 0) {
+        gr.end_trigger_player = best_p;
+        gr.end_trigger_round = gr.ending_round;
+      }
+    }
+    // First place = argmax of placement returns (tie -> lowest seat).
+    int first_place = 0;
+    for (int p = 1; p < kNumPlayers; ++p) {
+      if (returns[p] > returns[first_place]) first_place = p;
+    }
+    gr.winner_triggered = (gr.end_trigger_player >= 0)
+                              ? (first_place == gr.end_trigger_player ? 1 : 0)
+                              : -1;
   }
 }
 
@@ -495,6 +709,9 @@ void RunEvaluation() {
   int opp_num_blocks = absl::GetFlag(FLAGS_opp_num_blocks);
   const std::string output_dir = absl::GetFlag(FLAGS_output_dir);
   const float temperature = absl::GetFlag(FLAGS_temperature);
+  const double candidate_logit_cap = absl::GetFlag(FLAGS_candidate_logit_cap);
+  const double opponent_logit_cap = absl::GetFlag(FLAGS_opponent_logit_cap);
+  const std::string dump_logit_stats_path = absl::GetFlag(FLAGS_dump_logit_stats);
 
   if (model_checkpoint.empty()) {
     std::cerr << "Error: --model_checkpoint is required.\n";
@@ -650,6 +867,8 @@ void RunEvaluation() {
             << "Games:      " << total_games << "\n"
             << "Greedy:     " << (greedy ? "true" : "false") << "\n"
             << "Temperature:" << temperature << "\n"
+            << "CandCap:    " << candidate_logit_cap << "\n"
+            << "OppCap:     " << opponent_logit_cap << "\n"
             << "Threads:    " << num_threads << "\n"
             << "Eval mode:  " << (deterministic ? "Deterministic (batch-1)" : "Batched") << "\n"
             << "Nonlinear: "
@@ -666,6 +885,25 @@ void RunEvaluation() {
   }
   std::cout << std::endl;
 
+  // --- Optional per-candidate-decision logit-stat dump (audit) ---
+  std::ofstream logit_dump;
+  std::ofstream* logit_dump_ptr = nullptr;
+  if (!dump_logit_stats_path.empty()) {
+    logit_dump.open(dump_logit_stats_path);
+    if (logit_dump.is_open()) {
+      logit_dump << "episode_id,round,decision_role,n_legal,max_abs_z,p90_abs_z,"
+                    "entropy_uncapped,entropy_cap10,entropy_cap30,"
+                    "kl_cap10_uncapped,kl_cap10_cap30,"
+                    "frac_legal_absz_ge5,frac_legal_absz_ge10,frac_legal_absz_ge20\n";
+      logit_dump_ptr = &logit_dump;
+      std::cout << "Dumping candidate logit stats to " << dump_logit_stats_path
+                << "\n";
+    } else {
+      std::cerr << "WARNING: could not open --dump_logit_stats path: "
+                << dump_logit_stats_path << "\n";
+    }
+  }
+
   // --- Pre-allocate results (indexed by episode_id for determinism) ---
   std::vector<GameResult> results(total_games);
 
@@ -681,11 +919,15 @@ void RunEvaluation() {
         provides_info_state_tensor, provides_observations_tensor,
         std::ref(next_game_id), total_games,
         base_seed, domain, greedy, temperature,
+        static_cast<float>(candidate_logit_cap),
+        static_cast<float>(opponent_logit_cap),
+        logit_dump_ptr,
         std::ref(results));
   }
   for (auto& th : threads) {
     if (th.joinable()) th.join();
   }
+  if (logit_dump.is_open()) logit_dump.close();
 
   auto end_time = std::chrono::steady_clock::now();
   double elapsed_secs =
@@ -746,6 +988,12 @@ void RunEvaluation() {
                 << ",\"ending_round\":" << gr.ending_round
                 << ",\"track_vp\":" << gr.current_vp
                 << ",\"final_scored_vp\":" << gr.final_scored_vp
+                << ",\"vp_end_r5\":" << JsonVpArrayOrNull(gr.has_r5, gr.vp_end_r5)
+                << ",\"vp_end_r6\":" << JsonVpArrayOrNull(gr.has_r6, gr.vp_end_r6)
+                << ",\"vp_end_r7\":" << JsonVpArrayOrNull(gr.has_r7, gr.vp_end_r7)
+                << ",\"end_trigger_player\":" << JsonIntOrNull(gr.end_trigger_player)
+                << ",\"end_trigger_round\":" << JsonIntOrNull(gr.end_trigger_round)
+                << ",\"winner_triggered\":" << JsonBoolOrNull(gr.winner_triggered)
                 << "}\n";
     }
   }
@@ -850,6 +1098,10 @@ void RunEvaluation() {
               << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n"
               << "  \"temperature\": "
               << absl::StrFormat("%.2f", temperature) << ",\n"
+              << "  \"candidate_logit_cap\": "
+              << absl::StrFormat("%.4f", candidate_logit_cap) << ",\n"
+              << "  \"opponent_logit_cap\": "
+              << absl::StrFormat("%.4f", opponent_logit_cap) << ",\n"
               << "  \"hidden_dim\": " << main_hidden_dim << ",\n"
               << "  \"num_blocks\": " << main_num_blocks << ",\n"
               << "  \"opp_hidden_dim\": " << (opp_metadata.empty() ? -1 : opp_metadata[0].hidden_dim) << ",\n"
