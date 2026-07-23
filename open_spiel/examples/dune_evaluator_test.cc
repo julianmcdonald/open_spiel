@@ -43,6 +43,29 @@ void ExitingErrorHandler(const std::string& msg) {
   std::exit(1);
 }
 
+// Evaluates one observation of the given length on a DeterministicEvaluator
+// under a throwing error handler; returns true iff the observation-size contract
+// rejected it. Used to pin down the accept/reject boundary.
+bool EvalRejectsObsSize(
+    std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model,
+    torch::Device device, int64_t obs_len) {
+  std::mutex eval_mutex;
+  std::shared_mutex sync_mutex;
+  open_spiel::DeterministicEvaluator de(model, device, &eval_mutex,
+                                        &sync_mutex);
+  std::vector<float> obs(static_cast<size_t>(obs_len), 0.5f);
+  bool threw = false;
+  open_spiel::SetErrorHandler(
+      [](const std::string& msg) { throw std::runtime_error(msg); });
+  try {
+    de.Evaluate(obs);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  open_spiel::SetErrorHandler(ExitingErrorHandler);
+  return threw;
+}
+
 int main(int argc, char* argv[]) {
   std::string checkpoint_path = "";
   for (int i = 1; i < argc; ++i) {
@@ -256,11 +279,14 @@ int main(int argc, char* argv[]) {
   // the same result it gets when evaluated alone, regardless of batch position.
   {
     std::cout << "=== Test 6: Mixed-size batch per-request sizing ===\n";
-    const int64_t kInput = 16;                       // "5584" analog
-    const int64_t kShort = kInput - kObsSizeSlack;   // "5580" analog (within slack)
+    // The only batch that legitimately mixes observation lengths is the
+    // supported 5580 <-> 5584 dual layout; use exactly that so the request also
+    // passes the (now strict) size contract.
+    const int64_t kFull = 5584;
+    const int64_t kShort = 5580;
     torch::manual_seed(20260723);
     auto small_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kInput, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+        kFull, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
     small_model->eval();
     torch::Device cpu(torch::kCPU);
     small_model->to(cpu);
@@ -268,11 +294,15 @@ int main(int argc, char* argv[]) {
     BatchedEvaluator be(small_model, /*target_batch_size=*/4, /*timeout_ms=*/20,
                         cpu, &sync_mutex);
 
-    std::vector<float> obs_full(kInput), obs_short(kShort);
-    for (int64_t i = 0; i < kInput; ++i)
-      obs_full[i] = 0.13f * static_cast<float>(i + 1);
+    std::vector<float> obs_full(kFull), obs_short(kShort);
+    for (int64_t i = 0; i < kFull; ++i)
+      obs_full[i] = 0.01f * static_cast<float>((i % 17) + 1);
+    // Make the 4 trailing floats (indices 5580..5583, dropped by pre-fix
+    // truncation when a shorter obs sits at batch[0]) a large, distinctive
+    // signal so the truncation is unmistakably detectable.
+    for (int64_t i = kShort; i < kFull; ++i) obs_full[i] = 3.0f;
     for (int64_t i = 0; i < kShort; ++i)
-      obs_short[i] = -0.21f * static_cast<float>(i + 1);
+      obs_short[i] = -0.01f * static_cast<float>((i % 19) + 1);
 
     // Reference: each obs evaluated alone (a single-element batch sizes correctly
     // in every version, so these are the ground-truth per-request results).
@@ -292,34 +322,38 @@ int main(int argc, char* argv[]) {
     std::cout << "Test 6 Passed!\n\n";
   }
 
-  // Test 7: Unsupported observation sizes are rejected explicitly (WO-02).
-  // An obs further than kObsSizeSlack from the model input must fail rather than
-  // be silently truncated/over-read. A throwing error handler makes the fatal
-  // error observable from the caller thread.
+  // Test 7: Observation-size contract is exact match or the 5580/5584 pair only
+  // (WO-02). Near misses (+/-1, +/-2) and gross mismatches must be rejected --
+  // never silently zero-padded or truncated. A throwing error handler makes the
+  // fatal error observable from the caller thread.
   {
-    std::cout << "=== Test 7: Oversized observation rejected ===\n";
-    const int64_t kInput = 16;
-    torch::manual_seed(20260724);
-    auto small_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kInput, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
-    small_model->eval();
+    std::cout << "=== Test 7: Observation-size contract (exact or 5580/5584) ===\n";
     torch::Device cpu(torch::kCPU);
-    small_model->to(cpu);
-    std::mutex eval_mutex;
-    std::shared_mutex sync_mutex;
+    torch::manual_seed(20260724);
 
-    open_spiel::SetErrorHandler(
-        [](const std::string& msg) { throw std::runtime_error(msg); });
-    bool threw = false;
-    try {
-      DeterministicEvaluator de(small_model, cpu, &eval_mutex, &sync_mutex);
-      std::vector<float> oversized(kInput + kObsSizeSlack + 4, 1.0f);
-      de.Evaluate(oversized);
-    } catch (const std::exception&) {
-      threw = true;
+    // Model whose input matches neither dual-layout value: only the exact size
+    // is valid, everything else (including +/-1) must be rejected.
+    auto m16 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        16, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    m16->eval();
+    m16->to(cpu);
+    assert(!EvalRejectsObsSize(m16, cpu, 16));  // exact match accepted
+    for (int64_t bad : {14, 15, 17, 18, 24}) {  // +/-1, +/-2, gross: all rejected
+      assert(EvalRejectsObsSize(m16, cpu, bad));
     }
-    open_spiel::SetErrorHandler(ExitingErrorHandler);
-    assert(threw);
+
+    // A 5584-input model: the 5580 obs is the one tolerated non-exact case;
+    // 5581/5583/5585 (a single element off) must still be rejected.
+    auto m5584 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        5584, /*hidden_dim=*/8, /*action_dim=*/4, /*num_blocks=*/1);
+    m5584->eval();
+    m5584->to(cpu);
+    assert(!EvalRejectsObsSize(m5584, cpu, 5584));  // exact
+    assert(!EvalRejectsObsSize(m5584, cpu, 5580));  // supported pair
+    assert(EvalRejectsObsSize(m5584, cpu, 5581));   // near miss rejected
+    assert(EvalRejectsObsSize(m5584, cpu, 5583));   // near miss rejected
+    assert(EvalRejectsObsSize(m5584, cpu, 5585));   // near miss rejected
+
     std::cout << "Test 7 Passed!\n\n";
   }
 

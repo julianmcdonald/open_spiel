@@ -171,22 +171,24 @@ struct EvaluatorStats {
     double avg_batch_size = 0.0;
 };
 
-// Observation-size compatibility check shared by the evaluators (WO-02, search
-// finding 6). Two engine observation layouts differ by up to kObsSizeSlack
-// floats (the historical 5580 vs 5584 layouts), so a request whose length is
-// within that slack of the model input is accepted and clamped/zero-padded per
-// request. Anything further off is a genuine model/observation mismatch and is
-// rejected explicitly here rather than being silently truncated or over-read
-// deeper in the copy loop.
-inline constexpr int64_t kObsSizeSlack = 4;
+// Observation-size contract shared by the evaluators (WO-02, search finding 6).
+// An observation is accepted only if its length exactly matches the model input
+// dimension, or forms the single supported cross-layout pair (5580 <-> 5584).
+// This mirrors DuneNNEvaluator::CheckObsSize exactly; any other length -- even a
+// near miss such as 5581 or 5579 -- is a genuine model/observation mismatch and
+// is rejected here rather than being silently zero-padded or truncated in the
+// copy loops (which would otherwise drop or fabricate feature columns).
 inline void CheckEvalObsSize(size_t obs_size, int64_t model_input_dim) {
-    const int64_t diff = static_cast<int64_t>(obs_size) - model_input_dim;
-    if (diff > kObsSizeSlack || diff < -kObsSizeSlack) {
+    const int64_t size = static_cast<int64_t>(obs_size);
+    const bool ok = (size == model_input_dim) ||
+                    (size == 5580 && model_input_dim == 5584) ||
+                    (size == 5584 && model_input_dim == 5580);
+    if (!ok) {
         SpielFatalError("Evaluator observation size " +
                         std::to_string(obs_size) +
                         " is incompatible with model input dim " +
-                        std::to_string(model_input_dim) + " (slack +/-" +
-                        std::to_string(kObsSizeSlack) + ").");
+                        std::to_string(model_input_dim) +
+                        " (expected an exact match or the 5580/5584 pair).");
     }
 }
 
