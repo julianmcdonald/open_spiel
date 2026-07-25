@@ -896,6 +896,47 @@ void TestSamplePolicyActionDefaultCapParity() {
   } TEST_END();
 }
 
+// A UniformRandomBitGenerator returning a caller-chosen constant, so a test can
+// steer discrete_distribution onto a specific element however improbable it is.
+struct ConstantBitGenerator {
+  using result_type = uint64_t;
+  static constexpr result_type min() { return 0; }
+  static constexpr result_type max() {
+    return std::numeric_limits<result_type>::max();
+  }
+  result_type value = 0;
+  result_type operator()() { return value; }
+};
+
+// The reported log-probability must be exact, not floored. With the cap
+// disabled (--logit_cap<=0) a legal action can sit ~30 nats below the max — a
+// true probability near 9.4e-14, under the old std::max(prob, 1e-12) floor.
+// Sampling it and recording log(1e-12) hands PPO a probability the sampler
+// never used, while the update recomputes the true log_softmax unfloored.
+//
+// Note the comparison is on log-probabilities directly: exponentiating first
+// and comparing with an absolute tolerance hides every sub-1e-12 discrepancy.
+void TestSamplePolicyActionTinyProbabilityNotFloored() {
+  TEST_BEGIN("Sub-1e-12 sampled probability is reported exactly, not floored") {
+    std::vector<float> logits = {-30.0f, 0.0f};
+    std::vector<Action> legal = {0, 1};  // tiny weight FIRST
+    ConstantBitGenerator rng{0};         // p == 0 selects the leading element
+
+    auto s = SamplePolicyAction(&rng, logits, legal);
+    CHECK_EQ(s.first, static_cast<Action>(0));
+
+    const double tiny_weight = std::exp(static_cast<double>(-30.0f - 0.0f));
+    const double expected_log = std::log(tiny_weight / (tiny_weight + 1.0));
+    const double floored_log = std::log(1e-12);
+    // Guard the fixture itself: the floor must actually bite here, otherwise
+    // the test would pass against the pre-fix code.
+    UTILS_CHECK(expected_log < floored_log - 1.0);
+
+    CHECK_NEAR(static_cast<double>(s.second), expected_log, 1e-4);
+    UTILS_CHECK(std::abs(static_cast<double>(s.second) - floored_log) > 1.0);
+  } TEST_END();
+}
+
 // PPO finding 2: the [18B Aux] metrics existed only on stdout.
 static PpoUpdateStats MakeAuxDiagnosticsStats() {
   PpoUpdateStats stats;
@@ -1071,6 +1112,7 @@ int main() {
   TestSamplePolicyActionUnderflow();
   TestSamplePolicyActionZeroMassFallback();
   TestSamplePolicyActionDefaultCapParity();
+  TestSamplePolicyActionTinyProbabilityNotFloored();
   TestDiagnosticsPersistAuxMetrics();
   TestDiagnosticsCsvSchemaGate();
 #endif

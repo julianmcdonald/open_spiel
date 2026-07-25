@@ -217,9 +217,14 @@ inline std::pair<Action, float> SamplePolicyAction(
 
     std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
     size_t sampled_index = dist(*rng);
+    // A zero-weight element is never drawn, so the sampled probability is
+    // strictly positive and its log is exact. Deliberately NOT floored: with the
+    // cap disabled a legal action can sit ~30 nats below the max, and clamping
+    // its probability up to 1e-12 would hand PPO an old_log_prob the sampler
+    // never used — while the update recomputes the true log_softmax, unfloored.
     double prob = weights[sampled_index] / total_weight;
-    return {legal_actions[sampled_index],
-            static_cast<float>(std::log(std::max(prob, 1e-12)))};
+    SPIEL_CHECK_GT(prob, 0.0);
+    return {legal_actions[sampled_index], static_cast<float>(std::log(prob))};
 }
 
 struct EvaluatorStats {
