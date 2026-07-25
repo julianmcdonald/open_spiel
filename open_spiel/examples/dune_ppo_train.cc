@@ -620,6 +620,15 @@ struct WorkerStats {
   double raw_conflict_vp = 0.0;
   double raw_noncombat_vp = 0.0;
   double raw_total_vp = 0.0;
+
+  // Phase A canary: per-decision PRE-cap legal-centered max|z| for every
+  // nontrivial rollout decision this worker made, overall and split by decision
+  // role. Purely observational -- collected before CenterAndCapLegalLogits
+  // mutates the logits, and never read back into the acting path.
+  std::vector<float> precap_absz_all;
+  std::vector<float> precap_absz_primary;
+  std::vector<float> precap_absz_continuation;
+  std::vector<float> precap_absz_purchase;
 };
 
 
@@ -1161,6 +1170,51 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
       EvalResult result = evaluator->Evaluate(obs);
       std::vector<float> logits = std::move(result.logits);
+
+      // --- Phase A canary: pre-cap legal-centered |z| for this decision ---
+      // Measured HERE because CenterAndCapLegalLogits below mutates `logits` in
+      // place, destroying the raw values. The centering is a deliberate mirror
+      // of that function's: double accumulator, mean cast to float, same
+      // in-range guard -- so `z` is exactly what it would subtract, taken
+      // BEFORE its tanh. Restricted to nontrivial decisions (>= 2 legal
+      // actions) to match the trainer's own nontrivial definition; a forced
+      // decision's centered logit is identically 0 and would only dilute the
+      // percentiles. Observational only: no RNG draw, no tensor op, nothing
+      // read back into the acting path, so the sampled action is unaffected.
+      if (local_stats != nullptr && actions.size() >= 2) {
+        double legal_sum = 0.0;
+        int legal_count = 0;
+        for (Action a : actions) {
+          if (a >= 0 && static_cast<size_t>(a) < logits.size()) {
+            legal_sum += logits[a];
+            ++legal_count;
+          }
+        }
+        if (legal_count > 0) {
+          const float legal_mean = static_cast<float>(legal_sum / legal_count);
+          float max_absz = 0.0f;
+          for (Action a : actions) {
+            if (a < 0 || static_cast<size_t>(a) >= logits.size()) continue;
+            max_absz = std::max(max_absz, std::abs(logits[a] - legal_mean));
+          }
+          local_stats->precap_absz_all.push_back(max_absz);
+          switch (ClassifyDuneDecisionRole(*state, current_player,
+                                           /*has_active_session=*/false)) {
+            case DuneDecisionRole::kAgentPrimary:
+              local_stats->precap_absz_primary.push_back(max_absz);
+              break;
+            case DuneDecisionRole::kAgentContinuation:
+              local_stats->precap_absz_continuation.push_back(max_absz);
+              break;
+            case DuneDecisionRole::kPurchase:
+              local_stats->precap_absz_purchase.push_back(max_absz);
+              break;
+            default:
+              break;
+          }
+        }
+      }
+
       CenterAndCapLegalLogits(logits, actions, logit_cap);
 
       auto policy_sample = SamplePolicyAction(&policy_rng[current_player], logits, actions);
@@ -1546,12 +1600,36 @@ struct CollectResult {
   double raw_noncombat_vp = 0.0;
   double raw_total_vp = 0.0;
 
+  // Phase A canary: concatenation of every worker's per-decision max|z|, merged
+  // in thread-index order. Only the multiset matters downstream (percentiles
+  // sort), so the merge order does not affect the reported statistics.
+  std::vector<float> precap_absz_all;
+  std::vector<float> precap_absz_primary;
+  std::vector<float> precap_absz_continuation;
+  std::vector<float> precap_absz_purchase;
+
   // Phase 18B: online auxiliary-search examples collected from the SAME frozen
   // snapshot as `rollout`, so they travel together and are consumed by the same
   // TrainPpoUpdate. Empty unless --online_search_collection.
   std::vector<open_spiel::SearchTrainingExample> aux_examples;
   open_spiel::OnlineSearchCollectionStats aux_stats;
 };
+
+// Phase A: folds the rollout-side pre-cap |z| canaries into the update's stats
+// so every WriteDiagnostics site persists them. Called immediately after
+// episode_ids_unique is copied, which is the existing seam for carrying
+// collection-side facts into the diagnostics row.
+void AttachPrecapAbszStats(open_spiel::PpoUpdateStats* stats,
+                           const CollectResult& collect) {
+  stats->precap_absz_all =
+      open_spiel::SummarizePrecapAbsz(collect.precap_absz_all);
+  stats->precap_absz_primary =
+      open_spiel::SummarizePrecapAbsz(collect.precap_absz_primary);
+  stats->precap_absz_continuation =
+      open_spiel::SummarizePrecapAbsz(collect.precap_absz_continuation);
+  stats->precap_absz_purchase =
+      open_spiel::SummarizePrecapAbsz(collect.precap_absz_purchase);
+}
 
 
 
@@ -1607,6 +1685,21 @@ CollectResult CollectRollout(const Game* game,
     result.raw_conflict_vp += stats.raw_conflict_vp;
     result.raw_noncombat_vp += stats.raw_noncombat_vp;
     result.raw_total_vp += stats.raw_total_vp;
+
+    // Phase A canary: concatenate in thread-index order. Downstream only sorts,
+    // so order is irrelevant to the reported percentiles.
+    result.precap_absz_all.insert(result.precap_absz_all.end(),
+                                  stats.precap_absz_all.begin(),
+                                  stats.precap_absz_all.end());
+    result.precap_absz_primary.insert(result.precap_absz_primary.end(),
+                                      stats.precap_absz_primary.begin(),
+                                      stats.precap_absz_primary.end());
+    result.precap_absz_continuation.insert(result.precap_absz_continuation.end(),
+                                           stats.precap_absz_continuation.begin(),
+                                           stats.precap_absz_continuation.end());
+    result.precap_absz_purchase.insert(result.precap_absz_purchase.end(),
+                                       stats.precap_absz_purchase.begin(),
+                                       stats.precap_absz_purchase.end());
   }
 
   // Verify shaped reward conservation invariant
@@ -2360,6 +2453,7 @@ int main(int argc, char** argv) {
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
                                    obs_size, action_size, device, master, start_update, anchor_model);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+    AttachPrecapAbszStats(&stats, current_collect);
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
       double val_kl = search_buffer.ComputeValidationKL(training_model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
@@ -2426,6 +2520,7 @@ int main(int argc, char** argv) {
                                    current_collect.aux_examples, this_search_coef,
                                    online_search_collection ? aux_abort_ratio : 0.0);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+    AttachPrecapAbszStats(&stats, current_collect);
 
     // Phase 18B clean abort at the latest valid checkpoint (plan §18C): a
     // per-update aux/PPO grad-norm ratio over threshold stops the run; this

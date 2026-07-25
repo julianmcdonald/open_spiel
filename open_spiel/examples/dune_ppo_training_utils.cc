@@ -887,11 +887,15 @@ PpoUpdateStats TrainPpoUpdate(
           torch::nn::utils::clip_grad_norm_(
               model->parameters(), ::absl::GetFlag(::FLAGS_grad_clip_norm));
       if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
+        stats.nonfinite_abort = true;
         std::cerr << "Fatal PPO gradient norm: " << grad_norm << "\n";
         std::exit(EXIT_FAILURE);
       }
       stats.grad_norm_sum += grad_norm;
       stats.grad_norm_count += 1;
+      // clip_grad_norm_ returns the norm as measured BEFORE clipping, so this
+      // max tracks the same unclipped quantity grad_norm_sum accumulates.
+      if (grad_norm > stats.grad_norm_max) stats.grad_norm_max = grad_norm;
       optimizer.step();
 
       double kl = approx_kl.item<double>();
@@ -911,6 +915,7 @@ PpoUpdateStats TrainPpoUpdate(
 
       if (target_kl > 0.0 && kl > target_kl) {
         stats.early_stopped = true;
+        stats.kl_early_stop_epoch = epoch;
         break;
       }
     }
@@ -973,11 +978,50 @@ PpoUpdateStats TrainPpoUpdate(
   return stats;
 }
 
-// Diagnostics CSV schema v2 (WO-17): v1 plus the eight trailing Phase 18B aux
-// columns. Appending is only safe against a file carrying this exact header, so
-// a resumed run pointed at a v1 file fails loudly instead of writing rows the
-// header cannot describe. JSONL is self-describing per line and needs no such
-// gate.
+// Linear-interpolated percentile over a sorted vector, matching the convention
+// the frozen scripts/eval/logit_cap_audit.py uses so the two agree on the same
+// data. `sorted` must be non-empty and ascending.
+double SortedPercentile(const std::vector<float>& sorted, double q) {
+  if (sorted.empty()) return 0.0;
+  if (sorted.size() == 1) return sorted[0];
+  const double pos = (q / 100.0) * (static_cast<double>(sorted.size()) - 1.0);
+  const size_t lo = static_cast<size_t>(std::floor(pos));
+  const size_t hi = static_cast<size_t>(std::ceil(pos));
+  if (lo == hi) return sorted[lo];
+  const double frac = pos - static_cast<double>(lo);
+  return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
+}
+
+PrecapAbszStats SummarizePrecapAbsz(std::vector<float> values) {
+  PrecapAbszStats out;
+  out.decisions = static_cast<int64_t>(values.size());
+  if (values.empty()) return out;
+  std::sort(values.begin(), values.end());
+  out.p95 = SortedPercentile(values, 95.0);
+  out.p99 = SortedPercentile(values, 99.0);
+  out.max = values.back();
+  int64_t ge10 = 0;
+  for (float v : values) {
+    if (v >= 10.0f) ++ge10;
+  }
+  out.frac_ge10 = static_cast<double>(ge10) / static_cast<double>(values.size());
+  return out;
+}
+
+// Diagnostics CSV schema v3 (Phase A, 2026-07 screens): v2 plus the trailing
+// durable PPO-side canary columns. v1 -> v2 (WO-17) added the eight aux
+// columns; v2 -> v3 adds only PPO-side columns and changes no existing one, so
+// column meanings are stable across versions and only the tail grows.
+//
+// Appending is only safe against a file carrying this exact header, so a
+// resumed run pointed at a v1 or v2 file fails loudly instead of writing rows
+// the header cannot describe. JSONL is self-describing per line and needs no
+// such gate.
+//
+// Deliberately NOT reusing the WO-17 column `ppo_grad_norm_mean` as the PPO
+// grad-norm canary: that column is populated only when online collection fed
+// aux examples and reads 0.0 with collection off. `grad_norm_mean` /
+// `grad_norm_max` below are always populated.
 const char* const kDiagnosticsCsvHeader =
     "seed,run_uuid,run_prefix,config_fingerprint,update,rollout_hash,episode_ids_unique,policy_kl_before,return_min,return_max,return_p50,"
     "return_p95,return_p99,abs_return_p99,fraction_targets_outside_1,fraction_critic_near_1,"
@@ -985,7 +1029,16 @@ const char* const kDiagnosticsCsvHeader =
     "conflict_vp_generated,conflict_vp_attributed,conflict_vp_unattributed,"
     "raw_conflict_vp,raw_noncombat_vp,raw_total_vp,validation_kl,"
     "aux_examples_used,aux_search_loss_coef,aux_ce,aux_value_mse,"
-    "aux_grad_norm_mean,ppo_grad_norm_mean,aux_ppo_norm_ratio,aux_ratio_abort";
+    "aux_grad_norm_mean,ppo_grad_norm_mean,aux_ppo_norm_ratio,aux_ratio_abort,"
+    "entropy,approx_kl,kl_early_stop,kl_early_stop_epoch,"
+    "grad_norm_mean,grad_norm_max,value_loss,nonfinite_abort,"
+    "precap_absz_n,precap_absz_p95,precap_absz_p99,precap_absz_max,frac_decisions_absz_ge10,"
+    "precap_absz_n_primary,precap_absz_p95_primary,precap_absz_p99_primary,"
+    "precap_absz_max_primary,frac_decisions_absz_ge10_primary,"
+    "precap_absz_n_continuation,precap_absz_p95_continuation,precap_absz_p99_continuation,"
+    "precap_absz_max_continuation,frac_decisions_absz_ge10_continuation,"
+    "precap_absz_n_purchase,precap_absz_p95_purchase,precap_absz_p99_purchase,"
+    "precap_absz_max_purchase,frac_decisions_absz_ge10_purchase";
 
 // Returns true if `filepath` already holds a header line, and sets `out_header`
 // to it (trailing CR/LF stripped). An absent or zero-length file has no header.
@@ -1067,7 +1120,36 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
         << stats.aux_grad_norm_mean << ","
         << stats.ppo_grad_norm_mean << ","
         << stats.aux_ppo_norm_ratio << ","
-        << (stats.aux_ratio_abort ? 1 : 0) << "\n";
+        << (stats.aux_ratio_abort ? 1 : 0) << ","
+        // --- v3: durable PPO-side canaries (Phase A) ---
+        << stats.entropy << ","
+        << stats.approx_kl << ","
+        << (stats.early_stopped ? 1 : 0) << ","
+        << stats.kl_early_stop_epoch << ","
+        << stats.GradNormMean() << ","
+        << stats.grad_norm_max << ","
+        << stats.value_loss << ","
+        << (stats.nonfinite_abort ? 1 : 0) << ","
+        << stats.precap_absz_all.decisions << ","
+        << stats.precap_absz_all.p95 << ","
+        << stats.precap_absz_all.p99 << ","
+        << stats.precap_absz_all.max << ","
+        << stats.precap_absz_all.frac_ge10 << ","
+        << stats.precap_absz_primary.decisions << ","
+        << stats.precap_absz_primary.p95 << ","
+        << stats.precap_absz_primary.p99 << ","
+        << stats.precap_absz_primary.max << ","
+        << stats.precap_absz_primary.frac_ge10 << ","
+        << stats.precap_absz_continuation.decisions << ","
+        << stats.precap_absz_continuation.p95 << ","
+        << stats.precap_absz_continuation.p99 << ","
+        << stats.precap_absz_continuation.max << ","
+        << stats.precap_absz_continuation.frac_ge10 << ","
+        << stats.precap_absz_purchase.decisions << ","
+        << stats.precap_absz_purchase.p95 << ","
+        << stats.precap_absz_purchase.p99 << ","
+        << stats.precap_absz_purchase.max << ","
+        << stats.precap_absz_purchase.frac_ge10 << "\n";
     ofs.flush();
     if (!ofs) {
       SpielFatalError("Failed to write diagnostics CSV data to: " + filepath);
@@ -1125,6 +1207,29 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     obj["ppo_grad_norm_mean"] = stats.ppo_grad_norm_mean;
     obj["aux_ppo_norm_ratio"] = stats.aux_ppo_norm_ratio;
     obj["aux_ratio_abort"] = stats.aux_ratio_abort;
+
+    // Durable PPO-side canaries (Phase A): same names as the CSV columns, so
+    // the two formats stay analysable interchangeably.
+    obj["entropy"] = stats.entropy;
+    obj["approx_kl"] = stats.approx_kl;
+    obj["kl_early_stop"] = stats.early_stopped;
+    obj["kl_early_stop_epoch"] = stats.kl_early_stop_epoch;
+    obj["grad_norm_mean"] = stats.GradNormMean();
+    obj["grad_norm_max"] = stats.grad_norm_max;
+    obj["value_loss"] = stats.value_loss;
+    obj["nonfinite_abort"] = stats.nonfinite_abort;
+    const auto add_absz = [&obj](const std::string& suffix,
+                                 const PrecapAbszStats& z) {
+      obj["precap_absz_n" + suffix] = static_cast<int64_t>(z.decisions);
+      obj["precap_absz_p95" + suffix] = z.p95;
+      obj["precap_absz_p99" + suffix] = z.p99;
+      obj["precap_absz_max" + suffix] = z.max;
+      obj["frac_decisions_absz_ge10" + suffix] = z.frac_ge10;
+    };
+    add_absz("", stats.precap_absz_all);
+    add_absz("_primary", stats.precap_absz_primary);
+    add_absz("_continuation", stats.precap_absz_continuation);
+    add_absz("_purchase", stats.precap_absz_purchase);
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";
     ofs.flush();

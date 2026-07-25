@@ -35,6 +35,34 @@ struct PpoTransition {
 };
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
+// Summary of PRE-cap legal-centered |z| over one update's rollout decisions.
+//
+// Per decision, z = raw_logit - mean(raw_logit over legal actions) and the
+// decision's statistic is max|z| over its legal actions, measured BEFORE the
+// tanh soft-cap and centered exactly as CenterAndCapLegalLogits centers. The
+// percentiles/max/fraction below are then taken OVER DECISIONS of that
+// per-decision value, which is the same decision-level convention the frozen
+// scripts/eval/logit_cap_audit.py uses (its frac_ge(maxz, N)).
+//
+// Domain: decisions with >= 2 legal actions only, matching the trainer's own
+// `nontrivial` definition (legal_actions.size() > 1). A forced decision has
+// z == 0 identically -- the centered value of a single logit is always zero --
+// so including them would only dilute the percentiles toward 0 while telling
+// us nothing. `decisions` records the denominator so this stays auditable.
+struct PrecapAbszStats {
+  int64_t decisions = 0;
+  double p95 = 0.0;
+  double p99 = 0.0;
+  double max = 0.0;
+  double frac_ge10 = 0.0;
+};
+
+// Summarizes per-decision max|z| values. Takes the vector by value and sorts
+// it, so the result depends only on the multiset and not on the order the
+// worker threads happened to append in.
+PrecapAbszStats SummarizePrecapAbsz(std::vector<float> values);
+
 struct PpoUpdateStats {
   double policy_loss = 0.0;
   double value_loss = 0.0;
@@ -46,6 +74,39 @@ struct PpoUpdateStats {
   bool early_stopped = false;
   double grad_norm_sum = 0.0;
   int grad_norm_count = 0;
+
+  // --- Phase A durable PPO-side canaries (log-only; no behavior change) ---
+  // grad_norm_max is the per-update maximum of the SAME unclipped quantity
+  // grad_norm_sum accumulates: torch clip_grad_norm_ returns the total norm as
+  // measured BEFORE clipping, so both are pre-clip.
+  double grad_norm_max = 0.0;
+  // Epoch at which target_kl tripped the early stop, or -1 if it never did.
+  // `early_stopped` already carries the boolean; this adds the index.
+  int kl_early_stop_epoch = -1;
+  // Set immediately before the fatal-exit on a nonfinite gradient norm. NOTE:
+  // that path calls std::exit from inside TrainPpoUpdate, so a run that
+  // survives always reports 0 here and the durable evidence of a nonfinite
+  // abort is the "Fatal PPO gradient norm" line in run.log plus a short row
+  // count. The analyzer treats all three as equivalent evidence.
+  bool nonfinite_abort = false;
+
+  // Pre-cap legal-centered |z|, overall and by decision role. Sourced from the
+  // rollout (the behavior policy that generated the batch), not from the
+  // minibatch forward passes, and copied in by the caller before the
+  // diagnostics row is written.
+  PrecapAbszStats precap_absz_all;
+  PrecapAbszStats precap_absz_primary;       // DuneDecisionRole::kAgentPrimary
+  PrecapAbszStats precap_absz_continuation;  // DuneDecisionRole::kAgentContinuation
+  PrecapAbszStats precap_absz_purchase;      // DuneDecisionRole::kPurchase
+
+  // Mean of the unclipped per-minibatch gradient norms over this update.
+  // Distinct from the WO-17 column `ppo_grad_norm_mean`, which is the
+  // aux-comparison ppo-only decomposition and is populated ONLY when online
+  // collection fed examples -- it reads 0.0 with collection off, so it cannot
+  // serve as a general grad-norm canary.
+  double GradNormMean() const {
+    return grad_norm_count > 0 ? grad_norm_sum / grad_norm_count : 0.0;
+  }
 
   // Diagnostics (Phase 5)
   bool episode_ids_unique = true;
