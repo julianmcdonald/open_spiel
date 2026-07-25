@@ -2633,6 +2633,37 @@ int main(int argc, char** argv) {
 
   std::vector<size_t> gate1_indices(strategic_indices.begin(), strategic_indices.begin() + std::min<size_t>(target_g1, strategic_indices.size()));
   std::vector<size_t> gate2_indices(opportunity_indices.begin(), opportunity_indices.begin() + std::min<size_t>(target_g2, opportunity_indices.size()));
+
+  // Self-test takes a 2-state sample of a 32-state corpus. Taking the first two
+  // in corpus order lands on two states from the same episode, which is a
+  // single bootstrap cluster and therefore a degenerate interval -- the
+  // self-test would be exercising a configuration the gate rejects. Prefer
+  // distinct episodes so the sample represents a valid run.
+  //
+  // Scoped to self-test on purpose: a real run takes every opportunity state,
+  // so there is no selection left to make and production gating is untouched.
+  if (self_test && requested_root_indices.empty() && requested_root_prefix < 0 &&
+      gate2_indices.size() < opportunity_indices.size()) {
+    std::vector<size_t> spread;
+    std::set<int> episodes_taken;
+    for (size_t idx : opportunity_indices) {
+      if (spread.size() >= target_g2) break;
+      if (episodes_taken.insert(corpus[idx].episode_id).second) {
+        spread.push_back(idx);
+      }
+    }
+    // Backfill in corpus order if the corpus does not have enough distinct
+    // episodes to fill the sample.
+    for (size_t idx : opportunity_indices) {
+      if (spread.size() >= target_g2) break;
+      if (std::find(spread.begin(), spread.end(), idx) == spread.end()) {
+        spread.push_back(idx);
+      }
+    }
+    std::sort(spread.begin(), spread.end());
+    gate2_indices = std::move(spread);
+  }
+
   if (skip_gate1) gate1_indices.clear();
 
   // Gate 2's confidence interval is an episode-cluster bootstrap: it resamples
@@ -2675,6 +2706,36 @@ int main(int argc, char** argv) {
       }
       std::cerr << "\n  Use a v2 corpus carrying episode_id, or --gate1_only to "
                    "skip Gate 2.\n";
+      std::exit(1);
+    }
+
+    // Same failure mode one step further in: episode ids can all be present and
+    // valid yet still resolve to a single cluster. `ep_dist` is then
+    // uniform_int_distribution(0, 0), every replicate reselects the one
+    // cluster, all 10000 bootstrap means are identical, and the 95% LCB comes
+    // out exactly equal to the point estimate -- a zero-width interval checked
+    // against a `LCB > 0.0` limit, which passes whenever the mean is positive.
+    // A clustered bootstrap needs at least two clusters to have any width, so
+    // require that rather than reporting false precision.
+    std::set<int> distinct_episodes;
+    for (size_t idx : gate2_indices) {
+      distinct_episodes.insert(corpus[idx].episode_id);
+    }
+    if (distinct_episodes.size() < 2) {
+      std::cerr << "Fidelity Gate validation failed: the " << gate2_indices.size()
+                << " selected Gate 2 opportunity states span only "
+                << distinct_episodes.size()
+                << " distinct episode(s). The Gate 2 lower confidence bound is "
+                   "an episode-cluster bootstrap, which needs at least 2 "
+                   "clusters to produce an interval of nonzero width; with one "
+                   "cluster the reported 95% LCB equals the point estimate "
+                   "exactly.\n";
+      if (!distinct_episodes.empty()) {
+        std::cerr << "  Episode id present: " << *distinct_episodes.begin()
+                  << "\n";
+      }
+      std::cerr << "  Select opportunity states spanning at least 2 episodes, "
+                   "or use --gate1_only to skip Gate 2.\n";
       std::exit(1);
     }
   }
@@ -4449,9 +4510,15 @@ int main(int argc, char** argv) {
 
   if (self_test) {
     if (!mock_fail) {
+      // Force the verdict so the self-test is a deterministic plumbing check
+      // rather than a statistical one -- but do NOT rewrite the statistic
+      // itself. The previous `bootstrap_lcb = 0.01` here ran *after* the value
+      // was printed, so stdout showed the real bootstrap output while the JSON
+      // report carried a fabricated one. Anything reading the report instead of
+      // the console saw a number the gate never computed, and the field it
+      // overwrote was precisely the one that reveals a degenerate interval.
       bias_passed = true;
       bootstrap_passed = true;
-      bootstrap_lcb = 0.01;
     }
   }
 
