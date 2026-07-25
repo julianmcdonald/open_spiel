@@ -197,6 +197,14 @@ struct OnlineCollectionState {
   int search_loss_warmup_update = 0;   // warmup position (updates 1 -> this)
   double abort_grad_norm_ratio = 0.0;
   double target_sharpen_exponent = 1.0;  // CE-target peaking exponent (1.0 = inert)
+  // Prior the collector's covered-mass acceptance rule was measured against
+  // ("raw_network_prior" | "tree_prior"; see AcceptancePriorSource). The
+  // cumulative counters and hash chain below are only meaningful within ONE
+  // source, so this travels with them. EMPTY means the manifest predates WO-20,
+  // i.e. the run accumulated them under the post-noise tree prior; the resume
+  // path must treat that as "unknown contract" and refuse to extend it silently
+  // rather than defaulting.
+  std::string acceptance_prior_source;
   // Exact-resume cursor + cumulative counters + chained accepted-target hash.
   uint64_t next_auxiliary_episode_id = 0;
   int64_t cum_accepted = 0, cum_rejected = 0;

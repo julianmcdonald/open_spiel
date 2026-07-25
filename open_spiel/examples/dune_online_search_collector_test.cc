@@ -175,9 +175,10 @@ void TestAcceptance() {
 
 // WO-20, half 1 of 2 (the predicate): the SAME search accepts against the raw
 // network prior and rejects against the post-noise tree prior, so which vector
-// the rule is handed is a real decision, not bookkeeping. The teacher that froze
-// the 0.50 threshold pins dirichlet_epsilon=0 (dune_search_teacher.cc:465), so
-// only the raw column reproduces the contract the threshold was calibrated on.
+// the rule is handed is a real decision, not bookkeeping. (This test asserts
+// only that the two sources disagree. Which one is CORRECT is argued in
+// AcceptancePriorSource, and the argument is not "matches the teacher" — the
+// teacher's own acceptance runs post-noise.)
 void TestAcceptancePriorSourceMatters() {
   std::cout << "Running TestAcceptancePriorSourceMatters...\n";
   OnlineSearchCollector col(DefaultConfig(), "hash");

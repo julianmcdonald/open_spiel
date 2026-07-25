@@ -29,30 +29,54 @@ class Evaluator;  // frozen inference snapshot; defined in algorithms/mcts.h
 }  // namespace algorithms
 
 // Which root prior the covered-prior-mass acceptance rule is measured against
-// (WO-20). The rule's 0.50 threshold was frozen against the offline teacher,
-// which pins `dirichlet_epsilon = 0.0` (dune_search_teacher.cc:465), so there
-// the tree prior IS the network prior and the distinction did not exist. Once
-// the collector turns exploration noise on (pilot epsilon 0.25), the two come
-// apart and the choice has to be named rather than inherited from the noise
-// setting.
+// (WO-20). Once the collector turns exploration noise on (pilot epsilon 0.25),
+// the tree prior and the network prior come apart, and the choice has to be
+// named rather than inherited from the noise setting.
+//
+// PROVENANCE, stated carefully because the obvious argument is wrong. The
+// numeric constants (3 / 2 / 0.50) were copied from the offline teacher, and it
+// is tempting to cite `dirichlet_epsilon = 0.0` at dune_search_teacher.cc:465
+// as proof that the threshold was calibrated noise-free. It is not: the teacher
+// builds a `kTrainingFullFast` session, which OVERRIDES epsilon to 0.25 for
+// full sessions (dune_search_session.cc:341), and the teacher only evaluates
+// acceptance for full sessions (dune_search_teacher.cc:516). Its own
+// `covered_prior_mass` is therefore post-noise too. "Matches the teacher" does
+// NOT justify the raw prior — if anything it argues the other way.
+//
+// What does justify it: (1) the item-4 per-role telemetry in the same stats
+// struct deliberately measures against the raw prior, and two quantities named
+// "prior mass" in one struct must mean one thing — that mismatch IS the review
+// finding; (2) the coverage contract should not change meaning when someone
+// toggles `dirichlet_epsilon`; (3) the collector's search config is frozen
+// against the Step-2/3 benchmark (dune_search_benchmark.cc), which defaults
+// epsilon to 0.0 AND runs `kFixedSessionSimulations`, a mode with no override —
+// so that screen, unlike the teacher, is genuinely noise-free.
 enum class AcceptancePriorSource {
   // DEFAULT. The untransformed network prior (`SearchDiagnostics::raw_priors`,
   // falling back to `priors` when the root was not in the tree, where `priors`
   // is already raw). Strips both root transformations — the Dirichlet mixture
-  // and `root_prior_temperature` — so "covered prior mass >= 0.50" means the
-  // same thing at a noised root as at the noise-free teacher it was frozen
-  // against, and matches the source the item-4 per-role KL telemetry uses.
+  // and `root_prior_temperature` — so "covered prior mass >= 0.50" means one
+  // fixed thing regardless of the noise setting, and means the same thing the
+  // item-4 per-role KL telemetry does.
   kRawNetworkPrior,
   // The post-noise, post-temperature tree prior the search actually ran with
-  // (`SearchDiagnostics::priors`) — the pre-WO-20 behavior. Noise flattens the
-  // prior, so this measures a different quantity than the frozen rule and than
-  // the telemetry; acceptance rates are then not comparable across noise-on and
-  // noise-off arms. Opt in explicitly if you want the tree's own view.
+  // (`SearchDiagnostics::priors`) — the pre-WO-20 behavior, and what the
+  // offline teacher still does. Noise flattens the prior, so this measures a
+  // different quantity than the telemetry, and acceptance rates are not
+  // comparable across noise-on and noise-off arms. Opt in explicitly if you
+  // want the tree's own view or are extending a pre-WO-20 run's counters.
   kTreePrior,
 };
 
-// Stable, log/JSON-safe name of an acceptance prior source.
+// Stable, log/JSON-safe name of an acceptance prior source. These strings are
+// PERSISTED (checkpoint manifests, config fingerprint) — do not rename them.
 const char* AcceptancePriorSourceName(AcceptancePriorSource source);
+
+// Inverse of AcceptancePriorSourceName. Returns false on an unrecognized name
+// (callers must fail loudly rather than fall back to a default: the whole point
+// of the field is that the contract is never chosen implicitly).
+bool ParseAcceptancePriorSource(const std::string& name,
+                                AcceptancePriorSource* out);
 
 // One accepted online search example. Policy target is the normalized visit
 // distribution over legal_actions (cross-entropy); value target is the terminal
@@ -149,8 +173,9 @@ struct OnlineSearchConfig {
   int min_visits_per_action = 2;        // ...with >= 2 visits each
   double min_prior_mass = 0.50;         // covered prior mass >= 0.50
   // Prior the covered-mass half of the rule is measured against. Default = the
-  // raw network prior, which is what the teacher's frozen 0.50 threshold and
-  // the item-4 telemetry both mean by "prior mass"; see AcceptancePriorSource.
+  // raw network prior, which is what the item-4 telemetry means by "prior
+  // mass" and is invariant to the noise knob; see AcceptancePriorSource for why
+  // the teacher is NOT the justification here.
   AcceptancePriorSource acceptance_prior_source =
       AcceptancePriorSource::kRawNetworkPrior;
   double accepted_action_temperature = 1.0;  // sample executed action from visits

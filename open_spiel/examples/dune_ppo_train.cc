@@ -149,6 +149,12 @@ ABSL_FLAG(uint64_t, auxiliary_search_seed_domain, 0,
           "--online_search_collection is set (no silent default).");
 ABSL_FLAG(double, collector_dirichlet_epsilon, 0.25,
           "Root Dirichlet noise weight for online collection (pilot 0.25; probe used 0).");
+ABSL_FLAG(std::string, collector_acceptance_prior, "",
+          "Prior the collector's covered-mass acceptance rule is measured "
+          "against: 'raw_network_prior' (default when unset) or 'tree_prior' "
+          "(pre-WO-20 post-noise behavior). Must be stated EXPLICITLY when "
+          "resuming a checkpoint whose manifest predates the field, because its "
+          "cumulative counters were accumulated under tree_prior.");
 ABSL_FLAG(double, search_loss_coef, 0.10,
           "Target auxiliary search-loss coefficient (warms 0 -> target).");
 ABSL_FLAG(int, search_loss_warmup_update, 25,
@@ -782,6 +788,24 @@ std::string GenerateUUID() {
   return absl::StrFormat("%08x-%04x-%04x-%04x-%012llx", a, b, c, d, e);
 }
 
+// Acceptance prior source this run will actually use: the flag when stated,
+// otherwise the collector's library default. Unrecognized names are fatal —
+// never silently fall back, since the whole point of the field is that the
+// coverage contract is chosen explicitly (WO-20).
+AcceptancePriorSource EffectiveAcceptancePriorSource() {
+  const std::string name = absl::GetFlag(FLAGS_collector_acceptance_prior);
+  if (name.empty()) return OnlineSearchConfig().acceptance_prior_source;
+  AcceptancePriorSource source;
+  if (!ParseAcceptancePriorSource(name, &source)) {
+    SpielFatalError(absl::StrCat(
+        "--collector_acceptance_prior=", name, " is not a known prior source. ",
+        "Use '", AcceptancePriorSourceName(AcceptancePriorSource::kRawNetworkPrior),
+        "' or '", AcceptancePriorSourceName(AcceptancePriorSource::kTreePrior),
+        "'."));
+  }
+  return source;
+}
+
 std::string ComputeLegacyConfigFingerprint() {
   open_spiel::json::Object config_obj;
   config_obj["game"] = absl::GetFlag(FLAGS_game);
@@ -881,6 +905,14 @@ std::string ComputeConfigFingerprint() {
   config_obj["target_sharpen_exponent"] = absl::GetFlag(FLAGS_target_sharpen_exponent);
   config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
   config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
+  // Acceptance prior source is training semantics, not a launcher detail: it
+  // decides which searches become CE targets. Fingerprinted so two runs that
+  // measure coverage differently cannot stamp their examples with the same
+  // provenance hash (WO-20). Deliberately NOT added to the legacy fingerprint
+  // above — that one is a frozen field set whose job is to recognize older
+  // manifests, so extending it would defeat its purpose.
+  config_obj["collector_acceptance_prior"] =
+      std::string(AcceptancePriorSourceName(EffectiveAcceptancePriorSource()));
 
   // New flags added for complete config fingerprint validation
   config_obj["deterministic"] = absl::GetFlag(FLAGS_deterministic);
@@ -1771,6 +1803,54 @@ int main(int argc, char** argv) {
     m_path.replace_extension(".json");
     std::string manifest_path = m_path.string();
 
+    // WO-20 acceptance-contract guard, deliberately BEFORE the fingerprint
+    // check: adding the source to the fingerprint already makes a pre-WO-20
+    // 18B checkpoint fail to resume, but it would fail as an anonymous hash
+    // mismatch. Diagnose the specific cause first, while we can still name it.
+    //
+    // The cumulative accepted/rejected counters and the accepted-target hash
+    // chain are only meaningful within ONE acceptance contract. A manifest
+    // written before WO-20 has no source field and accumulated its counters
+    // against the post-noise tree prior, so silently extending them under the
+    // new raw-prior default would blend two contracts into one total.
+    if (absl::GetFlag(FLAGS_online_search_collection)) {
+      OnlineCollectionState prior_state;
+      std::string oc_probe_err;
+      if (ReadOnlineCollectionState(manifest_path, prior_state, oc_probe_err) &&
+          prior_state.present) {
+        const std::string effective =
+            AcceptancePriorSourceName(EffectiveAcceptancePriorSource());
+        const bool stated = !absl::GetFlag(FLAGS_collector_acceptance_prior).empty();
+        if (prior_state.acceptance_prior_source.empty() && !stated) {
+          SpielFatalError(absl::StrCat(
+              "Refusing to resume: ", manifest_path, " predates WO-20 and has "
+              "no online_collection.acceptance_prior_source, so its "
+              "cum_accepted=", prior_state.cum_accepted, " / cum_rejected=",
+              prior_state.cum_rejected, " were accumulated against the "
+              "POST-NOISE tree prior. Continuing under the new default ('",
+              effective, "') would mix two coverage contracts in one counter "
+              "set and one accepted-target hash chain.\n"
+              "  To continue that run's original contract: "
+              "--collector_acceptance_prior=tree_prior\n"
+              "  To adopt the new contract knowingly (counters and hash chain "
+              "then span both): --collector_acceptance_prior=", effective, "\n"
+              "  Note either choice changes the config fingerprint relative to "
+              "the stored one, which is intended — the semantics did change."));
+        }
+        if (!prior_state.acceptance_prior_source.empty() &&
+            prior_state.acceptance_prior_source != effective) {
+          SpielFatalError(absl::StrCat(
+              "Refusing to resume: ", manifest_path, " collected under "
+              "acceptance_prior_source='", prior_state.acceptance_prior_source,
+              "' but this run resolves to '", effective, "'. Its counters and "
+              "hash chain cannot be extended across a change of coverage "
+              "contract. Pass --collector_acceptance_prior=",
+              prior_state.acceptance_prior_source, " to continue it, or start "
+              "a fresh run."));
+        }
+      }
+    }
+
     CheckpointManifest manifest;
     std::string err;
     // Legacy fingerprints predate critic-remediation flags and therefore
@@ -2128,6 +2208,7 @@ int main(int argc, char** argv) {
     aux_config.auxiliary_search_seed_domain =
         absl::GetFlag(FLAGS_auxiliary_search_seed_domain);
     aux_config.dirichlet_epsilon = absl::GetFlag(FLAGS_collector_dirichlet_epsilon);
+    aux_config.acceptance_prior_source = EffectiveAcceptancePriorSource();
     aux_config.target_sharpen_exponent =
         absl::GetFlag(FLAGS_target_sharpen_exponent);
     aux_config.swordmaster_grant_fraction =
@@ -2208,6 +2289,10 @@ int main(int argc, char** argv) {
     s.auxiliary_search_seed_domain = aux_config.auxiliary_search_seed_domain;
     s.collector_dirichlet_epsilon = aux_config.dirichlet_epsilon;
     s.target_sharpen_exponent = aux_config.target_sharpen_exponent;
+    // Travels with cum_accepted/cum_rejected/accepted_hash_chain below: those
+    // totals mean nothing without the contract they were measured under.
+    s.acceptance_prior_source =
+        AcceptancePriorSourceName(aux_config.acceptance_prior_source);
     s.swordmaster_grant_fraction = aux_config.swordmaster_grant_fraction;
     s.swordmaster_grant_round = aux_config.swordmaster_grant_round;
     s.search_loss_coef_target = aux_search_loss_coef_target;

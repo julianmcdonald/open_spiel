@@ -267,6 +267,20 @@ const char* AcceptancePriorSourceName(AcceptancePriorSource source) {
   SpielFatalError("Unknown AcceptancePriorSource.");
 }
 
+bool ParseAcceptancePriorSource(const std::string& name,
+                                AcceptancePriorSource* out) {
+  SPIEL_CHECK_TRUE(out != nullptr);
+  if (name == AcceptancePriorSourceName(AcceptancePriorSource::kRawNetworkPrior)) {
+    *out = AcceptancePriorSource::kRawNetworkPrior;
+    return true;
+  }
+  if (name == AcceptancePriorSourceName(AcceptancePriorSource::kTreePrior)) {
+    *out = AcceptancePriorSource::kTreePrior;
+    return true;
+  }
+  return false;
+}
+
 bool OnlineSearchCollector::AcceptSearch(const std::vector<int>& visit_counts,
                                          const std::vector<double>& root_priors,
                                          int legal_count, int* num_covered_out,
@@ -509,10 +523,11 @@ void OnlineSearchCollector::CollectUpdate(
           // WO-20: the covered-mass half of the rule is measured against the
           // source named by config_.acceptance_prior_source, NOT against
           // whatever the noise setting happens to make diag.priors. The default
-          // (raw network prior) keeps "covered mass >= 0.50" meaning what it
-          // meant for the noise-free teacher the 0.50 was frozen against, and
-          // keeps it comparable with the telemetry above; kTreePrior is the
-          // opt-in for the tree's own post-noise view.
+          // (raw network prior) keeps "covered mass >= 0.50" meaning one fixed
+          // thing whatever dirichlet_epsilon is, and meaning the same thing as
+          // the telemetry above; kTreePrior is the opt-in for the tree's own
+          // post-noise view. (The offline teacher measures post-noise too — see
+          // AcceptancePriorSource; it is not the argument for this default.)
           const std::vector<double>& acceptance_priors =
               config_.acceptance_prior_source == AcceptancePriorSource::kTreePrior
                   ? diag.priors

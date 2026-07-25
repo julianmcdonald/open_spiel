@@ -367,6 +367,7 @@ void TestOnlineCollectionResume() {
     s.cum_granted = 3;
     s.cum_organic = 1;
     s.accepted_hash_chain = "deadbeefcafef00d";
+    s.acceptance_prior_source = "raw_network_prior";
 
     json::Object manifest;
     manifest["schema_version"] = static_cast<int64_t>(2);
@@ -394,6 +395,29 @@ void TestOnlineCollectionResume() {
       UTILS_CHECK(r.cum_role_accepted[i] == s.cum_role_accepted[i]);
     }
     UTILS_CHECK(r.accepted_hash_chain == s.accepted_hash_chain);
+    // WO-20: the acceptance contract travels with the cumulative counters, so
+    // it must survive the round trip like any other exact-resume field.
+    UTILS_CHECK(r.acceptance_prior_source == s.acceptance_prior_source);
+
+    // WO-20 migration case: a manifest written BEFORE the field existed. It must
+    // read back EMPTY -- "unknown contract" -- and must NOT be silently defaulted
+    // to the current source, because those counters were accumulated against the
+    // post-noise tree prior. dune_ppo_train's resume guard keys off exactly this
+    // emptiness to refuse the resume with a migration message.
+    json::Object legacy_manifest;
+    legacy_manifest["schema_version"] = static_cast<int64_t>(2);
+    WriteOnlineCollectionState(legacy_manifest, s);
+    legacy_manifest["online_collection"].GetObject().erase("acceptance_prior_source");
+    std::string path_legacy =
+        (std::filesystem::temp_directory_path() / "oc_manifest_pre_wo20.json").string();
+    { std::ofstream ofs(path_legacy); ofs << json::ToString(legacy_manifest, true); }
+    OnlineCollectionState r_legacy;
+    std::string err_legacy;
+    UTILS_CHECK(ReadOnlineCollectionState(path_legacy, r_legacy, err_legacy));
+    UTILS_CHECK(r_legacy.present);                        // the block is there...
+    UTILS_CHECK(r_legacy.acceptance_prior_source.empty());  // ...the contract is not
+    UTILS_CHECK(r_legacy.cum_accepted == s.cum_accepted);   // counters still restore
+    std::filesystem::remove(path_legacy);
 
     // A manifest WITHOUT online_collection reads back present=false, no error.
     json::Object empty_manifest;
