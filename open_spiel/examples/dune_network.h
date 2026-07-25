@@ -13,7 +13,9 @@
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#include <random>
 #include <shared_mutex>
+#include <utility>
 #include <ATen/autocast_mode.h>
 
 #include "open_spiel/spiel.h"
@@ -162,6 +164,62 @@ inline void CenterAndCapLegalLogits(std::vector<float>& logits,
             logit = logit_cap * std::tanh(logit / logit_cap);
         }
     }
+}
+
+// Samples one legal action from `logits` (already legal-centered and capped by
+// CenterAndCapLegalLogits) and returns it together with the log-probability of
+// the distribution that was ACTUALLY sampled from, so a stored `old_log_prob`
+// always describes the sampling law.
+//
+// Weights are the exact legal-softmax numerators exp(logit - max_legal_logit).
+// An action whose exponent underflows to zero stays at zero: it must not
+// inherit exp(0) == 1, which is the weight of the argmax. Only when the whole
+// legal distribution carries no usable mass — no legal action has a finite
+// logit, or every weight underflowed — do we fall back to uniform, and the
+// returned log-probability then describes that same uniform law.
+//
+// Shared by the PPO rollout and the swordmaster planner rollout so the two
+// cannot drift apart in their policy transform.
+template <typename RngType>
+inline std::pair<Action, float> SamplePolicyAction(
+    RngType* rng, const std::vector<float>& logits,
+    const std::vector<Action>& legal_actions) {
+    SPIEL_CHECK_FALSE(legal_actions.empty());
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (Action legal_action : legal_actions) {
+        if (legal_action >= 0 &&
+            static_cast<size_t>(legal_action) < logits.size()) {
+            max_logit = std::max(max_logit, logits[legal_action]);
+        }
+    }
+
+    std::vector<double> weights;
+    weights.reserve(legal_actions.size());
+    double total_weight = 0.0;
+    for (Action legal_action : legal_actions) {
+        // Zero, not one: an action with no logit of its own carries no mass.
+        double weight = 0.0;
+        if (legal_action >= 0 &&
+            static_cast<size_t>(legal_action) < logits.size() &&
+            std::isfinite(max_logit)) {
+            weight = std::exp(static_cast<double>(logits[legal_action] - max_logit));
+            if (!std::isfinite(weight) || weight < 0.0) weight = 0.0;
+        }
+        weights.push_back(weight);
+        total_weight += weight;
+    }
+
+    if (!(total_weight > 0.0) || !std::isfinite(total_weight)) {
+        weights.assign(legal_actions.size(), 1.0);
+        total_weight = static_cast<double>(legal_actions.size());
+    }
+
+    std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
+    size_t sampled_index = dist(*rng);
+    double prob = weights[sampled_index] / total_weight;
+    return {legal_actions[sampled_index],
+            static_cast<float>(std::log(std::max(prob, 1e-12)))};
 }
 
 struct EvaluatorStats {

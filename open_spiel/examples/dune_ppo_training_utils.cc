@@ -588,6 +588,7 @@ PpoUpdateStats TrainPpoUpdate(
   // line below is skipped and the update is numerically identical to today.
   const bool aux_active = !search_examples.empty() && search_loss_coef > 0.0 &&
                           !::absl::GetFlag(::FLAGS_train_value_only);
+  stats.aux_search_loss_coef = search_loss_coef;
   const int64_t aux_n =
       aux_active ? static_cast<int64_t>(search_examples.size()) : 0;
   torch::Tensor aux_states, aux_masks, aux_targets, aux_values;
@@ -965,6 +966,35 @@ PpoUpdateStats TrainPpoUpdate(
   return stats;
 }
 
+// Diagnostics CSV schema v2 (WO-17): v1 plus the eight trailing Phase 18B aux
+// columns. Appending is only safe against a file carrying this exact header, so
+// a resumed run pointed at a v1 file fails loudly instead of writing rows the
+// header cannot describe. JSONL is self-describing per line and needs no such
+// gate.
+const char* const kDiagnosticsCsvHeader =
+    "seed,run_uuid,run_prefix,config_fingerprint,update,rollout_hash,episode_ids_unique,policy_kl_before,return_min,return_max,return_p50,"
+    "return_p95,return_p99,abs_return_p99,fraction_targets_outside_1,fraction_critic_near_1,"
+    "total_transitions,nontrivial_transitions,forced_transitions,epoch_kls,"
+    "conflict_vp_generated,conflict_vp_attributed,conflict_vp_unattributed,"
+    "raw_conflict_vp,raw_noncombat_vp,raw_total_vp,validation_kl,"
+    "aux_examples_used,aux_search_loss_coef,aux_ce,aux_value_mse,"
+    "aux_grad_norm_mean,ppo_grad_norm_mean,aux_ppo_norm_ratio,aux_ratio_abort";
+
+// Returns true if `filepath` already holds a header line, and sets `out_header`
+// to it (trailing CR/LF stripped). An absent or zero-length file has no header.
+bool ReadDiagnosticsCsvHeader(const std::string& filepath,
+                              std::string* out_header) {
+  std::ifstream ifs(filepath);
+  if (!ifs) return false;
+  std::string line;
+  if (!std::getline(ifs, line)) return false;
+  while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+    line.pop_back();
+  }
+  *out_header = line;
+  return true;
+}
+
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
@@ -974,17 +1004,22 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
   bool is_csv = (filepath.size() >= 4 && filepath.substr(filepath.size() - 4) == ".csv");
 
   if (is_csv) {
-    bool file_exists = std::filesystem::exists(filepath);
+    std::string existing_header;
+    const bool has_header = ReadDiagnosticsCsvHeader(filepath, &existing_header);
+    if (has_header && existing_header != kDiagnosticsCsvHeader) {
+      SpielFatalError(
+          "Diagnostics CSV schema mismatch at: " + filepath +
+          "\n  Existing header: " + existing_header +
+          "\n  This binary writes: " + std::string(kDiagnosticsCsvHeader) +
+          "\n  Appending would produce rows the header cannot describe. Move "
+          "the old file aside or point --diagnostics_path at a new file.");
+    }
     std::ofstream ofs(filepath, std::ios::app);
     if (!ofs) {
       SpielFatalError("Could not open diagnostics path: " + filepath);
     }
-    if (!file_exists) {
-      ofs << "seed,run_uuid,run_prefix,config_fingerprint,update,rollout_hash,episode_ids_unique,policy_kl_before,return_min,return_max,return_p50,"
-             "return_p95,return_p99,abs_return_p99,fraction_targets_outside_1,fraction_critic_near_1,"
-             "total_transitions,nontrivial_transitions,forced_transitions,epoch_kls,"
-             "conflict_vp_generated,conflict_vp_attributed,conflict_vp_unattributed,"
-             "raw_conflict_vp,raw_noncombat_vp,raw_total_vp,validation_kl\n";
+    if (!has_header) {
+      ofs << kDiagnosticsCsvHeader << "\n";
     }
     std::string epoch_kls_str;
     for (size_t i = 0; i < stats.epoch_kls.size(); ++i) {
@@ -1017,7 +1052,15 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
         << raw_conflict_vp << ","
         << raw_noncombat_vp << ","
         << raw_total_vp << ","
-        << validation_kl << "\n";
+        << validation_kl << ","
+        << stats.aux_examples_used << ","
+        << stats.aux_search_loss_coef << ","
+        << stats.aux_ce << ","
+        << stats.aux_value_mse << ","
+        << stats.aux_grad_norm_mean << ","
+        << stats.ppo_grad_norm_mean << ","
+        << stats.aux_ppo_norm_ratio << ","
+        << (stats.aux_ratio_abort ? 1 : 0) << "\n";
     ofs.flush();
     if (!ofs) {
       SpielFatalError("Failed to write diagnostics CSV data to: " + filepath);
@@ -1064,6 +1107,17 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     obj["raw_noncombat_vp"] = raw_noncombat_vp;
     obj["raw_total_vp"] = raw_total_vp;
     obj["validation_kl"] = validation_kl;
+
+    // Phase 18B auxiliary-loss trajectory (WO-17): same names as the CSV
+    // columns, so the two formats stay analysable interchangeably.
+    obj["aux_examples_used"] = static_cast<int64_t>(stats.aux_examples_used);
+    obj["aux_search_loss_coef"] = stats.aux_search_loss_coef;
+    obj["aux_ce"] = stats.aux_ce;
+    obj["aux_value_mse"] = stats.aux_value_mse;
+    obj["aux_grad_norm_mean"] = stats.aux_grad_norm_mean;
+    obj["ppo_grad_norm_mean"] = stats.ppo_grad_norm_mean;
+    obj["aux_ppo_norm_ratio"] = stats.aux_ppo_norm_ratio;
+    obj["aux_ratio_abort"] = stats.aux_ratio_abort;
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";
     ofs.flush();

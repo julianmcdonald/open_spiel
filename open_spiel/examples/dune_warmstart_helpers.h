@@ -467,33 +467,13 @@ inline double ScoreSwordmasterRaceState(
   return score;
 }
 
-// Replicate SamplePolicyAction in helpers to keep it independent
+// Defers to the shared sampler (dune_network.h) so the planner rollout and the
+// PPO rollout cannot drift apart in their policy transform; the planner has no
+// use for the sampled action's log-probability.
 inline Action SampleActionFromLogits(
     std::mt19937* rng, const std::vector<float>& logits,
     const std::vector<Action>& legal_actions) {
-  float max_logit = -std::numeric_limits<float>::infinity();
-  for (Action legal_action : legal_actions) {
-    if (legal_action >= 0 &&
-        static_cast<size_t>(legal_action) < logits.size()) {
-      max_logit = std::max(max_logit, logits[legal_action]);
-    }
-  }
-
-  std::vector<double> weights;
-  weights.reserve(legal_actions.size());
-  for (Action legal_action : legal_actions) {
-    double weight = 1.0;
-    if (legal_action >= 0 &&
-        static_cast<size_t>(legal_action) < logits.size() &&
-        std::isfinite(max_logit)) {
-      weight = std::exp(static_cast<double>(logits[legal_action] - max_logit));
-    }
-    if (!std::isfinite(weight) || weight <= 0.0) weight = 1.0;
-    weights.push_back(weight);
-  }
-
-  std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
-  return legal_actions[dist(*rng)];
+  return SamplePolicyAction(rng, logits, legal_actions).first;
 }
 
 // Execute a single simulated rollout to score an action path

@@ -1,5 +1,12 @@
 // Tests for dune_ppo_training_utils.h / .cc
 //
+// WO-17 additions:
+//   Underflowed weights stay zero | Never promoted to the argmax weight
+//   Massless legal distribution   | Explicit uniform fallback, reported as such
+//   Default logit cap             | Sampler bit-identical to the pre-WO-17 one
+//   Phase 18B aux metrics         | Persisted to diagnostics CSV and JSONL
+//   Pre-WO-17 diagnostics CSV     | Append aborts instead of writing ragged rows
+//
 // 22 tests covering:
 //   1. Two deployments deltas 2 and 6, one VP | Exact 25% / 75% split
 //   2. Pass action | Zero conflict reward
@@ -24,13 +31,21 @@
 //  21. Partial/orphan checkpoint | Model without manifest → ignored by loader
 //  22. Train/validation label isolation | Validation never in training samples
 
-#include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <vector>
-#include <memory>
-#include <cmath>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
@@ -741,6 +756,299 @@ void TestShapingLambda() {
     CHECK_NEAR(ComputeRewardLambda(400, 100, 200), 0.0f, 1e-6);  // past decay
   } TEST_END();
 }
+
+// ---------------------------------------------------------------------------
+// WO-17 — policy-transform alignment and durable Phase 18B diagnostics.
+// ---------------------------------------------------------------------------
+
+// The pre-WO-17 sampler, kept verbatim so the tests can assert BOTH halves of
+// the fix: identical behavior wherever no weight underflows (every config that
+// has ever run), and divergence exactly where PPO finding 7 bites.
+template <typename RngType>
+static std::pair<Action, float> LegacySamplePolicyAction(
+    RngType* rng, const std::vector<float>& logits,
+    const std::vector<Action>& legal_actions) {
+  Action action = legal_actions.front();
+  float max_logit = -std::numeric_limits<float>::infinity();
+  for (Action legal_action : legal_actions) {
+    if (legal_action >= 0 &&
+        static_cast<size_t>(legal_action) < logits.size()) {
+      max_logit = std::max(max_logit, logits[legal_action]);
+    }
+  }
+  std::vector<double> weights;
+  weights.reserve(legal_actions.size());
+  double total_weight = 0.0;
+  for (Action legal_action : legal_actions) {
+    double weight = 1.0;
+    if (legal_action >= 0 &&
+        static_cast<size_t>(legal_action) < logits.size() &&
+        std::isfinite(max_logit)) {
+      weight = std::exp(static_cast<double>(logits[legal_action] - max_logit));
+    }
+    if (!std::isfinite(weight) || weight <= 0.0) weight = 1.0;
+    weights.push_back(weight);
+    total_weight += weight;
+  }
+  std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
+  size_t sampled_index = dist(*rng);
+  action = legal_actions[sampled_index];
+  double prob = total_weight > 0.0 ? weights[sampled_index] / total_weight
+                                   : 1.0 / legal_actions.size();
+  return {action, static_cast<float>(std::log(std::max(prob, 1e-12)))};
+}
+
+// PPO finding 7: a weight that underflows exp() to zero used to be rewritten to
+// 1.0 — the exact weight of the argmax after max-subtraction — so the least
+// likely legal action was sampled as often as the most likely one, and the
+// stored old_log_prob described that corrupted law instead of the softmax the
+// PPO update recomputes.
+void TestSamplePolicyActionUnderflow() {
+  TEST_BEGIN("Underflowed action weights stay zero, not promoted to argmax weight") {
+    // A gap of 800 underflows exp() to exactly 0.0 in double.
+    std::vector<float> logits = {0.0f, -800.0f, -1.0f};
+    std::vector<Action> legal = {0, 1, 2};
+    const double denom = std::exp(0.0) + std::exp(-1.0);  // action 1 has no mass
+
+    std::mt19937_64 rng(20260725ULL);
+    int counts[3] = {0, 0, 0};
+    for (int i = 0; i < 20000; ++i) {
+      auto s = SamplePolicyAction(&rng, logits, legal);
+      UTILS_CHECK(s.first >= 0 && s.first <= 2);
+      counts[s.first]++;
+      // The reported log-prob must describe the law actually sampled from.
+      double expected = std::exp(static_cast<double>(logits[s.first])) / denom;
+      CHECK_NEAR(std::exp(static_cast<double>(s.second)), expected, 1e-6);
+    }
+    CHECK_EQ(counts[1], 0);
+    UTILS_CHECK(counts[0] > 0 && counts[2] > 0);
+
+    // The legacy sampler gave the underflowed action the argmax's weight, so it
+    // came up roughly as often as action 0 — this is the defect being fixed.
+    std::mt19937_64 legacy_rng(20260725ULL);
+    int legacy_underflow_hits = 0;
+    for (int i = 0; i < 20000; ++i) {
+      if (LegacySamplePolicyAction(&legacy_rng, logits, legal).first == 1) {
+        ++legacy_underflow_hits;
+      }
+    }
+    UTILS_CHECK(legacy_underflow_hits > 1000);
+  } TEST_END();
+}
+
+// The whole legal distribution losing its mass is the ONLY case that may
+// fabricate a distribution, and the fallback it uses is the one it reports.
+void TestSamplePolicyActionZeroMassFallback() {
+  TEST_BEGIN("Only a fully massless legal distribution falls back to uniform") {
+    // No legal action indexes into the logit vector => no finite max logit.
+    std::vector<float> logits = {0.5f, 0.25f};
+    std::vector<Action> legal = {5, 7};
+    std::mt19937_64 rng(7ULL);
+    int seen5 = 0, seen7 = 0;
+    for (int i = 0; i < 2000; ++i) {
+      auto s = SamplePolicyAction(&rng, logits, legal);
+      if (s.first == 5) ++seen5;
+      else if (s.first == 7) ++seen7;
+      else UTILS_CHECK(false);
+      CHECK_NEAR(std::exp(static_cast<double>(s.second)), 0.5, 1e-6);
+    }
+    UTILS_CHECK(seen5 > 0 && seen7 > 0);
+
+    // All-NaN logits are the other way the legal mass disappears.
+    const float nan_f = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> nan_logits = {nan_f, nan_f};
+    std::vector<Action> nan_legal = {0, 1};
+    for (int i = 0; i < 100; ++i) {
+      auto s = SamplePolicyAction(&rng, nan_logits, nan_legal);
+      UTILS_CHECK(s.first == 0 || s.first == 1);
+      CHECK_NEAR(std::exp(static_cast<double>(s.second)), 0.5, 1e-6);
+    }
+  } TEST_END();
+}
+
+// Legal-centered logits under the default cap span at most [-10, 10], so the
+// smallest possible weight is exp(-20) ~ 2e-9 and nothing underflows: the fix
+// must be a no-op for every configuration that has actually run.
+void TestSamplePolicyActionDefaultCapParity() {
+  TEST_BEGIN("Default logit cap: sampler bit-identical to the pre-WO-17 one") {
+    std::vector<float> logits(8, -3.0f);
+    logits[1] = 10.0f;
+    logits[2] = -10.0f;
+    logits[3] = 2.5f;
+    logits[5] = 0.0f;
+    std::vector<Action> legal = {1, 2, 3, 5};
+
+    std::mt19937_64 rng(4242ULL);
+    std::mt19937_64 legacy_rng(4242ULL);
+    double denom = 0.0;
+    for (Action a : legal) {
+      denom += std::exp(static_cast<double>(logits[a] - 10.0f));
+    }
+    for (int i = 0; i < 20000; ++i) {
+      auto s = SamplePolicyAction(&rng, logits, legal);
+      auto l = LegacySamplePolicyAction(&legacy_rng, logits, legal);
+      CHECK_EQ(s.first, l.first);
+      CHECK_EQ(s.second, l.second);
+      double expected =
+          std::exp(static_cast<double>(logits[s.first] - 10.0f)) / denom;
+      CHECK_NEAR(std::exp(static_cast<double>(s.second)), expected, 1e-6);
+    }
+  } TEST_END();
+}
+
+// PPO finding 2: the [18B Aux] metrics existed only on stdout.
+static PpoUpdateStats MakeAuxDiagnosticsStats() {
+  PpoUpdateStats stats;
+  stats.rollout_hash = "deadbeef";
+  stats.epoch_kls = {0.25, 0.5};
+  // Exact binary fractions so the default 6-significant-digit CSV formatting
+  // round-trips without tolerance games.
+  stats.aux_examples_used = 12;
+  stats.aux_search_loss_coef = 0.0625;
+  stats.aux_ce = 1.25;
+  stats.aux_value_mse = 0.5;
+  stats.aux_grad_norm_mean = 3.5;
+  stats.ppo_grad_norm_mean = 7.0;
+  stats.aux_ppo_norm_ratio = 0.5;
+  stats.aux_ratio_abort = true;
+  return stats;
+}
+
+static std::vector<std::string> SplitCsvRow(const std::string& row) {
+  std::vector<std::string> fields;
+  std::string field;
+  std::istringstream iss(row);
+  while (std::getline(iss, field, ',')) fields.push_back(field);
+  return fields;
+}
+
+static std::vector<std::string> ReadLines(const std::string& path) {
+  std::vector<std::string> lines;
+  std::ifstream ifs(path);
+  std::string line;
+  while (std::getline(ifs, line)) lines.push_back(line);
+  return lines;
+}
+
+// Names and expected values shared by the CSV and JSONL assertions.
+static const std::pair<const char*, double> kAuxDiagnosticFields[] = {
+    {"aux_examples_used", 12.0},   {"aux_search_loss_coef", 0.0625},
+    {"aux_ce", 1.25},              {"aux_value_mse", 0.5},
+    {"aux_grad_norm_mean", 3.5},   {"ppo_grad_norm_mean", 7.0},
+    {"aux_ppo_norm_ratio", 0.5},   {"aux_ratio_abort", 1.0},
+};
+
+void TestDiagnosticsPersistAuxMetrics() {
+  TEST_BEGIN("Diagnostics CSV and JSONL carry every Phase 18B aux metric") {
+    PpoUpdateStats stats = MakeAuxDiagnosticsStats();
+    std::string csv_path = "wo17_aux_diagnostics.csv";
+    std::string jsonl_path = "wo17_aux_diagnostics.jsonl";
+    std::filesystem::remove(csv_path);
+    std::filesystem::remove(jsonl_path);
+
+    for (int update = 1; update <= 2; ++update) {
+      for (const std::string& path : {csv_path, jsonl_path}) {
+        WriteDiagnostics(path, update, stats, 1.0, 0.75, 0.25, /*seed=*/99,
+                         "run-uuid", "run-prefix", "cfg-fp", 2.0, 3.0, 5.0,
+                         /*validation_kl=*/0.125);
+      }
+    }
+
+    // CSV: one header, one row per update, aux values in their named columns.
+    std::vector<std::string> csv_lines = ReadLines(csv_path);
+    CHECK_EQ(csv_lines.size(), static_cast<size_t>(3));
+    std::vector<std::string> header = SplitCsvRow(csv_lines[0]);
+    std::vector<std::string> row = SplitCsvRow(csv_lines[1]);
+    CHECK_EQ(header.size(), row.size());
+    for (const auto& field : kAuxDiagnosticFields) {
+      auto it = std::find(header.begin(), header.end(), std::string(field.first));
+      if (it == header.end()) {
+        std::cerr << "\n  missing CSV column: " << field.first << "\n";
+        UTILS_CHECK(false);
+      }
+      size_t col = static_cast<size_t>(it - header.begin());
+      CHECK_NEAR(std::stod(row[col]), field.second, 1e-9);
+    }
+    CHECK_EQ(SplitCsvRow(csv_lines[2]).size(), header.size());
+
+    // JSONL: same names, one self-describing object per update.
+    std::vector<std::string> jsonl_lines = ReadLines(jsonl_path);
+    CHECK_EQ(jsonl_lines.size(), static_cast<size_t>(2));
+    auto parsed = open_spiel::json::FromString(jsonl_lines[0]);
+    UTILS_CHECK(parsed.has_value() && parsed->IsObject());
+    const auto& obj = parsed->GetObject();
+    for (const auto& field : kAuxDiagnosticFields) {
+      auto it = obj.find(field.first);
+      if (it == obj.end()) {
+        std::cerr << "\n  missing JSONL key: " << field.first << "\n";
+        UTILS_CHECK(false);
+      }
+      double value = it->second.IsBool()
+                         ? (it->second.GetBool() ? 1.0 : 0.0)
+                         : (it->second.IsInt()
+                                ? static_cast<double>(it->second.GetInt())
+                                : it->second.GetDouble());
+      CHECK_NEAR(value, field.second, 1e-9);
+    }
+
+    std::filesystem::remove(csv_path);
+    std::filesystem::remove(jsonl_path);
+  } TEST_END();
+}
+
+// Resume safety: appending WO-17 rows to a pre-WO-17 CSV would produce rows the
+// header cannot describe, so it must abort rather than corrupt the file.
+void TestDiagnosticsCsvSchemaGate() {
+  TEST_BEGIN("Appending to a pre-WO-17 diagnostics CSV aborts instead of raggedly appending") {
+    const std::string kLegacyHeader =
+        "seed,run_uuid,run_prefix,config_fingerprint,update,rollout_hash,episode_ids_unique,policy_kl_before,return_min,return_max,return_p50,"
+        "return_p95,return_p99,abs_return_p99,fraction_targets_outside_1,fraction_critic_near_1,"
+        "total_transitions,nontrivial_transitions,forced_transitions,epoch_kls,"
+        "conflict_vp_generated,conflict_vp_attributed,conflict_vp_unattributed,"
+        "raw_conflict_vp,raw_noncombat_vp,raw_total_vp,validation_kl";
+    std::string path = "wo17_legacy_diagnostics.csv";
+    std::filesystem::remove(path);
+    WriteMockFile(path, kLegacyHeader + "\n1,u,p,f,1,h,1,0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0\n");
+
+    PpoUpdateStats stats = MakeAuxDiagnosticsStats();
+    open_spiel::SetErrorHandler([](const std::string& msg) {
+      throw std::runtime_error(msg);
+    });
+    bool threw = false;
+    std::string message;
+    try {
+      WriteDiagnostics(path, 2, stats, 1.0, 0.75, 0.25, 99, "u", "p", "f", 2.0,
+                       3.0, 5.0, 0.125);
+    } catch (const std::runtime_error& e) {
+      threw = true;
+      message = e.what();
+    }
+    open_spiel::SetErrorHandler([](const std::string& msg) {
+      std::cerr << "Spiel Fatal Error: " << msg << std::endl;
+      std::exit(1);
+    });
+    UTILS_CHECK(threw);
+    UTILS_CHECK(message.find(path) != std::string::npos);
+
+    // The pre-existing file is left exactly as it was.
+    std::vector<std::string> lines = ReadLines(path);
+    CHECK_EQ(lines.size(), static_cast<size_t>(2));
+    CHECK_EQ(lines[0], kLegacyHeader);
+
+    // An empty file is not a headerless resume target: it gets the header.
+    std::string empty_path = "wo17_empty_diagnostics.csv";
+    std::filesystem::remove(empty_path);
+    WriteMockFile(empty_path, "");
+    WriteDiagnostics(empty_path, 1, stats, 1.0, 0.75, 0.25, 99, "u", "p", "f",
+                     2.0, 3.0, 5.0, 0.125);
+    std::vector<std::string> empty_lines = ReadLines(empty_path);
+    CHECK_EQ(empty_lines.size(), static_cast<size_t>(2));
+    UTILS_CHECK(empty_lines[0].find("aux_ppo_norm_ratio") != std::string::npos);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(empty_path);
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -760,6 +1068,11 @@ int main() {
   TestCriticOnlyParameterMovement();
   TestKLEarlyStopping();
   TestShapingLambda();
+  TestSamplePolicyActionUnderflow();
+  TestSamplePolicyActionZeroMassFallback();
+  TestSamplePolicyActionDefaultCapParity();
+  TestDiagnosticsPersistAuxMetrics();
+  TestDiagnosticsCsvSchemaGate();
 #endif
 
   // -----------------------------------------------------------------------

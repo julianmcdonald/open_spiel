@@ -1014,42 +1014,6 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   }
 }
 
-template <typename RngType>
-std::pair<Action, float> SamplePolicyAction(
-    RngType* rng, const std::vector<float>& logits,
-    const std::vector<Action>& legal_actions) {
-  Action action = legal_actions.front();
-  float max_logit = -std::numeric_limits<float>::infinity();
-  for (Action legal_action : legal_actions) {
-    if (legal_action >= 0 &&
-        static_cast<size_t>(legal_action) < logits.size()) {
-      max_logit = std::max(max_logit, logits[legal_action]);
-    }
-  }
-
-  std::vector<double> weights;
-  weights.reserve(legal_actions.size());
-  double total_weight = 0.0;
-  for (Action legal_action : legal_actions) {
-    double weight = 1.0;
-    if (legal_action >= 0 &&
-        static_cast<size_t>(legal_action) < logits.size() &&
-        std::isfinite(max_logit)) {
-      weight = std::exp(static_cast<double>(logits[legal_action] - max_logit));
-    }
-    if (!std::isfinite(weight) || weight <= 0.0) weight = 1.0;
-    weights.push_back(weight);
-    total_weight += weight;
-  }
-
-  std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
-  size_t sampled_index = dist(*rng);
-  action = legal_actions[sampled_index];
-  double prob = total_weight > 0.0 ? weights[sampled_index] / total_weight
-                                   : 1.0 / legal_actions.size();
-  return {action, static_cast<float>(std::log(std::max(prob, 1e-12)))};
-}
-
 struct CounterfactualPending {
   PpoTransition transition;
   int replay_weight;
@@ -2149,6 +2113,7 @@ int main(int argc, char** argv) {
   }
   std::shared_ptr<open_spiel::OnlineSearchCollector> aux_collector;
   std::shared_ptr<open_spiel::DuneNNEvaluator> aux_evaluator;
+  float aux_logit_cap = 0.0f;  // cap actually handed to aux_evaluator
   double aux_search_loss_coef_target = absl::GetFlag(FLAGS_search_loss_coef);
   int aux_search_loss_warmup = absl::GetFlag(FLAGS_search_loss_warmup_update);
   double aux_abort_ratio = absl::GetFlag(FLAGS_abort_grad_norm_ratio);
@@ -2172,20 +2137,25 @@ int main(int argc, char** argv) {
     // Exact resume: continue the aux episode cursor from the manifest.
     aux_config.next_auxiliary_episode_id =
         static_cast<int64_t>(aux_next_episode_id_persist);
-    aux_evaluator =
-        std::make_shared<open_spiel::DuneNNEvaluator>(inference_model, device, 10.0f);
+    // Same policy transform as the PPO rollout (which applies FLAGS_logit_cap
+    // itself, below): the 18B teacher's priors and the student being trained
+    // must not sit under different transforms. Echoed on the startup line so a
+    // run log records the cap the aux evaluator actually received.
+    aux_logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+    aux_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
+        inference_model, device, aux_logit_cap);
     aux_collector = std::make_shared<open_spiel::OnlineSearchCollector>(
         aux_config, config_fingerprint);
     std::cout << absl::StrFormat(
         "[18B] Online collection ON | aux_games=%d seed_domain=%llu "
         "dirichlet_eps=%.3f grant_frac=%.3f grant_round=%d loss_coef=%.3f/warmup%d "
-        "abort_ratio=%.3f sharpen=%.3f resume_ep=%llu\n",
+        "abort_ratio=%.3f sharpen=%.3f resume_ep=%llu logit_cap=%.3f\n",
         aux_config.auxiliary_games,
         (unsigned long long)aux_config.auxiliary_search_seed_domain,
         aux_config.dirichlet_epsilon, aux_config.swordmaster_grant_fraction,
         aux_config.swordmaster_grant_round, aux_search_loss_coef_target,
         aux_search_loss_warmup, aux_abort_ratio, aux_config.target_sharpen_exponent,
-        (unsigned long long)aux_next_episode_id_persist);
+        (unsigned long long)aux_next_episode_id_persist, aux_logit_cap);
   }
 
   // Collect one update's aux examples into `cr`, from the frozen snapshot. Runs
@@ -2374,6 +2344,22 @@ int main(int argc, char** argv) {
     // nonzero with a distinct message.
     if (stats.aux_ratio_abort) {
       if (have_bg && bg_collect_thread.joinable()) bg_collect_thread.join();
+      // Record the aborting update before exiting: its ratio is the one row a
+      // post-mortem needs, and stderr is not a durable diagnostics channel.
+      std::string abort_diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
+      if (!abort_diagnostics_path.empty()) {
+        open_spiel::WriteDiagnostics(
+            abort_diagnostics_path, update, stats,
+            current_collect.conflict_vp_generated,
+            current_collect.conflict_vp_attributed,
+            current_collect.conflict_vp_unattributed, master, run_uuid,
+            absl::GetFlag(FLAGS_run_prefix), config_fingerprint,
+            current_collect.raw_conflict_vp, current_collect.raw_noncombat_vp,
+            current_collect.raw_total_vp,
+            search_buffer.ComputeValidationKL(
+                training_model, device,
+                static_cast<float>(absl::GetFlag(FLAGS_logit_cap))));
+      }
       std::cerr << absl::StrFormat(
           "ABORT[18B grad-ratio]: update %d aux/PPO norm ratio %.4f > %.4f "
           "(aux_norm=%.4f ppo_norm=%.4f). Keeping last valid checkpoint; this "

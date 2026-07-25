@@ -65,8 +65,12 @@ struct PpoUpdateStats {
 
   // --- Phase 18B combined optimization (online search aux loss) diagnostics ---
   // All zero / false unless online collection fed non-empty examples with a
-  // positive search-loss coefficient this update.
+  // positive search-loss coefficient this update — except aux_search_loss_coef,
+  // which always records what was asked for.
   int aux_examples_used = 0;          // # search examples folded in this update
+  double aux_search_loss_coef = 0.0;  // coefficient REQUESTED this update (warmup
+                                      // ramps it); >0 with aux_examples_used==0
+                                      // means the collector produced nothing
   double aux_ce = 0.0;                // mean legal-action cross-entropy over aux slices
   double aux_value_mse = 0.0;         // mean critic MSE over aux slices
   double aux_grad_norm_mean = 0.0;    // per-update mean unclipped aux-only grad norm

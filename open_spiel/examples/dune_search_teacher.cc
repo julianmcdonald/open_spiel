@@ -61,6 +61,10 @@ ABSL_FLAG(double, search_opponent_temperature, 0.0,
 ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension");
 ABSL_FLAG(int, num_blocks, 8, "Network residual block count");
 ABSL_FLAG(int, seed, 42, "Seed for rng");
+ABSL_FLAG(double, logit_cap, 10.0,
+          "Smooth tanh cap on legal-centered policy logits, applied by "
+          "CenterAndCapLegalLogits. <=0 disables. Must match the cap the "
+          "consuming trainer runs under; 10.0 preserves prior behavior.");
 ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
 
 
@@ -398,6 +402,8 @@ int main(int argc, char** argv) {
   int max_games = absl::GetFlag(FLAGS_max_games);
   int num_threads = absl::GetFlag(FLAGS_threads);
 
+  const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+
   std::shared_mutex sync_mutex;
   auto batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
       model,
@@ -405,14 +411,14 @@ int main(int argc, char** argv) {
       5, // 5ms timeout
       device,
       &sync_mutex,
-      10.0f, // Default logit cap
+      logit_cap,
       true  // Device synchronize
   );
 
   auto worker_fn = [&](int thread_id) {
     auto evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(
         batched_eval,
-        10.0f
+        logit_cap
     );
 
     while ((training_labels_emitted < target_training_labels ||
@@ -664,6 +670,7 @@ int main(int argc, char** argv) {
     config_obj["uniform_ratio"] = absl::GetFlag(FLAGS_uniform_ratio);
     config_obj["search_opponent_temperature"] = absl::GetFlag(FLAGS_search_opponent_temperature);
     config_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
+    config_obj["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
 
     manifest_obj["effective_search_config"] = config_obj;
 
