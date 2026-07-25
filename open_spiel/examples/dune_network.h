@@ -49,6 +49,10 @@ struct ResBlockImpl : torch::nn::Module {
 };
 TORCH_MODULE(ResBlock);
 
+// Multiplier applied to the value head's scalar output layer at construction.
+// See the rationale block in the constructor below.
+inline constexpr double kValueHeadOutputInitScale = 0.01;
+
 // 2. Main Dual-Headed Policy-Value Network Definition
 struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
@@ -75,6 +79,46 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
       value_head2 = register_module("value_head2", torch::nn::Linear(hidden_dim / 2, 1));
     } else {
       value_head = register_module("value_head", torch::nn::Linear(hidden_dim, 1));
+    }
+
+    // Small-init on the scalar-producing value layer (canonical PPO practice).
+    //
+    // Without it a from-scratch run drives the tanh at :forward() into hard
+    // saturation on the FIRST optimizer step and stays pinned there for
+    // hundreds of updates. The trap is not a step-size problem, so neither
+    // grad_clip_norm nor a lower learning rate escapes it:
+    //
+    //   - the trunk output x is post-ReLU, so every component is >= 0 (~80%
+    //     strictly positive, mean ~1.8, sum_i mean(x_i) ~ 3.6e3 at hidden=2048);
+    //   - AdamW's first step is lr * m_hat/sqrt(v_hat) = lr * sign(g) for every
+    //     coordinate, independent of |g|. Clipping rescales g and is therefore
+    //     a no-op on the step actually taken;
+    //   - dL/dx = delta * w, so with default init (|w|_2 ~ 0.57) the whole
+    //     shared trunk is sign-stepped coherently in the one direction that
+    //     moves the value output, and ~6.7e7 trunk coordinates each contribute
+    //     lr to the same scalar. The resulting first-step displacement of the
+    //     pre-tanh z is ~45 — two orders of magnitude past the [-0.4375,
+    //     +0.5625] target range — so |v| lands at ~1.0 and 1 - v^2 then
+    //     throttles the value gradient by ~50x while AdamW's beta2 memory still
+    //     carries the pre-saturation second moment.
+    //
+    // Scaling this layer by 0.01 shrinks both z and dL/dx by the same factor
+    // and keeps the critic inside the linear region of the tanh, where the
+    // gradient it needs to fit the placement targets survives.
+    //
+    // This runs at CONSTRUCTION only. Every checkpoint path constructs and then
+    // overwrites via torch::load, so transfer runs are bitwise unaffected. The
+    // single exception is the nonlinear-head partial-copy path
+    // (dune_ppo_train.cc LoadModelCheckpoint), which deliberately does not copy
+    // the value head — there the fresh head is exactly the scratch-critic case
+    // this guards, so the smaller init applies by design.
+    {
+      torch::NoGradGuard no_grad;
+      torch::nn::Linear& value_out = use_nonlinear ? value_head2 : value_head;
+      value_out->weight.mul_(kValueHeadOutputInitScale);
+      if (value_out->bias.defined()) {
+        value_out->bias.mul_(kValueHeadOutputInitScale);
+      }
     }
   }
 

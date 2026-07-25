@@ -215,8 +215,25 @@ static std::string RunParityFixtureAndHash() {
 // SAME fixture through the post-integration TrainPpoUpdate (collection OFF /
 // empty examples, coef 0) and asserts this EXACT value: proof that turning
 // online collection off leaves the trainer numerically identical to today.
+//
+// RE-RECORDED 2026-07-26 for the value-head small-init fix
+// (kValueHeadOutputInitScale in dune_network.h). The previous value was
+//   e74c27c33076fd5fe51ea0e2d2f39ab4384e14b7c833b89cb427c34bac20419c
+// This fixture starts from a RANDOM-INIT model (torch::manual_seed(0x18B0FACE)
+// above), so scaling the value head's output layer at construction necessarily
+// moves its weight hash. The move is the intended change, not a regression: it
+// was confirmed to be the ONLY test affected (40/40 pass on the pre-fix header,
+// and the pre-fix run reproduces the old constant exactly).
+//
+// Note what this constant does and does not certify after the re-record. It
+// still pins the exact numeric output of the collection-off path, so any future
+// unintended drift in TrainPpoUpdate trips it. It no longer links back to the
+// PRE-INTEGRATION trainer, because the anchor moved. The property that turning
+// collection off is numerically inert does not rest on this constant: it is
+// asserted independently and bitwise by TestAuxGradients, which compares
+// coef-0/empty-examples against the no-aux path within a single run.
 static const char* kParityGoldenHash =
-    "e74c27c33076fd5fe51ea0e2d2f39ab4384e14b7c833b89cb427c34bac20419c";
+    "832c6f0549a3cd3895adf79a656608be302eecc73fc89579af11a12c4fa24aff";
 
 void TestTrainPpoUpdateParityGoldenHash() {
   TEST_BEGIN("TrainPpoUpdate collection-off parity (golden weight hash)") {
