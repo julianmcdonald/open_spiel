@@ -3121,6 +3121,157 @@ void TestRawPriorsCapturedUnderNoise() {
   std::cout << "TestRawPriorsCapturedUnderNoise Passed!\n\n";
 }
 
+// The companion to the test above: that one proves `raw_priors` is CORRECT,
+// this one proves the four raw-named diagnostics actually CONSUME it. They were
+// all computed from `diag.priors`, so with the exploration package on they
+// reported against the post-Dirichlet / temperature-scaled tree prior:
+// `raw_to_search_policy_kl` measured the wrong divergence, and the prior
+// rank/argmax that `chosen_action_raw_prior_rank` and
+// `action_changed_vs_raw_argmax` derive from moved with the noise draw.
+void TestRawDiagnosticsUseRawPriorBaseline() {
+  std::cout << "Running TestRawDiagnosticsUseRawPriorBaseline...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() >= 2);
+
+  // Strictly increasing network prior: the raw argmax is unambiguously the last
+  // legal action and every raw rank is distinct, so a baseline swap moves the
+  // rank/argmax fields rather than landing on a tie.
+  ActionsAndProbs mock_priors;
+  double sum = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    double p = 0.1 + 0.1 * i;
+    mock_priors.push_back({legal_actions[i], p});
+    sum += p;
+  }
+  for (auto& ap : mock_priors) ap.second /= sum;
+  std::vector<double> mock_values = {0.5, 0.5, 0.5, 0.5};
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  // Recompute a diagnostic set from an explicit baseline, mirroring
+  // GetRootDiagnostics. Called with `raw_priors` (the contract) and with
+  // `priors` (the defect) to prove the assertions below discriminate.
+  struct Expected {
+    double kl;
+    double chosen_prob;
+    int rank;
+    bool changed_vs_argmax;
+  };
+  auto recompute = [](const SearchDiagnostics& d,
+                      const std::vector<double>& baseline) {
+    const size_t n = d.actions.size();
+    double total_visits = 0.0;
+    for (int v : d.visit_counts) total_visits += v;
+    std::vector<double> search_probs(n, 1.0 / n);
+    if (total_visits > 0.0) {
+      for (size_t i = 0; i < n; ++i) search_probs[i] = d.visit_counts[i] / total_visits;
+    }
+    Expected e;
+    e.kl = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (search_probs[i] > 0.0) {
+        e.kl += search_probs[i] *
+                std::log(search_probs[i] / std::max(baseline[i], 1e-12));
+      }
+    }
+    // RunSearch reports with chosen_action unset, so the chosen index is the
+    // visit argmax.
+    size_t chosen_idx = 0;
+    double max_prob = -1.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (search_probs[i] > max_prob) { max_prob = search_probs[i]; chosen_idx = i; }
+    }
+    e.chosen_prob = baseline[chosen_idx];
+    e.rank = 1;
+    for (size_t i = 0; i < n; ++i) {
+      if (baseline[i] > e.chosen_prob) e.rank++;
+    }
+    size_t argmax_idx = 0;
+    double max_baseline = -1.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (baseline[i] > max_baseline) { max_baseline = baseline[i]; argmax_idx = i; }
+    }
+    e.changed_vs_argmax = (chosen_idx != argmax_idx);
+    return e;
+  };
+
+  // Each arm is a transformation that makes the tree prior differ from the raw
+  // prior. epsilon=1.0 replaces the tree prior with pure noise, which reorders
+  // it (temperature scaling is monotone, so it can only move the value-valued
+  // fields).
+  struct Arm { const char* name; double epsilon; double temperature; };
+  const std::vector<Arm> arms = {
+      {"dirichlet_eps=0.25", 0.25, 1.0},
+      {"dirichlet_eps=1.0", 1.0, 1.0},
+      {"root_prior_temperature=2.0", 0.0, 2.0},
+      {"root_prior_temperature=0.5", 0.0, 0.5},
+  };
+
+  bool any_rank_discriminated = false;
+  bool any_argmax_discriminated = false;
+
+  for (const Arm& arm : arms) {
+    // Several seeds per arm: the noise draw is what moves the prior ordering,
+    // so a single seed could pass by landing on an unreordered draw.
+    for (int seed : {7, 11, 13, 17, 23}) {
+      DuneSearchConfig cfg;
+      cfg.seed = seed;
+      cfg.max_simulations = 32;
+      cfg.dirichlet_epsilon = arm.epsilon;
+      if (arm.epsilon > 0.0) cfg.dirichlet_alpha_total = 10.83;
+      cfg.root_prior_temperature = arm.temperature;
+      cfg.check_strategic_state = false;
+      DunePUCTISMCTSBot bot(cfg, evaluator);
+      SearchDiagnostics d = bot.RunSearch(*state).diagnostics;
+
+      assert(d.raw_priors.size() == d.actions.size());
+      assert(d.priors.size() == d.actions.size());
+
+      // The tree prior really was transformed; otherwise this arm proves
+      // nothing and the assertions below would hold under the defect too.
+      double l1 = 0.0;
+      for (size_t i = 0; i < d.actions.size(); ++i) {
+        l1 += std::abs(d.priors[i] - d.raw_priors[i]);
+      }
+      assert(l1 > 1e-6);
+
+      const Expected want = recompute(d, d.raw_priors);
+      const Expected defect = recompute(d, d.priors);
+
+      // The contract: all four fields are computed against the raw prior.
+      assert(std::abs(d.raw_to_search_policy_kl - want.kl) < 1e-9);
+      assert(std::abs(d.chosen_action_raw_prior_probability - want.chosen_prob) < 1e-12);
+      assert(d.chosen_action_raw_prior_rank == want.rank);
+      assert(d.action_changed_vs_raw_argmax == want.changed_vs_argmax);
+
+      // The chosen-action prior probability is read straight off the baseline,
+      // so it separates the two on every arm.
+      assert(std::abs(want.chosen_prob - defect.chosen_prob) > 1e-9);
+      // KL against a reshaped prior is a different number on every arm too.
+      assert(std::abs(want.kl - defect.kl) > 1e-9);
+
+      if (want.rank != defect.rank) any_rank_discriminated = true;
+      if (want.changed_vs_argmax != defect.changed_vs_argmax) any_argmax_discriminated = true;
+    }
+  }
+
+  // The rank/argmax fields only diverge when the transformation REORDERS the
+  // prior, which temperature scaling cannot do. Assert some arm/seed actually
+  // exercised that, so these two fields are covered rather than incidentally
+  // passing on ties.
+  assert(any_rank_discriminated);
+  assert(any_argmax_discriminated);
+
+  std::cout << "  4 fields x " << arms.size()
+            << " transformation arms x 5 seeds; rank and argmax both"
+               " discriminated raw vs tree prior\n";
+  std::cout << "TestRawDiagnosticsUseRawPriorBaseline Passed!\n\n";
+}
+
 // ---------------------------------------------------------------------------
 // WO-15 regression tests (search findings 2, 3, 4, 5, 7, 9)
 // ---------------------------------------------------------------------------
@@ -3563,6 +3714,7 @@ int main() {
   open_spiel::TestDecisionDepthSimulationAccounting();
   open_spiel::TestDeriveRootNoiseSeed();
   open_spiel::TestRawPriorsCapturedUnderNoise();
+  open_spiel::TestRawDiagnosticsUseRawPriorBaseline();
   // WO-15 (search findings 2, 3, 4, 5, 7, 9)
   open_spiel::TestLegacyConstructorFieldAlignment();
   open_spiel::TestZeroVisitAndThresholdZeroContract();

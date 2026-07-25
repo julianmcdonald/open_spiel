@@ -1229,10 +1229,23 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     }
   }
 
+  // Every `raw_*`/`vs_raw` diagnostic below is defined against the UNTRANSFORMED
+  // network prior, so they must read `raw_priors`, not the tree prior: `priors`
+  // is the post-Dirichlet mixture at a noised root and carries
+  // `root_prior_temperature` scaling, either of which would make a field named
+  // "raw" report against a reshaped distribution (inflating KL, and moving the
+  // prior rank/argmax the override flags are derived from). `raw_priors` is
+  // empty only when the root was not in the tree, and on that path `priors` is
+  // itself built straight from the evaluator's prior, so it IS raw. Same
+  // fallback idiom as dune_online_search_collector.cc's item-4 telemetry.
+  const std::vector<double>& raw_baseline =
+      diag.raw_priors.size() == legal_actions.size() ? diag.raw_priors
+                                                     : diag.priors;
+
   diag.raw_to_search_policy_kl = 0.0;
   for (size_t i = 0; i < legal_actions.size(); ++i) {
     double p_search = search_probs[i];
-    double p_raw = diag.priors[i];
+    double p_raw = raw_baseline[i];
     if (p_search > 0.0) {
       diag.raw_to_search_policy_kl += p_search * std::log(p_search / std::max(p_raw, 1e-12));
     }
@@ -1260,11 +1273,11 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     }
   }
 
-  diag.chosen_action_raw_prior_probability = diag.priors[chosen_idx];
+  diag.chosen_action_raw_prior_probability = raw_baseline[chosen_idx];
 
   int rank = 1;
   for (size_t i = 0; i < legal_actions.size(); ++i) {
-    if (diag.priors[i] > diag.chosen_action_raw_prior_probability) {
+    if (raw_baseline[i] > diag.chosen_action_raw_prior_probability) {
       rank++;
     }
   }
@@ -1273,8 +1286,8 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
   size_t raw_argmax_idx = 0;
   double max_raw_prob = -1.0;
   for (size_t i = 0; i < legal_actions.size(); ++i) {
-    if (diag.priors[i] > max_raw_prob) {
-      max_raw_prob = diag.priors[i];
+    if (raw_baseline[i] > max_raw_prob) {
+      max_raw_prob = raw_baseline[i];
       raw_argmax_idx = i;
     }
   }
