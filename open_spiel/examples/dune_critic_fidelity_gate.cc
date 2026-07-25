@@ -14,6 +14,7 @@
 #include <limits>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -2666,6 +2667,12 @@ int main(int argc, char** argv) {
 
   if (skip_gate1) gate1_indices.clear();
 
+  // Set when the selected Gate 2 states resolve to fewer than 2 bootstrap
+  // clusters, which makes the confidence interval zero-width by construction.
+  // Fatal on the default selection; on an explicit sub-sample it only
+  // invalidates the interval (see the check below).
+  bool gate2_cluster_degenerate = false;
+
   // Gate 2's confidence interval is an episode-cluster bootstrap: it resamples
   // whole episodes, because opportunity states drawn from one episode are
   // correlated. Without episode telemetry every state carries episode_id = -1,
@@ -2715,28 +2722,65 @@ int main(int argc, char** argv) {
     // cluster, all 10000 bootstrap means are identical, and the 95% LCB comes
     // out exactly equal to the point estimate -- a zero-width interval checked
     // against a `LCB > 0.0` limit, which passes whenever the mean is positive.
-    // A clustered bootstrap needs at least two clusters to have any width, so
-    // require that rather than reporting false precision.
+    //
+    // Requiring >= 2 clusters removes that *structural* degeneracy: with one
+    // cluster the interval has zero width by construction, for any data. It is
+    // not a guarantee of nonzero width -- two clusters with identical means
+    // still collapse -- but that is a property of the sample rather than of the
+    // resampling scheme, and it is visible in the reported LCB.
     std::set<int> distinct_episodes;
     for (size_t idx : gate2_indices) {
       distinct_episodes.insert(corpus[idx].episode_id);
     }
     if (distinct_episodes.size() < 2) {
-      std::cerr << "Fidelity Gate validation failed: the " << gate2_indices.size()
-                << " selected Gate 2 opportunity states span only "
-                << distinct_episodes.size()
-                << " distinct episode(s). The Gate 2 lower confidence bound is "
-                   "an episode-cluster bootstrap, which needs at least 2 "
-                   "clusters to produce an interval of nonzero width; with one "
-                   "cluster the reported 95% LCB equals the point estimate "
-                   "exactly.\n";
-      if (!distinct_episodes.empty()) {
-        std::cerr << "  Episode id present: " << *distinct_episodes.begin()
-                  << "\n";
+      // Whether this is fatal depends on whether the run is doing inference.
+      //
+      // On the default selection the gate is measuring the corpus and the LCB
+      // is the product, so a structurally degenerate interval is a hard error.
+      // But an operator who named specific roots (--opportunity_root_indices)
+      // or took a prefix (--opportunity_root_prefix) has deliberately taken a
+      // sub-sample -- a latency probe, a cache-reuse check, a single-root
+      // investigation -- and is not claiming a corpus-level result. Aborting
+      // those is over-firing.
+      //
+      // So: keep the numbers, refuse to certify the interval. The run proceeds
+      // and reports its metrics, but gate2.bootstrap_valid is false and
+      // gate2.criterion_passed is forced false, so no reader can mistake a
+      // zero-width interval for a statistical pass.
+      //
+      // Note this is deliberately narrower than the missing-episode-id check
+      // above, which is fatal unconditionally: absent telemetry means the
+      // clustering is unknown, whereas here it is known and simply too small.
+      const bool explicit_subsample =
+          !requested_root_indices.empty() || requested_root_prefix >= 0;
+      gate2_cluster_degenerate = true;
+
+      std::ostringstream detail;
+      detail << "the " << gate2_indices.size()
+             << " selected Gate 2 opportunity states span only "
+             << distinct_episodes.size()
+             << " distinct episode(s). The Gate 2 lower confidence bound is an "
+                "episode-cluster bootstrap; with a single cluster every "
+                "replicate reselects the same states, so the reported 95% LCB "
+                "equals the point estimate exactly regardless of the data.";
+
+      if (explicit_subsample) {
+        std::cerr << "[WARNING] " << detail.str() << "\n";
+        std::cerr << "          Continuing because the roots were selected "
+                     "explicitly, but the Gate 2 confidence interval is not "
+                     "meaningful for this run:\n";
+        std::cerr << "          gate2.bootstrap_valid=false and "
+                     "gate2.criterion_passed=false in the report.\n";
+      } else {
+        std::cerr << "Fidelity Gate validation failed: " << detail.str() << "\n";
+        if (!distinct_episodes.empty()) {
+          std::cerr << "  Episode id present: " << *distinct_episodes.begin()
+                    << "\n";
+        }
+        std::cerr << "  Select opportunity states spanning at least 2 episodes, "
+                     "or use --gate1_only to skip Gate 2.\n";
+        std::exit(1);
       }
-      std::cerr << "  Select opportunity states spanning at least 2 episodes, "
-                   "or use --gate1_only to skip Gate 2.\n";
-      std::exit(1);
     }
   }
 
@@ -4508,6 +4552,16 @@ int main(int argc, char** argv) {
 
   bool bias_passed = skip_gate1 || (std::abs(mean_bias) <= 0.05);
 
+  // The verdict the statistics actually support, captured before any forcing.
+  // `passed` alone cannot answer "did this run meet the criteria?" because the
+  // self-test overrides it; these two fields can, and they are never forced.
+  const bool bias_criterion_passed = bias_passed;
+  // A degenerate cluster structure cannot yield a meaningful LCB, so it can
+  // never count as a criterion pass however the point estimate came out.
+  const bool bootstrap_criterion_passed =
+      bootstrap_passed && !gate2_cluster_degenerate;
+  bool verdict_forced = false;
+
   if (self_test) {
     if (!mock_fail) {
       // Force the verdict so the self-test is a deterministic plumbing check
@@ -4517,8 +4571,14 @@ int main(int argc, char** argv) {
       // report carried a fabricated one. Anything reading the report instead of
       // the console saw a number the gate never computed, and the field it
       // overwrote was precisely the one that reveals a degenerate interval.
+      //
+      // Forcing is recorded in the report (`self_test_verdict_forced`) so a
+      // machine reader can tell a forced pass from an earned one: a self-test
+      // legitimately reports `passed: true` alongside a `bootstrap_lcb` of 0.0
+      // that does not clear the documented `> 0` criterion.
       bias_passed = true;
       bootstrap_passed = true;
+      verdict_forced = true;
     }
   }
 
@@ -4628,14 +4688,26 @@ int main(int argc, char** argv) {
       }
       root["search_protocol_version"] = "session-v4";
 
+      // `passed` is the run's operational verdict and is forced under
+      // --self_test, so it answers "did the harness complete?", not "did the
+      // statistics clear the thresholds?". Machine readers that need the
+      // latter must use `criterion_passed`, which is computed from the metrics
+      // alone and never forced, and can consult `self_test_verdict_forced` to
+      // see whether the two were allowed to diverge. Without this split a
+      // self-test legitimately reports passed=true next to a bootstrap_lcb of
+      // 0.0 that does not clear the documented `> 0` criterion.
       root["passed"] = bias_passed &&
           (gate2_indices.empty() || bootstrap_passed);
+      root["criterion_passed"] = bias_criterion_passed &&
+          (gate2_indices.empty() || bootstrap_criterion_passed);
+      root["self_test_verdict_forced"] = verdict_forced;
 
       open_spiel::json::Object g1;
       g1["states_evaluated"] = static_cast<int64_t>(gate1_indices.size());
       g1["mean_bias"] = mean_bias;
       g1["rmse"] = rmse;
       g1["rank_correlation"] = rank_corr;
+      g1["criterion_passed"] = bias_criterion_passed;
       g1["skipped"] = skip_gate1;
       root["gate1"] = g1;
 
@@ -4647,6 +4719,11 @@ int main(int argc, char** argv) {
       g2["legacy_search_vs_raw_mean_q"] = legacy_mean_adv;
       g2["effective_episode_count"] = static_cast<int64_t>(unique_episodes.size());
       g2["hierarchical_lcb"] = hierarchical_lcb;
+      g2["criterion_passed"] = bootstrap_criterion_passed;
+      // False when the selected states resolve to fewer than 2 bootstrap
+      // clusters: bootstrap_lcb and hierarchical_lcb are then zero-width by
+      // construction and must not be read as bounds.
+      g2["bootstrap_valid"] = !gate2_cluster_degenerate;
 
       open_spiel::json::Array boot_reps_arr;
       for (double val : boot_means) boot_reps_arr.push_back(val);
