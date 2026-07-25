@@ -40,6 +40,18 @@ struct ControllerDecision {
 // Helper function to sample an action from a policy prior.
 Action SampleActionFromPrior(const ActionsAndProbs& prior, double r_val);
 
+// Per-activation seed for the kTrainingFullFast Bernoulli roll (WO-16 / search
+// finding 8). The four coordinates MUST stay distinguishable: the old code
+// collapsed them into `round + seat + episode + decision` and hashed that one
+// total, so every tuple sharing a sum (round 3/seat 2 vs round 2/seat 3) drew
+// the identical 25% full-search roll — correlating the full/fast split across
+// many otherwise-independent sessions. Position-tagged derivation keeps each
+// coordinate on its own axis. Exposed for unit testing.
+// Deterministic: identical inputs => identical seed.
+uint64_t DeriveTrainingFullFastSeed(uint64_t config_seed, int round,
+                                    Player seat, int episode_id,
+                                    int decision_id);
+
 class DuneSearchSession {
  public:
   DuneSearchSession(

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cassert>
 #include <algorithm>
+#include <set>
 #include <thread>
 #include <chrono>
 
@@ -13,6 +14,7 @@
 #include "dune_puct_is_mcts.h"
 #include "dune_search_routing.h"
 #include "dune_search_session.h"
+#include "dune_seed_utils.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/utils/json.h"
 
@@ -3667,6 +3669,151 @@ void TestTieBreakSeedIncludesNodeIdentity() {
   std::cout << "TestTieBreakSeedIncludesNodeIdentity Passed!\n\n";
 }
 
+// WO-16 / search finding 8: the kTrainingFullFast Bernoulli roll used to seed
+// itself from `round + seat + episode + decision` — one commutative SUM fed as
+// Combine()'s position argument. Every tuple sharing a sum collapsed onto one
+// seed, so round 3/seat 2 and round 2/seat 3 always drew the same 25%
+// full-search roll, correlating the full/fast split across sessions that have
+// nothing to do with each other.
+void TestTrainingFullFastSeedComponents() {
+  std::cout << "Running TestTrainingFullFastSeedComponents...\n";
+
+  // The pre-fix derivation, reproduced verbatim so the assertions below show
+  // the defect rather than merely restating the fix.
+  auto legacy_seed = [](uint64_t seed, int round, int seat, int episode,
+                        int decision) {
+    return dune_seed::Combine(seed, dune_seed::kStreamBlueprint,
+                              static_cast<uint64_t>(round + seat + episode +
+                                                    decision));
+  };
+  // The production roll, verbatim (dune_search_session.cc).
+  auto rolls_full = [](uint64_t seed) {
+    std::mt19937 rng = dune_seed::MakeRng32(seed);
+    return rng() % 4 == 0;
+  };
+
+  const uint64_t s = 12345;
+
+  // Reproducibility: same tuple, same base seed => same seed.
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) ==
+         DeriveTrainingFullFastSeed(s, 3, 2, 7, 1));
+
+  // Every coordinate is on its own axis, including the base seed.
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s, 4, 2, 7, 1));  // round
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s, 3, 3, 7, 1));  // seat
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s, 3, 2, 8, 1));  // episode
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s, 3, 2, 7, 2));  // decision
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s + 1, 3, 2, 7, 1));  // base seed
+
+  // The finding's own example: round 3/seat 2 vs round 2/seat 3. Identical
+  // under the old sum, distinct now.
+  assert(legacy_seed(s, 3, 2, 7, 1) == legacy_seed(s, 2, 3, 7, 1));
+  assert(DeriveTrainingFullFastSeed(s, 3, 2, 7, 1) !=
+         DeriveTrainingFullFastSeed(s, 2, 3, 7, 1));
+
+  // Pre-activation coordinates (round_ == -1, active_player_ == kInvalidPlayer)
+  // cast injectively rather than aliasing onto a live tuple.
+  assert(DeriveTrainingFullFastSeed(s, -1, kInvalidPlayer, 0, 0) !=
+         DeriveTrainingFullFastSeed(s, 1, 0, 0, 0));
+
+  // Whole-grid collision count. Sums span [2, 11] over this grid, so the old
+  // scheme could only ever produce 10 distinct streams for 96 distinct tuples.
+  std::set<uint64_t> new_seeds;
+  std::set<uint64_t> old_seeds;
+  std::vector<uint64_t> equal_sum_family;
+  int tuples = 0;
+  for (int round = 1; round <= 4; ++round) {
+    for (int seat = 0; seat <= 3; ++seat) {
+      for (int episode = 0; episode <= 2; ++episode) {
+        for (int decision = 1; decision <= 2; ++decision) {
+          ++tuples;
+          new_seeds.insert(
+              DeriveTrainingFullFastSeed(s, round, seat, episode, decision));
+          old_seeds.insert(legacy_seed(s, round, seat, episode, decision));
+          if (round + seat + episode + decision == 6) {
+            equal_sum_family.push_back(
+                DeriveTrainingFullFastSeed(s, round, seat, episode, decision));
+          }
+        }
+      }
+    }
+  }
+  assert(tuples == 96);
+  assert(new_seeds.size() == static_cast<size_t>(tuples));  // no collisions
+  assert(old_seeds.size() < static_cast<size_t>(tuples));   // the defect
+
+  // The observable consequence: within one equal-sum family the old scheme
+  // forced a single shared roll; the new one splits the family.
+  assert(equal_sum_family.size() > 1);
+  int full_rolls = 0;
+  for (uint64_t seed : equal_sum_family) {
+    if (rolls_full(seed)) ++full_rolls;
+  }
+  assert(full_rolls > 0);
+  assert(full_rolls < static_cast<int>(equal_sum_family.size()));
+
+  // Call-site proof: the session's roll must be exactly what the exposed
+  // helper predicts, otherwise the derivation above is dead code.
+  auto game = open_spiel::LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  while (!state->IsTerminal()) {
+    if (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    } else {
+      const dune_imperium::DuneImperiumState& dune_state =
+          static_cast<const dune_imperium::DuneImperiumState&>(*state);
+      if (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns &&
+          state->LegalActions().size() > 1) {
+        break;
+      }
+      state->ApplyAction(state->LegalActions().front());
+    }
+  }
+  ActionsAndProbs priors;
+  std::vector<Action> legal_actions = state->LegalActions();
+  for (Action a : legal_actions) {
+    priors.push_back({a, 1.0 / legal_actions.size()});
+  }
+  auto evaluator =
+      std::make_shared<MockEvaluator>(priors, std::vector<double>(4, 0.0));
+
+  const dune_imperium::DuneImperiumState& dune_state =
+      static_cast<const dune_imperium::DuneImperiumState&>(*state);
+  const int round = dune_state.GetCurrentRound();
+  const Player seat = state->CurrentPlayer();
+  // A fresh session post-increments decision_id_ when the placement activation
+  // opens, so the first roll of each session reads decision_id_ == 1.
+  const int decision_id = 1;
+
+  DuneSearchConfig config;
+  int observed_full = 0;
+  for (int episode = 0; episode < 40; ++episode) {
+    DuneSearchSession session(config, evaluator,
+                              DuneSearchBudgetMode::kTrainingFullFast);
+    session.SetEpisodeId(episode);
+    DuneSearchResult res = RunSessionSearch(session, *state);
+    bool predicted = rolls_full(DeriveTrainingFullFastSeed(
+        config.seed, round, seat, episode, decision_id));
+    assert(session.is_full_session() == predicted);
+    // hard_sim_limit corroborates the roll through the diagnostics path.
+    assert(res.diagnostics.hard_sim_limit == (predicted ? 64 : 8));
+    if (predicted) ++observed_full;
+  }
+  // Both arms are still reachable across episodes (the roll is not degenerate).
+  assert(observed_full > 0);
+  assert(observed_full < 40);
+
+  std::cout << "  96 tuples -> " << new_seeds.size() << " seeds (was "
+            << old_seeds.size() << "); full rolls " << observed_full
+            << "/40 across episodes\n";
+  std::cout << "TestTrainingFullFastSeedComponents Passed!\n\n";
+}
+
 }  // namespace
 
 } // namespace open_spiel
@@ -3721,6 +3868,8 @@ int main() {
   open_spiel::TestNoisedLowCoverageFallsBackToRawPrior();
   open_spiel::TestColdRootPerformsFullBudget();
   open_spiel::TestTieBreakSeedIncludesNodeIdentity();
+  // WO-16 (search finding 8)
+  open_spiel::TestTrainingFullFastSeedComponents();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

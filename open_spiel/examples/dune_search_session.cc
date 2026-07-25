@@ -59,6 +59,20 @@ Action PickActionRespectingTemperature(const ActionsAndProbs& policy,
 }
 } // namespace
 
+uint64_t DeriveTrainingFullFastSeed(uint64_t config_seed, int round,
+                                    Player seat, int episode_id,
+                                    int decision_id) {
+  // One position-tagged axis per coordinate. Signed inputs (round_ and
+  // active_player_ are -1 / kInvalidPlayer before a placement activation) cast
+  // injectively into the unsigned domain, so a negative coordinate is a
+  // distinct stream rather than an aliased one.
+  return dune_seed::DeriveSeed(config_seed, dune_seed::kStreamBlueprint,
+                               static_cast<uint64_t>(round),
+                               static_cast<uint64_t>(seat),
+                               static_cast<uint64_t>(episode_id),
+                               static_cast<uint64_t>(decision_id));
+}
+
 DuneSearchSession::DuneSearchSession(
     const DuneSearchConfig& config,
     std::shared_ptr<algorithms::Evaluator> evaluator,
@@ -314,8 +328,11 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       }
     } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingFullFast) {
       if (!training_full_fast_rolled_) {
-        uint64_t session_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, round_ + active_player_ + episode_id_ + decision_id_);
-        std::mt19937 roll_rng(session_seed);
+        uint64_t session_seed = DeriveTrainingFullFastSeed(
+            config_.seed, round_, active_player_, episode_id_, decision_id_);
+        // MakeRng32 seeds through a seed_seq over both halves; the plain
+        // mt19937(seed) ctor would truncate the derived seed to 32 bits.
+        std::mt19937 roll_rng = dune_seed::MakeRng32(session_seed);
         is_full_session_ = (roll_rng() % 4 == 0); // 25% chance of full search
         training_full_fast_rolled_ = true;
       }
