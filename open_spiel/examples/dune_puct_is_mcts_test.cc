@@ -190,8 +190,8 @@ void TestDeterministicPUCT() {
   DunePUCTISMCTSBot bot(42, evaluator, 1.0, 50, -1, 1.0, 0.0, 0.3, 1.0);
 
   DuneISMCTSNode node;
-  node.child_info[legal_actions[0]] = DuneChildInfo{0, 0.0, 0.9};
-  node.child_info[legal_actions[1]] = DuneChildInfo{0, 0.0, 0.1};
+  node.child_info[legal_actions[0]] = DuneChildInfo{.prior = 0.9};
+  node.child_info[legal_actions[1]] = DuneChildInfo{.prior = 0.1};
   node.priors_initialized = true;
 
   // Initial selection: both unvisited, choose the one with the highest prior
@@ -234,8 +234,8 @@ void TestPriorRenormalization() {
   DunePUCTISMCTSBot bot(42, evaluator, 1.0, 10);
 
   DuneISMCTSNode node;
-  node.child_info[legal_actions[0]] = DuneChildInfo{0, 0.0, 0.6};
-  node.child_info[legal_actions[1]] = DuneChildInfo{0, 0.0, 0.3};
+  node.child_info[legal_actions[0]] = DuneChildInfo{.prior = 0.6};
+  node.child_info[legal_actions[1]] = DuneChildInfo{.prior = 0.3};
   node.priors_initialized = true;
 
   // Filter so only legal_actions[0] and legal_actions[1] are tested
@@ -534,10 +534,10 @@ void TestPUCTFPUActionPruning() {
   DuneISMCTSNode node;
   node.priors_initialized = true;
   for (Action a : legal_actions) {
-    node.child_info[a] = DuneChildInfo{0, 0.0, 1e-5};
+    node.child_info[a] = DuneChildInfo{.prior = 1e-5};
   }
-  node.child_info[legal_actions[0]] = DuneChildInfo{0, 0.0, 0.2};
-  node.child_info[legal_actions[1]] = DuneChildInfo{0, 0.0, 0.8};
+  node.child_info[legal_actions[0]] = DuneChildInfo{.prior = 0.2};
+  node.child_info[legal_actions[1]] = DuneChildInfo{.prior = 0.8};
 
   // Step 1: Initial visit is done (node total visits is 0)
   // Run SelectTree. It should select legal_actions[1] because it has the highest prior (0.8).
