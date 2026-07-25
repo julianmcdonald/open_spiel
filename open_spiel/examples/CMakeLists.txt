@@ -75,6 +75,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_sha256_test dune_sha256_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_sha256_test ${TORCH_LIBRARIES})
+
+  add_executable(dune_offline_utils_test dune_offline_utils_test.cc
+    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_offline_utils_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_offline_utils_test COMMAND dune_offline_utils_test)
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()

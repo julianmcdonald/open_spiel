@@ -72,6 +72,10 @@ constexpr uint64_t kDomainEvalDev       = 0x0003;
 constexpr uint64_t kDomainEvalFinal     = 0x0004;
 constexpr uint64_t kDomainSearchTeacher = 0x0005;
 constexpr uint64_t kDomainFidelityGate  = 0x0006;
+// Legacy dune_eval_1000. Kept distinct from the EVAL_* domains so the legacy
+// evaluator and dune_population_eval never draw correlated game streams from
+// the same base seed.
+constexpr uint64_t kDomainEvalLegacy    = 0x0007;
 
 // ===========================================================================
 // Stream constants

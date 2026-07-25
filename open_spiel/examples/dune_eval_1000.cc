@@ -2,6 +2,8 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <array>
+#include <cstdint>
 #include <algorithm>
 #include <filesystem>
 #include <random>
@@ -18,6 +20,7 @@
 #include <torch/torch.h>
 
 #include "dune_network.h"
+#include "dune_seed_utils.h"
 
 namespace open_spiel {
 namespace {
@@ -48,10 +51,8 @@ void BatchedWorkerThread(
     std::atomic<int>& next_game_id,
     int total_games,
     float logit_cap,
+    uint64_t base_seed,
     ThreadStats& stats) {
-  std::random_device rd;
-  std::mt19937 rng(rd() ^ thread_id);
-
   // Pre-allocate observation buffer reused across all games
   std::vector<float> obs(obs_size, 0.0f);
 
@@ -61,6 +62,20 @@ void BatchedWorkerThread(
 
     int model_player = g % 4;
     stats.games_by_seat[model_player]++;
+
+    // Per-game streams derived from (base_seed, domain, game id, stream). A
+    // per-*thread* RNG would make results depend on which worker happened to
+    // claim game g, so the same seed would not reproduce across runs or across
+    // thread counts. Deriving per game removes the scheduler from the picture.
+    std::mt19937 chance_rng = dune_seed::MakeRng32(dune_seed::DeriveSeed(
+        base_seed, dune_seed::kDomainEvalLegacy, static_cast<uint64_t>(g),
+        dune_seed::kStreamChance));
+    std::array<std::mt19937_64, 4> policy_rngs;
+    for (int p = 0; p < 4; ++p) {
+      policy_rngs[p] = dune_seed::MakeRng64(dune_seed::DeriveSeed(
+          base_seed, dune_seed::kDomainEvalLegacy, static_cast<uint64_t>(g),
+          dune_seed::kStreamPolicyPlayer0 + static_cast<uint64_t>(p)));
+    }
 
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
@@ -79,13 +94,17 @@ void BatchedWorkerThread(
         if (game->GetType().chance_mode == GameType::ChanceMode::kSampledStochastic) {
           action = outcomes.front().first;
         } else {
-          action = SampleAction(outcomes, rng).first;
+          action = SampleAction(outcomes, chance_rng).first;
         }
         state->ApplyAction(action);
         continue;
       }
 
       Player current_player = state->CurrentPlayer();
+      // dune_imperium is kSequential, so past the chance check this is always a
+      // real seat. Assert it rather than let a sentinel index policy_rngs.
+      SPIEL_CHECK_GE(current_player, 0);
+      SPIEL_CHECK_LT(current_player, 4);
       std::vector<Action> legal_actions = state->LegalActions();
       if (legal_actions.empty()) {
         std::cerr << "Error in thread " << thread_id << ": empty legal actions in game " << g << "!\n";
@@ -128,7 +147,7 @@ void BatchedWorkerThread(
       } else {
         // Random opponent
         std::uniform_int_distribution<std::size_t> dist(0, legal_actions.size() - 1);
-        chosen_action = legal_actions[dist(rng)];
+        chosen_action = legal_actions[dist(policy_rngs[current_player])];
       }
 
       state->ApplyAction(chosen_action);
@@ -192,7 +211,8 @@ void RunEvaluation(const std::string& model_checkpoint,
                    int num_blocks = 4,
                    int opp_hidden_dim = -1,
                    int opp_num_blocks = -1,
-                   double logit_cap = 10.0) {
+                   double logit_cap = 10.0,
+                   uint64_t base_seed = 0) {
   // Default opponent architecture to same as eval model
   if (opp_hidden_dim < 0) opp_hidden_dim = hidden_dim;
   if (opp_num_blocks < 0) opp_num_blocks = num_blocks;
@@ -305,6 +325,9 @@ void RunEvaluation(const std::string& model_checkpoint,
             << " game threads, batch_size=" << eval_batch_size 
             << ", timeout=" << eval_timeout_ms << "ms on " << device_name << "...\n";
   std::cout << "Logit cap (legal-centered): " << logit_cap << "\n";
+  std::cout << "Base seed: " << base_seed
+            << " (per-game streams; game/seat assignment and RNG draws are "
+               "thread-count independent)\n";
   auto start_time = std::chrono::steady_clock::now();
 
   // 4. Launch game worker threads
@@ -318,7 +341,8 @@ void RunEvaluation(const std::string& model_checkpoint,
         std::cref(opponent_evaluators),
         obs_size, provides_info_state_tensor, provides_observations_tensor,
         std::ref(next_game_id), total_games,
-        static_cast<float>(logit_cap), std::ref(thread_stats_vec[t]));
+        static_cast<float>(logit_cap), base_seed,
+        std::ref(thread_stats_vec[t]));
   }
 
   for (auto& th : threads) {
@@ -411,7 +435,7 @@ int main(int argc, char* argv[]) {
   }
   at::set_num_interop_threads(1);
 
-  // Usage: dune_eval_1000 <model_a> <num_games> [opponent|"random"] [threads] [hidden_dim] [num_blocks] [opp_hidden_dim] [opp_num_blocks] [logit_cap]
+  // Usage: dune_eval_1000 <model_a> <num_games> [opponent|"random"] [threads] [hidden_dim] [num_blocks] [opp_hidden_dim] [opp_num_blocks] [logit_cap] [seed]
   std::string model_checkpoint = "/home/warcr/projects/dune_drl/dune_stage_a_run1_model.pt";
   int num_games = 1000;
   std::string opponent_checkpoint = "";
@@ -421,6 +445,9 @@ int main(int argc, char* argv[]) {
   int opp_hidden_dim = -1;  // -1 = same as eval model
   int opp_num_blocks = -1;
   double logit_cap = 10.0;  // legal-centered logit cap (default preserves prior behavior)
+  // Explicit base seed. Fixed default so a bare invocation is reproducible;
+  // pass a different value to draw an independent sample of games.
+  uint64_t base_seed = 12;
 
   if (argc > 1) model_checkpoint = argv[1];
   if (argc > 2) {
@@ -459,7 +486,12 @@ int main(int argc, char* argv[]) {
       std::cerr << "Warning: invalid logit cap. Defaulting to 10.0.\n";
     }
   }
+  if (argc > 10) {
+    try { base_seed = std::stoull(argv[10]); } catch (...) {
+      std::cerr << "Warning: invalid seed. Defaulting to " << base_seed << ".\n";
+    }
+  }
 
-  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads, hidden_dim, num_blocks, opp_hidden_dim, opp_num_blocks, logit_cap);
+  open_spiel::RunEvaluation(model_checkpoint, opponent_checkpoint, num_games, num_threads, hidden_dim, num_blocks, opp_hidden_dim, opp_num_blocks, logit_cap, base_seed);
   return 0;
 }

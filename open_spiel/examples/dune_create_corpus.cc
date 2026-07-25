@@ -249,13 +249,16 @@ int main(int argc, char** argv) {
               thread_candidates[thread_id].push_back(cs);
             }
 
-            // Collect opportunity
+            // Collect opportunity. Affordability comes from the engine's own
+            // cost table (CanAffordSwordmaster), not a hardcoded 8: Leto
+            // Atreides pays 7 for the Landsraad space, and a flat >= 8 test
+            // dropped every Leto seat holding exactly 7 out of the corpus.
             bool has_sm = dune_state && dune_state->HasSwordmaster(player);
-            int solari = dune_state ? dune_state->GetPlayerSolari(player) : 0;
+            bool can_afford_sm = dune_state && CanAffordSwordmaster(*dune_state, player);
 
             bool is_agent_primary = ClassifyDuneDecisionRole(*state, player, false) == DuneDecisionRole::kAgentPrimary;
 
-            if (is_agent_primary && round >= 2 && round <= 5 && !has_sm && solari >= 8 &&
+            if (is_agent_primary && round >= 2 && round <= 5 && !has_sm && can_afford_sm &&
                 SpaceIsReachable(state.get(), dune_imperium::kActionAgentSpaceSwordmaster)) {
               CandidateState cs;
               cs.category = "opportunity";

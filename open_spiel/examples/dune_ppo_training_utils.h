@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdint>
 
+#include "open_spiel/spiel.h"       // Action, ActionsAndProbs
 #include "open_spiel/utils/json.h"  // json::Object for manifest online-collection state
 
 
@@ -261,6 +262,57 @@ inline bool IsValidationLabel(const std::vector<float>& observation,
                               const std::vector<int32_t>& legal_actions,
                               int32_t player_id) {
   return ComputeLabelFnv1a(observation, legal_actions, player_id) % 11 == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Teacher-label action pairing
+// ---------------------------------------------------------------------------
+// The offline search teacher derives its PPO prior from LegalActions() and its
+// teacher prior from the search root's action vector. Those two orders agree
+// today, so every label paired them by index — but nothing enforced it. If
+// search ever prunes or reorders root actions, index pairing writes teacher
+// probabilities beside the wrong action ids and produces a label file that
+// still parses cleanly. Reorder explicitly instead, and refuse to guess when
+// the two do not describe the same action set.
+
+// Reorders `prior` into `actions` order. Returns false and leaves `out`
+// untouched unless the two are a bijection over the same action ids; callers
+// drop the label rather than emit a mispaired one.
+inline bool AlignPriorToActions(const ActionsAndProbs& prior,
+                                const std::vector<Action>& actions,
+                                ActionsAndProbs* out) {
+  if (out == nullptr || prior.size() != actions.size()) return false;
+  ActionsAndProbs aligned;
+  aligned.reserve(actions.size());
+  // `consumed` makes this a bijection check rather than a membership check, so
+  // duplicated ids on either side cannot map two slots onto one probability.
+  std::vector<bool> consumed(prior.size(), false);
+  for (Action action : actions) {
+    size_t match = prior.size();
+    for (size_t i = 0; i < prior.size(); ++i) {
+      if (!consumed[i] && prior[i].first == action) {
+        match = i;
+        break;
+      }
+    }
+    if (match == prior.size()) return false;
+    consumed[match] = true;
+    aligned.push_back(prior[match]);
+  }
+  *out = std::move(aligned);
+  return true;
+}
+
+// True when both vectors carry the same action ids in the same order — the
+// invariant a label writer relies on when it stores prior[i]'s action id beside
+// teacher[i]'s probability.
+inline bool PriorsShareActionOrder(const ActionsAndProbs& a,
+                                   const ActionsAndProbs& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].first != b[i].first) return false;
+  }
+  return true;
 }
 
 } // namespace open_spiel

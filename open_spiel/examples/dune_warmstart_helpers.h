@@ -153,6 +153,52 @@ inline Action FindActionOrCardPathToSpace(
   return best_card;
 }
 
+// Solari a seat must hold to place an agent on the Swordmaster space, read out
+// of the engine's own board table via AgentSpaceSolariCost so Leto Atreides'
+// Landsraad discount (7 rather than 8) is honoured. Tooling that hardcodes 8
+// silently disagrees with the engine about which seats can reach Swordmaster:
+// every Leto seat sitting on exactly 7 solari looks unaffordable.
+inline int SwordmasterSolariCost(const dune_imperium::DuneImperiumState& state,
+                                 Player player) {
+  const dune_imperium::AgentSpace* space =
+      dune_imperium::FindAgentSpace(dune_imperium::kActionAgentSpaceSwordmaster);
+  if (space == nullptr) {
+    SpielFatalError("Swordmaster agent space missing from the board table.");
+  }
+  if (player < 0 || player >= state.NumPlayers()) {
+    SpielFatalError("SwordmasterSolariCost called with an invalid player.");
+  }
+  return dune_imperium::AgentSpaceSolariCost(*space, state.PlayerLeader(player));
+}
+
+// Whether the seat's solari alone covers the Swordmaster placement. This is a
+// cost check, not a legality check — callers still gate on reachability.
+inline bool CanAffordSwordmaster(const dune_imperium::DuneImperiumState& state,
+                                 Player player) {
+  return state.GetPlayerSolari(player) >= SwordmasterSolariCost(state, player);
+}
+
+// Fills an observation buffer with the tensor the network was actually trained
+// on. The trainer and the online collector both prefer InformationStateTensor
+// when the game provides it (dune_ppo_train.cc:1123-1128), so any rollout that
+// feeds the same network must agree: sizing to InformationStateTensorSize while
+// filling via ObservationTensor overruns the engine's `offset == values.size()`
+// check and aborts the run.
+inline std::vector<float> NetworkObservation(const State& state, Player player) {
+  std::shared_ptr<const Game> game = state.GetGame();
+  const bool provides_istate =
+      game->GetType().provides_information_state_tensor;
+  std::vector<float> obs(
+      provides_istate ? game->InformationStateTensorSize()
+                      : game->ObservationTensorSize(), 0.0f);
+  if (provides_istate) {
+    state.InformationStateTensor(player, absl::MakeSpan(obs));
+  } else {
+    state.ObservationTensor(player, absl::MakeSpan(obs));
+  }
+  return obs;
+}
+
 struct SwordmasterPlannerConfig {
   int deadline_round = 4;
   int max_depth = 64;
@@ -476,13 +522,16 @@ inline Action SampleActionFromLogits(
   return SamplePolicyAction(rng, logits, legal_actions).first;
 }
 
-// Execute a single simulated rollout to score an action path
+// Execute a single simulated rollout to score an action path.
+// Takes the IGameEvaluator interface rather than the concrete BatchedEvaluator
+// so the policy-guided branches can be exercised against a stub in tests;
+// BatchedEvaluator still binds implicitly at any real call site.
 inline double RolloutSwordmasterRace(
     const State& start_state,
     Player owner,
     const SwordmasterPlannerConfig& cfg,
     std::mt19937* rng,
-    BatchedEvaluator* evaluator,
+    IGameEvaluator* evaluator,
     uint64_t* eval_requests_out = nullptr) {
 
   std::unique_ptr<State> state = start_state.Clone();
@@ -524,12 +573,7 @@ inline double RolloutSwordmasterRace(
       if (cfg.use_policy_for_owner && evaluator != nullptr) {
         action = FindActionOrCardPathToSpace(*state, owner, dune_imperium::kActionAgentSpaceSwordmaster, rng);
         if (action == kInvalidAction) {
-          auto game = state->GetGame();
-          int64_t obs_size = game->GetType().provides_information_state_tensor
-                                 ? game->InformationStateTensorSize()
-                                 : game->ObservationTensorSize();
-          std::vector<float> obs(obs_size, 0.0f);
-          state->ObservationTensor(cur_player, absl::MakeSpan(obs));
+          std::vector<float> obs = NetworkObservation(*state, cur_player);
           if (eval_requests_out) (*eval_requests_out)++;
           EvalResult res = evaluator->Evaluate(obs);
           std::vector<float> logits = std::move(res.logits);
@@ -543,8 +587,7 @@ inline double RolloutSwordmasterRace(
       bool block_taken = false;
       if (cfg.block_aware_opponents && dune_state != nullptr) {
         int owner_solari = dune_state->GetPlayerSolari(owner);
-        bool owner_is_leto = (dune_state->PlayerLeader(owner) == 4);
-        int needed_solari = owner_is_leto ? 7 : 8;
+        int needed_solari = SwordmasterSolariCost(*dune_state, owner);
         if (owner_solari >= needed_solari - 2) {
           std::uniform_real_distribution<double> dist_u(0.0, 1.0);
           if (dist_u(*rng) < 0.25) {
@@ -560,12 +603,7 @@ inline double RolloutSwordmasterRace(
       }
       if (!block_taken) {
         if (cfg.use_policy_for_opponents && evaluator != nullptr) {
-          auto game = state->GetGame();
-          int64_t obs_size = game->GetType().provides_information_state_tensor
-                                 ? game->InformationStateTensorSize()
-                                 : game->ObservationTensorSize();
-          std::vector<float> obs(obs_size, 0.0f);
-          state->ObservationTensor(cur_player, absl::MakeSpan(obs));
+          std::vector<float> obs = NetworkObservation(*state, cur_player);
           if (eval_requests_out) (*eval_requests_out)++;
           EvalResult res = evaluator->Evaluate(obs);
           std::vector<float> logits = std::move(res.logits);

@@ -182,6 +182,18 @@ class LabelWriter {
   void WriteLabel(const std::vector<float>& obs, const ActionsAndProbs& ppo_prior,
                   const ActionsAndProbs& teacher_prior, float kl, int num_covered_actions,
                   float eta, bool eta_capped, int player_id) {
+    // The record format stores ppo_prior[i]'s action id beside teacher_prior[i]'s
+    // probability, so the two must already agree id-for-id. Callers align them
+    // with AlignPriorToActions and drop labels that cannot be aligned; reaching
+    // here mispaired is a programming error, not bad data.
+    if (!PriorsShareActionOrder(ppo_prior, teacher_prior)) {
+      SpielFatalError(absl::StrFormat(
+          "WriteLabel: ppo_prior (%d actions) and teacher_prior (%d actions) "
+          "are not aligned by action id.",
+          static_cast<int>(ppo_prior.size()),
+          static_cast<int>(teacher_prior.size())));
+    }
+
     if (!out_.is_open()) {
       StartNewFile();
     }
@@ -374,6 +386,10 @@ int main(int argc, char** argv) {
   std::atomic<int> total_eta_capped_count{0};
   std::atomic<int> total_search_count{0};
   std::atomic<int> total_search_attempted{0};
+  // Label candidates dropped because the PPO prior and the search root's action
+  // vector were not a bijection. Expected to stay 0; a nonzero count means the
+  // two action orders have diverged and the corpus is short by that many labels.
+  std::atomic<int> total_labels_unaligned{0};
   std::atomic<double> total_actual_kl{0.0};
   std::mutex writer_mutex;
 
@@ -504,7 +520,27 @@ int main(int argc, char** argv) {
             bool has_coverage = (diag.num_covered_actions >= required_coverage);
             bool has_mass = (diag.covered_prior_mass >= absl::GetFlag(FLAGS_min_prior_mass));
 
+            // Everything in the label body indexes by the search root's action
+            // order: advantages, diag.priors, and the teacher prior all follow
+            // diag.actions, while ppo_prior follows LegalActions(). Reorder
+            // ppo_prior once, here, so CalibrateEta and WriteLabel cannot pair a
+            // PPO probability with someone else's action id. The two orders
+            // agree today, making this a no-op; if search ever prunes or
+            // reorders root actions the label is dropped and counted rather than
+            // silently mispaired.
+            bool prior_aligned = false;
             if (has_coverage && has_mass) {
+              open_spiel::ActionsAndProbs aligned_ppo_prior;
+              prior_aligned = open_spiel::AlignPriorToActions(
+                  ppo_prior, diag.actions, &aligned_ppo_prior);
+              if (prior_aligned) {
+                ppo_prior = std::move(aligned_ppo_prior);
+              } else {
+                total_labels_unaligned++;
+              }
+            }
+
+            if (has_coverage && has_mass && prior_aligned) {
               std::vector<double> Q_teacher(diag.actions.size());
               for (size_t i = 0; i < diag.actions.size(); ++i) {
                 if (diag.visit_counts[i] >= absl::GetFlag(FLAGS_min_visits_per_action)) {
@@ -635,6 +671,13 @@ int main(int argc, char** argv) {
 
   writer.Close();
 
+  if (total_labels_unaligned.load() > 0) {
+    std::cerr << "Warning: dropped " << total_labels_unaligned.load()
+              << " label candidate(s) whose PPO prior could not be aligned to "
+                 "the search root's action vector. The two action orders have "
+                 "diverged; labels were skipped rather than mispaired.\n";
+  }
+
   if (training_labels_emitted.load() < target_training_labels ||
       validation_labels_emitted.load() < target_validation_labels) {
     std::cerr << "Error: reached max_games=" << max_games
@@ -681,6 +724,8 @@ int main(int argc, char** argv) {
 
     manifest_obj["training_label_count"] = static_cast<int64_t>(training_labels_emitted.load());
     manifest_obj["validation_label_count"] = static_cast<int64_t>(validation_labels_emitted.load());
+    manifest_obj["unaligned_label_drop_count"] =
+        static_cast<int64_t>(total_labels_unaligned.load());
 
     open_spiel::json::Array files_arr;
     std::vector<std::string> bin_files;
