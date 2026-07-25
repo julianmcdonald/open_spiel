@@ -44,10 +44,14 @@ Action SampleActionFromPrior(const ActionsAndProbs& prior, double r_val);
 // finding 8). The four coordinates MUST stay distinguishable: the old code
 // collapsed them into `round + seat + episode + decision` and hashed that one
 // total, so every tuple sharing a sum (round 3/seat 2 vs round 2/seat 3) drew
-// the identical 25% full-search roll — correlating the full/fast split across
-// many otherwise-independent sessions. Position-tagged derivation keeps each
+// the identical 25% full-search roll. Position-tagged derivation keeps each
 // coordinate on its own axis. Exposed for unit testing.
 // Deterministic: identical inputs => identical seed.
+//
+// The collision was latent in dune_search_teacher, the only consumer: it varies
+// config.seed per game, and within a game the sum strictly increases. It bites
+// any consumer that holds the base seed fixed across sessions — the natural way
+// to drive a seeded session — which is why this is a contract, not a comment.
 uint64_t DeriveTrainingFullFastSeed(uint64_t config_seed, int round,
                                     Player seat, int episode_id,
                                     int decision_id);

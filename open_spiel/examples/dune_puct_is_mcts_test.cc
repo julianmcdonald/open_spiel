@@ -3673,8 +3673,12 @@ void TestTieBreakSeedIncludesNodeIdentity() {
 // itself from `round + seat + episode + decision` — one commutative SUM fed as
 // Combine()'s position argument. Every tuple sharing a sum collapsed onto one
 // seed, so round 3/seat 2 and round 2/seat 3 always drew the same 25%
-// full-search roll, correlating the full/fast split across sessions that have
-// nothing to do with each other.
+// full-search roll.
+//
+// This covers the derivation CONTRACT: it holds the base seed fixed and varies
+// the coordinates. That is deliberately not the pattern dune_search_teacher
+// uses (it varies config.seed per game, which is why the collision was latent
+// there), so this asserts the fix rather than reproducing a production defect.
 void TestTrainingFullFastSeedComponents() {
   std::cout << "Running TestTrainingFullFastSeedComponents...\n";
 
