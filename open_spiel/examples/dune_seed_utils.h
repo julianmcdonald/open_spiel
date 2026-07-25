@@ -71,6 +71,7 @@ constexpr uint64_t kDomainEvalBaseline  = 0x0002;
 constexpr uint64_t kDomainEvalDev       = 0x0003;
 constexpr uint64_t kDomainEvalFinal     = 0x0004;
 constexpr uint64_t kDomainSearchTeacher = 0x0005;
+constexpr uint64_t kDomainFidelityGate  = 0x0006;
 
 // ===========================================================================
 // Stream constants
@@ -87,6 +88,13 @@ constexpr uint64_t kStreamMCTS            = 0x0060;
 constexpr uint64_t kStreamModelInit       = 0x0070;
 constexpr uint64_t kStreamBlueprint       = 0x0080;
 constexpr uint64_t kStreamSearchGate      = 0x0090;
+
+// Fidelity-gate secondary diagnostics. Each sampled successor replicate draws
+// two independent streams (chance advance, then raw-policy rollout); sampled
+// leaves draw one.
+constexpr uint64_t kStreamFidelitySuccessorChance  = 0x00A0;
+constexpr uint64_t kStreamFidelitySuccessorRollout = 0x00A1;
+constexpr uint64_t kStreamFidelityLeafRollout      = 0x00A2;
 
 // ===========================================================================
 // RNG construction helpers

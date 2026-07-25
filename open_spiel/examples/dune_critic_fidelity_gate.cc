@@ -35,6 +35,7 @@
 #include "dune_search_routing.h"
 #include "dune_batched_evaluator.h"
 #include "dune_sha256.h"
+#include "dune_fidelity_seeds.h"
 
 ABSL_FLAG(std::string, model_checkpoint, "artifacts/branch_a_frozen/branch_a_seed11_model_update_2450.pt", "Path to the model checkpoint");
 ABSL_FLAG(std::string, corpus_path, "data/dune_diagnostic_corpus.json", "Path to the corpus JSON file");
@@ -2314,14 +2315,47 @@ int main(int argc, char** argv) {
   bool mock_fail = absl::GetFlag(FLAGS_mock_miscalibrated_critic);
   bool self_test = absl::GetFlag(FLAGS_self_test);
 
+  // Rollout-count validation, deliberately ahead of cache construction and any
+  // computation so an out-of-range request cannot first poison a cache.
+  //
+  // The Gate 1 and Gate 2 seed families address a state's replicates inside a
+  // 1000-wide block (`base + 1000 * state + replicate`). That is injective in
+  // (state, replicate) only while replicate stays under the block width, so
+  // the bound is enforced rather than assumed. Replicates are 1-based, hence
+  // the closed range [1, kMaxRollouts - 1].
+  int requested_rollouts = absl::GetFlag(FLAGS_rollouts);
+  if (requested_rollouts < 1 ||
+      requested_rollouts >= dune_fidelity_seeds::kMaxRollouts) {
+    std::cerr << "Fidelity Gate validation failed: --rollouts must satisfy 1 <= "
+                 "rollouts < "
+              << dune_fidelity_seeds::kMaxRollouts << ", got "
+              << requested_rollouts
+              << ". The Gate 1/Gate 2 seed families place each state's "
+                 "replicates in a "
+              << dune_fidelity_seeds::kStateBlockWidth
+              << "-wide block; at or above that width, replicates collide with "
+                 "the next state's rollout seeds.\n";
+    std::exit(1);
+  }
+
+  // Rejected rather than clamped: the old std::max(1, ...) turned a nonsensical
+  // --diagnostic_rollouts=0 into a silent single-replicate run whose
+  // successor/leaf diagnostics looked like a requested measurement.
+  int requested_diagnostic_rollouts = absl::GetFlag(FLAGS_diagnostic_rollouts);
+  if (requested_diagnostic_rollouts < 1) {
+    std::cerr << "Fidelity Gate validation failed: --diagnostic_rollouts must "
+                 "be >= 1, got "
+              << requested_diagnostic_rollouts << ".\n";
+    std::exit(1);
+  }
+
   // Self-test caps rollout counts for speed. Resolve them once as a cap, not a
   // hardcode, so an explicitly smaller --rollouts / --diagnostic_rollouts is
   // still honored (the silent override otherwise masks the requested count).
   // Behavior-neutral for existing callers: both flag defaults exceed 2, so a
   // plain --self_test still resolves to 2.
-  int effective_rollouts = absl::GetFlag(FLAGS_rollouts);
-  int effective_diagnostic_rollouts =
-      std::max(1, absl::GetFlag(FLAGS_diagnostic_rollouts));
+  int effective_rollouts = requested_rollouts;
+  int effective_diagnostic_rollouts = requested_diagnostic_rollouts;
   if (self_test) {
     effective_rollouts = std::min(effective_rollouts, 2);
     effective_diagnostic_rollouts = std::min(effective_diagnostic_rollouts, 2);
@@ -2592,6 +2626,50 @@ int main(int argc, char** argv) {
   std::vector<size_t> gate2_indices(opportunity_indices.begin(), opportunity_indices.begin() + std::min<size_t>(target_g2, opportunity_indices.size()));
   if (skip_gate1) gate1_indices.clear();
 
+  // Gate 2's confidence interval is an episode-cluster bootstrap: it resamples
+  // whole episodes, because opportunity states drawn from one episode are
+  // correlated. Without episode telemetry every state carries episode_id = -1,
+  // they collapse into a single cluster, and each bootstrap replicate reselects
+  // that same cluster -- so the "95% LCB" comes out exactly equal to the point
+  // estimate and passes LCB > 0 whenever the mean is positive. That is a
+  // zero-width interval reported as certainty.
+  //
+  // Fail closed instead. --allow_any_opportunity_count relaxes corpus
+  // cardinality and schema checks, but it must not license inventing an
+  // inference unit, so the check applies under that flag too. Falling back to
+  // treating states as independent is deliberately not offered: it would
+  // silently substitute a narrower, anti-conservative interval for the
+  // clustered one the gate is specified against. Checked before manifest
+  // verification so a run that cannot produce a valid interval never reuses or
+  // extends a cache.
+  if (!gate1_only_requested && !gate2_indices.empty()) {
+    std::vector<size_t> missing_episode_indices;
+    for (size_t idx : gate2_indices) {
+      if (corpus[idx].episode_id < 0) missing_episode_indices.push_back(idx);
+    }
+    if (!missing_episode_indices.empty()) {
+      std::cerr << "Fidelity Gate validation failed: "
+                << missing_episode_indices.size() << " of "
+                << gate2_indices.size()
+                << " selected Gate 2 opportunity states are missing episode "
+                   "telemetry (episode_id < 0). The Gate 2 lower confidence "
+                   "bound is an episode-cluster bootstrap; without episode ids "
+                   "every state collapses into one cluster and the reported "
+                   "95% LCB degenerates to the point estimate.\n";
+      std::cerr << "  Corpus indices:";
+      for (size_t i = 0; i < missing_episode_indices.size() && i < 16; ++i) {
+        std::cerr << " " << missing_episode_indices[i];
+      }
+      if (missing_episode_indices.size() > 16) {
+        std::cerr << " ... (" << (missing_episode_indices.size() - 16)
+                  << " more)";
+      }
+      std::cerr << "\n  Use a v2 corpus carrying episode_id, or --gate1_only to "
+                   "skip Gate 2.\n";
+      std::exit(1);
+    }
+  }
+
   if (split_cache.IsActive()) {
     if (split_cache.VerifyManifest(corpus, gate1_indices, gate2_indices)) {
       std::cout << "[Manifest] Verified complete cache manifest on startup.\n" << std::flush;
@@ -2761,7 +2839,7 @@ int main(int argc, char** argv) {
         }
         int k = local_task;
         // Aligned seeds with Gate 1 space prefix 300000
-        uint64_t roll_seed = 300000 + 1000 * idx + k;
+        uint64_t roll_seed = dune_fidelity_seeds::Gate1RolloutSeed(idx, k);
         gate1_returns[idx][k - 1] = RunRawPolicyRollout(
             *gate1_states[idx], cs.player, global_evaluator.get(), roll_seed,
             utility_divisor);
@@ -2928,7 +3006,7 @@ int main(int argc, char** argv) {
         double t_budget = absl::GetFlag(FLAGS_relative_time_budget_ms);
         bot_cfg.relative_time_budget_ms = (t_budget > 0.0) ? t_budget : std::numeric_limits<double>::infinity();
       }
-      bot_cfg.seed = search_seed + 200000 + 1000 * seed_index;
+      bot_cfg.seed = dune_fidelity_seeds::SearchBotSeed(search_seed, seed_index);
       bot_cfg.fixed_session_limit = bot_cfg.max_simulations;
       bot_cfg.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
       bot_cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
@@ -3170,8 +3248,8 @@ int main(int argc, char** argv) {
                     : DuneSearchBudgetMode::kLiveDeadline;
             DuneSearchSession root_session(bot_cfg, global_evaluator, mode);
             root_res = root_session.Search(*state);
-            std::mt19937 step_rng(
-                raw_policy_seed + 300000 + 1000 * seed_index);
+            std::mt19937 step_rng(dune_fidelity_seeds::ControllerStepSeed(
+                raw_policy_seed, seed_index));
             double r_val = absl::Uniform(step_rng, 0.0, 1.0);
             ControllerDecision decision = root_session.SelectControllerAction(*state, root_res, r_val);
             root_res = root_session.CommitAction(decision);
@@ -3331,8 +3409,10 @@ int main(int argc, char** argv) {
                 action_returns[a_idx].assign(rollouts, 0.0);
                 double critic_sum = 0.0;
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
-                  uint64_t rollout_seed = rollout_seed_base + 1000 * seed_index + k;
+                  uint64_t chance_seed = dune_fidelity_seeds::Gate2ForcedChanceSeed(
+                      chance_seed_base, seed_index, k);
+                  uint64_t rollout_seed = dune_fidelity_seeds::Gate2ForcedRolloutSeed(
+                      rollout_seed_base, seed_index, k);
                   ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, rollout_seed, utility_divisor);
@@ -3347,8 +3427,10 @@ int main(int argc, char** argv) {
                 // Layer 3 missed, Layer 4 hit: run rollouts only
                 action_returns[a_idx].assign(rollouts, 0.0);
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
-                  uint64_t rollout_seed = rollout_seed_base + 1000 * seed_index + k;
+                  uint64_t chance_seed = dune_fidelity_seeds::Gate2ForcedChanceSeed(
+                      chance_seed_base, seed_index, k);
+                  uint64_t rollout_seed = dune_fidelity_seeds::Gate2ForcedRolloutSeed(
+                      rollout_seed_base, seed_index, k);
                   ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, rollout_seed, utility_divisor);
@@ -3360,7 +3442,8 @@ int main(int argc, char** argv) {
                 // Layer 3 hit, Layer 4 missed: compute critic only
                 double critic_sum = 0.0;
                 for (int k = 1; k <= rollouts; ++k) {
-                  uint64_t chance_seed = chance_seed_base + 1000 * seed_index + k;
+                  uint64_t chance_seed = dune_fidelity_seeds::Gate2ForcedChanceSeed(
+                      chance_seed_base, seed_index, k);
                   critic_sum += GetSuccessorCriticValue(
                       *state, cs.player, action, global_evaluator.get(),
                       chance_seed, utility_divisor);
@@ -3391,10 +3474,10 @@ int main(int argc, char** argv) {
               if (task >= total_action_rollouts) break;
               size_t a_idx = task / rollouts;
               int k = task % rollouts;
-              uint64_t chance_seed =
-                  chance_seed_base + 1000 * seed_index + k + 1;
-              uint64_t rollout_seed =
-                  rollout_seed_base + 1000 * seed_index + k + 1;
+              uint64_t chance_seed = dune_fidelity_seeds::Gate2ForcedChanceSeed(
+                  chance_seed_base, seed_index, k + 1);
+              uint64_t rollout_seed = dune_fidelity_seeds::Gate2ForcedRolloutSeed(
+                  rollout_seed_base, seed_index, k + 1);
               ForcedActionRolloutResult forced = RunForcedActionPolicyRollout(
                   *state, cs.player, root_actions[a_idx], global_evaluator.get(),
                   chance_seed, rollout_seed, utility_divisor);
@@ -3594,8 +3677,8 @@ int main(int argc, char** argv) {
           }
           double leaf_true_sum = 0.0;
           for (int r = 1; r <= diagnostic_rollouts; ++r) {
-            uint64_t leaf_seed =
-                500000 + 1000 * seed_index + 100 * l_idx + r;
+            uint64_t leaf_seed = dune_fidelity_seeds::LeafRolloutSeed(
+                raw_policy_seed, seed_index, l_idx, r);
             leaf_true_sum += RunRawPolicyRollout(
                 *leaf_state, cs.player, global_evaluator.get(), leaf_seed,
                 utility_divisor);
@@ -3703,7 +3786,11 @@ int main(int argc, char** argv) {
       int total_searched_decisions = 0;
 
       for (int k = 1; k <= rollouts; ++k) {
-        uint64_t roll_seed = 100000 + 1000 * seed_index + k;
+        // Shared by both arms below on purpose: the raw and search controller
+        // rollouts for replicate k run under the same random stream, which is
+        // the common-random-number pairing behind mean_paired_advantage.
+        uint64_t roll_seed =
+            dune_fidelity_seeds::Gate2PairedRolloutSeed(seed_index, k);
 
         // Raw controller rollout
         RawRolloutResult raw_res = RunRawControllerRollout(*state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
@@ -3807,8 +3894,8 @@ int main(int argc, char** argv) {
             : DuneSearchBudgetMode::kLiveDeadline;
         DuneSearchSession temp_session(bot_cfg, global_evaluator, mode);
         DuneSearchResult root_res = temp_session.Search(*state);
-        std::mt19937 step_rng(
-            raw_policy_seed + 300000 + 1000 * seed_index);
+        std::mt19937 step_rng(dune_fidelity_seeds::ControllerStepSeed(
+            raw_policy_seed, seed_index));
         double r_val = absl::Uniform(step_rng, 0.0, 1.0);
         ControllerDecision decision = temp_session.SelectControllerAction(*state, root_res, r_val);
         root_res = temp_session.CommitAction(decision);
@@ -3826,13 +3913,15 @@ int main(int argc, char** argv) {
           int roll_count = effective_diagnostic_rollouts;
 
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t roll_seed =
-                400000 + 1000 * seed_index + 100 * a_idx + r;
+            uint64_t chance_seed = dune_fidelity_seeds::SuccessorChanceSeed(
+                raw_policy_seed, seed_index, a_idx, r);
+            uint64_t roll_seed = dune_fidelity_seeds::SuccessorRolloutSeed(
+                raw_policy_seed, seed_index, a_idx, r);
 
             auto roll_state = state->Clone();
             roll_state->ApplyAction(act);
 
-            std::mt19937 temp_rng(roll_seed);
+            std::mt19937 temp_rng(chance_seed);
             while (roll_state->IsChanceNode()) {
               auto outcomes = roll_state->ChanceOutcomes();
               if (outcomes.empty()) break;
@@ -3916,8 +4005,8 @@ int main(int argc, char** argv) {
           double leaf_true_sum = 0.0;
           int roll_count = effective_diagnostic_rollouts;
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t roll_seed =
-                500000 + 1000 * seed_index + 100 * l_idx + r;
+            uint64_t roll_seed = dune_fidelity_seeds::LeafRolloutSeed(
+                raw_policy_seed, seed_index, l_idx, r);
             leaf_true_sum += RunRawPolicyRollout(*leaf_state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
           }
           double leaf_true_val = leaf_true_sum / roll_count;

@@ -66,6 +66,10 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_seed_utils_test dune_seed_utils_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_seed_utils_test ${TORCH_LIBRARIES})
 
+  add_executable(dune_fidelity_seeds_test dune_fidelity_seeds_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_fidelity_seeds_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_fidelity_seeds_test COMMAND dune_fidelity_seeds_test)
+
   add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_training_utils_test dune_search ${TORCH_LIBRARIES})
 
