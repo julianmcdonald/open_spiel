@@ -97,6 +97,8 @@ open_spiel::json::Object ConfigEcho(const open_spiel::OnlineSearchConfig& c) {
   o["min_coverage"] = static_cast<int64_t>(c.min_coverage);
   o["min_visits_per_action"] = static_cast<int64_t>(c.min_visits_per_action);
   o["min_prior_mass"] = c.min_prior_mass;
+  o["acceptance_prior_source"] =
+      std::string(open_spiel::AcceptancePriorSourceName(c.acceptance_prior_source));
   o["accepted_action_temperature"] = c.accepted_action_temperature;
   o["search_loss_coef_target"] = c.search_loss_coef_target;
   o["search_loss_coef_warmup_update"] =
@@ -214,6 +216,10 @@ int main(int argc, char** argv) {
   agg["timeouts"] = static_cast<int64_t>(stats.timeouts);
   agg["mean_simulations_completed"] = stats.mean_simulations_completed;
   agg["mean_covered_prior_mass"] = stats.mean_covered_prior_mass;
+  // Prior the acceptance rate and the mean above were measured against. Noise-ON
+  // and noise-OFF runs are only comparable when this matches (WO-20).
+  agg["acceptance_prior_source"] = std::string(
+      open_spiel::AcceptancePriorSourceName(stats.acceptance_prior_source));
   agg["inference_calls"] = static_cast<int64_t>(stats.inference_calls);
   agg["collection_wall_time_s"] = stats.collection_wall_time_s;
   agg["wall_time_per_game"] = wall_per_game;
@@ -259,10 +265,11 @@ int main(int argc, char** argv) {
   role_line("purchase", stats.by_role[2]);
   std::cout << absl::StrFormat(
       "  aggregate    accepted=%d rejected=%d fallback=%d timeouts=%d "
-      "mean_sims=%.1f mean_coverage=%.3f\n",
+      "mean_sims=%.1f mean_coverage=%.3f (vs %s)\n",
       stats.accepted_targets, stats.rejected_incomplete,
       stats.fallback_raw_policy, stats.timeouts,
-      stats.mean_simulations_completed, stats.mean_covered_prior_mass);
+      stats.mean_simulations_completed, stats.mean_covered_prior_mass,
+      open_spiel::AcceptancePriorSourceName(stats.acceptance_prior_source));
   std::cout << absl::StrFormat(
       "  swordmaster  granted_games=%d organic_games=%d\n",
       static_cast<int>(stats.swordmaster_granted_games),

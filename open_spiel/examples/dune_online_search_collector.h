@@ -28,6 +28,32 @@ namespace algorithms {
 class Evaluator;  // frozen inference snapshot; defined in algorithms/mcts.h
 }  // namespace algorithms
 
+// Which root prior the covered-prior-mass acceptance rule is measured against
+// (WO-20). The rule's 0.50 threshold was frozen against the offline teacher,
+// which pins `dirichlet_epsilon = 0.0` (dune_search_teacher.cc:465), so there
+// the tree prior IS the network prior and the distinction did not exist. Once
+// the collector turns exploration noise on (pilot epsilon 0.25), the two come
+// apart and the choice has to be named rather than inherited from the noise
+// setting.
+enum class AcceptancePriorSource {
+  // DEFAULT. The untransformed network prior (`SearchDiagnostics::raw_priors`,
+  // falling back to `priors` when the root was not in the tree, where `priors`
+  // is already raw). Strips both root transformations — the Dirichlet mixture
+  // and `root_prior_temperature` — so "covered prior mass >= 0.50" means the
+  // same thing at a noised root as at the noise-free teacher it was frozen
+  // against, and matches the source the item-4 per-role KL telemetry uses.
+  kRawNetworkPrior,
+  // The post-noise, post-temperature tree prior the search actually ran with
+  // (`SearchDiagnostics::priors`) — the pre-WO-20 behavior. Noise flattens the
+  // prior, so this measures a different quantity than the frozen rule and than
+  // the telemetry; acceptance rates are then not comparable across noise-on and
+  // noise-off arms. Opt in explicitly if you want the tree's own view.
+  kTreePrior,
+};
+
+// Stable, log/JSON-safe name of an acceptance prior source.
+const char* AcceptancePriorSourceName(AcceptancePriorSource source);
+
 // One accepted online search example. Policy target is the normalized visit
 // distribution over legal_actions (cross-entropy); value target is the terminal
 // placement utility / utility_divisor, attached after the auxiliary game ends.
@@ -48,6 +74,9 @@ struct SearchTrainingExample {
   // Search diagnostics (accepted-target audit).
   int simulations_completed = 0;
   int num_covered_actions = 0;
+  // Prior mass on the covered actions, measured against the run's
+  // `acceptance_prior_source` (raw network prior by default). The stats record
+  // which source produced it.
   double covered_prior_mass = 0.0;
   double mean_depth = 0.0;
   double terminal_leaf_fraction = 0.0;
@@ -119,6 +148,11 @@ struct OnlineSearchConfig {
   int min_coverage = 3;                 // min(3, legal_count) actions...
   int min_visits_per_action = 2;        // ...with >= 2 visits each
   double min_prior_mass = 0.50;         // covered prior mass >= 0.50
+  // Prior the covered-mass half of the rule is measured against. Default = the
+  // raw network prior, which is what the teacher's frozen 0.50 threshold and
+  // the item-4 telemetry both mean by "prior mass"; see AcceptancePriorSource.
+  AcceptancePriorSource acceptance_prior_source =
+      AcceptancePriorSource::kRawNetworkPrior;
   double accepted_action_temperature = 1.0;  // sample executed action from visits
 
   // --- Combined-optimization coupling (consumed by the trainer) ---
@@ -165,7 +199,13 @@ struct OnlineSearchCollectionStats {
 
   double collection_wall_time_s = 0.0;
   double mean_simulations_completed = 0.0;
+  // Mean covered prior mass over SEARCHED roots (accepted or not), measured
+  // against `acceptance_prior_source` below — reported so a run records which
+  // prior its acceptance rate and this mean were computed from, and so noised
+  // and noise-free arms are only compared when the sources agree.
   double mean_covered_prior_mass = 0.0;
+  AcceptancePriorSource acceptance_prior_source =
+      AcceptancePriorSource::kRawNetworkPrior;
   int64_t inference_calls = 0;
   int timeouts = 0;
   int fallback_raw_policy = 0;          // rejected/incomplete -> raw policy executed
@@ -214,6 +254,10 @@ class OnlineSearchCollector {
   // Acceptance test on a completed search: >= min(min_coverage, legal_count)
   // actions with >= min_visits_per_action visits AND covered prior mass >=
   // min_prior_mass. Returns covered-action count and covered prior mass via out.
+  //
+  // `root_priors` must be the prior named by `config.acceptance_prior_source`
+  // (CollectUpdate selects it); this function is a pure predicate over whatever
+  // it is handed and does not re-derive it.
   bool AcceptSearch(const std::vector<int>& visit_counts,
                     const std::vector<double>& root_priors, int legal_count,
                     int* num_covered_out, double* covered_prior_mass_out) const;

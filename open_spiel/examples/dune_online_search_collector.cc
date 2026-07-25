@@ -259,6 +259,14 @@ bool OnlineSearchCollector::ShouldSearchAtRoot(int64_t episode_id,
   return UnitDouble(h) < config_.search_probability;
 }
 
+const char* AcceptancePriorSourceName(AcceptancePriorSource source) {
+  switch (source) {
+    case AcceptancePriorSource::kRawNetworkPrior: return "raw_network_prior";
+    case AcceptancePriorSource::kTreePrior:       return "tree_prior";
+  }
+  SpielFatalError("Unknown AcceptancePriorSource.");
+}
+
 bool OnlineSearchCollector::AcceptSearch(const std::vector<int>& visit_counts,
                                          const std::vector<double>& root_priors,
                                          int legal_count, int* num_covered_out,
@@ -298,6 +306,9 @@ void OnlineSearchCollector::CollectUpdate(
   // Reset stats; record the episode window collected this update.
   *stats = OnlineSearchCollectionStats();
   stats->auxiliary_games = config_.auxiliary_games;
+  // Report the prior the acceptance rate and mean_covered_prior_mass below were
+  // measured against, so a consumer never has to infer it from the noise knob.
+  stats->acceptance_prior_source = config_.acceptance_prior_source;
   const int64_t first_episode_id = config_.next_auxiliary_episode_id;
   stats->first_episode_id = first_episode_id;
 
@@ -468,21 +479,24 @@ void OnlineSearchCollector::CollectUpdate(
           if (res.timeout_status) ++stats->timeouts;
           sum_sims += res.simulations_completed;
 
+          // The RAW network prior at this root: diag.priors carries whatever the
+          // tree searched with (Dirichlet mixture at a noised root,
+          // root_prior_temperature flattening). Since WO-15 diag.raw_priors is
+          // populated on every searched root and strips both; it is empty only
+          // when the root was not in the tree, where diag.priors IS the raw
+          // prior. Item-4 telemetry and (by default) acceptance both read it —
+          // one local, so the two cannot drift apart again (WO-20).
+          const std::vector<double>& raw_root_priors =
+              diag.raw_priors.empty() ? diag.priors : diag.raw_priors;
+
           // Item-4 per-role telemetry: KL(visits||prior) + prior-argmax override,
           // over every searched root (accepted or not) for comparability with the
           // 200-sim role baselines (primary 0.43/24%, cont 0.51/25%, purch 0.62/29%).
-          // The baselines are vs the RAW network prior, so compare against
-          // diag.raw_priors: diag.priors carries whatever the tree searched with
-          // (Dirichlet mixture at a noised root, root_prior_temperature
-          // flattening), either of which would inflate KL and corrupt the budget
-          // decision in item 4. Since WO-15 raw_priors is populated on every
-          // searched root and strips both; it is empty only when the root was
-          // not in the tree, where diag.priors IS the raw prior.
+          // The baselines are vs the RAW network prior; either root transform
+          // would inflate KL and corrupt the budget decision in item 4.
           if (role_idx >= 0) {
-            const std::vector<double>& telemetry_priors =
-                diag.raw_priors.empty() ? diag.priors : diag.raw_priors;
             VisitPriorDivergence d =
-                ComputeVisitPriorDivergence(diag.visit_counts, telemetry_priors);
+                ComputeVisitPriorDivergence(diag.visit_counts, raw_root_priors);
             stats->by_role[role_idx].sum_kl += d.kl;
             if (d.prior_argmax_override) {
               ++stats->by_role[role_idx].prior_argmax_overrides;
@@ -491,14 +505,27 @@ void OnlineSearchCollector::CollectUpdate(
 
           // Acceptance is recomputed from the visit counts + root priors so the
           // collector, not the controller, owns the accept/reject decision.
+          //
+          // WO-20: the covered-mass half of the rule is measured against the
+          // source named by config_.acceptance_prior_source, NOT against
+          // whatever the noise setting happens to make diag.priors. The default
+          // (raw network prior) keeps "covered mass >= 0.50" meaning what it
+          // meant for the noise-free teacher the 0.50 was frozen against, and
+          // keeps it comparable with the telemetry above; kTreePrior is the
+          // opt-in for the tree's own post-noise view.
+          const std::vector<double>& acceptance_priors =
+              config_.acceptance_prior_source == AcceptancePriorSource::kTreePrior
+                  ? diag.priors
+                  : raw_root_priors;
           const int legal_count = static_cast<int>(diag.actions.size());
           int covered = 0;
           double covered_mass = 0.0;
           bool accept = false;
-          if (legal_count > 0 && diag.visit_counts.size() == diag.priors.size() &&
+          if (legal_count > 0 &&
+              diag.visit_counts.size() == acceptance_priors.size() &&
               diag.actions.size() == diag.visit_counts.size()) {
-            accept = AcceptSearch(diag.visit_counts, diag.priors, legal_count,
-                                  &covered, &covered_mass);
+            accept = AcceptSearch(diag.visit_counts, acceptance_priors,
+                                  legal_count, &covered, &covered_mass);
           }
           sum_covered_mass += covered_mass;
 
@@ -519,6 +546,10 @@ void OnlineSearchCollector::CollectUpdate(
             const bool package_active =
                 config_.forced_playouts_k > 0.0 && config_.dirichlet_epsilon > 0.0 &&
                 diag.q_values.size() == diag.visit_counts.size();
+            // diag.priors (NOT the acceptance source): KataGo's n_forced and its
+            // PUCT stop condition are defined against the P the tree actually
+            // searched with, so pruning stays on the post-noise prior whatever
+            // acceptance_prior_source says.
             if (package_active) {
               std::vector<int> pruned = PruneForcedPlayouts(
                   diag.visit_counts, diag.priors, diag.q_values,

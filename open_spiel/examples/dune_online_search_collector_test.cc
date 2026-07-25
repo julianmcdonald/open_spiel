@@ -3,6 +3,7 @@
 
 #include "open_spiel/examples/dune_online_search_collector.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -170,6 +171,55 @@ void TestAcceptance() {
     assert(ok);  // min(3,2)=2 covered, mass 1.0
   }
   std::cout << "TestAcceptance Passed!\n\n";
+}
+
+// WO-20, half 1 of 2 (the predicate): the SAME search accepts against the raw
+// network prior and rejects against the post-noise tree prior, so which vector
+// the rule is handed is a real decision, not bookkeeping. The teacher that froze
+// the 0.50 threshold pins dirichlet_epsilon=0 (dune_search_teacher.cc:465), so
+// only the raw column reproduces the contract the threshold was calibrated on.
+void TestAcceptancePriorSourceMatters() {
+  std::cout << "Running TestAcceptancePriorSourceMatters...\n";
+  OnlineSearchCollector col(DefaultConfig(), "hash");
+
+  // Same root as TestAcceptance's accept case: 3 actions with >= 2 visits
+  // carrying 0.60 of the raw prior.
+  const std::vector<int> visits = {5, 3, 2, 1, 0};
+  const std::vector<double> raw = {0.30, 0.20, 0.10, 0.25, 0.15};
+
+  // The tree prior the search ran with at a noised root: 0.75 * raw + 0.25 *
+  // Dirichlet, here drawn entirely on the two barely-visited actions (a legal
+  // draw, and the worst case for the covered actions). Noise costs the covered
+  // set a flat 25% of its mass: 0.60 -> 0.45.
+  const std::vector<double> noise = {0.0, 0.0, 0.0, 0.5, 0.5};
+  std::vector<double> tree(raw.size());
+  double tree_sum = 0.0;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    tree[i] = 0.75 * raw[i] + 0.25 * noise[i];
+    tree_sum += tree[i];
+  }
+  assert(std::abs(tree_sum - 1.0) < 1e-12);  // still a distribution
+
+  int covered_raw = 0, covered_tree = 0;
+  double mass_raw = 0.0, mass_tree = 0.0;
+  const bool ok_raw =
+      col.AcceptSearch(visits, raw, /*legal_count=*/5, &covered_raw, &mass_raw);
+  const bool ok_tree =
+      col.AcceptSearch(visits, tree, /*legal_count=*/5, &covered_tree, &mass_tree);
+
+  // Coverage (the visit half) is identical — only the measured mass moves.
+  assert(covered_raw == 3 && covered_tree == 3);
+  assert(std::abs(mass_raw - 0.60) < 1e-9);
+  assert(std::abs(mass_tree - 0.45) < 1e-9);
+  assert(ok_raw);    // frozen contract: 0.60 >= 0.50
+  assert(!ok_tree);  // post-noise view: 0.45 < 0.50 -- the same search, rejected
+
+  // The names are the ones that get logged/persisted; keep them stable.
+  assert(std::string(AcceptancePriorSourceName(
+             AcceptancePriorSource::kRawNetworkPrior)) == "raw_network_prior");
+  assert(std::string(AcceptancePriorSourceName(
+             AcceptancePriorSource::kTreePrior)) == "tree_prior");
+  std::cout << "TestAcceptancePriorSourceMatters Passed!\n\n";
 }
 
 void TestLossCoefWarmup() {
@@ -490,6 +540,111 @@ void TestCollectUpdateExplorationPackage() {
   std::cout << "TestCollectUpdateExplorationPackage Passed!\n\n";
 }
 
+// WO-20, half 2 of 2 (the wiring): which prior CollectUpdate hands the predicate.
+// The mock prior is uniform over the legal actions, so the raw covered mass is
+// exactly num_covered/legal_count at every root — an identity the Dirichlet
+// mixture cannot satisfy. That makes the recorded mass a direct read-out of the
+// source actually used.
+//
+// Noise OFF: the two sources are the same vector, so the runs agree exactly.
+// Noise ON: the default (raw) run still satisfies the identity, the kTreePrior
+// run does not — the acceptance decisions are held identical (thresholds
+// relaxed) so the ONLY difference is the quantity measured.
+void TestCollectUpdateAcceptancePriorSource() {
+  std::cout << "Running TestCollectUpdateAcceptancePriorSource...\n";
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig base = FastCollectConfig();
+  base.search_probability = 1.0;    // search every target root
+  base.min_coverage = 1;            // acceptance turns on the VISIT half only,
+  base.min_visits_per_action = 1;   // so both sources accept the same roots and
+  base.min_prior_mass = 0.0;        // the recorded mass is the isolated variable
+
+  auto run = [&](const OnlineSearchConfig& c,
+                 std::vector<SearchTrainingExample>* ex,
+                 OnlineSearchCollectionStats* s) {
+    OnlineSearchCollector(c, "ckpt").CollectUpdate(1, game, eval, ex, s);
+  };
+  // Deviation of a run's recorded masses from the uniform-prior identity.
+  auto max_identity_error = [](const std::vector<SearchTrainingExample>& ex) {
+    double worst = 0.0;
+    for (const auto& e : ex) {
+      assert(!e.legal_actions.empty());
+      const double expect = static_cast<double>(e.num_covered_actions) /
+                            static_cast<double>(e.legal_actions.size());
+      worst = std::max(worst, std::abs(e.covered_prior_mass - expect));
+    }
+    return worst;
+  };
+
+  // --- Noise OFF: the tree prior IS the network prior; the source is inert. ---
+  OnlineSearchConfig off_raw = base;  // dirichlet_epsilon defaults to 0.0
+  OnlineSearchConfig off_tree = off_raw;
+  off_tree.acceptance_prior_source = AcceptancePriorSource::kTreePrior;
+  std::vector<SearchTrainingExample> ex_off_raw, ex_off_tree;
+  OnlineSearchCollectionStats s_off_raw, s_off_tree;
+  run(off_raw, &ex_off_raw, &s_off_raw);
+  run(off_tree, &ex_off_tree, &s_off_tree);
+  assert(!ex_off_raw.empty());
+  assert(RunSignature(ex_off_raw, s_off_raw) ==
+         RunSignature(ex_off_tree, s_off_tree));
+  assert(ex_off_raw.size() == ex_off_tree.size());
+  for (size_t i = 0; i < ex_off_raw.size(); ++i) {
+    assert(std::abs(ex_off_raw[i].covered_prior_mass -
+                    ex_off_tree[i].covered_prior_mass) < 1e-12);
+  }
+  assert(max_identity_error(ex_off_raw) < 1e-9);   // uniform prior, either way
+  assert(max_identity_error(ex_off_tree) < 1e-9);
+  assert(std::abs(s_off_raw.mean_covered_prior_mass -
+                  s_off_tree.mean_covered_prior_mass) < 1e-12);
+
+  // --- Noise ON: the sources come apart. -------------------------------------
+  OnlineSearchConfig on_raw = base;
+  on_raw.dirichlet_epsilon = 0.25;   // pilot exploration package
+  on_raw.dirichlet_alpha_total = 10.83;
+  on_raw.forced_playouts_k = 2.0;
+  on_raw.root_noise_fpu_zero = true;
+  OnlineSearchConfig on_tree = on_raw;
+  on_tree.acceptance_prior_source = AcceptancePriorSource::kTreePrior;
+  std::vector<SearchTrainingExample> ex_on_raw, ex_on_tree;
+  OnlineSearchCollectionStats s_on_raw, s_on_tree;
+  run(on_raw, &ex_on_raw, &s_on_raw);
+  run(on_tree, &ex_on_tree, &s_on_tree);
+  assert(!ex_on_raw.empty());
+
+  // Same accepted set, same targets, same executed actions: only the measured
+  // mass may differ (RunSignature covers everything except that mass).
+  assert(RunSignature(ex_on_raw, s_on_raw) == RunSignature(ex_on_tree, s_on_tree));
+
+  // The default keeps the frozen, noise-independent coverage contract...
+  const double raw_err = max_identity_error(ex_on_raw);
+  assert(raw_err < 1e-9);
+  // ...while the tree prior measures the flattened distribution instead. The
+  // Dirichlet draw moves covered mass in EITHER direction (here the tree mean
+  // comes out higher), so assert on the magnitude of the deviation, not a sign.
+  const double tree_err = max_identity_error(ex_on_tree);
+  std::cout << "  identity error: raw=" << raw_err << " tree=" << tree_err
+            << " (noise on)\n";
+  assert(tree_err > 1e-6);
+
+  // The run reports which source it used — no inferring it from the noise knob.
+  assert(s_on_raw.acceptance_prior_source ==
+         AcceptancePriorSource::kRawNetworkPrior);
+  assert(s_on_tree.acceptance_prior_source == AcceptancePriorSource::kTreePrior);
+  assert(s_off_raw.acceptance_prior_source ==
+         AcceptancePriorSource::kRawNetworkPrior);
+
+  // Regression pin for the finding itself: with noise ON, the pre-WO-20
+  // behavior (tree prior) reports a DIFFERENT mean covered mass than the rule
+  // was frozen against, so the two arms were never comparable.
+  std::cout << "  mean covered mass: raw=" << s_on_raw.mean_covered_prior_mass
+            << " tree=" << s_on_tree.mean_covered_prior_mass << "\n";
+  assert(std::abs(s_on_raw.mean_covered_prior_mass -
+                  s_on_tree.mean_covered_prior_mass) > 1e-6);
+  std::cout << "TestCollectUpdateAcceptancePriorSource Passed!\n\n";
+}
+
 // Item 1 (surface extension) + Item 4 (per-role telemetry): the collector now
 // searches primary, continuation, AND purchase roots (the strategic-state gate
 // does NOT bypass continuation/purchase), and the per-role counters + KL are
@@ -658,6 +813,7 @@ int main() {
   open_spiel::TestSeatRotation();
   open_spiel::TestDeterministicBernoulliRate();
   open_spiel::TestAcceptance();
+  open_spiel::TestAcceptancePriorSourceMatters();
   open_spiel::TestLossCoefWarmup();
   open_spiel::TestCollectUpdateAcceptPath();
   open_spiel::TestCollectUpdateRejectPath();
@@ -666,6 +822,7 @@ int main() {
   open_spiel::TestPruneForcedPlayouts();
   open_spiel::TestTargetSharpen();
   open_spiel::TestCollectUpdateExplorationPackage();
+  open_spiel::TestCollectUpdateAcceptancePriorSource();
   open_spiel::TestCollectUpdateSurfaceAndTelemetry();
   open_spiel::TestCollectUpdateSwordmasterGrantAll();
   open_spiel::TestCollectUpdateSwordmasterInert();

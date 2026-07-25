@@ -2149,13 +2149,17 @@ int main(int argc, char** argv) {
     std::cout << absl::StrFormat(
         "[18B] Online collection ON | aux_games=%d seed_domain=%llu "
         "dirichlet_eps=%.3f grant_frac=%.3f grant_round=%d loss_coef=%.3f/warmup%d "
-        "abort_ratio=%.3f sharpen=%.3f resume_ep=%llu logit_cap=%.3f\n",
+        "abort_ratio=%.3f sharpen=%.3f resume_ep=%llu logit_cap=%.3f "
+        "accept_prior=%s\n",
         aux_config.auxiliary_games,
         (unsigned long long)aux_config.auxiliary_search_seed_domain,
         aux_config.dirichlet_epsilon, aux_config.swordmaster_grant_fraction,
         aux_config.swordmaster_grant_round, aux_search_loss_coef_target,
         aux_search_loss_warmup, aux_abort_ratio, aux_config.target_sharpen_exponent,
-        (unsigned long long)aux_next_episode_id_persist, aux_logit_cap);
+        (unsigned long long)aux_next_episode_id_persist, aux_logit_cap,
+        // Which prior the acceptance rate in this run's diagnostics was measured
+        // against — noise does not silently redefine it (WO-20).
+        open_spiel::AcceptancePriorSourceName(aux_config.acceptance_prior_source));
   }
 
   // Collect one update's aux examples into `cr`, from the frozen snapshot. Runs
