@@ -390,26 +390,42 @@ void WorkerThread(
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
       if (p == search_seat) {
+        // Designated initializers bind by NAME. This block used to be
+        // positional, and Phase 18B's three inserted KataGo fields shifted
+        // everything after dirichlet_alpha by three slots, so this binary
+        // silently ran with dirichlet_alpha_total=1.0 and
+        // root_noise_fpu_zero=true while DROPPING --check_strategic_state,
+        // --verbose_diagnostics and --root_prior_temperature entirely
+        // (bool<->double in a braced-init list is only a -Wnarrowing warning).
+        // See WO-15 / search finding 2 — latent in the legacy constructor, live
+        // here.
         DuneSearchConfig config{
-            absl::GetFlag(FLAGS_max_simulations),
-            absl::GetFlag(FLAGS_disable_time_limit) ? std::numeric_limits<double>::infinity() : absl::GetFlag(FLAGS_relative_time_budget_ms), // relative_time_budget_ms
-            50000,   // max_nodes
-            absl::GetFlag(FLAGS_puct_c),
-            absl::GetFlag(FLAGS_use_opponent_model) ? SearchOpponentMode::kPolicy : SearchOpponentMode::kMaxN,
-            absl::GetFlag(FLAGS_temperature),
-            absl::GetFlag(FLAGS_simulated_opponent_temperature),
-            absl::GetFlag(FLAGS_max_world_samples),
-            absl::GetFlag(FLAGS_utility_divisor),
-            2,     // min_visit_threshold
-            0.50,  // covered_prior_threshold
-            game_rng(), // seed
-            DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
-            absl::GetFlag(FLAGS_dirichlet_epsilon),
-            absl::GetFlag(FLAGS_dirichlet_alpha),
-            true,  // use_observation_string
-            absl::GetFlag(FLAGS_verbose_diagnostics),
-            absl::GetFlag(FLAGS_check_strategic_state),
-            absl::GetFlag(FLAGS_root_prior_temperature)
+            .max_simulations = absl::GetFlag(FLAGS_max_simulations),
+            .relative_time_budget_ms =
+                absl::GetFlag(FLAGS_disable_time_limit)
+                    ? std::numeric_limits<double>::infinity()
+                    : absl::GetFlag(FLAGS_relative_time_budget_ms),
+            .max_nodes = 50000,
+            .puct_c = absl::GetFlag(FLAGS_puct_c),
+            .opponent_mode = absl::GetFlag(FLAGS_use_opponent_model)
+                                 ? SearchOpponentMode::kPolicy
+                                 : SearchOpponentMode::kMaxN,
+            .temperature = absl::GetFlag(FLAGS_temperature),
+            .opponent_temperature =
+                absl::GetFlag(FLAGS_simulated_opponent_temperature),
+            .max_world_samples = absl::GetFlag(FLAGS_max_world_samples),
+            .utility_divisor = absl::GetFlag(FLAGS_utility_divisor),
+            .min_visit_threshold = 2,
+            .covered_prior_threshold = 0.50,
+            .seed = game_rng(),
+            .final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
+            .dirichlet_epsilon = absl::GetFlag(FLAGS_dirichlet_epsilon),
+            .dirichlet_alpha = absl::GetFlag(FLAGS_dirichlet_alpha),
+            .use_observation_string = true,
+            .verbose_diagnostics = absl::GetFlag(FLAGS_verbose_diagnostics),
+            .check_strategic_state = absl::GetFlag(FLAGS_check_strategic_state),
+            .root_prior_temperature =
+                absl::GetFlag(FLAGS_root_prior_temperature),
         };
         config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
         config.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);

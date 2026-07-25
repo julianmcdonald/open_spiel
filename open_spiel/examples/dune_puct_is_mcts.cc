@@ -70,19 +70,41 @@ bool IsStrategicState(const State& state, Player searched_player) {
   return false;
 }
 
+namespace {
+
+// FNV-1a over a state key gives a stable identity for a position that is cheap
+// to compute and does not depend on iteration order or pointer values.
+uint64_t FnvHash64(const std::string& s) {
+  uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
+  for (char ch : s) {
+    h ^= static_cast<uint64_t>(static_cast<unsigned char>(ch));
+    h *= 1099511628211ULL;              // FNV-1a prime
+  }
+  return h;
+}
+
+}  // namespace
+
+uint64_t DeriveNodeKeyHash(int player, const std::string& key_str) {
+  return dune_seed::Combine(FnvHash64(key_str),
+                            static_cast<uint64_t>(player), /*position=*/0);
+}
+
 uint64_t DeriveRootNoiseSeed(uint64_t config_seed, uint64_t search_count,
                              int root_player, const std::string& root_key_str) {
-  // FNV-1a hash of the root state key gives a stable per-root identity so noise
-  // varies by root regardless of caller (fresh-per-root sessions, persistent
-  // sessions, or Path B bots that reuse one config seed across many roots).
-  uint64_t key_hash = 1469598103934665603ULL;  // FNV-1a offset basis
-  for (char ch : root_key_str) {
-    key_hash ^= static_cast<uint64_t>(static_cast<unsigned char>(ch));
-    key_hash *= 1099511628211ULL;              // FNV-1a prime
-  }
+  // Hashing the root state key gives a stable per-root identity so noise varies
+  // by root regardless of caller (fresh-per-root sessions, persistent sessions,
+  // or Path B bots that reuse one config seed across many roots).
   return dune_seed::DeriveSeed(config_seed, dune_seed::kStreamBlueprint,
                                search_count, static_cast<uint64_t>(root_player),
-                               key_hash);
+                               FnvHash64(root_key_str));
+}
+
+uint64_t DeriveTieBreakSeed(uint64_t config_seed, uint64_t node_key_hash,
+                            int total_visits) {
+  return dune_seed::DeriveSeed(config_seed, dune_seed::kStreamMCTS,
+                               node_key_hash,
+                               static_cast<uint64_t>(total_visits));
 }
 
 // ---------------------------------------------------------------------------
@@ -112,25 +134,36 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
     bool use_opponent_model,
     double opponent_temperature,
     bool verbose_diagnostics)
+    // WO-15 / search finding 2: this used to be a POSITIONAL braced-init of
+    // DuneSearchConfig. Phase 18B inserted dirichlet_alpha_total,
+    // forced_playouts_k and root_noise_fpu_zero ahead of use_observation_string
+    // in the struct, so the trailing bools silently slid into the KataGo
+    // doubles (bool->double is only a -Wnarrowing warning, not an error):
+    // use_observation_string=true became dirichlet_alpha_total=1.0, which
+    // switches on KataGo inverse-legal-count alpha scaling the moment anyone
+    // enables noise on this path. Designated initializers bind by NAME, so
+    // inserting a field can no longer shift anyone's value; every field the
+    // legacy signature does not carry keeps its declared default.
     : DunePUCTISMCTSBot(
           DuneSearchConfig{
-              max_simulations,
-              10000.0, // relative_time_budget_ms
-              50000,   // max_nodes
-              puct_c,
-              use_opponent_model ? SearchOpponentMode::kPolicy : SearchOpponentMode::kMaxN,
-              temperature,
-              opponent_temperature,
-              max_world_samples,
-              utility_divisor, // utility_divisor = utility_divisor
-              2,           // min_visit_threshold
-              0.50,        // covered_prior_threshold
-              seed,
-              final_policy_type,
-              dirichlet_epsilon,
-              dirichlet_alpha,
-              use_observation_string,
-              verbose_diagnostics
+              .max_simulations = max_simulations,
+              .relative_time_budget_ms = 10000.0,
+              .max_nodes = 50000,
+              .puct_c = puct_c,
+              .opponent_mode = use_opponent_model ? SearchOpponentMode::kPolicy
+                                                  : SearchOpponentMode::kMaxN,
+              .temperature = temperature,
+              .opponent_temperature = opponent_temperature,
+              .max_world_samples = max_world_samples,
+              .utility_divisor = utility_divisor,
+              .min_visit_threshold = 2,
+              .covered_prior_threshold = 0.50,
+              .seed = seed,
+              .final_policy_type = final_policy_type,
+              .dirichlet_epsilon = dirichlet_epsilon,
+              .dirichlet_alpha = dirichlet_alpha,
+              .use_observation_string = use_observation_string,
+              .verbose_diagnostics = verbose_diagnostics,
           },
           evaluator) {}
 
@@ -199,6 +232,7 @@ DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
   auto key = GetStateKey(state);
   node_pool_.push_back(std::make_unique<DuneISMCTSNode>());
   DuneISMCTSNode* node = node_pool_.back().get();
+  node->key_hash = DeriveNodeKeyHash(key.first, key.second);
   nodes_[key] = node;
   return node;
 }
@@ -240,32 +274,50 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   inference_count_this_search_++;
   RecordSampledLeaf(state);
 
-  // Initialize all legal actions with 0.0 prior first
+  // Initialize all legal actions with 0.0 prior first. Fields are assigned by
+  // name, not position, so adding a DuneChildInfo member cannot silently
+  // reassign these values (the defect class of search finding 2).
   for (Action a : state.LegalActions()) {
-    node->child_info[a] = DuneChildInfo{0, 0.0, 0.0};
+    DuneChildInfo& child = node->child_info[a];
+    child.visits = 0;
+    child.return_sum = 0.0;
+    child.prior = 0.0;
+    child.raw_prior = 0.0;
   }
 
   const ActionsAndProbs& priors = eval_res.first;
-  if (node == root_node_ && !is_continuation_ && config_.root_prior_temperature != 1.0 && config_.root_prior_temperature > 0.0) {
+  // Root-prior temperature reshapes the prior the TREE searches with. The
+  // untransformed network prior is kept alongside it in `raw_prior` for every
+  // node, because that — not the reshaped tree prior — is what starvation
+  // fallbacks play and what the item-4 KL baseline is defined against.
+  const bool scale_root_prior =
+      node == root_node_ && !is_continuation_ &&
+      config_.root_prior_temperature != 1.0 &&
+      config_.root_prior_temperature > 0.0;
+  std::vector<double> tree_probs;
+  tree_probs.reserve(priors.size());
+  if (scale_root_prior) {
     double sum = 0.0;
-    std::vector<double> scaled_probs;
-    scaled_probs.reserve(priors.size());
     for (const auto& action_prob : priors) {
-      double p = std::pow(std::max(action_prob.second, 1e-12), 1.0 / config_.root_prior_temperature);
-      scaled_probs.push_back(p);
+      double p = std::pow(std::max(action_prob.second, 1e-12),
+                          1.0 / config_.root_prior_temperature);
+      tree_probs.push_back(p);
       sum += p;
     }
-    for (size_t i = 0; i < priors.size(); ++i) {
-      Action action = priors[i].first;
-      double prob = sum > 0.0 ? (scaled_probs[i] / sum) : (1.0 / priors.size());
-      node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+    for (double& p : tree_probs) {
+      p = sum > 0.0 ? (p / sum) : (1.0 / priors.size());
     }
   } else {
     for (const auto& action_prob : priors) {
-      Action action = action_prob.first;
-      double prob = action_prob.second;
-      node->child_info[action] = DuneChildInfo{0, 0.0, prob};
+      tree_probs.push_back(action_prob.second);
     }
+  }
+  for (size_t i = 0; i < priors.size(); ++i) {
+    DuneChildInfo& child = node->child_info[priors[i].first];
+    child.visits = 0;
+    child.return_sum = 0.0;
+    child.prior = tree_probs[i];
+    child.raw_prior = priors[i].second;
   }
 
   node->cached_values.resize(state.NumPlayers());
@@ -375,6 +427,34 @@ ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizePriors(
   return result;
 }
 
+ActionsAndProbs DunePUCTISMCTSBot::FilterAndNormalizeRawPriors(
+    DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const {
+  ActionsAndProbs result;
+  result.reserve(legal_actions.size());
+  double sum_prior = 0.0;
+
+  for (Action action : legal_actions) {
+    double prior = 1e-5;  // same missing-child fallback as the tree prior
+    auto iter = node->child_info.find(action);
+    if (iter != node->child_info.end()) {
+      prior = iter->second.raw_prior;
+    }
+    result.push_back({action, prior});
+    sum_prior += prior;
+  }
+
+  if (sum_prior > 0.0) {
+    for (auto& action_prob : result) {
+      action_prob.second /= sum_prior;
+    }
+    return result;
+  }
+  // No raw prior recorded at all (node never expanded). The tree prior still
+  // carries strictly more information than uniform, so degrade to it rather
+  // than to the uniform policy this whole path exists to avoid.
+  return FilterAndNormalizePriors(node, legal_actions);
+}
+
 Action DunePUCTISMCTSBot::SelectActionTreePolicy(
     DuneISMCTSNode* node, const std::vector<Action>& legal_actions) {
   ActionsAndProbs normalized = FilterAndNormalizePriors(node, legal_actions);
@@ -440,8 +520,10 @@ Action DunePUCTISMCTSBot::SelectActionTreePolicy(
   if (best_actions.size() == 1) {
     return best_actions[0];
   } else {
-    // Deterministic tie-breaking RNG derived from stream seed
-    uint64_t tie_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamMCTS, node->total_visits);
+    // Deterministic tie-breaking RNG derived from stream seed. Keyed on the
+    // NODE as well as its local visit count — see DeriveTieBreakSeed.
+    uint64_t tie_seed =
+        DeriveTieBreakSeed(config_.seed, node->key_hash, node->total_visits);
     std::mt19937 tie_rng(tie_seed);
     return best_actions[absl::Uniform(tie_rng, 0u, best_actions.size())];
   }
@@ -741,6 +823,17 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   root_node_ = LookupOrCreateNode(state);
   InitializePriorsAndValue(root_node_, state);
 
+  // WO-15 / search finding 7: mark the root EXPANDED here, where it is actually
+  // expanded, instead of leaving total_visits at -1 for the sim loop to trip
+  // over. It used to stay -1, so simulation 0 re-reached the root, flipped it to
+  // 0 and returned the cached value without ever descending: a cold N-simulation
+  // root did N-1 descents while reporting N against the budget. The under-funded
+  // 16-sim purchase window lost 1/16 of its search to this. Continuations
+  // re-enter an already-expanded root and are unaffected.
+  if (root_node_->total_visits < 0) {
+    root_node_->total_visits = 0;
+  }
+
   // Apply Dirichlet noise exactly once at the root node's priors (if enabled).
   if (config_.dirichlet_epsilon > 0.0 && !is_continuation_ && !root_node_->dirichlet_noise_applied) {
     if (legal_actions.size() > 1) {
@@ -771,9 +864,9 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
           Action action = legal_actions[i];
           double d_noise = sum_noise > 0.0 ? (noise[i] / sum_noise) : (1.0 / legal_actions.size());
           auto& child = root_node_->child_info[action];
-          // Snapshot the pre-noise network prior BEFORE mixing, so item-4
-          // telemetry can compare visits against the noise-free baseline.
-          child.raw_prior = child.prior;
+          // Only the TREE prior is noised. child.raw_prior already holds the
+          // untransformed network prior from expansion, which is what item-4
+          // telemetry and the starvation fallbacks read.
           child.prior = (1.0 - config_.dirichlet_epsilon) * child.prior + config_.dirichlet_epsilon * d_noise;
         }
         root_node_->dirichlet_noise_applied = true;
@@ -831,6 +924,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   result.simulations_completed = sim;
 
   // Coverage Check & Fallback Logic
+  const int min_visits = EffectiveMinVisitThreshold(config_.min_visit_threshold);
   double covered_prior_mass = 0.0;
   int num_covered_actions = 0;
   ActionsAndProbs normalized_priors = FilterAndNormalizePriors(root_node_, legal_actions);
@@ -839,7 +933,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     double prior = normalized_priors[i].second;
     auto iter = root_node_->child_info.find(action);
     int visits = (iter != root_node_->child_info.end()) ? iter->second.visits : 0;
-    if (visits >= config_.min_visit_threshold) {
+    if (visits >= min_visits) {
       covered_prior_mass += prior;
       num_covered_actions++;
     }
@@ -847,7 +941,15 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
 
   int req_covered_actions = std::min<int>(3, legal_actions.size());
   if (num_covered_actions < req_covered_actions || covered_prior_mass < config_.covered_prior_threshold) {
-    result.policy = normalized_priors;
+    // WO-15 / search finding 4: degrade to the RAW network prior, not to the
+    // tree prior. At a noised root the tree prior is a 25% Dirichlet mixture
+    // (and may carry root_prior_temperature flattening), so a consumer that
+    // plays this policy — e.g. the legacy kTrainingFullFast path in
+    // dune_search_session.cc — was executing exploration noise a quarter of the
+    // time on exactly the roots the search had failed to cover. Matches what
+    // the expired-deadline fallback above and the session policy-only fallback
+    // already play.
+    result.policy = FilterAndNormalizeRawPriors(root_node_, legal_actions);
     result.used_fallback = true;
     if (result.fallback_reason == "none") {
       result.fallback_reason = "low_coverage";
@@ -872,7 +974,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
 
   Action final_proposed_action = GetRootArgmaxAction(root_node_, legal_actions);
 
-  result.diagnostics = GetRootDiagnostics(state, config_.min_visit_threshold);
+  result.diagnostics = GetRootDiagnostics(state, min_visits);
   result.diagnostics.leaf_histories = current_search_leaf_histories_;
   result.diagnostics.sampled_leaf_states = current_search_sampled_leaf_states_;
   result.diagnostics.stability_checkpoint_action = stability_checkpoint_action;
@@ -903,12 +1005,13 @@ ActionsAndProbs DunePUCTISMCTSBot::GetFinalPolicy(const State& state, DuneISMCTS
   }
 
   if (total_legal_visits == 0.0) {
-    double uniform_prob = 1.0 / legal_actions.size();
-    policy.reserve(legal_actions.size());
-    for (Action action : legal_actions) {
-      policy.push_back({action, uniform_prob});
-    }
-    return policy;
+    // WO-15 / search finding 3: the historical starvation bug lived here. A
+    // root with no visits used to yield the UNIFORM policy, which callers
+    // played verbatim and which, under argmax selection, collapses to "always
+    // the lowest legal action id". There is nothing to read from the visit
+    // counts, so degrade to the raw network prior — the same policy every other
+    // starved path in this file plays.
+    return FilterAndNormalizeRawPriors(node, legal_actions);
   }
 
   if (config_.final_policy_type == DuneISMCTSFinalPolicyType::kMaxValue) {
@@ -988,6 +1091,10 @@ std::pair<ActionsAndProbs, Action> DunePUCTISMCTSBot::StepWithPolicy(const State
 }
 
 SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action) const {
+  // Clamp here too, not just at the call site: this is a public entry point and
+  // a threshold below 1 would let a zero-visit action reach `return_sum /
+  // visits` (search finding 5).
+  const int min_visits = EffectiveMinVisitThreshold(min_visit_threshold);
   SearchDiagnostics diag;
   diag.root_value = 0.0;
   diag.total_root_visits = 0;
@@ -1023,8 +1130,11 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
       }
       diag.visit_counts.push_back(visits);
 
+      // visits >= min_visits >= 1, so this division can never be 0/0. NaN Q
+      // values used to reach both telemetry and PruneForcedPlayouts' PUCT
+      // comparisons, where they compare false and silently disable pruning.
       double q_value = diag.root_value;
-      if (visits >= min_visit_threshold) {
+      if (visits >= min_visits) {
         q_value = return_sum / visits;
         diag.num_covered_actions++;
         diag.covered_prior_mass += prior;
@@ -1032,27 +1142,15 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
       diag.q_values.push_back(q_value);
     }
 
-    // Item-4 telemetry baseline: when Dirichlet noise perturbed this root's tree
-    // priors, expose the PRE-noise network prior (normalized identically to
-    // `priors`, over the same legal-action set) so KL(visits‖raw_prior) is
-    // comparable to the noise-free 200-sim role baselines. Left empty when no
-    // noise ran, in which case `priors` already equals the raw network prior.
-    if (node->dirichlet_noise_applied) {
-      diag.raw_priors.reserve(legal_actions.size());
-      double raw_sum = 0.0;
-      for (Action action : legal_actions) {
-        double rp = 1e-5;  // matches FilterAndNormalizePriors' missing-child fallback
-        auto child_iter = node->child_info.find(action);
-        if (child_iter != node->child_info.end()) rp = child_iter->second.raw_prior;
-        diag.raw_priors.push_back(rp);
-        raw_sum += rp;
-      }
-      if (raw_sum > 0.0) {
-        for (double& rp : diag.raw_priors) rp /= raw_sum;
-      } else {
-        for (double& rp : diag.raw_priors) rp = 1.0 / legal_actions.size();
-      }
-    }
+    // Item-4 telemetry baseline: the untransformed network prior, normalized
+    // identically to `priors` over the same legal-action set, so
+    // KL(visits‖raw_prior) is comparable to the noise-free 200-sim role
+    // baselines. Populated unconditionally (WO-15): it previously appeared only
+    // under Dirichlet noise, which left consumers reading the temperature-scaled
+    // tree prior as the "raw" baseline whenever root_prior_temperature != 1.
+    ActionsAndProbs normalized_raw = FilterAndNormalizeRawPriors(node, legal_actions);
+    diag.raw_priors.reserve(normalized_raw.size());
+    for (const auto& ap : normalized_raw) diag.raw_priors.push_back(ap.second);
   } else {
     ActionsAndProbs raw_priors = evaluators_[state.CurrentPlayer()]->Prior(state);
     absl::flat_hash_map<Action, double> prior_map;

@@ -471,11 +471,13 @@ void OnlineSearchCollector::CollectUpdate(
           // Item-4 per-role telemetry: KL(visits||prior) + prior-argmax override,
           // over every searched root (accepted or not) for comparability with the
           // 200-sim role baselines (primary 0.43/24%, cont 0.51/25%, purch 0.62/29%).
-          // The baselines are vs the RAW network prior, so compare against the
-          // pre-noise prior (diag.raw_priors) when the exploration package noised
-          // the root; diag.priors (post-noise) would inflate KL and corrupt the
-          // budget decision in item 4. Falls back to diag.priors when no noise ran
-          // (then priors already equals the raw prior).
+          // The baselines are vs the RAW network prior, so compare against
+          // diag.raw_priors: diag.priors carries whatever the tree searched with
+          // (Dirichlet mixture at a noised root, root_prior_temperature
+          // flattening), either of which would inflate KL and corrupt the budget
+          // decision in item 4. Since WO-15 raw_priors is populated on every
+          // searched root and strips both; it is empty only when the root was
+          // not in the tree, where diag.priors IS the raw prior.
           if (role_idx >= 0) {
             const std::vector<double>& telemetry_priors =
                 diag.raw_priors.empty() ? diag.priors : diag.raw_priors;

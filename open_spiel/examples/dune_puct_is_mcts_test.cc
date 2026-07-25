@@ -67,6 +67,14 @@ struct TestBotAccessor {
     b.nodes_.clear();
     b.node_pool_.clear();
   }
+  static ActionsAndProbs RunGetFinalPolicy(DunePUCTISMCTSBot& b, const State& s,
+                                           DuneISMCTSNode* n) {
+    return b.GetFinalPolicy(s, n);
+  }
+  static ActionsAndProbs RunFilterRawPriors(DunePUCTISMCTSBot& b, DuneISMCTSNode* node,
+                                            const std::vector<Action>& legals) {
+    return b.FilterAndNormalizeRawPriors(node, legals);
+  }
 };
 
 namespace {
@@ -272,22 +280,35 @@ void TestValueBackpropagation() {
   auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
   DunePUCTISMCTSBot bot(42, evaluator, 1.0, 10, -1, 1.0, 0.0, 0.3, 1.0);
 
-  ActionsAndProbs policy = bot.RunSearch(*state).policy;
-  assert(!policy.empty());
+  DuneSearchResult result = bot.RunSearch(*state);
+  assert(!result.policy.empty());
 
   DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
   assert(root != nullptr);
   assert(root->total_visits > 0);
 
   // Check that the sum of returns matches the evaluation from the evaluator.
-  // Note: Out of 10 simulations, the first is spent evaluating the root node itself
-  // (which doesn't update any child). The remaining 9 simulations visit and update children.
-  // 9 * 0.8 = 7.2
+  //
+  // WO-15 / search finding 7: ALL 10 simulations descend, so 10 * 0.8 = 8.0.
+  // This used to be 7.2, because the root was left unexpanded (total_visits
+  // == -1) until simulation 0 re-reached it, flipped it to 0 and returned the
+  // cached value without descending — a silent budget-1. The advertised budget
+  // and the work actually done now agree.
   double sum_q = 0.0;
   for (const auto& action_child : root->child_info) {
     sum_q += action_child.second.return_sum;
   }
-  AssertAlmostEqual(sum_q, 7.2, 1e-4);
+  AssertAlmostEqual(sum_q, 8.0, 1e-4);
+
+  // The same accounting, stated directly: an N-simulation cold root performs N
+  // root descents, and every one of them is reported.
+  assert(result.simulations_completed == 10);
+  assert(root->total_visits == 10);
+  int summed_child_visits = 0;
+  for (const auto& action_child : root->child_info) {
+    summed_child_visits += action_child.second.visits;
+  }
+  assert(summed_child_visits == 10);
 
   std::cout << "Test 4 Passed!\n\n";
 }
@@ -1366,9 +1387,21 @@ void TestTransactionalMCTSAndTreeFallback() {
   DuneISMCTSNode* root = TestBotAccessor::CallLookupNode(bot, *state);
 
   assert(res.timeout_status == true);
-  assert(res.simulations_completed == 2); // simulation 0 and 1 completed, simulation 2 aborted and rolled back
   assert(root != nullptr);
-  assert(root->total_visits == 1); // transactional rollback of sim 2 worked!
+  // Transactional accounting: a simulation that aborts on the deadline rolls its
+  // visits back, so every simulation REPORTED is a root descent that actually
+  // happened. On a cold root that makes the two exactly equal (WO-15 / search
+  // finding 7 — it used to be off by one, because the root's own expansion
+  // consumed simulation 0 without descending). Asserted as an invariant rather
+  // than as a fixed count, which only held for one particular interleaving of
+  // the 20 ms mock latency against the 35 ms budget.
+  assert(res.simulations_completed >= 1);
+  assert(root->total_visits == res.simulations_completed);
+  int child_visit_sum = 0;
+  for (const auto& action_child : root->child_info) {
+    child_visit_sum += action_child.second.visits;
+  }
+  assert(child_visit_sum == res.simulations_completed);
 
   // 2. Tree Fallback:
   DuneSearchConfig config2;
@@ -2985,12 +3018,13 @@ void TestDeriveRootNoiseSeed() {
   std::cout << "TestDeriveRootNoiseSeed Passed!\n\n";
 }
 
-// Item 1b (telemetry comparability): when Dirichlet noise perturbs the root tree
-// priors, SearchDiagnostics must expose the PRE-noise network prior in
-// `raw_priors` (so item-4 KL is measured against the same baseline as the
-// noise-free 200-sim references), while `priors` carries the post-noise tree
-// prior. With noise OFF, `raw_priors` is empty and `priors` already equals the
-// raw prior.
+// Item 1b (telemetry comparability): SearchDiagnostics must expose the
+// UNTRANSFORMED network prior in `raw_priors` — the baseline item-4 KL is
+// defined against — while `priors` carries whatever the tree actually searched
+// with. WO-15 widened this: `raw_priors` is now populated on every searched
+// root and strips root_prior_temperature as well as Dirichlet noise. It used to
+// appear only under noise and to snapshot the POST-temperature prior, so a
+// non-unit root_prior_temperature made the "raw" baseline not raw.
 void TestRawPriorsCapturedUnderNoise() {
   std::cout << "Running TestRawPriorsCapturedUnderNoise...\n";
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -3044,24 +3078,446 @@ void TestRawPriorsCapturedUnderNoise() {
   }
   assert(l1 > 1e-6);
 
-  // --- Noise OFF: raw_priors stays empty; priors == raw network prior. ---
+  // --- Noise OFF, temperature 1: raw_priors and priors both equal the network
+  // prior. Consumers using `raw_priors.empty() ? priors : raw_priors` therefore
+  // read exactly what they read before this change. ---
   DuneSearchConfig plain;
   plain.seed = 7;
   plain.max_simulations = 32;
   plain.check_strategic_state = false;  // dirichlet_epsilon defaults to 0.0
   DunePUCTISMCTSBot bot_plain(plain, evaluator);
   SearchDiagnostics d0 = bot_plain.RunSearch(*state).diagnostics;
-  assert(d0.raw_priors.empty());
+  assert(d0.raw_priors.size() == d0.actions.size());
   for (size_t i = 0; i < d0.actions.size(); ++i) {
     assert(std::abs(d0.priors[i] - mock_priors[i].second) < 1e-6);
+    assert(std::abs(d0.raw_priors[i] - d0.priors[i]) < 1e-12);
   }
 
+  // --- Noise OFF but root_prior_temperature != 1: this is the case the old
+  // contract got wrong. The tree prior is flattened, yet `raw_priors` must
+  // still be the untransformed network prior, or the item-4 KL baseline is
+  // measured against a reshaped distribution. ---
+  DuneSearchConfig tempered;
+  tempered.seed = 7;
+  tempered.max_simulations = 32;
+  tempered.root_prior_temperature = 2.0;
+  tempered.check_strategic_state = false;
+  DunePUCTISMCTSBot bot_tempered(tempered, evaluator);
+  SearchDiagnostics dt = bot_tempered.RunSearch(*state).diagnostics;
+  assert(dt.raw_priors.size() == dt.actions.size());
+  double raw_sum_t = 0.0;
+  for (double rp : dt.raw_priors) raw_sum_t += rp;
+  assert(std::abs(raw_sum_t - 1.0) < 1e-6);
+  double l1_t = 0.0;
+  for (size_t i = 0; i < dt.actions.size(); ++i) {
+    assert(std::abs(dt.raw_priors[i] - mock_priors[i].second) < 1e-6);
+    l1_t += std::abs(dt.priors[i] - dt.raw_priors[i]);
+  }
+  assert(l1_t > 1e-6);  // the tree prior really was reshaped
+
   std::cout << "  noised L1(priors,raw)=" << l1
-            << "  (raw_priors matches the network prior)\n";
+            << "  tempered L1(priors,raw)=" << l1_t
+            << "  (raw_priors matches the network prior in both)\n";
   std::cout << "TestRawPriorsCapturedUnderNoise Passed!\n\n";
 }
 
-} // namespace
+// ---------------------------------------------------------------------------
+// WO-15 regression tests (search findings 2, 3, 4, 5, 7, 9)
+// ---------------------------------------------------------------------------
+
+// A player decision with at least two legal actions, plus a normalized,
+// deliberately NON-uniform mock prior over exactly those actions. Non-uniform
+// matters: the historical starvation bug returned the uniform policy, and a
+// uniform mock prior would make the bug indistinguishable from the fix.
+struct SkewedPriorFixture {
+  std::shared_ptr<const Game> game;
+  std::unique_ptr<State> state;
+  std::vector<Action> legal_actions;
+  ActionsAndProbs priors;
+  std::shared_ptr<MockEvaluator> evaluator;
+
+  SkewedPriorFixture() {
+    game = LoadGame("dune_imperium");
+    state = game->NewInitialState();
+    while (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    }
+    legal_actions = state->LegalActions();
+    assert(legal_actions.size() >= 3);
+    double sum = 0.0;
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      double p = 1.0 + static_cast<double>(i);  // strictly increasing
+      priors.push_back({legal_actions[i], p});
+      sum += p;
+    }
+    for (auto& ap : priors) ap.second /= sum;
+    evaluator = std::make_shared<MockEvaluator>(
+        priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+  }
+};
+
+bool IsUniformPolicy(const ActionsAndProbs& policy) {
+  if (policy.empty()) return false;
+  double u = 1.0 / policy.size();
+  for (const auto& ap : policy) {
+    if (std::abs(ap.second - u) > 1e-9) return false;
+  }
+  return true;
+}
+
+// Search finding 2: the legacy seed-first constructor used positional
+// braced-init, so Phase 18B's three inserted KataGo fields shifted the trailing
+// bools into `dirichlet_alpha_total` / `forced_playouts_k`. Every field is
+// inspected here — both the ones the signature carries and the ones it must
+// leave at their declared defaults — so a future field insertion fails loudly
+// instead of silently rebinding someone's value.
+void TestLegacyConstructorFieldAlignment() {
+  std::cout << "Running TestLegacyConstructorFieldAlignment...\n";
+  SkewedPriorFixture f;
+  const DuneSearchConfig defaults;
+
+  for (bool obs_string : {true, false}) {
+    for (bool verbose : {true, false}) {
+      DunePUCTISMCTSBot bot(
+          /*seed=*/98765, f.evaluator, /*puct_c=*/0.77, /*max_simulations=*/37,
+          /*max_world_samples=*/5, /*temperature=*/0.6,
+          /*dirichlet_epsilon=*/0.11, /*dirichlet_alpha=*/0.42,
+          /*utility_divisor=*/3.5, obs_string,
+          DuneISMCTSFinalPolicyType::kMaxValue,
+          /*use_opponent_model=*/true, /*opponent_temperature=*/0.25, verbose);
+      const DuneSearchConfig& c = bot.GetConfig();
+
+      // Fields the legacy signature carries.
+      assert(c.max_simulations == 37);
+      assert(c.puct_c == 0.77);
+      assert(c.opponent_mode == SearchOpponentMode::kPolicy);
+      assert(c.temperature == 0.6);
+      assert(c.opponent_temperature == 0.25);
+      assert(c.max_world_samples == 5);
+      assert(c.utility_divisor == 3.5);
+      assert(c.seed == 98765ULL);
+      assert(c.final_policy_type == DuneISMCTSFinalPolicyType::kMaxValue);
+      assert(c.dirichlet_epsilon == 0.11);
+      assert(c.dirichlet_alpha == 0.42);
+      assert(c.use_observation_string == obs_string);
+      assert(c.verbose_diagnostics == verbose);
+
+      // Fields the legacy signature fixes.
+      assert(c.relative_time_budget_ms == 10000.0);
+      assert(c.max_nodes == 50000);
+      assert(c.min_visit_threshold == 2);
+      assert(c.covered_prior_threshold == 0.50);
+
+      // THE REGRESSION: the Phase 18B KataGo package must keep its defaults.
+      // Under the old positional init, use_observation_string=true landed here
+      // as dirichlet_alpha_total=1.0, silently switching on inverse-legal-count
+      // alpha scaling for anyone who enabled noise on this path.
+      assert(c.dirichlet_alpha_total == defaults.dirichlet_alpha_total);
+      assert(c.dirichlet_alpha_total == 0.0);
+      assert(c.forced_playouts_k == defaults.forced_playouts_k);
+      assert(c.forced_playouts_k == 0.0);
+      assert(c.root_noise_fpu_zero == defaults.root_noise_fpu_zero);
+      assert(c.root_noise_fpu_zero == false);
+
+      // Every remaining field must equal its declared default.
+      assert(c.check_strategic_state == defaults.check_strategic_state);
+      assert(c.root_prior_temperature == defaults.root_prior_temperature);
+      assert(c.training_root_prior_temperature ==
+             defaults.training_root_prior_temperature);
+      assert(c.fixed_continuation_reserve == defaults.fixed_continuation_reserve);
+      assert(c.purchase_combat_budget == defaults.purchase_combat_budget);
+      assert(c.live_continuation_reserve_seconds ==
+             defaults.live_continuation_reserve_seconds);
+      assert(c.fixed_session_limit == defaults.fixed_session_limit);
+      assert(c.model_checkpoint_path == defaults.model_checkpoint_path);
+      assert(c.conservative_override_enabled ==
+             defaults.conservative_override_enabled);
+      assert(c.conservative_covered_prior_threshold ==
+             defaults.conservative_covered_prior_threshold);
+      assert(c.conservative_meaningful_visit_threshold ==
+             defaults.conservative_meaningful_visit_threshold);
+      assert(c.conservative_q_margin_threshold ==
+             defaults.conservative_q_margin_threshold);
+      assert(c.conservative_stability_checkpoint_fraction ==
+             defaults.conservative_stability_checkpoint_fraction);
+      assert(c.conservative_continuation_overrides_disabled ==
+             defaults.conservative_continuation_overrides_disabled);
+      assert(c.max_search_decision_depth == defaults.max_search_decision_depth);
+    }
+  }
+  std::cout << "TestLegacyConstructorFieldAlignment Passed!\n\n";
+}
+
+// Search findings 3 and 5: min_visit_threshold <= 0 used to let a zero-visit
+// root pass the coverage gate trivially, which returned the UNIFORM policy
+// (the historical starvation bug) and evaluated return_sum/visits as 0/0.
+void TestZeroVisitAndThresholdZeroContract() {
+  std::cout << "Running TestZeroVisitAndThresholdZeroContract...\n";
+
+  // The contract itself, stated once.
+  assert(EffectiveMinVisitThreshold(0) == 1);
+  assert(EffectiveMinVisitThreshold(-7) == 1);
+  assert(EffectiveMinVisitThreshold(1) == 1);
+  assert(EffectiveMinVisitThreshold(2) == 2);
+
+  SkewedPriorFixture f;
+  for (int threshold : {0, -1, 1, 2}) {
+    DuneSearchConfig config;
+    config.max_simulations = 0;  // root expanded, zero visits anywhere
+    config.min_visit_threshold = threshold;
+    config.check_strategic_state = false;
+    DunePUCTISMCTSBot bot(config, f.evaluator);
+    DuneSearchResult res = bot.RunSearch(*f.state);
+
+    // A zero-visit root is starved regardless of how the threshold is set.
+    assert(res.used_fallback);
+    assert(res.diagnostics.num_covered_actions == 0);
+    AssertAlmostEqual(res.diagnostics.covered_prior_mass, 0.0);
+
+    // The policy is the raw network prior — finite, normalized, NOT uniform.
+    assert(res.policy.size() == f.legal_actions.size());
+    double sum = 0.0;
+    for (const auto& ap : res.policy) {
+      assert(std::isfinite(ap.second));
+      sum += ap.second;
+    }
+    AssertAlmostEqual(sum, 1.0);
+    assert(!IsUniformPolicy(res.policy));
+    for (size_t i = 0; i < res.policy.size(); ++i) {
+      assert(res.policy[i].first == f.priors[i].first);
+      AssertAlmostEqual(res.policy[i].second, f.priors[i].second);
+    }
+
+    // No NaN anywhere in the diagnostics the collector and the forced-playout
+    // pruner read. A NaN Q compares false against everything, which silently
+    // disables PruneForcedPlayouts for that child.
+    for (double q : res.diagnostics.q_values) assert(std::isfinite(q));
+    for (double p : res.diagnostics.priors) assert(std::isfinite(p));
+    for (double p : res.diagnostics.raw_priors) assert(std::isfinite(p));
+  }
+
+  // The public diagnostics entry point clamps too: a caller passing 0 directly
+  // must not be able to reach 0/0.
+  DuneSearchConfig config;
+  config.max_simulations = 0;
+  config.check_strategic_state = false;
+  DunePUCTISMCTSBot bot(config, f.evaluator);
+  bot.RunSearch(*f.state);
+  for (int threshold : {0, -3}) {
+    SearchDiagnostics diag = bot.GetRootDiagnostics(*f.state, threshold);
+    assert(diag.num_covered_actions == 0);
+    for (double q : diag.q_values) assert(std::isfinite(q));
+  }
+
+  // Defense in depth at the exact former bug site: GetFinalPolicy on a
+  // zero-visit node returns the raw prior, never uniform.
+  DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
+  assert(root != nullptr);
+  ActionsAndProbs final_policy =
+      TestBotAccessor::RunGetFinalPolicy(bot, *f.state, root);
+  assert(!IsUniformPolicy(final_policy));
+  for (size_t i = 0; i < final_policy.size(); ++i) {
+    AssertAlmostEqual(final_policy[i].second, f.priors[i].second);
+  }
+
+  std::cout << "TestZeroVisitAndThresholdZeroContract Passed!\n\n";
+}
+
+// Search finding 4: at a noised root the stored tree prior is a 25% Dirichlet
+// mixture (and may also carry root_prior_temperature flattening). The
+// low-coverage fallback must degrade to the RAW network prior, or a consumer
+// that plays the fallback policy executes exploration noise as if it were the
+// policy.
+void TestNoisedLowCoverageFallsBackToRawPrior() {
+  std::cout << "Running TestNoisedLowCoverageFallsBackToRawPrior...\n";
+  SkewedPriorFixture f;
+
+  // Pilot exploration package, starved so the coverage gate always trips.
+  DuneSearchConfig noised;
+  noised.seed = 7;
+  noised.max_simulations = 2;
+  noised.min_visit_threshold = 2;
+  noised.dirichlet_epsilon = 0.25;
+  noised.dirichlet_alpha_total = 10.83;
+  noised.check_strategic_state = false;
+  DunePUCTISMCTSBot bot(noised, f.evaluator);
+  DuneSearchResult res = bot.RunSearch(*f.state);
+
+  assert(res.used_fallback);
+  assert(res.fallback_reason == "low_coverage");
+
+  DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
+  assert(root != nullptr);
+  assert(root->dirichlet_noise_applied);  // the premise: noise really ran
+
+  // The fallback policy is the raw network prior...
+  assert(res.policy.size() == f.legal_actions.size());
+  for (size_t i = 0; i < res.policy.size(); ++i) {
+    assert(res.policy[i].first == f.priors[i].first);
+    AssertAlmostEqual(res.policy[i].second, f.priors[i].second);
+  }
+  // ...and that is a real distinction: the tree prior it used to return is
+  // measurably different.
+  ActionsAndProbs tree_prior =
+      TestBotAccessor::RunFilterPriors(bot, root, f.legal_actions);
+  double l1 = 0.0;
+  for (size_t i = 0; i < tree_prior.size(); ++i) {
+    l1 += std::abs(tree_prior[i].second - res.policy[i].second);
+  }
+  assert(l1 > 1e-6);
+
+  // Same requirement under root-prior temperature, with noise off: the
+  // fallback strips the temperature reshaping too.
+  DuneSearchConfig tempered;
+  tempered.seed = 7;
+  tempered.max_simulations = 2;
+  tempered.min_visit_threshold = 2;
+  tempered.root_prior_temperature = 2.0;
+  tempered.check_strategic_state = false;
+  DunePUCTISMCTSBot bot_t(tempered, f.evaluator);
+  DuneSearchResult res_t = bot_t.RunSearch(*f.state);
+  assert(res_t.used_fallback);
+  assert(res_t.fallback_reason == "low_coverage");
+  for (size_t i = 0; i < res_t.policy.size(); ++i) {
+    AssertAlmostEqual(res_t.policy[i].second, f.priors[i].second);
+  }
+  DuneISMCTSNode* root_t = TestBotAccessor::GetRootNode(bot_t);
+  ActionsAndProbs tree_prior_t =
+      TestBotAccessor::RunFilterPriors(bot_t, root_t, f.legal_actions);
+  double l1_t = 0.0;
+  for (size_t i = 0; i < tree_prior_t.size(); ++i) {
+    l1_t += std::abs(tree_prior_t[i].second - res_t.policy[i].second);
+  }
+  assert(l1_t > 1e-6);
+
+  std::cout << "  noised L1(tree,fallback)=" << l1
+            << "  tempered L1(tree,fallback)=" << l1_t << "\n";
+  std::cout << "TestNoisedLowCoverageFallsBackToRawPrior Passed!\n\n";
+}
+
+// Search finding 7: a cold N-simulation root must perform N root descents. It
+// used to perform N-1 — the root's own expansion consumed simulation 0 — while
+// still reporting N against the session budget.
+void TestColdRootPerformsFullBudget() {
+  std::cout << "Running TestColdRootPerformsFullBudget...\n";
+  SkewedPriorFixture f;
+
+  for (int budget : {1, 2, 7, 16, 64}) {
+    DuneSearchConfig config;
+    config.max_simulations = budget;
+    config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+    config.check_strategic_state = false;
+    DunePUCTISMCTSBot bot(config, f.evaluator);
+    DuneSearchResult res = bot.RunSearch(*f.state);
+
+    assert(res.simulations_completed == budget);
+    DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
+    assert(root != nullptr);
+    // Every advertised simulation is a root descent that actually happened.
+    assert(root->total_visits == budget);
+    int summed = 0;
+    for (const auto& child : root->child_info) summed += child.second.visits;
+    assert(summed == budget);
+    // ...and the visit counts the collector reads agree.
+    int diag_summed = 0;
+    for (int v : res.diagnostics.visit_counts) diag_summed += v;
+    assert(diag_summed == budget);
+  }
+
+  // A continuation re-enters an already-expanded root and keeps accumulating;
+  // it must not pay the expansion cost a second time.
+  DuneSearchConfig config;
+  config.max_simulations = 8;
+  config.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+  config.check_strategic_state = false;
+  DunePUCTISMCTSBot bot(config, f.evaluator);
+  bot.RunSearch(*f.state, /*max_sims=*/8, /*max_time_ms=*/-1.0,
+                /*start_sim_index=*/0);
+  DuneSearchResult cont =
+      bot.RunSearch(*f.state, /*max_sims=*/5, /*max_time_ms=*/-1.0,
+                    /*start_sim_index=*/8);
+  assert(cont.simulations_completed == 5);
+  DuneISMCTSNode* root = TestBotAccessor::GetRootNode(bot);
+  assert(root->total_visits == 13);
+
+  std::cout << "TestColdRootPerformsFullBudget Passed!\n\n";
+}
+
+// Search finding 9: the PUCT tie-break stream was keyed only on
+// (seed, kStreamMCTS, total_visits), so every node at the same local visit
+// count drew the identical tie-break — a correlated repeating pattern across
+// the whole tree, worst at fresh nodes where uniform priors make ties the norm.
+void TestTieBreakSeedIncludesNodeIdentity() {
+  std::cout << "Running TestTieBreakSeedIncludesNodeIdentity...\n";
+
+  // Unit level: each input dimension perturbs the stream, and equal inputs
+  // reproduce (deterministic replay).
+  assert(DeriveNodeKeyHash(0, "keyA") == DeriveNodeKeyHash(0, "keyA"));
+  assert(DeriveNodeKeyHash(0, "keyA") != DeriveNodeKeyHash(0, "keyB"));
+  assert(DeriveNodeKeyHash(0, "keyA") != DeriveNodeKeyHash(1, "keyA"));
+  assert(DeriveTieBreakSeed(42, 111, 7) == DeriveTieBreakSeed(42, 111, 7));
+  assert(DeriveTieBreakSeed(42, 111, 7) != DeriveTieBreakSeed(42, 222, 7));  // node
+  assert(DeriveTieBreakSeed(42, 111, 7) != DeriveTieBreakSeed(42, 111, 8));  // visits
+  assert(DeriveTieBreakSeed(43, 111, 7) != DeriveTieBreakSeed(42, 111, 7));  // seed
+
+  // Behavioral: two distinct nodes, identical tied children, identical local
+  // visit counts. They must not be forced into the same draw at every count.
+  SkewedPriorFixture f;
+  DuneSearchConfig config;
+  config.puct_c = 1.0;
+  config.check_strategic_state = false;
+  DunePUCTISMCTSBot bot(config, f.evaluator);
+
+  std::vector<Action> tied = {f.legal_actions[0], f.legal_actions[1]};
+  auto make_tied_node = [&](uint64_t key_hash) {
+    DuneISMCTSNode node;
+    node.priors_initialized = true;
+    node.key_hash = key_hash;
+    for (Action a : tied) {
+      DuneChildInfo& child = node.child_info[a];
+      child.prior = 0.5;      // exact PUCT tie between two unvisited children
+      child.raw_prior = 0.5;
+    }
+    return node;
+  };
+  DuneISMCTSNode node_a = make_tied_node(DeriveNodeKeyHash(0, "nodeA"));
+  DuneISMCTSNode node_b = make_tied_node(DeriveNodeKeyHash(0, "nodeB"));
+
+  int disagreements = 0;
+  for (int v = 0; v <= 31; ++v) {
+    node_a.total_visits = v;
+    node_b.total_visits = v;
+    Action pick_a = TestBotAccessor::RunSelectTree(bot, &node_a, tied);
+    Action pick_b = TestBotAccessor::RunSelectTree(bot, &node_b, tied);
+    // Determinism is preserved: the same node at the same count replays.
+    assert(TestBotAccessor::RunSelectTree(bot, &node_a, tied) == pick_a);
+    if (pick_a != pick_b) ++disagreements;
+  }
+  assert(disagreements > 0);
+
+  // Deterministic replay end to end: two bots with the same seed and config
+  // produce byte-identical policies and visit counts.
+  DuneSearchConfig replay;
+  replay.max_simulations = 24;
+  replay.seed = 4242;
+  replay.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+  replay.check_strategic_state = false;
+  DunePUCTISMCTSBot bot1(replay, f.evaluator);
+  DunePUCTISMCTSBot bot2(replay, f.evaluator);
+  DuneSearchResult r1 = bot1.RunSearch(*f.state);
+  DuneSearchResult r2 = bot2.RunSearch(*f.state);
+  assert(r1.policy == r2.policy);
+  assert(r1.diagnostics.visit_counts == r2.diagnostics.visit_counts);
+  assert(r1.diagnostics.q_values == r2.diagnostics.q_values);
+  assert(r1.simulations_completed == r2.simulations_completed);
+
+  std::cout << "  tie-break disagreements across 32 visit counts: "
+            << disagreements << "/32\n";
+  std::cout << "TestTieBreakSeedIncludesNodeIdentity Passed!\n\n";
+}
+
+}  // namespace
+
 } // namespace open_spiel
 
 int main() {
@@ -3107,6 +3563,12 @@ int main() {
   open_spiel::TestDecisionDepthSimulationAccounting();
   open_spiel::TestDeriveRootNoiseSeed();
   open_spiel::TestRawPriorsCapturedUnderNoise();
+  // WO-15 (search findings 2, 3, 4, 5, 7, 9)
+  open_spiel::TestLegacyConstructorFieldAlignment();
+  open_spiel::TestZeroVisitAndThresholdZeroContract();
+  open_spiel::TestNoisedLowCoverageFallsBackToRawPrior();
+  open_spiel::TestColdRootPerformsFullBudget();
+  open_spiel::TestTieBreakSeedIncludesNodeIdentity();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

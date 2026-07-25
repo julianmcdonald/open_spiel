@@ -39,6 +39,10 @@ struct DuneSearchConfig {
   double opponent_temperature = 1.0;
   int max_world_samples = -1;
   double utility_divisor = 4.0;
+  // Visits an action needs before it counts as "covered" by the search (and
+  // before its empirical Q is trusted over the root value). See
+  // EffectiveMinVisitThreshold: values below 1 are meaningless — a zero-visit
+  // action has no empirical Q — and are clamped to 1 rather than honored.
   int min_visit_threshold = 2;
   double covered_prior_threshold = 0.50;
   uint64_t seed = 42;
@@ -93,10 +97,18 @@ struct SearchDiagnostics {
   std::vector<int> visit_counts;     // N(a) per action
   std::vector<double> q_values;      // Empirical Q for covered, root_value for unsupported
   std::vector<double> priors;        // Tree prior π(a) at root — POST-noise when noised
-  // Pre-noise (raw network) prior, aligned to `actions`. Populated ONLY when
-  // Dirichlet noise was applied at this root; empty otherwise. Consumers that
-  // need a noise-free baseline (item-4 per-role KL telemetry) use this and fall
-  // back to `priors` when empty (no noise ⇒ priors already equal the raw prior).
+  // The UNTRANSFORMED network prior, aligned to `actions` and normalized over
+  // the same legal-action set as `priors`. This is the baseline the item-4
+  // per-role KL telemetry is defined against, so it strips BOTH root
+  // transformations the tree prior may carry: `root_prior_temperature` scaling
+  // and the Dirichlet mixture. Populated whenever the root is present in the
+  // search tree; empty only when it is not (in which case `priors` was built
+  // straight from the evaluator and is already the raw prior).
+  //
+  // WO-15: this used to be populated only when Dirichlet noise ran, and it
+  // snapshotted the POST-temperature prior, so under a non-unit
+  // `root_prior_temperature` the "raw" baseline was not raw. Consumers keep the
+  // `raw_priors.empty() ? priors : raw_priors` idiom; it is now exact.
   std::vector<double> raw_priors;
   double root_value = 0.0;           // Cached V(s) at root
   int total_root_visits = 0;
@@ -203,6 +215,32 @@ bool IsStrategicState(const State& state, Player searched_player);
 uint64_t DeriveRootNoiseSeed(uint64_t config_seed, uint64_t search_count,
                              int root_player, const std::string& root_key_str);
 
+// Stable 64-bit identity for a node's transposition key. Exposed so tests can
+// build nodes whose tie-break streams differ exactly as the search's do.
+uint64_t DeriveNodeKeyHash(int player, const std::string& key_str);
+
+// PUCT tie-break stream seed (WO-15 / search finding 9). MUST include the
+// node's identity: keying only on (seed, stream, total_visits) gave every node
+// at the same local visit count the identical draw, so ties among equal-PUCT
+// children resolved in one correlated repeating pattern across the whole tree
+// (worst at fresh nodes, where uniform priors make ties the common case).
+// Deterministic: identical inputs => identical seed.
+uint64_t DeriveTieBreakSeed(uint64_t config_seed, uint64_t node_key_hash,
+                            int total_visits);
+
+// The coverage/Q gate actually applied, given a configured min_visit_threshold.
+//
+// WO-15 (search findings 3 and 5) defines the <= 0 edge instead of honoring it.
+// A threshold of 0 made a zero-visit root pass the coverage gate trivially,
+// which (a) resurrected the historical uniform-policy starvation bug in
+// GetFinalPolicy and (b) evaluated `return_sum / visits` as 0/0, feeding NaN Q
+// values into telemetry and into PruneForcedPlayouts' PUCT comparisons (where
+// NaN compares false and silently disables pruning). "Covered" is only
+// meaningful for an action the search actually visited, so the floor is 1.
+constexpr int EffectiveMinVisitThreshold(int configured_threshold) {
+  return configured_threshold < 1 ? 1 : configured_threshold;
+}
+
 // ---------------------------------------------------------------------------
 // Bot structures
 // ---------------------------------------------------------------------------
@@ -210,11 +248,15 @@ uint64_t DeriveRootNoiseSeed(uint64_t config_seed, uint64_t search_count,
 struct DuneChildInfo {
   int visits = 0;
   double return_sum = 0.0;
+  // The tree prior the search actually uses. At the root this may carry
+  // `root_prior_temperature` scaling and, when enabled, the Dirichlet mixture.
   double prior = 0.0;
-  // Pre-noise network prior, snapshotted at the root exactly before Dirichlet
-  // noise mixes into `prior`. Only meaningful when the root's
-  // `dirichlet_noise_applied` is set; used for noise-free telemetry baselines
-  // (item-4 KL). `prior` itself carries the post-noise tree prior the search uses.
+  // The UNTRANSFORMED network prior for this action, snapshotted at expansion
+  // before either root transformation is applied. Populated for every expanded
+  // node, and it is what every starvation fallback degrades to — the invariant
+  // is "starved paths play the RAW network prior", and playing a noised or
+  // temperature-flattened prior would execute exploration noise as if it were
+  // the policy. Also the item-4 KL telemetry baseline.
   double raw_prior = 0.0;
   double value() const { return visits > 0 ? return_sum / visits : 0.0; }
 };
@@ -226,6 +268,11 @@ struct DuneISMCTSNode {
   double cached_value = 0.0;  // Neural V(s) for this node's current player
   std::vector<double> cached_values; // Neural V(s) for all players
   bool dirichlet_noise_applied = false;
+  // Stable identity of this node's transposition key, mixed into the PUCT
+  // tie-break stream so two different nodes at the same local visit count do
+  // not draw the same tie-break (search finding 9). 0 for nodes built outside
+  // the tree (tests); harmless, since determinism is what matters there.
+  uint64_t key_hash = 0;
 };
 
 struct TestBotAccessor;
@@ -292,6 +339,10 @@ class DunePUCTISMCTSBot : public Bot {
   Action SelectActionTreePolicy(DuneISMCTSNode* node, const std::vector<Action>& legal_actions);
   void InitializePriorsAndValue(DuneISMCTSNode* node, const State& state);
   ActionsAndProbs FilterAndNormalizePriors(DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const;
+  // Same shape as FilterAndNormalizePriors but over DuneChildInfo::raw_prior:
+  // the untransformed network prior, free of root temperature scaling and
+  // Dirichlet noise. This is the policy every starvation path degrades to.
+  ActionsAndProbs FilterAndNormalizeRawPriors(DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const;
   ActionsAndProbs GetFinalPolicy(const State& state, DuneISMCTSNode* node) const;
 
   std::mt19937 rng_;
