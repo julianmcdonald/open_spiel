@@ -119,7 +119,15 @@ class MockEvaluator : public algorithms::Evaluator {
   int sleep_ms_;
 };
 
-// Test 1: Key Uniqueness and history size presence
+// Test 1: Key uniqueness, and that the key carries NO path-derived field.
+//
+// This test used to assert that ObservationString CONTAINS "|history_size=".
+// That pinned the wrong contract: history length is a property of the path
+// taken, not of the position, so two identical frozen positions reached in a
+// different number of moves received different transposition keys and never
+// shared search statistics. WO-31 removed it; the assertion is now inverted.
+// Key uniqueness itself — the real point of this test — is unchanged and does
+// not depend on history_size: applying an action moves the position.
 void TestKeyUniqueness() {
   std::cout << "Running Test 1: Key Uniqueness...\n";
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -132,15 +140,20 @@ void TestKeyUniqueness() {
   }
 
   std::string obs1 = state->ObservationString(state->CurrentPlayer());
-  assert(obs1.find("|history_size=") != std::string::npos);
+  assert(obs1.find("history_size") == std::string::npos);
 
-  // Take a legal action and observe change in history size
+  // Take a legal action; the position — and therefore the key — must change.
   std::vector<Action> actions = state->LegalActions();
   state->ApplyAction(actions.front());
 
   std::string obs2 = state->ObservationString(state->CurrentPlayer());
-  assert(obs2.find("|history_size=") != std::string::npos);
+  assert(obs2.find("history_size") == std::string::npos);
   assert(obs1 != obs2);
+
+  // The InformationStateString is NOT the transposition key and legitimately
+  // keeps history_size in its body, outside the shared |obs= tail.
+  const std::string info = state->InformationStateString(state->CurrentPlayer());
+  assert(info.find("|history_size=") != std::string::npos);
 
   std::cout << "Test 1 Passed!\n\n";
 }
