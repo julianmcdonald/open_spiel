@@ -277,9 +277,17 @@ std::unique_ptr<State> ReconstructState(
   return state;
 }
 
-// Evaluate a single rollout using a generic algorithms::Evaluator pointer
-double RunRawPolicyRollout(const State& start_state, Player owner, algorithms::Evaluator* evaluator, uint64_t seed, double utility_divisor) {
-  std::mt19937 rng(seed);
+// Evaluate a single rollout using a generic algorithms::Evaluator pointer.
+//
+// Takes an already-constructed RNG rather than a seed so the seeding policy
+// stays visible at the call site. That distinction is load-bearing: the gate
+// families pass std::mt19937(seed) directly (their seeds are small, and any
+// change to the construction would re-roll recorded gate metrics), while the
+// diagnostic families must pass a dune_fidelity_seeds::Make*Rng factory, whose
+// seed_seq construction preserves all 64 bits of the derived seed. Seeding
+// mt19937 directly from a derived 64-bit seed truncates to 32 bits and
+// reintroduces collisions.
+double RunRawPolicyRollout(const State& start_state, Player owner, algorithms::Evaluator* evaluator, std::mt19937 rng, double utility_divisor) {
   auto state = start_state.Clone();
   const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
   SPIEL_CHECK_TRUE(dune_state != nullptr);
@@ -351,8 +359,9 @@ ForcedActionRolloutResult RunForcedActionPolicyRollout(
   double critic = state->IsTerminal()
       ? state->Returns()[owner] / utility_divisor
       : evaluator->Evaluate(*state)[owner];
+  // Gate family: narrow seeding preserved verbatim.
   double final_return = RunRawPolicyRollout(
-      *state, owner, evaluator, rollout_seed, utility_divisor);
+      *state, owner, evaluator, std::mt19937(rollout_seed), utility_divisor);
   return {final_return, critic};
 }
 
@@ -2840,9 +2849,10 @@ int main(int argc, char** argv) {
         int k = local_task;
         // Aligned seeds with Gate 1 space prefix 300000
         uint64_t roll_seed = dune_fidelity_seeds::Gate1RolloutSeed(idx, k);
+        // Gate family: narrow seeding preserved verbatim.
         gate1_returns[idx][k - 1] = RunRawPolicyRollout(
-            *gate1_states[idx], cs.player, global_evaluator.get(), roll_seed,
-            utility_divisor);
+            *gate1_states[idx], cs.player, global_evaluator.get(),
+            std::mt19937(roll_seed), utility_divisor);
       }
       int done = completed_gate1_tasks.fetch_add(1) + 1;
       completed_g1.store(std::min<int>(gate1_indices.size(), done / tasks_per_state));
@@ -3677,10 +3687,10 @@ int main(int argc, char** argv) {
           }
           double leaf_true_sum = 0.0;
           for (int r = 1; r <= diagnostic_rollouts; ++r) {
-            uint64_t leaf_seed = dune_fidelity_seeds::LeafRolloutSeed(
-                raw_policy_seed, seed_index, l_idx, r);
             leaf_true_sum += RunRawPolicyRollout(
-                *leaf_state, cs.player, global_evaluator.get(), leaf_seed,
+                *leaf_state, cs.player, global_evaluator.get(),
+                dune_fidelity_seeds::MakeLeafRolloutRng(
+                    raw_policy_seed, seed_index, l_idx, r),
                 utility_divisor);
           }
           ev.leaf_critic_values.push_back(leaf_critic);
@@ -3913,15 +3923,11 @@ int main(int argc, char** argv) {
           int roll_count = effective_diagnostic_rollouts;
 
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t chance_seed = dune_fidelity_seeds::SuccessorChanceSeed(
-                raw_policy_seed, seed_index, a_idx, r);
-            uint64_t roll_seed = dune_fidelity_seeds::SuccessorRolloutSeed(
-                raw_policy_seed, seed_index, a_idx, r);
-
             auto roll_state = state->Clone();
             roll_state->ApplyAction(act);
 
-            std::mt19937 temp_rng(chance_seed);
+            std::mt19937 temp_rng = dune_fidelity_seeds::MakeSuccessorChanceRng(
+                raw_policy_seed, seed_index, a_idx, r);
             while (roll_state->IsChanceNode()) {
               auto outcomes = roll_state->ChanceOutcomes();
               if (outcomes.empty()) break;
@@ -3940,7 +3946,11 @@ int main(int argc, char** argv) {
             }
             succ_critic_sum += c_val;
 
-            succ_true_sum += RunRawPolicyRollout(*roll_state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
+            succ_true_sum += RunRawPolicyRollout(
+                *roll_state, cs.player, global_evaluator.get(),
+                dune_fidelity_seeds::MakeSuccessorRolloutRng(
+                    raw_policy_seed, seed_index, a_idx, r),
+                utility_divisor);
           }
 
           successor_critic_vals.push_back(succ_critic_sum / roll_count);
@@ -4005,9 +4015,11 @@ int main(int argc, char** argv) {
           double leaf_true_sum = 0.0;
           int roll_count = effective_diagnostic_rollouts;
           for (int r = 1; r <= roll_count; ++r) {
-            uint64_t roll_seed = dune_fidelity_seeds::LeafRolloutSeed(
-                raw_policy_seed, seed_index, l_idx, r);
-            leaf_true_sum += RunRawPolicyRollout(*leaf_state, cs.player, global_evaluator.get(), roll_seed, utility_divisor);
+            leaf_true_sum += RunRawPolicyRollout(
+                *leaf_state, cs.player, global_evaluator.get(),
+                dune_fidelity_seeds::MakeLeafRolloutRng(
+                    raw_policy_seed, seed_index, l_idx, r),
+                utility_divisor);
           }
           double leaf_true_val = leaf_true_sum / roll_count;
 

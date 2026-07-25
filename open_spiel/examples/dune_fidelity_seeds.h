@@ -35,6 +35,7 @@
 #pragma once
 
 #include <cstdint>
+#include <random>
 
 #include "dune_seed_utils.h"
 
@@ -140,6 +141,57 @@ inline uint64_t LeafRolloutSeed(uint64_t raw_policy_seed,
                                dune_seed::kStreamFidelityLeafRollout,
                                raw_policy_seed, state_index, leaf_index,
                                replicate);
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic RNG construction. Callers must go through these.
+// ---------------------------------------------------------------------------
+//
+// The seed functions above return full 64-bit values, but std::mt19937's
+// single-value constructor takes a 32-bit result_type: seeding it directly from
+// a derived seed silently discards the high half. Over the supported diagnostic
+// grid (32 states x 40 actions/leaves x 256 replicates) that truncation
+// reintroduces exactly the collisions the 64-bit derivation exists to remove --
+// 18 colliding coordinate pairs for the successor-chance stream, 11 for
+// successor-rollout, 8 for leaf-rollout. dune_seed::MakeRng32 seeds through a
+// seed_seq built from both halves, so the whole derived value reaches the RNG
+// state.
+//
+// These factories are the single construction path for production and tests
+// alike, deliberately: an earlier revision of this change asserted injectivity
+// over the 64-bit seed values while the binary consumed truncated ones, so the
+// tests passed green while the collisions remained. Assert on what runs.
+//
+// The gate families keep plain std::mt19937(seed) construction at their call
+// sites and are intentionally absent here. Their seeds are small by
+// construction (base + 1000 * state + replicate, far below 2^32, so nothing is
+// truncated), and routing them through a seed_seq would change every gate RNG
+// stream -- the exact re-roll this work order set out to avoid.
+
+inline std::mt19937 MakeSuccessorChanceRng(uint64_t raw_policy_seed,
+                                           uint64_t state_index,
+                                           uint64_t action_index,
+                                           uint64_t replicate) {
+  return dune_seed::MakeRng32(
+      SuccessorChanceSeed(raw_policy_seed, state_index, action_index,
+                          replicate));
+}
+
+inline std::mt19937 MakeSuccessorRolloutRng(uint64_t raw_policy_seed,
+                                            uint64_t state_index,
+                                            uint64_t action_index,
+                                            uint64_t replicate) {
+  return dune_seed::MakeRng32(
+      SuccessorRolloutSeed(raw_policy_seed, state_index, action_index,
+                           replicate));
+}
+
+inline std::mt19937 MakeLeafRolloutRng(uint64_t raw_policy_seed,
+                                       uint64_t state_index,
+                                       uint64_t leaf_index,
+                                       uint64_t replicate) {
+  return dune_seed::MakeRng32(
+      LeafRolloutSeed(raw_policy_seed, state_index, leaf_index, replicate));
 }
 
 }  // namespace dune_fidelity_seeds
