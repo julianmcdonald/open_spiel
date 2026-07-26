@@ -82,6 +82,16 @@ class DuneSearchSession {
   DuneSearchResult SearchAndSelect(const State& state);
   DuneSearchResult SearchAndSelect(const State& state, double r_val);
 
+  // kLiveDeadline callers MUST route through here: it is the only entry point
+  // that forwards a wall-clock budget into Search(). Deliberately NOT an
+  // overload of SearchAndSelect — a defaulted `double` there would be
+  // ambiguous with the (state, r_val) overload and would silently break
+  // py::overload_cast<const State&> in games_dune_imperium.cc:676.
+  // `remaining_time_ms` < 0 means "unspecified", in which case Search() falls
+  // back to config.relative_time_budget_ms and fatals if that is unusable.
+  DuneSearchResult SearchAndSelectWithDeadline(const State& state,
+                                               double remaining_time_ms);
+
   // Setters/Getters for session metadata/diagnostics
   void SetEpisodeId(int episode_id) { episode_id_ = episode_id; }
   void SetUpdateId(int update_id) { update_id_ = update_id; }
@@ -101,6 +111,15 @@ class DuneSearchSession {
   void SetLastRequestedMaxSimsForTesting(int sims) { last_requested_max_sims_ = sims; }
 
  private:
+  // The CONFIGURED hard limits for a decision, i.e. what this decision's budget
+  // would have been. Both the searched path and the policy-only fallback path
+  // report these, so they cannot drift apart -- before WO-1 the fallback path
+  // emitted 0.0/0 and the searched path emitted a hardcoded 52000.0.
+  // `is_full_session_` is read live, so these must be called at the point the
+  // value is needed, not precomputed.
+  int ConfiguredHardSimLimit(bool is_short_window_role) const;
+  double ConfiguredHardTimeLimitMs(double resolved_live_deadline_ms) const;
+
   DuneSearchConfig config_;
   std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators_;
   DuneSearchBudgetMode budget_mode_;
@@ -143,6 +162,10 @@ class DuneSearchSession {
   // Clock tracking for live deadline mode
   std::chrono::steady_clock::time_point absolute_live_deadline_;
   bool live_deadline_initialized_ = false;
+  // The budget the active session's deadline was actually built from, so
+  // telemetry can report the deadline in force rather than a compile-time
+  // constant. -1.0 until the session initializes its deadline.
+  double live_deadline_budget_ms_ = -1.0;
 
   std::vector<Action> session_history_;
   std::vector<Action> last_input_history_;

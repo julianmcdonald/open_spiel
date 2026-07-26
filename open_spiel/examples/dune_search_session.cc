@@ -7,6 +7,7 @@
 #include <fstream>
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include "dune_evaluator.h"
 #include <torch/torch.h>
@@ -110,6 +111,7 @@ void DuneSearchSession::ResetSession(const std::string& reason) {
   last_re_root_status_ = "none";
   post_chance_branch_miss_ = false;
   live_deadline_initialized_ = false;
+  live_deadline_budget_ms_ = -1.0;
   last_role_ = DuneDecisionRole::kForcedOrBookkeeping;
   short_sims_completed_ = 0;
   short_cumulative_counter_ = 0;
@@ -132,6 +134,30 @@ void DuneSearchSession::HandleReRootMismatch(const std::string& reason) {
   last_re_root_status_ = "miss";
   post_chance_branch_miss_ = true;
   last_reset_reason_ = reason;
+}
+
+int DuneSearchSession::ConfiguredHardSimLimit(bool is_short_window_role) const {
+  if (is_short_window_role) return config_.purchase_combat_budget;
+  switch (budget_mode_) {
+    case DuneSearchBudgetMode::kTrainingFullFast:
+      return is_full_session_ ? 64 : 8;
+    case DuneSearchBudgetMode::kFixedSessionSimulations:
+      return config_.fixed_session_limit;
+    default:
+      return config_.max_simulations;
+  }
+}
+
+double DuneSearchSession::ConfiguredHardTimeLimitMs(
+    double resolved_live_deadline_ms) const {
+  if (budget_mode_ != DuneSearchBudgetMode::kLiveDeadline) {
+    return config_.relative_time_budget_ms;
+  }
+  // Report the deadline actually in force: the one the active session's clock
+  // was built from once initialized, otherwise the value this call resolved.
+  // Never a compile-time constant.
+  return live_deadline_initialized_ ? live_deadline_budget_ms_
+                                    : resolved_live_deadline_ms;
 }
 
 DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_time_ms) {
@@ -204,6 +230,37 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
 
   std::shared_ptr<DunePUCTISMCTSBot> active_bot = is_short_window_role ? short_bot_ : placement_bot_;
 
+  // Resolve the live-deadline budget up front, so that BOTH the deadline the
+  // search actually runs against and the deadline telemetry reports come from
+  // one place. This used to be a hardcoded 52000.0 in two independent spots
+  // (deadline init and hard_time_limit_ms), which meant every kLiveDeadline run
+  // silently measured a 52s deadline no matter what the caller configured, and
+  // the telemetry confirmed the lie. A measurement instrument must not invent
+  // its own deadline: if no budget is configured, that is a fatal
+  // misconfiguration, not something to paper over with a default.
+  //
+  // Resolved BEFORE the policy-only fallback lambda below so that (a) the
+  // fallback path can report the same configured limits as the searched path,
+  // and (b) a misconfigured live run fails at its very first decision rather
+  // than only once it reaches a strategic one.
+  double resolved_live_deadline_ms = -1.0;
+  if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
+    resolved_live_deadline_ms = (remaining_time_ms >= 0.0)
+                                    ? remaining_time_ms
+                                    : config_.relative_time_budget_ms;
+    if (!std::isfinite(resolved_live_deadline_ms) ||
+        resolved_live_deadline_ms <= 0.0) {
+      SpielFatalError(absl::StrCat(
+          "DuneSearchSession: kLiveDeadline budget mode entered with no usable "
+          "time budget (resolved=",
+          resolved_live_deadline_ms,
+          " ms). Pass a positive, finite remaining_time_ms via "
+          "SearchAndSelectWithDeadline(), or configure a positive finite "
+          "DuneSearchConfig::relative_time_budget_ms. Note --disable_time_limit "
+          "sets that budget to infinity, which is meaningless in live mode."));
+    }
+  }
+
   // Standard policy fallback result initialization
   auto get_policy_only_result = [&](const std::string& fallback_reason) {
     DuneSearchResult res;
@@ -227,9 +284,16 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     res.diagnostics.phase = LocalPhaseToString(dune_state.phase());
     res.diagnostics.decision_role = absl::StrCat(static_cast<int>(role));
     res.diagnostics.budget_mode = absl::StrCat(static_cast<int>(budget_mode_));
-    res.diagnostics.hard_sim_limit = 0;
+    // HARD limits describe what this decision was CONFIGURED to get; SOFT
+    // limits and elapsed describe what it actually got, which on this path is
+    // nothing (no search ran). Before WO-1 the hard limits were emitted as 0
+    // here, which made ~62% of live-mode search.jsonl rows indistinguishable
+    // from "zero budget configured" -- see the README note on grouping by
+    // hard_time_limit_ms in historical runs.
+    res.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role);
     res.diagnostics.soft_sim_limit = 0;
-    res.diagnostics.hard_time_limit_ms = 0.0;
+    res.diagnostics.hard_time_limit_ms =
+        ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
     res.diagnostics.soft_time_limit_ms = 0.0;
     res.diagnostics.elapsed_search_time_ms = 0.0;
     res.diagnostics.inherited_root_visits = 0;
@@ -361,8 +425,11 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       }
     } else if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
       if (!live_deadline_initialized_) {
-        double init_time_ms = (remaining_time_ms >= 0.0) ? remaining_time_ms : 52000.0;
-        absolute_live_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int64_t>(init_time_ms));
+        absolute_live_deadline_ =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+                static_cast<int64_t>(resolved_live_deadline_ms));
+        live_deadline_budget_ms_ = resolved_live_deadline_ms;
         live_deadline_initialized_ = true;
       }
       auto now = std::chrono::steady_clock::now();
@@ -435,13 +502,10 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   result.diagnostics.phase = LocalPhaseToString(dune_state.phase());
   result.diagnostics.decision_role = absl::StrCat(static_cast<int>(role));
   result.diagnostics.budget_mode = absl::StrCat(static_cast<int>(budget_mode_));
-  result.diagnostics.hard_sim_limit = is_short_window_role
-      ? config_.purchase_combat_budget
-      : ((budget_mode_ == DuneSearchBudgetMode::kTrainingFullFast)
-         ? (is_full_session_ ? 64 : 8)
-         : ((budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) ? config_.fixed_session_limit : config_.max_simulations));
+  result.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role);
   result.diagnostics.soft_sim_limit = max_sims;
-  result.diagnostics.hard_time_limit_ms = (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) ? 52000.0 : config_.relative_time_budget_ms;
+  result.diagnostics.hard_time_limit_ms =
+      ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
   result.diagnostics.soft_time_limit_ms = max_time_ms;
   result.diagnostics.elapsed_search_time_ms = result.elapsed_time_ms;
   result.diagnostics.inherited_root_visits = inherited_visits;
@@ -778,6 +842,15 @@ DuneSearchResult DuneSearchSession::SearchAndSelect(const State& state) {
 
 DuneSearchResult DuneSearchSession::SearchAndSelect(const State& state, double r_val) {
   DuneSearchResult res = Search(state);
+  ControllerDecision dec = SelectControllerAction(state, res, r_val);
+  return CommitAction(dec);
+}
+
+DuneSearchResult DuneSearchSession::SearchAndSelectWithDeadline(
+    const State& state, double remaining_time_ms) {
+  DuneSearchResult res = Search(state, remaining_time_ms);
+  std::uniform_real_distribution<double> dist(0.0, 1.0);
+  double r_val = dist(rng_);
   ControllerDecision dec = SelectControllerAction(state, res, r_val);
   return CommitAction(dec);
 }
