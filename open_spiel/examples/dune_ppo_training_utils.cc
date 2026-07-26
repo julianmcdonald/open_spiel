@@ -660,6 +660,9 @@ PpoUpdateStats TrainPpoUpdate(
   double weighted_clip_fraction_sum = 0.0;
   int64_t total_nontrivial_count = 0;
   double value_loss_sum = 0.0;
+  // WO-1 Phase 5: accumulated over executed minibatches, same denominator as
+  // value_loss_sum.
+  double value_clip_frac_sum = 0.0;
 
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
@@ -752,6 +755,9 @@ PpoUpdateStats TrainPpoUpdate(
 
       torch::Tensor policy_loss, value_loss, entropy, approx_kl, clip_fraction;
       torch::Tensor total_loss;
+      // Left undefined when --ppo_clip_value_loss=false: nothing is clipped, so
+      // the fraction contributes 0 rather than a fabricated value.
+      torch::Tensor value_clip_frac_t;
 
       auto compute_loss = [&]() {
         auto outputs = model->forward(mb_states);
@@ -759,6 +765,13 @@ PpoUpdateStats TrainPpoUpdate(
         // 3. Critic loss (Retain all samples)
         torch::Tensor new_values = outputs.values.squeeze(1);
         if (clip_value_loss) {
+          // WO-1 Phase 5: how often the value clip actually bound. Computed
+          // inside the autocast region but only read out where the other
+          // metrics are, so no extra device sync is added to the hot path.
+          value_clip_frac_t =
+              ((new_values - mb_old_values).abs() > clip_epsilon)
+                  .to(torch::kFloat32)
+                  .mean();
           torch::Tensor value_loss_unclipped =
               (new_values - mb_returns).pow(2);
           torch::Tensor value_clipped =
@@ -883,6 +896,32 @@ PpoUpdateStats TrainPpoUpdate(
         ++aux_norm_count;
       }
 
+      // WO-1 Phase 5: per-module pre-clip gradient norms. MUST be measured here,
+      // before clip_grad_norm_ rescales the gradients in place. Grouped by
+      // parameter-name prefix; the `value_head` test uses find() rather than a
+      // prefix match so `value_head2` (the nonlinear head's second layer) lands
+      // in the value group instead of the trunk.
+      {
+        double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
+        for (const auto& named : model->named_parameters()) {
+          const torch::Tensor& g = named.value().grad();
+          if (!g.defined()) continue;
+          const double sq = g.pow(2).sum().item<double>();
+          const std::string& nm = named.key();
+          if (nm.rfind("policy_head", 0) == 0) {
+            policy_sq += sq;
+          } else if (nm.find("value_head") != std::string::npos) {
+            value_sq += sq;
+          } else {
+            trunk_sq += sq;
+          }
+        }
+        stats.policy_head_grad_norm_sum += std::sqrt(policy_sq);
+        stats.value_head_grad_norm_sum += std::sqrt(value_sq);
+        stats.trunk_grad_norm_sum += std::sqrt(trunk_sq);
+        stats.head_grad_norm_count += 1;
+      }
+
       double grad_norm =
           torch::nn::utils::clip_grad_norm_(
               model->parameters(), ::absl::GetFlag(::FLAGS_grad_clip_norm));
@@ -900,6 +939,9 @@ PpoUpdateStats TrainPpoUpdate(
 
       double kl = approx_kl.item<double>();
       value_loss_sum += value_loss.item<double>();
+      if (value_clip_frac_t.defined()) {
+        value_clip_frac_sum += value_clip_frac_t.item<double>();
+      }
       stats.minibatches += 1;
 
       if (mb_num_nontrivial > 0) {
@@ -950,6 +992,7 @@ PpoUpdateStats TrainPpoUpdate(
 
   if (stats.minibatches > 0) {
     stats.value_loss = value_loss_sum / stats.minibatches;
+    stats.value_clip_fraction = value_clip_frac_sum / stats.minibatches;
     if (total_nontrivial_count > 0) {
       stats.policy_loss = weighted_policy_loss_sum / total_nontrivial_count;
       stats.entropy = weighted_entropy_sum / total_nontrivial_count;
@@ -1038,7 +1081,10 @@ const char* const kDiagnosticsCsvHeader =
     "precap_absz_n_continuation,precap_absz_p95_continuation,precap_absz_p99_continuation,"
     "precap_absz_max_continuation,frac_decisions_absz_ge10_continuation,"
     "precap_absz_n_purchase,precap_absz_p95_purchase,precap_absz_p99_purchase,"
-    "precap_absz_max_purchase,frac_decisions_absz_ge10_purchase";
+    "precap_absz_max_purchase,frac_decisions_absz_ge10_purchase,"
+    // --- v4: WO-1 Phase 5 scratch-anomaly bundle (log-only) ---
+    "value_clip_fraction,explained_variance,policy_head_grad_norm,"
+    "value_head_grad_norm,trunk_grad_norm,minibatches_executed";
 
 // Returns true if `filepath` already holds a header line, and sets `out_header`
 // to it (trailing CR/LF stripped). An absent or zero-length file has no header.
@@ -1149,7 +1195,17 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
         << stats.precap_absz_purchase.p95 << ","
         << stats.precap_absz_purchase.p99 << ","
         << stats.precap_absz_purchase.max << ","
-        << stats.precap_absz_purchase.frac_ge10 << "\n";
+        << stats.precap_absz_purchase.frac_ge10 << ","
+        // --- v4: WO-1 Phase 5 scratch-anomaly bundle ---
+        << stats.value_clip_fraction << ","
+        << stats.explained_variance << ","
+        << stats.PolicyHeadGradNormMean() << ","
+        << stats.ValueHeadGradNormMean() << ","
+        << stats.TrunkGradNormMean() << ","
+        // Minibatches actually executed, i.e. BEFORE the KL early stop cut the
+        // update short. Pairs with kl_early_stop/kl_early_stop_epoch: a short
+        // count with early_stop=0 means something else ended the update.
+        << stats.minibatches << "\n";
     ofs.flush();
     if (!ofs) {
       SpielFatalError("Failed to write diagnostics CSV data to: " + filepath);
@@ -1218,6 +1274,14 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     obj["grad_norm_max"] = stats.grad_norm_max;
     obj["value_loss"] = stats.value_loss;
     obj["nonfinite_abort"] = stats.nonfinite_abort;
+    // WO-1 Phase 5: same names as the CSV columns, so the two formats stay
+    // analysable interchangeably.
+    obj["value_clip_fraction"] = stats.value_clip_fraction;
+    obj["explained_variance"] = stats.explained_variance;
+    obj["policy_head_grad_norm"] = stats.PolicyHeadGradNormMean();
+    obj["value_head_grad_norm"] = stats.ValueHeadGradNormMean();
+    obj["trunk_grad_norm"] = stats.TrunkGradNormMean();
+    obj["minibatches_executed"] = stats.minibatches;
     const auto add_absz = [&obj](const std::string& suffix,
                                  const PrecapAbszStats& z) {
       obj["precap_absz_n" + suffix] = static_cast<int64_t>(z.decisions);

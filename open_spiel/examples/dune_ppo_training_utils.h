@@ -108,6 +108,36 @@ struct PpoUpdateStats {
     return grad_norm_count > 0 ? grad_norm_sum / grad_norm_count : 0.0;
   }
 
+  // --- WO-1 Phase 5 scratch-anomaly bundle (log-only; no behavior change) ---
+  // Fraction of minibatch samples whose critic output moved further than
+  // ppo_clip_epsilon from its rollout-time value, i.e. the fraction the clipped
+  // value loss actually clipped. Reads 0.0 when --ppo_clip_value_loss=false,
+  // where no value clipping happens at all.
+  double value_clip_fraction = 0.0;
+  // Per-module pre-clip gradient L2 norms, averaged over executed minibatches.
+  // Measured BEFORE clip_grad_norm_, which rescales gradients in place.
+  // Grouping is by parameter-name prefix: `policy_head.*`, anything containing
+  // `value_head` (which correctly catches `value_head2` in the nonlinear
+  // configuration), and everything else as trunk (`input_layer.*`, `resN.*`).
+  // Under --train_value_only the trunk/policy groups are frozen and read 0.0
+  // rather than being absent.
+  double policy_head_grad_norm_sum = 0.0;
+  double value_head_grad_norm_sum = 0.0;
+  double trunk_grad_norm_sum = 0.0;
+  int head_grad_norm_count = 0;
+  double PolicyHeadGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? policy_head_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+  double ValueHeadGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? value_head_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+  double TrunkGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? trunk_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+
   // Diagnostics (Phase 5)
   bool episode_ids_unique = true;
   double policy_kl_before = 0.0;
