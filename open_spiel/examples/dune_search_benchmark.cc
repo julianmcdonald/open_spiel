@@ -95,6 +95,14 @@ ABSL_FLAG(int, grant_swordmaster_round, 0,
           "is handled by the engine (permanent third agent, commit c8b3bf6); the "
           "probe adds NO persistence logic. 0 (default) = off (= arm A).");
 ABSL_FLAG(double, relative_time_budget_ms, 52000.0, "Time budget per move (ms).");
+// PWO-2: previously hardcoded to 50000 at the config site below, so no caller
+// could raise it. A live-deadline search that hits the node ceiling terminates
+// on `max_nodes` instead of the deadline (dune_puct_is_mcts.cc:900-902), which
+// silently turns "50 seconds of search" into "as much search as 50000 nodes
+// buys". Exposing it lets the deadline be PROVEN to be what stopped the search.
+ABSL_FLAG(int, max_nodes, 50000,
+          "Search tree node ceiling. Default preserves the historical hardcoded "
+          "value; PWO-2 runs pin 200000.");
 ABSL_FLAG(bool, conservative_override_enabled, false, "Enforce conservative override selection protocol");
 ABSL_FLAG(double, conservative_covered_prior_threshold, 0.95, "Minimum covered prior mass to avoid fallback");
 ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits required for raw and argmax actions");
@@ -532,7 +540,7 @@ void WorkerThread(
                 absl::GetFlag(FLAGS_disable_time_limit)
                     ? std::numeric_limits<double>::infinity()
                     : absl::GetFlag(FLAGS_relative_time_budget_ms),
-            .max_nodes = 50000,
+            .max_nodes = absl::GetFlag(FLAGS_max_nodes),
             .puct_c = absl::GetFlag(FLAGS_puct_c),
             .opponent_mode = absl::GetFlag(FLAGS_use_opponent_model)
                                  ? SearchOpponentMode::kPolicy

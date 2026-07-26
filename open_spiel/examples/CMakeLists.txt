@@ -73,6 +73,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_calibration dune_search_calibration.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_calibration dune_search ${TORCH_LIBRARIES})
 
+  add_executable(dune_pwo2_root_corpus dune_pwo2_root_corpus.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo2_root_corpus dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_pwo2_qualify dune_pwo2_qualify.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo2_qualify dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_seed_utils_test dune_seed_utils_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_seed_utils_test ${TORCH_LIBRARIES})
 
