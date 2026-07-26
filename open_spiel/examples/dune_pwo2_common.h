@@ -39,6 +39,11 @@ constexpr uint64_t Fnv1a64(const char* s) {
 
 constexpr uint64_t kDomainSearch = Fnv1a64("PWO2_SEARCH");
 constexpr uint64_t kDomainOracle = Fnv1a64("PWO2_ORACLE");
+// Amendment 1: within-micro-cell corpus ranking. Registered specifically to
+// REPLACE decision_index as the ranking key -- ranking by ascending
+// decision_index made "first eligible root per episode" mean "earliest
+// decision", which put 190/192 roots in round 1 and 143/192 at seat 0.
+constexpr uint64_t kDomainCorpusRank = Fnv1a64("PWO2_CORPUS_RANK");
 
 // ---------------------------------------------------------------------------
 // Root id: the first 16 hex characters of the 64-hex-char SHA256 history hash,
@@ -83,6 +88,13 @@ inline uint64_t OracleContinuationSeed(const std::string& history_hash,
                                        int continuation_index) {
   return dune_seed::DeriveSeed(kDomainOracle, HexPrefix64(history_hash),
                                static_cast<uint64_t>(continuation_index));
+}
+
+// Amendment 1 section 3.6-A: outcome-blind within-cell rank. A function of the
+// root's identity alone -- not of when in the game it occurred, not of which
+// seat acted, not of any search or outcome information.
+inline uint64_t CorpusRankKey(const std::string& history_hash) {
+  return dune_seed::DeriveSeed(kDomainCorpusRank, HexPrefix64(history_hash));
 }
 
 // ---------------------------------------------------------------------------

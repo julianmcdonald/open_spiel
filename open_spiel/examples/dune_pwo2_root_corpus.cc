@@ -77,24 +77,60 @@ using namespace open_spiel;
 
 namespace {
 
-// Registered stratum targets (registration 3.3).
+// Registered stratum targets. Amendment 1 3.6-A: the target is now
+// `quota_per_cell` x 16 cells (2 arms x 2 halves x 4 round buckets); the totals
+// 64/48/48/32 are unchanged from 3.3.
 struct StratumSpec {
   const char* name;
   DuneDecisionRole role;
+  int quota_per_cell;
   int target;
 };
 const std::vector<StratumSpec>& Strata() {
   static const std::vector<StratumSpec> kStrata = {
-      {"agent_primary", DuneDecisionRole::kAgentPrimary, 64},
-      {"agent_continuation", DuneDecisionRole::kAgentContinuation, 48},
-      {"purchase", DuneDecisionRole::kPurchase, 48},
-      {"combat_intrigue", DuneDecisionRole::kCombatIntrigue, 32},
+      {"agent_primary", DuneDecisionRole::kAgentPrimary, 4, 64},
+      {"agent_continuation", DuneDecisionRole::kAgentContinuation, 3, 48},
+      {"purchase", DuneDecisionRole::kPurchase, 3, 48},
+      {"combat_intrigue", DuneDecisionRole::kCombatIntrigue, 2, 32},
   };
   return kStrata;
 }
 
 constexpr int kNumArms = 2;
+constexpr int kNumHalves = 2;
+constexpr int kNumBuckets = 4;
+constexpr int kNumSeats = 4;
 const char* ArmName(int arm) { return arm == 0 ? "branch_a" : "u175"; }
+const char* HalfName(int h) { return h == 0 ? "calibration" : "validation"; }
+const char* BucketName(int b) {
+  static const char* kNames[] = {"b0", "b1", "b2", "b3"};
+  return kNames[b];
+}
+
+// Registered round buckets (Amendment 1 3.6-A): 1-2, 3-4, 5-6, 7+.
+int RoundBucket(int round) {
+  if (round <= 2) return 0;
+  if (round <= 4) return 1;
+  if (round <= 6) return 2;
+  return 3;
+}
+
+// Registered seat schedules (Amendment 1 3.6-A). Every seat gets equal
+// representation across the four round buckets.
+//   agent_primary        : all four seats in every cell
+//   continuation/purchase: bucket b OMITS seat b   -> each seat in 3 of 4
+//   combat_intrigue      : fixed rotating pairs    -> each seat in 2 of 4
+std::vector<int> SeatsForCell(const std::string& stratum, int bucket) {
+  if (stratum == "agent_primary") return {0, 1, 2, 3};
+  if (stratum == "combat_intrigue") {
+    static const int kPairs[4][2] = {{0, 1}, {2, 3}, {0, 2}, {1, 3}};
+    return {kPairs[bucket][0], kPairs[bucket][1]};
+  }
+  std::vector<int> seats;
+  for (int s = 0; s < kNumSeats; ++s)
+    if (s != bucket) seats.push_back(s);
+  return seats;  // agent_continuation and purchase
+}
 
 // Registered hard guards (registration 3.5).
 constexpr int kGuardMinRootsPerStratum = 32;
@@ -114,9 +150,23 @@ struct Root {
   std::vector<Action> legal_actions;
   std::vector<float> observation;
   std::string history_hash;
+  uint64_t rank_key = 0;  // Amendment 1: outcome-blind within-cell rank.
 
-  // Canonical order: (source_arm, source_episode_id, decision_index).
+  // Canonical order: (source_arm, source_episode_id, decision_index). Used for
+  // stable merging and for the FINAL corpus ordering only -- Amendment 1
+  // removed it from candidate ranking, where its decision_index term put
+  // 190/192 roots in round 1.
   bool operator<(const Root& o) const {
+    if (arm != o.arm) return arm < o.arm;
+    if (episode_id != o.episode_id) return episode_id < o.episode_id;
+    return decision_index < o.decision_index;
+  }
+
+  // Amendment 1 3.6-A within-cell ranking: lowest rank_key wins, then
+  // history_hash lexicographic, then arm, episode, decision_index.
+  bool RanksBefore(const Root& o) const {
+    if (rank_key != o.rank_key) return rank_key < o.rank_key;
+    if (history_hash != o.history_hash) return history_hash < o.history_hash;
     if (arm != o.arm) return arm < o.arm;
     if (episode_id != o.episode_id) return episode_id < o.episode_id;
     return decision_index < o.decision_index;
@@ -278,6 +328,7 @@ int main(int argc, char** argv) {
             r.legal_actions = legal;
             r.observation = state->InformationStateTensor(player);
             r.history_hash = pwo2::HistoryHash(r.history);
+            r.rank_key = pwo2::CorpusRankKey(r.history_hash);
             per_thread[tid].push_back(std::move(r));
             break;
           }
@@ -300,49 +351,75 @@ int main(int argc, char** argv) {
   };
 
   // -------------------------------------------------------------------------
-  // Selection (registration 3.6): deterministic, no RNG. Pass 1 takes at most
-  // one root per compound episode key to maximize distinct-episode count; pass
-  // 2 fills from already-used episodes under the global <= 2 cap.
+  // Selection (Amendment 1, registration 3.6-A): deterministic, outcome-blind,
+  // exact quota per micro-cell (stratum, arm, half, round_bucket, seat).
+  //
+  // This REPLACES the original 3.6 canonical-order scan. That scan ranked
+  // candidates by ascending decision_index, so "first eligible root per
+  // episode" meant "earliest decision": 190/192 roots landed in round 1 and
+  // 143/192 at seat 0, including every one of the 64 agent-primary verdict
+  // roots. Ranking is now a domain-separated hash of the root's identity, which
+  // cannot correlate with game time or seat.
   // -------------------------------------------------------------------------
+  struct Infeasible {
+    std::string stratum;
+    int arm, half, bucket, seat;
+    int n_available;       // candidates matching the cell coordinates
+    int n_admissible;      // ... that also pass the episode constraints
+  };
   struct SelectResult {
     std::vector<Root> selected;
-    std::map<std::string, std::map<int, int>> short_by;  // stratum -> arm -> shortfall
+    std::vector<Infeasible> infeasible;
     bool complete = false;
   };
 
-  auto select = [&](const std::vector<Root>& all) {
+  auto select = [&](const std::vector<Root>& all,
+                    const std::map<std::pair<int, int>, std::string>& halves) {
     SelectResult sr;
     std::set<std::string> seen_hash;
-    std::map<std::pair<int, int>, int> per_episode_global;  // (arm,ep) -> count
+    std::map<std::pair<int, int>, int> per_episode_global;                 // G3
+    std::map<std::pair<std::string, std::pair<int, int>>, int> per_ep_stratum;  // G12
 
+    // Deterministic cell order: stratum, arm, half, bucket, seat.
     for (const auto& sp : Strata()) {
       for (int arm = 0; arm < kNumArms; ++arm) {
-        const int cell_target = sp.target / kNumArms;
-        int taken = 0;
-        std::set<std::pair<int, int>> used_in_cell;
-
-        for (int pass = 0; pass < 2 && taken < cell_target; ++pass) {
-          for (const auto& r : all) {
-            if (taken >= cell_target) break;
-            if (r.arm != arm || r.stratum != sp.name) continue;
-            if (seen_hash.count(r.history_hash)) continue;  // G5
-            const std::pair<int, int> key{r.arm, r.episode_id};
-            const bool already = used_in_cell.count(key) > 0;
-            if (pass == 0 && already) continue;
-            if (pass == 1 && !already) continue;
-            if (per_episode_global[key] >= kGuardMaxRootsPerEpisodeGlobal) continue;  // G3
-            seen_hash.insert(r.history_hash);
-            per_episode_global[key]++;
-            used_in_cell.insert(key);
-            sr.selected.push_back(r);
-            ++taken;
+        for (int half = 0; half < kNumHalves; ++half) {
+          for (int bucket = 0; bucket < kNumBuckets; ++bucket) {
+            const std::vector<int> seats = SeatsForCell(sp.name, bucket);
+            SPIEL_CHECK_EQ(static_cast<int>(seats.size()), sp.quota_per_cell);
+            for (int seat : seats) {
+              const Root* best = nullptr;
+              int n_available = 0, n_admissible = 0;
+              for (const auto& r : all) {
+                if (r.arm != arm || r.stratum != sp.name) continue;
+                if (r.player != seat) continue;
+                if (RoundBucket(r.round) != bucket) continue;
+                if (halves.at({r.arm, r.episode_id}) != HalfName(half)) continue;
+                ++n_available;
+                if (seen_hash.count(r.history_hash)) continue;             // G5
+                const std::pair<int, int> ep{r.arm, r.episode_id};
+                if (per_episode_global[ep] >= kGuardMaxRootsPerEpisodeGlobal)
+                  continue;                                                // G3
+                if (per_ep_stratum[{sp.name, ep}] >= 1) continue;          // G12
+                ++n_admissible;
+                if (best == nullptr || r.RanksBefore(*best)) best = &r;
+              }
+              if (best == nullptr) {
+                sr.infeasible.push_back({sp.name, arm, half, bucket, seat,
+                                         n_available, n_admissible});
+                continue;
+              }
+              seen_hash.insert(best->history_hash);
+              per_episode_global[{best->arm, best->episode_id}]++;
+              per_ep_stratum[{sp.name, {best->arm, best->episode_id}}]++;
+              sr.selected.push_back(*best);
+            }
           }
         }
-        if (taken < cell_target) sr.short_by[sp.name][arm] = cell_target - taken;
       }
     }
-    sr.complete = sr.short_by.empty();
-    std::sort(sr.selected.begin(), sr.selected.end());
+    sr.complete = sr.infeasible.empty();
+    std::sort(sr.selected.begin(), sr.selected.end());  // final corpus order
     return sr;
   };
 
@@ -351,31 +428,41 @@ int main(int argc, char** argv) {
   std::cout << "\nGenerating " << episodes_per_arm << " episodes per arm...\n";
   std::vector<Root> all = collect(episodes_per_arm);
   std::cout << "  collected " << all.size() << " eligible roots\n";
-  SelectResult sel = select(all);
+  // Halves are assigned to EPISODES before any root selection, so no episode's
+  // roots can span both halves (registration 3.4).
+  auto halves = AssignHalves(episodes_per_arm, half_seed);
+  SelectResult sel = select(all, halves);
+
+  auto print_infeasible = [](std::ostream& os, const SelectResult& s) {
+    for (const auto& c : s.infeasible)
+      os << absl::StrFormat(
+          "    INFEASIBLE cell: %-20s arm=%-9s half=%-11s bucket=%s seat=%d "
+          "-> available=%d admissible=%d\n",
+          c.stratum, ArmName(c.arm), HalfName(c.half), BucketName(c.bucket),
+          c.seat, c.n_available, c.n_admissible);
+  };
 
   if (!sel.complete && episodes_per_arm < max_episodes) {
-    std::cout << "\nCell shortfall at " << episodes_per_arm
-              << " episodes/arm; extending to " << max_episodes
-              << " (registration 3.6 step 4).\n";
-    for (const auto& [s, m] : sel.short_by)
-      for (const auto& [a, n] : m)
-        std::cout << "    short: " << s << " / " << ArmName(a) << " by " << n << "\n";
+    std::cout << "\n" << sel.infeasible.size() << " infeasible cell(s) at "
+              << episodes_per_arm << " episodes/arm; spending the registered "
+              << "extra-episode budget (-> " << max_episodes << "/arm).\n";
+    print_infeasible(std::cout, sel);
     episodes_per_arm = max_episodes;
     all = collect(episodes_per_arm);
     std::cout << "  collected " << all.size() << " eligible roots\n";
-    sel = select(all);
+    halves = AssignHalves(episodes_per_arm, half_seed);
+    sel = select(all, halves);
   }
 
   if (!sel.complete) {
-    std::cerr << "\nSTOP: corpus guards unsatisfiable after the extra-episode budget.\n";
-    for (const auto& [s, m] : sel.short_by)
-      for (const auto& [a, n] : m)
-        std::cerr << "  short: " << s << " / " << ArmName(a) << " by " << n << "\n";
-    std::cerr << "Never ship a guard-violating corpus (registration 3.6 / STOP 4).\n";
+    std::cerr << "\nSTOP: " << sel.infeasible.size()
+              << " registered micro-cell(s) remain infeasible after the "
+                 "extra-episode budget. Availability table:\n";
+    print_infeasible(std::cerr, sel);
+    std::cerr << "Do NOT silently drop, merge, or re-quota a cell "
+                 "(registration 3.6-A). Report and stop.\n";
     return 1;
   }
-
-  auto halves = AssignHalves(episodes_per_arm, half_seed);
 
   // -------------------------------------------------------------------------
   // Guard verification. Every guard is checked on the FINAL selection and the
@@ -423,6 +510,50 @@ int main(int argc, char** argv) {
   const bool g3 = global_max <= kGuardMaxRootsPerEpisodeGlobal;
   all_pass = all_pass && g3;
 
+  // ---- Amendment 1 guards G8 / G11 / G12, checked in the generator too so a
+  // guard-violating corpus is never written even if the Python validator is not
+  // run. The Python validator remains the authority (G1-G12).
+  std::vector<std::string> cell_violations;
+  for (const auto& sp : Strata()) {
+    for (int arm = 0; arm < kNumArms; ++arm)
+      for (int half = 0; half < kNumHalves; ++half)
+        for (int bucket = 0; bucket < kNumBuckets; ++bucket) {
+          int cell_n = 0;
+          std::map<int, int> seat_n;
+          for (const auto& r : sel.selected) {
+            if (r.stratum != sp.name || r.arm != arm) continue;
+            if (RoundBucket(r.round) != bucket) continue;
+            if (halves.at({r.arm, r.episode_id}) != HalfName(half)) continue;
+            ++cell_n;
+            seat_n[r.player]++;
+          }
+          if (cell_n != sp.quota_per_cell)
+            cell_violations.push_back(absl::StrFormat(
+                "G8 %s/%s/%s/%s got %d want %d", sp.name, ArmName(arm),
+                HalfName(half), BucketName(bucket), cell_n, sp.quota_per_cell));
+          const auto want_seats = SeatsForCell(sp.name, bucket);
+          for (int s = 0; s < kNumSeats; ++s) {
+            const int want =
+                std::find(want_seats.begin(), want_seats.end(), s) != want_seats.end() ? 1 : 0;
+            if (seat_n[s] != want)
+              cell_violations.push_back(absl::StrFormat(
+                  "G11 %s/%s/%s/%s seat %d got %d want %d", sp.name, ArmName(arm),
+                  HalfName(half), BucketName(bucket), s, seat_n[s], want));
+          }
+        }
+    // G12: at most one root per compound episode within a stratum.
+    std::map<std::pair<int, int>, int> in_s;
+    for (const auto& r : sel.selected)
+      if (r.stratum == sp.name) in_s[{r.arm, r.episode_id}]++;
+    for (const auto& [k, c] : in_s)
+      if (c > 1)
+        cell_violations.push_back(absl::StrFormat(
+            "G12 %s episode %s:%d used %d times", sp.name, ArmName(k.first),
+            k.second, c));
+  }
+  const bool g8_11_12 = cell_violations.empty();
+  all_pass = all_pass && g8_11_12;
+
   // Cross-stratum episode overlap: NOT required to be zero, but recorded.
   std::map<std::pair<int, int>, std::set<std::string>> ep_strata;
   for (const auto& r : sel.selected) ep_strata[{r.arm, r.episode_id}].insert(r.stratum);
@@ -469,6 +600,20 @@ int main(int argc, char** argv) {
       live50.insert(pool[i]);
   }
   std::cout << "  live-50 registered subset: " << live50.size() << " roots\n";
+
+  // Round / seat / decision-index distributions. Computed here so they reach
+  // BOTH the manifest and stdout unconditionally: the rejected corpus passed
+  // every guard it had, and the confound was invisible only because nothing
+  // made anyone look at these.
+  std::map<int, int> round_hist, seat_hist, bucket_hist;
+  std::vector<int> di;
+  for (const auto& r : sel.selected) {
+    round_hist[r.round]++;
+    seat_hist[r.player]++;
+    bucket_hist[RoundBucket(r.round)]++;
+    di.push_back(r.decision_index);
+  }
+  std::sort(di.begin(), di.end());
 
   // -------------------------------------------------------------------------
   // Emit.
@@ -536,6 +681,28 @@ int main(int argc, char** argv) {
   man["G3_max_roots_per_compound_episode_global"] = static_cast<int64_t>(global_max);
   man["G3_pass"] = g3;
   man["G5_no_duplicate_history_hash"] = true;  // enforced during selection
+  man["G8_G11_G12_cell_seat_episode_quotas_pass"] = g8_11_12;
+  json::Array viol;
+  for (const auto& v : cell_violations) viol.push_back(v);
+  man["G8_G11_G12_violations"] = viol;
+  man["selection_rule"] = std::string(
+      "registration 3.6-A (Amendment 1): exact quota per micro-cell "
+      "(stratum, source_arm, half, round_bucket, seat); within-cell rank = "
+      "DeriveSeed(Fnv1a64(\"PWO2_CORPUS_RANK\"), HexPrefix64(history_hash)); "
+      "decision_index is a last-resort tie-break only, never a ranking key");
+  man["domain_tag_PWO2_CORPUS_RANK"] = static_cast<int64_t>(pwo2::kDomainCorpusRank);
+  json::Object rh, sh, bh;
+  for (const auto& [r, c] : round_hist) rh[std::to_string(r)] = static_cast<int64_t>(c);
+  for (const auto& [s, c] : seat_hist) sh[std::to_string(s)] = static_cast<int64_t>(c);
+  for (const auto& [b, c] : bucket_hist) bh[BucketName(b)] = static_cast<int64_t>(c);
+  man["round_histogram"] = rh;
+  man["seat_histogram"] = sh;
+  man["round_bucket_histogram"] = bh;
+  json::Object dio;
+  dio["min"] = static_cast<int64_t>(di.front());
+  dio["median"] = static_cast<int64_t>(di[di.size() / 2]);
+  dio["max"] = static_cast<int64_t>(di.back());
+  man["decision_index"] = dio;
   man["ALL_GUARDS_PASS"] = all_pass;
   man["cross_stratum_episode_overlap_count"] = static_cast<int64_t>(overlap_eps);
   man["cross_stratum_overlap_note"] =
@@ -574,7 +741,22 @@ int main(int argc, char** argv) {
   }
   std::cout << absl::StrFormat("  G3 max roots per compound episode (global) = %d  %s\n",
                                global_max, g3 ? "PASS" : "FAIL");
-  std::cout << "  ALL_GUARDS_PASS = " << (all_pass ? "true" : "false") << "\n";
+  std::cout << absl::StrFormat("  G8/G11/G12 cell+seat+episode quotas: %s\n",
+                               g8_11_12 ? "PASS" : "FAIL");
+  for (const auto& v : cell_violations) std::cout << "    " << v << "\n";
+
+  std::cout << "\nDistributions (always reported):\n  round buckets:";
+  for (const auto& [b, c] : bucket_hist)
+    std::cout << " " << BucketName(b) << "=" << c;
+  std::cout << "\n  exact rounds :";
+  for (const auto& [r, c] : round_hist) std::cout << " " << r << ":" << c;
+  std::cout << "\n  seats        :";
+  for (const auto& [s, c] : seat_hist) std::cout << " " << s << ":" << c;
+  std::cout << absl::StrFormat(
+      "\n  decision_index: min=%d p25=%d median=%d p75=%d max=%d\n", di.front(),
+      di[di.size() / 4], di[di.size() / 2], di[3 * di.size() / 4], di.back());
+
+  std::cout << "\n  ALL_GUARDS_PASS = " << (all_pass ? "true" : "false") << "\n";
   std::cout << "\nWrote " << absl::GetFlag(FLAGS_output_path) << " and "
             << absl::GetFlag(FLAGS_manifest_path) << "\n";
   return all_pass ? 0 : 1;
