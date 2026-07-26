@@ -157,6 +157,27 @@ struct GameResult {
   int end_trigger_player = -1;  // -1 => null
   int end_trigger_round = -1;   // -1 => null
   int winner_triggered = -1;    // -1 => null, 0 => false, 1 => true
+
+  // --- WO-1 Phase 3 pace/tempo telemetry (new keys only) ---
+  // Track VP at the end of EVERY round, 1..terminal. Supersedes the r5/r6/r7
+  // triple above, which stays for backward compatibility. vp_end_by_round[N-1]
+  // is round N; only the first `rounds_captured` entries are meaningful.
+  std::array<std::array<int, kNumPlayers>, kMaxRounds> vp_end_by_round{};
+  int rounds_captured = 0;
+  // First round at whose END this seat's track VP was >= kTargetVp; -1 => null.
+  std::array<int, kNumPlayers> first_round_vp_ge_11{};
+  // Every seat at track VP >= kTargetVp in the terminal round. May hold more
+  // than one seat: crossing is not exclusive and no causal trigger is assigned.
+  std::vector<int> terminal_threshold_set;
+  bool candidate_in_terminal_threshold_set = false;
+  // "threshold" | "round_limit" | "other". Derived from the same accessors the
+  // engine's own end test uses (dune_imperium.cc:8891-8904): end_game is set
+  // when round_ > kMaxRounds OR any vp_[p] >= kTargetVp. "threshold" wins when
+  // both hold, matching end_trigger_player's existing precedence. "other" is
+  // unreachable by construction and is emitted as a tripwire.
+  std::string terminal_reason = "other";
+  // Applied ConvertSpecimenToTroop actions per seat over the whole game.
+  std::array<int, kNumPlayers> specimen_conversions{};
 };
 
 // ---------------------------------------------------------------------------
@@ -178,6 +199,49 @@ std::string JsonIntOrNull(int x) {
 std::string JsonBoolOrNull(int tri) {
   if (tri < 0) return "null";
   return tri ? "true" : "false";
+}
+
+// --- WO-1 Phase 3 emission helpers ---
+// [[r1p0,r1p1,r1p2,r1p3],[r2...],...] for rounds 1..rounds_captured.
+std::string JsonVpByRound(
+    int rounds_captured,
+    const std::array<std::array<int, kNumPlayers>, kMaxRounds>& v) {
+  std::string s = "[";
+  for (int rd = 0; rd < rounds_captured; ++rd) {
+    if (rd) s += ",";
+    s += "[";
+    for (int p = 0; p < kNumPlayers; ++p) {
+      if (p) s += ",";
+      s += std::to_string(v[rd][p]);
+    }
+    s += "]";
+  }
+  return s + "]";
+}
+// Per-seat ints where a negative entry means "never" and emits JSON null.
+std::string JsonIntArrayWithNulls(const std::array<int, kNumPlayers>& v) {
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += v[p] < 0 ? std::string("null") : std::to_string(v[p]);
+  }
+  return s + "]";
+}
+std::string JsonIntArray(const std::array<int, kNumPlayers>& v) {
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += std::to_string(v[p]);
+  }
+  return s + "]";
+}
+std::string JsonIntVector(const std::vector<int>& v) {
+  std::string s = "[";
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) s += ",";
+    s += std::to_string(v[i]);
+  }
+  return s + "]";
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +283,8 @@ double LogitStatsPercentile(std::vector<double> v, double q) {
 void AppendLogitStatsRow(std::ofstream& out, int episode_id, int round,
                          const std::string& role,
                          const std::vector<Action>& legal,
-                         const std::vector<float>& raw_logits) {
+                         const std::vector<float>& raw_logits,
+                         double configured_cap) {
   const int n = static_cast<int>(legal.size());
   if (n == 0) return;
   double sum = 0.0;
@@ -269,6 +334,22 @@ void AppendLogitStatsRow(std::ofstream& out, int episode_id, int round,
     if (a >= 20.0) ++ge20;
   }
   const double dn = static_cast<double>(n);
+  // --- WO-1 Phase 3 per-decision policy-shape stats ---
+  // Normalized entropy puts decisions with different legal-set sizes on one
+  // scale: H/log(n) is 1.0 for a uniform policy and 0.0 for a deterministic
+  // one. n == 1 has log(n) == 0, so it is defined to 0.0 (a forced decision
+  // carries no choice entropy) rather than emitting a NaN.
+  const double norm_entropy = (n > 1) ? (H_unc / std::log(dn)) : 0.0;
+  const double eff_action_count = std::exp(H_unc);
+  double max_prob = 0.0;
+  for (double l : lp_unc) max_prob = std::max(max_prob, std::exp(l));
+  // Saturation against the cap this run is ACTUALLY configured with, unlike
+  // the fixed 5/10/20 columns above which predate the cap being a flag.
+  int ge_cap = 0, ge_2cap = 0;
+  for (double a : absz) {
+    if (a >= configured_cap) ++ge_cap;
+    if (a >= 2.0 * configured_cap) ++ge_2cap;
+  }
   std::lock_guard<std::mutex> lock(g_logit_dump_mutex);
   out << episode_id << ',' << round << ',' << role << ',' << n << ','
       << absl::StrFormat("%.6f", max_abs) << ',' << absl::StrFormat("%.6f", p90)
@@ -278,7 +359,14 @@ void AppendLogitStatsRow(std::ofstream& out, int episode_id, int round,
       << absl::StrFormat("%.6f", kl_10_30) << ','
       << absl::StrFormat("%.6f", ge5 / dn) << ','
       << absl::StrFormat("%.6f", ge10 / dn) << ','
-      << absl::StrFormat("%.6f", ge20 / dn) << '\n';
+      << absl::StrFormat("%.6f", ge20 / dn) << ','
+      // WO-1 Phase 3 (appended; all columns above are unchanged)
+      << absl::StrFormat("%.6f", norm_entropy) << ','
+      << absl::StrFormat("%.6f", max_prob) << ','
+      << absl::StrFormat("%.6f", eff_action_count) << ','
+      << absl::StrFormat("%.6f", configured_cap) << ','
+      << absl::StrFormat("%.6f", ge_cap / dn) << ','
+      << absl::StrFormat("%.6f", ge_2cap / dn) << '\n';
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +566,7 @@ void WorkerThread(
         dynamic_cast<const DuneImperiumState*>(state.get());
     std::array<std::array<int, kNumPlayers>, kMaxRounds + 2> vp_at_round_end{};
     std::array<bool, kMaxRounds + 2> round_end_seen{};
+    std::array<int, kNumPlayers> specimen_conversions{};
     int last_round = dune_state ? dune_state->GetCurrentRound() : -1;
     auto snapshot_round_ends = [&]() {
       if (!dune_state) return;
@@ -548,7 +637,8 @@ void WorkerThread(
           AppendLogitStatsRow(*dump_out, episode_id,
                               dune_state->GetCurrentRound(),
                               GamePhaseRole(dune_state->phase()),
-                              legal_actions, result.logits);
+                              legal_actions, result.logits,
+                              static_cast<double>(candidate_logit_cap));
         }
         const float logit_cap =
             use_model ? candidate_logit_cap : opponent_logit_cap;
@@ -601,6 +691,14 @@ void WorkerThread(
         chosen_action = legal_actions[dist(policy_rngs[current_player])];
       }
 
+      // WO-1 Phase 3 addendum: count applied specimen->troop conversions per
+      // seat, at application time, by engine action-ID range. Measurement only
+      // -- no shaping is enabled anywhere by this counter.
+      if (chosen_action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
+          chosen_action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12 &&
+          current_player >= 0 && current_player < kNumPlayers) {
+        ++specimen_conversions[current_player];
+      }
       state->ApplyAction(chosen_action);
     }
 
@@ -689,6 +787,47 @@ void WorkerThread(
     gr.winner_triggered = (gr.end_trigger_player >= 0)
                               ? (first_place == gr.end_trigger_player ? 1 : 0)
                               : -1;
+
+    // --- WO-1 Phase 3 pace/tempo telemetry ---------------------------------
+    // Dense round-end VP, replacing the r5/r6/r7 ceiling. The snapshot hook
+    // already captured rounds 1..kMaxRounds; only the emission was truncated.
+    gr.rounds_captured = 0;
+    for (int rd = 1; rd <= kMaxRounds; ++rd) {
+      if (!round_end_seen[rd]) break;
+      gr.vp_end_by_round[rd - 1] = vp_at_round_end[rd];
+      gr.rounds_captured = rd;
+    }
+    for (int p = 0; p < kNumPlayers; ++p) {
+      gr.first_round_vp_ge_11[p] = -1;
+      for (int rd = 1; rd <= gr.rounds_captured; ++rd) {
+        if (vp_at_round_end[rd][p] >= kTargetVp) {
+          gr.first_round_vp_ge_11[p] = rd;
+          break;
+        }
+      }
+    }
+    gr.specimen_conversions = specimen_conversions;
+    gr.terminal_threshold_set.clear();
+    gr.candidate_in_terminal_threshold_set = false;
+    gr.terminal_reason = "other";
+    if (dune_state) {
+      for (int p = 0; p < kNumPlayers; ++p) {
+        if (dune_state->GetPlayerVp(p) >= kTargetVp) {
+          gr.terminal_threshold_set.push_back(p);
+          if (p == model_player) gr.candidate_in_terminal_threshold_set = true;
+        }
+      }
+      // Mirrors the engine's own end test (dune_imperium.cc:8891-8904):
+      // end_game <- (round_ > kMaxRounds) OR (any vp_[p] >= kTargetVp).
+      // Threshold takes precedence when both hold, matching the precedence
+      // end_trigger_player already uses. "other" is unreachable; if it ever
+      // appears, the engine's end condition changed under a frozen engine.
+      if (!gr.terminal_threshold_set.empty()) {
+        gr.terminal_reason = "threshold";
+      } else if (dune_state->GetCurrentRound() > kMaxRounds) {
+        gr.terminal_reason = "round_limit";
+      }
+    }
   }
 }
 
@@ -894,7 +1033,11 @@ void RunEvaluation() {
       logit_dump << "episode_id,round,decision_role,n_legal,max_abs_z,p90_abs_z,"
                     "entropy_uncapped,entropy_cap10,entropy_cap30,"
                     "kl_cap10_uncapped,kl_cap10_cap30,"
-                    "frac_legal_absz_ge5,frac_legal_absz_ge10,frac_legal_absz_ge20\n";
+                    "frac_legal_absz_ge5,frac_legal_absz_ge10,frac_legal_absz_ge20,"
+                    // WO-1 Phase 3 (appended; columns above unchanged)
+                    "norm_entropy,max_action_prob,eff_action_count,"
+                    "configured_logit_cap,frac_legal_absz_ge_cap,"
+                    "frac_legal_absz_ge_2cap\n";
       logit_dump_ptr = &logit_dump;
       std::cout << "Dumping candidate logit stats to " << dump_logit_stats_path
                 << "\n";
@@ -994,6 +1137,20 @@ void RunEvaluation() {
                 << ",\"end_trigger_player\":" << JsonIntOrNull(gr.end_trigger_player)
                 << ",\"end_trigger_round\":" << JsonIntOrNull(gr.end_trigger_round)
                 << ",\"winner_triggered\":" << JsonBoolOrNull(gr.winner_triggered)
+                // --- WO-1 Phase 3: pace/tempo (new keys only; every key above
+                // is byte-identical to the pre-WO-1 emission) ---
+                << ",\"candidate_seat\":" << gr.seat
+                << ",\"vp_end_by_round\":"
+                << JsonVpByRound(gr.rounds_captured, gr.vp_end_by_round)
+                << ",\"first_round_vp_ge_11\":"
+                << JsonIntArrayWithNulls(gr.first_round_vp_ge_11)
+                << ",\"terminal_threshold_set\":"
+                << JsonIntVector(gr.terminal_threshold_set)
+                << ",\"candidate_in_terminal_threshold_set\":"
+                << (gr.candidate_in_terminal_threshold_set ? "true" : "false")
+                << ",\"terminal_reason\":\"" << gr.terminal_reason << "\""
+                << ",\"specimen_conversions\":"
+                << JsonIntArray(gr.specimen_conversions)
                 << "}\n";
     }
   }
