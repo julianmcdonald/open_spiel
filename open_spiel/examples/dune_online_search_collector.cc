@@ -281,25 +281,44 @@ bool ParseAcceptancePriorSource(const std::string& name,
   return false;
 }
 
-bool OnlineSearchCollector::AcceptSearch(const std::vector<int>& visit_counts,
-                                         const std::vector<double>& root_priors,
-                                         int legal_count, int* num_covered_out,
-                                         double* covered_prior_mass_out) const {
-  SPIEL_CHECK_EQ(visit_counts.size(), root_priors.size());
+bool ComputeSearchAcceptance(const std::vector<int>& visit_counts,
+                             const std::vector<double>& acceptance_priors,
+                             int legal_count, int min_coverage,
+                             int min_visits_per_action, double min_prior_mass,
+                             int* num_covered_out,
+                             double* covered_prior_mass_out) {
+  SPIEL_CHECK_EQ(visit_counts.size(), acceptance_priors.size());
   int num_covered = 0;
   double covered_prior_mass = 0.0;
   for (size_t i = 0; i < visit_counts.size(); ++i) {
-    if (visit_counts[i] >= config_.min_visits_per_action) {
+    if (visit_counts[i] >= min_visits_per_action) {
       ++num_covered;
-      covered_prior_mass += root_priors[i];
+      covered_prior_mass += acceptance_priors[i];
     }
   }
   if (num_covered_out != nullptr) *num_covered_out = num_covered;
   if (covered_prior_mass_out != nullptr) {
     *covered_prior_mass_out = covered_prior_mass;
   }
-  const int required = std::min(config_.min_coverage, legal_count);
-  return num_covered >= required && covered_prior_mass >= config_.min_prior_mass;
+  const int required = std::min(min_coverage, legal_count);
+  return num_covered >= required && covered_prior_mass >= min_prior_mass;
+}
+
+const std::vector<double>& SelectAcceptancePriors(
+    const std::vector<double>& raw_priors,
+    const std::vector<double>& tree_priors, AcceptancePriorSource source) {
+  if (source == AcceptancePriorSource::kTreePrior) return tree_priors;
+  return raw_priors.empty() ? tree_priors : raw_priors;
+}
+
+bool OnlineSearchCollector::AcceptSearch(const std::vector<int>& visit_counts,
+                                         const std::vector<double>& root_priors,
+                                         int legal_count, int* num_covered_out,
+                                         double* covered_prior_mass_out) const {
+  return ComputeSearchAcceptance(
+      visit_counts, root_priors, legal_count, config_.min_coverage,
+      config_.min_visits_per_action, config_.min_prior_mass, num_covered_out,
+      covered_prior_mass_out);
 }
 
 void OnlineSearchCollector::CollectUpdate(

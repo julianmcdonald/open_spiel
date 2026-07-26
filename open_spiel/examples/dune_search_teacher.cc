@@ -19,6 +19,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
+#include "dune_online_search_collector.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_search_session.h"
@@ -53,6 +54,17 @@ ABSL_FLAG(double, eta_max, 50.0, "Maximum eta cap");
 ABSL_FLAG(int, min_coverage, 3, "Min covered actions to emit");
 ABSL_FLAG(int, min_visits_per_action, 2, "Visits for coverage");
 ABSL_FLAG(double, min_prior_mass, 0.50, "Min PPO prior mass on covered actions");
+// WO-1 Phase 4: which root prior the covered-mass acceptance rule is measured
+// against. Defaults to the raw network prior, unifying the OFFLINE teacher with
+// the ONLINE collector (WO-20). Before this, the teacher measured against the
+// post-noise TREE prior -- it builds a kTrainingFullFast session, which forces
+// dirichlet_epsilon to 0.25 for full sessions, and only full sessions are
+// screened -- so teacher and collector acceptance rates were not comparable
+// despite sharing the 3/2/0.50 constants. Set to "tree_prior" only to reproduce
+// a pre-WO-1 teacher run.
+ABSL_FLAG(std::string, acceptance_prior_source, "raw_network_prior",
+          "Root prior the acceptance rule is measured against: "
+          "raw_network_prior (default) | tree_prior.");
 ABSL_FLAG(int, threads, 2, "Game threads");
 ABSL_FLAG(int, labels_per_file, 4096, "Labels per output file");
 ABSL_FLAG(double, search_opponent_temperature, 0.0,
@@ -337,10 +349,26 @@ Action SampleBlueprintAction(const ActionsAndProbs& prior, double temp, std::mt1
 } // namespace
 } // namespace open_spiel
 
+// Parsed once in main() from --acceptance_prior_source, then read-only. Worker
+// threads must not reparse the flag per decision.
+open_spiel::AcceptancePriorSource g_acceptance_prior_source =
+    open_spiel::AcceptancePriorSource::kRawNetworkPrior;
+
 int main(int argc, char** argv) {
   using namespace open_spiel;
   using namespace open_spiel::dune_imperium;
   absl::ParseCommandLine(argc, argv);
+
+  // Fail loudly on an unrecognized contract name: the whole point of naming the
+  // acceptance prior is that it is never chosen implicitly.
+  if (!open_spiel::ParseAcceptancePriorSource(
+          absl::GetFlag(FLAGS_acceptance_prior_source),
+          &g_acceptance_prior_source)) {
+    std::cerr << "Error: unrecognized --acceptance_prior_source '"
+              << absl::GetFlag(FLAGS_acceptance_prior_source)
+              << "' (expected raw_network_prior | tree_prior).\n";
+    return 1;
+  }
 
 
   std::string model_checkpoint = absl::GetFlag(FLAGS_model_checkpoint);
@@ -516,9 +544,32 @@ int main(int argc, char** argv) {
           bool is_primary_full = (role == open_spiel::DuneDecisionRole::kAgentPrimary && session.is_full_session());
           if (is_primary_full) {
             total_search_attempted++;
-            int required_coverage = std::min(absl::GetFlag(FLAGS_min_coverage), static_cast<int>(diag.actions.size()));
-            bool has_coverage = (diag.num_covered_actions >= required_coverage);
-            bool has_mass = (diag.covered_prior_mass >= absl::GetFlag(FLAGS_min_prior_mass));
+            // WO-1 Phase 4: one shared acceptance rule with the online
+            // collector, measured against the declared prior source. This
+            // replaced a read of diag.num_covered_actions/covered_prior_mass,
+            // which GetRootDiagnostics computes from the POST-noise tree prior
+            // and which therefore answered a different question than the
+            // collector's rule with identical constants.
+            int num_covered = 0;
+            double covered_mass = 0.0;
+            const std::vector<double>& acceptance_priors =
+                open_spiel::SelectAcceptancePriors(diag.raw_priors, diag.priors,
+                                                   g_acceptance_prior_source);
+            open_spiel::ComputeSearchAcceptance(
+                diag.visit_counts, acceptance_priors,
+                static_cast<int>(diag.actions.size()),
+                absl::GetFlag(FLAGS_min_coverage),
+                absl::GetFlag(FLAGS_min_visits_per_action),
+                absl::GetFlag(FLAGS_min_prior_mass), &num_covered,
+                &covered_mass);
+            // Kept as two separate predicates because the counters below
+            // distinguish "too few covered actions" from "too little mass".
+            // Their conjunction is exactly ComputeSearchAcceptance's verdict.
+            int required_coverage = std::min(
+                absl::GetFlag(FLAGS_min_coverage),
+                static_cast<int>(diag.actions.size()));
+            bool has_coverage = (num_covered >= required_coverage);
+            bool has_mass = (covered_mass >= absl::GetFlag(FLAGS_min_prior_mass));
 
             // Everything in the label body indexes by the search root's action
             // order: advantages, diag.priors, and the teacher prior all follow
@@ -599,7 +650,10 @@ int main(int argc, char** argv) {
                 lbl.ppo_prior = std::move(ppo_prior);
                 lbl.teacher_prior = std::move(teacher_prior);
                 lbl.kl = kl;
-                lbl.num_covered_actions = diag.num_covered_actions;
+                // The count the ACCEPTANCE decision used, not the tree-prior
+                // count in diag: after WO-1 Phase 4 those can differ, and the
+                // label must describe the rule that admitted it.
+                lbl.num_covered_actions = num_covered;
                 lbl.eta = eta;
                 lbl.eta_capped = eta_capped;
                 game_labels.push_back(std::move(lbl));
@@ -707,6 +761,11 @@ int main(int argc, char** argv) {
     config_obj["min_coverage"] = absl::GetFlag(FLAGS_min_coverage);
     config_obj["min_visits_per_action"] = absl::GetFlag(FLAGS_min_visits_per_action);
     config_obj["min_prior_mass"] = absl::GetFlag(FLAGS_min_prior_mass);
+    // WO-1 Phase 4: the acceptance contract travels with the labels. The same
+    // key and the same stable strings the online collector persists, so a
+    // teacher manifest and a collector manifest can be compared directly.
+    config_obj["acceptance_prior_source"] =
+        std::string(open_spiel::AcceptancePriorSourceName(g_acceptance_prior_source));
     config_obj["min_entropy_ratio"] = absl::GetFlag(FLAGS_min_entropy_ratio);
     config_obj["blueprint_temperature"] = absl::GetFlag(FLAGS_blueprint_temperature);
     config_obj["search_fraction"] = absl::GetFlag(FLAGS_search_fraction);

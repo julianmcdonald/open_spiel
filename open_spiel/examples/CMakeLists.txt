@@ -22,6 +22,13 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_puct_is_mcts_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_puct_is_mcts_test COMMAND dune_puct_is_mcts_test)
 
+  # WO-1 Phase 4: teacher/collector acceptance parity on a shared fixture.
+  add_executable(dune_acceptance_parity_test
+    dune_acceptance_parity_test.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_acceptance_parity_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_acceptance_parity_test COMMAND dune_acceptance_parity_test)
+
   add_executable(dune_online_search_collector_test
     dune_online_search_collector_test.cc dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
@@ -42,7 +49,10 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_benchmark dune_search_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_benchmark dune_search ${TORCH_LIBRARIES})
 
-  add_executable(dune_search_teacher dune_search_teacher.cc ${OPEN_SPIEL_OBJECTS})
+  # dune_online_search_collector.cc carries the SHARED acceptance rule
+  # (ComputeSearchAcceptance / SelectAcceptancePriors, WO-1 Phase 4) that the
+  # offline teacher and the online collector both call.
+  add_executable(dune_search_teacher dune_search_teacher.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_teacher dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_sm_value_probe dune_sm_value_probe.cc ${OPEN_SPIEL_OBJECTS})

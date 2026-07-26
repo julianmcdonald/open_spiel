@@ -78,6 +78,33 @@ const char* AcceptancePriorSourceName(AcceptancePriorSource source);
 bool ParseAcceptancePriorSource(const std::string& name,
                                 AcceptancePriorSource* out);
 
+// THE acceptance rule, in one place.
+//
+// WO-1 Phase 4 unified the two callers. Before that the ONLINE collector
+// measured covered prior mass against the RAW NETWORK prior (WO-20) while the
+// OFFLINE teacher (dune_search_teacher.cc) measured it against the POST-NOISE
+// TREE prior, via SearchDiagnostics::covered_prior_mass. They shared the
+// 3/2/0.50 constants, which made the two acceptance rates look comparable when
+// they were not: at the teacher's effective dirichlet_epsilon of 0.25 the noise
+// flattens the prior, so the same search can pass one rule and fail the other.
+//
+// Both callers now route through this function; there is deliberately no second
+// implementation to drift from, and dune_acceptance_parity_test.cc asserts the
+// two paths agree on a shared fixture.
+bool ComputeSearchAcceptance(const std::vector<int>& visit_counts,
+                             const std::vector<double>& acceptance_priors,
+                             int legal_count, int min_coverage,
+                             int min_visits_per_action, double min_prior_mass,
+                             int* num_covered_out,
+                             double* covered_prior_mass_out);
+
+// Picks the prior vector the rule above must be measured against. `raw_priors`
+// falls back to `tree_priors` when empty (the root was not in the tree, where
+// `priors` is already raw) -- the same idiom the collector has used since WO-20.
+const std::vector<double>& SelectAcceptancePriors(
+    const std::vector<double>& raw_priors,
+    const std::vector<double>& tree_priors, AcceptancePriorSource source);
+
 // One accepted online search example. Policy target is the normalized visit
 // distribution over legal_actions (cross-entropy); value target is the terminal
 // placement utility / utility_divisor, attached after the auxiliary game ends.
