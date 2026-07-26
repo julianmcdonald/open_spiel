@@ -28,6 +28,7 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_puct_is_mcts.h"
+#include <array>
 #include "dune_search_session.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
@@ -100,6 +101,36 @@ ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits requ
 ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
 ABSL_FLAG(double, conservative_stability_checkpoint_fraction, 0.5, "Fraction of budget at which to check stability");
 ABSL_FLAG(bool, conservative_continuation_overrides_disabled, true, "Disable overrides during continuation decisions");
+
+// --- WO-1 Phase 2: seat controller topology -------------------------------
+// Historically this binary supported exactly ONE searched seat (search_seat =
+// rotate_seat ? g%4 : 0); every other seat was driven by --opponent_checkpoint.
+// The pace program needs the homogeneous four-copy configuration (the PRIMARY
+// endpoint's controller) and an explicitly-labelled mixed slice, so the seat
+// topology is now a first-class flag. 'single' reproduces the legacy behavior
+// byte-for-byte and is the default.
+ABSL_FLAG(std::string, controller_mode, "single",
+          "Seat controller topology. 'single' (default, legacy): exactly one "
+          "searched seat, the other three driven by --opponent_checkpoint. "
+          "'homogeneous': all four seats run the search controller (the "
+          "four-copy production-controller configuration). 'mixed': the "
+          "rotating candidate seat is searched, the other three run "
+          "--mixed_opponent_controller.");
+ABSL_FLAG(std::string, mixed_opponent_controller, "random_legal",
+          "Controller for the three non-candidate seats when "
+          "--controller_mode=mixed. 'random_legal': uniform-random legal "
+          "action (slice S1). 'raw_policy': raw network prior from "
+          "--opponent_checkpoint (or the candidate checkpoint when unset), "
+          "selected at --external_opponent_temperature.");
+// Formerly the hard-coded 10.0f passed to every DuneNNEvaluator here. Split
+// per-model and named to match dune_population_eval's flags of the same name.
+// Default 10.0 preserves prior behavior exactly.
+ABSL_FLAG(double, candidate_logit_cap, 10.0,
+          "Logit cap for the CANDIDATE / searched-seat evaluator. Default 10.0 "
+          "preserves prior behavior (formerly hard-coded).");
+ABSL_FLAG(double, opponent_logit_cap, 10.0,
+          "Logit cap for OPPONENT-model evaluators. Default 10.0 preserves "
+          "prior behavior (formerly hard-coded).");
 
 namespace open_spiel {
 namespace {
@@ -335,6 +366,57 @@ Action SelectRawPriorAction(DuneNNEvaluator& evaluator, const State& state,
 }
 
 
+// --- WO-1 Phase 2: seat controller topology -------------------------------
+
+enum class SeatControllerMode { kSingle, kHomogeneous, kMixed };
+enum class MixedOpponentController { kRandomLegal, kRawPolicy };
+
+SeatControllerMode ParseControllerMode(const std::string& s) {
+  if (s == "single") return SeatControllerMode::kSingle;
+  if (s == "homogeneous") return SeatControllerMode::kHomogeneous;
+  if (s == "mixed") return SeatControllerMode::kMixed;
+  SpielFatalError("Unrecognized --controller_mode: '" + s +
+                  "' (expected single|homogeneous|mixed)");
+}
+
+MixedOpponentController ParseMixedOpponentController(const std::string& s) {
+  if (s == "random_legal") return MixedOpponentController::kRandomLegal;
+  if (s == "raw_policy") return MixedOpponentController::kRawPolicy;
+  SpielFatalError("Unrecognized --mixed_opponent_controller: '" + s +
+                  "' (expected random_legal|raw_policy)");
+}
+
+// Exactly what drove one seat for one game. Emitted per game so a result can
+// never be re-read without knowing which controller produced it -- the Phase 0
+// registration requires slice opponents and controllers to be pinned in the
+// run manifest, not described in prose.
+struct SeatControllerProvenance {
+  std::string controller = "unset";   // search|raw_policy|random_legal
+  std::string checkpoint;             // "" when the seat uses no model
+  std::string checkpoint_sha256;      // "" when the seat uses no model
+  int max_simulations = -1;           // -1 when not a searched seat
+  std::string budget_mode = "none";
+  double logit_cap = -1.0;            // -1 means "no evaluator on this seat"
+};
+
+// Checkpoint digests, computed ONCE in main() BEFORE any worker thread is
+// spawned and only read afterwards. That write-before-spawn ordering is what
+// makes these safe to touch from every worker without a lock; do not assign to
+// them from inside WorkerThread.
+std::string g_candidate_ckpt_sha256;
+std::string g_opponent_ckpt_sha256;
+
+std::string BudgetModeName(DuneSearchBudgetMode m) {
+  switch (m) {
+    case DuneSearchBudgetMode::kPolicyOnly: return "policy_only";
+    case DuneSearchBudgetMode::kFixedSessionSimulations:
+      return "fixed_session_simulations";
+    case DuneSearchBudgetMode::kTrainingFullFast: return "training_full_fast";
+    case DuneSearchBudgetMode::kLiveDeadline: return "live_deadline";
+  }
+  return "unknown";
+}
+
 void WorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
@@ -361,6 +443,28 @@ void WorkerThread(
   // searched seat a free Swordmaster (0 = off). Persistence is the engine's job.
   const int grant_swordmaster_round = absl::GetFlag(FLAGS_grant_swordmaster_round);
 
+  // The per-move wall-clock budget this run is configured for. It is handed to
+  // the session on every decision so that kLiveDeadline builds its clock from
+  // what the operator actually asked for. Before this, the benchmark passed
+  // nothing and the session substituted a hardcoded 52000.0, so
+  // --relative_time_budget_ms was inert in live mode and the emitted
+  // hard_time_limit_ms echoed 52000 regardless. Ignored outside live mode (the
+  // session only reads it in the kLiveDeadline branch), so the same call site
+  // serves every budget mode.
+  const double configured_move_budget_ms =
+      absl::GetFlag(FLAGS_disable_time_limit)
+          ? std::numeric_limits<double>::infinity()
+          : absl::GetFlag(FLAGS_relative_time_budget_ms);
+
+  const SeatControllerMode controller_mode =
+      ParseControllerMode(absl::GetFlag(FLAGS_controller_mode));
+  const MixedOpponentController mixed_opponent =
+      ParseMixedOpponentController(absl::GetFlag(FLAGS_mixed_opponent_controller));
+  const float candidate_logit_cap =
+      static_cast<float>(absl::GetFlag(FLAGS_candidate_logit_cap));
+  const float opponent_logit_cap =
+      static_cast<float>(absl::GetFlag(FLAGS_opponent_logit_cap));
+
   while (true) {
     int offset = next_game_id++;
     if (offset >= total_games) break;
@@ -381,15 +485,38 @@ void WorkerThread(
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
     // Create thread-local, bot-specific evaluator wrapping the shared search model
     auto search_evaluator = std::make_shared<DuneNNEvaluator>(
-        search_model, device, 10.0f);
+        search_model, device, candidate_logit_cap);
 
-    std::unique_ptr<DuneSearchSession> search_session;
+    // Which seats run the search controller this game. In 'single' (legacy) and
+    // 'mixed' that is exactly the candidate seat; in 'homogeneous' it is all
+    // four. `search_seat` remains the CANDIDATE seat in every mode, so all the
+    // candidate-relative statistics below keep their meaning.
+    std::array<bool, 4> seat_is_searched{};
+    for (int p = 0; p < 4; ++p) {
+      seat_is_searched[p] = (controller_mode == SeatControllerMode::kHomogeneous)
+                                ? true
+                                : (p == search_seat);
+    }
+    std::array<SeatControllerProvenance, 4> seat_provenance;
+
+    // One session per searched seat. Index `search_seat` is the candidate's.
+    std::vector<std::unique_ptr<DuneSearchSession>> seat_sessions(4);
+    // Per-seat evaluators: searched seats share the candidate evaluator (all
+    // four copies are the SAME controller in homogeneous mode, by definition).
+    std::vector<std::shared_ptr<DuneNNEvaluator>> seat_evaluators(4);
     // Path B (--use_session=false): a plain search bot driven by Step() per
     // decision, reproducing the July-14 reference protocol verbatim.
     std::unique_ptr<DunePUCTISMCTSBot> search_bot;
     std::vector<std::unique_ptr<Bot>> bots(4);
     for (int p = 0; p < 4; ++p) {
-      if (p == search_seat) {
+      // Exactly ONE game_rng() draw per seat, in seat order, in EVERY mode.
+      // The legacy code drew once for the searched seat's config.seed and once
+      // per opponent bot, which is the same count and order; preserving that is
+      // what keeps 'single' mode bitwise-identical to the pre-WO-1 binary.
+      // Moving, adding or conditionalising this draw silently reshuffles every
+      // downstream chance realization.
+      const uint64_t seat_seed = game_rng();
+      if (seat_is_searched[p]) {
         // Designated initializers bind by NAME. This block used to be
         // positional, and Phase 18B's three inserted KataGo fields shifted
         // everything after dirichlet_alpha by three slots, so this binary
@@ -417,7 +544,7 @@ void WorkerThread(
             .utility_divisor = absl::GetFlag(FLAGS_utility_divisor),
             .min_visit_threshold = 2,
             .covered_prior_threshold = 0.50,
-            .seed = game_rng(),
+            .seed = seat_seed,
             .final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount,
             .dirichlet_epsilon = absl::GetFlag(FLAGS_dirichlet_epsilon),
             .dirichlet_alpha = absl::GetFlag(FLAGS_dirichlet_alpha),
@@ -443,21 +570,55 @@ void WorkerThread(
             : (absl::GetFlag(FLAGS_live_deadline)
                 ? DuneSearchBudgetMode::kLiveDeadline
                 : DuneSearchBudgetMode::kFixedSessionSimulations);
+        seat_evaluators[p] = search_evaluator;
         if (absl::GetFlag(FLAGS_use_session)) {
-          search_session = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
+          seat_sessions[p] = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
         } else {
           // Reference protocol: fresh full search per decision, no session.
+          // Path B is single-seat only (guarded in main()), so this is the
+          // candidate's bot.
           search_bot = std::make_unique<DunePUCTISMCTSBot>(config, search_evaluator);
         }
+        seat_provenance[p] = SeatControllerProvenance{
+            /*controller=*/"search",
+            /*checkpoint=*/absl::GetFlag(FLAGS_model_checkpoint),
+            /*checkpoint_sha256=*/g_candidate_ckpt_sha256,
+            /*max_simulations=*/absl::GetFlag(FLAGS_max_simulations),
+            /*budget_mode=*/BudgetModeName(budget_mode),
+            /*logit_cap=*/static_cast<double>(candidate_logit_cap)};
+      } else if (controller_mode == SeatControllerMode::kMixed &&
+                 mixed_opponent == MixedOpponentController::kRandomLegal) {
+        // Slice S1: candidate + 3x random-legal, stated explicitly rather than
+        // inferred from --opponent_checkpoint=random.
+        bots[p] = std::make_unique<DuneRandomBot>(static_cast<int>(seat_seed));
+        seat_provenance[p] = SeatControllerProvenance{
+            /*controller=*/"random_legal", /*checkpoint=*/"",
+            /*checkpoint_sha256=*/"", /*max_simulations=*/-1,
+            /*budget_mode=*/"none", /*logit_cap=*/-1.0};
       } else {
+        // 'single' legacy behavior, and 'mixed' with raw_policy opponents: both
+        // resolve to the --opponent_checkpoint-driven bot. opponent_model is
+        // null exactly when --opponent_checkpoint=random.
         if (opponent_model != nullptr) {
           auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
-              opponent_model, device, 10.0f);
+              opponent_model, device, opponent_logit_cap);
           bots[p] = std::make_unique<DuneGreedyBot>(
-              std::move(local_opp_eval), game_rng(),
+              std::move(local_opp_eval), static_cast<int>(seat_seed),
               absl::GetFlag(FLAGS_external_opponent_temperature));
+          seat_provenance[p] = SeatControllerProvenance{
+              /*controller=*/"raw_policy",
+              /*checkpoint=*/absl::GetFlag(FLAGS_opponent_checkpoint).empty()
+                  ? absl::GetFlag(FLAGS_model_checkpoint)
+                  : absl::GetFlag(FLAGS_opponent_checkpoint),
+              /*checkpoint_sha256=*/g_opponent_ckpt_sha256,
+              /*max_simulations=*/-1, /*budget_mode=*/"none",
+              /*logit_cap=*/static_cast<double>(opponent_logit_cap)};
         } else {
-          bots[p] = std::make_unique<DuneRandomBot>(game_rng());
+          bots[p] = std::make_unique<DuneRandomBot>(static_cast<int>(seat_seed));
+          seat_provenance[p] = SeatControllerProvenance{
+              /*controller=*/"random_legal", /*checkpoint=*/"",
+              /*checkpoint_sha256=*/"", /*max_simulations=*/-1,
+              /*budget_mode=*/"none", /*logit_cap=*/-1.0};
         }
       }
     }
@@ -488,7 +649,36 @@ void WorkerThread(
     std::map<int, int> search_seat_agents_avail_by_round;
     int prev_search_agents = -1;
 
+    // --- WO-1 Phase 3: pace/tempo round-end VP tracking --------------------
+    // Same edge-detected round-boundary snapshot dune_population_eval uses:
+    // GetCurrentRound() is bumped before the terminal check, so observing
+    // cur == N+1 means round N just ended; read every seat's track VP then.
+    constexpr int kPaceMaxRounds = 10;
+    std::array<std::array<int, 4>, kPaceMaxRounds + 2> vp_at_round_end{};
+    std::array<bool, kPaceMaxRounds + 2> round_end_seen{};
+    std::array<int, 4> specimen_conversions{};
+    int pace_last_round = -1;
+    {
+      const auto* s0 = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      pace_last_round = s0 ? s0->GetCurrentRound() : -1;
+    }
+    auto snapshot_round_ends = [&]() {
+      const auto* ds = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      if (ds == nullptr) return;
+      int cur = ds->GetCurrentRound();
+      while (pace_last_round >= 0 && pace_last_round < cur) {
+        if (pace_last_round >= 1 && pace_last_round <= kPaceMaxRounds) {
+          for (int p = 0; p < 4; ++p) {
+            vp_at_round_end[pace_last_round][p] = ds->GetPlayerVp(p);
+          }
+          round_end_seen[pace_last_round] = true;
+        }
+        ++pace_last_round;
+      }
+    };
+
     while (!state->IsTerminal()) {
+      snapshot_round_ends();
       Player current_player = state->CurrentPlayer();
       if (const auto* trk = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get())) {
         const int trk_round = trk->GetCurrentRound();
@@ -579,15 +769,19 @@ void WorkerThread(
 
       if (forced_swordmaster) {
         // chosen_action already set by the acquisition heuristic; skip search.
-      } else if (current_player == search_seat) {
-        bool has_active = search_session ? search_session->HasActiveSession() : false;
+      } else if (seat_is_searched[current_player]) {
+        // In homogeneous mode every seat lands here; `cur_session` is that seat's
+        // own session, never a shared one.
+        auto& cur_session = seat_sessions[current_player];
+        bool has_active = cur_session ? cur_session->HasActiveSession() : false;
         open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, has_active);
         game_role_counts[static_cast<int>(role)]++;
         bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
         DuneSearchResult last_res;
-        if (search_session) {
-          last_res = search_session->SearchAndSelect(*state);
+        if (cur_session) {
+          last_res = cur_session->SearchAndSelectWithDeadline(
+              *state, configured_move_budget_ms);
           chosen_action = last_res.diagnostics.selected_action;
         } else {
           // Path B: fresh full search per decision, sample-on-fallback (verbatim
@@ -604,7 +798,8 @@ void WorkerThread(
             last_res.diagnostics.selected_action = chosen_action;
           } else {
             chosen_action = SelectRawPriorAction(
-                *search_evaluator, *state, absl::GetFlag(FLAGS_temperature), game_rng);
+                *seat_evaluators[current_player], *state,
+                absl::GetFlag(FLAGS_temperature), game_rng);
             last_res = DuneSearchResult();
             last_res.simulations_completed = 0;
             last_res.used_fallback = true;
@@ -657,9 +852,9 @@ void WorkerThread(
           int target_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary)
               ? (absl::GetFlag(FLAGS_max_simulations) - reserve)
               : absl::GetFlag(FLAGS_max_simulations);
-          int completed_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary || !search_session)
+          int completed_sims = (role == open_spiel::DuneDecisionRole::kAgentPrimary || !cur_session)
               ? last_res.simulations_completed
-              : search_session->session_new_simulations_completed();
+              : cur_session->session_new_simulations_completed();
 
           bool is_incomplete = false;
           if (absl::GetFlag(FLAGS_live_deadline)) {
@@ -789,6 +984,78 @@ void WorkerThread(
               search_obj["tree_node_count"] = static_cast<int64_t>(diag.tree_node_count);
               search_obj["legality_result"] = diag.legality_result;
 
+              // --- WO-1 Phase 3: per-decision policy shape + budget health ---
+              // Policy-shape stats are reported for TWO distributions, because
+              // they answer different questions: the raw network prior (how
+              // decisive is the policy head) and the search's visit
+              // distribution (how decisive is the controller after search).
+              // NOTE: pre-cap |z| saturation is deliberately NOT emitted here.
+              // DuneNNEvaluator applies cap*tanh(z/cap) inside Prior() and
+              // discards the pre-cap logits, and the tanh squash means post-cap
+              // values never reach the cap -- any saturation fraction derived
+              // from them would be identically zero. That statistic is a
+              // property of the policy network, and it is measured exactly, at
+              // the configured cap and 2x cap, by dune_population_eval's
+              // --dump_logit_stats path whose dump runs BEFORE the cap.
+              auto shape_stats = [](const std::vector<double>& w,
+                                    double* norm_h, double* max_p,
+                                    double* eff_n) {
+                double total = 0.0;
+                for (double v : w) total += (v > 0.0 ? v : 0.0);
+                const int n = static_cast<int>(w.size());
+                if (n <= 0 || total <= 0.0) {
+                  *norm_h = 0.0; *max_p = 0.0; *eff_n = 0.0;
+                  return;
+                }
+                double h = 0.0, mx = 0.0;
+                for (double v : w) {
+                  const double p = (v > 0.0 ? v : 0.0) / total;
+                  if (p > 0.0) h -= p * std::log(p);
+                  mx = std::max(mx, p);
+                }
+                // n == 1 has log(n) == 0: a forced decision carries no choice
+                // entropy, so define it as 0.0 rather than emitting NaN.
+                *norm_h = (n > 1) ? (h / std::log(static_cast<double>(n))) : 0.0;
+                *max_p = mx;
+                *eff_n = std::exp(h);
+              };
+              const std::vector<double>& raw_w =
+                  diag.raw_priors.empty() ? diag.priors : diag.raw_priors;
+              double rp_h = 0.0, rp_max = 0.0, rp_eff = 0.0;
+              shape_stats(raw_w, &rp_h, &rp_max, &rp_eff);
+              search_obj["raw_prior_norm_entropy"] = rp_h;
+              search_obj["raw_prior_max_action_prob"] = rp_max;
+              search_obj["raw_prior_eff_action_count"] = rp_eff;
+              std::vector<double> visit_w;
+              visit_w.reserve(diag.visit_counts.size());
+              for (int v : diag.visit_counts) visit_w.push_back(static_cast<double>(v));
+              double sp_h = 0.0, sp_max = 0.0, sp_eff = 0.0;
+              shape_stats(visit_w, &sp_h, &sp_max, &sp_eff);
+              search_obj["search_policy_norm_entropy"] = sp_h;
+              search_obj["search_policy_max_action_prob"] = sp_max;
+              search_obj["search_policy_eff_action_count"] = sp_eff;
+
+              search_obj["sims_per_sec"] =
+                  (last_res.elapsed_time_ms > 0.0)
+                      ? (last_res.simulations_completed * 1000.0 /
+                         last_res.elapsed_time_ms)
+                      : 0.0;
+              // Which SESSION-level budget ran out, if any. Set by the session
+              // alongside (never overwriting) RunSearch's own fallback_reason.
+              search_obj["budget_limit_reason"] = diag.budget_limit_reason;
+              // "none" is the SENTINEL for "no session limit was hit", not an
+              // empty string -- testing emptiness marks every row starved.
+              // Also excluded: soft_sim_limit <= 0, which is true for every
+              // forced/bookkeeping decision. Those are non-search decisions,
+              // not starved searches.
+              const bool hit_session_limit =
+                  !diag.budget_limit_reason.empty() &&
+                  diag.budget_limit_reason != "none";
+              search_obj["budget_starved"] =
+                  hit_session_limit ||
+                  last_res.fallback_reason == "short_window_budget_exceeded" ||
+                  last_res.fallback_reason == "live_deadline_reached";
+
               std::lock_guard<std::mutex> lock(log_mutex);
               std::ofstream search_file(search_jsonl, std::ios::app);
               if (search_file) {
@@ -799,8 +1066,19 @@ void WorkerThread(
         chosen_action = bots[current_player]->Step(*state);
       }
 
+      // WO-1 Phase 3 addendum: count applied specimen->troop conversions per
+      // seat, at application time, by engine action-ID range. Measurement only
+      // -- no shaping is enabled anywhere by this counter.
+      if (chosen_action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
+          chosen_action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12 &&
+          current_player >= 0 && current_player < 4) {
+        ++specimen_conversions[current_player];
+      }
       state->ApplyAction(chosen_action);
     }
+
+    // Capture the terminal round's VP snapshot (the loop exits before it).
+    snapshot_round_ends();
 
     if (in_search_turn) {
       std::cout << "--- End of Agent Turn Audit Summary ---\n"
@@ -979,6 +1257,84 @@ void WorkerThread(
         game_obj["opponent_swordmasters"] = opp_sm_arr;
         game_obj["wall_time_s"] = game_duration_s;
 
+        // --- WO-1 Phase 2: per-seat controller provenance -------------------
+        // The candidate seat under analysis. Equal to search_seat in every
+        // mode; emitted under its own name because in homogeneous mode
+        // "the searched seat" is no longer a unique thing.
+        game_obj["candidate_seat"] = static_cast<int64_t>(search_seat);
+        game_obj["controller_mode"] = absl::GetFlag(FLAGS_controller_mode);
+        open_spiel::json::Array seat_ctrl_arr;
+        for (int p = 0; p < 4; ++p) {
+          open_spiel::json::Object sc;
+          sc["seat"] = static_cast<int64_t>(p);
+          sc["controller"] = seat_provenance[p].controller;
+          sc["checkpoint"] = seat_provenance[p].checkpoint;
+          sc["checkpoint_sha256"] = seat_provenance[p].checkpoint_sha256;
+          sc["max_simulations"] =
+              static_cast<int64_t>(seat_provenance[p].max_simulations);
+          sc["budget_mode"] = seat_provenance[p].budget_mode;
+          sc["logit_cap"] = seat_provenance[p].logit_cap;
+          sc["is_candidate"] = (p == search_seat);
+          seat_ctrl_arr.push_back(sc);
+        }
+        game_obj["seat_controllers"] = seat_ctrl_arr;
+
+        // --- WO-1 Phase 3: pace/tempo ---------------------------------------
+        int rounds_captured = 0;
+        open_spiel::json::Array vp_by_round_arr;
+        for (int rd = 1; rd <= kPaceMaxRounds; ++rd) {
+          if (!round_end_seen[rd]) break;
+          open_spiel::json::Array one_round;
+          for (int p = 0; p < 4; ++p) {
+            one_round.push_back(static_cast<int64_t>(vp_at_round_end[rd][p]));
+          }
+          vp_by_round_arr.push_back(one_round);
+          rounds_captured = rd;
+        }
+        game_obj["vp_end_by_round"] = vp_by_round_arr;
+
+        open_spiel::json::Array first_ge11_arr;
+        for (int p = 0; p < 4; ++p) {
+          int first = -1;
+          for (int rd = 1; rd <= rounds_captured; ++rd) {
+            if (vp_at_round_end[rd][p] >= dune_imperium::kTargetVp) { first = rd; break; }
+          }
+          // "never crossed" emits JSON null, matching dune_population_eval's
+          // encoding of the same key exactly -- the two binaries' Phase 3
+          // fields must be interchangeable for downstream analysis.
+          if (first < 0) {
+            first_ge11_arr.push_back(open_spiel::json::Null());
+          } else {
+            first_ge11_arr.push_back(static_cast<int64_t>(first));
+          }
+        }
+        game_obj["first_round_vp_ge_11"] = first_ge11_arr;
+
+        open_spiel::json::Array thr_set_arr;
+        bool cand_in_thr = false;
+        for (int p = 0; p < 4; ++p) {
+          if (dune_state->GetPlayerVp(p) >= dune_imperium::kTargetVp) {
+            thr_set_arr.push_back(static_cast<int64_t>(p));
+            if (p == search_seat) cand_in_thr = true;
+          }
+        }
+        game_obj["terminal_threshold_set"] = thr_set_arr;
+        game_obj["candidate_in_terminal_threshold_set"] = cand_in_thr;
+        // Mirrors the engine's end test (dune_imperium.cc:8891-8904):
+        // end_game <- (round_ > 10) OR (any vp_[p] >= kTargetVp); threshold
+        // wins when both hold. "other" is unreachable by construction.
+        game_obj["terminal_reason"] =
+            !thr_set_arr.empty()
+                ? std::string("threshold")
+                : (dune_state->GetCurrentRound() > kPaceMaxRounds
+                       ? std::string("round_limit")
+                       : std::string("other"));
+        open_spiel::json::Array spec_arr;
+        for (int p = 0; p < 4; ++p) {
+          spec_arr.push_back(static_cast<int64_t>(specimen_conversions[p]));
+        }
+        game_obj["specimen_conversions"] = spec_arr;
+
         std::lock_guard<std::mutex> lock(log_mutex);
         std::ofstream game_file(game_jsonl, std::ios::app);
         if (game_file) {
@@ -1142,6 +1498,45 @@ int main(int argc, char* argv[]) {
   if (model_ckpt.empty()) {
     std::cerr << "Error: --model_checkpoint is required!\n";
     return 1;
+  }
+
+  // --- WO-1 Phase 2: validate the seat controller topology ------------------
+  const open_spiel::SeatControllerMode cli_controller_mode =
+      open_spiel::ParseControllerMode(absl::GetFlag(FLAGS_controller_mode));
+  open_spiel::ParseMixedOpponentController(
+      absl::GetFlag(FLAGS_mixed_opponent_controller));  // validate early
+  if (cli_controller_mode != open_spiel::SeatControllerMode::kSingle &&
+      !absl::GetFlag(FLAGS_use_session)) {
+    std::cerr << "Error: --controller_mode=" << absl::GetFlag(FLAGS_controller_mode)
+              << " requires --use_session=true. Path B (--use_session=false) is "
+                 "the single-seat July-14 reference protocol and has no "
+                 "multi-seat form; running it here would silently search only "
+                 "one seat.\n";
+    return 1;
+  }
+  if (cli_controller_mode == open_spiel::SeatControllerMode::kHomogeneous &&
+      absl::GetFlag(FLAGS_opponent_checkpoint) != "random" &&
+      !absl::GetFlag(FLAGS_opponent_checkpoint).empty()) {
+    std::cerr << "Warning: --controller_mode=homogeneous searches all four "
+                 "seats with the candidate model; --opponent_checkpoint="
+              << absl::GetFlag(FLAGS_opponent_checkpoint)
+              << " is unused and will not appear in seat provenance.\n";
+  }
+
+  // Checkpoint digests for per-seat provenance. Computed ONCE here, before any
+  // worker thread exists, and only read afterwards -- that ordering is what
+  // makes the globals safe without a lock.
+  open_spiel::g_candidate_ckpt_sha256 =
+      open_spiel::ComputeFileSHA256(model_ckpt);
+  {
+    const std::string opp = absl::GetFlag(FLAGS_opponent_checkpoint);
+    if (opp == "random") {
+      open_spiel::g_opponent_ckpt_sha256 = "";
+    } else if (opp.empty()) {
+      open_spiel::g_opponent_ckpt_sha256 = open_spiel::g_candidate_ckpt_sha256;
+    } else {
+      open_spiel::g_opponent_ckpt_sha256 = open_spiel::ComputeFileSHA256(opp);
+    }
   }
 
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
@@ -1368,6 +1763,15 @@ int main(int argc, char* argv[]) {
     agg_obj["puct_c"] = absl::GetFlag(FLAGS_puct_c);
     agg_obj["root_prior_temperature"] = absl::GetFlag(FLAGS_root_prior_temperature);
     agg_obj["use_opponent_model"] = absl::GetFlag(FLAGS_use_opponent_model);
+    // WO-1 Phase 2: run-level controller topology + evaluator caps, so an
+    // aggregate can never be read without knowing which controller produced it.
+    agg_obj["controller_mode"] = absl::GetFlag(FLAGS_controller_mode);
+    agg_obj["mixed_opponent_controller"] =
+        absl::GetFlag(FLAGS_mixed_opponent_controller);
+    agg_obj["candidate_logit_cap"] = absl::GetFlag(FLAGS_candidate_logit_cap);
+    agg_obj["opponent_logit_cap"] = absl::GetFlag(FLAGS_opponent_logit_cap);
+    agg_obj["candidate_checkpoint_sha256"] = open_spiel::g_candidate_ckpt_sha256;
+    agg_obj["opponent_checkpoint_sha256"] = open_spiel::g_opponent_ckpt_sha256;
     agg_obj["nonlinear_value_head"] =
         absl::GetFlag(FLAGS_nonlinear_value_head);
     agg_obj["opponent_nonlinear_value_head"] =
