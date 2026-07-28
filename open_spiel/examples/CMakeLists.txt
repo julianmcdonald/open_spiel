@@ -85,6 +85,19 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_pwo3_teacher_audit dune_pwo3_teacher_audit.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo3_teacher_audit dune_search ${TORCH_LIBRARIES})
 
+  # PWO-3 Amendment 2 (docs/PWO3_AMENDMENT_2_PRECISION_RECOVERY.md). A SEPARATE
+  # target on purpose: dune_pwo3_teacher_audit is the binary of record for every
+  # PWO-3 measurement and must survive the amendment byte-for-byte, so the
+  # recovery instrument may not be a mode on it.
+  add_executable(dune_pwo3_prior_recovery dune_pwo3_prior_recovery.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo3_prior_recovery dune_search ${TORCH_LIBRARIES})
+
+  # Battery check 9: root raw priors are immutable after expansion, which is what
+  # makes the recovery instrument's zero-simulation replay admissible.
+  add_executable(dune_pwo3_immutability_test dune_pwo3_immutability_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo3_immutability_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_pwo3_immutability_test COMMAND dune_pwo3_immutability_test)
+
   add_executable(dune_seed_utils_test dune_seed_utils_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_seed_utils_test ${TORCH_LIBRARIES})
 
