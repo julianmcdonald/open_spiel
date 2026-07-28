@@ -112,6 +112,8 @@
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_split.h"
+#include "open_spiel/abseil-cpp/absl/strings/string_view.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include "open_spiel/spiel.h"
@@ -137,7 +139,8 @@ ABSL_FLAG(std::string, games_jsonl_path, "", "Per-game summary + the full action
 ABSL_FLAG(std::string, manifest_json_path, "", "Run manifest: every pin, every digest, the provenance contract.");
 ABSL_FLAG(std::string, engine_tree_hash, "", "REQUIRED. git rev-parse HEAD:games/dune_imperium.");
 ABSL_FLAG(std::string, registration_sha256, "", "REQUIRED. sha256 of docs/PWO4_TRAJECTORY_REGISTRATION.md.");
-ABSL_FLAG(std::string, amendment_sha256, "", "REQUIRED. sha256 of docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md. The amendment governs the gate semantics this stream is judged by, so a stream that cannot name it is unjudgeable.");
+ABSL_FLAG(std::string, amendment_sha256, "", "REQUIRED. sha256 of the GOVERNING amendment -- docs/PWO4_AMENDMENT_2_RETAINED_TREE.md (provenance ruling, 2026-07-29). A stream that cannot name the amendment it was generated under is unjudgeable.");
+ABSL_FLAG(std::string, amendment_chain, "", "REQUIRED. The COMPLETE ordered amendment chain, 'path=sha256' entries separated by ';', in RATIFICATION order: Amendment 1 then Amendment 2. The singular --amendment_sha256 names which one GOVERNS and must equal the LAST entry's digest; the chain preserves the lineage a single scalar cannot express (Amendment 2 section 9 keeps Amendment 1 in force). Missing, short, out-of-order or mismatched => fatal.");
 
 // --- Frozen controller MODES. These are not tunables. They exist as flags so a
 // --- launcher must state them and the binary can FATALLY reject any other value:
@@ -551,10 +554,60 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (absl::GetFlag(FLAGS_amendment_sha256).empty()) {
-    std::cerr << "STOP: --amendment_sha256 is REQUIRED (docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md). "
-                 "Amendment 1 defines the gate semantics this stream is judged by; a stream that "
-                 "cannot name its amendment cannot be adjudicated.\n";
+    std::cerr << "STOP: --amendment_sha256 is REQUIRED. It names the GOVERNING "
+                 "amendment (docs/PWO4_AMENDMENT_2_RETAINED_TREE.md); a stream that "
+                 "cannot name the semantics it was generated under cannot be "
+                 "adjudicated.\n";
     return 1;
+  }
+  // --- The amendment CHAIN (provenance ruling, 2026-07-29).
+  // Two amendments are simultaneously in force -- Amendment 2 section 9 keeps
+  // Amendment 1 in force -- and one scalar cannot express that. The scalar says
+  // which amendment GOVERNS; the chain preserves the lineage. An absent, short,
+  // out-of-order or mismatched chain is fatal: an OPTIONAL provenance contract
+  // is worse than none (registration section 7.3).
+  std::vector<std::pair<std::string, std::string>> amendment_chain;
+  {
+    const std::string raw = absl::GetFlag(FLAGS_amendment_chain);
+    if (raw.empty()) {
+      std::cerr << "STOP: --amendment_chain is REQUIRED. Pass the complete ordered "
+                   "chain 'path=sha256;path=sha256' in ratification order.\n";
+      return 1;
+    }
+    for (absl::string_view entry : absl::StrSplit(raw, ';', absl::SkipEmpty())) {
+      const size_t eq = entry.find('=');
+      if (eq == absl::string_view::npos) {
+        std::cerr << "STOP: --amendment_chain entry '" << entry
+                  << "' is not 'path=sha256'.\n";
+        return 1;
+      }
+      amendment_chain.emplace_back(std::string(entry.substr(0, eq)),
+                                   std::string(entry.substr(eq + 1)));
+    }
+    if (amendment_chain.size() < 2) {
+      std::cerr << "STOP: --amendment_chain has " << amendment_chain.size()
+                << " entries; TWO amendments are in force and both must be named. "
+                   "A short chain silently drops a governing document.\n";
+      return 1;
+    }
+    if (amendment_chain.front().first.find("AMENDMENT_1") == std::string::npos ||
+        amendment_chain.back().first.find("AMENDMENT_2") == std::string::npos) {
+      std::cerr << "STOP: --amendment_chain is out of order. It must run in "
+                   "RATIFICATION order, Amendment 1 first then Amendment 2, "
+                   "because Amendment 2 amends clauses Amendment 1 had already "
+                   "amended. Got front='" << amendment_chain.front().first
+                << "' back='" << amendment_chain.back().first << "'.\n";
+      return 1;
+    }
+    if (amendment_chain.back().second != absl::GetFlag(FLAGS_amendment_sha256)) {
+      std::cerr << "STOP: --amendment_sha256 ("
+                << absl::GetFlag(FLAGS_amendment_sha256)
+                << ") is not the LAST entry of --amendment_chain ("
+                << amendment_chain.back().second
+                << "). The governing amendment must be the most recently ratified "
+                   "one.\n";
+      return 1;
+    }
   }
 
   // --- The frozen controller MODES, asserted fatally. -----------------------
@@ -742,6 +795,13 @@ int main(int argc, char** argv) {
     std::vector<Action> full_history;
     int decision_index = 0;
     int game_length = 0;
+    // PWO-4 Amendment 2 section 3 / section 4.8 guard 5. The bot is constructed
+    // fresh per game and seat rotation changes the searching player at every
+    // game boundary, so cross-game visit leakage is structurally impossible
+    // twice over -- and it is checked once per game anyway, on the first searched
+    // decision, because "impossible by construction" is exactly the kind of claim
+    // this stream has already had to withdraw once.
+    bool game_had_searched_decision = false;
     std::map<std::string, int64_t> game_role_counts;
     int64_t game_label_rows = 0;
     std::array<int, 4> specimen_conversions{};
@@ -854,17 +914,105 @@ int main(int argc, char** argv) {
       const double final_action_sampling_r_val =
           absl::Uniform(step_rng_replica, 0.0, 1.0);
 
-      // --- Registration section 2.3 / work order CP0.4: a game containing a
-      // --- short-searched decision is not a coherent fully searched trajectory,
-      // --- which is the section 8.3 premise. VOID THE GAME AND STOP.
-      if (search_expected && (last_res.simulations_completed != max_sims ||
-                              diag.inherited_root_visits != 0)) {
-        std::cerr << "STOP (registration section 2.3): game " << g << " decision "
-                  << decision_index << " was search_expected but completed "
-                  << last_res.simulations_completed << " simulations with "
-                  << diag.inherited_root_visits << " inherited root visits. "
-                  << "The GAME is inadmissible; generation halts for diagnosis.\n";
-        return 1;
+      // --- The retention block and the ACCOUNTING IDENTITY.
+      // --- PWO-4 Amendment 2 sections 4.1, 4.2, 4.9, 5.
+      //
+      // The old rule here also required diag.inherited_root_visits == 0 and
+      // called that "fresh". Amendment 2 finding F2 withdrew it: that field's
+      // only writers are in dune_search_session.cc, so on this path it is 0
+      // permanently no matter how much tree was retained, and the check was
+      // vacuous on every row. The replacement measures what it claimed to:
+      //
+      //     sum(final) - sum(pre_search) == simulations_completed == 200
+      //
+      // A RETAINED TREE IS NOT AN INCOMPLETE SEARCH and must not void a game --
+      // it is the pinned controller's normal behaviour on ~61% of rows. What
+      // voids a game is a decision that did not contribute exactly its budget of
+      // NEW simulations.
+      int64_t sum_pre = 0, sum_final = 0, sum_checkpoint = 0;
+      for (int v : diag.visit_counts_pre_search) sum_pre += v;
+      for (int v : diag.visit_counts_final) sum_final += v;
+      for (int v : diag.visit_counts_checkpoint) sum_checkpoint += v;
+      const int64_t visits_new_total = sum_final - sum_pre;
+
+      if (search_expected) {
+        if (!diag.retention_snapshots_valid) {
+          std::cerr << "STOP (Amendment 2 section 5): game " << g << " decision "
+                    << decision_index << " was search_expected but carries no "
+                       "retention snapshots. The accounting identity cannot be "
+                       "evaluated, so the row cannot be certified.\n";
+          return 1;
+        }
+        if (last_res.simulations_completed != max_sims ||
+            visits_new_total != last_res.simulations_completed) {
+          std::cerr << "STOP (registration section 2.3 as amended by Amendment 2 "
+                       "section 4.2): game " << g << " decision " << decision_index
+                    << " was search_expected but completed "
+                    << last_res.simulations_completed << " simulations while "
+                       "contributing " << visits_new_total << " new root visits ("
+                    << sum_final << " final - " << sum_pre << " pre-search). "
+                       "The accounting identity requires new == completed == "
+                    << max_sims << ". The GAME is inadmissible; generation halts "
+                       "for diagnosis.\n";
+          return 1;
+        }
+        // Visits are monotone: a retained child can only gain.
+        for (size_t i = 0; i < diag.visit_counts_final.size(); ++i) {
+          if (diag.visit_counts_final[i] < diag.visit_counts_pre_search[i]) {
+            std::cerr << "STOP (Amendment 2 section 4.8 guard 2): game " << g
+                      << " decision " << decision_index << " action index " << i
+                      << " lost visits during search ("
+                      << diag.visit_counts_pre_search[i] << " -> "
+                      << diag.visit_counts_final[i] << ").\n";
+            return 1;
+          }
+        }
+        // visit_counts_final is snapshotted independently of visit_counts, so
+        // this compares two reads rather than a value with its own copy.
+        if (diag.visit_counts_final != diag.visit_counts) {
+          std::cerr << "STOP (Amendment 2 section 5.1): game " << g << " decision "
+                    << decision_index << ": visit_counts_final disagrees with "
+                       "visit_counts.\n";
+          return 1;
+        }
+        // A cold root cannot carry pre-search visits, and a game's first searched
+        // decision cannot be a reuse (fresh bot per game; seat rotation forces
+        // Reset at every game boundary).
+        if (!diag.root_reused_pre_search && sum_pre != 0) {
+          std::cerr << "STOP (Amendment 2 section 4.8 guard 4): game " << g
+                    << " decision " << decision_index << ": root_reused_pre_search "
+                       "is false but pre-search visits sum to " << sum_pre << ".\n";
+          return 1;
+        }
+        if (!game_had_searched_decision) {
+          if (diag.root_reused_pre_search || sum_final != max_sims) {
+            std::cerr << "STOP (Amendment 2 section 4.8 guards 4/5): game " << g
+                      << " decision " << decision_index << " is the FIRST searched "
+                         "decision of the game but reports reuse="
+                      << diag.root_reused_pre_search << " and a final visit sum of "
+                      << sum_final << " (must be " << max_sims << "). Cross-game "
+                         "visit leakage is the one thing retention must never do.\n";
+            return 1;
+          }
+          game_had_searched_decision = true;
+        }
+        if (diag.visit_counts_pre_search.size() != static_cast<size_t>(n_legal) ||
+            diag.visit_counts_final.size() != static_cast<size_t>(n_legal) ||
+            (diag.stability_checkpoint_reached &&
+             diag.visit_counts_checkpoint.size() != static_cast<size_t>(n_legal))) {
+          std::cerr << "STOP (Amendment 2 section 4.8 guard 6): game " << g
+                    << " decision " << decision_index << ": a retention snapshot "
+                       "vector length differs from n_legal=" << n_legal << ".\n";
+          return 1;
+        }
+        if (diag.stability_checkpoint_reached &&
+            sum_checkpoint - sum_pre != stability_checkpoint_sim) {
+          std::cerr << "STOP (Amendment 2 section 4.8 guard 3): game " << g
+                    << " decision " << decision_index << ": checkpoint delta "
+                    << (sum_checkpoint - sum_pre) << " != checkpoint sim index "
+                    << stability_checkpoint_sim << ".\n";
+          return 1;
+        }
       }
       // The independent cross-check of CP0.4. This expression is a CROSS-CHECK,
       // never the definition: a disagreement means the controller's predicate and
@@ -918,6 +1066,34 @@ int main(int argc, char** argv) {
       row["search_expected"] = search_expected;
       row["search_expected_diagnostic_expr"] = diagnostic_expr;
       row["inference_count"] = static_cast<int64_t>(last_res.inference_count);
+
+      // --- The retention block (Amendment 2 section 5.1), on every row where a
+      // --- search actually ran. On the two early-return paths these fields are
+      // --- ABSENT, not zero: a zero vector is indistinguishable from a real cold
+      // --- root, and a plausible default reading as data is the exact defect
+      // --- that made inherited_root_visits useless.
+      row["retention_snapshots_valid"] = diag.retention_snapshots_valid;
+      if (diag.retention_snapshots_valid) {
+        row["root_reused_pre_search"] = diag.root_reused_pre_search;
+        row["visit_counts_pre_search"] = ToJsonArray(diag.visit_counts_pre_search);
+        row["visit_counts_checkpoint"] = ToJsonArray(diag.visit_counts_checkpoint);
+        row["visit_counts_final"] = ToJsonArray(diag.visit_counts_final);
+        std::vector<int> visit_counts_new;
+        visit_counts_new.reserve(diag.visit_counts_final.size());
+        for (size_t i = 0; i < diag.visit_counts_final.size(); ++i) {
+          visit_counts_new.push_back(diag.visit_counts_final[i] -
+                                     diag.visit_counts_pre_search[i]);
+        }
+        row["visit_counts_new"] = ToJsonArray(visit_counts_new);
+        row["visit_counts_pre_search_sum"] = static_cast<int64_t>(sum_pre);
+        row["visit_counts_final_sum"] = static_cast<int64_t>(sum_final);
+        row["visit_counts_new_sum"] = static_cast<int64_t>(visits_new_total);
+        // Descriptive only (Amendment 2 section 4.4): NOT the training target,
+        // enters no weight, and no PWO-5 arm may select or weight on it without
+        // a further pre-registered amendment.
+        PutDouble(&row, "retained_visit_fraction",
+                  sum_final > 0 ? static_cast<double>(sum_pre) / static_cast<double>(sum_final) : 0.0);
+      }
 
       // Seed provenance (registration section 4.1a). No single scalar reproduces a
       // search; recording all four makes the counter's trajectory auditable
@@ -1293,8 +1469,26 @@ int main(int argc, char** argv) {
     m["tool"] = std::string("dune_pwo4_trajectory");
     m["registration"] = std::string("docs/PWO4_TRAJECTORY_REGISTRATION.md revision 3");
     m["registration_sha256"] = absl::GetFlag(FLAGS_registration_sha256);
-    m["amendment"] = std::string("docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md");
+    // The GOVERNING amendment (provenance ruling, 2026-07-29), plus the complete
+    // ordered chain the scalar cannot express.
+    m["amendment"] = std::string("docs/PWO4_AMENDMENT_2_RETAINED_TREE.md");
     m["amendment_sha256"] = absl::GetFlag(FLAGS_amendment_sha256);
+    {
+      json::Array chain;
+      for (const auto& kv : amendment_chain) {
+        json::Object e;
+        e["document"] = kv.first;
+        e["sha256"] = kv.second;
+        chain.push_back(json::Value(std::move(e)));
+      }
+      m["amendment_chain"] = std::move(chain);
+      m["amendment_chain_order"] =
+          std::string("ratification order: Amendment 1 then Amendment 2. The "
+                      "governing amendment is the LAST entry and equals "
+                      "amendment_sha256. Amendment 2 section 9 keeps Amendment 1 "
+                      "in force, so a row governed by Amendment 2 is also "
+                      "governed by Amendment 1.");
+    }
     m["generator_binary_sha256"] = self_sha;
     m["model_path"] = model_ckpt;
     m["model_sha256"] = model_sha;

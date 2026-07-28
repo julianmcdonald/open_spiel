@@ -712,6 +712,21 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(
   return returns;
 }
 
+// PWO-4 Amendment 2 section 5.1. Root-child visits in legal-action order.
+// Pure read: no RNG, no tree mutation, no allocation into the tree. Actions with
+// no child yet read 0, which is what a cold root's children legitimately are.
+static void SnapshotRootVisits(const DuneISMCTSNode* root_node,
+                               const std::vector<Action>& legal_actions,
+                               std::vector<int>* out) {
+  out->clear();
+  if (root_node == nullptr) return;
+  out->reserve(legal_actions.size());
+  for (Action action : legal_actions) {
+    auto iter = root_node->child_info.find(action);
+    out->push_back(iter != root_node->child_info.end() ? iter->second.visits : 0);
+  }
+}
+
 Action GetRootArgmaxAction(const DuneISMCTSNode* root_node, const std::vector<Action>& legal_actions) {
   if (root_node == nullptr) return kInvalidAction;
   Action best_action = kInvalidAction;
@@ -748,6 +763,13 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   max_decision_depth_this_search_ = 0;
   sum_decision_depth_this_search_ = 0.0;
   is_continuation_ = (start_sim_index > 0);
+  // PWO-4 Amendment 2 section 5.1: was an existing tree left in place for this
+  // decision's root? Captured exactly where the amendment defines it -- after
+  // the reset-or-retain block resolves, before LookupOrCreateNode. Emission
+  // only: nothing below reads this flag, and the two assignments added here sit
+  // in `else` arms that previously did nothing, so no branch is taken
+  // differently than before.
+  bool root_reused_pre_search = false;
   if (!in_session_) {
     if (evaluators_ != last_evaluators_ ||
         state.CurrentPlayer() != last_searching_player_ ||
@@ -759,8 +781,16 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
       auto root_key = GetStateKey(state);
       if (nodes_.find(root_key) == nodes_.end()) {
         Reset();
+      } else {
+        root_reused_pre_search = true;
       }
     }
+  } else {
+    // The session path does not run the block above; the session owns the tree.
+    // Computed explicitly so the field is never a silent default there -- the
+    // exact defect (a plausible zero reading as data) that made
+    // inherited_root_visits useless on the fresh path.
+    root_reused_pre_search = (nodes_.find(GetStateKey(state)) != nodes_.end());
   }
 
   int actual_max_sims = (max_sims >= 0) ? max_sims : config_.max_simulations;
@@ -833,6 +863,16 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   if (root_node_->total_visits < 0) {
     root_node_->total_visits = 0;
   }
+
+  // PWO-4 Amendment 2 section 5.1: the PRE-SEARCH snapshot, taken HERE -- after
+  // LookupOrCreateNode, after InitializePriorsAndValue, and after the WO-15
+  // cold-root expansion bookkeeping immediately above -- and before the
+  // simulation loop below. Everything this decision's 200 simulations add is
+  // measured against it.
+  std::vector<int> visit_counts_pre_search;
+  std::vector<int> visit_counts_checkpoint;
+  std::vector<int> visit_counts_final;
+  SnapshotRootVisits(root_node_, legal_actions, &visit_counts_pre_search);
 
   // Apply Dirichlet noise exactly once at the root node's priors (if enabled).
   if (config_.dirichlet_epsilon > 0.0 && !is_continuation_ && !root_node_->dirichlet_noise_applied) {
@@ -921,6 +961,9 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
       stability_checkpoint_reached = true;
       pwo3_snapshot_coverage(&stability_checkpoint_num_covered,
                              &stability_checkpoint_prior_mass);
+      // PWO-4 Amendment 2 section 5.1: the CHECKPOINT snapshot, at the same
+      // point the existing PWO-3 checkpoint telemetry above already reads.
+      SnapshotRootVisits(root_node_, legal_actions, &visit_counts_checkpoint);
     }
 
     // Check relative time budget limit with measured max simulation latency safety margin
@@ -1034,6 +1077,16 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   result.diagnostics.half_time_checkpoint_sim = half_time_checkpoint_sim;
   result.diagnostics.half_time_checkpoint_num_covered_actions = half_time_checkpoint_num_covered;
   result.diagnostics.half_time_checkpoint_covered_prior_mass = half_time_checkpoint_prior_mass;
+  // PWO-4 Amendment 2 section 5.1: the FINAL snapshot and the retention block.
+  // Taken here, after GetRootDiagnostics has read the same node, so that
+  // requiring visit_counts_final == visit_counts is a genuine cross-check of two
+  // independent reads rather than a copy compared with itself.
+  SnapshotRootVisits(root_node_, legal_actions, &visit_counts_final);
+  result.diagnostics.retention_snapshots_valid = true;
+  result.diagnostics.root_reused_pre_search = root_reused_pre_search;
+  result.diagnostics.visit_counts_pre_search = visit_counts_pre_search;
+  result.diagnostics.visit_counts_checkpoint = visit_counts_checkpoint;
+  result.diagnostics.visit_counts_final = visit_counts_final;
   result.inference_count = inference_count_this_search_;
   last_search_result_ = result;
   return result;

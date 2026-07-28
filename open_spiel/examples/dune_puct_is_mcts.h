@@ -213,6 +213,57 @@ struct SearchDiagnostics {
   bool pass_meaningful_visits = false;
   bool pass_q_margin = false;
   bool pass_stability = false;
+
+  // PWO-4 Amendment 2 section 5.1 (RATIFIED 2026-07-29,
+  // docs/PWO4_AMENDMENT_2_RETAINED_TREE.md). RETENTION TELEMETRY, EMISSION ONLY.
+  //
+  // WHY THIS EXISTS. On the !in_session_ path this bot RETAINS its whole node
+  // map across a seat's decisions within a game (RunSearch's reset-or-retain
+  // block), so cumulative root visits legitimately exceed the simulation budget
+  // -- 593 of 969 rows on the CP1 gate block, up to 6.39x. inherited_root_visits
+  // CANNOT detect that: its only writers are in dune_search_session.cc, so on
+  // this path it holds its initializer of 0 forever, and three registered
+  // "freshness proofs" built on it were vacuous. These fields are the live
+  // replacement, and the accounting identity over them
+  //
+  //     sum(final) - sum(pre_search) == simulations_completed
+  //
+  // is what now proves a search contributed exactly its budget of NEW
+  // simulations.
+  //
+  // BEHAVIOUR NEUTRALITY. Snapshots only: they copy child visit counts at points
+  // the search already reaches, draw no RNG, mutate no tree state, and are read
+  // by nothing in selection, expansion, backup or seeding. On a FIXED-simulation
+  // tier -- which PWO-4 pins, with disable_time_limit=true so no clock can
+  // truncate -- cost cannot change the result at all, because the search stops
+  // on a COUNT. The claim is not left as an assertion: the section 7.1 A<->B2
+  // fidelity gate compares every pre-existing field bitwise against a reference
+  // binary that does not contain this code, and one mismatch is a registered
+  // STOP.
+  //
+  // Valid ONLY when a search actually ran. RunSearch's two early returns
+  // (single legal action; non-strategic state) leave snapshots_valid false and
+  // the vectors empty -- ABSENT, not zero. A zero vector would be
+  // indistinguishable from a real cold-root reading.
+  bool retention_snapshots_valid = false;
+  // The controller state key was present in nodes_ AFTER the reset-or-retain
+  // block resolved and BEFORE LookupOrCreateNode ran -- i.e. the retain branch
+  // was taken. False whenever Reset() fired, since the map is then empty.
+  bool root_reused_pre_search = false;
+  // Root-child visits in legal-action order, snapshotted immediately before the
+  // simulation loop -- after LookupOrCreateNode, InitializePriorsAndValue and
+  // the WO-15 cold-root expansion bookkeeping. A fresh root's child_info is
+  // populated with ZERO visits at that point, so a cold root's vector is all
+  // zeros: populated, not absent, which is why retention_snapshots_valid is a
+  // separate flag rather than an emptiness test.
+  std::vector<int> visit_counts_pre_search;
+  // The same vector at the stability checkpoint (sim floor(max_sims * fraction),
+  // = 100 of 200 under the PWO-4 pin).
+  std::vector<int> visit_counts_checkpoint;
+  // The same vector at search end. Snapshotted INDEPENDENTLY of visit_counts
+  // rather than copied from it, so that requiring the two to be equal is a real
+  // cross-check of GetRootDiagnostics against this path instead of a tautology.
+  std::vector<int> visit_counts_final;
 };
 
 struct DuneSearchResult {
