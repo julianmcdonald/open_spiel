@@ -137,6 +137,18 @@ ABSL_FLAG(std::string, games_jsonl_path, "", "Per-game summary + the full action
 ABSL_FLAG(std::string, manifest_json_path, "", "Run manifest: every pin, every digest, the provenance contract.");
 ABSL_FLAG(std::string, engine_tree_hash, "", "REQUIRED. git rev-parse HEAD:games/dune_imperium.");
 ABSL_FLAG(std::string, registration_sha256, "", "REQUIRED. sha256 of docs/PWO4_TRAJECTORY_REGISTRATION.md.");
+ABSL_FLAG(std::string, amendment_sha256, "", "REQUIRED. sha256 of docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md. The amendment governs the gate semantics this stream is judged by, so a stream that cannot name it is unjudgeable.");
+
+// --- Frozen controller MODES. These are not tunables. They exist as flags so a
+// --- launcher must state them and the binary can FATALLY reject any other value:
+// --- a mode silently defaulted is a mode nobody declared. Amendment 1 section 5.
+ABSL_FLAG(bool, use_session, false, "FROZEN false. The July-14 reference protocol: a fresh full search per decision, no session.");
+ABSL_FLAG(std::string, controller_mode, "single", "FROZEN 'single'. Homogeneous + use_session=false is a fatal error in the reference itself (dune_search_benchmark.cc:1516-1524).");
+ABSL_FLAG(std::string, fresh_search_roles, "", "FROZEN empty. A non-empty value is the arm-4 decomposition filter and would change the eligible set.");
+ABSL_FLAG(bool, policy_only, false, "FROZEN false.");
+ABSL_FLAG(bool, live_deadline, false, "FROZEN false. With policy_only=false this yields budget_mode = kFixedSessionSimulations.");
+ABSL_FLAG(int, force_swordmaster_rounds, 0, "FROZEN 0. No curriculum, no forcing (registration section 2.6).");
+ABSL_FLAG(int, grant_swordmaster_round, 0, "FROZEN 0. No endowment.");
 
 // --- Run range (registration section 4.2) ----------------------------------
 ABSL_FLAG(int, games, 8, "How many games to play.");
@@ -538,6 +550,78 @@ int main(int argc, char** argv) {
                  "content hash, 57ec6310...0733).\n";
     return 1;
   }
+  if (absl::GetFlag(FLAGS_amendment_sha256).empty()) {
+    std::cerr << "STOP: --amendment_sha256 is REQUIRED (docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md). "
+                 "Amendment 1 defines the gate semantics this stream is judged by; a stream that "
+                 "cannot name its amendment cannot be adjudicated.\n";
+    return 1;
+  }
+
+  // --- The frozen controller MODES, asserted fatally. -----------------------
+  // Each of these changes WHAT IS MEASURED, not how fast it is measured, so a
+  // wrong value must not produce data at all. They are flags rather than
+  // constants precisely so a launcher has to state them: registration section 2.6's
+  // rule is that no flag default defines a measurement-of-record configuration.
+  {
+    struct ModePin { const char* name; bool ok; std::string got; const char* want; };
+    const std::vector<ModePin> pins = {
+      {"--use_session", absl::GetFlag(FLAGS_use_session) == false,
+       absl::GetFlag(FLAGS_use_session) ? "true" : "false", "false"},
+      {"--controller_mode", absl::GetFlag(FLAGS_controller_mode) == "single",
+       absl::GetFlag(FLAGS_controller_mode), "single"},
+      {"--fresh_search_roles", absl::GetFlag(FLAGS_fresh_search_roles).empty(),
+       absl::GetFlag(FLAGS_fresh_search_roles), "(empty)"},
+      {"--policy_only", absl::GetFlag(FLAGS_policy_only) == false,
+       absl::GetFlag(FLAGS_policy_only) ? "true" : "false", "false"},
+      {"--live_deadline", absl::GetFlag(FLAGS_live_deadline) == false,
+       absl::GetFlag(FLAGS_live_deadline) ? "true" : "false", "false"},
+      {"--force_swordmaster_rounds", absl::GetFlag(FLAGS_force_swordmaster_rounds) == 0,
+       std::to_string(absl::GetFlag(FLAGS_force_swordmaster_rounds)), "0"},
+      {"--grant_swordmaster_round", absl::GetFlag(FLAGS_grant_swordmaster_round) == 0,
+       std::to_string(absl::GetFlag(FLAGS_grant_swordmaster_round)), "0"},
+    };
+    bool all_ok = true;
+    for (const ModePin& p : pins) {
+      if (!p.ok) {
+        std::cerr << "STOP: " << p.name << " is FROZEN at " << p.want << " but was given '"
+                  << p.got << "' (registration section 2.6).\n";
+        all_ok = false;
+      }
+    }
+    if (!all_ok) return 1;
+  }
+  if (absl::GetFlag(FLAGS_disable_time_limit) != true) {
+    std::cerr << "STOP: --disable_time_limit is FROZEN true, so no clock can truncate a "
+                 "count-terminated search (registration section 2.2).\n";
+    return 1;
+  }
+  if (absl::GetFlag(FLAGS_temperature) != 0.0) {
+    std::cerr << "STOP: --temperature is FROZEN at 0.0 (registration section 2.6).\n";
+    return 1;
+  }
+  if (absl::GetFlag(FLAGS_dirichlet_epsilon) != 0.0) {
+    std::cerr << "STOP: --dirichlet_epsilon is FROZEN at 0.0: root noise OFF. A noised root "
+                 "would separate `priors` from `raw_prior_vector` and break the Amendment-1 "
+                 "section 4 identity assert.\n";
+    return 1;
+  }
+  if (absl::GetFlag(FLAGS_root_prior_temperature) != 1.0) {
+    std::cerr << "STOP: --root_prior_temperature is FROZEN at 1.0, for the same reason as "
+                 "--dirichlet_epsilon.\n";
+    return 1;
+  }
+  if (absl::GetFlag(FLAGS_covered_prior_threshold) != 0.50 ||
+      absl::GetFlag(FLAGS_min_visit_threshold) != 2) {
+    std::cerr << "STOP: the coverage-rule operands are FROZEN at min_visit_threshold=2 and "
+                 "covered_prior_threshold=0.50 (registration section 6.2). A divergence would "
+                 "silently change the weight rule.\n";
+    return 1;
+  }
+  if (absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction) != 0.5) {
+    std::cerr << "STOP: --conservative_stability_checkpoint_fraction is FROZEN at 0.5 -- it is "
+                 "the section 5.3 prefix checkpoint, NOT inert.\n";
+    return 1;
+  }
   const std::string audit_path = absl::GetFlag(FLAGS_audit_jsonl_path);
   const std::string labels_path = absl::GetFlag(FLAGS_labels_jsonl_path);
   const std::string games_path = absl::GetFlag(FLAGS_games_jsonl_path);
@@ -751,8 +835,24 @@ int main(int argc, char** argv) {
       last_res.diagnostics.selected_action = chosen_action;
       const SearchDiagnostics& diag = last_res.diagnostics;
 
+      // --- The post-search final-action sampling draw, reconstructed.
+      // Step() computes these internally and exposes none of them
+      // (dune_puct_is_mcts.cc:1126-1130). They are recomputed here from the same
+      // inputs by the same functions, and the reconstruction is SELF-VALIDATING:
+      // Amendment 1 section 3 requires the analyzer to recompute the inverse-CDF
+      // sample from (deployed_policy, r_val) and match deployed_action on every
+      // coverage-fallback row. If any step of this reconstruction were wrong,
+      // that check would fail on those rows.
+      //
+      // Amendment 1 section 4: this seed is INERT only on non-fallback rows,
+      // where the policy is one-hot and SampleAction returns the argmax whatever
+      // r_val is. On a coverage fallback the policy is the raw-prior
+      // DISTRIBUTION and the draw genuinely selects the action.
       const uint64_t final_action_sampling_seed = dune_seed::Combine(
           search_config_seed, dune_seed::kStreamBlueprint, search_count_after);
+      std::mt19937 step_rng_replica(final_action_sampling_seed);
+      const double final_action_sampling_r_val =
+          absl::Uniform(step_rng_replica, 0.0, 1.0);
 
       // --- Registration section 2.3 / work order CP0.4: a game containing a
       // --- short-searched decision is not a coherent fully searched trajectory,
@@ -830,8 +930,15 @@ int main(int argc, char** argv) {
       // POST-search. Seeds ONLY the draw that samples the final action from
       // res.policy. NEVER label this the search seed (registration section 4.1a
       // error 4). It is inert wherever the policy is one-hot -- i.e. wherever the
-      // coverage gate did NOT fire -- and live where it did.
+      // coverage gate did NOT fire -- and LIVE where it did (Amendment 1 section 4).
       row["final_action_sampling_seed"] = static_cast<int64_t>(final_action_sampling_seed);
+      PutDouble(&row, "final_action_sampling_r_val", final_action_sampling_r_val);
+      // uint64 decimal strings. json::Value takes int64_t, so a seed above 2^63
+      // serializes NEGATIVE; the int64 fields above keep reference parity, and
+      // these carry the unambiguous value the analyzer recomputes against.
+      row["game_seed_u64"] = std::to_string(game_seed);
+      row["search_config_seed_u64"] = std::to_string(search_config_seed);
+      row["final_action_sampling_seed_u64"] = std::to_string(final_action_sampling_seed);
 
       // The reference's remaining live telemetry, under the reference's names.
       row["protocol_version"] = diag.protocol_version;
@@ -939,6 +1046,7 @@ int main(int argc, char** argv) {
       row["opponent_model_sha256"] = opp_sha;
       row["engine_tree_hash"] = absl::GetFlag(FLAGS_engine_tree_hash);
       row["registration_sha256"] = absl::GetFlag(FLAGS_registration_sha256);
+      row["amendment_sha256"] = absl::GetFlag(FLAGS_amendment_sha256);
       row["configured_max_simulations"] = static_cast<int64_t>(max_sims);
       row["configured_max_nodes"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_nodes));
       PutDouble(&row, "configured_covered_prior_threshold", absl::GetFlag(FLAGS_covered_prior_threshold));
@@ -1185,6 +1293,8 @@ int main(int argc, char** argv) {
     m["tool"] = std::string("dune_pwo4_trajectory");
     m["registration"] = std::string("docs/PWO4_TRAJECTORY_REGISTRATION.md revision 3");
     m["registration_sha256"] = absl::GetFlag(FLAGS_registration_sha256);
+    m["amendment"] = std::string("docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md");
+    m["amendment_sha256"] = absl::GetFlag(FLAGS_amendment_sha256);
     m["generator_binary_sha256"] = self_sha;
     m["model_path"] = model_ckpt;
     m["model_sha256"] = model_sha;
@@ -1251,12 +1361,17 @@ int main(int argc, char** argv) {
     pin["max_simulations"] = static_cast<int64_t>(max_sims);
     pin["max_nodes"] = static_cast<int64_t>(absl::GetFlag(FLAGS_max_nodes));
     pin["disable_time_limit"] = absl::GetFlag(FLAGS_disable_time_limit);
-    pin["use_session"] = false;
-    pin["controller_mode"] = std::string("single");
+    // The frozen MODES, echoed from the flags that were fatally asserted above --
+    // never as literals. A manifest that hardcodes what it claims to observe
+    // records the author's intention, not the run's configuration.
+    pin["use_session"] = absl::GetFlag(FLAGS_use_session);
+    pin["controller_mode"] = absl::GetFlag(FLAGS_controller_mode);
     pin["rotate_seat"] = absl::GetFlag(FLAGS_rotate_seat);
-    pin["fresh_search_roles"] = std::string("");
-    pin["policy_only"] = false;
-    pin["live_deadline"] = false;
+    pin["fresh_search_roles"] = absl::GetFlag(FLAGS_fresh_search_roles);
+    pin["policy_only"] = absl::GetFlag(FLAGS_policy_only);
+    pin["live_deadline"] = absl::GetFlag(FLAGS_live_deadline);
+    pin["force_swordmaster_rounds"] = static_cast<int64_t>(absl::GetFlag(FLAGS_force_swordmaster_rounds));
+    pin["grant_swordmaster_round"] = static_cast<int64_t>(absl::GetFlag(FLAGS_grant_swordmaster_round));
     pin["check_strategic_state"] = absl::GetFlag(FLAGS_check_strategic_state);
     pin["use_opponent_model"] = absl::GetFlag(FLAGS_use_opponent_model);
     pin["nonlinear_value_head"] = absl::GetFlag(FLAGS_nonlinear_value_head);
