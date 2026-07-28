@@ -180,18 +180,28 @@ struct SearchDiagnostics {
   bool stability_agreement = false;
 
   // PWO-3 (docs/PWO3_REGISTRATION.md section 4.2). TELEMETRY ONLY: recorded at
-  // checkpoints already visited by the loop, consuming no RNG and mutating no
-  // tree state, so search behaviour is bitwise unchanged. The section 6.1.1
-  // cross-build gate proves that rather than asserting it.
+  // checkpoints already visited by the loop, drawing no RNG and mutating no tree
+  // state.
   //
   // The coverage-gate INPUTS at the half-budget checkpoint. PWO-2 recorded only
-  // stability_checkpoint_action, and never emitted even that.
+  // stability_checkpoint_action, and never emitted even that. On a FIXED tier
+  // this is behaviour-neutral in the strong sense -- the search stops on a COUNT,
+  // so the snapshot's cost cannot change the result -- and section 6.1.1 proves
+  // that on all 384 Branch-A fixed_800 rows.
   int stability_checkpoint_num_covered_actions = 0;
   double stability_checkpoint_covered_prior_mass = 0.0;
   // The half-TIME checkpoint. A live tier's budget is TIME, not simulations: its
-  // max_simulations is 100000 while PWO-2 measured live searches completing 4,133
-  // (p50) to 73,934 (max) simulations, so the sim-count checkpoint at 50,000 is
-  // unreached on most live rows and "half budget" there means half the deadline.
+  // max_simulations is 100000, while 0 of PWO-2's 384 ISOLATED live_50 rows
+  // reached 50,000 simulations (max 40,951), so the sim-count checkpoint is
+  // unreached on EVERY live row and "half budget" there means half the deadline.
+  //
+  // NOT bitwise-neutral, and registration 14.3a says so: a live search stops on
+  // the CLOCK, so this snapshot's cost is time not spent simulating and can shift
+  // simulations_completed slightly. It fires at most once per search and costs one
+  // prior pass plus an argmax -- order 1e-6 of a 50 s deadline -- and it cannot
+  // change the searched TREE. Live simulations_completed was never reproducible
+  // anyway (PWO-2 final report 3.4: agreement on 0/76 rows across its own rerun,
+  // with chosen_action identical throughout).
   Action half_time_checkpoint_action = -1;
   bool half_time_checkpoint_reached = false;
   int half_time_checkpoint_sim = -1;

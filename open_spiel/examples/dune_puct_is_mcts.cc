@@ -877,9 +877,13 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   int stability_checkpoint = std::floor(actual_max_sims * config_.conservative_stability_checkpoint_fraction);
   Action stability_checkpoint_action = kInvalidAction;
   bool stability_checkpoint_reached = false;
-  // PWO-3 telemetry (docs/PWO3_REGISTRATION.md section 4.2). Read-only snapshots
-  // at checkpoints the loop already visits: no RNG is drawn and no tree state is
-  // mutated, so search behaviour is bitwise unchanged.
+  // PWO-3 telemetry (docs/PWO3_REGISTRATION.md sections 4.2, 14.3a). Read-only
+  // snapshots at checkpoints the loop already visits: no RNG is drawn and no tree
+  // state is mutated. On a FIXED tier that makes them behaviour-neutral outright
+  // (the search stops on a COUNT). The half-TIME snapshot below sits inside the
+  // TIMED loop, so on a live tier it is MEASUREMENT OVERHEAD -- bounded, fires at
+  // most once, cannot change the tree, but can shift simulations_completed
+  // slightly. Do not describe it as bitwise unchanged.
   const int pwo3_min_visits = EffectiveMinVisitThreshold(config_.min_visit_threshold);
   int stability_checkpoint_num_covered = 0;
   double stability_checkpoint_prior_mass = 0.0;
