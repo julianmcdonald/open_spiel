@@ -47,8 +47,15 @@
 // ---------------------------------------------------------------------------
 //   audit.jsonl   every searched-seat decision, including the zero-simulation
 //                 single-action and non-strategic ones. ~197.8 rows/game.
-//   labels.jsonl  ONLY search_expected && simulations_completed == 200 &&
-//                 inherited_root_visits == 0. ~121.4 rows/game.
+//   labels.jsonl  ONLY search_expected && simulations_completed == 200 && the
+//                 Amendment 2 accounting identity
+//                 (sum(final) - sum(pre_search) == simulations_completed).
+//                 ~121.4 rows/game.
+//
+//                 The admission rule used to name inherited_root_visits == 0 as
+//                 its third clause. Amendment 2 finding F2 WITHDREW that: the
+//                 field has no writer on this path, so it was 0 on every row and
+//                 admitted everything. The identity measures what it claimed to.
 //
 // A non-eligible decision is NOT a weight-zero label: it has no target, no
 // coverage reading and no stability reading, and never enters labels.jsonl.
@@ -568,6 +575,20 @@ int main(int argc, char** argv) {
   // is worse than none (registration section 7.3).
   std::vector<std::pair<std::string, std::string>> amendment_chain;
   {
+    // The REGISTERED chain, pinned as compile-time constants. Verifying the
+    // chain against values the caller also supplies would verify nothing: a
+    // wrong-but-well-formed hash would sail through. These are the values the
+    // provenance ruling names, and the binary refuses anything else.
+    struct RegisteredAmendment { const char* path; const char* sha256; };
+    static const RegisteredAmendment kRegisteredChain[] = {
+        {"docs/PWO4_AMENDMENT_1_GATE_SEMANTICS.md",
+         "85536fccf7a0ecf23afc13988d73246a37e8f5fe84d884d70f2009d209f0288c"},
+        {"docs/PWO4_AMENDMENT_2_RETAINED_TREE.md",
+         "dfe302e09bd0f495f7ad96e14c474fec9003c871420124a5ab846cbcaaa74f66"},
+    };
+    static const size_t kRegisteredChainLen =
+        sizeof(kRegisteredChain) / sizeof(kRegisteredChain[0]);
+
     const std::string raw = absl::GetFlag(FLAGS_amendment_chain);
     if (raw.empty()) {
       std::cerr << "STOP: --amendment_chain is REQUIRED. Pass the complete ordered "
@@ -584,28 +605,47 @@ int main(int argc, char** argv) {
       amendment_chain.emplace_back(std::string(entry.substr(0, eq)),
                                    std::string(entry.substr(eq + 1)));
     }
-    if (amendment_chain.size() < 2) {
+    // EXACT length. Not ">= 2": an EXTRA entry is a document nobody registered
+    // silently claiming to govern this stream.
+    if (amendment_chain.size() != kRegisteredChainLen) {
       std::cerr << "STOP: --amendment_chain has " << amendment_chain.size()
-                << " entries; TWO amendments are in force and both must be named. "
-                   "A short chain silently drops a governing document.\n";
+                << " entries; exactly " << kRegisteredChainLen
+                << " amendments are registered. A short chain drops a governing "
+                   "document; a long one smuggles in an unregistered one.\n";
       return 1;
     }
-    if (amendment_chain.front().first.find("AMENDMENT_1") == std::string::npos ||
-        amendment_chain.back().first.find("AMENDMENT_2") == std::string::npos) {
-      std::cerr << "STOP: --amendment_chain is out of order. It must run in "
-                   "RATIFICATION order, Amendment 1 first then Amendment 2, "
-                   "because Amendment 2 amends clauses Amendment 1 had already "
-                   "amended. Got front='" << amendment_chain.front().first
-                << "' back='" << amendment_chain.back().first << "'.\n";
-      return 1;
+    // EXACT path and EXACT hash, position by position. Position enforces
+    // ratification order, since Amendment 2 amends clauses Amendment 1 had
+    // already amended.
+    for (size_t i = 0; i < kRegisteredChainLen; ++i) {
+      if (amendment_chain[i].first != kRegisteredChain[i].path) {
+        std::cerr << "STOP: --amendment_chain[" << i << "] is '"
+                  << amendment_chain[i].first << "', but position " << i
+                  << " of the registered chain is '" << kRegisteredChain[i].path
+                  << "'. Paths are compared EXACTLY -- a substring match would "
+                     "accept a lookalike such as "
+                     "docs/COPY_OF_PWO4_AMENDMENT_1_GATE_SEMANTICS.md.\n";
+        return 1;
+      }
+      if (amendment_chain[i].second != kRegisteredChain[i].sha256) {
+        std::cerr << "STOP: --amendment_chain[" << i << "] ("
+                  << kRegisteredChain[i].path << ") has sha256 "
+                  << amendment_chain[i].second << ", but the registered value is "
+                  << kRegisteredChain[i].sha256
+                  << ". A nonempty wrong hash is not weaker evidence than a "
+                     "missing one -- it is worse, because it looks correct.\n";
+        return 1;
+      }
     }
-    if (amendment_chain.back().second != absl::GetFlag(FLAGS_amendment_sha256)) {
+    // The governing scalar must be Amendment 2 -- the LAST registered entry.
+    if (absl::GetFlag(FLAGS_amendment_sha256) !=
+        kRegisteredChain[kRegisteredChainLen - 1].sha256) {
       std::cerr << "STOP: --amendment_sha256 ("
                 << absl::GetFlag(FLAGS_amendment_sha256)
-                << ") is not the LAST entry of --amendment_chain ("
-                << amendment_chain.back().second
-                << "). The governing amendment must be the most recently ratified "
-                   "one.\n";
+                << ") is not the GOVERNING amendment. It must equal the last "
+                   "registered chain entry ("
+                << kRegisteredChain[kRegisteredChainLen - 1].path << ", "
+                << kRegisteredChain[kRegisteredChainLen - 1].sha256 << ").\n";
       return 1;
     }
   }
@@ -1059,6 +1099,23 @@ int main(int argc, char** argv) {
         row["action_chosen_string"] = dune_state->ActionToString(current_player, chosen_action);
       }
       row["simulations_completed"] = static_cast<int64_t>(last_res.simulations_completed);
+      // DEAD-FIELD INVARIANCE, not a freshness proof (Amendment 2 F2, section
+      // 4.8). This field's only writers are in dune_search_session.cc, so on the
+      // pinned use_session=false path it must hold its header initializer of 0
+      // forever. It proves NOTHING about whether a search was fresh -- the
+      // accounting identity does that -- but a value that stopped being 0 would
+      // mean the session path had somehow been entered, which would invalidate
+      // the whole controller pin. So it is checked, as an invariant on a dead
+      // field, and never consulted for eligibility or weight.
+      if (diag.inherited_root_visits != 0) {
+        std::cerr << "STOP (Amendment 2 section 4.8, dead-field invariance): game "
+                  << g << " decision " << decision_index << " reports "
+                  << "inherited_root_visits=" << diag.inherited_root_visits
+                  << ". On the use_session=false path this field has no writer and "
+                     "must be 0; a non-zero value means the session path was "
+                     "entered and the controller pin is not in force.\n";
+        return 1;
+      }
       row["inherited_root_visits"] = static_cast<int64_t>(diag.inherited_root_visits);
       row["fallback_reason"] = last_res.fallback_reason;
       row["used_fallback"] = last_res.used_fallback;
@@ -1237,8 +1294,14 @@ int main(int argc, char** argv) {
       // A non-eligible decision is NOT a weight-zero label: it has no target,
       // no coverage reading and no stability reading (work order section 1).
       // ------------------------------------------------------------------
+      // AMENDMENT 2 sections 4.3 / 4.6: admission is search_expected, exactly
+      // 200 NEW simulations, and the accounting identity. The withdrawn
+      // inherited_root_visits == 0 clause admitted every row, so it never
+      // excluded anything and cannot be what makes this set correct.
+      const bool accounting_identity_holds =
+          diag.retention_snapshots_valid && visits_new_total == last_res.simulations_completed;
       if (search_expected && last_res.simulations_completed == max_sims &&
-          diag.inherited_root_visits == 0) {
+          accounting_identity_holds) {
         json::Object lab = row;
 
         // --- Raw prior. The `raw_priors.empty() ? priors : raw_priors` idiom is
@@ -1326,12 +1389,23 @@ int main(int argc, char** argv) {
         PutDouble(&lab, "half_budget_covered_prior_mass", diag.stability_checkpoint_covered_prior_mass);
         lab["stability_agreement"] = diag.stability_agreement;
 
-        // --- The section 6.1 weight rule. Deterministic and binary; no fitted
-        // --- lambda of any kind and no post-generation threshold tuning. The
-        // --- analyzer recomputes it independently.
+        // --- The section 6.1 weight rule AS AMENDED (Amendment 2 section 4.6).
+        // --- Deterministic and binary; no fitted lambda of any kind and no
+        // --- post-generation threshold tuning. The analyzer recomputes it
+        // --- independently.
+        // ---
+        // --- Conjunct 2 was inherited_root_visits == 0, described as "fresh,
+        // --- not re-rooted". It is now the ACCOUNTING IDENTITY. The old
+        // --- conjunct was vacuously true on every row, so it could never have
+        // --- moved a weight; the identity can, and does exactly when a search
+        // --- failed to contribute its full budget of NEW simulations.
+        // ---
+        // --- RETENTION NEVER ZEROES A WEIGHT: a retained tree satisfies the
+        // --- identity, and zero-weighting the ~61% of rows that retain would
+        // --- discard the controller's actual behaviour.
         const bool coverage_passes = !pwo3::CoverageGateFires(num_covered_actions, covered_prior_mass, n_legal);
         const int weight = (last_res.simulations_completed == max_sims &&
-                            diag.inherited_root_visits == 0 && coverage_passes &&
+                            accounting_identity_holds && coverage_passes &&
                             diag.stability_agreement)
                                ? 1 : 0;
         lab["weight"] = static_cast<int64_t>(weight);
