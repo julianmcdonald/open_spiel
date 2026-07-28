@@ -92,6 +92,24 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_pwo3_prior_recovery dune_pwo3_prior_recovery.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo3_prior_recovery dune_search ${TORCH_LIBRARIES})
 
+  # PWO-4 trajectory distillation (docs/PWO4_TRAJECTORY_REGISTRATION.md rev 3,
+  # frozen by docs/PWO4_FREEZE_ADDENDUM.md). A SEPARATE target for the same reason
+  # dune_pwo3_prior_recovery is separate from dune_pwo3_teacher_audit: here the
+  # binary of record is dune_search_benchmark, the reference instrument of the
+  # section 7.1 cross-build fidelity gate (sha256 60ea430a...). It must survive
+  # byte-for-byte, so the generator may not be a mode on it, and `make` must never
+  # relink it. Build ONLY this target.
+  add_executable(dune_pwo4_trajectory dune_pwo4_trajectory.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo4_trajectory dune_search ${TORCH_LIBRARIES})
+
+  # CP0.6 guard 3: decision_role must equal an INDEPENDENTLY reconstructed
+  # classification. A second call on the emitter's own live state would prove only
+  # that the classifier is deterministic, so the check is a separate binary that
+  # replays each decision's persisted history from a fresh initial state and
+  # reclassifies. Loads no model and runs no search.
+  add_executable(dune_pwo4_role_verify dune_pwo4_role_verify.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo4_role_verify dune_search ${TORCH_LIBRARIES})
+
   # Battery check 9: root raw priors are immutable after expansion, which is what
   # makes the recovery instrument's zero-simulation replay admissible.
   add_executable(dune_pwo3_immutability_test dune_pwo3_immutability_test.cc ${OPEN_SPIEL_OBJECTS})
