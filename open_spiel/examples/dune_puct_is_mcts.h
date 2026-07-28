@@ -178,6 +178,25 @@ struct SearchDiagnostics {
   Action stability_checkpoint_action = -1;
   bool stability_checkpoint_reached = false;
   bool stability_agreement = false;
+
+  // PWO-3 (docs/PWO3_REGISTRATION.md section 4.2). TELEMETRY ONLY: recorded at
+  // checkpoints already visited by the loop, consuming no RNG and mutating no
+  // tree state, so search behaviour is bitwise unchanged. The section 6.1.1
+  // cross-build gate proves that rather than asserting it.
+  //
+  // The coverage-gate INPUTS at the half-budget checkpoint. PWO-2 recorded only
+  // stability_checkpoint_action, and never emitted even that.
+  int stability_checkpoint_num_covered_actions = 0;
+  double stability_checkpoint_covered_prior_mass = 0.0;
+  // The half-TIME checkpoint. A live tier's budget is TIME, not simulations: its
+  // max_simulations is 100000 while PWO-2 measured live searches completing 4,133
+  // (p50) to 73,934 (max) simulations, so the sim-count checkpoint at 50,000 is
+  // unreached on most live rows and "half budget" there means half the deadline.
+  Action half_time_checkpoint_action = -1;
+  bool half_time_checkpoint_reached = false;
+  int half_time_checkpoint_sim = -1;
+  int half_time_checkpoint_num_covered_actions = 0;
+  double half_time_checkpoint_covered_prior_mass = 0.0;
   bool pass_complete_search = false;
   bool pass_min_actions = false;
   bool pass_prior_mass = false;

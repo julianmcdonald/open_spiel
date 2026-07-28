@@ -877,6 +877,36 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   int stability_checkpoint = std::floor(actual_max_sims * config_.conservative_stability_checkpoint_fraction);
   Action stability_checkpoint_action = kInvalidAction;
   bool stability_checkpoint_reached = false;
+  // PWO-3 telemetry (docs/PWO3_REGISTRATION.md section 4.2). Read-only snapshots
+  // at checkpoints the loop already visits: no RNG is drawn and no tree state is
+  // mutated, so search behaviour is bitwise unchanged.
+  const int pwo3_min_visits = EffectiveMinVisitThreshold(config_.min_visit_threshold);
+  int stability_checkpoint_num_covered = 0;
+  double stability_checkpoint_prior_mass = 0.0;
+  Action half_time_checkpoint_action = kInvalidAction;
+  bool half_time_checkpoint_reached = false;
+  int half_time_checkpoint_sim = -1;
+  int half_time_checkpoint_num_covered = 0;
+  double half_time_checkpoint_prior_mass = 0.0;
+  const double half_time_ms = 0.5 * actual_max_time_ms;
+  const bool has_finite_time_budget = std::isfinite(actual_max_time_ms);
+  // The end-of-search coverage computation (below, "Coverage Check & Fallback
+  // Logic"), lifted verbatim so a checkpoint measures exactly what the gate does.
+  auto pwo3_snapshot_coverage = [&](int* num_covered, double* prior_mass) {
+    double mass = 0.0;
+    int covered = 0;
+    ActionsAndProbs np = FilterAndNormalizePriors(root_node_, legal_actions);
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      auto it = root_node_->child_info.find(legal_actions[i]);
+      int v = (it != root_node_->child_info.end()) ? it->second.visits : 0;
+      if (v >= pwo3_min_visits) {
+        mass += np[i].second;
+        covered++;
+      }
+    }
+    *num_covered = covered;
+    *prior_mass = mass;
+  };
 
   int sim = 0;
   double max_sim_duration_ms = 10.0;
@@ -885,11 +915,23 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     if (sim == stability_checkpoint) {
       stability_checkpoint_action = GetRootArgmaxAction(root_node_, legal_actions);
       stability_checkpoint_reached = true;
+      pwo3_snapshot_coverage(&stability_checkpoint_num_covered,
+                             &stability_checkpoint_prior_mass);
     }
 
     // Check relative time budget limit with measured max simulation latency safety margin
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - start_time).count();
+    // PWO-3 half-TIME checkpoint: fires once, at the first simulation at or past
+    // half the deadline. Only meaningful under a finite time budget (live tiers).
+    if (has_finite_time_budget && !half_time_checkpoint_reached &&
+        elapsed_ms >= half_time_ms) {
+      half_time_checkpoint_action = GetRootArgmaxAction(root_node_, legal_actions);
+      half_time_checkpoint_reached = true;
+      half_time_checkpoint_sim = sim;
+      pwo3_snapshot_coverage(&half_time_checkpoint_num_covered,
+                             &half_time_checkpoint_prior_mass);
+    }
     if (elapsed_ms + max_sim_duration_ms >= actual_max_time_ms) {
       result.timeout_status = true;
       result.fallback_reason = "timeout";
@@ -980,6 +1022,14 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   result.diagnostics.stability_checkpoint_action = stability_checkpoint_action;
   result.diagnostics.stability_checkpoint_reached = stability_checkpoint_reached;
   result.diagnostics.stability_agreement = stability_checkpoint_reached && (stability_checkpoint_action == final_proposed_action);
+  // PWO-3 telemetry (docs/PWO3_REGISTRATION.md section 4.2).
+  result.diagnostics.stability_checkpoint_num_covered_actions = stability_checkpoint_num_covered;
+  result.diagnostics.stability_checkpoint_covered_prior_mass = stability_checkpoint_prior_mass;
+  result.diagnostics.half_time_checkpoint_action = half_time_checkpoint_action;
+  result.diagnostics.half_time_checkpoint_reached = half_time_checkpoint_reached;
+  result.diagnostics.half_time_checkpoint_sim = half_time_checkpoint_sim;
+  result.diagnostics.half_time_checkpoint_num_covered_actions = half_time_checkpoint_num_covered;
+  result.diagnostics.half_time_checkpoint_covered_prior_mass = half_time_checkpoint_prior_mass;
   result.inference_count = inference_count_this_search_;
   last_search_result_ = result;
   return result;

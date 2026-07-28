@@ -1659,13 +1659,35 @@ void TestInvariantGatesAndScenarios() {
 
 
 
-    // Test that intermediate forced/bookkeeping search (a state with 1 legal action) does NOT renew the budget
-    // Test that intermediate forced/bookkeeping search (a state with 1 legal action) does NOT renew the budget
-    // Second search in combat intrigue (descendant of state_combat) has exactly 1 legal action, so it is forced/bookkeeping
-    // and should have 0 simulations completed.
+    // Test that an intermediate forced/bookkeeping search (a state with 1 legal
+    // action) does NOT renew the short-window budget. The descendant of
+    // state_combat has exactly 1 legal action, so it classifies as
+    // kForcedOrBookkeeping and returns via get_policy_only_result without
+    // running a search.
+    //
+    // NOTE ON hard_sim_limit. This assertion used to read `== 0`, which was the
+    // pre-WO-1 semantics. WO-1 (submodule 4109e757, 2026-07-26) deliberately
+    // changed the fallback path to emit the CONFIGURED limit instead: HARD
+    // limits now describe what a decision was configured to get, while SOFT and
+    // elapsed describe what it actually got (nothing here). Emitting 0 made ~62%
+    // of live-mode search.jsonl rows indistinguishable from "zero budget
+    // configured" -- see dune_search_session.cc:283-291. The assertion was never
+    // updated with the code, so this test had been failing since that commit.
+    //
+    // kForcedOrBookkeeping is NOT a short-window role (dune_search_session.cc:216),
+    // so ConfiguredHardSimLimit reports the session limit, not
+    // purchase_combat_budget. The config field is referenced rather than a magic
+    // number so a default change cannot silently re-stale this.
     DuneSearchResult res2 = RunSessionSearch(session, *state_combat2);
-    assert(res2.diagnostics.hard_sim_limit == 0);
+    assert(res2.diagnostics.hard_sim_limit == config.fixed_session_limit);
+    assert(res2.fallback_reason == "forced_or_bookkeeping");
+    // What the test is actually about: no search ran, and the short-window
+    // budget consumed by res1 was NOT renewed by this intervening decision.
     assert(res2.simulations_completed == 0);
+    assert(res2.diagnostics.soft_sim_limit == 0);
+    assert(res2.diagnostics.newly_completed_simulations == 0);
+    assert(res2.diagnostics.elapsed_search_time_ms == 0.0);
+    assert(res2.diagnostics.short_window_cumulative_simulations == 16);
   }
 
   // 5. Reset reasons
