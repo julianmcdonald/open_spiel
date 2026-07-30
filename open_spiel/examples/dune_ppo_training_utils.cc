@@ -437,7 +437,8 @@ PpoUpdateStats TrainPpoUpdate(
     uint64_t master, int global_update,
     std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model,
     const std::vector<SearchTrainingExample>& search_examples,
-    double search_loss_coef, double abort_grad_norm_ratio) {
+    double search_loss_coef, double abort_grad_norm_ratio,
+    const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
   stats.rollout_hash = ComputeRolloutHash(batch);
@@ -681,6 +682,37 @@ PpoUpdateStats TrainPpoUpdate(
   // value_loss_sum.
   double value_clip_frac_sum = 0.0;
 
+  // --- PWO-5 section 8.6: slice the update's 1,024 auxiliary rows across the
+  // PPO minibatches, with the SAME ComputeAuxSlices pattern the 18B path uses.
+  //
+  // The slices are RE-CONSUMED EACH EPOCH (this partition sits outside the
+  // epoch loop and mb_index is the index within an epoch), so the realized
+  // presentation count is 1,024 x (epochs actually executed) <= 4,096 --
+  // "<=" because --target_kl can truncate the epoch loop. Both the realized
+  // presentation count and the realized DISTINCT-row count are emitted per
+  // update so the exposure is measured, not assumed.
+  const bool pwo5_active = pwo5_aux.valid && pwo5_cfg.AnyActive();
+  const int64_t pwo5_n =
+      pwo5_active ? pwo5_aux.obs.size(0) : static_cast<int64_t>(0);
+  std::vector<int64_t> pwo5_slice_start, pwo5_slice_len;
+  if (pwo5_active) {
+    const int64_t num_mb_p = (n + minibatch_size - 1) / minibatch_size;
+    auto pslices = ComputeAuxSlices(pwo5_n, num_mb_p);
+    pwo5_slice_start.assign(num_mb_p, 0);
+    pwo5_slice_len.assign(num_mb_p, 0);
+    for (int64_t k = 0; k < num_mb_p && k < (int64_t)pslices.size(); ++k) {
+      pwo5_slice_start[k] = pslices[k].first;
+      pwo5_slice_len[k] = pslices[k].second;
+    }
+    stats.pwo5_distinct_rows = pwo5_n;
+  }
+  double pwo5_final_vp_sum = 0.0, pwo5_terminal_round_sum = 0.0,
+         pwo5_next_action_sum = 0.0;
+  int64_t pwo5_final_vp_games = 0, pwo5_terminal_round_games = 0,
+          pwo5_next_action_games = 0;
+  int64_t pwo5_slice_uses = 0;
+  int64_t pwo5_presentations = 0;
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
@@ -714,6 +746,129 @@ PpoUpdateStats TrainPpoUpdate(
       // ppo_grad = total_grad - aux_grad exactly (grads add). Entirely skipped
       // when aux is inactive or this minibatch's slice is empty -> identical to
       // today. Aux terms never touch PPO ratios/clip/entropy/adv/KL. ---
+      // --- PWO-5 section 8.6: the DEDICATED AUXILIARY FORWARD. ------------
+      //
+      // The three heads are computed HERE and nowhere else -- never in the PPO
+      // forward below, never in the rollout/inference forward, never in an
+      // evaluation forward. Reached only when a coefficient is nonzero, so a
+      // head-off arm (T, P) never computes a head output at all.
+      //
+      // Summed into the PPO loss (not a separate optimizer step), so an H arm
+      // executes the IDENTICAL number of optimizer steps as its matched T arm
+      // and the ablation differs in exactly the three coefficients.
+      //
+      // All three losses are TRAJECTORY-WEIGHTED: the within-game mean, then
+      // the mean over the games present. final_vp and terminal_round targets
+      // are CONSTANT within a trajectory (one searched seat per game), so for
+      // them trajectory weighting is not merely defensible but correct, and row
+      // weighting was the biased choice.
+      if (pwo5_active) {
+        const int64_t ps = pwo5_slice_start[mb_index];
+        const int64_t pl = pwo5_slice_len[mb_index];
+        if (pl > 0) {
+          torch::Tensor p_obs = pwo5_aux.obs.narrow(0, ps, pl);
+          torch::Tensor p_final_vp = pwo5_aux.final_vp.narrow(0, ps, pl);
+          torch::Tensor p_round = pwo5_aux.terminal_round.narrow(0, ps, pl);
+          torch::Tensor p_next = pwo5_aux.next_action.narrow(0, ps, pl);
+          torch::Tensor p_game = pwo5_aux.game_id.narrow(0, ps, pl);
+
+          torch::Tensor scaled_pwo5;
+          double fv_val = 0.0, tr_val = 0.0, na_val = 0.0;
+          int64_t fv_games = 0, tr_games = 0, na_games = 0;
+
+          // Mean over games of the within-game mean, computed with a scatter
+          // over the slice's game ids. `mask` selects contributing rows, so an
+          // omitted row is out of BOTH the numerator and the denominator, and a
+          // game with no contributing row is out of the game denominator too.
+          auto trajectory_mean = [&](const torch::Tensor& per_row,
+                                     const torch::Tensor& mask,
+                                     int64_t* out_games) -> torch::Tensor {
+            const int64_t G = pwo5_aux.num_games;
+            torch::Tensor w = mask.to(per_row.dtype());
+            torch::Tensor num = torch::zeros(
+                {G}, torch::TensorOptions().dtype(per_row.dtype())
+                         .device(per_row.device()));
+            torch::Tensor den = torch::zeros_like(num);
+            num = num.index_add(0, p_game, per_row * w);
+            den = den.index_add(0, p_game, w);
+            torch::Tensor present = den > 0;
+            *out_games = present.sum().item<int64_t>();
+            if (*out_games == 0) {
+              return torch::zeros({}, per_row.options());
+            }
+            torch::Tensor safe_den = torch::where(
+                present, den, torch::ones_like(den));
+            torch::Tensor per_game = num / safe_den;
+            return (per_game * present.to(per_game.dtype())).sum() /
+                   static_cast<double>(*out_games);
+          };
+
+          auto compute_pwo5 = [&]() {
+            auto ao = model->ForwardAux(p_obs);
+            torch::Tensor total = torch::zeros({}, p_final_vp.options());
+
+            if (pwo5_cfg.final_vp_coef != 0.0) {
+              // Huber on the /20 scale, delta 0.10. The framework default of
+              // 1.0 would be pure squared error over the whole reachable range
+              // [0.25, 0.80] and would make "Huber" a misnomer.
+              torch::Tensor pred = ao.final_vp.squeeze(1);
+              torch::Tensor diff = pred - p_final_vp;
+              const double d = pwo5_cfg.huber_delta;
+              torch::Tensor absd = diff.abs();
+              torch::Tensor per_row = torch::where(
+                  absd <= d, 0.5 * diff * diff, d * (absd - 0.5 * d));
+              torch::Tensor ones = torch::ones_like(absd, torch::kBool);
+              torch::Tensor l = trajectory_mean(per_row, ones, &fv_games);
+              fv_val = l.item<double>();
+              total = total + static_cast<float>(pwo5_cfg.final_vp_coef) * l;
+            }
+            if (pwo5_cfg.terminal_round_coef != 0.0) {
+              torch::Tensor logp = torch::log_softmax(ao.terminal_round, -1);
+              torch::Tensor per_row =
+                  -logp.gather(1, p_round.unsqueeze(1)).squeeze(1);
+              torch::Tensor ones = torch::ones_like(per_row, torch::kBool);
+              torch::Tensor l = trajectory_mean(per_row, ones, &tr_games);
+              tr_val = l.item<double>();
+              total = total + static_cast<float>(pwo5_cfg.terminal_round_coef) * l;
+            }
+            if (pwo5_cfg.next_own_action_coef != 0.0) {
+              // Full 2,391-way softmax, NO MASK. The current state's legal mask
+              // is not valid for a FUTURE action: the target is illegal at the
+              // predicting state on 74.57% of rows, so masking would make the
+              // correct answer unreachable on three rows in four.
+              torch::Tensor mask = p_next >= 0;
+              torch::Tensor safe_idx = torch::where(
+                  mask, p_next, torch::zeros_like(p_next));
+              torch::Tensor logp = torch::log_softmax(ao.next_own_action, -1);
+              torch::Tensor per_row =
+                  -logp.gather(1, safe_idx.unsqueeze(1)).squeeze(1);
+              torch::Tensor l = trajectory_mean(per_row, mask, &na_games);
+              na_val = l.item<double>();
+              total =
+                  total + static_cast<float>(pwo5_cfg.next_own_action_coef) * l;
+            }
+            scaled_pwo5 = total;
+          };
+
+          if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
+            AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+            compute_pwo5();
+          } else {
+            compute_pwo5();
+          }
+          scaled_pwo5.backward();
+
+          pwo5_final_vp_sum += fv_val;
+          pwo5_terminal_round_sum += tr_val;
+          pwo5_next_action_sum += na_val;
+          pwo5_final_vp_games += fv_games;
+          pwo5_terminal_round_games += tr_games;
+          pwo5_next_action_games += na_games;
+          pwo5_presentations += pl;
+          ++pwo5_slice_uses;
+        }
+      }
+
       std::vector<torch::Tensor> aux_grad_snapshot;
       bool this_mb_has_aux = false;
       double this_aux_norm = 0.0;
@@ -919,13 +1074,34 @@ PpoUpdateStats TrainPpoUpdate(
       // prefix match so `value_head2` (the nonlinear head's second layer) lands
       // in the value group instead of the trunk.
       {
+        // PWO-5 section 16 gate 3 item 6 requires per-component gradient norms
+        // for "policy, value, trunk, AND EACH AUXILIARY HEAD".
+        //
+        // The `else` branch below was a real trap, not a gap: before PWO-5 it
+        // swept every non-policy, non-value parameter into `trunk_sq`, so the
+        // three new heads would have been silently counted as trunk and the
+        // trunk_grad_norm column would have been corrupted for exactly the arms
+        // (H) whose trunk gradient the ablation is about. The auxiliary tests
+        // come FIRST for that reason.
+        //
+        // Ordering note: `next_own_action_head` does not contain the substring
+        // "value_head", but a future head that did would have been captured by
+        // the value branch. Testing the auxiliary names first makes the
+        // classification independent of the other branches' patterns.
         double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
+        double final_vp_sq = 0.0, terminal_round_sq = 0.0, next_action_sq = 0.0;
         for (const auto& named : model->named_parameters()) {
           const torch::Tensor& g = named.value().grad();
           if (!g.defined()) continue;
           const double sq = g.pow(2).sum().item<double>();
           const std::string& nm = named.key();
-          if (nm.rfind("policy_head", 0) == 0) {
+          if (nm.rfind("final_vp_head", 0) == 0) {
+            final_vp_sq += sq;
+          } else if (nm.rfind("terminal_round_head", 0) == 0) {
+            terminal_round_sq += sq;
+          } else if (nm.rfind("next_own_action_head", 0) == 0) {
+            next_action_sq += sq;
+          } else if (nm.rfind("policy_head", 0) == 0) {
             policy_sq += sq;
           } else if (nm.find("value_head") != std::string::npos) {
             value_sq += sq;
@@ -936,6 +1112,9 @@ PpoUpdateStats TrainPpoUpdate(
         stats.policy_head_grad_norm_sum += std::sqrt(policy_sq);
         stats.value_head_grad_norm_sum += std::sqrt(value_sq);
         stats.trunk_grad_norm_sum += std::sqrt(trunk_sq);
+        stats.final_vp_head_grad_norm_sum += std::sqrt(final_vp_sq);
+        stats.terminal_round_head_grad_norm_sum += std::sqrt(terminal_round_sq);
+        stats.next_own_action_head_grad_norm_sum += std::sqrt(next_action_sq);
         stats.head_grad_norm_count += 1;
       }
 
@@ -1005,6 +1184,21 @@ PpoUpdateStats TrainPpoUpdate(
         stats.aux_ppo_norm_ratio > abort_grad_norm_ratio) {
       stats.aux_ratio_abort = true;
     }
+  }
+
+  // --- PWO-5 section 16 gate 3 item 6: per-head loss, per-head denominator,
+  // and the REALIZED exposure. Emitted per update so a silent denominator
+  // change is visible in diagnostics.csv rather than inferred, and so the
+  // exposure schedule is MEASURED rather than assumed.
+  stats.pwo5_slice_uses = pwo5_slice_uses;
+  stats.pwo5_presentations = pwo5_presentations;
+  if (pwo5_slice_uses > 0) {
+    stats.pwo5_final_vp_loss = pwo5_final_vp_sum / pwo5_slice_uses;
+    stats.pwo5_terminal_round_loss = pwo5_terminal_round_sum / pwo5_slice_uses;
+    stats.pwo5_next_action_loss = pwo5_next_action_sum / pwo5_slice_uses;
+    stats.pwo5_final_vp_games = pwo5_final_vp_games;
+    stats.pwo5_terminal_round_games = pwo5_terminal_round_games;
+    stats.pwo5_next_action_games = pwo5_next_action_games;
   }
 
   if (stats.minibatches > 0) {

@@ -40,6 +40,7 @@
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_pwo5_aux.h"
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
@@ -2512,6 +2513,130 @@ int main(int argc, char** argv) {
   // arms; a subsequent load simply overwrites the ones the archive carries.
   open_spiel::MaterializeAuxOptimizerState(training_model, *optimizer);
 
+  // --- PWO-5 sections 5.2, 8.5, 8.6: the auxiliary data path. -------------
+  //
+  // The target artifact and the held-out membership list are MATCHED fields
+  // (Appendix A.1): all six arms are launched with the same paths and the same
+  // digests, and ALL SIX VERIFY THEM. Verification is UNCONDITIONAL; USE is not
+  // -- whether the targets are ever read is decided by the coefficients alone.
+  // That keeps H vs T at exactly three differences while still catching a
+  // corrupt artifact on every arm at launch rather than only on the two that
+  // would have read it.
+  open_spiel::pwo5::AuxTargetStore pwo5_store;
+  open_spiel::Pwo5AuxConfig pwo5_cfg;
+  pwo5_cfg.final_vp_coef = absl::GetFlag(FLAGS_final_vp_head_coef);
+  pwo5_cfg.terminal_round_coef = absl::GetFlag(FLAGS_terminal_round_head_coef);
+  pwo5_cfg.next_own_action_coef = absl::GetFlag(FLAGS_next_own_action_head_coef);
+  pwo5_cfg.huber_delta = absl::GetFlag(FLAGS_huber_delta_final_vp);
+  std::vector<int32_t> pwo5_heldout_games;
+  if (pwo5_aux_layout) {
+    // (a) the held-out membership list, and its registered digest.
+    const std::string heldout_path = absl::GetFlag(FLAGS_aux_heldout_games_path);
+    if (heldout_path.empty()) {
+      SpielFatalError(
+          "PWO-5: --aux_target_path is set but --aux_heldout_games_path is "
+          "empty. Section 8.5 requires the whole-trajectory split membership "
+          "list on every arm; without it the loader's per-row % 11 rule would "
+          "silently determine the heads' held-out set, which plan section 9.6 "
+          "forbids.");
+    }
+    std::ifstream hin(heldout_path);
+    if (!hin) SpielFatalError("PWO-5: cannot open " + heldout_path);
+    std::string heldout_text((std::istreambuf_iterator<char>(hin)),
+                             std::istreambuf_iterator<char>());
+    // Parse the ascending integer list out of "heldout_game_indices": [...].
+    {
+      const std::size_t key = heldout_text.find("heldout_game_indices");
+      if (key == std::string::npos) {
+        SpielFatalError("PWO-5: " + heldout_path +
+                        " has no heldout_game_indices");
+      }
+      const std::size_t lb = heldout_text.find('[', key);
+      const std::size_t rb = heldout_text.find(']', lb);
+      std::string body = heldout_text.substr(lb + 1, rb - lb - 1);
+      for (char& c : body) if (c == ',') c = ' ';
+      std::istringstream bs(body);
+      int32_t v;
+      while (bs >> v) pwo5_heldout_games.push_back(v);
+    }
+    // The canonical serialization is the ASCENDING indices joined by "," with
+    // no spaces -- computed over the LIST, not the file, so a reformatted JSON
+    // still verifies.
+    std::sort(pwo5_heldout_games.begin(), pwo5_heldout_games.end());
+    std::string canonical;
+    for (std::size_t i = 0; i < pwo5_heldout_games.size(); ++i) {
+      if (i) canonical += ",";
+      canonical += std::to_string(pwo5_heldout_games[i]);
+    }
+    const std::string heldout_digest =
+        open_spiel::ComputeStringSHA256(canonical);
+    const std::string expect_heldout = absl::GetFlag(FLAGS_aux_heldout_sha256);
+    if (!expect_heldout.empty() && expect_heldout != heldout_digest) {
+      SpielFatalError(
+          "PWO-5 section 8.5: held-out split digest mismatch. expected " +
+          expect_heldout + " computed " + heldout_digest +
+          ". The split cannot silently differ across arms, replicates or the "
+          "u600 extension.");
+    }
+
+    // (b) the target artifact, and its registered digest. Section 5.2: a
+    // materialized artifact that is not hashed is an unpinned replay input,
+    // which section 7's exact-resume gate would not catch.
+    const std::string target_path = absl::GetFlag(FLAGS_aux_target_path);
+    size_t target_size = 0;
+    const std::string target_digest =
+        open_spiel::ComputeFileSHA256(target_path, &target_size);
+    const std::string expect_target = absl::GetFlag(FLAGS_aux_target_sha256);
+    if (!expect_target.empty() && expect_target != target_digest) {
+      SpielFatalError("PWO-5 section 5.2: --aux_target_sha256 mismatch for " +
+                      target_path + ". expected " + expect_target +
+                      " computed " + target_digest);
+    }
+    std::string load_error;
+    if (!pwo5_store.Load(target_path, pwo5_heldout_games, &load_error)) {
+      SpielFatalError("PWO-5: auxiliary target artifact rejected: " +
+                      load_error);
+    }
+    if (pwo5_store.obs_size() != obs_size) {
+      SpielFatalError(absl::StrFormat(
+          "PWO-5: auxiliary target obs_size %lld != the game's %lld. The "
+          "targets were prepared against a different observation encoder.",
+          static_cast<long long>(pwo5_store.obs_size()),
+          static_cast<long long>(obs_size)));
+    }
+    std::cout << "[PWO-5] auxiliary targets: " << target_path << " sha256="
+              << target_digest << "\n"
+              << "[PWO-5]   training games " << pwo5_store.training_games().size()
+              << ", training rows " << pwo5_store.training_row_count()
+              << ", min rows/game " << pwo5_store.MinRowsPerTrainingGame()
+              << ", held out " << pwo5_heldout_games.size()
+              << " (digest " << heldout_digest << ")\n"
+              << "[PWO-5]   head coefficients: final_vp="
+              << pwo5_cfg.final_vp_coef << " terminal_round="
+              << pwo5_cfg.terminal_round_coef << " next_own_action="
+              << pwo5_cfg.next_own_action_coef
+              << (pwo5_cfg.AnyActive() ? "  (HEAD-ON)" : "  (HEAD-OFF: no "
+                  "auxiliary forward, no head output computed)")
+              << std::endl;
+    // Section 17.4 floors (a2)/(a3), checked here rather than trusted.
+    if (pwo5_cfg.AnyActive()) {
+      const int min_rows = pwo5_store.MinRowsPerTrainingGame();
+      if (min_rows < absl::GetFlag(FLAGS_aux_rows_per_game)) {
+        SpielFatalError(absl::StrFormat(
+            "PWO-5 section 8.6: a training game has only %d rows but "
+            "--aux_rows_per_game=%d. The without-replacement draw would be "
+            "infeasible.",
+            min_rows, absl::GetFlag(FLAGS_aux_rows_per_game)));
+      }
+      if (static_cast<int>(pwo5_store.training_games().size()) <
+          absl::GetFlag(FLAGS_aux_games_per_update)) {
+        SpielFatalError(
+            "PWO-5 section 8.6: fewer training games than "
+            "--aux_games_per_update.");
+      }
+    }
+  }
+
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> anchor_model = nullptr;
   if (absl::GetFlag(FLAGS_train_value_only) && absl::GetFlag(FLAGS_unfreeze_trunk)) {
     anchor_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
@@ -3201,11 +3326,72 @@ int main(int argc, char** argv) {
             ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
                                                   aux_search_loss_warmup)
             : 0.0;
+    // --- PWO-5 section 8.6: draw this update's auxiliary batch. ----------
+    //
+    // ONE draw per update (aux = 0), on its own RNG stream. Reusing
+    // kStreamSearchSampling is FORBIDDEN: the two samplers draw different
+    // populations (41,132 rows vs 20,582) in different units (games vs rows),
+    // so a shared stream would couple head and distillation row choice.
+    open_spiel::Pwo5AuxBatch pwo5_batch;
+    std::string pwo5_draw_digest;
+    if (pwo5_aux_layout && pwo5_cfg.AnyActive()) {
+      const uint64_t aux_seed = dune_seed::DeriveSeed(
+          master, dune_seed::kDomainTrain, update, /*aux=*/0,
+          dune_seed::kStreamAuxSampling);
+      const auto draw = pwo5_store.Draw(
+          aux_seed, absl::GetFlag(FLAGS_aux_games_per_update),
+          absl::GetFlag(FLAGS_aux_rows_per_game),
+          absl::GetFlag(FLAGS_aux_batches_per_update));
+      pwo5_draw_digest = open_spiel::ComputeStringSHA256(draw.digest);
+      if (update == start_update) {
+        std::cout << "[PWO-5] update-1 sampler digest " << pwo5_draw_digest
+                  << std::endl;
+      }
+      // Flatten batch -> game -> rows into one tensor set, with game_id a
+      // 0-based index over the update's sampled games so the trajectory
+      // weighting inside the loss is exact.
+      std::vector<float> obs_flat;
+      std::vector<float> fvp;
+      std::vector<int64_t> tround, nact, gid;
+      int64_t g_counter = 0;
+      for (const auto& batch_games : draw.batches) {
+        for (const auto& game_rows : batch_games) {
+          for (int64_t r : game_rows) {
+            const auto& row = pwo5_store.rows()[r];
+            const float* o = pwo5_store.observation(r);
+            obs_flat.insert(obs_flat.end(), o, o + pwo5_store.obs_size());
+            fvp.push_back(row.final_vp_target);
+            tround.push_back(row.terminal_round_class);
+            nact.push_back(row.next_own_action);
+            gid.push_back(g_counter);
+          }
+          ++g_counter;
+        }
+      }
+      const int64_t nrows = static_cast<int64_t>(fvp.size());
+      auto fopt = torch::TensorOptions().dtype(torch::kFloat32);
+      auto iopt = torch::TensorOptions().dtype(torch::kInt64);
+      pwo5_batch.obs = torch::from_blob(obs_flat.data(),
+                                        {nrows, pwo5_store.obs_size()}, fopt)
+                           .clone().to(device);
+      pwo5_batch.final_vp =
+          torch::from_blob(fvp.data(), {nrows}, fopt).clone().to(device);
+      pwo5_batch.terminal_round =
+          torch::from_blob(tround.data(), {nrows}, iopt).clone().to(device);
+      pwo5_batch.next_action =
+          torch::from_blob(nact.data(), {nrows}, iopt).clone().to(device);
+      pwo5_batch.game_id =
+          torch::from_blob(gid.data(), {nrows}, iopt).clone().to(device);
+      pwo5_batch.num_games = g_counter;
+      pwo5_batch.valid = true;
+    }
+
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
                                    obs_size, action_size, device, master, update, anchor_model,
                                    current_collect.aux_examples, this_search_coef,
-                                   online_search_collection ? aux_abort_ratio : 0.0);
+                                   online_search_collection ? aux_abort_ratio : 0.0,
+                                   pwo5_batch, pwo5_cfg);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);

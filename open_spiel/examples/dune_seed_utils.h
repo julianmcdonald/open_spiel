@@ -100,6 +100,15 @@ constexpr uint64_t kStreamFidelitySuccessorChance  = 0x00A0;
 constexpr uint64_t kStreamFidelitySuccessorRollout = 0x00A1;
 constexpr uint64_t kStreamFidelityLeafRollout      = 0x00A2;
 
+// PWO-5 section 10.1: the ONE new stream constant this registration adds, for
+// the section 8.6 auxiliary-head sampler. Takes the next free value in this
+// block (0x00A0-0x00A2 are the fidelity streams).
+//
+// Reusing kStreamSearchSampling for it is FORBIDDEN: the two samplers draw
+// different populations (41,132 rows vs 20,582) in different units (games vs
+// rows), so a shared stream would couple head and distillation row choice.
+inline constexpr uint64_t kStreamAuxSampling = 0x00A3;
+
 // ===========================================================================
 // RNG construction helpers
 // ===========================================================================

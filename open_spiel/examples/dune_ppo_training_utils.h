@@ -125,6 +125,13 @@ struct PpoUpdateStats {
   double policy_head_grad_norm_sum = 0.0;
   double value_head_grad_norm_sum = 0.0;
   double trunk_grad_norm_sum = 0.0;
+  // PWO-5 section 16 gate 3 item 6: per-AUXILIARY-head gradient norms. Zero in
+  // head-off arms, where the loss terms are not constructed and `.grad()` is
+  // never defined for these parameters -- which is itself the check that the
+  // short-circuit worked.
+  double final_vp_head_grad_norm_sum = 0.0;
+  double terminal_round_head_grad_norm_sum = 0.0;
+  double next_own_action_head_grad_norm_sum = 0.0;
   int head_grad_norm_count = 0;
   double PolicyHeadGradNormMean() const {
     return head_grad_norm_count > 0
@@ -137,6 +144,18 @@ struct PpoUpdateStats {
   double TrunkGradNormMean() const {
     return head_grad_norm_count > 0
                ? trunk_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+  double FinalVpHeadGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? final_vp_head_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+  double TerminalRoundHeadGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? terminal_round_head_grad_norm_sum / head_grad_norm_count : 0.0;
+  }
+  double NextOwnActionHeadGradNormMean() const {
+    return head_grad_norm_count > 0
+               ? next_own_action_head_grad_norm_sum / head_grad_norm_count : 0.0;
   }
 
   // Diagnostics (Phase 5)
@@ -184,6 +203,22 @@ struct PpoUpdateStats {
   int64_t norm_entropy_n = 0;
   double norm_entropy_role[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   int64_t norm_entropy_n_role[7] = {0, 0, 0, 0, 0, 0, 0};
+  // --- PWO-5 section 16 gate 3 item 6: per-head telemetry. ---------------
+  // Each head's loss AND its denominator, plus the realized auxiliary exposure.
+  // The denominators are the GAME counts (all three heads are
+  // trajectory-weighted, section 8.6), summed over the update's slices. A row
+  // with no later action contributes to neither the numerator nor the
+  // denominator of next_own_action, so its game count is legitimately lower.
+  double pwo5_final_vp_loss = 0.0;
+  double pwo5_terminal_round_loss = 0.0;
+  double pwo5_next_action_loss = 0.0;
+  int64_t pwo5_final_vp_games = 0;
+  int64_t pwo5_terminal_round_games = 0;
+  int64_t pwo5_next_action_games = 0;
+  int64_t pwo5_slice_uses = 0;
+  int64_t pwo5_distinct_rows = 0;   // 1,024 by construction when active
+  int64_t pwo5_presentations = 0;   // <= 4,096; "<=" because target_kl truncates
+
   double max_action_prob = 0.0;
   double frac_legal_absz_ge_cap = 0.0;
   int64_t frac_legal_absz_ge_cap_n = 0;
@@ -214,6 +249,49 @@ torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
 
 float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps);
 
+// PWO-5 section 8.6: one update's auxiliary-head batch, already materialized as
+// device tensors by the caller.
+//
+// `game_id` maps each row to its 0-based index among the batch's sampled games,
+// which is what makes the TRAJECTORY-WEIGHTED denominators of sections 8.2/8.6
+// computable inside the loss: "mean over the batch's sampled games of the
+// within-game mean loss", never a per-row mean. Flat row weighting would let
+// long games dominate -- games carry 67 to 206 label rows -- and section 8.4
+// item (i) mandates equal trajectory weight.
+//
+// `next_action` is -1 on a row with no later action in its trajectory (exactly
+// the 400 final rows, one per game). Section 8.3 item (d): such a row is
+// OMITTED, and "omitted" means removed from the NUMERATOR AND THE DENOMINATOR
+// -- not zero-filled and not given a uniform target, either of which would
+// train the head toward a fiction on 0.8% of rows.
+struct Pwo5AuxBatch {
+  torch::Tensor obs;             // [N, obs_size] float
+  torch::Tensor final_vp;        // [N] float,  FinalScoredVp(seat)/20
+  torch::Tensor terminal_round;  // [N] int64,  class 0/1/2
+  torch::Tensor next_action;     // [N] int64,  -1 = omit
+  torch::Tensor game_id;         // [N] int64,  0 .. num_games-1
+  int64_t num_games = 0;
+  bool valid = false;
+};
+
+// The three coefficients plus the Huber delta, carried together so the
+// short-circuit is decided in ONE place.
+struct Pwo5AuxConfig {
+  double final_vp_coef = 0.0;
+  double terminal_round_coef = 0.0;
+  double next_own_action_coef = 0.0;
+  double huber_delta = 0.10;
+  // Section 7.4: at exactly zero the loss terms are NOT CONSTRUCTED -- a
+  // short-circuit, not a multiply-by-zero. Multiply-by-zero would still build
+  // the graph, still populate .grad with exact zeros, and still expose the
+  // parameters to weight decay and to any non-finite value in the head's
+  // forward pass.
+  bool AnyActive() const {
+    return final_vp_coef != 0.0 || terminal_round_coef != 0.0 ||
+           next_own_action_coef != 0.0;
+  }
+};
+
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
@@ -224,7 +302,13 @@ PpoUpdateStats TrainPpoUpdate(
     // skipped entirely and the update is numerically identical to today.
     const std::vector<SearchTrainingExample>& search_examples = {},
     double search_loss_coef = 0.0,
-    double abort_grad_norm_ratio = 0.0);
+    double abort_grad_norm_ratio = 0.0,
+    // PWO-5 section 8.6. Default-invalid batch + all-zero coefficients => the
+    // head machinery is skipped ENTIRELY: no auxiliary forward, no head output
+    // computed, no graph node, no gradient. That is what makes a head-off arm's
+    // behaviour independent of the heads' numerics.
+    const Pwo5AuxBatch& pwo5_aux = Pwo5AuxBatch(),
+    const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig());
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
