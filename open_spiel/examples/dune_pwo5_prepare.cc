@@ -18,14 +18,22 @@
 // The tool runs no search, loads no model and touches no GPU. It is a pure
 // function of (games.jsonl, labels.jsonl, the engine).
 //
-// ONE REGISTERED ASSERTION DOES NOT HOLD ON THIS CORPUS. Registration 5.3
-// assertion 5 requires the replayed terminal `FinalScoredVp` by seat to equal
-// games.jsonl's `final_vp`. It does not, on 212 of 1,600 (game, seat) pairs,
-// because the recorded field was written by a different function. The split
-// into assertions 5a / 5b / 5c and the full mechanism are documented at
-// Pwo4LegacyReportedVp below; the tool reports the divergence in full
-// rather than passing over it, and --strict_final_scored_vp restores the
-// literal reading as a hard STOP.
+// ASSERTION 5 IS THREE ASSERTIONS, per amendment 1 ruling 3
+// (docs/PWO5_AMENDMENT_1_TARGET_EXPOSURE_TELEMETRY_2026_07_31.md section 4).
+// Registration 5.3 assertion 5 as literally written required the replayed
+// terminal `FinalScoredVp` by seat to equal games.jsonl's `final_vp`. It does
+// not hold, on 212 of 1,600 (game, seat) pairs, because the recorded field was
+// written by a different function -- and that equality requirement has been
+// WITHDRAWN. What replaces it:
+//   5a  GetCurrentRound() - 1 == rounds_played              (hard STOP)
+//   5b  recomputed PWO-4 legacy reported VP == final_vp     (hard STOP)
+//   5c  FinalScoredVp recomputed INDEPENDENTLY for the head target, NOT
+//       required to equal the recorded field; the 212/1,600 and 59/400
+//       divergences are PINNED and a different count is a hard STOP
+// The mechanism is documented at Pwo4LegacyReportedVp below.
+//
+// There is no --strict_final_scored_vp flag. It was deleted: it made a
+// knowingly-failing assertion optional while the tool still reported success.
 //
 // ---------------------------------------------------------------------------
 // WHAT IT PRODUCES, in <out_dir>
@@ -1351,16 +1359,13 @@ int main(int argc, char** argv) {
   Require(games_checked == static_cast<int64_t>(games.size()),
           "did not replay every game");
 
-  std::cout << "\nGATE RESULT: PASS (assertions 1, 2, 3, 4, 5a, 5b, 5c)\n"
-            << "  games replayed        : " << games_checked << "\n"
-            << "  label rows checked    : " << rows_written << "\n"
-            << "  assertion 1 (legal set, order+content) : no mismatch on any row\n"
-            << "  assertion 2 (|legal| == n_legal)       : no mismatch on any row\n"
-            << "  assertion 3 (CurrentPlayer == acting)  : no mismatch on any row\n"
-            << "  assertion 4 (position == history_len)  : no mismatch on any row\n"
-            << "  assertion 5a (terminal round)          : no mismatch on any game\n"
-            << "  assertion 5b (recomputed PWO-4 legacy reported VP\n"
-            << "                == games.jsonl final_vp)  : no mismatch on any seat\n\n";
+  // Progress only. THE PASS BANNER IS AT THE END OF main(), after every check.
+  // Printing it here -- which is what this line used to do -- meant the tool
+  // announced PASS before the 5c pins, the histogram totals, the saturation
+  // check, the pack read-back and the loader floors had run.
+  std::cout << "\nreplay complete: " << games_checked << " games, "
+            << rows_written << " label rows; assertions 1-4 and 5a-5b clean on "
+               "every row. Running the remaining checks...\n\n";
 
   // -------------------------------------------------------------------------
   // Assertion 5c under amendment 1 ruling 3c: FinalScoredVp is recomputed
@@ -1722,11 +1727,45 @@ int main(int argc, char** argv) {
             << "  terminal_round_class rows  le8=" << rows_by_class[0]
             << " r9=" << rows_by_class[1] << " r10=" << rows_by_class[2] << "\n"
             << "  terminal_round_class games le8=" << games_by_class[0]
-            << " r9=" << games_by_class[1] << " r10=" << games_by_class[2] << "\n\n"
-            << "ALL GATES PASSED.\n";
+            << " r9=" << games_by_class[1] << " r10=" << games_by_class[2] << "\n";
 
   Require(rows_no_next == games_checked,
           "rows with next_own_action == -1 (" + std::to_string(rows_no_next) +
               ") is not one per game (" + std::to_string(games_checked) + ")");
+
+  // -------------------------------------------------------------------------
+  // THE SUCCESS BANNERS, AND THEY ARE LAST ON PURPOSE.
+  // -------------------------------------------------------------------------
+  // Nothing below this line may fail, because nothing below this line runs a
+  // check. Every assertion in this tool executes ABOVE here.
+  //
+  // This ordering is the whole point and it was WRONG until an adversarial
+  // review demonstrated it by execution: the banners used to print before the
+  // 5c pins, the histogram totals, the /20 saturation check, the pack read-back
+  // and the loader floors, so the tool would emit
+  //     GATE RESULT: PASS (assertions 1, 2, 3, 4, 5a, 5b, 5c)
+  //     ALL GATES PASSED.
+  // on stdout and then STOP on stderr with exit 2. A caller reading the exit
+  // code was safe; a human, or anything grepping stdout, was not. That is the
+  // same "reports success while a check fails" shape amendment 1 section 4.4
+  // removed the --strict_final_scored_vp flag to eliminate, reintroduced by
+  // print ORDER rather than by an optional assertion.
+  //
+  // If you add a check to this tool, add it ABOVE this block.
+  std::cout << "\nGATE RESULT: PASS (assertions 1, 2, 3, 4, 5a, 5b, 5c)\n"
+            << "  games replayed        : " << games_checked << "\n"
+            << "  label rows checked    : " << rows_written << "\n"
+            << "  assertion 1 (legal set, order+content) : no mismatch on any row\n"
+            << "  assertion 2 (|legal| == n_legal)       : no mismatch on any row\n"
+            << "  assertion 3 (CurrentPlayer == acting)  : no mismatch on any row\n"
+            << "  assertion 4 (position == history_len)  : no mismatch on any row\n"
+            << "  assertion 5a (terminal round)          : no mismatch on any game\n"
+            << "  assertion 5b (recomputed PWO-4 legacy reported VP\n"
+            << "                == games.jsonl final_vp)  : no mismatch on any seat\n"
+            << "  assertion 5c (pinned divergence)       : " << vp_divergences
+            << " pairs / " << vp_divergences_acting_seat << " searched seats\n"
+            << "  /20 saturation (max < 20)              : max " << acting_vp_max
+            << "\n\n"
+            << "ALL GATES PASSED.\n";
   return 0;
 }
