@@ -120,6 +120,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_pwo5_prepare dune_pwo5_prepare.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_prepare dune_search ${TORCH_LIBRARIES})
 
+  # PWO-5 gate 3: the section 8.6 auxiliary sampler's EXACT pinned algorithm.
+  add_executable(dune_pwo5_sampler_test dune_pwo5_sampler_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_sampler_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_pwo5_sampler_test COMMAND dune_pwo5_sampler_test)
+
   # PWO-5 gate 3: diagnostics schema v5 and the section 14.1c partition identity.
   add_executable(dune_pwo5_schema_test dune_pwo5_schema_test.cc
     dune_ppo_training_utils.cc dune_online_search_collector.cc
