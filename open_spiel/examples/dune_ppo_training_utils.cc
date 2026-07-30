@@ -34,6 +34,22 @@ ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters."
 
 namespace open_spiel {
 
+// PWO-5 gate 2 item (b). The term is SUBTRACTED, so a positive penalty lowers
+// the reward. The range predicate is the shared 741-752 one, never an inline
+// `base .. base + 12`. See dune_specimen_conversion.h for why 740 is excluded.
+// `reward_lambda` is a FLOAT at the one call site, and the arithmetic below is
+// written in float for that reason: the original in-line statement was
+// `reward -= static_cast<float>(penalty) * reward_lambda`, all-float, and a
+// double intermediate here would be a last-ulp behaviour change smuggled in
+// under a refactor.
+float ApplySpecimenExchangeShaping(float reward, Action action,
+                                   double specimen_exchange_penalty,
+                                   float reward_lambda) {
+  if (specimen_exchange_penalty == 0.0) return reward;
+  if (!dune_shaping::IsSpecimenConversionAction(action)) return reward;
+  return reward - static_cast<float>(specimen_exchange_penalty) * reward_lambda;
+}
+
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch) {
   std::string data;
   for (const auto& t : batch) {

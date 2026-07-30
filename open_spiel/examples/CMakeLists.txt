@@ -129,6 +129,24 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_sha256_test dune_sha256_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_sha256_test ${TORCH_LIBRARIES})
 
+  # PWO-5 gate 2 item (b): the sign of --specimen_exchange_penalty. Links
+  # dune_ppo_training_utils.cc so it exercises ApplySpecimenExchangeShaping --
+  # the function dune_ppo_train's rollout loop actually calls, not a copy.
+  add_executable(dune_shaping_sign_test dune_shaping_sign_test.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_shaping_sign_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_shaping_sign_test COMMAND dune_shaping_sign_test)
+
+  # PWO-5 gate 2 item (d): --opponent_greedy / --opponent_temperature leave the
+  # default path bitwise unchanged. Header-only under test, so no torch needed
+  # beyond the standard link.
+  add_executable(dune_eval_action_selection_test
+    dune_eval_action_selection_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_eval_action_selection_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_eval_action_selection_test
+           COMMAND dune_eval_action_selection_test)
+
   add_executable(dune_offline_utils_test dune_offline_utils_test.cc
     ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_utils_test ${TORCH_LIBRARIES})

@@ -27,6 +27,7 @@
 
 #include "dune_network.h"
 #include "dune_evaluator.h"
+#include "dune_specimen_conversion.h"
 #include "dune_puct_is_mcts.h"
 #include <array>
 #include "dune_search_session.h"
@@ -1077,8 +1078,12 @@ void WorkerThread(
       // WO-1 Phase 3 addendum: count applied specimen->troop conversions per
       // seat, at application time, by engine action-ID range. Measurement only
       // -- no shaping is enabled anywhere by this counter.
-      if (chosen_action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
-          chosen_action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12 &&
+      //
+      // PWO-5 gate 2 item (c): the range is 741-752, not 740-752. Numerically a
+      // no-op on every committed run -- 740 is an unused base constant, absent
+      // from all 10,903 conversion-legal rows of the frozen PWO-4 stream -- so
+      // no committed conversion count moves. See dune_specimen_conversion.h.
+      if (dune_shaping::IsSpecimenConversionAction(chosen_action) &&
           current_player >= 0 && current_player < 4) {
         ++specimen_conversions[current_player];
       }

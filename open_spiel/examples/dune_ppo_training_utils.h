@@ -9,6 +9,7 @@
 
 #include "open_spiel/spiel.h"       // Action, ActionsAndProbs
 #include "open_spiel/utils/json.h"  // json::Object for manifest online-collection state
+#include "dune_specimen_conversion.h"  // the single 741-752 conversion predicate
 
 
 
@@ -401,6 +402,25 @@ inline bool AlignPriorToActions(const ActionsAndProbs& prior,
   *out = std::move(aligned);
   return true;
 }
+
+// Specimen-exchange anti-breadcrumb shaping, extracted so its SIGN is testable.
+//
+// PWO-5 gate 2 items (a)+(b) (docs/PWO5_PILOT_REGISTRATION.md section 16).
+//
+// `--specimen_exchange_penalty` is a MAGNITUDE THAT IS SUBTRACTED, so a POSITIVE
+// value PENALIZES and a NEGATIVE value is a BONUS. That inversion is not
+// hypothetical: the u175 lineage was trained with `-0.02`, i.e. a +0.02 bonus on
+// exactly the breadcrumb behaviour the term exists to suppress, and the
+// committed `calibration_results_v2/pilot300_search_seed12/launch.sh` still
+// shows it. `dune_ppo_train` now rejects a negative value fatally, and this
+// function exists so "positive DECREASES the reward" is a unit-tested property
+// of the code the trainer actually runs rather than a comment above it.
+//
+// Returns the shaped reward. A non-conversion action, or a zero penalty, returns
+// `reward` unchanged and bit-identically.
+float ApplySpecimenExchangeShaping(float reward, Action action,
+                                   double specimen_exchange_penalty,
+                                   float reward_lambda);
 
 // True when both vectors carry the same action ids in the same order — the
 // invariant a label writer relies on when it stores prior[i]'s action id beside

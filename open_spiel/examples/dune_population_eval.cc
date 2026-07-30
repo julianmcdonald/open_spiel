@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <shared_mutex>
 #include <sstream>
@@ -40,6 +41,8 @@
 
 #include "dune_network.h"
 #include "dune_seed_utils.h"
+#include "dune_eval_action_selection.h"
+#include "dune_specimen_conversion.h"
 #include "open_spiel/utils/json.h"
 
 // ---------------------------------------------------------------------------
@@ -73,6 +76,19 @@ ABSL_FLAG(std::string, output_dir, "",
           "Empty = stdout only.");
 ABSL_FLAG(float, temperature, 1.0f,
           "Softmax temperature for stochastic policy (--greedy=false).");
+// PWO-5 gate 2 item (d). OPTIONAL flags: unset (the default) means INHERIT the
+// global --greedy / --temperature, which is exactly the pre-gate-2 behaviour for
+// every seat. A plain bool defaulting to true would NOT be backward compatible,
+// because a run passing --greedy=false would then keep greedy opponents.
+ABSL_FLAG(std::optional<bool>, opponent_greedy, std::nullopt,
+          "Action selection for OPPONENT seats only. Unset (default) = inherit "
+          "--greedy, i.e. identical to pre-existing behaviour. Set true to hold "
+          "opponents at argmax while the candidate samples -- required to "
+          "express the frozen strong population (raw prior, GREEDY) against a "
+          "candidate sampled at temperature 1.0.");
+ABSL_FLAG(std::optional<float>, opponent_temperature, std::nullopt,
+          "Softmax temperature for OPPONENT seats only. Unset (default) = "
+          "inherit --temperature. Inert when opponents are greedy.");
 ABSL_FLAG(bool, deterministic_eval, true,
           "If true, use batch-1 mutex-serialized inference for strict bitwise "
           "thread-count reproducibility. Much slower than batched mode.");
@@ -499,6 +515,11 @@ void WorkerThread(
     uint64_t domain,
     bool greedy,
     float temperature,
+    // PWO-5 gate 2 item (d). `has_*` false = inherit the global value above.
+    bool has_opponent_greedy,
+    bool opponent_greedy,
+    bool has_opponent_temperature,
+    float opponent_temperature,
     float candidate_logit_cap,
     float opponent_logit_cap,
     std::ofstream* dump_out,
@@ -644,46 +665,18 @@ void WorkerThread(
             use_model ? candidate_logit_cap : opponent_logit_cap;
         CenterAndCapLegalLogits(result.logits, legal_actions, logit_cap);
 
-        if (greedy || legal_actions.size() == 1) {
-          // Argmax
-          chosen_action = legal_actions.front();
-          float max_logit = -1e9f;
-          for (Action a : legal_actions) {
-            if (result.logits[a] > max_logit) {
-              max_logit = result.logits[a];
-              chosen_action = a;
-            }
-          }
-        } else {
-          // Stochastic: softmax with temperature, then sample
-          double max_logit = -1e30;
-          for (Action a : legal_actions) {
-            if (result.logits[a] > max_logit) {
-              max_logit = result.logits[a];
-            }
-          }
-          std::vector<double> probs(legal_actions.size());
-          double sum = 0.0;
-          for (size_t i = 0; i < legal_actions.size(); ++i) {
-            probs[i] = std::exp(
-                (static_cast<double>(result.logits[legal_actions[i]]) -
-                 max_logit) / static_cast<double>(temperature));
-            sum += probs[i];
-          }
-          for (auto& p : probs) p /= sum;
-
-          std::uniform_real_distribution<double> dist(0.0, 1.0);
-          double r = dist(policy_rngs[current_player]);
-          double cumulative = 0.0;
-          chosen_action = legal_actions.back();
-          for (size_t i = 0; i < legal_actions.size(); ++i) {
-            cumulative += probs[i];
-            if (r < cumulative) {
-              chosen_action = legal_actions[i];
-              break;
-            }
-          }
-        }
+        // PWO-5 gate 2 item (d): the candidate seat and the opponent seats can
+        // now select differently. With the overrides unset this resolves to the
+        // global (greedy, temperature) for BOTH, which is the pre-gate-2
+        // behaviour bit for bit -- see dune_eval_action_selection.h.
+        const dune_eval::SelectionPolicy policy =
+            dune_eval::ResolveSelectionPolicy(
+                use_model, greedy, temperature, has_opponent_greedy,
+                opponent_greedy, has_opponent_temperature,
+                opponent_temperature);
+        chosen_action = dune_eval::SelectActionFromLogits(
+            result.logits, legal_actions, policy,
+            policy_rngs[current_player]);
       } else {
         // Random opponent (no model loaded)
         std::uniform_int_distribution<size_t> dist(
@@ -694,8 +687,14 @@ void WorkerThread(
       // WO-1 Phase 3 addendum: count applied specimen->troop conversions per
       // seat, at application time, by engine action-ID range. Measurement only
       // -- no shaping is enabled anywhere by this counter.
-      if (chosen_action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
-          chosen_action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12 &&
+      //
+      // PWO-5 gate 2 item (c): the range is 741-752, not 740-752. This site was
+      // NOT named in the registration's known list (which named the trainer's
+      // guard and dune_search_benchmark's counter); the registered "sweep for
+      // other 740-752 sites" found it. Numerically a no-op -- 740 is an unused
+      // base constant and is never legal -- so the committed PWO-2 popeval
+      // conversion baselines (4.730 / 5.232 / 4.165 candidate-seat) do not move.
+      if (dune_shaping::IsSpecimenConversionAction(chosen_action) &&
           current_player >= 0 && current_player < kNumPlayers) {
         ++specimen_conversions[current_player];
       }
@@ -848,6 +847,16 @@ void RunEvaluation() {
   int opp_num_blocks = absl::GetFlag(FLAGS_opp_num_blocks);
   const std::string output_dir = absl::GetFlag(FLAGS_output_dir);
   const float temperature = absl::GetFlag(FLAGS_temperature);
+  // PWO-5 gate 2 item (d). Unset => inherit the global value; the resolution
+  // itself lives in dune_eval::ResolveSelectionPolicy so it is unit-testable.
+  const std::optional<bool> opponent_greedy_opt =
+      absl::GetFlag(FLAGS_opponent_greedy);
+  const std::optional<float> opponent_temperature_opt =
+      absl::GetFlag(FLAGS_opponent_temperature);
+  const bool has_opponent_greedy = opponent_greedy_opt.has_value();
+  const bool opponent_greedy = opponent_greedy_opt.value_or(false);
+  const bool has_opponent_temperature = opponent_temperature_opt.has_value();
+  const float opponent_temperature = opponent_temperature_opt.value_or(0.0f);
   const double candidate_logit_cap = absl::GetFlag(FLAGS_candidate_logit_cap);
   const double opponent_logit_cap = absl::GetFlag(FLAGS_opponent_logit_cap);
   const std::string dump_logit_stats_path = absl::GetFlag(FLAGS_dump_logit_stats);
@@ -1006,6 +1015,13 @@ void RunEvaluation() {
             << "Games:      " << total_games << "\n"
             << "Greedy:     " << (greedy ? "true" : "false") << "\n"
             << "Temperature:" << temperature << "\n"
+            << "OppGreedy:  "
+            << (has_opponent_greedy ? (opponent_greedy ? "true" : "false")
+                                    : "(inherit --greedy)") << "\n"
+            << "OppTemp:    "
+            << (has_opponent_temperature ? std::to_string(opponent_temperature)
+                                         : std::string("(inherit --temperature)"))
+            << "\n"
             << "CandCap:    " << candidate_logit_cap << "\n"
             << "OppCap:     " << opponent_logit_cap << "\n"
             << "Threads:    " << num_threads << "\n"
@@ -1062,6 +1078,8 @@ void RunEvaluation() {
         provides_info_state_tensor, provides_observations_tensor,
         std::ref(next_game_id), total_games,
         base_seed, domain, greedy, temperature,
+        has_opponent_greedy, opponent_greedy,
+        has_opponent_temperature, opponent_temperature,
         static_cast<float>(candidate_logit_cap),
         static_cast<float>(opponent_logit_cap),
         logit_dump_ptr,
@@ -1253,6 +1271,13 @@ void RunEvaluation() {
               << "  \"base_seed\": " << base_seed << ",\n"
               << "  \"num_games\": " << total_games << ",\n"
               << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n"
+              << "  \"opponent_greedy\": "
+              << (has_opponent_greedy ? (opponent_greedy ? "true" : "false")
+                                      : "null") << ",\n"
+              << "  \"opponent_temperature\": "
+              << (has_opponent_temperature
+                      ? absl::StrFormat("%.6f", opponent_temperature)
+                      : std::string("null")) << ",\n"
               << "  \"temperature\": "
               << absl::StrFormat("%.2f", temperature) << ",\n"
               << "  \"candidate_logit_cap\": "

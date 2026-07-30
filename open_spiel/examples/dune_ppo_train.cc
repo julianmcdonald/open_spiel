@@ -92,9 +92,14 @@ ABSL_FLAG(double, tleilaxu_breadcrumb_weight, 0.0,
 ABSL_FLAG(double, tleilaxu_level7_breadcrumb_weight, 0.0,
           "Weight for Tleilaxu level 7 breadcrumb.");
 // Sign convention: the value is SUBTRACTED from reward — pass a POSITIVE value to penalize. (The phase-18 pilots passed -0.02, which was a +0.02 bonus.)
+// A NEGATIVE value is now rejected fatally in main() (PWO-5 gate 2 item (a)).
 ABSL_FLAG(double, specimen_exchange_penalty, 0.0,
           "Magnitude of the negative shaping SUBTRACTED from a transition that "
-          "takes a ConvertSpecimenToTroop action (IDs 740-752). Training-only "
+          "takes a ConvertSpecimenToTroop action (IDs 741-752; 740 is an unused "
+          "base constant and is never legal). MUST BE >= 0: the value is "
+          "subtracted, so a POSITIVE value penalizes and a NEGATIVE value would "
+          "be a BONUS on the very behaviour this term exists to suppress -- a "
+          "negative value is rejected fatally at startup. Training-only "
           "anti-breadcrumb (never eval). Apply the SAME value to BOTH pilot and "
           "control arms so the search-distillation contrast stays a pure "
           "experiment. Typical 0.02 (terminal win utility is 2.25). Requires "
@@ -1407,18 +1412,24 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
 
         // Specimen-exchange anti-breadcrumb (Item 3): a small negative shaping on
-        // the transition that takes a ConvertSpecimenToTroop action (IDs 740-752),
-        // to discourage the over-used specimen->troop breadcrumb behavior.
-        // Training-only (never eval). Must be set to the SAME value on both the
-        // pilot and control arms so the search-distillation contrast stays pure.
+        // the transition that takes a ConvertSpecimenToTroop action (IDs 741-752
+        // -- 740 is an unused base constant and is never legal; see
+        // dune_specimen_conversion.h), to discourage the over-used
+        // specimen->troop breadcrumb behavior. Training-only (never eval). Must
+        // be set to the SAME value on both the pilot and control arms so the
+        // search-distillation contrast stays pure.
+        //
+        // PWO-5 gate 2 items (b)+(c): the range predicate and the subtraction
+        // both moved into shared, unit-tested helpers. The sign is the point --
+        // a POSITIVE penalty must DECREASE this reward.
         if (specimen_exchange_penalty != 0.0 &&
             current_player >= 0 && current_player < game.NumPlayers() &&
-            action >= dune_imperium::kActionConvertSpecimenToTroop0 &&
-            action <= dune_imperium::kActionConvertSpecimenToTroop0 + 12) {
+            dune_shaping::IsSpecimenConversionAction(action)) {
           int idx = last_transition_index[current_player];
           if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-            (*trajectory)[idx].reward -=
-                static_cast<float>(specimen_exchange_penalty) * reward_lambda;
+            (*trajectory)[idx].reward = ApplySpecimenExchangeShaping(
+                (*trajectory)[idx].reward, action, specimen_exchange_penalty,
+                reward_lambda);
           }
         }
 
@@ -1727,6 +1738,27 @@ CollectResult CollectRollout(const Game* game,
 int main(int argc, char** argv) {
   setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
+  // PWO-5 gate 2 item (a): reject a NEGATIVE --specimen_exchange_penalty
+  // fatally, after argument parsing and before anything else runs.
+  //
+  // The flag is a magnitude that is SUBTRACTED from the reward of a conversion
+  // transition, so a negative value is a BONUS on exactly the breadcrumb
+  // behaviour the term exists to suppress. This is not a hypothetical foot-gun:
+  // the u175 lineage was trained with `--specimen_exchange_penalty=-0.02` and
+  // the committed calibration_results_v2/pilot300_search_seed12/launch.sh still
+  // carries it. Until now the ONLY validation of this flag was the
+  // --allow_shaping gate below, which tests `!= 0.0` and accepts negatives.
+  if (absl::GetFlag(FLAGS_specimen_exchange_penalty) < 0.0) {
+    std::cerr << "Fatal: --specimen_exchange_penalty="
+              << absl::GetFlag(FLAGS_specimen_exchange_penalty)
+              << " is NEGATIVE. This flag is a MAGNITUDE THAT IS SUBTRACTED "
+                 "from the reward of a ConvertSpecimenToTroop transition, so a "
+                 "negative value is a BONUS on the breadcrumb behaviour the "
+                 "term exists to penalize (this is the u175-lineage defect). "
+                 "Pass a value >= 0; 0.0 disables the term."
+              << std::endl;
+    return -1;
+  }
   if (absl::GetFlag(FLAGS_shaped_reward_weight) != 0.0 ||
       absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight) != 0.0 ||
       absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight) != 0.0 ||
