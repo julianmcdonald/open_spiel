@@ -112,6 +112,21 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   # Battery check 9: root raw priors are immutable after expansion, which is what
   # makes the recovery instrument's zero-simulation replay admissible.
+  # PWO-5 gate 3: the offline preparation pass. Replays all 400 PWO-4 game
+  # histories through the frozen engine, runs the section 5.3 replay-fidelity
+  # gate over all 48,443 label rows, derives the three auxiliary targets, fixes
+  # the section 8.5 whole-trajectory split, and writes the distillation label
+  # pack plus the parallel hashed auxiliary-target artifact.
+  add_executable(dune_pwo5_prepare dune_pwo5_prepare.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_prepare dune_search ${TORCH_LIBRARIES})
+
+  # PWO-5 gate 3: diagnostics schema v5 and the section 14.1c partition identity.
+  add_executable(dune_pwo5_schema_test dune_pwo5_schema_test.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_schema_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_pwo5_schema_test COMMAND dune_pwo5_schema_test)
+
   add_executable(dune_pwo3_immutability_test dune_pwo3_immutability_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo3_immutability_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo3_immutability_test COMMAND dune_pwo3_immutability_test)

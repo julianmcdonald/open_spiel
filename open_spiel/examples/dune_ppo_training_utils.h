@@ -160,6 +160,34 @@ struct PpoUpdateStats {
   // All zero / false unless online collection fed non-empty examples with a
   // positive search-loss coefficient this update — except aux_search_loss_coef,
   // which always records what was asked for.
+  // --- PWO-5 section 14.1c: the seventeen canary columns 70-86. ----------
+  //
+  // Measured at section 14.1b's FROZEN site (the rollout behaviour-policy
+  // decision) and carried here by AttachCanaryStats. These are NOT column 36
+  // `entropy`, which is presentation-weighted over executed PPO minibatches on
+  // an evolving model; these are per-decision on the frozen behaviour policy.
+  // The two differ in population, weighting, model state and timing, and may
+  // never be compared or substituted. Column 36 remains emitted and is read by
+  // no rail.
+  //
+  // Role index = the integer value of DuneDecisionRole. Six of the seven can
+  // carry a nontrivial row here; kForcedOrBookkeeping is identically empty at
+  // this site by section 14.1c's proof, and is accumulated anyway so the
+  // partition identity is CHECKED rather than asserted.
+  //
+  // Zero-support semantics (section 14.1c): when a role's count is 0 its mean
+  // is emitted as 0.0, and 0.0 there means "no support this update", NEVER
+  // "entropy collapsed to zero". Every consumer reads the count first. No rail
+  // reads a role split at all -- the rails read the global mean -- so zero
+  // support can never move a rail.
+  double norm_entropy = 0.0;
+  int64_t norm_entropy_n = 0;
+  double norm_entropy_role[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  int64_t norm_entropy_n_role[7] = {0, 0, 0, 0, 0, 0, 0};
+  double max_action_prob = 0.0;
+  double frac_legal_absz_ge_cap = 0.0;
+  int64_t frac_legal_absz_ge_cap_n = 0;
+
   int aux_examples_used = 0;          // # search examples folded in this update
   double aux_search_loss_coef = 0.0;  // coefficient REQUESTED this update (warmup
                                       // ramps it); >0 with aux_examples_used==0
@@ -202,7 +230,20 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
                       double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp,
-                      double validation_kl = -1.0);
+                      double validation_kl = -1.0,
+                      // PWO-5 section 14.1c. Defaults to false so every
+                      // pre-PWO-5 caller keeps the v4 69-column schema
+                      // byte-for-byte -- the header is compared literally on
+                      // resume, so a silent widening would kill every existing
+                      // run at its first WriteDiagnostics.
+                      bool emit_canary_columns = false);
+
+// The diagnostics CSV header for the requested schema. v4 = 69 columns; v5 =
+// those 69 plus section 14.1c's seventeen canary columns 70-86, appended at the
+// tail and changing no existing column. There is no numeric version constant in
+// this format: the header string IS the version, stored as line 1 of the file
+// and compared byte-for-byte on resume.
+std::string DiagnosticsCsvHeader(bool emit_canary_columns);
 #endif
 
 class CombatCreditAccumulator {

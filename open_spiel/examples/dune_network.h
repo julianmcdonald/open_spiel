@@ -19,6 +19,7 @@
 #include <ATen/autocast_mode.h>
 
 #include "open_spiel/spiel.h"
+#include "dune_seed_utils.h"  // MakeTorchCPUGenerator, for the PWO-5 head init
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -53,6 +54,10 @@ TORCH_MODULE(ResBlock);
 // See the rationale block in the constructor below.
 inline constexpr double kValueHeadOutputInitScale = 0.01;
 
+// PWO-5 section 7.2: the same x0.01 applied to the three auxiliary heads'
+// output weights, for the same reason and with the same precedent.
+inline constexpr double kAuxHeadOutputInitScale = 0.01;
+
 // 2. Main Dual-Headed Policy-Value Network Definition
 struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
@@ -62,7 +67,33 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear value_head2{nullptr};
   bool use_nonlinear_value_head_ = false;
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false) {
+  // --- PWO-5 section 7.2: the three auxiliary heads. -----------------------
+  //
+  // Constructed ONLY when `with_aux_heads` is true, which ONLY dune_ppo_train
+  // passes. That default is load-bearing three times over:
+  //
+  //   * every evaluation binary keeps the pre-migration module set, so it can
+  //     still load the frozen Branch-A u2450 opponent checkpoint, which has no
+  //     head tensors;
+  //   * a candidate checkpoint that DOES have them still loads into a
+  //     head-less module, because torch's Module::load walks the MODULE's own
+  //     members and ignores extra archive entries;
+  //   * it makes section 9.5's "auxiliary outputs unused at runtime" a
+  //     STRUCTURAL fact rather than a convention -- the evaluator cannot
+  //     compute a head output because the head does not exist in its process.
+  //
+  // The heads are NEVER computed by forward(). Section 8.6 registers a
+  // "dedicated auxiliary forward path": ForwardAux() below is the only entry
+  // point that touches them, and it is called only from the auxiliary slice of
+  // the PPO minibatch loop, only when a head coefficient is nonzero. So a
+  // head-off arm (T, P) never computes a head output at all, which is what
+  // makes the head-off claim exact rather than a multiply-by-zero.
+  torch::nn::Linear final_vp_head{nullptr};        // 1 output
+  torch::nn::Linear terminal_round_head{nullptr};  // 3 classes: <=8 / 9 / 10
+  torch::nn::Linear next_own_action_head{nullptr}; // action_dim classes
+  bool has_aux_heads_ = false;
+
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0) {
     use_nonlinear_value_head_ = use_nonlinear;
     input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
 
@@ -120,6 +151,53 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
         value_out->bias.mul_(kValueHeadOutputInitScale);
       }
     }
+
+    // --- PWO-5 section 7.2: deterministic auxiliary-head initialization. ----
+    //
+    // Registered recipe: linear from the trunk, "weights x 0.01 of the standard
+    // init, bias 0", derived from a FIXED REGISTERED CONSTANT and NOT from the
+    // run seed, so that the initial head parameters are BYTE-IDENTICAL ACROSS
+    // ALL SIX ARMS (section 9's matching table checks this rather than assuming
+    // it). Deriving from the triplet seed would give T1/P1/H1 one set and
+    // T2/P2/H2 another, which satisfies the ablation's within-triplet
+    // requirement but NOT the stronger all-six property the work order states.
+    //
+    // The x0.01 mirrors this repo's verified critic-init fix (submodule
+    // b48a35ee): a standard-init tanh value head saturated at update 2 and
+    // dwelt there ~837 updates. A near-zero-output init also keeps the
+    // auxiliary gradients small at the start, so H's early trajectory is not
+    // dominated by head transients.
+    //
+    // Determinism: torch::nn::Linear's constructor above already drew from the
+    // global generator, so we OVERWRITE both tensors from a private,
+    // seed-derived CPU generator instead of relying on that draw. Whatever the
+    // ambient global RNG state is, these three heads come out identical.
+    if (with_aux_heads) {
+      has_aux_heads_ = true;
+      final_vp_head =
+          register_module("final_vp_head", torch::nn::Linear(hidden_dim, 1));
+      terminal_round_head =
+          register_module("terminal_round_head", torch::nn::Linear(hidden_dim, 3));
+      next_own_action_head = register_module(
+          "next_own_action_head", torch::nn::Linear(hidden_dim, action_dim));
+
+      torch::NoGradGuard no_grad;
+      at::Generator head_gen = dune_seed::MakeTorchCPUGenerator(head_init_seed);
+      // kaiming_uniform_ with a=sqrt(5) is what torch::nn::Linear's own
+      // reset_parameters() uses, so "the standard init" is reproduced exactly
+      // and then scaled -- rather than a different distribution scaled to look
+      // similar. bias is set to EXACTLY zero, per the registered recipe.
+      auto init_head = [&](torch::nn::Linear& head) {
+        const double bound =
+            std::sqrt(6.0 / ((1.0 + 5.0) * head->weight.size(1)));
+        head->weight.uniform_(-bound, bound, head_gen);
+        head->weight.mul_(kAuxHeadOutputInitScale);
+        if (head->bias.defined()) head->bias.zero_();
+      };
+      init_head(final_vp_head);
+      init_head(terminal_round_head);
+      init_head(next_own_action_head);
+    }
   }
 
   struct ModelOutputs {
@@ -127,11 +205,25 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     torch::Tensor values;
   };
 
-  ModelOutputs forward(torch::Tensor x) {
+  // The three auxiliary head outputs. Produced ONLY by ForwardAux().
+  struct AuxOutputs {
+    torch::Tensor final_vp;        // [B, 1]
+    torch::Tensor terminal_round;  // [B, 3]  logits
+    torch::Tensor next_own_action; // [B, action_dim]  logits
+  };
+
+  // Shared trunk. Split out of forward() so ForwardAux() reuses exactly the
+  // same computation rather than a parallel copy of it.
+  torch::Tensor Trunk(torch::Tensor x) {
     x = torch::relu(input_layer->forward(x));
     for (auto& block : res_blocks) {
       x = block->forward(x);
     }
+    return x;
+  }
+
+  ModelOutputs forward(torch::Tensor x) {
+    x = Trunk(x);
 
     torch::Tensor logits = policy_head->forward(x);
     torch::Tensor values;
@@ -142,6 +234,25 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
       values = torch::tanh(value_head->forward(x));
     }
     return {logits, values};
+  }
+
+  // PWO-5 section 8.6's DEDICATED AUXILIARY FORWARD PATH.
+  //
+  // The three heads are computed here and NOWHERE ELSE -- never in the PPO
+  // forward, never in the rollout/inference forward, never in an evaluation
+  // forward. Callers must check the coefficients first; this asserts rather
+  // than silently returning empty tensors, because a head-off arm reaching this
+  // function at all is a bug in the caller, not a no-op.
+  AuxOutputs ForwardAux(torch::Tensor x) {
+    if (!has_aux_heads_) {
+      throw std::runtime_error(
+          "ForwardAux called on a model constructed without auxiliary heads. "
+          "The heads are a dedicated forward path (PWO-5 section 8.6); a "
+          "head-off arm must never reach this call.");
+    }
+    torch::Tensor h = Trunk(x);
+    return {final_vp_head->forward(h), terminal_round_head->forward(h),
+            next_own_action_head->forward(h)};
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);

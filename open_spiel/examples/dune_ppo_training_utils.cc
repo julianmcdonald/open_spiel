@@ -1,5 +1,6 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
+#include "dune_search_routing.h"  // DuneDecisionRole, for the PWO-5 canary role order
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/utils/json.h"
 
@@ -1102,6 +1103,41 @@ const char* const kDiagnosticsCsvHeader =
     "value_clip_fraction,explained_variance,policy_head_grad_norm,"
     "value_head_grad_norm,trunk_grad_norm,minibatches_executed";
 
+// --- PWO-5 section 14.1c: schema v5 = v4 (69 cols) + 17 canary cols 70-86. --
+//
+// The names, the ORDER and the pairing of every role mean with its own `_n`
+// denominator are all frozen by section 14.1c. The six role denominators are
+// what makes the partition identity AUDITABLE; revision 7 of the registration
+// registered the identity while emitting no counts at all, which made it
+// decoration rather than a check.
+//
+// Role coverage is a COMPLETE PARTITION of NE's domain at the registered
+// measurement site, not a convenient subset: `DuneDecisionRole` has SEVEN
+// members and kOtherOptional ALONE is 45.82% of the PWO-4 stream, so the
+// existing precap_absz convention of primary/continuation/purchase would leave
+// the canary blind to nearly half of all decisions. The seventh role,
+// kForcedOrBookkeeping, is excluded by proof: the classifier returns it iff the
+// searched player is the chance player OR n_legal <= 1; chance nodes `continue`
+// in the rollout loop BEFORE any policy evaluation or role classification, so
+// the first disjunct is unsatisfiable at this site; and NE's population already
+// requires n_legal >= 2. A norm_entropy_forced column would be identically
+// empty by construction.
+const char* const kDiagnosticsCsvHeaderV5Suffix =
+    ",norm_entropy,norm_entropy_n,"
+    "norm_entropy_primary,norm_entropy_n_primary,"
+    "norm_entropy_continuation,norm_entropy_n_continuation,"
+    "norm_entropy_purchase,norm_entropy_n_purchase,"
+    "norm_entropy_combat_intrigue,norm_entropy_n_combat_intrigue,"
+    "norm_entropy_other_optional,norm_entropy_n_other_optional,"
+    "norm_entropy_leader_selection,norm_entropy_n_leader_selection,"
+    "max_action_prob,frac_legal_absz_ge_cap,frac_legal_absz_ge_cap_n";
+
+std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
+  std::string header(kDiagnosticsCsvHeader);
+  if (emit_canary_columns) header += kDiagnosticsCsvHeaderV5Suffix;
+  return header;
+}
+
 // Returns true if `filepath` already holds a header line, and sets `out_header`
 // to it (trailing CR/LF stripped). An absent or zero-length file has no header.
 bool ReadDiagnosticsCsvHeader(const std::string& filepath,
@@ -1121,18 +1157,19 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
                       double raw_conflict_vp, double raw_noncombat_vp, double raw_total_vp,
-                      double validation_kl) {
+                      double validation_kl, bool emit_canary_columns) {
   if (filepath.empty()) return;
   bool is_csv = (filepath.size() >= 4 && filepath.substr(filepath.size() - 4) == ".csv");
 
   if (is_csv) {
     std::string existing_header;
     const bool has_header = ReadDiagnosticsCsvHeader(filepath, &existing_header);
-    if (has_header && existing_header != kDiagnosticsCsvHeader) {
+    const std::string expected_header = DiagnosticsCsvHeader(emit_canary_columns);
+    if (has_header && existing_header != expected_header) {
       SpielFatalError(
           "Diagnostics CSV schema mismatch at: " + filepath +
           "\n  Existing header: " + existing_header +
-          "\n  This binary writes: " + std::string(kDiagnosticsCsvHeader) +
+          "\n  This binary writes: " + expected_header +
           "\n  Appending would produce rows the header cannot describe. Move "
           "the old file aside or point --diagnostics_path at a new file.");
     }
@@ -1141,7 +1178,7 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
       SpielFatalError("Could not open diagnostics path: " + filepath);
     }
     if (!has_header) {
-      ofs << kDiagnosticsCsvHeader << "\n";
+      ofs << expected_header << "\n";
     }
     std::string epoch_kls_str;
     for (size_t i = 0; i < stats.epoch_kls.size(); ++i) {
@@ -1221,7 +1258,41 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
         // Minibatches actually executed, i.e. BEFORE the KL early stop cut the
         // update short. Pairs with kl_early_stop/kl_early_stop_epoch: a short
         // count with early_stop=0 means something else ended the update.
-        << stats.minibatches << "\n";
+        << stats.minibatches;
+    if (emit_canary_columns) {
+      // --- v5: PWO-5 section 14.1c, columns 70-86 in registered order. -----
+      //
+      // Round-trip precision, per section 13.5's rule as applied to CSV: a
+      // normalized entropy of 3e-7 must not print as 0.000000. The stream's
+      // default precision is 6 SIGNIFICANT digits (not 6 decimals), which
+      // switches to scientific notation rather than flushing a small value to
+      // zero -- but 6 significant digits still loses information, so the
+      // canary columns are written at max_digits10 and restored afterwards.
+      const std::streamsize prev_precision = ofs.precision(
+          std::numeric_limits<double>::max_digits10);
+      // Role order is the registered column order, which is the section 8.2
+      // strategic set (primary, continuation, purchase, combat_intrigue,
+      // other_optional) followed by leader_selection -- NOT the enum's
+      // declaration order.
+      const int kRoleColumnOrder[6] = {
+          static_cast<int>(DuneDecisionRole::kAgentPrimary),
+          static_cast<int>(DuneDecisionRole::kAgentContinuation),
+          static_cast<int>(DuneDecisionRole::kPurchase),
+          static_cast<int>(DuneDecisionRole::kCombatIntrigue),
+          static_cast<int>(DuneDecisionRole::kOtherOptional),
+          static_cast<int>(DuneDecisionRole::kLeaderSelection)};
+      ofs << "," << stats.norm_entropy << "," << stats.norm_entropy_n;
+      for (int i = 0; i < 6; ++i) {
+        const int r = kRoleColumnOrder[i];
+        ofs << "," << stats.norm_entropy_role[r]
+            << "," << stats.norm_entropy_n_role[r];
+      }
+      ofs << "," << stats.max_action_prob
+          << "," << stats.frac_legal_absz_ge_cap
+          << "," << stats.frac_legal_absz_ge_cap_n;
+      ofs.precision(prev_precision);
+    }
+    ofs << "\n";
     ofs.flush();
     if (!ofs) {
       SpielFatalError("Failed to write diagnostics CSV data to: " + filepath);

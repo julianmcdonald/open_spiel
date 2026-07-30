@@ -199,6 +199,90 @@ ABSL_FLAG(int, counterfactual_replay_weight, 8,
           "Value-loss replay multiplicity for each sampled counterfactual successor.");
 ABSL_DECLARE_FLAG(double, policy_kl_anchor_coeff);
 
+// ===========================================================================
+// PWO-5 gate 3 — Appendix A.1 of docs/PWO5_PILOT_REGISTRATION.md
+// ===========================================================================
+//
+// These THIRTEEN flags are FROZEN by that appendix, which registers them
+// BEFORE they exist precisely so no post-hoc flag can enter the experiment
+// claiming it was always intended. **A flag below whose name, type or compiled
+// default differs from the appendix is a STOP, as is any ADDITIONAL flag gate 3
+// introduces that the appendix does not list.** So: exactly these thirteen,
+// exactly these names, exactly these types, exactly these defaults.
+//
+// EVERY COMPILED DEFAULT IS INERT (0.0 / "" / 0 / false). That is a registered
+// property, not a convenience: a build that has gained these flags but is
+// launched without them trains exactly as the pre-gate-3 binary did, which is
+// what keeps the section 7.3 legacy-inference parity gate and the section 6.4
+// no-aux-leakage check meaningful AFTER gate 3 lands.
+//
+// The three coefficients are the H-vs-T TREATMENT (section 9.1) and are
+// therefore expected to differ across arms; everything else here is MATCHED and
+// must be byte-identical on all six.
+
+ABSL_FLAG(double, final_vp_head_coef, 0.0,
+          "PWO-5 section 8.1: coefficient on the final_vp_head Huber loss. "
+          "0.05 in H arms, 0.0 in T and P. Exactly 0.0 short-circuits the head "
+          "entirely -- the loss term is NOT CONSTRUCTED, so no graph node "
+          "exists and the head parameters receive no gradient at all (section "
+          "7.4 rejects multiply-by-zero as the mechanism).");
+ABSL_FLAG(double, terminal_round_head_coef, 0.0,
+          "PWO-5 section 8.1: coefficient on the terminal_round_head "
+          "cross-entropy over the three classes <=8 / 9 / 10. 0.05 in H arms, "
+          "0.0 in T and P.");
+ABSL_FLAG(double, next_own_action_head_coef, 0.0,
+          "PWO-5 section 8.1: coefficient on the next_own_action_head "
+          "cross-entropy over the full 2391-action vocabulary, unmasked. 0.15 "
+          "in H arms, 0.0 in T and P.");
+ABSL_FLAG(std::string, aux_target_path, "",
+          "PWO-5 section 6.1 item 1: the parallel, separately hashed auxiliary "
+          "target artifact keyed by (game_index, decision_index). MATCHED on "
+          "all six arms and digest-verified on all six; LOADED AND USED only "
+          "when at least one head coefficient is nonzero. The verification is "
+          "unconditional, the use is not -- so a corrupt artifact is caught on "
+          "every arm at launch, not only on the two that would have read it.");
+ABSL_FLAG(std::string, aux_target_sha256, "",
+          "PWO-5 section 5.2: sha256 of --aux_target_path, asserted on all six "
+          "arms. A mismatch is fatal (section 17.5 item 3): a materialized "
+          "artifact that is not hashed is an unpinned replay input.");
+ABSL_FLAG(int, aux_games_per_update, 0,
+          "PWO-5 section 8.6: G, the number of games drawn uniformly WITHOUT "
+          "replacement ONCE per update, then partitioned. Registered 64.");
+ABSL_FLAG(int, aux_rows_per_game, 0,
+          "PWO-5 section 8.6: R, rows drawn uniformly without replacement from "
+          "each drawn game. Registered 16.");
+ABSL_FLAG(int, aux_batches_per_update, 0,
+          "PWO-5 section 8.6: the partition count. Registered 2, giving "
+          "2 x 32 games x 16 rows = 1,024 DISTINCT rows per update.");
+ABSL_FLAG(std::string, aux_heldout_games_path, "",
+          "PWO-5 section 8.5: the 60-game whole-trajectory held-out membership "
+          "list. Held-out games are excluded from ALL offline losses, "
+          "INCLUDING distillation, because the trunk is shared.");
+ABSL_FLAG(std::string, aux_heldout_sha256, "",
+          "PWO-5 section 8.5: sha256 of the canonical serialization of the 60 "
+          "held-out game indices, asserted on resume and on the u600 extension "
+          "so the split cannot silently differ across arms or replicates.");
+ABSL_FLAG(double, huber_delta_final_vp, 0.10,
+          "PWO-5 section 8.2: Huber delta for final_vp_head, on the /20 scale. "
+          "The target spans [0.25, 0.80], so 0.10 puts the quadratic/linear "
+          "knee at ~18% of the target range. The framework default 1.0 would "
+          "be pure squared error over the whole reachable range and would make "
+          "'Huber' a misnomer.");
+ABSL_FLAG(uint64_t, head_init_constant, 20260800,
+          "PWO-5 section 7.2: kHeadInitConstant. NOT a run seed -- it is a "
+          "fixed registered constant so that the initial head parameters are "
+          "byte-identical across ALL SIX arms. Deriving from the triplet seed "
+          "would give T1/P1/H1 one set and T2/P2/H2 another. Outside the "
+          "reserved final-gate base-seed range by section 10.2's arithmetic.");
+ABSL_FLAG(bool, emit_canary_columns, false,
+          "PWO-5 section 14.1a: emit the seventeen collapse-canary columns "
+          "70-86 (diagnostics schema v4 -> v5, 69 -> 86 columns), measured at "
+          "section 14.1b's FROZEN site -- the rollout behaviour-policy "
+          "decision -- and nowhere else. Launching a PWO-5 arm with this false "
+          "is section 17.5 item 14: without the columns the section 14.2 halt "
+          "rail cannot fire, and an unmonitored 300-update run is exactly the "
+          "failure mode the u175 collapse lineage represents.");
+
 namespace open_spiel {
 namespace {
 
@@ -634,21 +718,80 @@ struct WorkerStats {
   std::vector<float> precap_absz_primary;
   std::vector<float> precap_absz_continuation;
   std::vector<float> precap_absz_purchase;
+
+  // --- PWO-5 section 14.1b: the three collapse canaries. ------------------
+  //
+  // Measured at the ROLLOUT BEHAVIOUR-POLICY DECISION and nowhere else. The
+  // registration considered three candidate sites and rejected the other two:
+  // the executed-PPO-minibatch site (existing col 36 `entropy`) is
+  // presentation-weighted over an EVOLVING model and is truncated by
+  // --target_kl, so an arm that early-stops more often would show a different
+  // entropy for reasons unrelated to collapse -- "a safety rail must not be a
+  // function of its own optimizer's stopping behaviour"; and a pre-optimizer
+  // snapshot would cost a second forward over 32,768 transitions and still
+  // lack the role and legal-action data.
+  //
+  // Population: unique rollout decisions of the acting seat with n_legal >= 2,
+  // one measurement each. No re-presentation, no epoch weighting, no dependence
+  // on KL early stop.
+  //
+  // These are NOT column 36 and may never be compared to or substituted for it.
+  //
+  // Role index is the integer value of DuneDecisionRole (7 members). The
+  // kForcedOrBookkeeping slot is identically empty at this site, by the
+  // section 14.1c proof: the classifier returns it iff the searched player is
+  // the chance player OR n_legal <= 1, chance nodes `continue` before ever
+  // reaching the classifier here, and the population already requires
+  // n_legal >= 2. It is accumulated anyway so the partition identity is
+  // checked rather than assumed.
+  double canary_ne_sum = 0.0;             // sum of H_row / log(n_legal)
+  int64_t canary_ne_n = 0;                // qualifying decisions
+  double canary_ne_sum_role[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  int64_t canary_ne_n_role[7] = {0, 0, 0, 0, 0, 0, 0};
+  double canary_maxprob_sum = 0.0;        // denominator is canary_ne_n
+  int64_t canary_sat_ge_cap = 0;          // legal PRE-cap |z| >= logit_cap
+  int64_t canary_sat_logits = 0;          // legal logits examined (LOGIT unit)
 };
 
 
+// Copies BY NAME, not by position.
+//
+// PWO-5 makes the two models' module sets deliberately asymmetric: the training
+// model carries the three auxiliary heads and the inference model does not
+// (section 8.6 -- the heads must never be computed in a rollout/inference
+// forward, and the cleanest way to guarantee that is for them not to exist
+// there). The previous positional loop indexed `target_params[i]` for every `i`
+// in the SOURCE's range, so a source with 6 extra tensors would have walked off
+// the end of the target.
+//
+// Name-based copy is also strictly safer than positional in general: it cannot
+// silently pair `policy_head.weight` with `value_head.weight` if a future
+// registration order changes. When the module sets DO match it copies exactly
+// the same tensors as before, so this is behaviour-preserving for every
+// pre-PWO-5 caller.
 void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
                       std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
   torch::NoGradGuard no_grad;
-  auto source_params = source->parameters();
-  auto target_params = target->parameters();
-  auto source_buffers = source->buffers();
-  auto target_buffers = target->buffers();
-  for (size_t i = 0; i < source_params.size(); ++i) {
-    target_params[i].copy_(source_params[i].to(target_params[i].device()));
+  auto source_params = source->named_parameters();
+  auto source_buffers = source->named_buffers();
+  for (auto& item : target->named_parameters()) {
+    auto* src = source_params.find(item.key());
+    if (src == nullptr) {
+      SpielFatalError(
+          "CopyModelWeights: target parameter '" + item.key() +
+          "' has no counterpart in the source model. The inference model may "
+          "be a SUBSET of the training model (PWO-5 auxiliary heads), never a "
+          "superset.");
+    }
+    item.value().copy_(src->to(item.value().device()));
   }
-  for (size_t i = 0; i < source_buffers.size(); ++i) {
-    target_buffers[i].copy_(source_buffers[i].to(target_buffers[i].device()));
+  for (auto& item : target->named_buffers()) {
+    auto* src = source_buffers.find(item.key());
+    if (src == nullptr) {
+      SpielFatalError("CopyModelWeights: target buffer '" + item.key() +
+                      "' has no counterpart in the source model.");
+    }
+    item.value().copy_(src->to(item.value().device()));
   }
 }
 
@@ -685,8 +828,127 @@ std::string HashNonValueParameters(const std::shared_ptr<SharedDunePolicyValueNe
   return open_spiel::ComputeStringSHA256(ss.str());
 }
 
+// PWO-5 section 7.2 — THE ARCHITECTURE-VERSIONED CHECKPOINT MIGRATION.
+//
+// Loads trunk, policy head, value head "WITHOUT NUMERICAL CHANGE" from a
+// checkpoint that may PREDATE the three auxiliary heads, and leaves the heads at
+// their deterministic init (section 7.2) when the checkpoint does not carry
+// them.
+//
+// The mechanism is the temp-model copy already proven in this file for the
+// nonlinear-value-head case below, plus one probe. It relies on a documented
+// property of torch: `Module::load(InputArchive&)` iterates the MODULE's own
+// parameters/buffers/children and reads each by key, so
+//
+//   * loading a PRE-migration archive into a HEAD-LESS temp model succeeds, and
+//   * a POST-migration archive's extra head entries are simply never visited.
+//
+// So the temp model reads both generations, and the only question is whether to
+// then also pull the heads across -- which `try_read` on the head submodule
+// answers without ever partially mutating `model`.
+//
+// Numerical exactness: the trunk/policy/value tensors are `copy_`d from the
+// loaded temp model, which is a bitwise copy of the same dtype and shape. This
+// is what makes section 7.3's bitwise legacy-inference parity gate passable.
+bool LoadModelCheckpointMigrating(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    const std::string& path, torch::Device device) {
+  int64_t input_dim = model->input_layer->weight.size(1);
+  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+  int64_t action_dim = model->policy_head->weight.size(0);
+  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
+
+  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      input_dim, hidden_dim, action_dim, num_blocks, use_nonlinear,
+      /*with_aux_heads=*/false);
+  temp_model->to(device);
+  torch::load(temp_model, path, device);
+
+  torch::NoGradGuard no_grad;
+  // Trunk.
+  model->input_layer->weight.copy_(temp_model->input_layer->weight);
+  if (model->input_layer->bias.defined() &&
+      temp_model->input_layer->bias.defined()) {
+    model->input_layer->bias.copy_(temp_model->input_layer->bias);
+  }
+  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+    auto source_params = temp_model->res_blocks[i]->parameters();
+    auto target_params = model->res_blocks[i]->parameters();
+    for (size_t j = 0; j < source_params.size(); ++j) {
+      target_params[j].copy_(source_params[j]);
+    }
+    auto source_buffers = temp_model->res_blocks[i]->buffers();
+    auto target_buffers = model->res_blocks[i]->buffers();
+    for (size_t j = 0; j < source_buffers.size(); ++j) {
+      target_buffers[j].copy_(source_buffers[j]);
+    }
+  }
+  // Policy head.
+  model->policy_head->weight.copy_(temp_model->policy_head->weight);
+  if (model->policy_head->bias.defined() &&
+      temp_model->policy_head->bias.defined()) {
+    model->policy_head->bias.copy_(temp_model->policy_head->bias);
+  }
+  // Value head(s). Unlike the nonlinear partial-copy path below, the migration
+  // DOES carry the value head across: section 7.2 requires the value head load
+  // "without numerical change", and a fresh critic here would silently restart
+  // the value function at update 0 of every arm.
+  model->value_head->weight.copy_(temp_model->value_head->weight);
+  if (model->value_head->bias.defined() &&
+      temp_model->value_head->bias.defined()) {
+    model->value_head->bias.copy_(temp_model->value_head->bias);
+  }
+  if (use_nonlinear) {
+    model->value_head2->weight.copy_(temp_model->value_head2->weight);
+    if (model->value_head2->bias.defined() &&
+        temp_model->value_head2->bias.defined()) {
+      model->value_head2->bias.copy_(temp_model->value_head2->bias);
+    }
+  }
+
+  // Now the heads, if and only if this checkpoint already has them.
+  bool migrated = true;
+  if (model->has_aux_heads_) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive head_archive;
+    if (archive.try_read("final_vp_head", head_archive)) {
+      // Post-migration checkpoint: load all three normally.
+      model->final_vp_head->load(head_archive);
+      torch::serialize::InputArchive a2, a3;
+      if (!archive.try_read("terminal_round_head", a2) ||
+          !archive.try_read("next_own_action_head", a3)) {
+        SpielFatalError(
+            "PWO-5 migration: the checkpoint at " + path +
+            " carries final_vp_head but not all three auxiliary heads. A "
+            "partially migrated checkpoint is a STOP, not something to repair "
+            "silently -- section 17.5 item 4.");
+      }
+      model->terminal_round_head->load(a2);
+      model->next_own_action_head->load(a3);
+      migrated = false;  // it was ALREADY migrated
+    } else {
+      std::cout << "[PWO-5] MIGRATION: " << path
+                << " predates the auxiliary heads. Trunk, policy head and "
+                   "value head loaded without numerical change; the three "
+                   "heads keep their deterministic init from "
+                   "kHeadInitConstant=" << absl::GetFlag(FLAGS_head_init_constant)
+                << "." << std::endl;
+    }
+  }
+  return migrated;
+}
+
 void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                          const std::string& path, torch::Device device) {
+  // PWO-5: when the model carries the auxiliary heads, the migrating loader is
+  // the only correct path -- a plain torch::load would demand head tensors the
+  // base checkpoint does not have and would abort the run.
+  if (model->has_aux_heads_) {
+    LoadModelCheckpointMigrating(model, path, device);
+    return;
+  }
   if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
     torch::load(model, path, device);
     return;
@@ -757,7 +1019,25 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
 
   std::vector<torch::Tensor> policy_params;
   std::vector<torch::Tensor> other_params;
+  // PWO-5 section 7.4: the three auxiliary heads sit in their OWN parameter
+  // group with weight_decay = 0.0, IN ALL SIX ARMS.
+  //
+  // This is not tidiness. In a head-off arm (T, P) the coefficients are exactly
+  // zero and the loss terms are not constructed, so the head parameters receive
+  // no gradient -- but AdamW's DECOUPLED weight decay does not need a gradient
+  // to move a parameter. Left in the default group at --weight_decay, a
+  // head-off arm's head tensors would shrink on every step and would silently
+  // diverge from a head-on arm's initial values, breaking both the section 9
+  // "same tensors, same keys, same order" match and section 15.2 gate 7's
+  // bitwise-equal-to-initial check.
+  std::vector<torch::Tensor> aux_head_params;
   auto policy_params_set = model->policy_head->parameters();
+  std::vector<torch::Tensor> aux_params_set;
+  if (model->has_aux_heads_) {
+    for (auto& p : model->final_vp_head->parameters()) aux_params_set.push_back(p);
+    for (auto& p : model->terminal_round_head->parameters()) aux_params_set.push_back(p);
+    for (auto& p : model->next_own_action_head->parameters()) aux_params_set.push_back(p);
+  }
   for (auto& param : model->parameters()) {
     bool is_policy = false;
     for (auto& policy_param : policy_params_set) {
@@ -766,16 +1046,31 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
         break;
       }
     }
+    bool is_aux = false;
+    for (auto& aux_param : aux_params_set) {
+      if (param.is_same(aux_param)) {
+        is_aux = true;
+        break;
+      }
+    }
     if (is_policy) {
       policy_params.push_back(param);
+    } else if (is_aux) {
+      aux_head_params.push_back(param);
     } else {
       other_params.push_back(param);
     }
   }
 
+  // Group order is part of the checkpoint contract (section 9: "same
+  // param_groups, same order"), and the post-load re-assertion below indexes by
+  // it. Order: 0 = policy, 1 = everything else, 2 = the auxiliary heads.
   std::vector<torch::optim::OptimizerParamGroup> groups;
   groups.emplace_back(policy_params);
   groups.emplace_back(other_params);
+  if (model->has_aux_heads_) {
+    groups.emplace_back(aux_head_params);
+  }
   auto optimizer = std::make_unique<torch::optim::AdamW>(
       groups, torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate))
                   .eps(1e-5));
@@ -785,7 +1080,125 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
   static_cast<torch::optim::AdamWOptions&>(
       optimizer->param_groups()[1].options())
       .weight_decay(absl::GetFlag(FLAGS_weight_decay));
+  if (model->has_aux_heads_) {
+    static_cast<torch::optim::AdamWOptions&>(
+        optimizer->param_groups()[2].options())
+        .weight_decay(0.0);  // section 7.4 -- hard zero, never a flag
+  }
   return optimizer;
+}
+
+// PWO-5 section 7.2 — the OPTIMIZER half of the migration.
+//
+// The base optimizer checkpoint was written by an AdamW over the PRE-head
+// parameter set in TWO groups. The migrated optimizer has THREE groups and 6
+// more tensors, so `torch::load` straight into it cannot work: the archive and
+// the optimizer disagree about how many parameters exist.
+//
+// The migration mirrors the model's: build a TEMPORARY AdamW whose group
+// structure is exactly the pre-migration one -- and, critically, whose tensors
+// are THE REAL MODEL'S OWN non-head parameters, not copies. AdamW keys its state
+// map by `TensorImpl*`, so after loading, the temp optimizer's state is already
+// keyed by the identities the real optimizer uses, and the entries can simply be
+// moved across. Nothing is re-derived and no state tensor is reconstructed, so
+// "optimizer state loaded without numerical change" is exact.
+//
+// Returns true if it migrated (the archive was pre-head), false if the caller
+// should do an ordinary load.
+bool LoadOptimizerCheckpointMigrating(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer, const std::string& path,
+    torch::Device device) {
+  if (!model->has_aux_heads_) return false;
+
+  // Reproduce the pre-migration grouping over the real model's tensors.
+  std::vector<torch::Tensor> policy_params;
+  std::vector<torch::Tensor> other_params;
+  auto policy_params_set = model->policy_head->parameters();
+  std::vector<torch::Tensor> aux_params_set;
+  for (auto& p : model->final_vp_head->parameters()) aux_params_set.push_back(p);
+  for (auto& p : model->terminal_round_head->parameters()) aux_params_set.push_back(p);
+  for (auto& p : model->next_own_action_head->parameters()) aux_params_set.push_back(p);
+  for (auto& param : model->parameters()) {
+    bool is_policy = false;
+    for (auto& q : policy_params_set) {
+      if (param.is_same(q)) { is_policy = true; break; }
+    }
+    bool is_aux = false;
+    for (auto& q : aux_params_set) {
+      if (param.is_same(q)) { is_aux = true; break; }
+    }
+    if (is_policy) policy_params.push_back(param);
+    else if (!is_aux) other_params.push_back(param);
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> legacy_groups;
+  legacy_groups.emplace_back(policy_params);
+  legacy_groups.emplace_back(other_params);
+  torch::optim::AdamW legacy_optimizer(
+      legacy_groups,
+      torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
+
+  try {
+    torch::load(legacy_optimizer, path, device);
+  } catch (const c10::Error& e) {
+    // Not a pre-migration archive (or a genuinely broken one). Let the caller's
+    // ordinary load run and report its own error, so a real corruption is not
+    // misreported as a migration failure.
+    return false;
+  }
+
+  int moved = 0;
+  for (auto& entry : legacy_optimizer.state()) {
+    optimizer.state()[entry.first] = std::move(entry.second);
+    ++moved;
+  }
+  std::cout << "[PWO-5] MIGRATION: optimizer state moved for " << moved
+            << " pre-head parameters from " << path
+            << " without numerical change; the three heads' state is "
+               "materialized separately at zero." << std::endl;
+  return true;
+}
+
+// PWO-5 section 7.4 — MATERIALIZE the auxiliary heads' optimizer state.
+//
+// "This is a registered requirement, not a framework default." With the
+// coefficient short-circuit, a head-off arm's head parameters never receive a
+// gradient, and AdamW creates per-parameter state LAZILY on the first gradient.
+// A head-off arm's optimizer state dict would therefore be MISSING those keys
+// while a head-on arm's has them -- breaking section 9's "same tensors, same
+// keys, same order" and making section 15.2 gate 7's "auxiliary optimizer state
+// all-zero" unverifiable, because ABSENT IS NOT ZERO.
+//
+// Called in all six arms, whether or not a gradient ever flows.
+void MaterializeAuxOptimizerState(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer) {
+  if (!model->has_aux_heads_) return;
+  if (optimizer.param_groups().size() < 3) {
+    SpielFatalError(
+        "PWO-5 section 7.4: the model has auxiliary heads but the optimizer has "
+        "fewer than three parameter groups. The head group is missing.");
+  }
+  torch::NoGradGuard no_grad;
+  int materialized = 0;
+  int already_present = 0;
+  for (auto& param : optimizer.param_groups()[2].params()) {
+    auto key = param.unsafeGetTensorImpl();
+    if (optimizer.state().count(key) > 0) {
+      ++already_present;
+      continue;
+    }
+    auto state = std::make_unique<torch::optim::AdamWParamState>();
+    state->step(0);
+    state->exp_avg(torch::zeros_like(param, torch::MemoryFormat::Preserve));
+    state->exp_avg_sq(torch::zeros_like(param, torch::MemoryFormat::Preserve));
+    optimizer.state()[key] = std::move(state);
+    ++materialized;
+  }
+  std::cout << "[PWO-5] auxiliary optimizer state: materialized "
+            << materialized << " entries (step=0, exp_avg=0, exp_avg_sq=0), "
+            << already_present << " already present." << std::endl;
 }
 
 std::string GenerateUUID() {
@@ -1115,6 +1528,16 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
     double specimen_exchange_penalty =
         absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    // PWO-5 section 14.1b. Hoisted per episode alongside the other flag reads,
+    // so the canary measurement costs one bool test per decision when off.
+    const bool emit_canary_columns =
+        (local_stats != nullptr) && absl::GetFlag(FLAGS_emit_canary_columns);
+    // Carried across the CenterAndCapLegalLogits call: the PRE-cap half (SAT,
+    // and the role) is measured before it, the POST-cap half (NE,
+    // max_action_prob) after it, and both halves must describe the SAME
+    // decision.
+    bool canary_measure_this_decision = false;
+    int canary_role_this_decision = 0;
 
     torch::NoGradGuard no_grad;
     int game_length = 0;
@@ -1203,8 +1626,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
             max_absz = std::max(max_absz, std::abs(logits[a] - legal_mean));
           }
           local_stats->precap_absz_all.push_back(max_absz);
-          switch (ClassifyDuneDecisionRole(*state, current_player,
-                                           /*has_active_session=*/false)) {
+          const DuneDecisionRole decision_role = ClassifyDuneDecisionRole(
+              *state, current_player, /*has_active_session=*/false);
+          switch (decision_role) {
             case DuneDecisionRole::kAgentPrimary:
               local_stats->precap_absz_primary.push_back(max_absz);
               break;
@@ -1217,10 +1641,92 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
             default:
               break;
           }
+
+          // --- PWO-5 section 14.1b: SAT, the PRE-cap half. ----------------
+          //
+          // `SAT` is PER LOGIT, over the decision's legal actions, against the
+          // CONFIGURED cap -- three properties that are each load-bearing and
+          // none of which the existing `frac_decisions_absz_ge10` has:
+          // that column is per DECISION (max|z| over the row), and hard-codes
+          // 10.0 independently of --logit_cap. The two are reported side by
+          // side and are never conflated.
+          //
+          // It must be PRE-cap. The cap is `c * tanh(z / c)`, not a clamp, so
+          // in exact arithmetic |y| < c strictly for every finite z and a
+          // post-cap definition would be IDENTICALLY ZERO -- a rail that can
+          // never fire. In finite precision it is worse than zero: tanh rounds
+          // to exactly 1.0 at |z| >= 90.1 in fp32 but at |z| >= 31.2 in bf16,
+          // so the rail's sensitivity would become a function of the autocast
+          // dtype. Captured here, before CenterAndCapLegalLogits mutates
+          // `logits` in place.
+          if (emit_canary_columns) {
+            for (Action a : actions) {
+              if (a < 0 || static_cast<size_t>(a) >= logits.size()) continue;
+              ++local_stats->canary_sat_logits;
+              if (std::abs(logits[a] - legal_mean) >= logit_cap) {
+                ++local_stats->canary_sat_ge_cap;
+              }
+            }
+            canary_role_this_decision = static_cast<int>(decision_role);
+            canary_measure_this_decision = true;
+          }
         }
       }
 
       CenterAndCapLegalLogits(logits, actions, logit_cap);
+
+      // --- PWO-5 section 14.1b: NE and max_action_prob, the POST-cap half. --
+      //
+      // Taken from the distribution the behaviour policy ACTUALLY SAMPLES FROM
+      // (SamplePolicyAction, immediately below), which is the legal softmax of
+      // the capped logits. Post-cap is what section 14.2's positive-entropy-
+      // floor argument assumes: because the cap is applied BEFORE the softmax,
+      // the softmax argument range is bounded by (-c, +c), so post-cap entropy
+      // has a strictly positive floor for every n_legal >= 2 and can never
+      // reach 0 -- which is why an absolute entropy threshold is unanchorable
+      // and the rails are decline-based rather than absolute.
+      //
+      // The normalizer is log(n_legal) -- not log(vocabulary_size) and not
+      // log(len(visits)). n_legal >= 2 here by construction, so log(n_legal)
+      // > 0 always and the repository's two incompatible conventions for the
+      // n_legal == 1 case are both moot.
+      if (canary_measure_this_decision) {
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (Action a : actions) {
+          if (a >= 0 && static_cast<size_t>(a) < logits.size()) {
+            max_logit = std::max(max_logit, logits[a]);
+          }
+        }
+        double total = 0.0;
+        std::vector<double> probs;
+        probs.reserve(actions.size());
+        for (Action a : actions) {
+          double w = 0.0;
+          if (a >= 0 && static_cast<size_t>(a) < logits.size() &&
+              std::isfinite(max_logit)) {
+            w = std::exp(static_cast<double>(logits[a]) -
+                         static_cast<double>(max_logit));
+          }
+          probs.push_back(w);
+          total += w;
+        }
+        if (total > 0.0) {
+          double h = 0.0;
+          double max_p = 0.0;
+          for (double& w : probs) {
+            w /= total;
+            if (w > 0.0) h -= w * std::log(w);
+            max_p = std::max(max_p, w);
+          }
+          const double ne = h / std::log(static_cast<double>(actions.size()));
+          local_stats->canary_ne_sum += ne;
+          ++local_stats->canary_ne_n;
+          local_stats->canary_ne_sum_role[canary_role_this_decision] += ne;
+          ++local_stats->canary_ne_n_role[canary_role_this_decision];
+          local_stats->canary_maxprob_sum += max_p;
+        }
+        canary_measure_this_decision = false;
+      }
 
       auto policy_sample = SamplePolicyAction(&policy_rng[current_player], logits, actions);
       Action action = policy_sample.first;
@@ -1619,6 +2125,19 @@ struct CollectResult {
   std::vector<float> precap_absz_continuation;
   std::vector<float> precap_absz_purchase;
 
+  // PWO-5 section 14.1b canaries, summed over workers. Summation is exact for
+  // the integer counts; the double sums are order-dependent at the last ulp,
+  // and the merge is in thread-index order, which is deterministic given a
+  // thread count. That is the same guarantee every other double accumulator in
+  // this struct carries, and it is why every bitwise gate runs at --threads=1.
+  double canary_ne_sum = 0.0;
+  int64_t canary_ne_n = 0;
+  double canary_ne_sum_role[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  int64_t canary_ne_n_role[7] = {0, 0, 0, 0, 0, 0, 0};
+  double canary_maxprob_sum = 0.0;
+  int64_t canary_sat_ge_cap = 0;
+  int64_t canary_sat_logits = 0;
+
   // Phase 18B: online auxiliary-search examples collected from the SAME frozen
   // snapshot as `rollout`, so they travel together and are consumed by the same
   // TrainPpoUpdate. Empty unless --online_search_collection.
@@ -1630,6 +2149,79 @@ struct CollectResult {
 // so every WriteDiagnostics site persists them. Called immediately after
 // episode_ids_unique is copied, which is the existing seam for carrying
 // collection-side facts into the diagnostics row.
+// PWO-5 section 14.1c: fold the rollout-side canaries into the update's stats,
+// and CHECK the partition identity rather than assuming it.
+//
+// Two halves, both registered:
+//   Sum_r n_r == norm_entropy_n            EXACTLY (integer equality) -- the
+//     stronger half; it proves no qualifying decision was dropped or
+//     double-counted.
+//   |Sum_r (n_r * NE_r) / Sum_r n_r - NE_global| <= 1e-9  -- float slack only.
+//
+// A violation is a gate-3 failure, not a rounding artifact, so it is fatal here
+// rather than reported.
+void AttachCanaryStats(open_spiel::PpoUpdateStats* stats,
+                       const CollectResult& collect) {
+  stats->norm_entropy_n = collect.canary_ne_n;
+  stats->norm_entropy =
+      collect.canary_ne_n > 0 ? collect.canary_ne_sum / collect.canary_ne_n : 0.0;
+  stats->max_action_prob =
+      collect.canary_ne_n > 0 ? collect.canary_maxprob_sum / collect.canary_ne_n
+                              : 0.0;
+  stats->frac_legal_absz_ge_cap_n = collect.canary_sat_logits;
+  stats->frac_legal_absz_ge_cap =
+      collect.canary_sat_logits > 0
+          ? static_cast<double>(collect.canary_sat_ge_cap) /
+                static_cast<double>(collect.canary_sat_logits)
+          : 0.0;
+
+  int64_t role_n_total = 0;
+  double weighted_sum = 0.0;
+  for (int r = 0; r < 7; ++r) {
+    stats->norm_entropy_n_role[r] = collect.canary_ne_n_role[r];
+    // Zero-support semantics: mean is 0.0 when the count is 0, and 0.0 there
+    // means "no support this update", never "entropy collapsed to zero".
+    stats->norm_entropy_role[r] =
+        collect.canary_ne_n_role[r] > 0
+            ? collect.canary_ne_sum_role[r] / collect.canary_ne_n_role[r]
+            : 0.0;
+    role_n_total += collect.canary_ne_n_role[r];
+    weighted_sum += collect.canary_ne_sum_role[r];
+  }
+
+  if (role_n_total != collect.canary_ne_n) {
+    SpielFatalError(absl::StrFormat(
+        "PWO-5 section 14.1c partition identity FAILED (count half): "
+        "sum of role denominators = %lld but norm_entropy_n = %lld. A "
+        "qualifying decision was dropped or double-counted.",
+        static_cast<long long>(role_n_total),
+        static_cast<long long>(collect.canary_ne_n)));
+  }
+  if (role_n_total > 0) {
+    const double reconstructed = weighted_sum / role_n_total;
+    if (std::abs(reconstructed - stats->norm_entropy) > 1e-9) {
+      SpielFatalError(absl::StrFormat(
+          "PWO-5 section 14.1c partition identity FAILED (mean half): "
+          "row-count-weighted role mean %.17g vs norm_entropy %.17g, "
+          "difference %.3g exceeds 1e-9.",
+          reconstructed, stats->norm_entropy,
+          std::abs(reconstructed - stats->norm_entropy)));
+    }
+  }
+  // The seventh role must be identically empty at this site (section 14.1c's
+  // proof). Checked, because the proof depends on the measurement site and a
+  // future move of that site would silently invalidate it.
+  if (collect.canary_ne_n_role[static_cast<int>(
+          DuneDecisionRole::kForcedOrBookkeeping)] != 0) {
+    SpielFatalError(
+        "PWO-5 section 14.1c: kForcedOrBookkeeping carried a canary decision. "
+        "That role is provably empty at the registered rollout measurement "
+        "site (chance nodes continue before classification, and the population "
+        "requires n_legal >= 2), so a nonzero count means the canaries are no "
+        "longer being measured where section 14.1b froze them.");
+  }
+}
+
 void AttachPrecapAbszStats(open_spiel::PpoUpdateStats* stats,
                            const CollectResult& collect) {
   stats->precap_absz_all =
@@ -1711,6 +2303,17 @@ CollectResult CollectRollout(const Game* game,
     result.precap_absz_purchase.insert(result.precap_absz_purchase.end(),
                                        stats.precap_absz_purchase.begin(),
                                        stats.precap_absz_purchase.end());
+
+    // PWO-5 section 14.1b canaries.
+    result.canary_ne_sum += stats.canary_ne_sum;
+    result.canary_ne_n += stats.canary_ne_n;
+    for (int r = 0; r < 7; ++r) {
+      result.canary_ne_sum_role[r] += stats.canary_ne_sum_role[r];
+      result.canary_ne_n_role[r] += stats.canary_ne_n_role[r];
+    }
+    result.canary_maxprob_sum += stats.canary_maxprob_sum;
+    result.canary_sat_ge_cap += stats.canary_sat_ge_cap;
+    result.canary_sat_logits += stats.canary_sat_logits;
   }
 
   // Verify shaped reward conservation invariant
@@ -1801,10 +2404,41 @@ int main(int argc, char** argv) {
     std::cout << "CUDA available. PPO training on GPU.\n";
   }
 
+  // PWO-5 section 7.2 / Appendix A.1.
+  //
+  // The migrated layout is used by ALL SIX ARMS, P arms included -- "the arms
+  // differ only in coefficients, never in architecture". A P arm running the
+  // pre-migration architecture would differ from T in TWO ways at once and
+  // would not be a control for it. So the heads are constructed whenever the
+  // auxiliary configuration is present, NOT when a coefficient is nonzero.
+  //
+  // The trigger is --aux_target_path, which Appendix A.1 files under MATCHED:
+  // all six arms are launched with the same target artifact and all six verify
+  // its digest, while whether the targets are ever READ is decided by the
+  // coefficients alone. That keeps H vs T at exactly three differences.
+  //
+  // The init seed is the fixed constant, never the run seed, so all six arms'
+  // initial head parameters are byte-identical (section 9's matching table).
+  const bool pwo5_aux_layout = !absl::GetFlag(FLAGS_aux_target_path).empty();
+  const uint64_t pwo5_head_init_seed =
+      dune_seed::DeriveSeed(absl::GetFlag(FLAGS_head_init_constant),
+                            dune_seed::kDomainTrain, 0,
+                            dune_seed::kStreamModelInit);
+  if (pwo5_aux_layout) {
+    std::cout << "[PWO-5] auxiliary head layout ENABLED (--aux_target_path set). "
+              << "head_init_constant=" << absl::GetFlag(FLAGS_head_init_constant)
+              << " -> derived init seed " << pwo5_head_init_seed << std::endl;
+  }
+
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
+          pwo5_aux_layout, pwo5_head_init_seed);
+  // The INFERENCE model deliberately does NOT get the heads. Section 8.6
+  // requires the three heads be computed "never in the rollout/inference
+  // forward"; constructing them here would make that a matter of care instead
+  // of a structural impossibility.
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
@@ -1874,6 +2508,9 @@ int main(int argc, char** argv) {
   inference_model->eval();
 
   auto optimizer = open_spiel::MakeOptimizer(training_model);
+  // Section 7.4: materialize BEFORE any load, so the entries exist in all six
+  // arms; a subsequent load simply overwrites the ones the archive carries.
+  open_spiel::MaterializeAuxOptimizerState(training_model, *optimizer);
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> anchor_model = nullptr;
   if (absl::GetFlag(FLAGS_train_value_only) && absl::GetFlag(FLAGS_unfreeze_trunk)) {
@@ -2044,7 +2681,12 @@ int main(int argc, char** argv) {
         std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
       }
       if (!absl::GetFlag(FLAGS_train_value_only)) {
-        torch::load(*optimizer, optim_path, device);
+        // PWO-5 section 7.2: a pre-head archive migrates; a post-head archive
+        // loads normally.
+        if (!open_spiel::LoadOptimizerCheckpointMigrating(
+                training_model, *optimizer, optim_path, device)) {
+          torch::load(*optimizer, optim_path, device);
+        }
       } else {
         std::cout << "[INFO] train_value_only is true: keeping fresh value-only optimizer. Skipping optimizer checkpoint load.\n";
       }
@@ -2057,8 +2699,14 @@ int main(int argc, char** argv) {
       auto& options =
           static_cast<torch::optim::AdamWOptions&>(
               optimizer->param_groups()[g].options());
+      // PWO-5 section 7.4: group 2 is the auxiliary-head group and must stay
+      // at weight_decay = 0.0. The pre-PWO-5 form of this loop was
+      // `g == 0 ? policy_wd : wd`, which would have applied --weight_decay to
+      // the heads on every resume and silently drifted a head-off arm's head
+      // parameters away from their initial values.
       options.weight_decay(g == 0 ? absl::GetFlag(FLAGS_policy_weight_decay)
-                                  : absl::GetFlag(FLAGS_weight_decay));
+                          : g == 1 ? absl::GetFlag(FLAGS_weight_decay)
+                                   : 0.0);
     }
     for (auto& pair : optimizer->state()) {
       if (auto* state =
@@ -2104,7 +2752,12 @@ int main(int argc, char** argv) {
         std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
       }
       if (!absl::GetFlag(FLAGS_train_value_only)) {
-        torch::load(*optimizer, optim_path, device);
+        // PWO-5 section 7.2: the bootstrap path is where the Branch-A u2450
+        // optimizer -- written before the three heads existed -- is migrated.
+        if (!open_spiel::LoadOptimizerCheckpointMigrating(
+                training_model, *optimizer, optim_path, device)) {
+          torch::load(*optimizer, optim_path, device);
+        }
       } else {
         std::cout << "[INFO] train_value_only is true: using fresh value-only optimizer (skipping baseline optimizer load).\n";
       }
@@ -2486,6 +3139,7 @@ int main(int argc, char** argv) {
                                    obs_size, action_size, device, master, start_update, anchor_model);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
+    AttachCanaryStats(&stats, current_collect);
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
       double val_kl = search_buffer.ComputeValidationKL(training_model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
@@ -2497,7 +3151,8 @@ int main(int argc, char** argv) {
                                    current_collect.raw_conflict_vp,
                                    current_collect.raw_noncombat_vp,
                                    current_collect.raw_total_vp,
-                                   val_kl);
+                                   val_kl,
+                                   absl::GetFlag(FLAGS_emit_canary_columns));
     }
     std::cout << "Diagnostics-only run complete. Exiting.\n";
     exit(0);
@@ -2553,6 +3208,7 @@ int main(int argc, char** argv) {
                                    online_search_collection ? aux_abort_ratio : 0.0);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
+    AttachCanaryStats(&stats, current_collect);
 
     // Phase 18B clean abort at the latest valid checkpoint (plan §18C): a
     // per-update aux/PPO grad-norm ratio over threshold stops the run; this
@@ -2574,7 +3230,8 @@ int main(int argc, char** argv) {
             current_collect.raw_total_vp,
             search_buffer.ComputeValidationKL(
                 training_model, device,
-                static_cast<float>(absl::GetFlag(FLAGS_logit_cap))));
+                static_cast<float>(absl::GetFlag(FLAGS_logit_cap))),
+            absl::GetFlag(FLAGS_emit_canary_columns));
       }
       std::cerr << absl::StrFormat(
           "ABORT[18B grad-ratio]: update %d aux/PPO norm ratio %.4f > %.4f "
@@ -2611,7 +3268,8 @@ int main(int argc, char** argv) {
                                    current_collect.raw_conflict_vp,
                                    current_collect.raw_noncombat_vp,
                                    current_collect.raw_total_vp,
-                                   val_kl);
+                                   val_kl,
+                                   absl::GetFlag(FLAGS_emit_canary_columns));
     }
 
     // --- Search auxiliary distillation steps ---
