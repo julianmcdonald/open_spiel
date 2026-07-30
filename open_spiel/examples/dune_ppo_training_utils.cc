@@ -810,7 +810,14 @@ PpoUpdateStats TrainPpoUpdate(
             if (pwo5_cfg.final_vp_coef != 0.0) {
               // Huber on the /20 scale, delta 0.10. The framework default of
               // 1.0 would be pure squared error over the whole reachable range
-              // [0.25, 0.80] and would make "Huber" a misnomer.
+              // [0.25, 0.75] and would make "Huber" a misnomer.
+              //
+              // The range is [0.25, 0.75], NOT [0.25, 0.80]: amendment 1
+              // ruling 1 registers the target as FinalScoredVp/20, whose
+              // measured max over the 400 games is 15 VP. The 16-VP figure
+              // that produced 0.80 came from the legacy GetTrueFinalVp
+              // reporting helper, which awarded the all-factions-at-3 bonus
+              // without the tech-tile-8 guard.
               torch::Tensor pred = ao.final_vp.squeeze(1);
               torch::Tensor diff = pred - p_final_vp;
               const double d = pwo5_cfg.huber_delta;
@@ -1345,6 +1352,130 @@ bool ReadDiagnosticsCsvHeader(const std::string& filepath,
   }
   *out_header = line;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// PWO-5 head telemetry sidecar. See the header for ruling 6's four registered
+// properties.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The registered field order. A consumer reads names from the header record, so
+// this array IS the contract; changing it changes the schema.
+constexpr const char* kPwo5TelemetryFields[] = {
+    "pilot_local_update",
+    "global_update",
+    "final_vp_head_loss",
+    "terminal_round_head_loss",
+    "next_own_action_head_loss",
+    "final_vp_head_games",
+    "terminal_round_head_games",
+    "next_own_action_head_games",
+    "aux_distinct_rows",
+    "aux_row_presentations",
+    "policy_grad_norm",
+    "value_grad_norm",
+    "trunk_grad_norm",
+    "final_vp_head_grad_norm",
+    "terminal_round_head_grad_norm",
+    "next_own_action_head_grad_norm",
+};
+
+// %.17g, built by hand. NOT open_spiel::json -- its writer emits doubles as
+// `%f` at six decimals, so any per-head loss below 5e-7 would serialize as
+// exactly 0.0 and a head converging to zero would be indistinguishable from a
+// head that was never computed.
+std::string F17(double v) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.17g", v);
+  return std::string(buf);
+}
+
+}  // namespace
+
+std::string Pwo5HeadTelemetryPath(const std::string& diagnostics_path) {
+  if (diagnostics_path.empty()) return std::string();
+  std::filesystem::path p(diagnostics_path);
+  std::filesystem::path dir = p.parent_path();
+  return (dir / "pwo5_head_telemetry.jsonl").string();
+}
+
+std::string Pwo5HeadTelemetryContract() {
+  std::string s =
+      "{\"record\":\"header\",\"schema\":\"pwo5_head_telemetry.v1\","
+      "\"float_format\":\"%.17g\",\"global_update_base\":" +
+      std::to_string(kPwo5GlobalUpdateBase) + ",\"fields\":[";
+  const int n = static_cast<int>(sizeof(kPwo5TelemetryFields) /
+                                 sizeof(kPwo5TelemetryFields[0]));
+  for (int i = 0; i < n; ++i) {
+    if (i) s += ",";
+    s += "\"";
+    s += kPwo5TelemetryFields[i];
+    s += "\"";
+  }
+  s += "]";
+  return s;
+}
+
+void WritePwo5HeadTelemetry(const std::string& diagnostics_path,
+                            int pilot_local_update,
+                            const PpoUpdateStats& stats,
+                            const std::string& run_uuid,
+                            const std::string& config_fingerprint,
+                            uint64_t base_seed) {
+  const std::string path = Pwo5HeadTelemetryPath(diagnostics_path);
+  if (path.empty()) return;
+
+  const std::string contract = Pwo5HeadTelemetryContract();
+  bool needs_header = true;
+  {
+    std::ifstream in(path);
+    std::string first;
+    if (in && std::getline(in, first) && !first.empty()) {
+      needs_header = false;
+      if (first.compare(0, contract.size(), contract) != 0) {
+        SpielFatalError(
+            "PWO-5 head telemetry schema mismatch at: " + path +
+            "\n  Existing header contract: " + first.substr(0, contract.size()) +
+            "\n  This binary writes:       " + contract +
+            "\n  Appending would produce records the header cannot describe.");
+      }
+    }
+  }
+
+  std::ofstream out(path, std::ios::app);
+  if (!out) {
+    SpielFatalError("Could not open PWO-5 head telemetry sidecar: " + path);
+  }
+  if (needs_header) {
+    out << contract << ",\"run_uuid\":\"" << run_uuid
+        << "\",\"config_fingerprint\":\"" << config_fingerprint
+        << "\",\"base_seed\":" << base_seed << "}\n";
+  }
+
+  // Section 11.1: BOTH conventions, as explicit separate fields, so no
+  // consumer has to infer the 2450 offset. The u175 / update_25 trap is the
+  // standing precedent for what inferring it costs.
+  out << "{\"record\":\"update\""
+      << ",\"pilot_local_update\":" << pilot_local_update
+      << ",\"global_update\":" << (kPwo5GlobalUpdateBase + pilot_local_update)
+      << ",\"final_vp_head_loss\":" << F17(stats.pwo5_final_vp_loss)
+      << ",\"terminal_round_head_loss\":" << F17(stats.pwo5_terminal_round_loss)
+      << ",\"next_own_action_head_loss\":" << F17(stats.pwo5_next_action_loss)
+      << ",\"final_vp_head_games\":" << stats.pwo5_final_vp_games
+      << ",\"terminal_round_head_games\":" << stats.pwo5_terminal_round_games
+      << ",\"next_own_action_head_games\":" << stats.pwo5_next_action_games
+      << ",\"aux_distinct_rows\":" << stats.pwo5_distinct_rows
+      << ",\"aux_row_presentations\":" << stats.pwo5_presentations
+      << ",\"policy_grad_norm\":" << F17(stats.PolicyHeadGradNormMean())
+      << ",\"value_grad_norm\":" << F17(stats.ValueHeadGradNormMean())
+      << ",\"trunk_grad_norm\":" << F17(stats.TrunkGradNormMean())
+      << ",\"final_vp_head_grad_norm\":" << F17(stats.FinalVpHeadGradNormMean())
+      << ",\"terminal_round_head_grad_norm\":"
+      << F17(stats.TerminalRoundHeadGradNormMean())
+      << ",\"next_own_action_head_grad_norm\":"
+      << F17(stats.NextOwnActionHeadGradNormMean())
+      << "}\n";
 }
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,

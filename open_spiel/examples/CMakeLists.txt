@@ -120,6 +120,22 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_pwo5_prepare dune_pwo5_prepare.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_prepare dune_search ${TORCH_LIBRARIES})
 
+  # PWO-5 amendment 1 ruling 7: the update-300 whole-dataset head evaluator.
+  # A SEPARATE BINARY on purpose -- Appendix A.1's closing rule makes any
+  # gate-3 trainer flag outside its table a STOP, and a whole-dataset
+  # evaluation pass has no registered trainer flag.
+  add_executable(dune_pwo5_head_eval dune_pwo5_head_eval.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_head_eval dune_search ${TORCH_LIBRARIES})
+
+  # PWO-5 gate 3: the auxiliary-label loader's manifest FILE ROLES
+  # (amendment 1 ruling 5) and the numeric head losses.
+  add_executable(dune_pwo5_loader_roles_test dune_pwo5_loader_roles_test.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_loader_roles_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_pwo5_loader_roles_test COMMAND dune_pwo5_loader_roles_test)
+
   # PWO-5 gate 3: the section 8.6 auxiliary sampler's EXACT pinned algorithm.
   add_executable(dune_pwo5_sampler_test dune_pwo5_sampler_test.cc
     ${OPEN_SPIEL_OBJECTS})

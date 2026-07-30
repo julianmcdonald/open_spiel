@@ -1029,8 +1029,23 @@ int main(int argc, char** argv) {
   // the gate did not verify.
   // -------------------------------------------------------------------------
   const std::string aux_path = (std::filesystem::path(out_dir) / "aux_targets.bin").string();
-  const std::string pack_name = "labels_000.bin";
-  const std::string pack_path = (pack_dir / pack_name).string();
+  // Amendment 1 ruling 5: TWO packs with EXPLICIT roles, not one pack split by
+  // a per-row hash.
+  //
+  //   labels_train_000.bin      role "train"      -- the weight-one rows of the
+  //                                                  340 NON-held-out games
+  //   labels_validation_000.bin role "validation" -- the weight-one rows of the
+  //                                                  60 HELD-OUT games
+  //
+  // The train pack bypasses IsValidationLabel entirely, restoring the
+  // registered 20,582 rows and 14.93 expected passes. The validation pack
+  // buys a genuine whole-trajectory-held-out distillation KL, which the %11
+  // bucket never measured -- and which is DESCRIPTIVE ONLY: no gate,
+  // threshold or nomination criterion reads it (ruling 5, section 6.4).
+  const std::string pack_train_name = "labels_train_000.bin";
+  const std::string pack_val_name = "labels_validation_000.bin";
+  const std::string pack_train_path = (pack_dir / pack_train_name).string();
+  const std::string pack_val_path = (pack_dir / pack_val_name).string();
 
   auto aux = std::make_unique<BinWriter>(aux_path);
   aux->U32(0x50573541u);                          // magic
@@ -1040,20 +1055,23 @@ int main(int argc, char** argv) {
   aux->U64(static_cast<uint64_t>(n_rows));        // num_rows
   aux->U64(0u);                                   // reserved
 
-  // Legacy pack header -- byte for byte as SearchLabelBuffer::LoadFile reads it
-  // (dune_ppo_train.cc:466-540). The descriptive fields carry PWO-4's own
-  // controller pin (calibration_results_v2/pwo4_trajectory/manifest.json
-  // controller_pin), so the file describes the teacher that produced it. Only
-  // magic / schema / obs_size / action_dim / utility_divisor are checked by the
-  // reader; utility_divisor MUST be exactly 4.0f or the file is rejected.
-  auto pack = std::make_unique<BinWriter>(pack_path);
+  // Legacy pack header -- byte for byte as SearchLabelBuffer::LoadFile reads it.
+  // The descriptive fields carry PWO-4's own controller pin
+  // (calibration_results_v2/pwo4_trajectory/manifest.json controller_pin), so
+  // the file describes the teacher that produced it. Only magic / schema /
+  // obs_size / action_dim / utility_divisor are checked by the reader;
+  // utility_divisor MUST be exactly 4.0f or the file is rejected.
+  auto pack = std::make_unique<BinWriter>(pack_train_path);
+  auto pack_val = std::make_unique<BinWriter>(pack_val_path);
   {
-    // The 64-bit header fingerprint is a file-identity tag the loader only uses
+    // The 64-bit header fingerprint is a file-identity tag the loader uses only
     // to detect MIXED fingerprints across several .bin files in one directory.
-    // There is exactly one file here, and the value must be written before the
-    // row counts are known, so it is derived from the count-independent
-    // teacher identity. It is NOT the manifest's search_label_fingerprint,
-    // which is a sha256 over a semantic object that does include the counts.
+    // BOTH packs carry the SAME value on purpose: they are two role-partitioned
+    // halves of one teacher stream, so a "mixed fingerprints" warning between
+    // them would be a false positive. The value must be written before the row
+    // counts are known, so it is derived from the count-independent teacher
+    // identity. It is NOT the manifest's search_label_fingerprint, which is a
+    // sha256 over a semantic object that does include the counts and the roles.
     const std::string fp_domain =
         "PWO5|pwo4_trajectory|model=4bffd2b7d73fc684344947d2064560d5c367c63e28"
         "a124fc87010de04e021f79|engine=a67f1925305d35d9a2f30fd9658b9f01fe21bdd6";
@@ -1064,19 +1082,21 @@ int main(int argc, char** argv) {
       const uint64_t nib = (ch >= '0' && ch <= '9') ? (ch - '0') : (ch - 'a' + 10);
       fp = (fp << 4) | nib;
     }
-    pack->U32(0x4c545344u);                        // magic "DSTL"
-    pack->U32(2u);                                 // schema (loader accepts 1 or 2)
-    pack->I32(static_cast<int32_t>(obs_size));
-    pack->I32(static_cast<int32_t>(action_dim));
-    pack->I32(200);                                // max_simulations (PWO-4 pin)
-    pack->F32(4.0f);                               // utility_divisor -- ASSERTED == 4.0
-    pack->F32(0.3f);                               // puct_c (PWO-4 pin)
-    pack->F32(0.0f);                               // target_teacher_kl (unused offline)
-    pack->I32(2);                                  // min_visits (PWO-4 min_visit_threshold)
-    pack->I32(0);                                  // min_coverage (PWO-4 uses a prior-mass gate)
-    pack->F32(1.0f);                               // blueprint_temp (root_prior_temperature)
-    pack->U64(fp);
-    pack->U32(0u);                                 // reserved
+    for (BinWriter* w : {pack.get(), pack_val.get()}) {
+      w->U32(0x4c545344u);                        // magic "DSTL"
+      w->U32(2u);                                 // schema (loader accepts 1 or 2)
+      w->I32(static_cast<int32_t>(obs_size));
+      w->I32(static_cast<int32_t>(action_dim));
+      w->I32(200);                                // max_simulations (PWO-4 pin)
+      w->F32(4.0f);                               // utility_divisor -- ASSERTED == 4.0
+      w->F32(0.3f);                               // puct_c (PWO-4 pin)
+      w->F32(0.0f);                               // target_teacher_kl (unused offline)
+      w->I32(2);                                  // min_visits (PWO-4 min_visit_threshold)
+      w->I32(0);                                  // min_coverage (PWO-4 uses a prior-mass gate)
+      w->F32(1.0f);                               // blueprint_temp (root_prior_temperature)
+      w->U64(fp);
+      w->U32(0u);                                 // reserved
+    }
   }
 
   // Counters
@@ -1087,8 +1107,13 @@ int main(int argc, char** argv) {
   int64_t w1_heldout = 0;
   int64_t w1_training = 0;
   int64_t rows_no_next = 0;
-  int64_t pack_rows = 0;
-  int64_t pack_loader_validation = 0;  // the % 11 diversion, inside training only
+  int64_t pack_rows = 0;               // rows written to the "train"-role pack
+  int64_t pack_val_rows = 0;           // rows written to the "validation"-role pack
+  // What the loader's %11 rule WOULD have diverted out of the train pack. Under
+  // ruling 5 the train pack declares role "train", so this diversion no longer
+  // happens -- the number is measured and reported so the restored exposure is
+  // visible rather than asserted.
+  int64_t pack_loader_validation = 0;
   std::array<int64_t, 3> rows_by_class{{0, 0, 0}};
   std::array<int64_t, 3> games_by_class{{0, 0, 0}};
   int64_t games_checked = 0;
@@ -1316,31 +1341,40 @@ int main(int argc, char** argv) {
         if (held) ++w1_heldout; else ++w1_training;
       }
 
-      // ----- the distillation pack: training weight-one rows ONLY -----
-      if (r.weight == 1 && !held) {
-        pack->Floats(game_obs[i]);
-        pack->I32(r.n_legal);
+      // ----- the two role-partitioned distillation packs -----
+      // Every weight-one row goes to exactly one pack, chosen by WHOLE-GAME
+      // held-out membership -- never by a per-row property. That is the whole
+      // content of the section 8.5 split.
+      if (r.weight == 1) {
+        BinWriter* w = held ? pack_val.get() : pack.get();
+        w->Floats(game_obs[i]);
+        w->I32(r.n_legal);
         for (int32_t k = 0; k < r.n_legal; ++k) {
-          pack->I32(r.legal_actions[k]);
-          pack->F32(r.policy_target[k]);
-          pack->F32(r.raw_prior[k]);
+          w->I32(r.legal_actions[k]);
+          w->F32(r.policy_target[k]);
+          w->F32(r.raw_prior[k]);
         }
-        pack->F32(r.teacher_kl);
-        pack->I32(r.num_covered_actions);
-        pack->F32(0.0f);                                   // eta
-        pack->U8(0);                                       // eta_capped
-        pack->U8(static_cast<uint8_t>(r.acting_player));   // player_id
-        pack->U8(0);                                       // padding[0]
-        pack->U8(0);                                       // padding[1]
-        ++pack_rows;
-
-        // The loader will run IsValidationLabel over EXACTLY these bytes:
-        // legal_actions are rebuilt from the stored teacher_probs action ids,
-        // in the stored order, and player_id is the uint8 widened to int32.
-        // Reproduced here so the manifest's counts are the loader's counts.
-        legal_i32.assign(r.legal_actions.begin(), r.legal_actions.end());
-        if (IsValidationLabel(game_obs[i], legal_i32, r.acting_player)) {
-          ++pack_loader_validation;
+        w->F32(r.teacher_kl);
+        w->I32(r.num_covered_actions);
+        w->F32(0.0f);                                   // eta
+        w->U8(0);                                       // eta_capped
+        w->U8(static_cast<uint8_t>(r.acting_player));   // player_id
+        w->U8(0);                                       // padding[0]
+        w->U8(0);                                       // padding[1]
+        if (held) {
+          ++pack_val_rows;
+        } else {
+          ++pack_rows;
+          // What the legacy %11 rule WOULD have diverted out of the train
+          // pack, computed over EXACTLY the bytes the loader would hash:
+          // legal_actions rebuilt from the stored teacher_probs action ids, in
+          // the stored order, and player_id the uint8 widened to int32.
+          // Measured so the exposure ruling 5 restores is a number in the
+          // manifest rather than a claim in a comment.
+          legal_i32.assign(r.legal_actions.begin(), r.legal_actions.end());
+          if (IsValidationLabel(game_obs[i], legal_i32, r.acting_player)) {
+            ++pack_loader_validation;
+          }
         }
       }
     }
@@ -1354,6 +1388,7 @@ int main(int argc, char** argv) {
 
   aux->Close();
   pack->Close();
+  pack_val->Close();
 
   Require(rows_written == n_rows, "wrote fewer aux rows than were read");
   Require(games_checked == static_cast<int64_t>(games.size()),
@@ -1508,44 +1543,72 @@ int main(int argc, char** argv) {
                 " bytes, expected " + std::to_string(expect_bytes));
   }
 
-  // Read the pack back with the reader's own walk (see VerifyPackAgainstReader).
+  // Read BOTH packs back with the reader's own walk (VerifyPackAgainstReader).
   {
     int64_t vrows = 0, vval = 0;
-    std::cout << "verifying the pack against the reader's own record walk...\n"
+    std::cout << "verifying the train pack against the reader's own record walk...\n"
               << std::flush;
-    VerifyPackAgainstReader(pack_path, obs_size, action_dim, &vrows, &vval);
+    VerifyPackAgainstReader(pack_train_path, obs_size, action_dim, &vrows, &vval);
     Require(vrows == pack_rows,
-            "pack read-back found " + std::to_string(vrows) +
+            "train pack read-back found " + std::to_string(vrows) +
                 " records but " + std::to_string(pack_rows) + " were written");
     Require(vval == pack_loader_validation,
-            "pack read-back %11 validation count " + std::to_string(vval) +
+            "train pack read-back %11 count " + std::to_string(vval) +
                 " != the writer's " + std::to_string(pack_loader_validation));
-    std::cout << "  read-back OK: " << vrows << " records, " << vval
-              << " will land in the loader's validation bucket\n\n";
+    std::cout << "  read-back OK: " << vrows << " records\n" << std::flush;
+
+    int64_t vrows2 = 0, vval2 = 0;
+    std::cout << "verifying the validation pack against the reader's own walk...\n"
+              << std::flush;
+    VerifyPackAgainstReader(pack_val_path, obs_size, action_dim, &vrows2, &vval2);
+    Require(vrows2 == pack_val_rows,
+            "validation pack read-back found " + std::to_string(vrows2) +
+                " records but " + std::to_string(pack_val_rows) + " were written");
+    std::cout << "  read-back OK: " << vrows2 << " records\n\n";
   }
 
   // -------------------------------------------------------------------------
-  // The `% 11` diversion, measured and printed loudly.
+  // Ruling 5: the roles, the restored exposure, and the %11 rule the train
+  // pack now BYPASSES.
   // -------------------------------------------------------------------------
-  const int64_t pack_training = pack_rows - pack_loader_validation;
-  std::cout << "--- distillation pack and the loader's %11 rule ---\n"
-            << "  rows written to the pack (weight-one, NOT held out): " << pack_rows << "\n"
-            << "  of those, the loader's IsValidationLabel (FNV-1a %11 == 0)\n"
-            << "  will DIVERT into its own validation bucket             : "
-            << pack_loader_validation << "  ("
-            << (pack_rows > 0 ? 100.0 * pack_loader_validation / pack_rows : 0.0)
-            << "%)\n"
-            << "  realized rows the distillation loss actually trains on : "
-            << pack_training << "\n"
-            << "  NO ROW OF ANY HELD-OUT GAME IS IN THE PACK, so the %11 rule\n"
-            << "  only ever splits WITHIN the training portion. The section 8.5\n"
-            << "  whole-trajectory split is intact; what is lost is "
-            << pack_loader_validation << " rows of\n"
-            << "  distillation exposure. Disposition is a principal's call.\n\n";
+  const int64_t manifest_training = pack_rows;
+  const int64_t manifest_validation = pack_val_rows;
 
-  // The manifest must state what the loader will COMPUTE, not what was written.
-  const int64_t manifest_training = pack_training;
-  const int64_t manifest_validation = pack_loader_validation;
+  // The registered realized counts. A different number is a STOP, not a note:
+  // ruling 5 registers 20,582 / 3,541 and section 6.3's 14.93 expected passes
+  // is arithmetic over the first of them.
+  Require(manifest_training == 20582,
+          "train-role pack holds " + std::to_string(manifest_training) +
+              " rows; amendment 1 ruling 5 registers 20582");
+  Require(manifest_validation == 3541,
+          "validation-role pack holds " + std::to_string(manifest_validation) +
+              " rows; amendment 1 ruling 5 registers 3541");
+
+  const double passes = 300.0 * 1024.0 / static_cast<double>(manifest_training);
+  std::cout << "--- role-partitioned distillation packs (ruling 5) ---\n"
+            << "  " << pack_train_name << "  role=train       rows = "
+            << manifest_training << "  (the 340 NON-held-out games)\n"
+            << "  " << pack_val_name << "  role=validation  rows = "
+            << manifest_validation << "  (the 60 HELD-OUT games)\n"
+            << "  Because the train pack declares a role, the loader does NOT\n"
+            << "  consult IsValidationLabel for it. The %11 rule WOULD have\n"
+            << "  diverted " << pack_loader_validation << " of those "
+            << manifest_training << " rows ("
+            << (manifest_training > 0
+                    ? 100.0 * pack_loader_validation / manifest_training : 0.0)
+            << "%) into the loader's own\n"
+            << "  validation bucket, cutting the registered exposure to "
+            << (manifest_training - pack_loader_validation) << " rows.\n"
+            << "  Restored: 300 updates x 1024 presentations / "
+            << manifest_training << " rows = " << passes
+            << " expected passes\n"
+            << "  (registration section 6.2 registers 14.93).\n"
+            << "  NO HELD-OUT ROW IS IN THE TRAIN PACK, and the validation pack\n"
+            << "  is loaded validation-only, so no held-out row can receive a\n"
+            << "  training gradient. The held-out distillation KL it buys is\n"
+            << "  DESCRIPTIVE ONLY -- no gate, threshold or nomination\n"
+            << "  criterion reads it (ruling 5, section 6.4).\n\n";
+
   if (manifest_training < 8192 || manifest_validation < 1024) {
     Stop("legacy-loader floors violated: training_label_count=" +
          std::to_string(manifest_training) + " (needs >= 8192), "
@@ -1560,9 +1623,11 @@ int main(int argc, char** argv) {
   // Hashes and manifests.
   // -------------------------------------------------------------------------
   std::cout << "hashing artifacts (this reads ~"
-            << ((aux->bytes() + pack->bytes()) >> 20) << " MiB)...\n" << std::flush;
+            << ((aux->bytes() + pack->bytes() + pack_val->bytes()) >> 20)
+            << " MiB)...\n" << std::flush;
   const std::string aux_sha = ComputeFileSHA256(aux_path);
-  const std::string pack_sha = ComputeFileSHA256(pack_path);
+  const std::string pack_sha = ComputeFileSHA256(pack_train_path);
+  const std::string pack_val_sha = ComputeFileSHA256(pack_val_path);
 
   // ----- the legacy pack manifest -----
   // Built as json::Object so the semantic sub-object below is byte-identical to
@@ -1588,16 +1653,37 @@ int main(int argc, char** argv) {
         "nonlinear_value_head=false"));
     semantic["training_label_count"] = json::Value(manifest_training);
     semantic["validation_label_count"] = json::Value(manifest_validation);
+    // Ruling 5: a ROLE-AWARE manifest binds the (filename, sha256, role)
+    // mapping into the fingerprint. Without it the roles would be the one part
+    // of the contract nothing authenticates, and an edited manifest could move
+    // the held-out pack into the training bucket with every hash still
+    // verifying. The string is order-sensitive and MUST match
+    // SearchLabelBuffer::CanonicalFileRoles byte for byte -- the loader
+    // recomputes exactly this and compares.
+    const std::string file_roles =
+        pack_train_name + ":" + pack_sha + ":train;" +
+        pack_val_name + ":" + pack_val_sha + ":validation;";
+    semantic["file_roles"] = json::Value(file_roles);
 
     const std::string semantic_json = json::ToString(semantic);
     const std::string fingerprint = ComputeStringSHA256(semantic_json);
 
     json::Object manifest = semantic;
-    json::Object file_entry;
-    file_entry["filename"] = json::Value(pack_name);
-    file_entry["sha256"] = json::Value(pack_sha);
     json::Array files;
-    files.push_back(json::Value(file_entry));
+    {
+      json::Object e;
+      e["filename"] = json::Value(pack_train_name);
+      e["sha256"] = json::Value(pack_sha);
+      e["role"] = json::Value(std::string("train"));
+      files.push_back(json::Value(e));
+    }
+    {
+      json::Object e;
+      e["filename"] = json::Value(pack_val_name);
+      e["sha256"] = json::Value(pack_val_sha);
+      e["role"] = json::Value(std::string("validation"));
+      files.push_back(json::Value(e));
+    }
     manifest["files"] = json::Value(files);
     manifest["search_label_fingerprint"] = json::Value(fingerprint);
     // Non-semantic provenance. The loader ignores unknown keys, and they are
@@ -1606,10 +1692,14 @@ int main(int argc, char** argv) {
     manifest["source"] = json::Value(std::string(
         "calibration_results_v2/pwo4_trajectory (PWO-4 CP4 accepted corpus)"));
     manifest["pack_population"] = json::Value(std::string(
-        "weight-one rows of the 340 NON-held-out games only; no row of any "
-        "PWO-5 section 8.5 held-out game is present"));
-    manifest["rows_written"] = json::Value(pack_rows);
-    manifest["loader_validation_diverted"] = json::Value(pack_loader_validation);
+        "role=train: the weight-one rows of the 340 NON-held-out games "
+        "(gradient-eligible). role=validation: the weight-one rows of the 60 "
+        "PWO-5 section 8.5 HELD-OUT games (held out from ALL gradients; the "
+        "held-out distillation KL they yield is DESCRIPTIVE ONLY)."));
+    manifest["rows_written_train"] = json::Value(pack_rows);
+    manifest["rows_written_validation"] = json::Value(pack_val_rows);
+    manifest["legacy_pct11_would_have_diverted"] =
+        json::Value(pack_loader_validation);
     manifest["heldout_membership_sha256"] = json::Value(membership_sha256);
     manifest["produced_by"] = json::Value(std::string("dune_pwo5_prepare"));
 
@@ -1694,12 +1784,25 @@ int main(int argc, char** argv) {
       << ", \"r9\": " << games_by_class[1] << ", \"r10\": " << games_by_class[2] << "},\n"
       << "  \"pack\": {\n"
       << "    \"dir\": \"search_labels\",\n"
-      << "    \"file\": \"" << pack_name << "\",\n"
-      << "    \"sha256\": \"" << pack_sha << "\",\n"
-      << "    \"file_bytes\": " << pack->bytes() << ",\n"
-      << "    \"rows_written\": " << pack_rows << ",\n"
+      << "    \"role_aware\": true,\n"
+      << "    \"train\": {\n"
+      << "      \"file\": \"" << pack_train_name << "\",\n"
+      << "      \"role\": \"train\",\n"
+      << "      \"sha256\": \"" << pack_sha << "\",\n"
+      << "      \"file_bytes\": " << pack->bytes() << ",\n"
+      << "      \"rows_written\": " << pack_rows << "\n"
+      << "    },\n"
+      << "    \"validation\": {\n"
+      << "      \"file\": \"" << pack_val_name << "\",\n"
+      << "      \"role\": \"validation\",\n"
+      << "      \"sha256\": \"" << pack_val_sha << "\",\n"
+      << "      \"file_bytes\": " << pack_val->bytes() << ",\n"
+      << "      \"rows_written\": " << pack_val_rows << "\n"
+      << "    },\n"
       << "    \"loader_training_label_count\": " << manifest_training << ",\n"
-      << "    \"loader_validation_label_count\": " << manifest_validation << "\n"
+      << "    \"loader_validation_label_count\": " << manifest_validation << ",\n"
+      << "    \"legacy_pct11_would_have_diverted\": " << pack_loader_validation
+      << "\n"
       << "  }\n"
       << "}\n";
     const std::string p =
@@ -1716,8 +1819,12 @@ int main(int argc, char** argv) {
   std::cout << "\n--- artifacts ---\n"
             << "  aux_targets.bin            " << aux->bytes() << " bytes\n"
             << "    sha256                   " << aux_sha << "\n"
-            << "  search_labels/" << pack_name << "      " << pack->bytes() << " bytes\n"
+            << "  search_labels/" << pack_train_name << "  role=train       "
+            << pack->bytes() << " bytes, " << pack_rows << " rows\n"
             << "    sha256                   " << pack_sha << "\n"
+            << "  search_labels/" << pack_val_name << "  role=validation  "
+            << pack_val->bytes() << " bytes, " << pack_val_rows << " rows\n"
+            << "    sha256                   " << pack_val_sha << "\n"
             << "  heldout membership sha256  " << membership_sha256 << "\n\n"
             << "--- auxiliary-target counts ---\n"
             << "  rows                       " << rows_written << "\n"

@@ -184,6 +184,12 @@ class AuxTargetStore {
       obs_.insert(obs_.end(), scratch.begin(), scratch.end());
       if (!in_list) {
         game_rows_[r.game_index].push_back(row_index);
+      } else {
+        // Held-out rows are grouped SEPARATELY and are never reachable from
+        // game_rows_, so the sampler cannot draw one. They exist here only so
+        // the update-300 evaluator can compute the registered
+        // whole-trajectory-HELD-OUT loss, which is a no-gradient measurement.
+        heldout_game_rows_[r.game_index].push_back(row_index);
       }
     }
 
@@ -200,6 +206,15 @@ class AuxTargetStore {
       training_games_.push_back(kv.first);
     }
     std::sort(training_games_.begin(), training_games_.end());
+    heldout_games_.reserve(heldout_game_rows_.size());
+    for (auto& kv : heldout_game_rows_) {
+      std::sort(kv.second.begin(), kv.second.end(),
+                [this](int64_t a, int64_t b) {
+                  return rows_[a].decision_index < rows_[b].decision_index;
+                });
+      heldout_games_.push_back(kv.first);
+    }
+    std::sort(heldout_games_.begin(), heldout_games_.end());
     return true;
   }
 
@@ -213,6 +228,21 @@ class AuxTargetStore {
   size_t training_row_count() const {
     size_t n = 0;
     for (const auto& kv : game_rows_) n += kv.second.size();
+    return n;
+  }
+  // The two whole-trajectory splits, as (game -> canonically ordered rows).
+  // Used by the update-300 evaluator, which reports EVERY row of both, and by
+  // nothing that computes a gradient.
+  const std::map<int32_t, std::vector<int64_t>>& training_game_rows() const {
+    return game_rows_;
+  }
+  const std::map<int32_t, std::vector<int64_t>>& heldout_game_rows() const {
+    return heldout_game_rows_;
+  }
+  const std::vector<int32_t>& heldout_games() const { return heldout_games_; }
+  size_t heldout_row_count() const {
+    size_t n = 0;
+    for (const auto& kv : heldout_game_rows_) n += kv.second.size();
     return n;
   }
   int MinRowsPerTrainingGame() const {
@@ -287,6 +317,10 @@ class AuxTargetStore {
   // from ALL offline losses, so a held-out row can never be drawn.
   std::map<int32_t, std::vector<int64_t>> game_rows_;
   std::vector<int32_t> training_games_;
+  // Held-out games, kept strictly apart from game_rows_ so no draw can reach
+  // them. Read only by the update-300 evaluator.
+  std::map<int32_t, std::vector<int64_t>> heldout_game_rows_;
+  std::vector<int32_t> heldout_games_;
 };
 
 }  // namespace pwo5

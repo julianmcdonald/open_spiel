@@ -1449,6 +1449,17 @@ int main(int argc, char* argv[]) {
   auto run_start_time = std::chrono::steady_clock::now();
   absl::ParseCommandLine(argc, argv);
 
+  // PWO-5 section 10.2: the reserved final-gate base-seed range. No training
+  // OR EVALUATION seed may enter [9000000, 9999999]; checked before any work.
+  {
+    const std::string stop = dune_seed::ReservedFinalGateSeedStop(
+        "--seed", static_cast<long long>(absl::GetFlag(FLAGS_seed)));
+    if (!stop.empty()) {
+      std::cerr << stop << "\n";
+      return 1;
+    }
+  }
+
   // Arm-4 (agent-phase decomposition): the --fresh_search_roles filter is only
   // defined for the Path B fresh-search driver. Fail fast on misuse or typos,
   // before any threads spawn.

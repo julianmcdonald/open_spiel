@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <random>
+#include <string>
 
 #include <torch/torch.h>
 #include <ATen/CPUGeneratorImpl.h>
@@ -108,6 +109,42 @@ constexpr uint64_t kStreamFidelityLeafRollout      = 0x00A2;
 // different populations (41,132 rows vs 20,582) in different units (games vs
 // rows), so a shared stream would couple head and distillation row choice.
 inline constexpr uint64_t kStreamAuxSampling = 0x00A3;
+
+// ===========================================================================
+// The reserved final-gate base-seed range
+// ===========================================================================
+//
+// [9000000, 9999999] is RESERVED for the primary-endpoint final gate
+// (docs/PWO2_QUALIFICATION_REGISTRATION.md:56,
+//  docs/PACE_ENDPOINTS_REGISTRATION.md:127, carried at
+//  docs/PWO3_REGISTRATION.md:222, and PWO-5 section 10.2).
+//
+// The reservation is over BASE SEEDS ONLY. Derived 64-bit values are consumed
+// as mt19937(_64) states and are never passed as --seed / --base_seed, so a
+// derived value that happens to land numerically inside the range does not
+// touch the reservation. This guard therefore checks exactly the flag values,
+// at exactly the launchers -- which is what makes PWO-5 section 10.2's ground 1
+// mechanical rather than a matter of operator care.
+inline constexpr uint64_t kReservedFinalGateSeedLo = 9000000ULL;
+inline constexpr uint64_t kReservedFinalGateSeedHi = 9999999ULL;
+
+inline bool IsReservedFinalGateBaseSeed(long long base_seed) {
+  return base_seed >= static_cast<long long>(kReservedFinalGateSeedLo) &&
+         base_seed <= static_cast<long long>(kReservedFinalGateSeedHi);
+}
+
+// Returns the STOP message for a reserved base seed, or "" if the seed is
+// legal. Callers print it and exit non-zero (or SpielFatalError) -- returning
+// the string rather than exiting keeps this header free of a process-exit
+// policy and keeps it unit-testable.
+inline std::string ReservedFinalGateSeedStop(const char* flag_name,
+                                             long long base_seed) {
+  if (!IsReservedFinalGateBaseSeed(base_seed)) return std::string();
+  return std::string("STOP: ") + flag_name + "=" + std::to_string(base_seed) +
+         " lies in the RESERVED final-gate base-seed range [9000000, 9999999]"
+         " (PWO-5 registration section 10.2). No training or evaluation seed"
+         " may enter that range.";
+}
 
 // ===========================================================================
 // RNG construction helpers

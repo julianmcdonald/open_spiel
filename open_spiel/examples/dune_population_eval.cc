@@ -1359,6 +1359,17 @@ int main(int argc, char* argv[]) {
   setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
 
+  // PWO-5 section 10.2: the reserved final-gate base-seed range. No training
+  // OR EVALUATION seed may enter [9000000, 9999999]; checked before any work.
+  {
+    const std::string stop = dune_seed::ReservedFinalGateSeedStop(
+        "--base_seed", static_cast<long long>(absl::GetFlag(FLAGS_base_seed)));
+    if (!stop.empty()) {
+      std::cerr << stop << "\n";
+      return 1;
+    }
+  }
+
   // Set PyTorch to use deterministic algorithms globally
   at::globalContext().setDeterministicAlgorithms(true, /*silent=*/true);
 

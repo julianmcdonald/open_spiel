@@ -41,6 +41,7 @@
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
 #include "dune_pwo5_aux.h"
+#include "dune_search_label_buffer.h"
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
@@ -346,352 +347,13 @@ class PpoRolloutBuffer {
   size_t num_transitions_ = 0;
 };
 
-struct SearchLabel {
-  std::vector<float> state;
-  int32_t num_legal_actions;
-  std::vector<std::pair<int64_t, float>> teacher_probs;
-  std::vector<std::pair<int64_t, float>> ppo_probs;
-  float teacher_kl;
-  int32_t num_covered_actions;
-  float eta;
-  uint8_t eta_capped;
-  uint8_t player_id;
-};
-
-class SearchLabelBuffer {
- public:
-  void SetExpectedDimensions(int64_t obs_size, int64_t action_dim) {
-    expected_obs_size_ = obs_size;
-    expected_action_dim_ = action_dim;
-  }
-
-  void LoadFromDirectory(const std::string& dir) {
-    if (dir.empty() || !std::filesystem::exists(dir)) return;
-
-    // Verify manifest.json
-    std::filesystem::path manifest_path = std::filesystem::path(dir) / "manifest.json";
-    if (!std::filesystem::exists(manifest_path)) {
-      SpielFatalError("SearchLabelBuffer: manifest.json not found in " + dir);
-    }
-
-    std::ifstream ifs(manifest_path.string());
-    if (!ifs) {
-      SpielFatalError("SearchLabelBuffer: Failed to open manifest.json in " + dir);
-    }
-    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    ifs.close();
-
-    auto val_opt = open_spiel::json::FromString(content);
-    if (!val_opt) {
-      SpielFatalError("SearchLabelBuffer: Failed to parse manifest.json in " + dir);
-    }
-
-    const auto& manifest_obj = val_opt->GetObject();
-
-    // Verify schema_version
-    auto schema_it = manifest_obj.find("schema_version");
-    if (schema_it == manifest_obj.end() || static_cast<int>(schema_it->second.GetInt()) != 2) {
-      SpielFatalError("SearchLabelBuffer: Unsupported manifest schema version in " + dir + " (expected 2)");
-    }
-
-    // Verify training_label_count & validation_label_count
-    auto train_cnt_it = manifest_obj.find("training_label_count");
-    auto val_cnt_it = manifest_obj.find("validation_label_count");
-    if (train_cnt_it == manifest_obj.end() || val_cnt_it == manifest_obj.end()) {
-      SpielFatalError("SearchLabelBuffer: Missing training/validation counts in manifest.json");
-    }
-
-    int64_t training_count = train_cnt_it->second.GetInt();
-    int64_t validation_count = val_cnt_it->second.GetInt();
-    if (training_count < 8192 || validation_count < 1024) {
-      SpielFatalError("SearchLabelBuffer: Manifest training count (" + std::to_string(training_count) +
-                     ") or validation count (" + std::to_string(validation_count) + ") is insufficient.");
-    }
-
-    // Verify files & SHA-256 hashes
-    auto files_it = manifest_obj.find("files");
-    if (files_it == manifest_obj.end()) {
-      SpielFatalError("SearchLabelBuffer: Missing 'files' list in manifest.json");
-    }
-    const auto& files_arr = files_it->second.GetArray();
-    for (const auto& f_val : files_arr) {
-      const auto& f_obj = f_val.GetObject();
-      auto fn_it = f_obj.find("filename");
-      auto hash_it = f_obj.find("sha256");
-      if (fn_it == f_obj.end() || hash_it == f_obj.end()) {
-        SpielFatalError("SearchLabelBuffer: Missing filename or sha256 in file entry");
-      }
-
-      std::string filename = fn_it->second.GetString();
-      std::string expected_sha256 = hash_it->second.GetString();
-      std::filesystem::path bin_path = std::filesystem::path(dir) / filename;
-      if (!std::filesystem::exists(bin_path)) {
-        SpielFatalError("SearchLabelBuffer: Label file " + filename + " listed in manifest does not exist.");
-      }
-
-      std::string actual_sha256 = open_spiel::ComputeFileSHA256(bin_path.string());
-      if (actual_sha256 != expected_sha256) {
-        SpielFatalError("SearchLabelBuffer: Hash mismatch for file " + filename +
-                       ": expected=" + expected_sha256 + " actual=" + actual_sha256);
-      }
-    }
-
-    // Reconstruct semantic object for fingerprint verification
-    open_spiel::json::Object semantic_obj;
-    semantic_obj["schema_version"] = manifest_obj.at("schema_version");
-    semantic_obj["base_seed"] = manifest_obj.at("base_seed");
-    semantic_obj["model_checkpoint_sha256"] = manifest_obj.at("model_checkpoint_sha256");
-    semantic_obj["effective_search_config"] = manifest_obj.at("effective_search_config");
-    semantic_obj["architecture"] = manifest_obj.at("architecture");
-    semantic_obj["training_label_count"] = manifest_obj.at("training_label_count");
-    semantic_obj["validation_label_count"] = manifest_obj.at("validation_label_count");
-
-    std::string semantic_json = open_spiel::json::ToString(semantic_obj);
-    std::string expected_fingerprint = open_spiel::ComputeStringSHA256(semantic_json);
-
-    auto fp_it = manifest_obj.find("search_label_fingerprint");
-    if (fp_it == manifest_obj.end() || fp_it->second.GetString() != expected_fingerprint) {
-      SpielFatalError("SearchLabelBuffer: Manifest search_label_fingerprint mismatch!");
-    }
-
-    std::cout << "SearchLabelBuffer: manifest.json verified successfully. Fingerprint: "
-              << expected_fingerprint << "\n";
-
-    LoadNewFiles(dir);
-  }
-
-  void LoadNewFiles(const std::string& dir) {
-    if (dir.empty() || !std::filesystem::exists(dir)) return;
-    std::lock_guard<std::mutex> lock(mu_);
-    std::vector<std::string> paths;
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-      if (entry.path().extension() == ".bin") {
-        paths.push_back(entry.path().string());
-      }
-    }
-    std::sort(paths.begin(), paths.end());
-    for (const auto& path_str : paths) {
-      if (loaded_files_.find(path_str) == loaded_files_.end()) {
-        LoadFile(path_str);
-        loaded_files_.insert(path_str);
-      }
-    }
-  }
-
-  std::vector<SearchLabel> Sample(int n, std::mt19937* rng) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    std::vector<SearchLabel> batch;
-    if (labels_.empty()) return batch;
-    batch.reserve(n);
-    std::uniform_int_distribution<size_t> dist(0, labels_.size() - 1);
-    for (int i = 0; i < n; ++i) {
-      batch.push_back(labels_[dist(*rng)]);
-    }
-    return batch;
-  }
-
-  size_t Size() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return labels_.size();
-  }
-
-  double ComputeValidationKL(const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model,
-                             const torch::Device& device, float logit_cap) const {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (validation_labels_.empty()) return 0.0;
-
-    torch::NoGradGuard no_grad;
-    const size_t batch_size = 512;
-    double kl_sum = 0.0;
-    size_t total_count = 0;
-
-    for (size_t i = 0; i < validation_labels_.size(); i += batch_size) {
-      size_t current_batch_size = std::min(batch_size, validation_labels_.size() - i);
-
-      torch::Tensor states_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_obs_size_}, torch::kFloat);
-      torch::Tensor masks_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kBool);
-      torch::Tensor teacher_probs_cpu = torch::zeros({static_cast<int64_t>(current_batch_size), expected_action_dim_}, torch::kFloat);
-
-      float* states_ptr = states_cpu.data_ptr<float>();
-      bool* masks_ptr = masks_cpu.data_ptr<bool>();
-      float* teacher_ptr = teacher_probs_cpu.data_ptr<float>();
-
-      for (size_t j = 0; j < current_batch_size; ++j) {
-        const auto& label = validation_labels_[i + j];
-        std::copy(label.state.begin(), label.state.end(), states_ptr + j * expected_obs_size_);
-        for (const auto& ap : label.teacher_probs) {
-          int action_id = ap.first;
-          float prob = ap.second;
-          masks_ptr[j * expected_action_dim_ + action_id] = true;
-          teacher_ptr[j * expected_action_dim_ + action_id] = prob;
-        }
-      }
-
-      torch::Tensor states = states_cpu.to(device);
-      torch::Tensor masks = masks_cpu.to(device);
-      torch::Tensor teacher_probs = teacher_probs_cpu.to(device);
-
-      auto outputs = model->forward(states);
-      torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
-      torch::Tensor masked_logits = logits.masked_fill(masks.logical_not(), -1e9f);
-      torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-
-      torch::Tensor log_teacher = torch::log(teacher_probs.clamp_min(1e-12f));
-      torch::Tensor kl_loss = teacher_probs * (log_teacher - log_probs);
-      torch::Tensor mean_kl = kl_loss.sum(-1);
-
-      kl_sum += mean_kl.sum().item<double>();
-      total_count += current_batch_size;
-    }
-
-    return total_count > 0 ? (kl_sum / total_count) : 0.0;
-  }
-
-  size_t ValidationSize() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return validation_labels_.size();
-  }
-
- private:
-  void LoadFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-      std::cerr << "SearchLabelBuffer: Failed to open file: " << path << "\n";
-      return;
-    }
-
-    uint32_t magic = 0;
-    uint32_t schema = 0;
-    int32_t obs_size = 0;
-    int32_t action_dim = 0;
-    int32_t max_simulations = 0;
-    float utility_divisor = 0;
-    float puct_c = 0;
-    float target_teacher_kl = 0;
-    int32_t min_visits = 0;
-    int32_t min_coverage = 0;
-    float blueprint_temp = 0;
-    uint64_t fingerprint = 0;
-    uint32_t reserved = 0;
-
-    in.read(reinterpret_cast<char*>(&magic), 4);
-    if (magic != 0x4c545344) {
-      std::cerr << "SearchLabelBuffer: Invalid magic in " << path << "\n";
-      return;
-    }
-    in.read(reinterpret_cast<char*>(&schema), 4);
-    if (schema != 1 && schema != 2) {
-      std::cerr << "SearchLabelBuffer: Unsupported schema version " << schema
-                << " in " << path << " (expected 1 or 2)\n";
-      return;
-    }
-    in.read(reinterpret_cast<char*>(&obs_size), 4);
-    in.read(reinterpret_cast<char*>(&action_dim), 4);
-    if (expected_obs_size_ > 0 && obs_size != expected_obs_size_) {
-      std::cerr << "SearchLabelBuffer: obs_size mismatch in " << path
-                << ": file=" << obs_size << " expected=" << expected_obs_size_ << "\n";
-      return;
-    }
-    if (expected_action_dim_ > 0 && action_dim != expected_action_dim_) {
-      std::cerr << "SearchLabelBuffer: action_dim mismatch in " << path
-                << ": file=" << action_dim << " expected=" << expected_action_dim_ << "\n";
-      return;
-    }
-    in.read(reinterpret_cast<char*>(&max_simulations), 4);
-    in.read(reinterpret_cast<char*>(&utility_divisor), 4);
-    if (utility_divisor != 4.0f) {
-      std::cerr << "SearchLabelBuffer: utility_divisor mismatch in " << path
-                << ": file=" << utility_divisor << " expected=4.0\n";
-      return;
-    }
-    in.read(reinterpret_cast<char*>(&puct_c), 4);
-    in.read(reinterpret_cast<char*>(&target_teacher_kl), 4);
-    in.read(reinterpret_cast<char*>(&min_visits), 4);
-    in.read(reinterpret_cast<char*>(&min_coverage), 4);
-    in.read(reinterpret_cast<char*>(&blueprint_temp), 4);
-    in.read(reinterpret_cast<char*>(&fingerprint), 8);
-    if (!has_fingerprint_) {
-      expected_fingerprint_ = fingerprint;
-      has_fingerprint_ = true;
-    } else if (fingerprint != expected_fingerprint_) {
-      std::cerr << "Warning: mixed label fingerprints in " << path
-                << ": file fingerprint=0x" << std::hex << fingerprint
-                << " expected=0x" << expected_fingerprint_ << std::dec << "\n";
-    }
-    in.read(reinterpret_cast<char*>(&reserved), 4);
-
-    int labels_before = labels_.size();
-    int val_before = validation_labels_.size();
-    while (in.peek() != EOF) {
-      SearchLabel label;
-      label.state.resize(obs_size);
-      in.read(reinterpret_cast<char*>(label.state.data()), obs_size * sizeof(float));
-      if (!in) break;
-
-      in.read(reinterpret_cast<char*>(&label.num_legal_actions), sizeof(int32_t));
-      if (label.num_legal_actions <= 0 || label.num_legal_actions > action_dim) {
-        std::cerr << "SearchLabelBuffer: Invalid num_legal_actions " << label.num_legal_actions
-                  << " in " << path << "\n";
-        break;
-      }
-      label.teacher_probs.resize(label.num_legal_actions);
-      label.ppo_probs.resize(label.num_legal_actions);
-
-      bool valid = true;
-      for (int32_t i = 0; i < label.num_legal_actions; ++i) {
-        int32_t action_id = 0;
-        float t_prob = 0.0f;
-        float p_prob = 0.0f;
-        in.read(reinterpret_cast<char*>(&action_id), sizeof(int32_t));
-        in.read(reinterpret_cast<char*>(&t_prob), sizeof(float));
-        in.read(reinterpret_cast<char*>(&p_prob), sizeof(float));
-        if (action_id < 0 || action_id >= action_dim ||
-            !std::isfinite(t_prob) || !std::isfinite(p_prob)) {
-          valid = false;
-          break;
-        }
-        label.teacher_probs[i] = {action_id, t_prob};
-        label.ppo_probs[i] = {action_id, p_prob};
-      }
-      if (!valid || !in) break;
-      in.read(reinterpret_cast<char*>(&label.teacher_kl), sizeof(float));
-      in.read(reinterpret_cast<char*>(&label.num_covered_actions), sizeof(int32_t));
-      in.read(reinterpret_cast<char*>(&label.eta), sizeof(float));
-      in.read(reinterpret_cast<char*>(&label.eta_capped), sizeof(uint8_t));
-
-      uint8_t pid = 0;
-      uint8_t padding[2];
-      in.read(reinterpret_cast<char*>(&pid), sizeof(uint8_t));
-      in.read(reinterpret_cast<char*>(padding), 2);
-      if (!in) break;
-      label.player_id = pid;
-
-      std::vector<int32_t> legal_actions;
-      for (const auto& ap : label.teacher_probs) {
-        legal_actions.push_back(static_cast<int32_t>(ap.first));
-      }
-
-      if (IsValidationLabel(label.state, legal_actions, label.player_id)) {
-        validation_labels_.push_back(std::move(label));
-      } else {
-        labels_.push_back(std::move(label));
-      }
-    }
-    int labels_loaded = labels_.size() - labels_before;
-    int val_loaded = validation_labels_.size() - val_before;
-    std::cout << "SearchLabelBuffer: Loaded " << labels_loaded
-              << " train, " << val_loaded << " val labels from " << path << "\n";
-  }
-
-  int64_t expected_obs_size_ = 0;
-  int64_t expected_action_dim_ = 0;
-  uint64_t expected_fingerprint_ = 0;
-  bool has_fingerprint_ = false;
-  std::vector<SearchLabel> labels_;
-  std::vector<SearchLabel> validation_labels_;
-  std::set<std::string> loaded_files_;
-  mutable std::mutex mu_;
-};
+// SearchLabel, SearchLabelRole, SearchLabelFileEntry and SearchLabelBuffer now
+// live in dune_search_label_buffer.h so that the trainer and the ruling-5 role
+// tests link ONE definition rather than two that can drift.
+using open_spiel::SearchLabel;
+using open_spiel::SearchLabelBuffer;
+using open_spiel::SearchLabelFileEntry;
+using open_spiel::SearchLabelRole;
 
 struct WorkerStats {
   uint64_t games = 0;
@@ -1365,6 +1027,69 @@ std::string ComputeConfigFingerprint() {
   return open_spiel::ComputeStringSHA256(json_str);
 }
 
+// ---------------------------------------------------------------------------
+// PWO-5 manifest / resume contract (registration Appendix A.1 note 3).
+// ---------------------------------------------------------------------------
+//
+// Appendix A.1 registers that "the manifest gains matching fields, asserted on
+// resume and on the u600 extension": both target flags, the held-out split
+// digest, the three head coefficients, the three sampler-shape flags, the
+// Huber delta, the head-init constant, --emit_canary_columns, and section
+// 8.6's update-1 sampler digest.
+//
+// These are kept OUT of ComputeConfigFingerprint deliberately. That fingerprint
+// is a frozen field set whose job is to recognize older manifests; extending it
+// would make every pre-PWO-5 checkpoint fail to resume as an ANONYMOUS hash
+// mismatch. A dedicated block instead fails with the field NAME that moved,
+// and leaves every legacy fingerprint verifying exactly as before.
+//
+// Every double is serialized as a %.17g STRING, never as a JSON number:
+// open_spiel's json.cc writer emits doubles as `%f` at six decimals, so a
+// coefficient of 5e-8 would persist as "0.000000" and compare equal to zero.
+std::string Pwo5Double(double v) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.17g", v);
+  return std::string(buf);
+}
+
+// Populated once at startup by BuildPwo5ManifestFields(), then merged into
+// every manifest this process writes. Empty when the run is not a PWO-5 arm
+// (no --aux_target_path), in which case nothing is written and nothing is
+// asserted -- a legacy run is untouched.
+open_spiel::json::Object g_pwo5_manifest_fields;
+bool g_pwo5_manifest_active = false;
+
+// A canonical, order-stable digest over every field above, so a single
+// comparison covers the whole block and a mismatch cannot be missed by a
+// checker that forgot one key. json::Object is a std::map, so ToString emits
+// keys in lexicographic order regardless of insertion order.
+std::string ComputePwo5Fingerprint(const open_spiel::json::Object& fields) {
+  return open_spiel::ComputeStringSHA256(open_spiel::json::ToString(fields));
+}
+
+// The head-initialization IDENTITY: a digest over the three auxiliary heads'
+// parameter tensors as they stand immediately after construction/migration.
+//
+// Section 7.2 requires the initial head parameters be BYTE-IDENTICAL on all six
+// arms (derived from kHeadInitConstant, not from any run seed). A digest makes
+// that checkable rather than asserted, and it is what section 15.2 gate 7's
+// "head parameters bitwise equal their initial values" is compared against.
+std::string ComputeAuxHeadIdentity(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  torch::NoGradGuard no_grad;
+  std::string blob;
+  auto append = [&blob](const torch::Tensor& t) {
+    torch::Tensor c = t.detach().to(torch::kCPU).contiguous().to(torch::kFloat32);
+    const auto n = c.numel();
+    const char* p = reinterpret_cast<const char*>(c.data_ptr<float>());
+    blob.append(p, static_cast<size_t>(n) * sizeof(float));
+  };
+  for (auto& p : model->final_vp_head->parameters()) append(p);
+  for (auto& p : model->terminal_round_head->parameters()) append(p);
+  for (auto& p : model->next_own_action_head->parameters()) append(p);
+  return open_spiel::ComputeStringSHA256(blob);
+}
+
 std::string GetSearchLabelFingerprint(const std::string& search_label_dir) {
   if (search_label_dir.empty()) {
     return "";
@@ -1444,6 +1169,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["optimizer_sha256"] = optim_hash;
     manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
+    // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
+    if (g_pwo5_manifest_active) {
+      manifest_obj["pwo5"] = json::Value(g_pwo5_manifest_fields);
+      manifest_obj["pwo5_fingerprint"] =
+          json::Value(ComputePwo5Fingerprint(g_pwo5_manifest_fields));
+    }
     // Phase 18B: persist online-collection state for exact resume (plan §18C).
     if (aux_state != nullptr) {
       open_spiel::WriteOnlineCollectionState(manifest_obj, *aux_state);
@@ -2342,6 +2073,17 @@ CollectResult CollectRollout(const Game* game,
 int main(int argc, char** argv) {
   setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
   absl::ParseCommandLine(argc, argv);
+  // PWO-5 section 10.2: the reserved final-gate base-seed range, enforced at
+  // the launcher so the exclusion is mechanical rather than a matter of
+  // operator care. Checked before ANY other work.
+  {
+    const std::string stop = dune_seed::ReservedFinalGateSeedStop(
+        "--seed", static_cast<long long>(absl::GetFlag(FLAGS_seed)));
+    if (!stop.empty()) {
+      std::cerr << stop << "\n";
+      return 1;
+    }
+  }
   // PWO-5 gate 2 item (a): reject a NEGATIVE --specimen_exchange_penalty
   // fatally, after argument parsing and before anything else runs.
   //
@@ -2529,6 +2271,10 @@ int main(int argc, char** argv) {
   pwo5_cfg.next_own_action_coef = absl::GetFlag(FLAGS_next_own_action_head_coef);
   pwo5_cfg.huber_delta = absl::GetFlag(FLAGS_huber_delta_final_vp);
   std::vector<int32_t> pwo5_heldout_games;
+  // Carried out of the block below so the Appendix A.1 manifest fields can be
+  // assembled once `search_label_fingerprint` also exists.
+  std::string pwo5_target_digest, pwo5_heldout_digest,
+      pwo5_update1_sampler_digest, pwo5_head_identity;
   if (pwo5_aux_layout) {
     // (a) the held-out membership list, and its registered digest.
     const std::string heldout_path = absl::GetFlag(FLAGS_aux_heldout_games_path);
@@ -2635,6 +2381,30 @@ int main(int argc, char** argv) {
             "--aux_games_per_update.");
       }
     }
+
+    // Section 8.6's update-1 sampler digest, computed EAGERLY on ALL SIX arms
+    // rather than captured when update 1 happens to run. Two reasons, both
+    // registered: T and P arms have all-zero coefficients so they never draw,
+    // yet Appendix A.1 note 3 requires the digest in EVERY arm's manifest so a
+    // triplet can be checked to have drawn identically; and the bootstrap
+    // manifest is written before any update executes, so a lazily captured
+    // digest could not appear in it at all.
+    const uint64_t update1_aux_seed = dune_seed::DeriveSeed(
+        master, dune_seed::kDomainTrain, /*update=*/1, /*aux=*/0,
+        dune_seed::kStreamAuxSampling);
+    const auto update1_draw = pwo5_store.Draw(
+        update1_aux_seed, absl::GetFlag(FLAGS_aux_games_per_update),
+        absl::GetFlag(FLAGS_aux_rows_per_game),
+        absl::GetFlag(FLAGS_aux_batches_per_update));
+    pwo5_update1_sampler_digest =
+        open_spiel::ComputeStringSHA256(update1_draw.digest);
+    pwo5_target_digest = target_digest;
+    pwo5_heldout_digest = heldout_digest;
+    pwo5_head_identity = ComputeAuxHeadIdentity(training_model);
+    std::cout << "[PWO-5] update-1 sampler digest (precomputed) "
+              << pwo5_update1_sampler_digest << "\n"
+              << "[PWO-5] head-init identity " << pwo5_head_identity
+              << std::endl;
   }
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> anchor_model = nullptr;
@@ -2653,6 +2423,55 @@ int main(int argc, char** argv) {
   std::string config_fingerprint = open_spiel::ComputeConfigFingerprint();
   std::string search_label_fingerprint = open_spiel::GetSearchLabelFingerprint(absl::GetFlag(FLAGS_search_label_dir));
   std::string run_uuid = open_spiel::GenerateUUID();
+
+  // -------------------------------------------------------------------------
+  // PWO-5 Appendix A.1 note 3: assemble the manifest block, ONCE, before any
+  // manifest is written or read. Both init_mode branches below consume it.
+  // -------------------------------------------------------------------------
+  if (pwo5_aux_layout) {
+    open_spiel::json::Object& f = open_spiel::g_pwo5_manifest_fields;
+    // --- the five TREATMENT fields (section 9.1). Differing ACROSS arms is
+    // the point; differing from the arm's OWN registered value across a resume
+    // is the STOP, which is what the within-arm check below enforces.
+    f["final_vp_head_coef"] =
+        open_spiel::Pwo5Double(absl::GetFlag(FLAGS_final_vp_head_coef));
+    f["terminal_round_head_coef"] =
+        open_spiel::Pwo5Double(absl::GetFlag(FLAGS_terminal_round_head_coef));
+    f["next_own_action_head_coef"] =
+        open_spiel::Pwo5Double(absl::GetFlag(FLAGS_next_own_action_head_coef));
+    f["search_lambda"] =
+        open_spiel::Pwo5Double(absl::GetFlag(FLAGS_search_lambda));
+    f["search_label_dir"] = absl::GetFlag(FLAGS_search_label_dir);
+    // --- the MATCHED fields: byte-identical on all six arms.
+    f["aux_target_path"] = absl::GetFlag(FLAGS_aux_target_path);
+    f["aux_target_sha256"] = pwo5_target_digest;
+    f["aux_heldout_games_path"] = absl::GetFlag(FLAGS_aux_heldout_games_path);
+    f["aux_heldout_sha256"] = pwo5_heldout_digest;
+    f["aux_games_per_update"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_aux_games_per_update));
+    f["aux_rows_per_game"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_aux_rows_per_game));
+    f["aux_batches_per_update"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_aux_batches_per_update));
+    f["huber_delta_final_vp"] =
+        open_spiel::Pwo5Double(absl::GetFlag(FLAGS_huber_delta_final_vp));
+    f["head_init_constant"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_head_init_constant));
+    f["emit_canary_columns"] = absl::GetFlag(FLAGS_emit_canary_columns);
+    // --- identities the flags alone do not pin. The label pack's FILE ROLES
+    // ride `search_label_fingerprint`: a role-aware manifest binds every
+    // (filename, sha256, role) triple into that digest, so persisting it here
+    // persists the role mapping.
+    f["head_init_identity"] = pwo5_head_identity;
+    f["search_label_fingerprint"] = search_label_fingerprint;
+    // --- section 8.6's update-1 sampler digest. Matched WITHIN a triplet
+    // (T/P/H share a base seed) and expected to differ BETWEEN triplets, so it
+    // is neither a treatment nor a global matched field.
+    f["update1_sampler_digest"] = pwo5_update1_sampler_digest;
+    open_spiel::g_pwo5_manifest_active = true;
+    std::cout << "[PWO-5] manifest fingerprint "
+              << open_spiel::ComputePwo5Fingerprint(f) << std::endl;
+  }
 
   std::atomic<uint64_t> total_env_steps{0};
   std::atomic<uint64_t> next_episode_id{0};
@@ -2754,6 +2573,95 @@ int main(int argc, char** argv) {
                                   absl::GetFlag(FLAGS_num_blocks),
                                   manifest, err, legacy_fingerprint)) {
       SpielFatalError(err);
+    }
+
+    // ---------------------------------------------------------------------
+    // PWO-5 Appendix A.1 note 3: the within-arm invariant. Every field of the
+    // block -- both target flags, the split digest, the three head
+    // coefficients, the three sampler-shape flags, the Huber delta, the
+    // head-init constant AND identity, --emit_canary_columns, the label pack's
+    // role-bearing fingerprint, and the update-1 sampler digest -- MUST NOT
+    // change across a resume or the u600 extension. An arm's own configuration
+    // is fixed for its lifetime.
+    //
+    // The check runs HERE: before the model is loaded, before the optimizer is
+    // restored, and before a single update executes.
+    // ---------------------------------------------------------------------
+    {
+      std::string stored_fp, stored_block;
+      open_spiel::json::Object stored_fields;
+      bool stored_present = false;
+      {
+        std::ifstream mfs(manifest_path);
+        std::string content((std::istreambuf_iterator<char>(mfs)),
+                            std::istreambuf_iterator<char>());
+        auto parsed = open_spiel::json::FromString(content);
+        if (parsed && parsed->IsObject()) {
+          const auto& obj = parsed->GetObject();
+          auto it = obj.find("pwo5");
+          auto fp_it = obj.find("pwo5_fingerprint");
+          if (it != obj.end() && it->second.IsObject()) {
+            stored_fields = it->second.GetObject();
+            stored_present = true;
+            stored_block = open_spiel::json::ToString(stored_fields);
+          }
+          if (fp_it != obj.end() && fp_it->second.IsString()) {
+            stored_fp = fp_it->second.GetString();
+          }
+        }
+      }
+      if (stored_present != open_spiel::g_pwo5_manifest_active) {
+        SpielFatalError(
+            std::string("PWO-5 resume contract: the manifest ") +
+            (stored_present ? "CARRIES" : "does NOT carry") +
+            " a pwo5 block but this run " +
+            (open_spiel::g_pwo5_manifest_active ? "IS" : "is NOT") +
+            " a PWO-5 arm (--aux_target_path " +
+            (open_spiel::g_pwo5_manifest_active ? "set" : "empty") +
+            "). Resuming across that boundary would silently change the "
+            "architecture, the auxiliary data path, or both.");
+      }
+      if (stored_present) {
+        const std::string current_fp =
+            open_spiel::ComputePwo5Fingerprint(open_spiel::g_pwo5_manifest_fields);
+        if (stored_fp != current_fp) {
+          // Name the fields that moved rather than emitting an anonymous hash
+          // mismatch: a resume failure a human cannot diagnose is a resume
+          // failure a human will work around.
+          std::string detail;
+          for (const auto& kv : open_spiel::g_pwo5_manifest_fields) {
+            auto sit = stored_fields.find(kv.first);
+            const std::string now = open_spiel::json::ToString(kv.second);
+            const std::string was = (sit == stored_fields.end())
+                                        ? std::string("<absent>")
+                                        : open_spiel::json::ToString(sit->second);
+            if (now != was) {
+              detail += "\n    " + kv.first + ": manifest=" + was +
+                        "  this run=" + now;
+            }
+          }
+          for (const auto& kv : stored_fields) {
+            if (open_spiel::g_pwo5_manifest_fields.find(kv.first) ==
+                open_spiel::g_pwo5_manifest_fields.end()) {
+              detail += "\n    " + kv.first + ": manifest=" +
+                        open_spiel::json::ToString(kv.second) +
+                        "  this run=<absent>";
+            }
+          }
+          SpielFatalError(
+              "PWO-5 resume contract VIOLATED (Appendix A.1 note 3).\n"
+              "  manifest pwo5_fingerprint: " + stored_fp + "\n"
+              "  this run's fingerprint:    " + current_fp + "\n"
+              "  fields that differ:" + detail +
+              "\n  An arm's own configuration is fixed for its lifetime. "
+              "Training is refused before it continues.");
+        }
+        std::cout << "[PWO-5] resume contract verified: pwo5_fingerprint "
+                  << current_fp << " matches the manifest ("
+                  << open_spiel::g_pwo5_manifest_fields.size() << " fields)."
+                  << std::endl;
+        (void)stored_block;
+      }
     }
 
     int global_update = manifest.global_update;
@@ -2921,6 +2829,13 @@ int main(int argc, char** argv) {
     manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
+    // PWO-5 Appendix A.1 note 3: the same block the checkpoint writer emits, so
+    // the bootstrap manifest an arm resumes FROM already carries the contract.
+    if (g_pwo5_manifest_active) {
+      manifest_obj["pwo5"] = json::Value(g_pwo5_manifest_fields);
+      manifest_obj["pwo5_fingerprint"] =
+          json::Value(ComputePwo5Fingerprint(g_pwo5_manifest_fields));
+    }
 
     {
       std::ofstream ofs(manifest_tmp);
@@ -3343,9 +3258,19 @@ int main(int argc, char** argv) {
           absl::GetFlag(FLAGS_aux_rows_per_game),
           absl::GetFlag(FLAGS_aux_batches_per_update));
       pwo5_draw_digest = open_spiel::ComputeStringSHA256(draw.digest);
-      if (update == start_update) {
+      if (update == 1) {
+        // The manifest's update-1 digest was precomputed at startup. Assert
+        // the REALIZED draw reproduces it, so the recorded value is a
+        // measurement of this run rather than a prediction about it.
+        if (pwo5_draw_digest != pwo5_update1_sampler_digest) {
+          SpielFatalError(
+              "PWO-5 section 8.6: the realized update-1 sampler digest " +
+              pwo5_draw_digest + " does not match the precomputed digest " +
+              pwo5_update1_sampler_digest +
+              " recorded in the manifest. The sampler is not reproducible.");
+        }
         std::cout << "[PWO-5] update-1 sampler digest " << pwo5_draw_digest
-                  << std::endl;
+                  << " (matches the manifest)" << std::endl;
       }
       // Flatten batch -> game -> rows into one tensor set, with game_id a
       // 0-based index over the update's sampled games so the trajectory
@@ -3456,6 +3381,14 @@ int main(int argc, char** argv) {
                                    current_collect.raw_total_vp,
                                    val_kl,
                                    absl::GetFlag(FLAGS_emit_canary_columns));
+      // PWO-5 amendment 1 ruling 6: the head telemetry sidecar. Path DERIVED
+      // from --diagnostics_path (no new flag), gated by the already-registered
+      // --emit_canary_columns.
+      if (absl::GetFlag(FLAGS_emit_canary_columns)) {
+        open_spiel::WritePwo5HeadTelemetry(
+            diagnostics_path, update, stats, run_uuid, config_fingerprint,
+            static_cast<uint64_t>(absl::GetFlag(FLAGS_seed)));
+      }
     }
 
     // --- Search auxiliary distillation steps ---

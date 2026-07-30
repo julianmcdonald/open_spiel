@@ -310,6 +310,57 @@ PpoUpdateStats TrainPpoUpdate(
     const Pwo5AuxBatch& pwo5_aux = Pwo5AuxBatch(),
     const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig());
 
+// ---------------------------------------------------------------------------
+// PWO-5 head telemetry sidecar (amendment 1 ruling 6).
+// ---------------------------------------------------------------------------
+//
+// Registration section 16 gate 3 item 6 requires per-head loss, per-head
+// denominators and per-component gradient norms; sections 14.1c and 17.5 item
+// 14 simultaneously pin `diagnostics.csv` at EXACTLY 86 columns and make any
+// other header a STOP. Both cannot hold. Ruling 6 resolves it: the CSV stays
+// v5/86, and the head telemetry goes to a separate sidecar with four registered
+// properties --
+//
+//   * FIXED PATH, derived mechanically from --diagnostics_path: that path with
+//     its filename replaced by `pwo5_head_telemetry.jsonl` in the same
+//     directory. Deterministic, per-arm, no operator choice;
+//   * NO NEW CLI FLAG. Appendix A.1's closing rule makes any gate-3 flag
+//     outside its table a STOP, so the path is DERIVED, never PASSED, and
+//     emission is gated by the already-registered --emit_canary_columns;
+//   * SELF-DESCRIBING: line 1 is a header record declaring the schema, the run
+//     identity and the exact ordered field names. A consumer never infers a
+//     column position;
+//   * ROUND-TRIP PRECISION: every float serialized at `%.17g`, and NOT routed
+//     through open_spiel's json.cc writer, whose `%f` six-decimal floor turns
+//     anything below 5e-7 into exactly 0.0 -- which a per-head loss approaching
+//     zero would otherwise trip.
+
+// Section 11.1: the base is GLOBAL update 2450 (Branch-A u2450, the frozen
+// PWO-5 base), so pilot-local `n` is global `2450 + n`. A CONSTANT rather than
+// a flag, because ruling 6 forbids the sidecar introducing one and because the
+// base checkpoint is frozen by section 7.1 -- a flag here could drift from the
+// checkpoint it describes.
+inline constexpr int kPwo5GlobalUpdateBase = 2450;
+
+// The derived sidecar path, or "" when diagnostics_path is empty.
+std::string Pwo5HeadTelemetryPath(const std::string& diagnostics_path);
+
+// The fixed contract prefix of the header record: schema, float format, global
+// update base and the exact ordered field names. Everything a consumer must
+// agree on, and nothing run-specific -- so it can be compared byte for byte
+// across a resume.
+std::string Pwo5HeadTelemetryContract();
+
+// Appends one update's record, writing the header record first if the file is
+// new. On resume, a header whose contract prefix differs from this binary's is
+// a fatal error rather than an append.
+void WritePwo5HeadTelemetry(const std::string& diagnostics_path,
+                            int pilot_local_update,
+                            const PpoUpdateStats& stats,
+                            const std::string& run_uuid,
+                            const std::string& config_fingerprint,
+                            uint64_t base_seed);
+
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
                       uint64_t seed, const std::string& run_uuid, const std::string& run_prefix, const std::string& config_fingerprint,
