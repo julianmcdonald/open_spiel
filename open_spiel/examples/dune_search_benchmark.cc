@@ -33,6 +33,7 @@
 #include "dune_search_session.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_terminal_vp_report.h"
 #include "dune_warmstart_helpers.h"  // ChooseHeuristicAcquisitionAction (swordmaster probe)
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include <fstream>
@@ -144,62 +145,18 @@ ABSL_FLAG(double, opponent_logit_cap, 10.0,
 namespace open_spiel {
 namespace {
 
+// Terminal VP for REPORTING (vp_margin, search_vp, opponent_vps).
+//
+// Delegates to the ONE definition in dune_terminal_vp_report.h, which calls the
+// engine. This used to be a hand-copied reimplementation of ComputeEndgameVp
+// that awarded the all-factions-at-3 +1 without the tech-tile-8 (Memocorders)
+// guard the engine applies -- see that header for the full history and the
+// measured corpus impact. DO NOT reintroduce a local copy.
+//
+// Precondition: the state is terminal. All callers below run after
+// `while (!state->IsTerminal())` has exited.
 int GetTrueFinalVp(const dune_imperium::DuneImperiumState* dune_state, int p) {
-  int base_vp = dune_state->GetPlayerVpForTesting(p);
-  int endgame_vp = 0;
-
-  // 1. Endgame Intrigues
-  const auto& hand = dune_state->GetIntrigueHandForTesting(p);
-  for (int intrigue_id : hand) {
-    const auto* intrigue = dune_imperium::FindIntrigueCardById(intrigue_id);
-    if (intrigue && (intrigue->phase_mask & dune_imperium::kIntriguePhaseEndgameMask) != 0) {
-      endgame_vp += dune_state->EndgameIntrigueVpBonusForTesting(p, intrigue_id);
-    }
-  }
-
-  // 2. Tech tile 6: Holtzman Engine
-  const auto& tech_tiles = dune_state->GetPlayerTechTilesForTesting(p);
-  if (std::find(tech_tiles.begin(), tech_tiles.end(), 6) != tech_tiles.end()) {
-    int tsmf_count = 0;
-    auto count_tsmf = [&](const std::vector<int>& cards) {
-      for (int id : cards) {
-        if (id == dune_imperium::kCardTheSpiceMustFlow) tsmf_count++;
-      }
-    };
-    auto* mutable_state = const_cast<dune_imperium::DuneImperiumState*>(dune_state);
-    count_tsmf(mutable_state->GetPlayerDrawDeckForTesting(p));
-    count_tsmf(mutable_state->GetPlayerDiscardForTesting(p));
-    count_tsmf(mutable_state->GetPlayerHandForTesting(p));
-    count_tsmf(dune_state->GetPlayedAgentCardsForTesting(p));
-    count_tsmf(dune_state->GetRevealedCardsForTesting(p));
-    if (tsmf_count >= 2) {
-      endgame_vp += 1;
-    }
-  }
-
-  // 3. Faction Influence milestone (>=3 in all 4 factions)
-  bool all_3 = true;
-  for (int f = 0; f < 4; ++f) {
-    if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) < 3) {
-      all_3 = false;
-    }
-  }
-  if (all_3) {
-    endgame_vp += 1;
-  }
-
-  // 4. Tech tile 14: Spy Satellites
-  if (std::find(tech_tiles.begin(), tech_tiles.end(), 14) != tech_tiles.end()) {
-    int low_influence_factions = 0;
-    for (int f = 0; f < 4; ++f) {
-      if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) <= 1) {
-        low_influence_factions++;
-      }
-    }
-    endgame_vp += low_influence_factions;
-  }
-
-  return base_vp + endgame_vp;
+  return dune_report::TerminalVpForReporting(dune_state, p);
 }
 
 class DuneGreedyBot : public Bot {

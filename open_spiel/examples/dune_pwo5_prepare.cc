@@ -23,7 +23,7 @@
 // games.jsonl's `final_vp`. It does not, on 212 of 1,600 (game, seat) pairs,
 // because the recorded field was written by a different function. The split
 // into assertions 5a / 5b / 5c and the full mechanism are documented at
-// GetTrueFinalVpAsRecorded below; the tool reports the divergence in full
+// Pwo4LegacyReportedVp below; the tool reports the divergence in full
 // rather than passing over it, and --strict_final_scored_vp restores the
 // literal reading as a hard STOP.
 //
@@ -155,16 +155,21 @@ ABSL_FLAG(std::string, out_dir, "", "REQUIRED. Where the artifacts are written."
 ABSL_FLAG(int, expect_label_rows, 48443, "Registration 4.1 row count. Asserted.");
 ABSL_FLAG(int, expect_games, 400, "Registration 4.1 game count. Asserted.");
 ABSL_FLAG(int, heldout_games, 60, "Registration 8.5: 15% of 400.");
-ABSL_FLAG(bool, strict_final_scored_vp, false,
-          "Make gate assertion 5c (FinalScoredVp == games.jsonl final_vp) a hard "
-          "STOP, i.e. registration 5.3 assertion 5 read LITERALLY. It does not "
-          "hold on this corpus: games.jsonl's final_vp was emitted by "
-          "GetTrueFinalVp, not by FinalScoredVp, and the two disagree. See the "
-          "GetTrueFinalVpAsRecorded comment block. Default false so the pass "
-          "completes and REPORTS the divergence instead of hiding behind it.");
-
 namespace open_spiel {
 namespace {
+
+// ---------------------------------------------------------------------------
+// The pinned corpus-audit divergence (amendment 1 ruling 3)
+// ---------------------------------------------------------------------------
+// `--strict_final_scored_vp` is GONE. It made a knowingly-failing assertion
+// optional while the tool still printed "ALL GATES PASSED", which is exactly
+// the shape this program forbids. Amendment 1 replaces the equality
+// requirement with a PIN: the divergence between the engine's FinalScoredVp
+// and the legacy reported field is a measured property of the frozen corpus,
+// and these are its measured values. The tool asserts them, so an unexpected
+// count -- in EITHER direction -- is a STOP.
+constexpr int64_t kExpectedVpDivergences = 212;            // of 1,600 pairs
+constexpr int64_t kExpectedVpDivergencesActingSeat = 59;   // of 400 games
 
 // ---------------------------------------------------------------------------
 // STOP
@@ -180,6 +185,21 @@ namespace {
 
 void Require(bool cond, const std::string& msg) {
   if (!cond) Stop(msg);
+}
+
+// Amendment 1 ruling 2 requires the COMPLETE histogram to be recorded, not a
+// summary of it. Emitted as a sparse {"vp": count} object -- integer counts, so
+// json.cc's six-decimal float floor cannot touch them.
+std::string HistogramJson(const std::array<int64_t, 41>& h) {
+  std::string out;
+  bool first = true;
+  for (int v = 0; v < static_cast<int>(h.size()); ++v) {
+    if (h[v] == 0) continue;
+    if (!first) out += ", ";
+    first = false;
+    out += "\"" + std::to_string(v) + "\": " + std::to_string(h[v]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,24 +538,28 @@ struct LabelRow {
 // `vp_[p] + ComputeEndgameVp(p)`, i.e. on FinalScoredVp. GetTrueFinalVp is a
 // reporting-only helper.
 //
-// Consequences this tool acts on:
-//   * assertion 5b (the REPLAY-FIDELITY content of assertion 5) compares the
-//     recomputed GetTrueFinalVp against the recorded field, because that is
-//     the function whose output was recorded -- a mismatch there really does
-//     mean the replay landed somewhere else. It is a hard STOP.
-//   * assertion 5c compares FinalScoredVp against the recorded field. It is
-//     REPORTED, with counts and examples, and is a STOP only under
-//     --strict_final_scored_vp. Making it a silent pass would be the papering
-//     over that section 0's discipline exists to prevent; making it an
-//     unconditional STOP would block the pass on a defect in a field this
-//     tool does not own.
-//   * the final_vp_head target uses FinalScoredVp, per registration 5.4's
-//     literal wording and because it is the engine's real score.
+// AMENDMENT 1 RULING 3 restates assertion 5 as three parts, and this tool
+// implements exactly that:
+//   * 5a -- GetCurrentRound() - 1 == games.jsonl rounds_played. Hard STOP.
+//   * 5b -- the recomputed PWO-4 legacy reported VP equals the recorded
+//     final_vp field. This is the REPLAY-FIDELITY content: it compares the
+//     function whose output was actually recorded, so a mismatch really does
+//     mean the replay landed on a different terminal state. Hard STOP.
+//   * 5c -- FinalScoredVp is recomputed INDEPENDENTLY for the head target and
+//     is NOT required to equal the recorded field. The 212/1,600 all-seat and
+//     59/400 searched-seat divergences are PINNED as corpus-audit facts
+//     (kExpectedVpDivergences above); a different count is a STOP.
+//   * the final_vp_head target uses FinalScoredVp -- amendment 1 ruling 1.
 //
-// The function below is GetTrueFinalVp copied verbatim so the comparison is
-// against what the generator computed, bug included. It is NOT a scoring
-// function and nothing else in this file may call it.
-int GetTrueFinalVpAsRecorded(const dune_imperium::DuneImperiumState* dune_state,
+// THE SOURCE BUG IS FIXED ELSEWHERE, AND THIS COPY SURVIVES ON PURPOSE.
+// dune_pwo4_trajectory.cc and dune_search_benchmark.cc no longer carry their
+// own endgame arithmetic; both now report through
+// DuneImperiumState::FinalScoredVp. The function below is the FROZEN
+// HISTORICAL REPRODUCTION of the arithmetic that wrote the frozen corpus,
+// bug included, retained for one purpose only: auditing that corpus. It is
+// NOT a scoring function, it is not what any future artifact will contain,
+// and nothing else in this file may call it.
+int Pwo4LegacyReportedVp(const dune_imperium::DuneImperiumState* dune_state,
                              int p) {
   int base_vp = dune_state->GetPlayerVpForTesting(p);
   int endgame_vp = 0;
@@ -1060,14 +1084,21 @@ int main(int argc, char** argv) {
   std::array<int64_t, 3> rows_by_class{{0, 0, 0}};
   std::array<int64_t, 3> games_by_class{{0, 0, 0}};
   int64_t games_checked = 0;
-  // Assertion 5c bookkeeping (see GetTrueFinalVpAsRecorded).
-  const bool strict_final_scored_vp = absl::GetFlag(FLAGS_strict_final_scored_vp);
+  // Assertion 5c bookkeeping (see Pwo4LegacyReportedVp).
   int64_t vp_divergences = 0;
   int64_t vp_divergences_acting_seat = 0;
   std::vector<std::string> vp_divergence_examples;
   int64_t acting_vp_sum = 0, acting_vp_recorded_sum = 0;
   int acting_vp_min = 1 << 30, acting_vp_max = -(1 << 30);
   int acting_vp_recorded_min = 1 << 30, acting_vp_recorded_max = -(1 << 30);
+  // Amendment 1 ruling 2: the COMPLETE histogram of the acting seat's VP, on
+  // BOTH functions, is a registered output -- the Huber-delta justification is
+  // re-derived against the FinalScoredVp distribution and a bare min/max/mean
+  // cannot support that. Indexed by VP; 0..40 covers the reachable range with
+  // room to spare (the /20 divisor is registered on the premise that no game
+  // reaches 20, which the histogram now makes checkable rather than asserted).
+  std::array<int64_t, 41> acting_vp_hist{};
+  std::array<int64_t, 41> acting_vp_recorded_hist{};
 
   std::vector<float> obs(static_cast<size_t>(obs_size), 0.0f);
   std::vector<std::vector<float>> game_obs;
@@ -1151,7 +1182,7 @@ int main(int argc, char** argv) {
 
     // Assertion 5a: the replayed game is terminal and its terminal round equals
     // rounds_played. The VP half of registration 5.3 assertion 5 is split into
-    // 5b and 5c below -- see GetTrueFinalVpAsRecorded for why it has to be.
+    // 5b and 5c below -- see Pwo4LegacyReportedVp for why it has to be.
     Require(state->IsTerminal(),
             "GATE assertion 5a FAILED: game " + std::to_string(g.game_index) +
                 " is not terminal after replaying its full history");
@@ -1183,15 +1214,18 @@ int main(int argc, char** argv) {
       // Assertion 5b: reproduce the field the generator actually wrote. This
       // is the replay-fidelity content -- a mismatch means the replay reached
       // a different terminal state. Hard STOP.
-      const int as_recorded = GetTrueFinalVpAsRecorded(ds, p);
+      const int as_recorded = Pwo4LegacyReportedVp(ds, p);
       Require(as_recorded == g.final_vp[p],
               "GATE assertion 5b FAILED: game " + std::to_string(g.game_index) +
                   " recomputed GetTrueFinalVp(" + std::to_string(p) + ")=" +
                   std::to_string(as_recorded) + " != games.jsonl final_vp " +
                   std::to_string(g.final_vp[p]) +
                   " -- the replay did not reach the generator's terminal state");
-      // Assertion 5c: the registration's literal wording. Reported, not fatal
-      // unless --strict_final_scored_vp. See GetTrueFinalVpAsRecorded.
+      // Assertion 5c (amendment 1 ruling 3c): FinalScoredVp is recomputed
+      // INDEPENDENTLY here, for the head target. It is NOT required to equal
+      // the recorded field -- the amendment removed that requirement, because
+      // the recorded field is a different function. The divergence is counted
+      // and pinned after the loop against the amendment's audited values.
       if (replayed_vp[p] != g.final_vp[p]) {
         ++vp_divergences;
         if (p == g.searched_seat) ++vp_divergences_acting_seat;
@@ -1202,12 +1236,17 @@ int main(int argc, char** argv) {
               std::to_string(replayed_vp[p]) + " games.jsonl final_vp=" +
               std::to_string(g.final_vp[p]));
         }
-        if (strict_final_scored_vp) {
-          Stop("GATE assertion 5c FAILED (--strict_final_scored_vp): game " +
-               std::to_string(g.game_index) + " FinalScoredVp(" +
-               std::to_string(p) + ")=" + std::to_string(replayed_vp[p]) +
-               " != games.jsonl final_vp " + std::to_string(g.final_vp[p]));
-        }
+        // The divergence mechanism is exactly one clause (the tech-tile-8
+        // guard), so the legacy field can only ever OVERSTATE by exactly 1.
+        // Asserting the magnitude turns "we know why they differ" from a
+        // comment into a check.
+        Require(g.final_vp[p] - replayed_vp[p] == 1,
+                "GATE assertion 5c FAILED: game " +
+                    std::to_string(g.game_index) + " seat " +
+                    std::to_string(p) + " differs by " +
+                    std::to_string(g.final_vp[p] - replayed_vp[p]) +
+                    ", but the only known divergence is the tech-tile-8 guard, "
+                    "which can only overstate by exactly 1");
       }
     }
     {
@@ -1219,6 +1258,14 @@ int main(int argc, char** argv) {
       acting_vp_recorded_sum += rec;
       acting_vp_recorded_min = std::min(acting_vp_recorded_min, rec);
       acting_vp_recorded_max = std::max(acting_vp_recorded_max, rec);
+      Require(acting_vp >= 0 && acting_vp < static_cast<int>(acting_vp_hist.size()),
+              "acting-seat FinalScoredVp out of histogram range in game " +
+                  std::to_string(g.game_index));
+      Require(rec >= 0 && rec < static_cast<int>(acting_vp_recorded_hist.size()),
+              "acting-seat recorded final_vp out of histogram range in game " +
+                  std::to_string(g.game_index));
+      ++acting_vp_hist[acting_vp];
+      ++acting_vp_recorded_hist[rec];
     }
 
     // ----- targets + artifacts for this game -----
@@ -1304,7 +1351,7 @@ int main(int argc, char** argv) {
   Require(games_checked == static_cast<int64_t>(games.size()),
           "did not replay every game");
 
-  std::cout << "\nGATE RESULT: PASS (assertions 1, 2, 3, 4, 5a, 5b)\n"
+  std::cout << "\nGATE RESULT: PASS (assertions 1, 2, 3, 4, 5a, 5b, 5c)\n"
             << "  games replayed        : " << games_checked << "\n"
             << "  label rows checked    : " << rows_written << "\n"
             << "  assertion 1 (legal set, order+content) : no mismatch on any row\n"
@@ -1312,32 +1359,37 @@ int main(int argc, char** argv) {
             << "  assertion 3 (CurrentPlayer == acting)  : no mismatch on any row\n"
             << "  assertion 4 (position == history_len)  : no mismatch on any row\n"
             << "  assertion 5a (terminal round)          : no mismatch on any game\n"
-            << "  assertion 5b (recomputed GetTrueFinalVp == games.jsonl final_vp)\n"
-            << "                                         : no mismatch on any seat\n\n";
+            << "  assertion 5b (recomputed PWO-4 legacy reported VP\n"
+            << "                == games.jsonl final_vp)  : no mismatch on any seat\n\n";
 
   // -------------------------------------------------------------------------
-  // Assertion 5c -- REPORTED, and it CONTRADICTS registration 5.3 assertion 5
-  // as literally written. See GetTrueFinalVpAsRecorded for the mechanism.
+  // Assertion 5c under amendment 1 ruling 3c: FinalScoredVp is recomputed
+  // independently for the head target and is NOT required to equal the
+  // recorded field. What IS required is that the divergence equals the pinned
+  // audited values. See Pwo4LegacyReportedVp for the mechanism.
   // -------------------------------------------------------------------------
-  std::cout << "--- assertion 5c: FinalScoredVp vs games.jsonl final_vp ---\n";
+  std::cout << "--- assertion 5c: FinalScoredVp vs the legacy reported field ---\n";
   if (vp_divergences == 0) {
     std::cout << "  no divergence: FinalScoredVp == final_vp on all "
               << (games_checked * 4) << " (game, seat) pairs.\n\n";
   } else {
     std::cout
-        << "*** REGISTRATION CONTRADICTION ***\n"
-        << "  Registration 5.3 assertion 5 requires terminal FinalScoredVp by\n"
-        << "  seat to equal games.jsonl final_vp. It does not hold on this\n"
-        << "  corpus, and the cause is the generator, not the replay:\n"
-        << "  games.jsonl final_vp was written by GetTrueFinalVp\n"
-        << "  (dune_pwo4_trajectory.cc:401-445, copied from\n"
-        << "  dune_search_benchmark.cc:147-202), which awards the\n"
-        << "  'all four factions at influence >= 3' +1 UNCONDITIONALLY, while\n"
+        << "  PINNED CORPUS-AUDIT FACT (amendment 1 ruling 3c). The two\n"
+        << "  functions differ, they are EXPECTED to differ, and the cause is\n"
+        << "  the generator, not the replay:\n"
+        << "  games.jsonl final_vp was written by the since-REMOVED\n"
+        << "  GetTrueFinalVp reporting helper, which awarded the 'all four\n"
+        << "  factions at influence >= 3' +1 UNCONDITIONALLY, while\n"
         << "  DuneImperiumState::ComputeEndgameVp -- and therefore\n"
         << "  FinalScoredVp, and therefore Returns() and the engine's actual\n"
-        << "  placement -- awards it ONLY to a seat owning tech tile 8.\n"
-        << "  The recorded field OVERSTATES those seats by exactly 1 VP.\n"
-        << "  Assertion 5b (recomputed GetTrueFinalVp == recorded) passed on\n"
+        << "  placement -- awards it ONLY to a seat owning tech tile 8\n"
+        << "  (Memocorders). The recorded field OVERSTATES those seats by\n"
+        << "  exactly 1 VP. That helper is now fixed at source in both\n"
+        << "  dune_pwo4_trajectory.cc and dune_search_benchmark.cc; the frozen\n"
+        << "  corpus is preserved unrewritten as historical evidence, and the\n"
+        << "  arithmetic survives here ONLY as Pwo4LegacyReportedVp so this\n"
+        << "  audit can still reproduce it.\n"
+        << "  Assertion 5b (recomputed legacy VP == recorded) passed on\n"
         << "  every seat of every game, so the REPLAY is exact; what differs\n"
         << "  is which VP function the recorded field represents.\n"
         << "  divergent (game, seat) pairs : " << vp_divergences << " of "
@@ -1363,9 +1415,62 @@ int main(int argc, char** argv) {
         << (static_cast<double>(acting_vp_sum) / games_checked) << "  -> /20 = ["
         << (acting_vp_min / 20.0) << ", " << (acting_vp_max / 20.0)
         << "], mean " << (static_cast<double>(acting_vp_sum) / games_checked / 20.0)
-        << "\n"
-        << "  Rerun with --strict_final_scored_vp to make 5c a hard STOP.\n\n";
+        << "\n\n";
   }
+
+  // -------------------------------------------------------------------------
+  // Amendment 1 ruling 3: the divergence is a PINNED CORPUS-AUDIT FACT.
+  // -------------------------------------------------------------------------
+  // Assertion 5c no longer asserts equality -- the amendment removed that
+  // requirement, because the two functions are not the same function. What it
+  // asserts instead is that the corpus's divergence is EXACTLY the one that was
+  // audited and ruled on: 212 of 1,600 (game, seat) pairs and 59 of the 400
+  // searched seats. A different count means the corpus, the engine, or the
+  // legacy reproduction moved, and that is a STOP -- so the check has teeth in
+  // both directions rather than being a report nobody can fail.
+  Require(vp_divergences == kExpectedVpDivergences,
+          "GATE assertion 5c FAILED: divergent (game, seat) pairs = " +
+              std::to_string(vp_divergences) + ", pinned by amendment 1 at " +
+              std::to_string(kExpectedVpDivergences) +
+              " -- the corpus, the engine, or Pwo4LegacyReportedVp has moved");
+  Require(vp_divergences_acting_seat == kExpectedVpDivergencesActingSeat,
+          "GATE assertion 5c FAILED: divergent searched seats = " +
+              std::to_string(vp_divergences_acting_seat) +
+              ", pinned by amendment 1 at " +
+              std::to_string(kExpectedVpDivergencesActingSeat) +
+              " -- the corpus, the engine, or Pwo4LegacyReportedVp has moved");
+  std::cout << "  assertion 5c (pinned divergence) : " << vp_divergences
+            << " pairs / " << vp_divergences_acting_seat
+            << " searched seats -- MATCHES the amendment-1 pins\n\n";
+
+  // -------------------------------------------------------------------------
+  // Amendment 1 ruling 2: the COMPLETE acting-seat histograms.
+  // -------------------------------------------------------------------------
+  auto print_hist = [&](const char* label, const std::array<int64_t, 41>& h) {
+    std::cout << "  " << label << ":\n    ";
+    int64_t total = 0;
+    for (int v = 0; v < static_cast<int>(h.size()); ++v) {
+      if (h[v] == 0) continue;
+      std::cout << v << "->" << h[v] << "  ";
+      total += h[v];
+    }
+    std::cout << "\n    total " << total << "\n";
+    Require(total == games_checked,
+            std::string(label) + " histogram total != games replayed");
+  };
+  std::cout << "--- acting-seat VP histograms (amendment 1 ruling 2) ---\n";
+  print_hist("FinalScoredVp(searched_seat)   [the registered target source]",
+             acting_vp_hist);
+  print_hist("recorded final_vp[searched_seat] [the legacy reported field]",
+             acting_vp_recorded_hist);
+  // The /20 divisor is registered on the premise that no game reaches 20 VP.
+  // With the full histogram in hand that premise is checkable, so it is checked.
+  Require(acting_vp_max < 20,
+          "GATE FAILED: acting-seat FinalScoredVp reached " +
+              std::to_string(acting_vp_max) +
+              " -- the /20 divisor saturates and registration 5.4's "
+              "'never saturates' claim is false");
+  std::cout << "\n";
 
   // -------------------------------------------------------------------------
   // Realized split sizes vs the registration. WARNING, never a hard failure:
@@ -1539,23 +1644,45 @@ int main(int argc, char** argv) {
       << "  \"final_vp_target_source\": \"DuneImperiumState::FinalScoredVp("
          "acting_player) / 20\",\n"
       << "  \"gate_assertion_5c\": {\n"
-      << "    \"claim\": \"registration 5.3 assertion 5: terminal FinalScoredVp "
-         "by seat == games.jsonl final_vp\",\n"
-      << "    \"holds\": " << (vp_divergences == 0 ? "true" : "false") << ",\n"
-      << "    \"divergent_game_seat_pairs\": " << vp_divergences << ",\n"
-      << "    \"divergent_searched_seat_games\": " << vp_divergences_acting_seat << ",\n"
-      << "    \"cause\": \"games.jsonl final_vp was emitted by GetTrueFinalVp "
-         "(dune_pwo4_trajectory.cc:401-445), which awards the all-factions>=3 "
-         "+1 unconditionally; ComputeEndgameVp awards it only with tech tile 8. "
-         "Replay fidelity itself is unaffected: assertion 5b passed on every "
-         "seat of every game.\"\n"
+      << "    \"rule\": \"amendment 1 ruling 3c: FinalScoredVp is recomputed "
+         "INDEPENDENTLY for the head target and is NOT required to equal the "
+         "recorded final_vp field. The divergence below is a PINNED "
+         "corpus-audit fact; a different count is a STOP.\",\n"
+      << "    \"pinned_divergent_game_seat_pairs\": " << kExpectedVpDivergences
+      << ",\n"
+      << "    \"pinned_divergent_searched_seat_games\": "
+      << kExpectedVpDivergencesActingSeat << ",\n"
+      << "    \"measured_divergent_game_seat_pairs\": " << vp_divergences << ",\n"
+      << "    \"measured_divergent_searched_seat_games\": "
+      << vp_divergences_acting_seat << ",\n"
+      << "    \"pins_match\": "
+      << ((vp_divergences == kExpectedVpDivergences &&
+           vp_divergences_acting_seat == kExpectedVpDivergencesActingSeat)
+              ? "true"
+              : "false")
+      << ",\n"
+      << "    \"divergence_magnitude\": \"the legacy field overstates by "
+         "exactly 1, asserted per divergent seat\",\n"
+      << "    \"cause\": \"games.jsonl final_vp was emitted by the "
+         "since-removed GetTrueFinalVp reporting helper, which awarded the "
+         "all-factions>=3 +1 unconditionally; ComputeEndgameVp awards it only "
+         "with tech tile 8 (Memocorders). The helper is now fixed at source in "
+         "dune_pwo4_trajectory.cc and dune_search_benchmark.cc, both of which "
+         "report through DuneImperiumState::FinalScoredVp; the frozen corpus is "
+         "preserved unrewritten as historical evidence and the legacy "
+         "arithmetic survives only as dune_pwo5_prepare.cc's "
+         "Pwo4LegacyReportedVp for this audit. Replay fidelity itself is "
+         "unaffected: assertion 5b passed on every seat of every game.\"\n"
       << "  },\n"
       << "  \"acting_seat_final_scored_vp\": {\"min\": " << acting_vp_min
       << ", \"max\": " << acting_vp_max << ", \"mean\": "
-      << (static_cast<double>(acting_vp_sum) / games_checked) << "},\n"
+      << std::setprecision(17) << (static_cast<double>(acting_vp_sum) / games_checked)
+      << ", \"histogram\": {" << HistogramJson(acting_vp_hist) << "}},\n"
       << "  \"acting_seat_recorded_final_vp\": {\"min\": " << acting_vp_recorded_min
       << ", \"max\": " << acting_vp_recorded_max << ", \"mean\": "
-      << (static_cast<double>(acting_vp_recorded_sum) / games_checked) << "},\n"
+      << std::setprecision(17)
+      << (static_cast<double>(acting_vp_recorded_sum) / games_checked)
+      << ", \"histogram\": {" << HistogramJson(acting_vp_recorded_hist) << "}},\n"
       << "  \"terminal_round_class_rows\": {\"le8\": " << rows_by_class[0]
       << ", \"r9\": " << rows_by_class[1] << ", \"r10\": " << rows_by_class[2] << "},\n"
       << "  \"terminal_round_class_games\": {\"le8\": " << games_by_class[0]

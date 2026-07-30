@@ -133,6 +133,15 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_pwo5_schema_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo5_schema_test COMMAND dune_pwo5_schema_test)
 
+  # The Memocorders endgame-VP reporting regression. Lives HERE and not in
+  # games/dune_imperium/ because that directory's tree hash is a pinned
+  # registered quantity (a67f1925...bdd6) asserted by every PWO-5 arm.
+  add_executable(dune_endgame_vp_reporting_test
+    dune_endgame_vp_reporting_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_endgame_vp_reporting_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_endgame_vp_reporting_test
+    COMMAND dune_endgame_vp_reporting_test)
+
   add_executable(dune_pwo3_immutability_test dune_pwo3_immutability_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo3_immutability_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo3_immutability_test COMMAND dune_pwo3_immutability_test)

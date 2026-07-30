@@ -14,7 +14,8 @@
 #include <torch/torch.h>
 
 // Import the synced shared architecture
-#include "dune_network.h" 
+#include "dune_network.h"
+#include "dune_terminal_vp_report.h" 
 
 using namespace open_spiel;
 
@@ -729,16 +730,30 @@ int main(int argc, char* argv[]) {
         }
       }
 
-      // 3. Faction Influence milestone (>=3 in all 4 factions)
+      // 3. Tech tile 8 (Memocorders): +1 VP if all four factions are at >= 3.
+      //
+      // THE GUARD IS LOAD-BEARING AND USED TO BE MISSING HERE. This narration
+      // block awarded the bonus to every seat at >= 3 influence everywhere,
+      // while the engine's ComputeEndgameVp awards it only to a seat owning
+      // tech tile 8 (dune_imperium.cc:2303-2310). It was the THIRD copy of the
+      // endgame arithmetic in this repository and the last one found -- the
+      // other two were named GetTrueFinalVp and this one was inline, which is
+      // why a name-based search missed it and why the repository guard in
+      // tests/test_endgame_vp_no_duplication.py keys on the CLAUSE instead.
+      // See docs/PWO5_AMENDMENT_1_TARGET_EXPOSURE_TELEMETRY_2026_07_31.md s10.
       bool all_3 = true;
       for (int f = 0; f < 4; ++f) {
         if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) < 3) {
           all_3 = false;
         }
       }
-      if (all_3) {
+      const bool owns_memocorders =
+          std::find(tech_tiles.begin(), tech_tiles.end(), 8) != tech_tiles.end();
+      if (all_3 && owns_memocorders) {
         endgame_vp += 1;
-        std::cout << "  - Faction Influence milestone (>=3 in all 4 factions) -> Scored 1 VP\n";
+        std::cout << "  - Tech Tile Memocorders (>=3 influence in all 4 factions) -> Scored 1 VP\n";
+      } else if (all_3) {
+        std::cout << "  - >=3 influence in all 4 factions, but NO Memocorders (tech tile 8) -> Scored 0 VP\n";
       }
 
       // 4. Tech tile 14: Spy Satellites
@@ -755,8 +770,21 @@ int main(int argc, char* argv[]) {
         }
       }
 
-      true_final_vp[p] = base_vp + endgame_vp;
+      // THE ENGINE IS THE AUTHORITY. The clause-by-clause narration above
+      // exists to explain WHY a seat scored what it scored; the number itself
+      // comes from DuneImperiumState::FinalScoredVp, which is what Returns()
+      // ranks placements on. Reconciling the two turns a future drift into a
+      // printed warning instead of a plausible wrong number -- which is exactly
+      // how the missing Memocorders guard survived here undetected.
+      true_final_vp[p] = dune_report::TerminalVpForReporting(dune_state, p);
+      const int narrated = base_vp + endgame_vp;
       std::cout << "  True Final Victory Points: " << true_final_vp[p] << "\n";
+      if (narrated != true_final_vp[p]) {
+        std::cout << "  *** WARNING: the breakdown above sums to " << narrated
+                  << " but the engine scores " << true_final_vp[p]
+                  << ". The narration has drifted from ComputeEndgameVp; the "
+                     "ENGINE value is the correct one. ***\n";
+      }
     }
 
     std::cout << "\nFinal Victory Points (including Endgame): ";

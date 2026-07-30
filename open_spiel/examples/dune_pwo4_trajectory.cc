@@ -138,6 +138,7 @@
 #include "dune_search_routing.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_terminal_vp_report.h"
 
 // --- Output paths ----------------------------------------------------------
 ABSL_FLAG(std::string, audit_jsonl_path, "", "Per-decision audit telemetry (every searched-seat decision).");
@@ -394,55 +395,36 @@ class DuneGreedyBot : public Bot {
   double temperature_;
 };
 
-// dune_search_benchmark.cc:146-202, verbatim: base VP plus the four endgame
-// bonuses. The terminal outcome is persisted per trajectory for TRAJECTORY-LEVEL
-// REPORTING ONLY and is never a causal label for an individual move
-// (registration section 3.1, plan section 8.3.2, ruling O3).
+// Terminal VP for the per-game `final_vp` array. The terminal outcome is
+// persisted per trajectory for TRAJECTORY-LEVEL REPORTING ONLY and is never a
+// causal label for an individual move (registration section 3.1, plan section
+// 8.3.2, ruling O3).
+//
+// Delegates to the ONE definition in dune_terminal_vp_report.h, which calls the
+// engine. This used to be a verbatim copy of dune_search_benchmark.cc's
+// hand-reimplementation of ComputeEndgameVp, and that copy awarded the "all
+// four factions at influence >= 3" +1 UNCONDITIONALLY, while the engine awards
+// it only to a seat owning tech tile 8 (Memocorders). The copy therefore
+// OVERSTATED by exactly 1 for any seat at >= 3 influence everywhere without
+// Memocorders.
+//
+// THE ALREADY-GENERATED CORPUS IS NOT REGENERATED. calibration_results_v2/
+// pwo4_trajectory/games.jsonl was written by the old arithmetic and carries 212
+// inflated (game, seat) values, 59 of them on searched seats. It is preserved
+// unrewritten as historical evidence, its inflated values are registered as a
+// historical telemetry defect, and PWO-5's compatibility replay audits them
+// against a frozen reproduction of the old arithmetic
+// (dune_pwo5_prepare.cc's Pwo4LegacyReportedVp). Nothing about placements,
+// returns, labels or corpus acceptance is affected -- Returns() always ranked
+// on the engine's own ComputeEndgameVp. See
+// docs/PWO5_AMENDMENT_1_TARGET_EXPOSURE_TELEMETRY_2026_07_31.md section 10.
+//
+// DO NOT reintroduce a local copy of endgame scoring. Call the engine.
+//
+// Precondition: the state is terminal. FinalScoredVp asserts it, and the caller
+// runs after `while (!state->IsTerminal())` has exited.
 int GetTrueFinalVp(const dune_imperium::DuneImperiumState* dune_state, int p) {
-  int base_vp = dune_state->GetPlayerVpForTesting(p);
-  int endgame_vp = 0;
-
-  const auto& hand = dune_state->GetIntrigueHandForTesting(p);
-  for (int intrigue_id : hand) {
-    const auto* intrigue = dune_imperium::FindIntrigueCardById(intrigue_id);
-    if (intrigue && (intrigue->phase_mask & dune_imperium::kIntriguePhaseEndgameMask) != 0) {
-      endgame_vp += dune_state->EndgameIntrigueVpBonusForTesting(p, intrigue_id);
-    }
-  }
-
-  const auto& tech_tiles = dune_state->GetPlayerTechTilesForTesting(p);
-  if (std::find(tech_tiles.begin(), tech_tiles.end(), 6) != tech_tiles.end()) {
-    int tsmf_count = 0;
-    auto count_tsmf = [&](const std::vector<int>& cards) {
-      for (int id : cards) if (id == dune_imperium::kCardTheSpiceMustFlow) tsmf_count++;
-    };
-    auto* mutable_state = const_cast<dune_imperium::DuneImperiumState*>(dune_state);
-    count_tsmf(mutable_state->GetPlayerDrawDeckForTesting(p));
-    count_tsmf(mutable_state->GetPlayerDiscardForTesting(p));
-    count_tsmf(mutable_state->GetPlayerHandForTesting(p));
-    count_tsmf(dune_state->GetPlayedAgentCardsForTesting(p));
-    count_tsmf(dune_state->GetRevealedCardsForTesting(p));
-    if (tsmf_count >= 2) endgame_vp += 1;
-  }
-
-  bool all_3 = true;
-  for (int f = 0; f < 4; ++f) {
-    if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) < 3) {
-      all_3 = false;
-    }
-  }
-  if (all_3) endgame_vp += 1;
-
-  if (std::find(tech_tiles.begin(), tech_tiles.end(), 14) != tech_tiles.end()) {
-    int low_influence_factions = 0;
-    for (int f = 0; f < 4; ++f) {
-      if (dune_state->GetPlayerInfluenceForTesting(p, static_cast<dune_imperium::Faction>(f)) <= 1) {
-        low_influence_factions++;
-      }
-    }
-    endgame_vp += low_influence_factions;
-  }
-  return base_vp + endgame_vp;
+  return dune_report::TerminalVpForReporting(dune_state, p);
 }
 
 // The section 2.6 pin, assembled once and reused for every seat's config so the
