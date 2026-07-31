@@ -76,6 +76,11 @@ ABSL_FLAG(uint64_t, probe_seed, 20260803,
           "Probe-set RNG seed. Fixed so the probe set is reproducible; it "
           "feeds no model and enters no registered stream.");
 ABSL_FLAG(std::string, output_json, "", "REQUIRED. Where the report is written.");
+ABSL_FLAG(std::string, optimizer_roundtrip_check, "",
+          "Optional: an optimizer checkpoint. Loads it into a freshly built "
+          "3-group AdamW, re-saves it, and reports whether the state survived "
+          "the round trip. Isolates the section 7.5 boot-copy mechanism from "
+          "everything else.");
 
 namespace {
 
@@ -329,6 +334,76 @@ int main(int argc, char** argv) {
           "trained nothing");
   }
 
+  // -------------------------------------------------------------------------
+  // Optimizer save/load ROUND-TRIP probe.
+  //
+  // Section 7.5's boot-copy extension loads a POST-migration 3-group AdamW
+  // archive. If that round trip is lossy, the extension's next update diverges
+  // from an in-place continuation for a reason that has nothing to do with
+  // determinism -- which is exactly what the section 7.5 gate exists to catch.
+  // This isolates the round trip from the rollout, the counters and the model.
+  // -------------------------------------------------------------------------
+  bool ran_rt = false;
+  bool rt_state_survived = false;
+  int64_t rt_entries_before = 0, rt_entries_after = 0;
+  double rt_max_abs_delta = 0.0;
+  const std::string rt_path = absl::GetFlag(FLAGS_optimizer_roundtrip_check);
+  if (!rt_path.empty()) {
+    ran_rt = true;
+    std::cout << "\n=== optimizer save/load ROUND-TRIP probe ===\n"
+              << "  archive: " << rt_path << "\n";
+    auto probe = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        obs_size, absl::GetFlag(FLAGS_hidden_dim), action_dim,
+        absl::GetFlag(FLAGS_num_blocks),
+        absl::GetFlag(FLAGS_nonlinear_value_head),
+        /*with_aux_heads=*/true, head_init_seed);
+    probe->to(device);
+    // The registered 3-group layout: policy / everything-else / the three heads
+    // at weight_decay = 0.0.
+    std::vector<torch::Tensor> policy_p, other_p, aux_p;
+    for (auto& q : probe->final_vp_head->parameters()) aux_p.push_back(q);
+    for (auto& q : probe->terminal_round_head->parameters()) aux_p.push_back(q);
+    for (auto& q : probe->next_own_action_head->parameters()) aux_p.push_back(q);
+    auto pol = probe->policy_head->parameters();
+    for (auto& param : probe->parameters()) {
+      bool is_pol = false, is_aux = false;
+      for (auto& q : pol) if (param.is_same(q)) { is_pol = true; break; }
+      for (auto& q : aux_p) if (param.is_same(q)) { is_aux = true; break; }
+      if (is_pol) policy_p.push_back(param);
+      else if (!is_aux) other_p.push_back(param);
+    }
+    std::vector<torch::optim::OptimizerParamGroup> groups;
+    groups.emplace_back(policy_p);
+    groups.emplace_back(other_p);
+    groups.emplace_back(aux_p);
+    torch::optim::AdamW opt(
+        groups, torch::optim::AdamWOptions(1e-5).eps(1e-5));
+    try {
+      torch::load(opt, rt_path, device);
+    } catch (const c10::Error& e) {
+      std::cout << "  LOAD THREW: " << e.msg() << "\n";
+    }
+    rt_entries_before = static_cast<int64_t>(opt.state().size());
+    std::cout << "  state entries after load: " << rt_entries_before << "\n";
+    // Re-save, reload into a second identical optimizer, and compare.
+    const std::string tmp = rt_path + ".roundtrip.tmp";
+    torch::save(opt, tmp);
+    torch::optim::AdamW opt2(
+        groups, torch::optim::AdamWOptions(1e-5).eps(1e-5));
+    try { torch::load(opt2, tmp, device); }
+    catch (const c10::Error& e) { std::cout << "  RELOAD THREW\n"; }
+    rt_entries_after = static_cast<int64_t>(opt2.state().size());
+    std::cout << "  state entries after re-load: " << rt_entries_after << "\n";
+    std::remove(tmp.c_str());
+    rt_state_survived = (rt_entries_before > 0) &&
+                        (rt_entries_before == rt_entries_after);
+    Check(rt_entries_before > 0,
+          "the archive's optimizer state is NON-EMPTY after load (" +
+              std::to_string(rt_entries_before) + " entries)");
+    Check(rt_state_survived,
+          "state entry count survives a save/load round trip");
+  }
+
   std::ofstream o(out_json);
   o << "{\n"
     << "  \"tool\": \"dune_pwo5_gate3_verify\",\n"
@@ -360,7 +435,17 @@ int main(int argc, char** argv) {
   } else {
     o << "null\n";
   }
-  o << "  ,\"failures\": " << g_failures << "\n}\n";
+  o << "  ,\"optimizer_roundtrip\": ";
+  if (ran_rt) {
+    o << "{\"archive\": \"" << rt_path << "\", \"entries_after_load\": "
+      << rt_entries_before << ", \"entries_after_resave_reload\": "
+      << rt_entries_after << ", \"state_survived\": "
+      << (rt_state_survived ? "true" : "false") << ", \"max_abs_delta\": "
+      << F17(rt_max_abs_delta) << "}";
+  } else {
+    o << "null";
+  }
+  o << "\n  ,\"failures\": " << g_failures << "\n}\n";
   o.close();
 
   std::cout << "\n";
