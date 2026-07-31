@@ -278,12 +278,49 @@ struct AutocastGuard {
         }
     }
     ~AutocastGuard() {
+        // PWO-5 section 7.5. Autocast caches the lower-precision cast of every
+        // fp32 LEAF parameter that requires grad, keyed by TensorImpl*, and that
+        // cache is NOT scoped to the region -- `set_autocast_enabled(false)`
+        // does not clear it. Upstream's own context manager clears it on region
+        // exit; this guard sets the flags directly and so never did.
+        //
+        // The consequence is not a slow path, it is a WRONG one: the optimizer
+        // mutates parameters IN PLACE, which leaves the TensorImpl* unchanged,
+        // so the next region's forward silently reuses the bf16 cast of the
+        // weights as they were on this process's FIRST autocast region. Every
+        // PPO minibatch after the first therefore differentiated a stale
+        // linearization point, and a run that executed update 1 in-process
+        // computed a different update 2 than a run that restored the identical
+        // state from a checkpoint -- which is exactly the section 7.5 bitwise
+        // continuation failure, deterministic in both directions.
+        //
+        // Clearing on scope exit restores the upstream contract: a region's
+        // cache does not outlive the region. It cannot change a value that was
+        // not already stale -- the only effect is to force `arg.to(bf16)` to be
+        // recomputed, and a cast is deterministic.
+        //
+        // MEASURED, not assumed (scratch probe, this box, the linked torch
+        // 2.12.1+cu130 that `ldd dune_ppo_train` reports -- NOT the unused
+        // vendored 2.3.0 tree): staleness is gated on `requires_grad` alone and
+        // is independent of grad mode -- requires_grad=true goes stale under
+        // both `NoGradGuard` and grad-enabled; requires_grad=false never
+        // caches. `inference_model` is `eval()`-ed but its parameters are NOT
+        // set_requires_grad(false), so it is cache-eligible and
+        // `CopyModelWeights`' in-place `copy_` does leave a stale entry behind
+        // on whichever thread holds it (`cached_casts` is thread_local).
+        //
+        // The evaluation binaries are unaffected for a STRUCTURAL reason, not
+        // because of a requires_grad setting: a cached cast can only be wrong
+        // if the parameter is mutated in place between regions, and they load a
+        // checkpoint once and never mutate it.
         if (device_type_ == c10::DeviceType::CUDA) {
             at::autocast::set_autocast_enabled(at::kCUDA, previous_state_);
             at::autocast::set_autocast_dtype(at::kCUDA, previous_dtype_);
+            at::autocast::clear_cache();
         } else if (device_type_ == c10::DeviceType::CPU) {
             at::autocast::set_autocast_enabled(at::kCPU, previous_state_);
             at::autocast::set_autocast_dtype(at::kCPU, previous_dtype_);
+            at::autocast::clear_cache();
         }
     }
 };
