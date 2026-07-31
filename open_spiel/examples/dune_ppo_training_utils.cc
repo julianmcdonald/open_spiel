@@ -776,31 +776,14 @@ PpoUpdateStats TrainPpoUpdate(
           double fv_val = 0.0, tr_val = 0.0, na_val = 0.0;
           int64_t fv_games = 0, tr_games = 0, na_games = 0;
 
-          // Mean over games of the within-game mean, computed with a scatter
-          // over the slice's game ids. `mask` selects contributing rows, so an
-          // omitted row is out of BOTH the numerator and the denominator, and a
-          // game with no contributing row is out of the game denominator too.
+          // Mean over games of the within-game mean, via the SHARED definition
+          // in pwo5loss -- the same one the update-300 whole-dataset evaluator
+          // and the numeric tests call.
           auto trajectory_mean = [&](const torch::Tensor& per_row,
                                      const torch::Tensor& mask,
                                      int64_t* out_games) -> torch::Tensor {
-            const int64_t G = pwo5_aux.num_games;
-            torch::Tensor w = mask.to(per_row.dtype());
-            torch::Tensor num = torch::zeros(
-                {G}, torch::TensorOptions().dtype(per_row.dtype())
-                         .device(per_row.device()));
-            torch::Tensor den = torch::zeros_like(num);
-            num = num.index_add(0, p_game, per_row * w);
-            den = den.index_add(0, p_game, w);
-            torch::Tensor present = den > 0;
-            *out_games = present.sum().item<int64_t>();
-            if (*out_games == 0) {
-              return torch::zeros({}, per_row.options());
-            }
-            torch::Tensor safe_den = torch::where(
-                present, den, torch::ones_like(den));
-            torch::Tensor per_game = num / safe_den;
-            return (per_game * present.to(per_game.dtype())).sum() /
-                   static_cast<double>(*out_games);
+            return pwo5loss::TrajectoryMean(per_row, mask, p_game,
+                                            pwo5_aux.num_games, out_games);
           };
 
           auto compute_pwo5 = [&]() {
@@ -819,20 +802,16 @@ PpoUpdateStats TrainPpoUpdate(
               // reporting helper, which awarded the all-factions-at-3 bonus
               // without the tech-tile-8 guard.
               torch::Tensor pred = ao.final_vp.squeeze(1);
-              torch::Tensor diff = pred - p_final_vp;
-              const double d = pwo5_cfg.huber_delta;
-              torch::Tensor absd = diff.abs();
-              torch::Tensor per_row = torch::where(
-                  absd <= d, 0.5 * diff * diff, d * (absd - 0.5 * d));
-              torch::Tensor ones = torch::ones_like(absd, torch::kBool);
+              torch::Tensor per_row = pwo5loss::HuberPerRow(
+                  pred, p_final_vp, pwo5_cfg.huber_delta);
+              torch::Tensor ones = torch::ones_like(per_row, torch::kBool);
               torch::Tensor l = trajectory_mean(per_row, ones, &fv_games);
               fv_val = l.item<double>();
               total = total + static_cast<float>(pwo5_cfg.final_vp_coef) * l;
             }
             if (pwo5_cfg.terminal_round_coef != 0.0) {
-              torch::Tensor logp = torch::log_softmax(ao.terminal_round, -1);
               torch::Tensor per_row =
-                  -logp.gather(1, p_round.unsqueeze(1)).squeeze(1);
+                  pwo5loss::CrossEntropyPerRow(ao.terminal_round, p_round);
               torch::Tensor ones = torch::ones_like(per_row, torch::kBool);
               torch::Tensor l = trajectory_mean(per_row, ones, &tr_games);
               tr_val = l.item<double>();
@@ -844,11 +823,13 @@ PpoUpdateStats TrainPpoUpdate(
               // predicting state on 74.57% of rows, so masking would make the
               // correct answer unreachable on three rows in four.
               torch::Tensor mask = p_next >= 0;
+              // The -1 rows are masked OUT of the trajectory mean, but gather
+              // still needs a valid index for them, so they are pointed at 0
+              // and their contribution is discarded by the mask.
               torch::Tensor safe_idx = torch::where(
                   mask, p_next, torch::zeros_like(p_next));
-              torch::Tensor logp = torch::log_softmax(ao.next_own_action, -1);
-              torch::Tensor per_row =
-                  -logp.gather(1, safe_idx.unsqueeze(1)).squeeze(1);
+              torch::Tensor per_row = pwo5loss::CrossEntropyPerRow(
+                  ao.next_own_action, safe_idx);
               torch::Tensor l = trajectory_mean(per_row, mask, &na_games);
               na_val = l.item<double>();
               total =
@@ -1203,9 +1184,21 @@ PpoUpdateStats TrainPpoUpdate(
     stats.pwo5_final_vp_loss = pwo5_final_vp_sum / pwo5_slice_uses;
     stats.pwo5_terminal_round_loss = pwo5_terminal_round_sum / pwo5_slice_uses;
     stats.pwo5_next_action_loss = pwo5_next_action_sum / pwo5_slice_uses;
-    stats.pwo5_final_vp_games = pwo5_final_vp_games;
-    stats.pwo5_terminal_round_games = pwo5_terminal_round_games;
-    stats.pwo5_next_action_games = pwo5_next_action_games;
+    // The REGISTERED denominators come from the DRAW, not from summing the
+    // per-slice game counts. Slices are re-consumed once per executed epoch, so
+    // a slice-sum counts a game up to ppo_update_epochs times and its value is
+    // a function of how many epochs --target_kl allowed -- which is exactly the
+    // "silent denominator change" section 8.2 emits a denominator to prevent.
+    stats.pwo5_sampled_games = pwo5_aux.sampled_games;
+    stats.pwo5_final_vp_games = pwo5_aux.final_vp_games;
+    stats.pwo5_terminal_round_games = pwo5_aux.terminal_round_games;
+    stats.pwo5_next_action_games = pwo5_aux.next_own_action_games;
+    // Retained as a separate, differently-named diagnostic so the loss mean's
+    // own denominator (slice-uses) is visible and is never mistaken for the
+    // trajectory denominator.
+    stats.pwo5_slice_game_sum_final_vp = pwo5_final_vp_games;
+    stats.pwo5_slice_game_sum_terminal_round = pwo5_terminal_round_games;
+    stats.pwo5_slice_game_sum_next_action = pwo5_next_action_games;
   }
 
   if (stats.minibatches > 0) {
@@ -1355,6 +1348,51 @@ bool ReadDiagnosticsCsvHeader(const std::string& filepath,
 }
 
 // ---------------------------------------------------------------------------
+// The three PWO-5 head loss forms. ONE definition, called by the trainer, the
+// update-300 whole-dataset evaluator and the numeric tests.
+// ---------------------------------------------------------------------------
+namespace pwo5loss {
+
+torch::Tensor TrajectoryMean(const torch::Tensor& per_row,
+                             const torch::Tensor& mask,
+                             const torch::Tensor& game_id, int64_t num_games,
+                             int64_t* out_games) {
+  torch::Tensor w = mask.to(per_row.dtype());
+  torch::Tensor num = torch::zeros(
+      {num_games},
+      torch::TensorOptions().dtype(per_row.dtype()).device(per_row.device()));
+  torch::Tensor den = torch::zeros_like(num);
+  num = num.index_add(0, game_id, per_row * w);
+  den = den.index_add(0, game_id, w);
+  torch::Tensor present = den > 0;
+  const int64_t games = present.sum().item<int64_t>();
+  if (out_games != nullptr) *out_games = games;
+  if (games == 0) return torch::zeros({}, per_row.options());
+  // A game with no contributing row is out of the GAME denominator; the
+  // where() only avoids a divide-by-zero on that game's (masked-out) entry.
+  torch::Tensor safe_den = torch::where(present, den, torch::ones_like(den));
+  torch::Tensor per_game = num / safe_den;
+  return (per_game * present.to(per_game.dtype())).sum() /
+         static_cast<double>(games);
+}
+
+torch::Tensor HuberPerRow(const torch::Tensor& pred, const torch::Tensor& target,
+                          double delta) {
+  torch::Tensor diff = pred - target;
+  torch::Tensor absd = diff.abs();
+  return torch::where(absd <= delta, 0.5 * diff * diff,
+                      delta * (absd - 0.5 * delta));
+}
+
+torch::Tensor CrossEntropyPerRow(const torch::Tensor& logits,
+                                 const torch::Tensor& target_index) {
+  torch::Tensor logp = torch::log_softmax(logits, -1);
+  return -logp.gather(1, target_index.unsqueeze(1)).squeeze(1);
+}
+
+}  // namespace pwo5loss
+
+// ---------------------------------------------------------------------------
 // PWO-5 head telemetry sidecar. See the header for ruling 6's four registered
 // properties.
 // ---------------------------------------------------------------------------
@@ -1371,6 +1409,11 @@ constexpr const char* kPwo5TelemetryFields[] = {
     "final_vp_head_games",
     "terminal_round_head_games",
     "next_own_action_head_games",
+    "aux_sampled_games",
+    "aux_slice_uses",
+    "aux_slice_game_sum_final_vp",
+    "aux_slice_game_sum_terminal_round",
+    "aux_slice_game_sum_next_action",
     "aux_distinct_rows",
     "aux_row_presentations",
     "policy_grad_norm",
@@ -1465,6 +1508,14 @@ void WritePwo5HeadTelemetry(const std::string& diagnostics_path,
       << ",\"final_vp_head_games\":" << stats.pwo5_final_vp_games
       << ",\"terminal_round_head_games\":" << stats.pwo5_terminal_round_games
       << ",\"next_own_action_head_games\":" << stats.pwo5_next_action_games
+      << ",\"aux_sampled_games\":" << stats.pwo5_sampled_games
+      << ",\"aux_slice_uses\":" << stats.pwo5_slice_uses
+      << ",\"aux_slice_game_sum_final_vp\":"
+      << stats.pwo5_slice_game_sum_final_vp
+      << ",\"aux_slice_game_sum_terminal_round\":"
+      << stats.pwo5_slice_game_sum_terminal_round
+      << ",\"aux_slice_game_sum_next_action\":"
+      << stats.pwo5_slice_game_sum_next_action
       << ",\"aux_distinct_rows\":" << stats.pwo5_distinct_rows
       << ",\"aux_row_presentations\":" << stats.pwo5_presentations
       << ",\"policy_grad_norm\":" << F17(stats.PolicyHeadGradNormMean())

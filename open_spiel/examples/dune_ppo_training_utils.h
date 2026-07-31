@@ -212,9 +212,21 @@ struct PpoUpdateStats {
   double pwo5_final_vp_loss = 0.0;
   double pwo5_terminal_round_loss = 0.0;
   double pwo5_next_action_loss = 0.0;
+  // The REGISTERED trajectory denominators: the count of DRAWN GAMES
+  // contributing to each head this update (section 8.2's "sampled game
+  // count"). Properties of the draw, independent of slicing and of how many
+  // epochs --target_kl allowed.
+  int64_t pwo5_sampled_games = 0;
   int64_t pwo5_final_vp_games = 0;
   int64_t pwo5_terminal_round_games = 0;
   int64_t pwo5_next_action_games = 0;
+  // The per-slice game counts SUMMED over the update's slice-uses. This is the
+  // denominator of the reported loss MEAN, not a trajectory denominator, and
+  // the two are named differently so they cannot be confused: a slice-sum
+  // counts a game once per epoch it was re-presented in.
+  int64_t pwo5_slice_game_sum_final_vp = 0;
+  int64_t pwo5_slice_game_sum_terminal_round = 0;
+  int64_t pwo5_slice_game_sum_next_action = 0;
   int64_t pwo5_slice_uses = 0;
   int64_t pwo5_distinct_rows = 0;   // 1,024 by construction when active
   int64_t pwo5_presentations = 0;   // <= 4,096; "<=" because target_kl truncates
@@ -272,7 +284,68 @@ struct Pwo5AuxBatch {
   torch::Tensor game_id;         // [N] int64,  0 .. num_games-1
   int64_t num_games = 0;
   bool valid = false;
+
+  // The REGISTERED per-update trajectory denominators (sections 8.2, 8.6, and
+  // amendment ruling 6): the count of DRAWN GAMES that contribute to each
+  // head, computed once from the draw itself.
+  //
+  // These are NOT the same as summing each minibatch slice's game count. The
+  // aux batch is partitioned across the update's PPO minibatches and the
+  // slices are RE-CONSUMED once per executed epoch, so a slice-sum counts the
+  // same game up to `ppo_update_epochs` times and its value depends on how
+  // many epochs --target_kl happened to allow. Section 8.2 registers "the
+  // sampled game count", which is a property of the DRAW and of nothing else.
+  int64_t sampled_games = 0;             // = num_games, i.e. G = 64
+  int64_t final_vp_games = 0;            // every drawn game (all rows have a target)
+  int64_t terminal_round_games = 0;      // every drawn game
+  int64_t next_own_action_games = 0;     // drawn games with >= 1 row that HAS a
+                                         // later action; a game whose sampled
+                                         // rows are all terminal contributes
+                                         // nothing and is out of the denominator
 };
+
+// ---------------------------------------------------------------------------
+// The three PWO-5 head loss forms, as SHARED definitions.
+// ---------------------------------------------------------------------------
+//
+// Extracted so the trainer, the update-300 whole-dataset evaluator and the
+// numeric tests all call ONE implementation. Three reimplementations of one
+// arithmetic rule drifting apart is the exact defect the Memocorders finding
+// was, and these are the same shape of rule.
+namespace pwo5loss {
+
+// Section 8.4 item i and section 8.6: the mean over CONTRIBUTING GAMES of the
+// within-game mean. NOT a row mean.
+//
+// A per-row mean weights each game by its label count, and round-10 games are
+// both over-represented among games AND carry more rows each -- the same
+// imbalance twice over. `mask` selects contributing rows, so an omitted row is
+// out of BOTH the numerator and the denominator, and a game with no
+// contributing row is out of the game denominator too.
+//
+// `*out_games` receives the realized contributing-game count.
+torch::Tensor TrajectoryMean(const torch::Tensor& per_row,
+                             const torch::Tensor& mask,
+                             const torch::Tensor& game_id, int64_t num_games,
+                             int64_t* out_games);
+
+// Huber, on the /20 scale. delta = 0.10 puts the quadratic/linear knee at
+// 1.034 target standard deviations, so squared-error behaviour covers the
+// central 68.25% of trajectories and the tails are linear. The framework
+// default of 1.0 would be pure squared error over the whole reachable range
+// [0.25, 0.75] and would make "Huber" a misnomer.
+torch::Tensor HuberPerRow(const torch::Tensor& pred, const torch::Tensor& target,
+                          double delta);
+
+// Cross-entropy of `logits` against integer class targets, per row.
+// Used by terminal_round_head (3 classes) and next_own_action_head (the FULL
+// 2,391-action vocabulary, with NO mask -- the current state's legal mask is
+// not valid for a FUTURE action, and the target is illegal at the predicting
+// state on 74.57% of rows).
+torch::Tensor CrossEntropyPerRow(const torch::Tensor& logits,
+                                 const torch::Tensor& target_index);
+
+}  // namespace pwo5loss
 
 // The three coefficients plus the Huber delta, carried together so the
 // short-circuit is decided in ONE place.

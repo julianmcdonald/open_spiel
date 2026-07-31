@@ -3308,6 +3308,26 @@ int main(int argc, char** argv) {
       pwo5_batch.game_id =
           torch::from_blob(gid.data(), {nrows}, iopt).clone().to(device);
       pwo5_batch.num_games = g_counter;
+      // Section 8.2's registered trajectory denominators, computed HERE from
+      // the draw itself. Every drawn game contributes `aux_rows_per_game` rows,
+      // and final_vp / terminal_round have a target on every row, so both are
+      // the full drawn-game count. next_own_action can legitimately be lower:
+      // a row whose decision is the game's LAST label row has no later action
+      // (target -1), and a game all of whose sampled rows were terminal would
+      // contribute nothing and drop out of the denominator entirely. That is
+      // measured rather than assumed.
+      {
+        std::vector<char> na_present(static_cast<size_t>(g_counter), 0);
+        for (std::size_t i = 0; i < nact.size(); ++i) {
+          if (nact[i] >= 0) na_present[static_cast<size_t>(gid[i])] = 1;
+        }
+        int64_t na_games = 0;
+        for (char c : na_present) na_games += c ? 1 : 0;
+        pwo5_batch.sampled_games = g_counter;
+        pwo5_batch.final_vp_games = g_counter;
+        pwo5_batch.terminal_round_games = g_counter;
+        pwo5_batch.next_own_action_games = na_games;
+      }
       pwo5_batch.valid = true;
     }
 
@@ -3399,7 +3419,16 @@ int main(int argc, char** argv) {
     int search_minibatch_size = absl::GetFlag(FLAGS_search_minibatch_size);
     float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
-    if (!search_label_dir.empty()) {
+    // Per-update refresh, for the streaming case where a producer drops new
+    // .bin packs into the directory while training runs.
+    //
+    // A ROLE-AWARE dataset is CLOSED at load time -- its membership is exactly
+    // the manifest's list, and a rescan would reload those files without their
+    // roles, which is the precise defect ruling 5 removes. So the refresh is
+    // SKIPPED rather than attempted; LoadNewFiles itself still refuses a
+    // role-aware directory, which is what makes this a guard and not a
+    // convention.
+    if (!search_label_dir.empty() && !search_buffer.role_aware()) {
       search_buffer.LoadNewFiles(search_label_dir);
     }
 

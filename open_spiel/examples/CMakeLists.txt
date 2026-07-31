@@ -128,6 +128,21 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_head_eval dune_search ${TORCH_LIBRARIES})
 
+  # PWO-5 gate 3: sections 7.3 (legacy-inference parity) and 7.4 (head-off
+  # parameter invariance). Pure forward passes on a fixed probe set, so it
+  # needs no training and takes no thread count.
+  add_executable(dune_pwo5_gate3_verify dune_pwo5_gate3_verify.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_gate3_verify dune_search ${TORCH_LIBRARIES})
+
+  # PWO-5 gate 3: the NUMERICS of the three auxiliary head losses, against the
+  # shared pwo5loss:: definitions the trainer and the evaluator both call.
+  add_executable(dune_pwo5_head_loss_test dune_pwo5_head_loss_test.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pwo5_head_loss_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_pwo5_head_loss_test COMMAND dune_pwo5_head_loss_test)
+
   # PWO-5 gate 3: the auxiliary-label loader's manifest FILE ROLES
   # (amendment 1 ruling 5) and the numeric head losses.
   add_executable(dune_pwo5_loader_roles_test dune_pwo5_loader_roles_test.cc
