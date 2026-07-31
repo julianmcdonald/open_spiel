@@ -161,6 +161,28 @@ struct GameResult {
   int ending_round;
   int current_vp;
   int final_scored_vp;
+
+  // PWO-5 section 13.5. The registered VP-margin estimand is
+  //
+  //     vp_margin = candidate's TRUE final VP - MEAN of the three opponents'
+  //
+  // -- true final VP, not track VP; the mean of three, not the best. Before
+  // this, popeval emitted only the CANDIDATE's `final_scored_vp`, so the
+  // quantity section 15.2 gate 2 asks for could not be computed from its
+  // output at all; a reconstruction from `vp_end_by_round` computes a
+  // different thing.
+  //
+  // `FinalScoredVp` is the ENGINE's function. It is NOT `GetTrueFinalVp`, the
+  // REPORTING helper that drops the tech-tile-8 guard and disagrees with the
+  // engine on 212 of 1,600 seat values -- the defect that became the PWO-5
+  // gate-3 STOP. Every seat here goes through the engine.
+  std::array<int, kNumPlayers> final_scored_vp_all{};
+  // Exactly representable only as a rational with denominator 3, so it is
+  // carried as a double and SERIALIZED AT ROUND-TRIP PRECISION (%.17g). It is
+  // never routed through open_spiel's JSON writer, which emits doubles as %f
+  // at six decimal places and would silently floor anything below 5e-7 to 0.0.
+  double vp_margin = 0.0;
+  bool vp_margin_valid = false;
   // --- Phase-3 pace/threshold telemetry (new keys only) ---
   // vp_end_rN[p] = player p's running (track) VP at the end of round N.
   // has_rN=false => the game ended before round N completed (emitted as null).
@@ -752,6 +774,24 @@ void WorkerThread(
                          ? dune_state->FinalScoredVp(model_player)
                          : -1;
 
+    // PWO-5 section 13.5: every seat's TRUE final VP, and the exact margin.
+    if (dune_state) {
+      long long opponent_sum = 0;
+      for (int p = 0; p < kNumPlayers; ++p) {
+        gr.final_scored_vp_all[p] = dune_state->FinalScoredVp(p);
+        if (p != model_player) opponent_sum += gr.final_scored_vp_all[p];
+      }
+      // The mean of the THREE opponents, not the best of them.
+      gr.vp_margin = static_cast<double>(gr.final_scored_vp_all[model_player]) -
+                     static_cast<double>(opponent_sum) /
+                         static_cast<double>(kNumPlayers - 1);
+      gr.vp_margin_valid = true;
+    } else {
+      gr.final_scored_vp_all.fill(-1);
+      gr.vp_margin = 0.0;
+      gr.vp_margin_valid = false;
+    }
+
     // --- Phase-3 pace/threshold telemetry ---
     gr.has_r5 = round_end_seen[5];
     gr.has_r6 = round_end_seen[6];
@@ -1149,6 +1189,17 @@ void RunEvaluation() {
                 << ",\"ending_round\":" << gr.ending_round
                 << ",\"track_vp\":" << gr.current_vp
                 << ",\"final_scored_vp\":" << gr.final_scored_vp
+                // PWO-5 section 13.5. All four seats' TRUE final VP, from the
+                // engine's FinalScoredVp, and the exact registered margin.
+                // `%.17g` is round-trip precision: `vp_margin` has denominator
+                // 3, so 1/3 and 2/3 are not exactly representable and a
+                // fixed-decimal format would quietly change the estimand.
+                << ",\"final_scored_vp_all\":"
+                << JsonIntArray(gr.final_scored_vp_all)
+                << ",\"vp_margin\":"
+                << (gr.vp_margin_valid
+                        ? absl::StrFormat("%.17g", gr.vp_margin)
+                        : std::string("null"))
                 << ",\"vp_end_r5\":" << JsonVpArrayOrNull(gr.has_r5, gr.vp_end_r5)
                 << ",\"vp_end_r6\":" << JsonVpArrayOrNull(gr.has_r6, gr.vp_end_r6)
                 << ",\"vp_end_r7\":" << JsonVpArrayOrNull(gr.has_r7, gr.vp_end_r7)
