@@ -42,6 +42,7 @@
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
+#include "dune_pf2_matched_fallback.h"   // the PRODUCTION rules under test
 #include "dune_puct_is_mcts.h"
 #include "dune_search_routing.h"
 #include "dune_search_session.h"
@@ -80,7 +81,11 @@ DuneSearchConfig MakeConfig(uint64_t seed, bool check_strategic_state) {
   DuneSearchConfig c{};
   c.max_simulations = 8;
   c.relative_time_budget_ms = std::numeric_limits<double>::infinity();
-  c.max_nodes = -1;
+  // 50000 is the binary's real default. -1 is NOT 'unlimited': the ceiling
+  // check is `node_pool_.size() >= config_.max_nodes`, so -1 trips on the
+  // first node and every strategic decision falls back with 0 simulations --
+  // which silently disabled search in an earlier revision of these tests.
+  c.max_nodes = 50000;
   c.puct_c = 0.30;
   c.opponent_mode = SearchOpponentMode::kPolicy;
   c.temperature = 0.0;
@@ -173,10 +178,11 @@ void TestClassificationParity() {
     DuneSearchResult res = bot.RunSearch(s);
     if (res.fallback_reason == "non_strategic_state") pathb_fallback.insert(i);
 
-    // --- the frozen predicate --------------------------------------------
-    if (s.LegalActions().size() > 1 && !IsStrategicState(s, p)) {
-      matched_eligible.insert(i);
-    }
+    // --- the frozen predicate, called from PRODUCTION ---------------------
+    // pf2::MatchedFallbackEligible is the function dune_search_benchmark.cc
+    // itself calls. Re-expressing the predicate here would test the
+    // re-expression, which is what Sol's review rejected.
+    if (pf2::MatchedFallbackEligible(s, p)) matched_eligible.insert(i);
 
     // --- known-wrong alternative A: drop the multi-legal clause ----------
     if (!IsStrategicState(s, p)) wrong_strategic_only.insert(i);
@@ -336,14 +342,14 @@ void TestOrdinalSequence() {
 
     std::pair<ActionsAndProbs, Action> got = bot.StepWithPolicy(s);
 
-    // Predict from the FROZEN schedule: ordinal is 1-based and counts this
-    // decision regardless of its type.
+    // Predict using the PRODUCTION functions the matched arm calls, against
+    // the real bot's own play. This is the load-bearing direction: if the
+    // matched arm's seed/ordinal/sampler rules disagree with Path B's Step(),
+    // this comparison fails.
     const uint64_t ordinal = static_cast<uint64_t>(k) + 1;
-    const uint64_t step_seed =
-        dune_seed::Combine(kSeed, dune_seed::kStreamBlueprint, ordinal);
-    std::mt19937 step_rng(step_seed);
-    const double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-    const Action predicted = SampleAction(got.first, r_val).first;
+    const uint64_t step_seed = pf2::MatchedFallbackStepSeed(kSeed, ordinal);
+    const double r_val = pf2::MatchedFallbackRVal(step_seed);
+    const Action predicted = pf2::MatchedFallbackSelect(got.first, r_val);
 
     if (predicted != got.second) {
       std::cout << "  FAIL at decision " << k << " (ordinal " << ordinal
@@ -380,37 +386,246 @@ void TestOrdinalSequence() {
 }
 
 // ---------------------------------------------------------------------------
-// TEST 4 — SEED DERIVATION IDENTITY.
+// TEST 4 — SEED DERIVATION, AGAINST PATH B'S ACTUAL STREAM.
 // ---------------------------------------------------------------------------
 //
-// Part B derives from seat_config_seed[player], recorded at seat setup from
-// the single game_rng() draw that also becomes DuneSearchConfig::seed. If the
-// two ever diverge the streams cannot agree, so pin the identity of the
-// derivation itself.
-void TestSeedDerivationIdentity() {
-  std::cout << "PF-2 test 4: seed derivation identity\n";
-  const uint64_t config_seed = 0xDEADBEEFCAFEULL;
+// The previous version of this test asserted
+//     Combine(seed, kStreamBlueprint, k) == Combine(seed, kStreamBlueprint, k)
+// which is the same expression on both sides and passes for ANY
+// implementation. Sol's review caught it. The reference here is Path B's real
+// bot instead: the production derivation must reproduce the r_val the bot
+// actually drew, which is observable because the bot's played action is
+// SampleAction(policy, r_val).
+void TestSeedDerivationAgainstPathB() {
+  std::cout << "PF-2 test 4: seed derivation vs Path B's actual stream\n";
+  const uint64_t kSeed = 0xDEADBEEFCAFEULL;
 
-  for (uint64_t ordinal = 1; ordinal <= 64; ++ordinal) {
-    const uint64_t pathb =
-        dune_seed::Combine(config_seed, dune_seed::kStreamBlueprint, ordinal);
-    const uint64_t partb =
-        dune_seed::Combine(config_seed, dune_seed::kStreamBlueprint, ordinal);
-    assert(pathb == partb);
+  std::vector<Decision> decisions = CollectDecisions(12, 20270903);
+  assert(decisions.size() >= 5);
+  auto evaluator = std::make_shared<MockEvaluator>(
+      std::vector<double>{0.0, 0.0, 0.0, 0.0});
+  DunePUCTISMCTSBot bot(MakeConfig(kSeed, true), evaluator);
 
-    // Distinctness across ordinals: a Combine that collapsed would make the
-    // whole schedule moot.
-    const uint64_t next =
-        dune_seed::Combine(config_seed, dune_seed::kStreamBlueprint, ordinal + 1);
-    assert(pathb != next);
-
-    // And the stream tag must matter.
-    const uint64_t other_stream =
-        dune_seed::Combine(config_seed, dune_seed::kStreamSearchGate, ordinal);
-    assert(pathb != other_stream);
+  int multi_legal = 0;
+  for (size_t k = 0; k < decisions.size(); ++k) {
+    std::pair<ActionsAndProbs, Action> got =
+        bot.StepWithPolicy(*decisions[k].state);
+    const uint64_t seed = pf2::MatchedFallbackStepSeed(kSeed, k + 1);
+    const Action predicted =
+        pf2::MatchedFallbackSelect(got.first, pf2::MatchedFallbackRVal(seed));
+    assert(predicted == got.second);
+    if (got.first.size() > 1) multi_legal++;
   }
-  std::cout << "  PASS — derivation identical, ordinal-distinct, "
-               "stream-distinct\n\n";
+
+  // DISCRIMINATION: with a single-entry policy every r_val yields the same
+  // action, so the seed would be untested. Require real choices.
+  if (multi_legal == 0) {
+    std::cout << "  FAIL(vacuous): every policy had one entry, so any seed "
+                 "would pass.\n";
+    assert(false);
+  }
+
+  // Ordinal- and stream-distinctness, which make the schedule meaningful.
+  for (uint64_t o = 1; o <= 64; ++o) {
+    assert(pf2::MatchedFallbackStepSeed(kSeed, o) !=
+           pf2::MatchedFallbackStepSeed(kSeed, o + 1));
+    assert(pf2::MatchedFallbackStepSeed(kSeed, o) !=
+           dune_seed::Combine(kSeed, dune_seed::kStreamSearchGate, o));
+  }
+  std::cout << "  PASS — production derivation reproduces Path B's stream on "
+            << decisions.size() << " decisions (" << multi_legal
+            << " with a real choice)\n\n";
+}
+
+// ---------------------------------------------------------------------------
+// TEST 5 — COMMIT BOUNDARY: the committed action IS the played action.
+// ---------------------------------------------------------------------------
+//
+// The fourth member of the parity family, from
+// docs/PF2_COMMIT_LIFECYCLE_DEFECT_2026_08_01.md. Part B's first
+// implementation called SearchAndSelectWithDeadline and substituted the
+// sampled action AFTERWARDS. That wrapper is Search -> SelectControllerAction
+// -> CommitAction, and CommitAction PERSISTS the decision into session
+// history before returning — so on exactly the decisions Part B exists to
+// change, the game would play the sampled action while the session recorded
+// the argmax, and every later re-root would key off a history that never
+// happened.
+//
+// Every other test in this file passes against that broken implementation.
+// This one does not: it drives the real two-phase lifecycle and asserts the
+// action the session COMMITTED equals the action Part B chose.
+void TestCommitBoundary() {
+  std::cout << "PF-2 test 5: commit boundary (committed == played)\n";
+  const uint64_t kSeed = 4242424242ULL;
+
+  // A COHERENT trajectory, not a bag of cloned positions. The session keeps
+  // persistent history and re-roots against it, so feeding it unrelated
+  // states makes every re-root a mismatch and tests nothing about commit
+  // ordering. This drives one real game exactly as the benchmark does:
+  // opponents play, the searched seat goes through the two-phase lifecycle,
+  // and the committed action is the one applied to the state.
+  auto evaluator = std::make_shared<MockEvaluator>(
+      std::vector<double>{0.0, 0.0, 0.0, 0.0});
+  DuneSearchConfig cfg = MakeConfig(kSeed, /*check_strategic_state=*/true);
+  cfg.purchase_combat_budget = 0;
+  DuneSearchSession session(cfg, evaluator, DuneSearchBudgetMode::kPolicyOnly);
+
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+  std::unique_ptr<State> state = game->NewInitialState();
+  std::mt19937 rng(20270904);
+  const Player searched_seat = 0;
+
+  int sampled = 0, overridden_differs = 0, checked = 0;
+  uint64_t ordinal = 0;
+  const int kMaxDecisions = 220;
+
+  while (!state->IsTerminal() && checked < kMaxDecisions) {
+    if (state->IsChanceNode()) {
+      auto outcomes = state->ChanceOutcomes();
+      std::vector<double> w;
+      w.reserve(outcomes.size());
+      for (const auto& o : outcomes) w.push_back(o.second);
+      std::discrete_distribution<int> d(w.begin(), w.end());
+      state->ApplyAction(outcomes[d(rng)].first);
+      continue;
+    }
+    const Player p = state->CurrentPlayer();
+    if (p != searched_seat) {
+      std::vector<Action> legal = state->LegalActions();
+      state->ApplyAction(legal[rng() % legal.size()]);
+      continue;
+    }
+
+    // The ordinal counts EVERY candidate decision, matching Path B.
+    ++ordinal;
+
+    // The production two-phase lifecycle, exactly as the benchmark runs it.
+    DuneSearchResult searched = session.Search(*state);
+    ControllerDecision dec = session.SelectControllerAction(*state, searched, 0.0);
+    const Action argmax_action = dec.selected_action;
+
+    Action intended = argmax_action;
+    if (pf2::MatchedFallbackEligible(*state, p) && !searched.policy.empty()) {
+      const uint64_t seed = pf2::MatchedFallbackStepSeed(kSeed, ordinal);
+      intended = pf2::MatchedFallbackSelect(searched.policy,
+                                            pf2::MatchedFallbackRVal(seed));
+      dec.selected_action = intended;      // override BEFORE the commit
+      sampled++;
+      if (intended != argmax_action) overridden_differs++;
+    }
+
+    DuneSearchResult committed = session.CommitAction(dec);
+
+    // THE ASSERTION. If the override landed after CommitAction (the defect),
+    // the committed action would still be the argmax on overridden rows.
+    if (committed.diagnostics.selected_action != intended) {
+      std::cout << "  FAIL at decision " << ordinal << ": committed "
+                << committed.diagnostics.selected_action << ", Part B chose "
+                << intended << std::endl;
+      assert(false);
+    }
+    checked++;
+    state->ApplyAction(intended);          // play what was committed
+  }
+
+  std::cout << "  decisions=" << checked << "  sampled=" << sampled
+            << "  sampled-and-differing-from-argmax=" << overridden_differs
+            << "\n";
+
+  // DISCRIMINATION, and this one is essential: if the sampled action NEVER
+  // differed from the argmax, a commit-after-override implementation would
+  // record the same action either way and this test could not tell them
+  // apart. A green result would then be meaningless.
+  if (overridden_differs == 0) {
+    std::cout << "  FAIL(vacuous): the sampled action never differed from the "
+                 "argmax on this block, so the commit-ordering defect would be "
+                 "invisible here. Widen the block.\n";
+    assert(false);
+  }
+  std::cout << "  PASS — the committed action is Part B's action on every "
+               "sampled decision, including "
+            << overridden_differs << " where it differs from the argmax\n\n";
+}
+
+// ---------------------------------------------------------------------------
+// TEST 6 — PART A FIELD REGRESSION.
+// ---------------------------------------------------------------------------
+//
+// The defect Part A fixes: on the fresh path the session-populated
+// diagnostics stay blank/-1, because only dune_search_session.cc:501 ever
+// writes them. 13,395 of 26,147 historical `fallback_reason=="none"` rows
+// carry round -1 and an empty role.
+//
+// Exercises pf2::PopulatePathBDiagnostics — the function the benchmark calls.
+void TestPartAFields() {
+  std::cout << "PF-2 test 6: Part A field population\n";
+
+  struct FakeDiag {
+    int round = -1;
+    std::string phase;
+    std::string decision_role;
+  };
+
+  std::vector<Decision> decisions = CollectDecisions(150, 20270905);
+  assert(!decisions.empty());
+
+  int populated_round = 0, populated_phase = 0, unknown_phase = 0;
+  for (size_t k = 0; k < decisions.size(); ++k) {
+    FakeDiag d;
+    // Pre-state is the defect: blank/-1, exactly what the fresh path emitted.
+    assert(d.round == -1 && d.phase.empty() && d.decision_role.empty());
+
+    pf2::PopulatePathBDiagnostics(d, *decisions[k].state, /*role=*/2);
+
+    assert(!d.decision_role.empty());
+    assert(d.decision_role == "2");
+    if (d.round != -1) populated_round++;
+    if (!d.phase.empty()) populated_phase++;
+    // A phase that maps to "Unknown" means the switch has fallen behind the
+    // engine's GamePhase enum -- the session path would then disagree with
+    // the fresh path on the same position.
+    if (d.phase == "Unknown") unknown_phase++;
+  }
+
+  std::cout << "  decisions=" << decisions.size()
+            << "  round populated=" << populated_round
+            << "  phase populated=" << populated_phase
+            << "  phase==Unknown=" << unknown_phase << std::endl;
+
+  if (populated_round == 0 || populated_phase == 0) {
+    std::cout << "  FAIL: Part A populated nothing -- the fields would still "
+                 "serialize blank/-1 on the fresh path.\n";
+    assert(false);
+  }
+  if (unknown_phase != 0) {
+    std::cout << "  FAIL: " << unknown_phase << " decision(s) mapped to "
+                 "\"Unknown\" -- the phase switch has fallen behind the "
+                 "engine's GamePhase enum.\n";
+    assert(false);
+  }
+
+  // The zero-simulation row must stay distinguishable: simulations_completed
+  // is the searched-row discriminator on the fresh path, and Part A must not
+  // have disturbed it.
+  auto evaluator = std::make_shared<MockEvaluator>(
+      std::vector<double>{0.0, 0.0, 0.0, 0.0});
+  DunePUCTISMCTSBot bot(MakeConfig(77777, true), evaluator);
+  int zero_sim = 0, positive_sim = 0;
+  for (size_t k = 0; k < decisions.size(); ++k) {
+    DuneSearchResult r = bot.RunSearch(*decisions[k].state);
+    if (r.simulations_completed == 0) zero_sim++;
+    else positive_sim++;
+  }
+  std::cout << "  zero-simulation rows=" << zero_sim
+            << "  positive-simulation rows=" << positive_sim << std::endl;
+  if (zero_sim == 0 || positive_sim == 0) {
+    std::cout << "  FAIL(vacuous): the block has only one kind of row, so "
+                 "`simulations_completed==0` could not be shown to "
+                 "discriminate.\n";
+    assert(false);
+  }
+  std::cout << "  PASS — fields populated, phase mapping current, "
+               "zero-simulation rows distinguishable\n\n";
 }
 
 }  // namespace
@@ -421,7 +636,9 @@ int main(int argc, char** argv) {
   open_spiel::TestClassificationParity();
   open_spiel::TestSamplerBoundary();
   open_spiel::TestOrdinalSequence();
-  open_spiel::TestSeedDerivationIdentity();
+  open_spiel::TestSeedDerivationAgainstPathB();
+  open_spiel::TestCommitBoundary();
+  open_spiel::TestPartAFields();
   std::cout << "=== all PF-2 conformance tests passed ===\n";
   return 0;
 }

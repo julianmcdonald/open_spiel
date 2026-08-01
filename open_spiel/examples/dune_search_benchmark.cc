@@ -32,6 +32,10 @@
 #include <array>
 #include "dune_search_session.h"
 #include "dune_seed_utils.h"
+// PF-2: the matched-hybrid controller's frozen rules and Part A's field
+// population, shared with the conformance tests so those tests exercise THIS
+// code rather than a re-expression of it.
+#include "dune_pf2_matched_fallback.h"
 #include "dune_sha256.h"
 #include "dune_terminal_vp_report.h"
 #include "dune_warmstart_helpers.h"  // ChooseHeuristicAcquisitionAction (swordmaster probe)
@@ -392,27 +396,8 @@ std::string BudgetModeName(DuneSearchBudgetMode m) {
   return "unknown";
 }
 
-// PF-2 Part A. Duplicated verbatim from the anonymous-namespace helper in
-// dune_search_session.cc:18 — that one has internal linkage, and lifting it
-// would modify a translation unit other binaries link, which Part A's
-// flag-OFF neutrality proof must not do. The two must stay in step: the
-// fresh path's `phase` string is only comparable to the session path's if
-// they map identically.
-std::string PathBPhaseToString(dune_imperium::GamePhase phase) {
-  switch (phase) {
-    case dune_imperium::GamePhase::kLeaderOfferChance: return "kLeaderOfferChance";
-    case dune_imperium::GamePhase::kLeaderDraft: return "kLeaderDraft";
-    case dune_imperium::GamePhase::kDeal: return "kDeal";
-    case dune_imperium::GamePhase::kRoundStart: return "kRoundStart";
-    case dune_imperium::GamePhase::kAgentTurns: return "kAgentTurns";
-    case dune_imperium::GamePhase::kRevealTurns: return "kRevealTurns";
-    case dune_imperium::GamePhase::kCombat: return "kCombat";
-    case dune_imperium::GamePhase::kMakers: return "kMakers";
-    case dune_imperium::GamePhase::kRecall: return "kRecall";
-    case dune_imperium::GamePhase::kTerminal: return "kTerminal";
-    default: return "Unknown";
-  }
-}
+// PF-2 Part A's phase mapping moved to dune_pf2_matched_fallback.h so the
+// field regression test exercises the same mapping this binary uses.
 
 void WorkerThread(
     int thread_id,
@@ -846,21 +831,20 @@ void WorkerThread(
           //
           // No searched-arm output is read anywhere here: the class comes from
           // (state, player) alone, so the arms share a RULE, never a decision.
+          // Every rule below is the SHARED one from
+          // dune_pf2_matched_fallback.h. It is deliberately not written out
+          // here: when these were inline, the conformance tests could only
+          // re-express them, and a test of a re-expression says nothing about
+          // this binary (Sol's review, 2026-08-01). The tests now call these
+          // exact functions.
           const bool eligible =
-              state->LegalActions().size() > 1 &&
-              !open_spiel::IsStrategicState(*state, current_player);
+              open_spiel::pf2::MatchedFallbackEligible(*state, current_player);
           if (eligible && !searched.policy.empty()) {
-            // Path-B's exact draw: Combine(config.seed, kStreamBlueprint,
-            // ordinal) -> mt19937 -> absl::Uniform[0,1) -> OpenSpiel
-            // SampleAction (dune_puct_is_mcts.cc:1180-1183). SampleAction,
-            // NOT the session's SampleActionFromPrior — the session's own
-            // comment records that the two differ at cumulative boundaries.
-            const uint64_t step_seed = dune_seed::Combine(
-                seat_config_seed[current_player],
-                dune_seed::kStreamBlueprint, matched_step_count);
-            std::mt19937 step_rng(step_seed);
-            const double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-            dec.selected_action = SampleAction(searched.policy, r_val).first;
+            const uint64_t step_seed = open_spiel::pf2::MatchedFallbackStepSeed(
+                seat_config_seed[current_player], matched_step_count);
+            const double r_val = open_spiel::pf2::MatchedFallbackRVal(step_seed);
+            dec.selected_action =
+                open_spiel::pf2::MatchedFallbackSelect(searched.policy, r_val);
             matched_sampled_this_decision = true;
           }
           // Commit AFTER the override: the session's persisted history and the
@@ -909,15 +893,10 @@ void WorkerThread(
           // Scoped to the Path-B branch DELIBERATELY. Hoisting it past the
           // enclosing if/else would overwrite the session path's own values
           // and break the policy-only half of the flag-OFF neutrality proof.
-          const auto* pathb_dune_state =
-              dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
-          if (pathb_dune_state != nullptr) {
-            last_res.diagnostics.round = pathb_dune_state->GetCurrentRound();
-            last_res.diagnostics.phase =
-                PathBPhaseToString(pathb_dune_state->phase());
-          }
-          last_res.diagnostics.decision_role =
-              std::to_string(static_cast<int>(role));
+          // Shared with the field regression test (dune_pf2_matched_fallback.h)
+          // so the test exercises this population, not a copy of it.
+          open_spiel::pf2::PopulatePathBDiagnostics(
+              last_res.diagnostics, *state, static_cast<int>(role));
         }
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
