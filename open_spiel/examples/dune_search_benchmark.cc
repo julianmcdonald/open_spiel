@@ -68,6 +68,15 @@ ABSL_FLAG(bool, opponent_nonlinear_value_head, false,
           "Use the versioned nonlinear value head for the external opponent model.");
 ABSL_FLAG(bool, verbose_diagnostics, true, "Print IS-MCTS node-reuse and depth diagnostics periodically.");
 ABSL_FLAG(bool, check_strategic_state, false, "Whether to bypass MCTS search at non-strategic states.");
+// PF-2 Part B. DEFAULT-INERT, and an intentional selection change when ON —
+// this is deliberately NOT covered by Part A's neutrality claim. When ON in the
+// policy-only session, non-strategic multi-legal decisions sample the raw prior
+// with Path-B's exact RNG semantics instead of playing argmax; everything else
+// stays greedy raw. Exists so B1 has a matched-hybrid control whose ONLY
+// difference from the searched arm is the strategic searched routine.
+ABSL_FLAG(bool, matched_fallback_sampling, false,
+          "PF-2 Part B: sample the raw prior on non-strategic multi-legal "
+          "decisions using Path-B's registered RNG semantics (default off).");
 ABSL_FLAG(bool, disable_time_limit, false, "Disable the time limit per move for fixed-simulation evaluation.");
 ABSL_FLAG(double, root_prior_temperature, 1.0, "Root prior temperature.");
 ABSL_FLAG(int, fixed_continuation_reserve, 0, "Continuation reserve simulations.");
@@ -383,6 +392,28 @@ std::string BudgetModeName(DuneSearchBudgetMode m) {
   return "unknown";
 }
 
+// PF-2 Part A. Duplicated verbatim from the anonymous-namespace helper in
+// dune_search_session.cc:18 — that one has internal linkage, and lifting it
+// would modify a translation unit other binaries link, which Part A's
+// flag-OFF neutrality proof must not do. The two must stay in step: the
+// fresh path's `phase` string is only comparable to the session path's if
+// they map identically.
+std::string PathBPhaseToString(dune_imperium::GamePhase phase) {
+  switch (phase) {
+    case dune_imperium::GamePhase::kLeaderOfferChance: return "kLeaderOfferChance";
+    case dune_imperium::GamePhase::kLeaderDraft: return "kLeaderDraft";
+    case dune_imperium::GamePhase::kDeal: return "kDeal";
+    case dune_imperium::GamePhase::kRoundStart: return "kRoundStart";
+    case dune_imperium::GamePhase::kAgentTurns: return "kAgentTurns";
+    case dune_imperium::GamePhase::kRevealTurns: return "kRevealTurns";
+    case dune_imperium::GamePhase::kCombat: return "kCombat";
+    case dune_imperium::GamePhase::kMakers: return "kMakers";
+    case dune_imperium::GamePhase::kRecall: return "kRecall";
+    case dune_imperium::GamePhase::kTerminal: return "kTerminal";
+    default: return "Unknown";
+  }
+}
+
 void WorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
@@ -444,6 +475,17 @@ void WorkerThread(
     std::mt19937 force_rng(dune_seed::DeriveSeed(absl::GetFlag(FLAGS_seed), dune_seed::kStreamSearchGate, g));
     auto game_start_time = std::chrono::steady_clock::now();
 
+    // PF-2 Part B: the matched arm's decision ordinal. Mirrors Path-B's
+    // DunePUCTISMCTSBot::search_count_ EXACTLY (dune_puct_is_mcts.cc:1179-1180):
+    // zero per game/bot, +1 on EVERY candidate decision — single-legal,
+    // strategic and fallback alike — and incremented BEFORE the seed is
+    // derived, so the first decision derives with 1, not 0. It is a plain local,
+    // so nothing resets it mid-game (Path-B's is likewise untouched by tree
+    // Reset()). An implementation that only counted eligible fallbacks would
+    // pass every per-decision tuple test and still desynchronise the stream —
+    // which is exactly what the ordinal sequence test exists to catch.
+    uint64_t matched_step_count = 0;
+
     bool rotate_seat = absl::GetFlag(FLAGS_rotate_seat);
     int search_seat = rotate_seat ? (g % 4) : 0;
     thread_stats.games_by_seat[search_seat]++;
@@ -474,6 +516,13 @@ void WorkerThread(
     // decision, reproducing the July-14 reference protocol verbatim.
     std::unique_ptr<DunePUCTISMCTSBot> search_bot;
     std::vector<std::unique_ptr<Bot>> bots(4);
+    // PF-2 Part B: remember each seat's DuneSearchConfig::seed. Path-B derives
+    // its per-decision sampling seed from config_.seed, so the matched arm must
+    // derive from the SAME value or the streams cannot agree. Recording it
+    // rather than re-drawing is essential — the seat draw below is exactly one
+    // game_rng() call per seat in seat order, and any extra draw reshuffles
+    // every downstream chance realization.
+    std::array<uint64_t, 4> seat_config_seed{};
     for (int p = 0; p < 4; ++p) {
       // Exactly ONE game_rng() draw per seat, in seat order, in EVERY mode.
       // The legacy code drew once for the searched seat's config.seed and once
@@ -482,6 +531,7 @@ void WorkerThread(
       // Moving, adding or conditionalising this draw silently reshuffles every
       // downstream chance realization.
       const uint64_t seat_seed = game_rng();
+      seat_config_seed[p] = seat_seed;
       if (seat_is_searched[p]) {
         // Designated initializers bind by NAME. This block used to be
         // positional, and Phase 18B's three inserted KataGo fields shifted
@@ -745,7 +795,82 @@ void WorkerThread(
         bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
         DuneSearchResult last_res;
-        if (cur_session) {
+        // PF-2 Part B ordinal. Incremented here — once per candidate decision,
+        // before either branch and before any seed derivation — so it counts
+        // exactly what Path-B's search_count_ counts. Unused when the flag is
+        // off; an unread increment has no behavioural effect, which is what
+        // keeps the flag-OFF projection identical.
+        ++matched_step_count;
+        bool matched_sampled_this_decision = false;
+        if (cur_session && absl::GetFlag(FLAGS_matched_fallback_sampling)) {
+          // PF-2 Part B, TWO-PHASE lifecycle. SearchAndSelectWithDeadline is
+          // Search -> SelectControllerAction -> CommitAction
+          // (dune_search_session.cc:849-856), and CommitAction PERSISTS the
+          // decision into the session history. Overriding the returned action
+          // afterwards would make the session's history record the argmax while
+          // the game plays the sampled action — the two desynchronise on
+          // exactly the decisions this arm exists to change, and every
+          // subsequent re-root would key off a history that never happened.
+          // The override therefore has to land on the ControllerDecision BEFORE
+          // it is committed.
+          //
+          // r_val = 0.0 is provably inert here rather than merely unused:
+          // SelectControllerAction feeds r_val only to
+          // PickActionRespectingTemperature, which returns argmax without
+          // reading it when config_.temperature == 0.0, and the session's rng_
+          // is consumed nowhere except the two SearchAndSelect* wrappers this
+          // branch bypasses. The fatal guard in main() enforces
+          // --temperature=0, so the precondition is checked, not assumed.
+          DuneSearchResult searched =
+              cur_session->Search(*state, configured_move_budget_ms);
+          ControllerDecision dec =
+              cur_session->SelectControllerAction(*state, searched, 0.0);
+          // PF-2 Part B. Classification calls IsStrategicState DIRECTLY on this
+          // arm's OWN state. It deliberately does NOT reuse the session's role
+          // routing (dune_search_session.cc:331 forced/leader, :347
+          // purchase/combat — the latter live here via
+          // --purchase_combat_budget=0): those exits sit exactly at the classes
+          // where the role notion diverges from IsStrategicState, so making
+          // them sample is the natural and WRONG implementation. Purchase and
+          // combat-intrigue decisions are STRATEGIC under the gate that
+          // actually produces Path-B's fallbacks, and non-strategic under the
+          // roles; sampling there would put the matched arm at decisions the
+          // searched arm searches.
+          //
+          // Two clauses, not one: RunSearch() returns early on single-legal
+          // BEFORE the strategic branch, so single-legal decisions never
+          // produce a fallback. !IsStrategicState alone returns true for them
+          // (the predicate is false below 2 legals) and would sweep in the
+          // forced actions — inflating the class roughly eightfold and letting
+          // a count check pass on decisions that were never choices.
+          //
+          // No searched-arm output is read anywhere here: the class comes from
+          // (state, player) alone, so the arms share a RULE, never a decision.
+          const bool eligible =
+              state->LegalActions().size() > 1 &&
+              !open_spiel::IsStrategicState(*state, current_player);
+          if (eligible && !searched.policy.empty()) {
+            // Path-B's exact draw: Combine(config.seed, kStreamBlueprint,
+            // ordinal) -> mt19937 -> absl::Uniform[0,1) -> OpenSpiel
+            // SampleAction (dune_puct_is_mcts.cc:1180-1183). SampleAction,
+            // NOT the session's SampleActionFromPrior — the session's own
+            // comment records that the two differ at cumulative boundaries.
+            const uint64_t step_seed = dune_seed::Combine(
+                seat_config_seed[current_player],
+                dune_seed::kStreamBlueprint, matched_step_count);
+            std::mt19937 step_rng(step_seed);
+            const double r_val = absl::Uniform(step_rng, 0.0, 1.0);
+            dec.selected_action = SampleAction(searched.policy, r_val).first;
+            matched_sampled_this_decision = true;
+          }
+          // Commit AFTER the override: the session's persisted history and the
+          // action the game plays are now the same action by construction.
+          last_res = cur_session->CommitAction(dec);
+          chosen_action = last_res.diagnostics.selected_action;
+        } else if (cur_session) {
+          // Flag OFF: byte-identical to the pre-change binary. The two-phase
+          // path above is never entered, so the OFF-flag neutrality projection
+          // is unaffected by Part B entirely.
           last_res = cur_session->SearchAndSelectWithDeadline(
               *state, configured_move_budget_ms);
           chosen_action = last_res.diagnostics.selected_action;
@@ -773,6 +898,26 @@ void WorkerThread(
             last_res.diagnostics.selected_action = chosen_action;
             last_res.diagnostics.decision_role = std::to_string(static_cast<int>(role));
           }
+          // PF-2 Part A. Path B emits the session-populated diagnostic fields,
+          // but only dune_search_session.cc:501 ever writes them, so on the
+          // fresh path they stay blank/-1 (13,395 of 26,147 historical
+          // `fallback_reason=="none"` rows carry round -1 and an empty role).
+          // The values are already computed locally at :743; this copies them
+          // onto the record that gets serialized. Telemetry only: no
+          // control-flow, RNG, or action-selection effect.
+          //
+          // Scoped to the Path-B branch DELIBERATELY. Hoisting it past the
+          // enclosing if/else would overwrite the session path's own values
+          // and break the policy-only half of the flag-OFF neutrality proof.
+          const auto* pathb_dune_state =
+              dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+          if (pathb_dune_state != nullptr) {
+            last_res.diagnostics.round = pathb_dune_state->GetCurrentRound();
+            last_res.diagnostics.phase =
+                PathBPhaseToString(pathb_dune_state->phase());
+          }
+          last_res.diagnostics.decision_role =
+              std::to_string(static_cast<int>(role));
         }
         auto step_end = std::chrono::steady_clock::now();
         double step_duration = std::chrono::duration<double>(step_end - step_start).count();
@@ -937,6 +1082,28 @@ void WorkerThread(
               search_obj["soft_time_limit_ms"] = diag.soft_time_limit_ms;
               search_obj["elapsed_search_time_ms"] = diag.elapsed_search_time_ms;
               search_obj["observation_wait_time_ms"] = diag.observation_wait_time_ms;
+              // PF-2 Part B corroboration marker. Emitted ONLY when the flag is
+              // ON: with it off the field is ABSENT, so the flag-OFF neutrality
+              // projection stays exactly the five Part-A fields and a correct
+              // implementation cannot fail that proof. In ON mode it is present
+              // on EVERY candidate decision row, true iff Part B sampled that
+              // decision — so the corroboration count is
+              // sum(row["matched_fallback_sampled"] == true), never a count of
+              // field occurrences. It corroborates that the branch was
+              // exercised; the classification-parity UNIT TEST, not this
+              // marker, governs whether the classification is correct.
+              if (absl::GetFlag(FLAGS_matched_fallback_sampling)) {
+                search_obj["matched_fallback_sampled"] =
+                    matched_sampled_this_decision;
+              }
+              // PF-2 Part A, fifth field. Computed in search
+              // (dune_puct_is_mcts.cc:772/:785/:793, stored to diagnostics at
+              // :1086) but serialized ONLY by dune_pwo4_trajectory.cc:1116 —
+              // this binary emitted zero occurrences, so B1's registered
+              // retention-rate deliverable could not be produced by the binary
+              // that runs B1. Denominator for that rate is positive-simulation,
+              // valid-snapshot rows, not all rows.
+              search_obj["root_reused_pre_search"] = diag.root_reused_pre_search;
               search_obj["inherited_root_visits"] = static_cast<int64_t>(diag.inherited_root_visits);
               search_obj["newly_completed_simulations"] = static_cast<int64_t>(diag.newly_completed_simulations);
               search_obj["session_cumulative_simulations"] = static_cast<int64_t>(diag.session_cumulative_simulations);
@@ -1469,6 +1636,77 @@ int main(int argc, char* argv[]) {
           "--fresh_search_roles requires --use_session=false (Path B fresh search).");
     }
     (void)open_spiel::ParseFreshSearchRoles(absl::GetFlag(FLAGS_fresh_search_roles));
+  }
+
+  // PF-2 Part B: fail-closed configuration guard, over EVERY condition that
+  // defines the matched-hybrid controller — not just the ones whose violation
+  // is easy to notice. Each clause below has a distinct silent-failure mode,
+  // and none of them crashes on its own; the arm would simply stop being the
+  // controller B1 registered while still producing a full set of plausible
+  // numbers. That is the failure mode this whole work order is built to
+  // prevent, so every condition is checked, in one place, fatally.
+  if (absl::GetFlag(FLAGS_matched_fallback_sampling)) {
+    // (a) The strategic gate. DEFAULTS FALSE in this binary. With it off, the
+    // Part-B branch is inert and the matched-hybrid arm silently becomes the
+    // greedy-raw arm: three B1 arms collapse to two, identical numbers the
+    // only symptom.
+    if (!absl::GetFlag(FLAGS_check_strategic_state)) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires --check_strategic_state=true. "
+          "With the strategic check off the matched-hybrid arm silently becomes "
+          "the greedy-raw arm.");
+    }
+    // (b) Temperature. The two-phase path passes r_val = 0.0 into
+    // SelectControllerAction, inert ONLY on the argmax branch of
+    // PickActionRespectingTemperature. At any positive temperature that 0.0
+    // becomes a live, wrong draw.
+    if (absl::GetFlag(FLAGS_temperature) != 0.0) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires --temperature=0. At a "
+          "positive temperature the two-phase path's r_val=0.0 would become a "
+          "live, incorrect draw inside SelectControllerAction.");
+    }
+    // (c) The session. Part B lives entirely on the session branch; with
+    // --use_session=false the binary constructs the fresh-search bot instead
+    // (:534/:541) and the flag would do nothing at all — the arm would be
+    // Path B, i.e. the searched arm, wearing the matched arm's label.
+    if (!absl::GetFlag(FLAGS_use_session)) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires --use_session=true. On the "
+          "fresh path the flag is inert and the arm is not the matched-hybrid "
+          "controller.");
+    }
+    // (d)+(e) Policy-only with no purchase/combat budget. These define "raw"
+    // for this arm. With search budget anywhere in the session the arm is a
+    // searched controller, and the primary contrast stops isolating the
+    // strategic searched routine — the round-8 confound, reintroduced
+    // quietly.
+    if (!absl::GetFlag(FLAGS_policy_only)) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires --policy_only=true; "
+          "otherwise the matched arm is a searched controller.");
+    }
+    if (absl::GetFlag(FLAGS_purchase_combat_budget) != 0) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires "
+          "--purchase_combat_budget=0; a positive short-window budget gives the "
+          "matched arm search at purchase/combat decisions.");
+    }
+    // (f) Exactly one searched seat. The Part-B ordinal is ONE counter per
+    // game, mirroring ONE Path-B bot's search_count_. Path B keeps a separate
+    // counter per bot, so with more than one searched seat a single shared
+    // ordinal interleaves the seats' decisions into one sequence and every
+    // derived sampling seed diverges from the Path-B stream it is contracted
+    // to reproduce. The ordinal-sequence test would catch this — but only if
+    // it were run in homogeneous mode, so the guard carries it instead.
+    if (open_spiel::ParseControllerMode(absl::GetFlag(FLAGS_controller_mode)) !=
+        open_spiel::SeatControllerMode::kSingle) {
+      open_spiel::SpielFatalError(
+          "--matched_fallback_sampling=true requires --controller_mode=single. "
+          "The Part-B decision ordinal is one counter per game and mirrors one "
+          "Path-B bot; with multiple searched seats the shared counter cannot "
+          "reproduce any seat's sampling stream.");
+    }
   }
 
   // Set PyTorch thread limit to 1 to avoid thread contention across CPU-bound forward runs
