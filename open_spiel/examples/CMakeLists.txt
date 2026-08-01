@@ -164,6 +164,16 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_pwo5_schema_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo5_schema_test COMMAND dune_pwo5_schema_test)
 
+  # PF-2 Part B: the matched-fallback conformance suite. Classification,
+  # sampler and ordinal parity against Path B's OBSERVED behaviour, each
+  # paired with a discrimination check that the known-wrong alternative
+  # actually fails — B1's primary control is only as trustworthy as these.
+  add_executable(dune_pf2_matched_fallback_test
+    dune_pf2_matched_fallback_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pf2_matched_fallback_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_pf2_matched_fallback_test
+    COMMAND dune_pf2_matched_fallback_test)
+
   # The Memocorders endgame-VP reporting regression. Lives HERE and not in
   # games/dune_imperium/ because that directory's tree hash is a pinned
   # registered quantity (a67f1925...bdd6) asserted by every PWO-5 arm.
