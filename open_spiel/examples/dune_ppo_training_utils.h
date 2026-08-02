@@ -365,6 +365,56 @@ struct Pwo5AuxConfig {
   }
 };
 
+// PF-6 / C: JOINT search-teacher distillation.
+//
+// C's design sums the teacher KL INTO the PPO objective, under PPO's own KL
+// throttle, instead of running it as SEPARATE optimizer steps -- which is
+// what PWO-5 did (dune_ppo_train.cc "Search auxiliary distillation steps"),
+// and which its post-mortem names as one of four UNTESTED hypotheses for the
+// family failure: separate steps competed with PPO rather than shaping it,
+// and were not subject to the throttle that keeps PPO stable.
+//
+// Because the term is added to `total_loss` before the single backward(), it
+// is inside the same graph as the PPO loss and is therefore governed by the
+// same `kl_early_stop` epoch break. That is the whole point of the change.
+//
+// DEFAULT-INERT BY CONSTRUCTION, following the section 7.4 rule stated above
+// for the PWO-5 heads: with lambda 0 or no batch the term is NOT CONSTRUCTED
+// -- no forward, no graph node, no gradient, no exposure to weight decay or
+// to a non-finite value -- rather than built and multiplied by zero.
+//
+// The batch is materialized by the CALLER, once per update. TrainPpoUpdate
+// therefore makes no RNG draw of its own for it, so with the feature off the
+// update's RNG consumption and step count are bit-for-bit unchanged.
+//
+// *** LAMBDA IS NOT COMPARABLE TO PWO-5's LAMBDA. READ THIS BEFORE PICKING ONE.
+//
+// The term is added to EVERY minibatch of EVERY epoch -- the same cadence as
+// the policy KL anchor above it, which is the right shape for a regularizer.
+// PWO-5's separate-step path instead took `search_minibatches_per_update`
+// gradient steps on the teacher, total, per update. So at equal `lambda` the
+// joint path applies the teacher roughly
+//
+//     (ppo_update_epochs * minibatches_per_epoch) / search_minibatches_per_update
+//
+// times as often. With PWO-5's own settings (4 epochs, 16 minibatches, 2
+// separate steps) that is ~32x. Carrying PWO-5's lambda across unchanged
+// would not be "the same treatment delivered differently" -- it would be a
+// far stronger one, and a strength result from it could not be attributed to
+// the objective change. C's registration must derive lambda for THIS cadence
+// and say so; the manipulation check in its section 2 is what would catch a
+// mis-set value, and it is relative to a matched control precisely so that it
+// can.
+struct Pf6JointDistillBatch {
+  torch::Tensor states;         // [N, obs_size], on device
+  torch::Tensor masks;          // [N, action_dim], bool, on device
+  torch::Tensor teacher_probs;  // [N, action_dim], on device
+  double lambda = 0.0;
+  bool Active() const {
+    return lambda != 0.0 && states.defined() && states.numel() > 0;
+  }
+};
+
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
@@ -381,7 +431,10 @@ PpoUpdateStats TrainPpoUpdate(
     // computed, no graph node, no gradient. That is what makes a head-off arm's
     // behaviour independent of the heads' numerics.
     const Pwo5AuxBatch& pwo5_aux = Pwo5AuxBatch(),
-    const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig());
+    const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig(),
+    // PF-6 / C. Default-constructed => lambda 0, no tensors => Active() false
+    // => the term is never constructed. Every existing call site is unchanged.
+    const Pf6JointDistillBatch& pf6_joint = Pf6JointDistillBatch());
 
 // ---------------------------------------------------------------------------
 // PWO-5 head telemetry sidecar (amendment 1 ruling 6).

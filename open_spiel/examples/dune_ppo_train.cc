@@ -141,6 +141,25 @@ ABSL_FLAG(int, search_minibatches_per_update, 2,
 ABSL_FLAG(int, search_minibatch_size, 512,
           "[LEGACY offline-distillation] Size of each search distillation minibatch.");
 
+// --- PF-6 / C: joint distillation. DEFAULT-INERT. -------------------------
+// C's design sums the teacher KL INTO the PPO objective under PPO's own KL
+// throttle, instead of PWO-5's SEPARATE optimizer steps. With this flag false
+// the trainer's objective, RNG draws and step count are bit-for-bit what they
+// were before the flag existed: no batch is materialized (so no RNG is
+// drawn), Pf6JointDistillBatch stays default-constructed, and its Active() is
+// false, so TrainPpoUpdate constructs no term at all.
+//
+// C IS CLOSED. This flag exists so the implementation is written, built and
+// smoke-validated BEFORE any trigger fires -- not assembled in the moment by
+// someone who wants the door open. Turning it on for a registered run
+// requires the C amendment, ratified under section 0.1.
+ABSL_FLAG(bool, search_distill_joint, false,
+          "[PF-6 / C] Sum the search-teacher KL into the PPO objective "
+          "(under PPO's KL throttle) instead of running separate optimizer "
+          "steps. DEFAULT FALSE = bit-for-bit unchanged. Mutually exclusive "
+          "with the legacy separate-step path: enabling this DISABLES those "
+          "steps rather than running both.");
+
 // --- Phase 18B online auxiliary-search collection (combined optimization) ---
 // Treatment-arm switch. When true, each update collects search examples online
 // from the frozen pre-update snapshot and folds them into TrainPpoUpdate as an
@@ -3158,6 +3177,92 @@ int main(int argc, char** argv) {
     search_buffer.LoadFromDirectory(search_label_dir);
   }
 
+  // PF-6 / C: joint distillation. FAIL LOUDLY rather than silently inert.
+  //
+  // The precedent is PF-2's Part-B rule that the matched-fallback flag ON with
+  // --check_strategic_state=false is a FATAL configuration error: a treatment
+  // flag that is on but has nothing to act on produces an arm that LOOKS
+  // treated and is not, which is exactly the ambiguity PWO-5 could not resolve
+  // after the fact. So joint mode with no labels is fatal, not a warning.
+  const bool pf6_joint_distill = absl::GetFlag(FLAGS_search_distill_joint);
+  if (pf6_joint_distill) {
+    if (search_label_dir.empty() || search_buffer.Size() == 0) {
+      SpielFatalError(
+          "--search_distill_joint=true requires a non-empty "
+          "--search_label_dir: joint distillation with no labels would train "
+          "a nominally-treated arm with no treatment.");
+    }
+    if (absl::GetFlag(FLAGS_search_lambda) <= 0.0) {
+      SpielFatalError(
+          "--search_distill_joint=true requires --search_lambda > 0.");
+    }
+    if (absl::GetFlag(FLAGS_online_search_collection)) {
+      SpielFatalError(
+          "--search_distill_joint is mutually exclusive with "
+          "--online_search_collection.");
+    }
+    if (absl::GetFlag(FLAGS_diagnostics_only)) {
+      // The diagnostics-only path deliberately calls TrainPpoUpdate with the
+      // bare PPO signature -- no aux, no PWO-5 heads, and no joint batch. A
+      // joint flag there would be SILENTLY IGNORED, producing a run that
+      // reports itself as treated and is not. Fatal instead.
+      SpielFatalError(
+          "--search_distill_joint is not supported with --diagnostics_only: "
+          "that path runs bare PPO and would silently ignore the flag.");
+    }
+    std::cout << "[PF-6] JOINT distillation ACTIVE: the teacher KL is summed "
+                 "into the PPO objective under its KL throttle; the legacy "
+                 "separate-step path is DISABLED for this run.\n";
+  }
+
+  // Materializes ONE distillation minibatch per update, on device, for the
+  // joint path. Called ONLY when the flag is on, so with the flag off no RNG
+  // is drawn here and `Sample()` is never reached -- which is what makes the
+  // flag-off projection bit-for-bit rather than merely equivalent.
+  //
+  // It draws from the SAME seed stream as the legacy separate-step path
+  // (kStreamSearchSampling, aux index 0). The two paths are mutually
+  // exclusive, so there is no collision, and sharing the stream means a
+  // joint-vs-separate comparison sees the same labels rather than confounding
+  // the objective change with a different draw.
+  auto make_pf6_joint_batch =
+      [&](int update_idx) -> open_spiel::Pf6JointDistillBatch {
+    open_spiel::Pf6JointDistillBatch jb;
+    if (!pf6_joint_distill) return jb;  // inert: no draw, no tensors
+    uint64_t s = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain,
+                                       update_idx, 0,
+                                       dune_seed::kStreamSearchSampling);
+    std::mt19937 rng = dune_seed::MakeRng32(s);
+    std::vector<SearchLabel> lb =
+        search_buffer.Sample(absl::GetFlag(FLAGS_search_minibatch_size), &rng);
+    if (lb.empty()) return jb;
+    int64_t m = static_cast<int64_t>(lb.size());
+    auto cf = torch::TensorOptions().dtype(torch::kFloat32);
+    auto cb = torch::TensorOptions().dtype(torch::kBool);
+    torch::Tensor st = torch::empty({m, obs_size}, cf);
+    torch::Tensor mk = torch::zeros({m, action_size}, cb);
+    torch::Tensor tp = torch::zeros({m, action_size}, cf);
+    float* sp = st.data_ptr<float>();
+    bool* mp = mk.data_ptr<bool>();
+    float* tpp = tp.data_ptr<float>();
+    for (int64_t i = 0; i < m; ++i) {
+      std::memcpy(sp + i * obs_size, lb[i].state.data(),
+                  obs_size * sizeof(float));
+      for (const auto& ap : lb[i].teacher_probs) {
+        int64_t a = ap.first;
+        if (a >= 0 && a < action_size) {
+          mp[i * action_size + a] = true;
+          tpp[i * action_size + a] = ap.second;
+        }
+      }
+    }
+    jb.states = st.to(device);
+    jb.masks = mk.to(device);
+    jb.teacher_probs = tp.to(device);
+    jb.lambda = absl::GetFlag(FLAGS_search_lambda);
+    return jb;
+  };
+
   int rollout_games = absl::GetFlag(FLAGS_rollout_games);
 
   std::string initial_non_value_hash = "";
@@ -3336,7 +3441,8 @@ int main(int argc, char** argv) {
                                    obs_size, action_size, device, master, update, anchor_model,
                                    current_collect.aux_examples, this_search_coef,
                                    online_search_collection ? aux_abort_ratio : 0.0,
-                                   pwo5_batch, pwo5_cfg);
+                                   pwo5_batch, pwo5_cfg,
+                                   make_pf6_joint_batch(update));
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -3432,7 +3538,13 @@ int main(int argc, char** argv) {
       search_buffer.LoadNewFiles(search_label_dir);
     }
 
-    if (search_lambda > 0.0 && search_buffer.Size() > 0) {
+    // PF-6 / C: the legacy SEPARATE-STEP path. Disabled when joint mode is on
+    // -- the two are alternatives, not layers. Running both would apply the
+    // teacher twice per update and confound the very comparison C exists to
+    // make. With --search_distill_joint=false this condition is exactly what
+    // it was before the flag existed.
+    if (!pf6_joint_distill && search_lambda > 0.0 &&
+        search_buffer.Size() > 0) {
       auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
       auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
 
@@ -3594,7 +3706,12 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (search_lambda > 0.0 && search_buffer.Size() > 0) {
+    // Telemetry for the SEPARATE-STEP path only. In joint mode those
+    // accumulators are never written, so printing them would report a
+    // SearchKL of 0.000 for a run that is distilling -- a false readout, not
+    // merely a missing one. Suppressed rather than printed misleadingly.
+    if (!pf6_joint_distill && search_lambda > 0.0 &&
+        search_buffer.Size() > 0) {
       double avg_search_kl = (search_minibatches_per_update > 0) ? (search_kl_sum / search_minibatches_per_update) : 0.0;
       double avg_search_grad = (search_minibatches_per_update > 0) ? (search_grad_sum / search_minibatches_per_update) : 0.0;
       double avg_ppo_grad = (stats.grad_norm_count > 0) ? (stats.grad_norm_sum / stats.grad_norm_count) : 0.0;

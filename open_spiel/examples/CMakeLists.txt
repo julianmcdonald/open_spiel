@@ -128,6 +128,21 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_head_eval dune_search ${TORCH_LIBRARIES})
 
+  # PF-5 item 3: the counterfactual held-out teacher KL on the UNTREATED P
+  # arms. A separate read-only binary, for the same reason head_eval is one --
+  # and specifically NOT a trainer invocation, because the trainer collects a
+  # rollout before optimizing even at --learning_rate=0, which would generate
+  # games and violate PF-5's no-new-games constraint.
+  # Links dune_ppo_training_utils.cc for CenterAndCapLogitsTensor, which
+  # SearchLabelBuffer::ComputeValidationKL calls -- the point being to reuse
+  # the trainer's own transform rather than copy it. The collector comes along
+  # for the same reason it does in dune_ppo_training_utils_test: it satisfies
+  # the flag definitions training utils declares.
+  add_executable(dune_pf5_counterfactual_kl dune_pf5_counterfactual_kl.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_pf5_counterfactual_kl dune_search ${TORCH_LIBRARIES})
+
   # PWO-5 gate 3: sections 7.3 (legacy-inference parity) and 7.4 (head-off
   # parameter invariance). Pure forward passes on a fixed probe set, so it
   # needs no training and takes no thread count.
