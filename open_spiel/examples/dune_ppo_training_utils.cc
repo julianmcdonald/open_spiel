@@ -438,8 +438,7 @@ PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model,
     const std::vector<SearchTrainingExample>& search_examples,
     double search_loss_coef, double abort_grad_norm_ratio,
-    const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg,
-    const Pf6JointDistillBatch& pf6_joint) {
+    const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
   stats.rollout_hash = ComputeRolloutHash(batch);
@@ -1029,43 +1028,11 @@ PpoUpdateStats TrainPpoUpdate(
         }
       };
 
-      // PF-6 / C: the JOINT distillation term, summed into the PPO objective.
-      //
-      // Placed here rather than inside compute_loss() so that it applies on
-      // every path compute_loss() can take (including its early return), with
-      // a single insertion point and no edit to the PPO objective itself.
-      // It runs INSIDE the same autocast scope as the PPO loss, matching the
-      // numerics PWO-5's separate distillation steps used.
-      //
-      // Section 7.4 discipline: when inactive NOTHING here is constructed --
-      // no forward, no graph node, no gradient.
-      auto add_pf6_joint_distill = [&]() {
-        if (!pf6_joint.Active()) return;
-        auto joint_out = model->forward(pf6_joint.states);
-        torch::Tensor jl = CenterAndCapLogitsTensor(
-            joint_out.logits, pf6_joint.masks, logit_cap);
-        torch::Tensor jml =
-            jl.masked_fill(pf6_joint.masks.logical_not(), -1e9f);
-        torch::Tensor jlogp = torch::log_softmax(jml, -1);
-        torch::Tensor jlogt =
-            torch::log(pf6_joint.teacher_probs.clamp_min(1e-12f));
-        // Identical reduction to SearchLabelBuffer::ComputeValidationKL and to
-        // PWO-5's distillation step: sum over actions, then mean over rows.
-        torch::Tensor jkl =
-            (pf6_joint.teacher_probs * (jlogt - jlogp)).sum(-1).mean();
-        total_loss = total_loss + pf6_joint.lambda * jkl;
-      };
-
-      auto compute_loss_with_joint = [&]() {
-        compute_loss();
-        add_pf6_joint_distill();
-      };
-
       if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
         AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
-        compute_loss_with_joint();
+        compute_loss();
       } else {
-        compute_loss_with_joint();
+        compute_loss();
       }
 
       total_loss.backward();
