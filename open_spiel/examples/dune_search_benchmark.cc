@@ -1719,6 +1719,40 @@ int RunCorpusRootBenchmark(
     return 1;
   }
 
+  // WO-PERF-R3 (deliverable 2, WO-3 review F2 forward-fix): self-record the
+  // selected root set so every run carries its own root-set identity. The
+  // Phase-2 root-set hash recipe was lost and could not be reproduced; this
+  // prevents a recurrence. The serialization is deliberately simple, stable, and
+  // documented here so a future run can recompute and compare it by hand:
+  //
+  //   line 1:            "<root_count>"
+  //   one line per root, IN SELECTION ORDER:
+  //                      "<corpus_idx>|<category>|<player>|<round>|<a0,a1,...,ak>"
+  //
+  // The fields are exactly the identifying fields the driver reads from
+  // data/dune_diagnostic_corpus.json to select and reconstruct each root
+  // (corpus_idx pins provenance; history is the reconstruction input; category/
+  // player/round pin the decision). Every line is '\n'-terminated. The root-set
+  // hash is the sha256 of that byte string. It is emitted to stdout (below), to
+  // each per-root JSONL record, and to the batcher-telemetry JSON.
+  std::string root_set_serialization;
+  {
+    std::ostringstream ss;
+    ss << roots.size() << "\n";
+    for (const auto& cs : roots) {
+      ss << cs.corpus_idx << "|" << cs.category << "|"
+         << static_cast<int>(cs.player) << "|" << cs.round << "|";
+      for (size_t k = 0; k < cs.history.size(); ++k) {
+        if (k != 0) ss << ",";
+        ss << static_cast<long long>(cs.history[k]);
+      }
+      ss << "\n";
+    }
+    root_set_serialization = ss.str();
+  }
+  const std::string root_set_sha256 =
+      open_spiel::ComputeStringSHA256(root_set_serialization);
+
   std::cout << "\n=== WO-PERF-3 corpus-root benchmark ===\n"
             << "  evaluator_mode:  " << mode << "\n"
             << "  roots:           " << roots.size() << " (" << role_flag << ")\n"
@@ -1730,7 +1764,9 @@ int RunCorpusRootBenchmark(
               << "  max_queue_wait:  " << timeout_ms << " ms\n";
   }
   std::cout << "  checkpoint:      " << absl::GetFlag(FLAGS_model_checkpoint)
-            << "\n\n";
+            << "\n";
+  std::cout << "  root_set_count:  " << roots.size() << "\n"
+            << "  root_set_sha256: " << root_set_sha256 << "\n\n";
 
   // The shared coordinator (batched mode only).
   std::shared_mutex model_mutex;
@@ -1872,6 +1908,10 @@ int RunCorpusRootBenchmark(
       for (const auto& oc : outcomes) {
         open_spiel::json::Object o;
         o["evaluator_mode"] = mode;
+        // WO-PERF-R3: every record self-records the root-set identity so a
+        // direct-mode run (which emits no telemetry JSON) still carries it.
+        o["root_set_sha256"] = root_set_sha256;
+        o["root_set_count"] = static_cast<int64_t>(roots.size());
         o["root_idx"] = static_cast<int64_t>(oc.root_idx);
         o["corpus_idx"] = static_cast<int64_t>(oc.corpus_idx);
         o["player"] = static_cast<int64_t>(oc.player);
@@ -1940,6 +1980,9 @@ int RunCorpusRootBenchmark(
     if (!tel_path.empty()) {
       open_spiel::json::Object o;
       o["evaluator_mode"] = mode;
+      // WO-PERF-R3 (deliverable 2): root-set identity, self-recorded.
+      o["root_set_sha256"] = root_set_sha256;
+      o["root_set_count"] = static_cast<int64_t>(roots.size());
       o["roots"] = static_cast<int64_t>(roots.size());
       o["workers"] = static_cast<int64_t>(workers);
       o["max_simulations"] = static_cast<int64_t>(max_sims);
