@@ -13,6 +13,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_seed_utils.h"
+#include <atomic>
 #include <unordered_set>
 #include <cmath>
 
@@ -31,6 +32,28 @@ ABSL_DECLARE_FLAG(bool, train_amp);
 ABSL_DECLARE_FLAG(double, grad_clip_norm);
 ABSL_DECLARE_FLAG(bool, diagnostics_only);
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
+// --- WO-PERF-1 (2026-08-14): diagnostics-only performance flags. Both
+// defaults reproduce today's behavior bit-for-bit; neither statistic has any
+// consumer outside diagnostics (PPO Phase-0 findings, 2026-07-29).
+ABSL_FLAG(std::string, diag_prepass_mode, "full",
+          "Phase 5 diagnostics pre-pass mode. 'full' (default): today's "
+          "behavior, an FP32 no-grad forward over the whole rollout every "
+          "update. 'cadenced': fraction_critic_near_1 is computed exactly "
+          "from each transition's stored rollout value (no forward), and "
+          "policy_kl_before is measured over the full rollout only at process "
+          "startup/resume and every --diag_prepass_interval updates, in the "
+          "same autocast precision as rollout inference when on CUDA.");
+ABSL_FLAG(int, diag_prepass_interval, 25,
+          "With --diag_prepass_mode=cadenced, measure policy_kl_before on "
+          "updates where global_update %% this interval == 0 (absolute, like "
+          "--checkpoint_interval), plus always on the first update of the "
+          "process. <= 0 means startup/resume only.");
+ABSL_FLAG(std::string, grad_telemetry_mode, "per_param",
+          "Per-module gradient-norm telemetry. 'per_param' (default): today's "
+          "behavior, one device-to-host .item() read per parameter tensor per "
+          "minibatch (70 reads/minibatch at production size). 'accumulated': "
+          "the six group sums stay on-device in float64 and are read back "
+          "once per update; values are identical on CPU by construction.");
 #endif
 
 namespace open_spiel {
@@ -398,6 +421,18 @@ bool ReadOnlineCollectionState(const std::string& manifest_path,
 }
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+namespace {
+// WO-PERF-1: true until the first TrainPpoUpdate of this process consumes it
+// (only in --diag_prepass_mode=cadenced; full mode never touches it). A
+// resume is always a new process, so first-call-in-process is exactly the
+// "startup/resume" condition the cadenced pre-pass must always measure on.
+std::atomic<bool> g_diag_prepass_first_call{true};
+}  // namespace
+
+void ResetDiagPrepassStateForTesting() {
+  g_diag_prepass_first_call.store(true);
+}
+
 float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps) {
   if (decay_steps == 0) {
     return 1.0f;
@@ -536,51 +571,131 @@ PpoUpdateStats TrainPpoUpdate(
 
   torch::Tensor nontrivial_mask = nontrivial_mask_cpu.to(device);
 
-  // 3. Policy KL Before & Saturation Checks (merged forward pre-pass)
+  // 3. Policy KL Before & Saturation Checks
+  //
+  // WO-PERF-1: two modes. 'full' is the pre-WO merged FP32 forward pre-pass,
+  // bit-for-bit. 'cadenced' takes the full-rollout forward off the hot path:
+  // the saturation metric comes exactly from the stored rollout values (the
+  // actual behavior-policy statistic rather than an FP32 replay of it), and
+  // the policy_kl_before canary is measured only at process startup/resume
+  // and on the --diag_prepass_interval cadence, in rollout-inference autocast
+  // precision on CUDA. Neither statistic has any consumer outside
+  // diagnostics; stats.measured_transitions records how many nontrivial
+  // transitions the KL was actually measured over (0 = "not measured", so an
+  // unmeasured update can never be read as KL == 0).
+  const std::string diag_prepass_mode =
+      ::absl::GetFlag(::FLAGS_diag_prepass_mode);
+  const bool prepass_cadenced = (diag_prepass_mode == "cadenced");
+  if (!prepass_cadenced && diag_prepass_mode != "full") {
+    SpielFatalError("Unknown --diag_prepass_mode: '" + diag_prepass_mode +
+                    "' (expected 'full' or 'cadenced').");
+  }
+
   double kl_before_sum = 0.0;
   int64_t kl_before_nontrivial_count = 0;
-  double value_near_one_count = 0;
 
-  bool was_training = model->is_training();
-  model->eval();
-  {
-    torch::NoGradGuard no_grad;
-    for (int64_t start = 0; start < n; start += minibatch_size) {
-      int64_t end = std::min(start + minibatch_size, n);
-      torch::Tensor mb_states = states.narrow(0, start, end - start);
-      torch::Tensor mb_masks = masks.narrow(0, start, end - start);
-      torch::Tensor mb_actions = actions.narrow(0, start, end - start);
-      torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
-      torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+  if (!prepass_cadenced) {
+    double value_near_one_count = 0;
 
-      auto outputs = model->forward(mb_states);
-      if (!::absl::GetFlag(::FLAGS_train_value_only)) {
-        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-        torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
-        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-        torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+    bool was_training = model->is_training();
+    model->eval();
+    {
+      torch::NoGradGuard no_grad;
+      for (int64_t start = 0; start < n; start += minibatch_size) {
+        int64_t end = std::min(start + minibatch_size, n);
+        torch::Tensor mb_states = states.narrow(0, start, end - start);
+        torch::Tensor mb_masks = masks.narrow(0, start, end - start);
+        torch::Tensor mb_actions = actions.narrow(0, start, end - start);
+        torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
+        torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
 
-        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-        torch::Tensor ratio = torch::exp(log_ratio);
-        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+        auto outputs = model->forward(mb_states);
+        if (!::absl::GetFlag(::FLAGS_train_value_only)) {
+          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+          torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+          torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
 
-        torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
-        if (masked_kl.numel() > 0) {
-          kl_before_sum += masked_kl.sum().item<double>();
-          kl_before_nontrivial_count += masked_kl.numel();
+          torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+          torch::Tensor ratio = torch::exp(log_ratio);
+          torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+          if (masked_kl.numel() > 0) {
+            kl_before_sum += masked_kl.sum().item<double>();
+            kl_before_nontrivial_count += masked_kl.numel();
+          }
+        }
+
+        torch::Tensor mb_values = outputs.values.squeeze(1);
+        torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
+        value_near_one_count += mb_near_one.sum().item<double>();
+      }
+    }
+    if (was_training) {
+      model->train();
+    }
+    stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
+    stats.fraction_critic_near_1 = value_near_one_count / n;
+  } else {
+    // (1) Saturation exactly from the stored rollout-time values -- the same
+    // |v| >= 0.99f predicate the full mode applies to its replayed values,
+    // applied to PpoTransition.value (already copied into old_values_cpu).
+    int64_t stored_near_one_count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+      if (std::abs(old_values_ptr[i]) >= 0.99f) ++stored_near_one_count;
+    }
+    stats.fraction_critic_near_1 = static_cast<double>(stored_near_one_count) / n;
+
+    // (2) The policy_kl_before canary, at startup/resume and on the cadence.
+    const int prepass_interval = ::absl::GetFlag(::FLAGS_diag_prepass_interval);
+    const bool first_update_in_process =
+        g_diag_prepass_first_call.exchange(false);
+    const bool measure_kl_now =
+        first_update_in_process ||
+        (prepass_interval > 0 && global_update % prepass_interval == 0);
+    if (measure_kl_now && !::absl::GetFlag(::FLAGS_train_value_only)) {
+      bool was_training = model->is_training();
+      model->eval();
+      {
+        torch::NoGradGuard no_grad;
+        // Same autocast setup as rollout inference (dune_evaluator.h):
+        // BF16 on CUDA, disabled (plain FP32) on CPU. A NEW scope -- the
+        // PWO-5 section 7.5 cache-clearing guard, not a restructuring of the
+        // existing training autocast scopes below.
+        AutocastGuard autocast_guard(device.type(), device.is_cuda());
+        for (int64_t start = 0; start < n; start += minibatch_size) {
+          int64_t end = std::min(start + minibatch_size, n);
+          torch::Tensor mb_states = states.narrow(0, start, end - start);
+          torch::Tensor mb_masks = masks.narrow(0, start, end - start);
+          torch::Tensor mb_actions = actions.narrow(0, start, end - start);
+          torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
+          torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+
+          auto outputs = model->forward(mb_states);
+          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+          torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+          torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+
+          torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+          torch::Tensor ratio = torch::exp(log_ratio);
+          torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+          if (masked_kl.numel() > 0) {
+            kl_before_sum += masked_kl.sum().item<double>();
+            kl_before_nontrivial_count += masked_kl.numel();
+          }
         }
       }
-
-      torch::Tensor mb_values = outputs.values.squeeze(1);
-      torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
-      value_near_one_count += mb_near_one.sum().item<double>();
+      if (was_training) {
+        model->train();
+      }
     }
+    stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
   }
-  if (was_training) {
-    model->train();
-  }
-  stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
-  stats.fraction_critic_near_1 = value_near_one_count / n;
+  stats.measured_transitions = kl_before_nontrivial_count;
 
   // 4. Return Calibration Diagnostics
   std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
@@ -712,6 +827,26 @@ PpoUpdateStats TrainPpoUpdate(
           pwo5_next_action_games = 0;
   int64_t pwo5_slice_uses = 0;
   int64_t pwo5_presentations = 0;
+
+  // WO-PERF-1 Part B: per-module gradient-telemetry mode. 'per_param' is
+  // today's behavior (one .item() host read per parameter tensor per
+  // minibatch). 'accumulated' keeps the six group sums on-device in float64
+  // and reads them back once per update, after the epoch loop. Group order in
+  // the accumulator: [0]=policy, [1]=value, [2]=trunk, [3]=final_vp,
+  // [4]=terminal_round, [5]=next_own_action.
+  const std::string grad_telemetry_mode =
+      ::absl::GetFlag(::FLAGS_grad_telemetry_mode);
+  const bool grad_telemetry_accumulated =
+      (grad_telemetry_mode == "accumulated");
+  if (!grad_telemetry_accumulated && grad_telemetry_mode != "per_param") {
+    SpielFatalError("Unknown --grad_telemetry_mode: '" + grad_telemetry_mode +
+                    "' (expected 'per_param' or 'accumulated').");
+  }
+  torch::Tensor head_norm_accum;
+  if (grad_telemetry_accumulated) {
+    head_norm_accum = torch::zeros(
+        {6}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
+  }
 
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
@@ -1076,34 +1211,71 @@ PpoUpdateStats TrainPpoUpdate(
         // "value_head", but a future head that did would have been captured by
         // the value branch. Testing the auxiliary names first makes the
         // classification independent of the other branches' patterns.
-        double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
-        double final_vp_sq = 0.0, terminal_round_sq = 0.0, next_action_sq = 0.0;
-        for (const auto& named : model->named_parameters()) {
-          const torch::Tensor& g = named.value().grad();
-          if (!g.defined()) continue;
-          const double sq = g.pow(2).sum().item<double>();
-          const std::string& nm = named.key();
-          if (nm.rfind("final_vp_head", 0) == 0) {
-            final_vp_sq += sq;
-          } else if (nm.rfind("terminal_round_head", 0) == 0) {
-            terminal_round_sq += sq;
-          } else if (nm.rfind("next_own_action_head", 0) == 0) {
-            next_action_sq += sq;
-          } else if (nm.rfind("policy_head", 0) == 0) {
-            policy_sq += sq;
-          } else if (nm.find("value_head") != std::string::npos) {
-            value_sq += sq;
-          } else {
-            trunk_sq += sq;
+        if (!grad_telemetry_accumulated) {
+          double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
+          double final_vp_sq = 0.0, terminal_round_sq = 0.0, next_action_sq = 0.0;
+          for (const auto& named : model->named_parameters()) {
+            const torch::Tensor& g = named.value().grad();
+            if (!g.defined()) continue;
+            const double sq = g.pow(2).sum().item<double>();
+            const std::string& nm = named.key();
+            if (nm.rfind("final_vp_head", 0) == 0) {
+              final_vp_sq += sq;
+            } else if (nm.rfind("terminal_round_head", 0) == 0) {
+              terminal_round_sq += sq;
+            } else if (nm.rfind("next_own_action_head", 0) == 0) {
+              next_action_sq += sq;
+            } else if (nm.rfind("policy_head", 0) == 0) {
+              policy_sq += sq;
+            } else if (nm.find("value_head") != std::string::npos) {
+              value_sq += sq;
+            } else {
+              trunk_sq += sq;
+            }
           }
+          stats.policy_head_grad_norm_sum += std::sqrt(policy_sq);
+          stats.value_head_grad_norm_sum += std::sqrt(value_sq);
+          stats.trunk_grad_norm_sum += std::sqrt(trunk_sq);
+          stats.final_vp_head_grad_norm_sum += std::sqrt(final_vp_sq);
+          stats.terminal_round_head_grad_norm_sum += std::sqrt(terminal_round_sq);
+          stats.next_own_action_head_grad_norm_sum += std::sqrt(next_action_sq);
+          stats.head_grad_norm_count += 1;
+        } else {
+          // WO-PERF-1 Part B: same classification, same accumulation order,
+          // same double-precision arithmetic -- but on-device, so a minibatch
+          // contributes ZERO device-to-host synchronization points here. Each
+          // per-parameter float32 sum is widened to float64 exactly (as
+          // .item<double>() did), group sums accumulate left-to-right in
+          // parameter order (as `policy_sq += sq` did), and sqrt in float64
+          // is correctly rounded on both paths, so the values read back after
+          // the epoch loop are bit-identical to per_param on CPU.
+          auto f64_opts =
+              torch::TensorOptions().dtype(torch::kFloat64).device(device);
+          torch::Tensor group_sq = torch::zeros({6}, f64_opts);
+          for (const auto& named : model->named_parameters()) {
+            const torch::Tensor& g = named.value().grad();
+            if (!g.defined()) continue;
+            torch::Tensor sq = g.pow(2).sum().to(torch::kFloat64);
+            const std::string& nm = named.key();
+            int group_idx;
+            if (nm.rfind("final_vp_head", 0) == 0) {
+              group_idx = 3;
+            } else if (nm.rfind("terminal_round_head", 0) == 0) {
+              group_idx = 4;
+            } else if (nm.rfind("next_own_action_head", 0) == 0) {
+              group_idx = 5;
+            } else if (nm.rfind("policy_head", 0) == 0) {
+              group_idx = 0;
+            } else if (nm.find("value_head") != std::string::npos) {
+              group_idx = 1;
+            } else {
+              group_idx = 2;
+            }
+            group_sq[group_idx] += sq;
+          }
+          head_norm_accum += group_sq.sqrt();
+          stats.head_grad_norm_count += 1;
         }
-        stats.policy_head_grad_norm_sum += std::sqrt(policy_sq);
-        stats.value_head_grad_norm_sum += std::sqrt(value_sq);
-        stats.trunk_grad_norm_sum += std::sqrt(trunk_sq);
-        stats.final_vp_head_grad_norm_sum += std::sqrt(final_vp_sq);
-        stats.terminal_round_head_grad_norm_sum += std::sqrt(terminal_round_sq);
-        stats.next_own_action_head_grad_norm_sum += std::sqrt(next_action_sq);
-        stats.head_grad_norm_count += 1;
       }
 
       double grad_norm =
@@ -1150,6 +1322,21 @@ PpoUpdateStats TrainPpoUpdate(
     stats.epoch_kls.push_back(ep_kl);
 
     if (stats.early_stopped) break;
+  }
+
+  // WO-PERF-1 Part B: the one host readback per update. Adding the whole
+  // accumulated total into the zero-initialized sums is exact (0.0 + x == x),
+  // so the resulting sums match per_param's minibatch-by-minibatch host
+  // accumulation bit-for-bit on CPU.
+  if (grad_telemetry_accumulated && stats.head_grad_norm_count > 0) {
+    torch::Tensor head_norms_cpu = head_norm_accum.to(torch::kCPU);
+    auto head_norms = head_norms_cpu.accessor<double, 1>();
+    stats.policy_head_grad_norm_sum += head_norms[0];
+    stats.value_head_grad_norm_sum += head_norms[1];
+    stats.trunk_grad_norm_sum += head_norms[2];
+    stats.final_vp_head_grad_norm_sum += head_norms[3];
+    stats.terminal_round_head_grad_norm_sum += head_norms[4];
+    stats.next_own_action_head_grad_norm_sum += head_norms[5];
   }
 
   // Phase 18B combined-optimization diagnostics + per-update abort decision.
@@ -1326,9 +1513,24 @@ const char* const kDiagnosticsCsvHeaderV5Suffix =
     "norm_entropy_leader_selection,norm_entropy_n_leader_selection,"
     "max_action_prob,frac_legal_absz_ge_cap,frac_legal_absz_ge_cap_n";
 
+// --- v6 (WO-PERF-1): one column, gated on --diag_prepass_mode=cadenced. ----
+//
+// Gated, not unconditional, for the same reason v5 is gated on
+// --emit_canary_columns: the v4/69 and v5/86 shapes are pinned character by
+// character (dune_pwo5_schema_test; PWO-5 registration section 17.5 item 14
+// makes any other header a STOP for runs under that registration), so a mode
+// that reproduces today's behavior must also reproduce today's header. In
+// cadenced mode the column is what makes a skipped KL measurement (0)
+// distinguishable from a measured KL of zero. Appended AFTER the v5 canary
+// block so the frozen positions 70-86 never move.
+const char* const kDiagnosticsCsvHeaderV6Suffix = ",measured_transitions";
+
 std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
   std::string header(kDiagnosticsCsvHeader);
   if (emit_canary_columns) header += kDiagnosticsCsvHeaderV5Suffix;
+  if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
+    header += kDiagnosticsCsvHeaderV6Suffix;
+  }
   return header;
 }
 
@@ -1668,6 +1870,11 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
           << "," << stats.frac_legal_absz_ge_cap_n;
       ofs.precision(prev_precision);
     }
+    // --- v6 (WO-PERF-1): the KL-measurement denominator, cadenced mode only
+    // (matching DiagnosticsCsvHeader's gate so header and rows never diverge).
+    if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
+      ofs << "," << stats.measured_transitions;
+    }
     ofs << "\n";
     ofs.flush();
     if (!ofs) {
@@ -1757,6 +1964,13 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     add_absz("_primary", stats.precap_absz_primary);
     add_absz("_continuation", stats.precap_absz_continuation);
     add_absz("_purchase", stats.precap_absz_purchase);
+
+    // --- v6 (WO-PERF-1): same name and the same cadenced-mode gate as the
+    // CSV column, so the two formats stay analysable interchangeably.
+    if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
+      obj["measured_transitions"] =
+          static_cast<int64_t>(stats.measured_transitions);
+    }
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";
     ofs.flush();

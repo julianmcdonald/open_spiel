@@ -172,6 +172,13 @@ struct PpoUpdateStats {
   int64_t total_transitions = 0;
   int64_t nontrivial_transitions = 0;
   int64_t forced_transitions = 0;
+  // WO-PERF-1: how many nontrivial transitions the policy_kl_before statistic
+  // was actually measured over this update. 0 alongside policy_kl_before ==
+  // 0.0 means "not measured this update" (a cadenced-mode off-interval update,
+  // or value-only mode), never "measured and exactly zero". In
+  // --diag_prepass_mode=full every update measures, so this equals the
+  // nontrivial count (or 0 under --train_value_only, which skips the KL).
+  int64_t measured_transitions = 0;
   std::vector<double> epoch_kls;
   std::string rollout_hash;
 
@@ -364,6 +371,13 @@ struct Pwo5AuxConfig {
            next_own_action_coef != 0.0;
   }
 };
+
+// WO-PERF-1: re-arm the process-lifetime "first TrainPpoUpdate in this
+// process" marker that forces a full policy_kl_before measurement at
+// startup/resume when --diag_prepass_mode=cadenced. A resume is always a new
+// process, so first-call-in-process IS the startup/resume condition; this
+// hook exists only so tests can exercise the cadence deterministically.
+void ResetDiagPrepassStateForTesting();
 
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,

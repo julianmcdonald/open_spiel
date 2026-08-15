@@ -75,6 +75,10 @@ ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
 ABSL_DECLARE_FLAG(bool, train_value_only);
+// WO-PERF-1 flags (defined in dune_ppo_training_utils.cc).
+ABSL_DECLARE_FLAG(std::string, diag_prepass_mode);
+ABSL_DECLARE_FLAG(int, diag_prepass_interval);
+ABSL_DECLARE_FLAG(std::string, grad_telemetry_mode);
 #endif
 
 using namespace open_spiel;
@@ -1131,6 +1135,203 @@ void TestDiagnosticsCsvSchemaGate() {
     std::filesystem::remove(empty_path);
   } TEST_END();
 }
+
+// ---------------------------------------------------------------------------
+// WO-PERF-1 -- cadenced diagnostics pre-pass and accumulated grad telemetry.
+// ---------------------------------------------------------------------------
+
+// Deterministic fixture for the pre-pass tests. Returns the update stats;
+// fills `out_values` with the stored rollout values the batch carried, so the
+// A3 assertion can recompute the saturation fraction from the SAME stored
+// values the implementation used.
+static PpoUpdateStats RunPrepassFixture(int global_update,
+                                        std::vector<float>* out_values = nullptr) {
+  const int64_t obs = 12, act = 5;
+  torch::manual_seed(0x9E4F1);
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 32, act, 2);
+  model->to(torch::kCPU);
+  torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+  std::vector<PpoTransition> batch(8);
+  for (int i = 0; i < 8; ++i) {
+    batch[i].state = std::vector<float>(obs, 0.07f * (i + 1));
+    batch[i].legal_actions = (i == 7) ? std::vector<Action>{1}  // forced row
+                                      : std::vector<Action>{0, 1, 2};
+    batch[i].action =
+        batch[i].legal_actions[static_cast<size_t>(i) %
+                               batch[i].legal_actions.size()];
+    batch[i].old_log_prob = -1.0f;
+    batch[i].reward = 0.0f;
+    // Exercise the |v| >= 0.99f boundary exactly: at it, above it (negative
+    // side), and just below it.
+    batch[i].value = (i == 0) ? 0.99f
+                   : (i == 1) ? -0.995f
+                   : (i == 2) ? 0.9899f
+                              : 0.1f * i;
+    batch[i].advantage = (i % 2) ? 0.5f : -0.5f;
+    batch[i].return_value = 0.2f;
+    batch[i].player_id = 0;
+    batch[i].episode_id = 100 + i;
+  }
+  if (out_values) {
+    out_values->clear();
+    for (const auto& t : batch) out_values->push_back(t.value);
+  }
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+  absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+  absl::SetFlag(&FLAGS_normalize_advantages, true);
+  absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+  absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+  absl::SetFlag(&FLAGS_value_coef, 0.5);
+  absl::SetFlag(&FLAGS_logit_cap, 10.0);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_train_amp, false);
+  absl::SetFlag(&FLAGS_grad_clip_norm, 0.5);
+  absl::SetFlag(&FLAGS_diagnostics_only, false);
+  absl::SetFlag(&FLAGS_train_value_only, false);
+  torch::manual_seed(31337);
+  return TrainPpoUpdate(model, opt, batch, obs, act, torch::kCPU,
+                        /*master=*/11, global_update);
+}
+
+// WO-PERF-1 acceptance A2 + A3.
+void TestDiagPrepassCadenced() {
+  TEST_BEGIN("WO-PERF-1: cadenced pre-pass (stored-value saturation, KL cadence, measured_transitions)") {
+    // Full mode measures every update: the denominator is the nontrivial
+    // count (row 7 is forced and excluded).
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "full");
+    PpoUpdateStats full = RunPrepassFixture(/*global_update=*/7);
+    CHECK_EQ(full.nontrivial_transitions, int64_t{7});
+    CHECK_EQ(full.measured_transitions, full.nontrivial_transitions);
+
+    // Cadenced, first update in a (reset) process: measured even off-interval.
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "cadenced");
+    absl::SetFlag(&FLAGS_diag_prepass_interval, 25);
+    ResetDiagPrepassStateForTesting();
+    std::vector<float> stored_values;
+    PpoUpdateStats first = RunPrepassFixture(/*global_update=*/7, &stored_values);
+    CHECK_EQ(first.measured_transitions, first.nontrivial_transitions);
+    UTILS_CHECK(first.policy_kl_before > 0.0);
+
+    // A3: the stored-value fraction_critic_near_1 equals a direct
+    // recomputation from the same stored values -- exactly, no tolerance.
+    int64_t near_one = 0;
+    for (float v : stored_values) {
+      if (std::abs(v) >= 0.99f) ++near_one;
+    }
+    CHECK_EQ(near_one, int64_t{2});  // 0.99f and -0.995f; 0.9899f is below
+    UTILS_CHECK(first.fraction_critic_near_1 ==
+                static_cast<double>(near_one) / stored_values.size());
+
+    // Off-cadence update: the KL is NOT measured, and that is distinguishable
+    // from a measured KL of zero by measured_transitions == 0 (A2).
+    PpoUpdateStats skipped = RunPrepassFixture(/*global_update=*/8);
+    CHECK_EQ(skipped.measured_transitions, int64_t{0});
+    UTILS_CHECK(skipped.policy_kl_before == 0.0);
+    // The saturation metric is unconditional in cadenced mode.
+    UTILS_CHECK(skipped.fraction_critic_near_1 == first.fraction_critic_near_1);
+
+    // On-cadence update (50 % 25 == 0): measured again.
+    PpoUpdateStats on_cadence = RunPrepassFixture(/*global_update=*/50);
+    CHECK_EQ(on_cadence.measured_transitions, on_cadence.nontrivial_transitions);
+
+    // The v6 column: present, LAST, and carrying the value -- in cadenced
+    // mode. Header and row stay the same width.
+    const std::string csv_path = "wo_perf1_diag.csv";
+    std::filesystem::remove(csv_path);
+    WriteDiagnostics(csv_path, 8, skipped, 0.0, 0.0, 0.0, /*seed=*/1, "u", "p",
+                     "f", 0.0, 0.0, 0.0, /*validation_kl=*/0.0);
+    std::vector<std::string> lines = ReadLines(csv_path);
+    CHECK_EQ(lines.size(), static_cast<size_t>(2));
+    std::vector<std::string> header = SplitCsvRow(lines[0]);
+    std::vector<std::string> row = SplitCsvRow(lines[1]);
+    CHECK_EQ(header.size(), row.size());
+    UTILS_CHECK(header.back() == "measured_transitions");
+    CHECK_EQ(row.back(), std::string("0"));
+    std::filesystem::remove(csv_path);
+
+    // Back to defaults: the v4 header shape is untouched in full mode.
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "full");
+    CHECK_EQ(SplitCsvRow(DiagnosticsCsvHeader(false)).size(),
+             static_cast<size_t>(69));
+    ResetDiagPrepassStateForTesting();
+  } TEST_END();
+}
+
+// Deterministic fixture for the telemetry-mode parity test. Returns the
+// post-update weight hash; fills `out_stats`.
+static std::string RunTelemetryFixture(const char* mode,
+                                       PpoUpdateStats* out_stats) {
+  absl::SetFlag(&FLAGS_grad_telemetry_mode, mode);
+  const int64_t obs = 12, act = 5;
+  torch::manual_seed(0xB0B57);
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 32, act, 2);
+  model->to(torch::kCPU);
+  torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+  std::vector<PpoTransition> batch(8);
+  for (int i = 0; i < 8; ++i) {
+    batch[i].state = std::vector<float>(obs, 0.05f * (i + 1));
+    batch[i].legal_actions = (i % 2 == 0) ? std::vector<Action>{0, 1, 2}
+                                          : std::vector<Action>{1, 3, 4};
+    batch[i].action = batch[i].legal_actions[i % 3];
+    batch[i].old_log_prob = -1.1f;
+    batch[i].reward = 0.1f * i;
+    batch[i].value = 0.02f * i - 0.05f;
+    batch[i].advantage = (i % 2 == 0) ? 0.3f : -0.4f;
+    batch[i].return_value = 0.1f * i - 0.2f;
+    batch[i].player_id = i % 4;
+    batch[i].episode_id = 200 + i;
+  }
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);   // 2 minibatches/epoch
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+  absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+  absl::SetFlag(&FLAGS_normalize_advantages, true);
+  absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+  absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+  absl::SetFlag(&FLAGS_value_coef, 0.5);
+  absl::SetFlag(&FLAGS_logit_cap, 10.0);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_train_amp, false);
+  absl::SetFlag(&FLAGS_grad_clip_norm, 0.5);
+  absl::SetFlag(&FLAGS_diagnostics_only, false);
+  absl::SetFlag(&FLAGS_train_value_only, false);
+  torch::manual_seed(908);
+  PpoUpdateStats s = TrainPpoUpdate(model, opt, batch, obs, act, torch::kCPU,
+                                    /*master=*/13, /*global_update=*/9);
+  if (out_stats) *out_stats = s;
+  absl::SetFlag(&FLAGS_grad_telemetry_mode, "per_param");
+  return HashModelParams(model);
+}
+
+// WO-PERF-1 acceptance A5.
+void TestGradTelemetryAccumulatedParity() {
+  TEST_BEGIN("WO-PERF-1: accumulated grad telemetry == per_param bit-for-bit on CPU") {
+    PpoUpdateStats per_param_stats, accumulated_stats;
+    std::string h_per = RunTelemetryFixture("per_param", &per_param_stats);
+    std::string h_acc = RunTelemetryFixture("accumulated", &accumulated_stats);
+    // The telemetry mode must not perturb training at all.
+    UTILS_CHECK(h_per == h_acc);
+    CHECK_EQ(per_param_stats.head_grad_norm_count,
+             accumulated_stats.head_grad_norm_count);
+    UTILS_CHECK(per_param_stats.head_grad_norm_count > 0);
+    // The emitted group means match EXACTLY -- ==, not "near".
+    UTILS_CHECK(per_param_stats.PolicyHeadGradNormMean() ==
+                accumulated_stats.PolicyHeadGradNormMean());
+    UTILS_CHECK(per_param_stats.ValueHeadGradNormMean() ==
+                accumulated_stats.ValueHeadGradNormMean());
+    UTILS_CHECK(per_param_stats.TrunkGradNormMean() ==
+                accumulated_stats.TrunkGradNormMean());
+    UTILS_CHECK(per_param_stats.FinalVpHeadGradNormMean() ==
+                accumulated_stats.FinalVpHeadGradNormMean());
+    UTILS_CHECK(per_param_stats.TerminalRoundHeadGradNormMean() ==
+                accumulated_stats.TerminalRoundHeadGradNormMean());
+    UTILS_CHECK(per_param_stats.NextOwnActionHeadGradNormMean() ==
+                accumulated_stats.NextOwnActionHeadGradNormMean());
+    // Nontrivial evidence: the compared quantities are not all zero.
+    UTILS_CHECK(per_param_stats.PolicyHeadGradNormMean() > 0.0);
+    UTILS_CHECK(per_param_stats.TrunkGradNormMean() > 0.0);
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -1156,6 +1357,8 @@ int main() {
   TestSamplePolicyActionTinyProbabilityNotFloored();
   TestDiagnosticsPersistAuxMetrics();
   TestDiagnosticsCsvSchemaGate();
+  TestDiagPrepassCadenced();
+  TestGradTelemetryAccumulatedParity();
 #endif
 
   // -----------------------------------------------------------------------
