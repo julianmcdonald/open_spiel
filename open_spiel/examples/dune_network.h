@@ -783,7 +783,18 @@ public:
         return s;
     }
 
-    // WO-PERF-3: rich, opt-in telemetry for the Phase-2 "Batcher" list. Safe to
+    // R2 (WO-3 review F1): arms the per-batch bookkeeping below (batch-size
+    // record, per-row queue-wait accounting, split-leaf-group maps). Call it
+    // BEFORE the workload starts; without it those sections are skipped and
+    // GetBatcherTelemetry() reports zeros for the affected fields while the
+    // always-on counters (rows, batches, class counts, timeout flushes) stay
+    // live. Existing consumers that never opt in are unaffected by design.
+    void EnableBatcherTelemetry() {
+        batcher_telemetry_enabled_.store(true, std::memory_order_relaxed);
+    }
+
+    // WO-PERF-3: rich, opt-in telemetry for the Phase-2 "Batcher" list — the
+    // detailed sections require EnableBatcherTelemetry() first. Safe to
     // call from another thread while the runner is live (all reads are atomic or
     // guarded by telemetry_mutex_); intended to be read once after the workload
     // drains. Percentiles are computed from the recorded per-batch sizes.
@@ -886,6 +897,10 @@ private:
     std::atomic<uint64_t> group_wait_ns_sum_{0};
     std::atomic<uint64_t> group_wait_ns_max_{0};
     std::atomic<uint64_t> group_wait_n_{0};
+    // R2 (WO-3 review F1): per-batch bookkeeping is OPT-IN. Consumers that
+    // never call EnableBatcherTelemetry() pay one relaxed load per physical
+    // batch and hold no growing state.
+    std::atomic<bool> batcher_telemetry_enabled_{false};
     mutable std::mutex telemetry_mutex_;          // guards physical_batch_sizes_
     std::vector<uint32_t> physical_batch_sizes_;  // one entry per physical batch
     // Runner-thread-only maps for split-leaf-group detection. A leaf group's
@@ -958,6 +973,12 @@ private:
             if (timeout_flush) {
                 timeout_flush_batches_.fetch_add(1, std::memory_order_relaxed);
             }
+            // R2 (WO-3 review F1): the per-batch size record, per-row
+            // queue-wait accounting, and split-group maps below run ONLY for a
+            // caller that opted in via EnableBatcherTelemetry(). The teacher,
+            // calibration, and fidelity-gate consumers never opt in, so they
+            // hold no growing state and do no per-row telemetry work.
+            if (batcher_telemetry_enabled_.load(std::memory_order_relaxed)) {
             {
                 std::lock_guard<std::mutex> lk(telemetry_mutex_);
                 physical_batch_sizes_.push_back(static_cast<uint32_t>(batch_size));
@@ -1010,6 +1031,7 @@ private:
                     group_rows_left_.erase(gid);
                 }
             }
+            }  // if (batcher_telemetry_enabled_) — R2 opt-in gate
 
             // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop based on model_input_dim_
             if (!pinned_allocated) {

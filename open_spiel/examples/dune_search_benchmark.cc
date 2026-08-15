@@ -1739,6 +1739,9 @@ int RunCorpusRootBenchmark(
     batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
         search_model, target, timeout_ms, device, &model_mutex,
         /*logit_cap=*/0.0f);
+    // R2: the corpus driver is the one consumer that reads the detailed
+    // batcher telemetry, so it alone arms the per-batch bookkeeping.
+    batched_eval->EnableBatcherTelemetry();
   }
 
   // Snapshot the evaluator-side leaf-value counter so its DELTA independently
