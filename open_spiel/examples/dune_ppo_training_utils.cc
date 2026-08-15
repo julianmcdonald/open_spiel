@@ -14,6 +14,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_seed_utils.h"
 #include <atomic>
+#include <mutex>
 #include <unordered_set>
 #include <cmath>
 
@@ -422,15 +423,25 @@ bool ReadOnlineCollectionState(const std::string& manifest_path,
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 namespace {
-// WO-PERF-1: true until the first TrainPpoUpdate of this process consumes it
-// (only in --diag_prepass_mode=cadenced; full mode never touches it). A
-// resume is always a new process, so first-call-in-process is exactly the
-// "startup/resume" condition the cadenced pre-pass must always measure on.
-std::atomic<bool> g_diag_prepass_first_call{true};
+// WO-PERF-1 (R2 review fix F2): the "first TrainPpoUpdate in this process"
+// marker is keyed PER MODEL (module identity), not process-global, so a
+// process that trains two models (e.g. a pilot arm and a live arm) force-
+// measures each model's own first update. A resume is always a new process,
+// so first-call-per-model-in-process is exactly the "startup/resume"
+// condition the cadenced pre-pass must always measure on. Only touched in
+// --diag_prepass_mode=cadenced; full mode never reaches it.
+std::mutex g_diag_prepass_seen_mu;
+std::unordered_set<const void*> g_diag_prepass_seen_models;
+// Returns true exactly once per model identity per process (per reset).
+bool ConsumeFirstPrepassForModel(const void* model_identity) {
+  std::lock_guard<std::mutex> lock(g_diag_prepass_seen_mu);
+  return g_diag_prepass_seen_models.insert(model_identity).second;
+}
 }  // namespace
 
 void ResetDiagPrepassStateForTesting() {
-  g_diag_prepass_first_call.store(true);
+  std::lock_guard<std::mutex> lock(g_diag_prepass_seen_mu);
+  g_diag_prepass_seen_models.clear();
 }
 
 float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps) {
@@ -581,7 +592,8 @@ PpoUpdateStats TrainPpoUpdate(
   // and on the --diag_prepass_interval cadence, in rollout-inference autocast
   // precision on CUDA. Neither statistic has any consumer outside
   // diagnostics; stats.measured_transitions records how many nontrivial
-  // transitions the KL was actually measured over (0 = "not measured", so an
+  // transitions the KL was actually measured over (-1 = "not measured this
+  // update", 0 = "measured, but zero nontrivial transitions"; either way an
   // unmeasured update can never be read as KL == 0).
   const std::string diag_prepass_mode =
       ::absl::GetFlag(::FLAGS_diag_prepass_mode);
@@ -593,6 +605,10 @@ PpoUpdateStats TrainPpoUpdate(
 
   double kl_before_sum = 0.0;
   int64_t kl_before_nontrivial_count = 0;
+  // R2 review fix F1: distinguishes "KL not measured this update" (emitted as
+  // measured_transitions = -1) from "measured over zero nontrivial
+  // transitions" (0). Full mode measures every update, so it stays true there.
+  bool kl_measured_this_update = true;
 
   if (!prepass_cadenced) {
     double value_near_one_count = 0;
@@ -649,12 +665,14 @@ PpoUpdateStats TrainPpoUpdate(
 
     // (2) The policy_kl_before canary, at startup/resume and on the cadence.
     const int prepass_interval = ::absl::GetFlag(::FLAGS_diag_prepass_interval);
-    const bool first_update_in_process =
-        g_diag_prepass_first_call.exchange(false);
+    const bool first_update_for_model =
+        ConsumeFirstPrepassForModel(static_cast<const void*>(model.get()));
     const bool measure_kl_now =
-        first_update_in_process ||
+        first_update_for_model ||
         (prepass_interval > 0 && global_update % prepass_interval == 0);
-    if (measure_kl_now && !::absl::GetFlag(::FLAGS_train_value_only)) {
+    kl_measured_this_update =
+        measure_kl_now && !::absl::GetFlag(::FLAGS_train_value_only);
+    if (kl_measured_this_update) {
       bool was_training = model->is_training();
       model->eval();
       {
@@ -695,7 +713,8 @@ PpoUpdateStats TrainPpoUpdate(
     }
     stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
   }
-  stats.measured_transitions = kl_before_nontrivial_count;
+  stats.measured_transitions =
+      kl_measured_this_update ? kl_before_nontrivial_count : int64_t{-1};
 
   // 4. Return Calibration Diagnostics
   std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
@@ -1520,8 +1539,9 @@ const char* const kDiagnosticsCsvHeaderV5Suffix =
 // character (dune_pwo5_schema_test; PWO-5 registration section 17.5 item 14
 // makes any other header a STOP for runs under that registration), so a mode
 // that reproduces today's behavior must also reproduce today's header. In
-// cadenced mode the column is what makes a skipped KL measurement (0)
-// distinguishable from a measured KL of zero. Appended AFTER the v5 canary
+// cadenced mode the column is what makes a skipped KL measurement (-1)
+// distinguishable from a measured KL of zero (>= 0; 0 itself means "measured
+// over zero nontrivial transitions"). Appended AFTER the v5 canary
 // block so the frozen positions 70-86 never move.
 const char* const kDiagnosticsCsvHeaderV6Suffix = ",measured_transitions";
 

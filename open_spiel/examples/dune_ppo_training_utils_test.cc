@@ -1224,9 +1224,11 @@ void TestDiagPrepassCadenced() {
                 static_cast<double>(near_one) / stored_values.size());
 
     // Off-cadence update: the KL is NOT measured, and that is distinguishable
-    // from a measured KL of zero by measured_transitions == 0 (A2).
+    // from a measured KL of zero by measured_transitions == -1 (A2; the R2
+    // sentinel — 0 is reserved for "measured over zero nontrivial
+    // transitions", e.g. an all-forced rollout).
     PpoUpdateStats skipped = RunPrepassFixture(/*global_update=*/8);
-    CHECK_EQ(skipped.measured_transitions, int64_t{0});
+    CHECK_EQ(skipped.measured_transitions, int64_t{-1});
     UTILS_CHECK(skipped.policy_kl_before == 0.0);
     // The saturation metric is unconditional in cadenced mode.
     UTILS_CHECK(skipped.fraction_critic_near_1 == first.fraction_critic_near_1);
@@ -1247,7 +1249,8 @@ void TestDiagPrepassCadenced() {
     std::vector<std::string> row = SplitCsvRow(lines[1]);
     CHECK_EQ(header.size(), row.size());
     UTILS_CHECK(header.back() == "measured_transitions");
-    CHECK_EQ(row.back(), std::string("0"));
+    // R2 sentinel: an unmeasured update serializes as -1, never 0.
+    CHECK_EQ(row.back(), std::string("-1"));
     std::filesystem::remove(csv_path);
 
     // Back to defaults: the v4 header shape is untouched in full mode.

@@ -372,11 +372,13 @@ struct Pwo5AuxConfig {
   }
 };
 
-// WO-PERF-1: re-arm the process-lifetime "first TrainPpoUpdate in this
-// process" marker that forces a full policy_kl_before measurement at
-// startup/resume when --diag_prepass_mode=cadenced. A resume is always a new
-// process, so first-call-in-process IS the startup/resume condition; this
-// hook exists only so tests can exercise the cadence deterministically.
+// WO-PERF-1 (R2: per-model): re-arm the per-model "first TrainPpoUpdate in
+// this process" markers that force a full policy_kl_before measurement at
+// startup/resume when --diag_prepass_mode=cadenced. The marker is keyed on
+// module identity, so a process training two models measures each model's
+// first update. A resume is always a new process, so first-call-per-model IS
+// the startup/resume condition; this hook exists only so tests can exercise
+// the cadence deterministically.
 void ResetDiagPrepassStateForTesting();
 
 PpoUpdateStats TrainPpoUpdate(
