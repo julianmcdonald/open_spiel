@@ -173,11 +173,22 @@ struct PpoUpdateStats {
   int64_t nontrivial_transitions = 0;
   int64_t forced_transitions = 0;
   // WO-PERF-1: how many nontrivial transitions the policy_kl_before statistic
-  // was actually measured over this update. 0 alongside policy_kl_before ==
-  // 0.0 means "not measured this update" (a cadenced-mode off-interval update,
-  // or value-only mode), never "measured and exactly zero". In
+  // was actually measured over this update.
+  //
+  //   -1  = NOT MEASURED this update (a cadenced-mode off-interval update, or
+  //         value-only mode).
+  //    0  = measured, and there were zero nontrivial transitions.
+  //
+  // Either way an unmeasured update can never be read as KL == 0. In
   // --diag_prepass_mode=full every update measures, so this equals the
   // nontrivial count (or 0 under --train_value_only, which skips the KL).
+  //
+  // (Corrected 2026-08-16. This comment documented 0 as the not-measured
+  // sentinel, which WO-PERF-R2 had already changed to -1 in the .cc without
+  // updating it here. Anything gating on `measured_transitions == 0` to mean
+  // "not measured" would misclassify every genuinely-measured-but-empty
+  // update. The implementation is dune_ppo_training_utils.cc:716-717 and its
+  // comment at :594-597; this header now agrees with both.)
   int64_t measured_transitions = 0;
   std::vector<double> epoch_kls;
   std::string rollout_hash;
