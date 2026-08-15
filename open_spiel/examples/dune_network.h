@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <unordered_map>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -576,6 +577,46 @@ private:
     mutable std::atomic<uint64_t> requests_{0};
 };
 
+// WO-PERF-3: permanent, opt-in telemetry for the shared batched-inference
+// coordinator. Every field here is DERIVED from counters the runner/actor
+// threads increment purely as a side effect; none of it changes which requests
+// land in which physical batch, so it is behaviour-neutral for every existing
+// consumer of BatchedEvaluator. `submitted_rows`/`physical_batches`/
+// `max_batch_size` duplicate EvaluatorStats so the batcher can be read through
+// one struct. The logical-call decomposition is BY SUBMISSION METHOD: a
+// one-row `Evaluate()` (opponent Prior or an out-of-MCTS raw prior) increments
+// `single_row_calls`; a `EvaluateBatch()` of N rows (a searched-leaf
+// PriorAndEvaluate/Evaluate group) increments `group_calls` and adds N to
+// `group_rows`. Hence the identity `submitted_rows == single_row_calls +
+// group_rows` holds by construction (Phase-2 "rows are not logical calls").
+// Device-side timings (H2D/D2H/forward/sync, utilisation) are intentionally
+// ABSENT under RC-1 (no GPU); a GPU follow-up WO adds them in the runner.
+struct BatcherTelemetry {
+    // Row/batch level.
+    uint64_t submitted_rows = 0;          // total observation rows enqueued
+    uint64_t physical_batches = 0;        // model forwards actually run
+    uint64_t max_batch_size = 0;          // largest realised physical batch
+    double mean_batch_size = 0.0;
+    uint64_t p50_batch_size = 0;
+    uint64_t p95_batch_size = 0;
+    int target_batch_size = 0;            // configured target row count
+    int timeout_ms = 0;                   // configured max queue wait
+    double target_occupancy = 0.0;        // mean_batch_size / target_batch_size
+    uint64_t timeout_flush_batches = 0;   // batches dispatched under-target on deadline
+    // Logical calls by request class.
+    uint64_t single_row_calls = 0;        // Evaluate() invocations (1 row each)
+    uint64_t group_calls = 0;             // EvaluateBatch() invocations (leaf groups)
+    uint64_t group_rows = 0;              // sum of rows across EvaluateBatch() calls
+    uint64_t leaf_groups_split = 0;       // leaf groups whose rows spanned >1 batch
+    // Queue-wait by request class (per row, milliseconds).
+    double single_wait_ms_mean = 0.0;
+    double single_wait_ms_max = 0.0;
+    uint64_t single_wait_n = 0;
+    double group_wait_ms_mean = 0.0;
+    double group_wait_ms_max = 0.0;
+    uint64_t group_wait_n = 0;
+};
+
 class BatchedEvaluator : public IGameEvaluator {
 public:
     BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
@@ -622,10 +663,23 @@ public:
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // WO-PERF-3: single now() serves both the existing first-request
+            // stamp (semantics unchanged: assigned only when the queue was
+            // empty) and this row's per-request enqueue stamp.
+            auto now = std::chrono::steady_clock::now();
             if (requests_.empty()) {
-                first_request_ts_ = std::chrono::steady_clock::now();
+                first_request_ts_ = now;
             }
-            requests_.push_back({&obs, &result, &ready});
+            Request req;
+            req.obs = &obs;
+            req.result_dest = &result;
+            req.ready_flag = &ready;
+            req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            req.group_size = 1;
+            req.is_group = false;
+            req.enqueue_ts = now;
+            requests_.push_back(req);
+            single_row_calls_.fetch_add(1, std::memory_order_relaxed);
 
             // Only wake the Runner on the first arrival or when the batch is full
             if (requests_.size() == 1 || requests_.size() >= (size_t)target_batch_size_) {
@@ -666,13 +720,28 @@ public:
         auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
             if (requests_.empty()) {
-                first_request_ts_ = std::chrono::steady_clock::now();
+                first_request_ts_ = now;
             }
+            // WO-PERF-3: one group id for the whole leaf group so the runner can
+            // detect when its rows straddle two physical batches.
+            const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t gsize = static_cast<uint32_t>(observations.size());
             for (size_t i = 0; i < observations.size(); ++i) {
                 ready[i].store(false, std::memory_order_relaxed);
-                requests_.push_back({&observations[i], &results[i], &ready[i]});
+                Request req;
+                req.obs = &observations[i];
+                req.result_dest = &results[i];
+                req.ready_flag = &ready[i];
+                req.group_id = gid;
+                req.group_size = gsize;
+                req.is_group = true;
+                req.enqueue_ts = now;
+                requests_.push_back(req);
             }
+            group_calls_.fetch_add(1, std::memory_order_relaxed);
+            group_rows_.fetch_add(gsize, std::memory_order_relaxed);
             // Submit all player observations atomically so the runner can form
             // a useful batch without four serial queue/wait cycles.
             cv_.notify_one();
@@ -714,11 +783,71 @@ public:
         return s;
     }
 
+    // WO-PERF-3: rich, opt-in telemetry for the Phase-2 "Batcher" list. Safe to
+    // call from another thread while the runner is live (all reads are atomic or
+    // guarded by telemetry_mutex_); intended to be read once after the workload
+    // drains. Percentiles are computed from the recorded per-batch sizes.
+    BatcherTelemetry GetBatcherTelemetry() const {
+        BatcherTelemetry t;
+        t.submitted_rows = total_requests_.load(std::memory_order_relaxed);
+        t.physical_batches = total_batches_.load(std::memory_order_relaxed);
+        t.max_batch_size = max_batch_size_seen_.load(std::memory_order_relaxed);
+        t.target_batch_size = target_batch_size_;
+        t.timeout_ms = timeout_ms_;
+        t.timeout_flush_batches = timeout_flush_batches_.load(std::memory_order_relaxed);
+        t.single_row_calls = single_row_calls_.load(std::memory_order_relaxed);
+        t.group_calls = group_calls_.load(std::memory_order_relaxed);
+        t.group_rows = group_rows_.load(std::memory_order_relaxed);
+        t.leaf_groups_split = leaf_groups_split_.load(std::memory_order_relaxed);
+
+        std::vector<uint32_t> sizes;
+        {
+            std::lock_guard<std::mutex> lk(telemetry_mutex_);
+            sizes = physical_batch_sizes_;
+        }
+        if (!sizes.empty()) {
+            std::sort(sizes.begin(), sizes.end());
+            double sum = 0.0;
+            for (uint32_t s : sizes) sum += s;
+            t.mean_batch_size = sum / sizes.size();
+            auto pct = [&sizes](double p) -> uint64_t {
+                size_t idx = static_cast<size_t>(std::round(p * (sizes.size() - 1)));
+                return static_cast<uint64_t>(sizes[idx]);
+            };
+            t.p50_batch_size = pct(0.50);
+            t.p95_batch_size = pct(0.95);
+        }
+        t.target_occupancy =
+            target_batch_size_ > 0 ? t.mean_batch_size / target_batch_size_ : 0.0;
+
+        t.single_wait_n = single_wait_n_.load(std::memory_order_relaxed);
+        t.group_wait_n = group_wait_n_.load(std::memory_order_relaxed);
+        t.single_wait_ms_mean =
+            t.single_wait_n > 0
+                ? (single_wait_ns_sum_.load(std::memory_order_relaxed) / 1e6) / t.single_wait_n
+                : 0.0;
+        t.group_wait_ms_mean =
+            t.group_wait_n > 0
+                ? (group_wait_ns_sum_.load(std::memory_order_relaxed) / 1e6) / t.group_wait_n
+                : 0.0;
+        t.single_wait_ms_max = single_wait_ns_max_.load(std::memory_order_relaxed) / 1e6;
+        t.group_wait_ms_max = group_wait_ns_max_.load(std::memory_order_relaxed) / 1e6;
+        return t;
+    }
+
 private:
     struct Request {
         const std::vector<float>* obs;
         EvalResult* result_dest;
         std::atomic<bool>* ready_flag;
+        // WO-PERF-3 telemetry tags (no effect on dispatch). group_id is unique
+        // per logical call; a one-row Evaluate() is its own group. is_group is
+        // true only for EvaluateBatch() (searched-leaf) rows. enqueue_ts stamps
+        // when the row entered the queue so the runner can measure queue wait.
+        uint64_t group_id = 0;
+        uint32_t group_size = 1;
+        bool is_group = false;
+        std::chrono::steady_clock::time_point enqueue_ts{};
     };
 
     std::mutex park_mutex_;
@@ -744,6 +873,27 @@ private:
     std::atomic<uint64_t> total_requests_{0};
     std::atomic<uint64_t> max_batch_size_seen_{0};
 
+    // --- WO-PERF-3 telemetry (additive; does not influence dispatch) ---------
+    std::atomic<uint64_t> next_group_id_{1};
+    std::atomic<uint64_t> single_row_calls_{0};   // Evaluate() invocations
+    std::atomic<uint64_t> group_calls_{0};        // EvaluateBatch() invocations
+    std::atomic<uint64_t> group_rows_{0};         // rows across EvaluateBatch() calls
+    std::atomic<uint64_t> timeout_flush_batches_{0};
+    std::atomic<uint64_t> leaf_groups_split_{0};
+    std::atomic<uint64_t> single_wait_ns_sum_{0};
+    std::atomic<uint64_t> single_wait_ns_max_{0};
+    std::atomic<uint64_t> single_wait_n_{0};
+    std::atomic<uint64_t> group_wait_ns_sum_{0};
+    std::atomic<uint64_t> group_wait_ns_max_{0};
+    std::atomic<uint64_t> group_wait_n_{0};
+    mutable std::mutex telemetry_mutex_;          // guards physical_batch_sizes_
+    std::vector<uint32_t> physical_batch_sizes_;  // one entry per physical batch
+    // Runner-thread-only maps for split-leaf-group detection. A leaf group's
+    // rows are contiguous in the deque, so within one physical batch a group is
+    // a single run; a group counted in a second physical batch is a split.
+    std::unordered_map<uint64_t, int> group_batches_seen_;  // gid -> # batches
+    std::unordered_map<uint64_t, int> group_rows_left_;     // gid -> rows undispatched
+
     void Runner() {
         torch::InferenceMode inference_guard;
         torch::Tensor pinned_stacked_obs;
@@ -751,6 +901,7 @@ private:
 
         while (true) {
             std::vector<Request> batch;
+            bool timeout_flush = false;  // WO-PERF-3: dispatched under-target on deadline
 
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -769,6 +920,11 @@ private:
                 });
 
                 if (stop_ && requests_.empty()) break;
+
+                // WO-PERF-3: a batch scooped with fewer than target rows (and not
+                // during shutdown) was released by the deadline, not by filling.
+                timeout_flush = !stop_ &&
+                                requests_.size() < (size_t)target_batch_size_;
 
                 // 4. Scoop up the batch
                 size_t actual_batch = std::min((size_t)target_batch_size_, requests_.size());
@@ -794,6 +950,65 @@ private:
                    !max_batch_size_seen_.compare_exchange_weak(
                        observed_max, static_cast<uint64_t>(batch_size),
                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+            }
+
+            // --- WO-PERF-3 telemetry (behaviour-neutral bookkeeping) -----------
+            // Runner is the sole writer of the split-detection maps, so they need
+            // no lock. Everything else is atomic or guarded by telemetry_mutex_.
+            if (timeout_flush) {
+                timeout_flush_batches_.fetch_add(1, std::memory_order_relaxed);
+            }
+            {
+                std::lock_guard<std::mutex> lk(telemetry_mutex_);
+                physical_batch_sizes_.push_back(static_cast<uint32_t>(batch_size));
+            }
+            // Per-row queue wait, split by request class.
+            const auto dispatch_ts = std::chrono::steady_clock::now();
+            // Distinct leaf groups present in THIS physical batch: rows counted
+            // and group_size captured for split accounting.
+            std::unordered_map<uint64_t, std::pair<int, uint32_t>> groups_here;
+            for (const Request& r : batch) {
+                const uint64_t wait_ns = static_cast<uint64_t>(std::max<int64_t>(
+                    0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           dispatch_ts - r.enqueue_ts)
+                           .count()));
+                if (r.is_group) {
+                    group_wait_ns_sum_.fetch_add(wait_ns, std::memory_order_relaxed);
+                    group_wait_n_.fetch_add(1, std::memory_order_relaxed);
+                    uint64_t gmax = group_wait_ns_max_.load(std::memory_order_relaxed);
+                    while (wait_ns > gmax &&
+                           !group_wait_ns_max_.compare_exchange_weak(
+                               gmax, wait_ns, std::memory_order_relaxed,
+                               std::memory_order_relaxed)) {}
+                    auto& e = groups_here[r.group_id];
+                    e.first += 1;
+                    e.second = r.group_size;
+                } else {
+                    single_wait_ns_sum_.fetch_add(wait_ns, std::memory_order_relaxed);
+                    single_wait_n_.fetch_add(1, std::memory_order_relaxed);
+                    uint64_t smax = single_wait_ns_max_.load(std::memory_order_relaxed);
+                    while (wait_ns > smax &&
+                           !single_wait_ns_max_.compare_exchange_weak(
+                               smax, wait_ns, std::memory_order_relaxed,
+                               std::memory_order_relaxed)) {}
+                }
+            }
+            for (const auto& kv : groups_here) {
+                const uint64_t gid = kv.first;
+                const int rows_here = kv.second.first;
+                const uint32_t gsize = kv.second.second;
+                const int seen = ++group_batches_seen_[gid];
+                if (seen == 2) {
+                    // First time this group appears in a SECOND physical batch.
+                    leaf_groups_split_.fetch_add(1, std::memory_order_relaxed);
+                }
+                int& left =
+                    group_rows_left_.try_emplace(gid, static_cast<int>(gsize)).first->second;
+                left -= rows_here;
+                if (left <= 0) {
+                    group_batches_seen_.erase(gid);
+                    group_rows_left_.erase(gid);
+                }
             }
 
             // A. PINNED MEMORY: Allocate exactly ONCE outside the hot loop based on model_input_dim_
