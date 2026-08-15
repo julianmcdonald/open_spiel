@@ -327,8 +327,16 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     return res;
   };
 
-  // 1. Zero simulations for bookkeeping or draft
-  if (role == DuneDecisionRole::kForcedOrBookkeeping || role == DuneDecisionRole::kLeaderSelection) {
+  // 1. Zero simulations for bookkeeping, and for a leader draft UNLESS the
+  // WO-LEADER-1A flag makes it search-eligible. Splitting the two roles keeps
+  // the default path (search_leader_draft == false) bit-for-bit identical:
+  // both bookkeeping and leader nodes still return the "forced_or_bookkeeping"
+  // policy-only result. When search_leader_draft is true, kLeaderSelection
+  // falls through to the budget setup and search below.
+  if (role == DuneDecisionRole::kForcedOrBookkeeping) {
+    return get_policy_only_result("forced_or_bookkeeping");
+  }
+  if (role == DuneDecisionRole::kLeaderSelection && !config_.search_leader_draft) {
     return get_policy_only_result("forced_or_bookkeeping");
   }
 
@@ -445,6 +453,26 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       }
       max_sims = config_.max_simulations;
     }
+  } else if (role == DuneDecisionRole::kLeaderSelection) {
+    // WO-LEADER-1A: search-eligible leader draft. Only reached when
+    // config_.search_leader_draft is true (the default path returned the
+    // "forced_or_bookkeeping" policy-only result above). A leader draft is a
+    // once-per-seat decision that is neither a short-window role nor an
+    // agent-turn role, so it runs on the placement bot with a dedicated,
+    // fixed simulation budget independent of the session budgets.
+    if (config_.leader_draft_simulations <= 0) {
+      // Starved by configuration. Degrade to the raw network prior carrying
+      // the leader node's OWN fallback reason -- never "forced_or_bookkeeping",
+      // and never a uniform policy (get_policy_only_result returns the
+      // evaluator prior, which SelectControllerAction argmaxes at temperature
+      // 0). Obeys the search/eval parity invariant.
+      return get_policy_only_result("leader_draft_no_budget");
+    }
+    max_sims = config_.leader_draft_simulations;
+    // A fixed-simulation search stops on the COUNT; the time budget is only a
+    // guard against a runaway clock. Reuse the configured relative budget so a
+    // live/finite deadline still bounds the leader search.
+    max_time_ms = config_.relative_time_budget_ms;
   }
 
   // 3. Re-routing key matching check
@@ -762,6 +790,21 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
       decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
       decision.confidence_fallback = search_result.used_fallback;
     }
+  } else if (role == DuneDecisionRole::kLeaderSelection && config_.search_leader_draft) {
+    // WO-LEADER-1A: consume the leader search result like an ordinary searched
+    // role. On success search_result.policy is the visit-based final policy; on
+    // a starved leader node Search() set it to the raw network prior, so this
+    // reduces to the raw-prior argmax (never uniform), with an empty-policy
+    // guard for defense in depth. Default-inert: when search_leader_draft is
+    // false, kLeaderSelection falls through to the unchanged branch below.
+    if (search_result.policy.empty()) {
+      decision.selected_action = decision.raw_reference_action;
+    } else {
+      decision.selected_action = PickActionRespectingTemperature(
+          search_result.policy, config_.temperature, r_val);
+    }
+    decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+    decision.confidence_fallback = search_result.used_fallback;
   } else if (role == DuneDecisionRole::kForcedOrBookkeeping || role == DuneDecisionRole::kLeaderSelection) {
     std::vector<Action> legal_actions = state.LegalActions();
     if (role == DuneDecisionRole::kForcedOrBookkeeping && legal_actions.size() == 1) {

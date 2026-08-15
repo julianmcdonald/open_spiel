@@ -68,6 +68,20 @@ ABSL_FLAG(double, dirichlet_epsilon, 0.0, "Dirichlet noise weight at root.");
 ABSL_FLAG(double, dirichlet_alpha, 0.3, "Dirichlet noise alpha.");
 ABSL_FLAG(bool, rotate_seat, true, "Rotate the seat of the search agent across games.");
 ABSL_FLAG(bool, use_opponent_model, false, "Whether non-search players in simulation follow the PPO prior policy instead of PUCT.");
+// --- WO-LEADER-1A: search-eligible leader drafts (default-inert) --------------
+// See LEADER_PICK_SEARCH_WO_2026_08_14.md Part A. Default false reproduces
+// today's routing bit-for-bit: a leader draft short-circuits to
+// forced_or_bookkeeping with 0 sims. When enabled, the leader node is searched
+// at --leader_draft_simulations; if that budget is <=0 the leader node degrades
+// to the raw prior with its own "leader_draft_no_budget" fallback reason.
+ABSL_FLAG(bool, search_leader_draft, false,
+          "WO-LEADER-1A: make kLeaderDraft decisions search-eligible instead of "
+          "short-circuiting to forced_or_bookkeeping (default false = today's "
+          "routing bit-for-bit).");
+ABSL_FLAG(int, leader_draft_simulations, 64,
+          "WO-LEADER-1A: simulation budget for a searched leader draft. Consulted "
+          "only when --search_leader_draft. Accepts at least 64/200/800; <=0 "
+          "starves the leader node to the raw prior.");
 // --- WO-PERF-3: shared batched-inference coordinator (Phase-2 integration) ----
 // These flags are the permanent, opt-in instrument the deferred GPU sweep will
 // drive. Default-inert: --corpus_roots=false leaves the full-game benchmark
@@ -595,6 +609,9 @@ void WorkerThread(
             .root_prior_temperature =
                 absl::GetFlag(FLAGS_root_prior_temperature),
         };
+        // WO-LEADER-1A: search-eligible leader drafts (default-inert).
+        config.search_leader_draft = absl::GetFlag(FLAGS_search_leader_draft);
+        config.leader_draft_simulations = absl::GetFlag(FLAGS_leader_draft_simulations);
         config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
         config.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
         config.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);

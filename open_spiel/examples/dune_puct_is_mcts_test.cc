@@ -2511,6 +2511,149 @@ void TestPersistentSessionScenarios() {
   std::cout << "TestPersistentSessionScenarios Passed!\n\n";
 }
 
+// WO-LEADER-1A: default-inert search-eligible leader drafts. Covers BOTH modes:
+//   - default (search_leader_draft == false): a leader node still short-circuits
+//     to forced_or_bookkeeping with 0 sims, 0 root visits, all-zero q_values --
+//     today's behavior, and NOT the budget (proven with fixed_session_limit=800).
+//   - enabled (search_leader_draft == true): the leader node receives exactly
+//     leader_draft_simulations simulations, nonzero root visits, populated
+//     q_values, and does NOT report forced_or_bookkeeping.
+//   - starved (enabled but leader_draft_simulations <= 0): its OWN
+//     "leader_draft_no_budget" reason, degrading to the raw prior (never uniform).
+void TestLeaderDraftSearchRouting() {
+  std::cout << "Running Test: Leader Draft Search Routing (WO-LEADER-1A)...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+
+  // The game opens in kLeaderOfferChance; the FIRST non-chance node is the
+  // leader draft, where a real player chooses among the offered leaders.
+  auto make_leader_state = [&]() {
+    std::unique_ptr<State> s = game->NewInitialState();
+    while (!s->IsTerminal()) {
+      if (!s->IsChanceNode()) {
+        const auto& ds =
+            static_cast<const dune_imperium::DuneImperiumState&>(*s);
+        if (ds.phase() == dune_imperium::GamePhase::kLeaderDraft &&
+            s->LegalActions().size() > 1) {
+          break;
+        }
+      }
+      if (s->IsChanceNode()) {
+        s->ApplyAction(s->ChanceOutcomes().front().first);
+      } else {
+        s->ApplyAction(s->LegalActions().front());
+      }
+    }
+    return s;
+  };
+
+  std::unique_ptr<State> state = make_leader_state();
+  // Preconditions: a real-player leader draft with >1 legal actions, classified
+  // as kLeaderSelection regardless of the flag (the router is unchanged; the
+  // mode difference lives in the SESSION).
+  assert(!state->IsChanceNode());
+  const auto& dune_state =
+      static_cast<const dune_imperium::DuneImperiumState&>(*state);
+  assert(dune_state.phase() == dune_imperium::GamePhase::kLeaderDraft);
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() > 1);
+  assert(ClassifyDuneDecisionRole(*state, state->CurrentPlayer(), false) ==
+         DuneDecisionRole::kLeaderSelection);
+
+  // Non-uniform priors so the starved path can be distinguished from uniform.
+  ActionsAndProbs mock_priors;
+  double prior_sum = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    double p = 1.0 + static_cast<double>(i);  // 1, 2, 3, ...
+    mock_priors.push_back({legal_actions[i], p});
+    prior_sum += p;
+  }
+  for (auto& ap : mock_priors) ap.second /= prior_sum;
+  std::vector<double> mock_values(state->NumPlayers(), 0.5);
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors, mock_values);
+
+  // 1. DEFAULT mode: flag off => 0 sims even with a large fixed session budget.
+  {
+    DuneSearchConfig config;
+    config.check_strategic_state = false;
+    config.fixed_session_limit = 800;  // prove the router binds, not the budget
+    assert(config.search_leader_draft == false);  // default-inert
+    DuneSearchSession session(config, evaluator,
+                              DuneSearchBudgetMode::kFixedSessionSimulations);
+    DuneSearchResult res = session.Search(*state);
+    assert(res.simulations_completed == 0);
+    assert(res.diagnostics.total_root_visits == 0);
+    assert(res.used_fallback == true);
+    assert(res.fallback_reason == "forced_or_bookkeeping");
+    for (double q : res.diagnostics.q_values) assert(q == 0.0);
+    assert(!session.HasActiveSession());
+    session.DiscardPendingAction();
+  }
+
+  // 2. ENABLED mode: flag on => exactly leader_draft_simulations at the leader
+  //    node, nonzero root visits, populated q_values, no bookkeeping fallback.
+  for (int budget : {64, 200, 800}) {  // WO requires accepting at least these
+    DuneSearchConfig config;
+    config.check_strategic_state = false;
+    config.search_leader_draft = true;
+    config.leader_draft_simulations = budget;
+    DuneSearchSession session(config, evaluator,
+                              DuneSearchBudgetMode::kFixedSessionSimulations);
+    DuneSearchResult res = session.Search(*state);
+    assert(res.simulations_completed == budget);
+    assert(res.diagnostics.total_root_visits > 0);
+    assert(res.fallback_reason != "forced_or_bookkeeping");
+    assert(res.used_fallback == false);
+    assert(res.diagnostics.q_values.size() == legal_actions.size());
+    bool any_nonzero_q = false;
+    for (double q : res.diagnostics.q_values) {
+      if (q != 0.0) any_nonzero_q = true;
+    }
+    assert(any_nonzero_q);
+    if (budget == 64) {
+      std::cout << "  [enabled] sims=" << res.simulations_completed
+                << " total_root_visits=" << res.diagnostics.total_root_visits
+                << " q_values.size=" << res.diagnostics.q_values.size()
+                << " fallback_reason=" << res.fallback_reason << "\n";
+    }
+    session.DiscardPendingAction();
+  }
+
+  // 3. STARVED mode: enabled but zero budget => OWN reason, raw prior (never
+  //    uniform). The returned policy equals the non-uniform evaluator prior.
+  {
+    DuneSearchConfig config;
+    config.check_strategic_state = false;
+    config.search_leader_draft = true;
+    config.leader_draft_simulations = 0;  // starve
+    DuneSearchSession session(config, evaluator,
+                              DuneSearchBudgetMode::kFixedSessionSimulations);
+    DuneSearchResult res = session.Search(*state);
+    assert(res.simulations_completed == 0);
+    assert(res.diagnostics.total_root_visits == 0);
+    assert(res.used_fallback == true);
+    assert(res.fallback_reason == "leader_draft_no_budget");
+    assert(res.fallback_reason != "forced_or_bookkeeping");
+    // Parity invariant: the fallback policy is the raw network prior, NOT
+    // uniform. Match it element-wise against the evaluator prior, and confirm
+    // it is genuinely non-uniform (so this is a meaningful distinction).
+    ActionsAndProbs raw = evaluator->Prior(*state);
+    assert(res.policy.size() == raw.size());
+    bool non_uniform = false;
+    for (size_t i = 0; i < res.policy.size(); ++i) {
+      assert(res.policy[i].first == raw[i].first);
+      AssertAlmostEqual(res.policy[i].second, raw[i].second);
+      if (std::abs(res.policy[i].second -
+                   1.0 / static_cast<double>(res.policy.size())) > 1e-6) {
+        non_uniform = true;
+      }
+    }
+    assert(non_uniform);
+    session.DiscardPendingAction();
+  }
+
+  std::cout << "Test Leader Draft Search Routing Passed!\n\n";
+}
+
 void TestFallbackDeterministic() {
   std::cout << "Running TestFallbackDeterministic...\n";
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -3875,6 +4018,7 @@ int main() {
   open_spiel::TestInvariantGatesAndScenarios();
   open_spiel::TestMoreRoutingAndScenarioInvariants();
   open_spiel::TestPersistentSessionScenarios();
+  open_spiel::TestLeaderDraftSearchRouting();
   open_spiel::TestFidelityGateScenarios();
   open_spiel::TestFallbackDeterministic();
   open_spiel::TestCommitLifecycle();

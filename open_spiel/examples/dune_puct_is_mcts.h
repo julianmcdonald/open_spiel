@@ -90,6 +90,31 @@ struct DuneSearchConfig {
   // Maximum multi-action player decisions traversed from the root. Negative
   // preserves uncapped behavior; chance and forced transitions do not count.
   int max_search_decision_depth = -1;
+
+  // --- WO-LEADER-1A: search-eligible leader drafts (default-inert) --------
+  // Design reference: docs/work_orders/LEADER_PICK_SEARCH_WO_2026_08_14.md
+  // Part A, and docs/LEADER_PICK_TRAINING_TODO_2026-08-14.md.
+  //
+  // When false (the DEFAULT), a kLeaderDraft / kLeaderOfferChance player
+  // decision short-circuits at the search router to the policy-only
+  // "forced_or_bookkeeping" path with ZERO simulations -- today's behavior,
+  // bit-for-bit. The TODO doc verified live that the router, not the budget,
+  // is binding: fixed_session_limit=800 still yields 0 sims at a leader node.
+  //
+  // When true, the leader draft becomes search-eligible: the session runs
+  // leader_draft_simulations simulations at the leader node (routed through
+  // the ordinary placement-bot search path) and the controller consumes the
+  // resulting visit policy, degrading to the raw-prior argmax (never uniform)
+  // when the search is starved. Part A wires the mechanism and its telemetry
+  // only; any training-side use (budget arms, matched controls, default flip)
+  // is Part B and is ratification-gated.
+  bool search_leader_draft = false;
+  // Simulation budget for a searched leader draft. Consulted ONLY when
+  // search_leader_draft is true. Accepts at least 64/200/800. <= 0 means the
+  // leader node is starved: it degrades to the raw network prior carrying its
+  // OWN "leader_draft_no_budget" fallback reason rather than reverting to the
+  // bookkeeping path.
+  int leader_draft_simulations = 64;
 };
 
 struct SearchDiagnostics {
