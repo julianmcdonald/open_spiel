@@ -118,6 +118,13 @@ ABSL_FLAG(int, corpus_workers, 14,
 ABSL_FLAG(std::string, corpus_root_jsonl_path, "",
           "WO-PERF-3: path to write per-root JSONL (selected action + full root "
           "visit vector) for direct/batched parity comparison.");
+ABSL_FLAG(int, corpus_warmup_searches, 0,
+          "WO-PERF-TIMING-BATCH: run this many discarded warm-up searches "
+          "before timing and before batcher telemetry is armed. Identical "
+          "across every arm of a sweep, so the first arm does not silently pay "
+          "for lazy CUDA context setup, cuBLAS autotuning and allocator growth "
+          "that later arms inherit for free. 0 = no warm-up (default, "
+          "reproducing today's behaviour).");
 ABSL_FLAG(std::string, batcher_telemetry_json_path, "",
           "WO-PERF-3: path to write batcher telemetry JSON (batched mode only).");
 ABSL_FLAG(bool, nonlinear_value_head, false,
@@ -1648,7 +1655,12 @@ struct CorpusRootOutcome {
   std::vector<int> visit_counts;
   int total_root_visits = 0;
   int simulations_completed = 0;
-  double elapsed_time_ms = 0.0;
+  double elapsed_time_ms = 0.0;   // the SEARCH's own internal elapsed
+  // End-to-end wall time for this root: state reconstruction, both out-of-MCTS
+  // raw-prior calls, the search itself and the commit. This -- not
+  // elapsed_time_ms -- is the quantity the registered latency bound is stated
+  // against, because it is what a consumer of the search actually waits for.
+  double root_wall_ms = 0.0;
   bool populated = false;
 };
 
@@ -1792,8 +1804,59 @@ int RunCorpusRootBenchmark(
     batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
         search_model, target, timeout_ms, device, &model_mutex,
         /*logit_cap=*/0.0f);
+  }
+
+  // --- Registered warm-up, BEFORE telemetry is armed and before the clock ---
+  //
+  // Ordering is the whole point. Warm-up runs first, so the CUDA context
+  // creation, cuBLAS/cuDNN autotuning and caching-allocator growth it triggers
+  // are paid by every arm equally and counted by none: the batcher telemetry is
+  // armed AFTER it, and wall_start is taken after that. Without this the first
+  // arm of a sweep absorbs one-time costs that every later arm inherits free,
+  // which reads as the first configuration being slower.
+  const int warmup_n = absl::GetFlag(FLAGS_corpus_warmup_searches);
+  if (warmup_n > 0 && !roots.empty()) {
+    torch::InferenceMode inference_guard;
+    std::shared_ptr<algorithms::Evaluator> wu_eval;
+    if (batched) {
+      wu_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
+          batched_eval, candidate_logit_cap);
+    } else {
+      wu_eval = std::make_shared<open_spiel::DuneNNEvaluator>(
+          search_model, device, candidate_logit_cap);
+    }
+    for (int w = 0; w < warmup_n; ++w) {
+      const CorpusRootRecord& cs = roots[w % roots.size()];
+      auto st = ReconstructCorpusRootState(game, cs.history);
+      // Same config the scored loop uses, with a DISJOINT seed base so warm-up
+      // never replays a scored root's search stream.
+      DuneSearchConfig wcfg;
+      wcfg.max_simulations = max_sims;
+      wcfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+      wcfg.puct_c = puct_c;
+      wcfg.opponent_mode = SearchOpponentMode::kPolicy;
+      wcfg.opponent_temperature = 1.0;
+      wcfg.temperature = 0.0;
+      wcfg.utility_divisor = utility_divisor;
+      wcfg.seed = seed + 900000 + w;
+      wcfg.root_prior_temperature = prior_temp;
+      wcfg.fixed_session_limit = max_sims;
+      wcfg.fixed_continuation_reserve =
+          absl::GetFlag(FLAGS_fixed_continuation_reserve);
+      wcfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+      wcfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+      DuneSearchSession wsession(wcfg, wu_eval,
+                                 DuneSearchBudgetMode::kFixedSessionSimulations);
+      (void)wsession.Search(*st);
+    }
+    std::cout << "  warm-up:         " << warmup_n
+              << " discarded searches (before telemetry and timing)\n";
+  }
+
+  if (batched) {
     // R2: the corpus driver is the one consumer that reads the detailed
-    // batcher telemetry, so it alone arms the per-batch bookkeeping.
+    // batcher telemetry, so it alone arms the per-batch bookkeeping. Armed
+    // AFTER warm-up so warm-up rows are never counted.
     batched_eval->EnableBatcherTelemetry();
   }
 
@@ -1823,6 +1886,7 @@ int RunCorpusRootBenchmark(
     while (true) {
       int idx = next_idx.fetch_add(1);
       if (idx >= static_cast<int>(roots.size())) break;
+      const auto root_t0 = std::chrono::steady_clock::now();
       const CorpusRootRecord& cs = roots[idx];
       auto state = ReconstructCorpusRootState(game, cs.history);
 
@@ -1879,6 +1943,8 @@ int RunCorpusRootBenchmark(
       benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
       DuneSearchResult committed = session.CommitAction(decision);
       oc.selected_action = committed.diagnostics.selected_action;
+      oc.root_wall_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - root_t0).count();
       oc.populated = true;
 
       outcomes[idx] = std::move(oc);
@@ -1901,6 +1967,36 @@ int RunCorpusRootBenchmark(
   // --- Per-root output + parity summary -----------------------------------
   int total_sims = 0;
   for (const auto& oc : outcomes) total_sims += oc.simulations_completed;
+  // --- Per-root latency percentiles (the registered latency bound) ---------
+  // Computed over root_wall_ms, the end-to-end per-root figure, because that is
+  // what a consumer of the search waits for. Reported for every arm, direct and
+  // batched alike, so the bound is checkable without a batcher telemetry file.
+  double lat_p50 = 0.0, lat_p95 = 0.0, lat_p99 = 0.0, lat_max = 0.0;
+  {
+    std::vector<double> lat;
+    lat.reserve(outcomes.size());
+    for (const auto& oc : outcomes) {
+      if (oc.populated) lat.push_back(oc.root_wall_ms);
+    }
+    if (!lat.empty()) {
+      std::sort(lat.begin(), lat.end());
+      auto pct = [&lat](double q) {
+        size_t i = static_cast<size_t>(std::round(q * (lat.size() - 1)));
+        return lat[std::min(i, lat.size() - 1)];
+      };
+      lat_p50 = pct(0.50);
+      lat_p95 = pct(0.95);
+      lat_p99 = pct(0.99);
+      lat_max = lat.back();
+      std::cout << "Per-root latency (root_wall_ms): P50 "
+                << absl::StrFormat("%.2f", lat_p50) << "  P95 "
+                << absl::StrFormat("%.2f", lat_p95) << "  P99 "
+                << absl::StrFormat("%.2f", lat_p99) << "  max "
+                << absl::StrFormat("%.2f", lat_max) << "  (n=" << lat.size()
+                << ")\n";
+    }
+  }
+
   std::cout << "Completed " << outcomes.size() << " roots, " << total_sims
             << " simulations in " << absl::StrFormat("%.3f", wall_s) << "s ("
             << absl::StrFormat("%.3f", total_sims / std::max(1e-9, wall_s))
@@ -1938,6 +2034,12 @@ int RunCorpusRootBenchmark(
         o["total_root_visits"] = static_cast<int64_t>(oc.total_root_visits);
         o["simulations_completed"] =
             static_cast<int64_t>(oc.simulations_completed);
+        // Latency payload. root_wall_ms is end-to-end for the root and is the
+        // quantity the registered latency bound is stated against;
+        // elapsed_time_ms is the search's own internal figure, kept for
+        // continuity with the existing exclusion list.
+        o["root_wall_ms"] = oc.root_wall_ms;
+        o["elapsed_time_ms"] = oc.elapsed_time_ms;
         open_spiel::json::Array acts;
         for (Action a : oc.actions) acts.push_back(static_cast<int64_t>(a));
         o["actions"] = acts;
