@@ -15,6 +15,10 @@
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
+#include <c10/core/Event.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
+#include <chrono>
+#include <optional>
 #include "dune_network.h"
 #include "dune_online_search_collector.h"  // SearchTrainingExample (18B combined opt)
 #endif
@@ -63,6 +67,126 @@ struct PrecapAbszStats {
 // it, so the result depends only on the multiset and not on the order the
 // worker threads happened to append in.
 PrecapAbszStats SummarizePrecapAbsz(std::vector<float> values);
+
+// --- WO-PERF-TIMING (2026-08-16): per-update PPO phase attribution. ---------
+//
+// Populated only under --phase_timing_mode=phases. At the default `off` no
+// timer is armed, no event is created and no clock is read, so the default
+// path is bit-for-bit and instruction-for-instruction today's behavior.
+//
+// `device_s` is CUDA-event time: the interval between the bracket's two events
+// EXECUTING on the compute stream, read once after a single end-of-update
+// synchronise. On CPU it falls back to steady_clock. `host_s` is host wall
+// time for the same bracket on both devices.
+//
+// READ device_s CAREFULLY. It is NOT "GPU busy time". Stream events are
+// markers in the stream's own order, so the interval between them includes any
+// period the stream sat IDLE waiting on the host. A phase that is host-bound
+// -- the tensor-packing loop, or `per_param` gradient telemetry with its ~70
+// `.item()` readbacks per minibatch, each draining the stream -- will report a
+// large device_s that is mostly idle, not execution. Neither number alone is
+// an attribution:
+//
+//   * host_s around an async phase measures LAUNCH latency, and the real cost
+//     lands on whichever later phase happens to synchronise first;
+//   * device_s around a host-bound phase measures stream idle.
+//
+// Both are reported so a reader can tell those two cases apart. sum(host_s) is
+// the quantity comparable to the trainer's `PPO:` figure; `unattributed_host_s`
+// is the declared residual. See §3.3 of
+// docs/work_orders/WO_PERF_TIMING_INSTRUMENTATION_2026_08_16.md.
+inline constexpr int kPhaseTimingNumPhases = 8;
+
+// Ordered exactly as the work order's table, and as the sidecar's field list.
+extern const char* const kPhaseTimingNames[kPhaseTimingNumPhases];
+
+struct PpoPhaseTimings {
+  bool enabled = false;   // --phase_timing_mode=phases
+  bool cuda = false;      // device_s came from CUDA events, not steady_clock
+  double device_s[kPhaseTimingNumPhases] = {0, 0, 0, 0, 0, 0, 0, 0};
+  double host_s[kPhaseTimingNumPhases] = {0, 0, 0, 0, 0, 0, 0, 0};
+  double total_attributed_s = 0.0;       // sum(device_s)
+  double total_host_attributed_s = 0.0;  // sum(host_s)
+  // Cost of the single end-of-update synchronise, and NOTHING ELSE. It is not
+  // the instrument's total perturbation: the per-bracket cudaEventRecord calls
+  // execute INSIDE the brackets they delimit, and the elapsedTime readback loop
+  // runs after this. `events_recorded` sizes both of those so a reader can
+  // bound them rather than assume sync_s covers them.
+  double sync_s = 0.0;
+  int64_t bracket_count = 0;    // timed brackets recorded this update
+  int64_t events_recorded = 0;  // 2 per bracket on CUDA, 0 on CPU
+};
+
+// Phase indices, named so call sites read as the work order's §3.2 table.
+enum PhaseIndex {
+  kPhaseTensorPackH2D = 0,
+  kPhaseDiagPrepass = 1,
+  kPhasePpoForwardLoss = 2,
+  kPhaseBackward = 3,
+  kPhaseGradTelemetry = 4,
+  kPhaseGradClip = 5,
+  kPhaseOptimizerStep = 6,
+  kPhaseScalarReads = 7,
+};
+
+// Brackets the eight phases. Declared here rather than hidden in the .cc so the
+// bracket pairing, the accumulation and the CPU fallback are reachable from the
+// test TU -- an untestable timer is how a wrong attribution table survives.
+//
+// When disabled every method returns immediately having touched nothing: no
+// clock read, no event, no allocation. That is what makes the default path
+// instruction-for-instruction today's behavior.
+class PhaseTimer {
+ public:
+  PhaseTimer(bool enabled, torch::Device device);
+
+  void Begin(int phase);
+  void End(int phase);
+  // ONE synchronise, then read every pair. Safe to call when disabled.
+  void Finalize(PpoPhaseTimings* out);
+
+ private:
+  static constexpr size_t kNoEvent = static_cast<size_t>(-1);
+  struct Pair {
+    int phase;
+    size_t start;
+  };
+
+  size_t AcquirePair();
+
+  const bool enabled_;
+  const bool cuda_;
+  const torch::Device device_;
+  std::optional<c10::impl::VirtualGuardImpl> impl_;
+
+  std::vector<Pair> pairs_;
+  size_t next_free_ = 0;
+  size_t last_recorded_ = kNoEvent;
+  // kNoEvent until Begin opens the phase, so an unmatched End is detectable
+  // instead of indexing element 1 of a possibly-empty pool.
+  size_t open_event_[kPhaseTimingNumPhases];
+
+  std::chrono::steady_clock::time_point host_begin_[kPhaseTimingNumPhases];
+  double host_s_[kPhaseTimingNumPhases] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int64_t bracket_count_ = 0;
+  int64_t events_recorded_ = 0;
+};
+
+// RAII bracket, so an early break/return inside a phase cannot leak a half-open
+// bracket and silently drop the phase from the attribution.
+class PhaseScope {
+ public:
+  PhaseScope(PhaseTimer* t, int phase) : t_(t), phase_(phase) {
+    t_->Begin(phase_);
+  }
+  ~PhaseScope() { t_->End(phase_); }
+  PhaseScope(const PhaseScope&) = delete;
+  PhaseScope& operator=(const PhaseScope&) = delete;
+
+ private:
+  PhaseTimer* t_;
+  int phase_;
+};
 
 struct PpoUpdateStats {
   double policy_loss = 0.0;
@@ -263,6 +387,11 @@ struct PpoUpdateStats {
   double ppo_grad_norm_mean = 0.0;    // per-update mean unclipped ppo-only grad norm
   double aux_ppo_norm_ratio = 0.0;    // aux_grad_norm_mean / ppo_grad_norm_mean
   bool aux_ratio_abort = false;       // ratio exceeded abort_grad_norm_ratio (caller aborts)
+
+  // WO-PERF-TIMING. All zero and `enabled == false` unless
+  // --phase_timing_mode=phases. No diagnostics column consumes this; it is
+  // written only to the phase_timing.jsonl sidecar.
+  PpoPhaseTimings phase_timings;
 };
 
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch);
@@ -460,6 +589,30 @@ void WritePwo5HeadTelemetry(const std::string& diagnostics_path,
                             const std::string& run_uuid,
                             const std::string& config_fingerprint,
                             uint64_t base_seed);
+
+// --- WO-PERF-TIMING sidecar ------------------------------------------------
+//
+// Same shape as the PWO-5 head-telemetry sidecar and for the same reason: a
+// new diagnostics.csv column is a hard fatal against an existing file
+// (WriteDiagnostics' header gate) and would break the character-pinned v4/v5
+// schema the schema tests enforce.
+//
+// The derived sidecar path, or "" when diagnostics_path is empty.
+std::string PhaseTimingPath(const std::string& diagnostics_path);
+
+// The fixed contract prefix of the header record. Run-agnostic, so it can be
+// compared byte for byte across a resume.
+std::string PhaseTimingContract();
+
+// Appends one update's record, writing the header record first if the file is
+// new. A header whose contract prefix differs from this binary's is fatal
+// rather than an append. `ppo_elapsed_s` is the trainer's own `PPO:` figure,
+// carried so a reader can see the attribution discrepancy directly instead of
+// having to join this file against stdout.
+void WritePhaseTiming(const std::string& diagnostics_path, int update,
+                      const PpoUpdateStats& stats, double ppo_elapsed_s,
+                      const std::string& run_uuid,
+                      const std::string& run_prefix);
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,

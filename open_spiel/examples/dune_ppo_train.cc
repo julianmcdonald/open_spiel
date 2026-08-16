@@ -192,6 +192,9 @@ ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstra
 ABSL_FLAG(std::string, diagnostics_path, "",
           "Path to write structured diagnostics JSON/CSV. Extension determines format.");
 ABSL_DECLARE_FLAG(bool, train_value_only);
+// WO-PERF-TIMING: defined in dune_ppo_training_utils.cc beside the WO-PERF-1
+// flags. Read here only to enforce the --pipeline incompatibility at startup.
+ABSL_DECLARE_FLAG(std::string, phase_timing_mode);
 ABSL_FLAG(bool, unfreeze_trunk, false, "Unfreeze the shared trunk (input + res blocks) during training.");
 ABSL_FLAG(bool, nonlinear_value_head, false, "Use a nonlinear value head.");
 ABSL_FLAG(bool, sample_counterfactual_states, false, "Sample generic counterfactual successor states.");
@@ -2420,6 +2423,25 @@ int main(int argc, char** argv) {
     SpielFatalError("Required flag --init_mode is missing. Must be 'random', 'checkpoint', 'bootstrap', or 'validate_legacy'.");
   }
 
+  // WO-PERF-TIMING. Enforced HERE, at startup, because FLAGS_pipeline is
+  // defined in this TU and validating at the first update would waste a whole
+  // rollout before failing.
+  //
+  // --pipeline=true runs CollectRollout's GPU inference on a background thread
+  // concurrently with TrainPpoUpdate, and nothing under examples/ isolates CUDA
+  // streams -- there is no CUDAStreamGuard, setCurrentCUDAStream or
+  // getStreamFromPool anywhere in the tree. Every phase's event pair would then
+  // bracket collector kernels as well as PPO kernels, producing an entirely
+  // plausible table that is wrong, with no post-hoc way to detect it.
+  if (absl::GetFlag(FLAGS_phase_timing_mode) == "phases" &&
+      absl::GetFlag(FLAGS_pipeline)) {
+    SpielFatalError(
+        "--phase_timing_mode=phases is incompatible with --pipeline=true: the "
+        "background collection thread shares the compute stream, so every "
+        "per-phase device time would silently include collector kernels. Run "
+        "timed arms with --pipeline=false.");
+  }
+
   std::string config_fingerprint = open_spiel::ComputeConfigFingerprint();
   std::string search_label_fingerprint = open_spiel::GetSearchLabelFingerprint(absl::GetFlag(FLAGS_search_label_dir));
   std::string run_uuid = open_spiel::GenerateUUID();
@@ -3409,6 +3431,13 @@ int main(int argc, char** argv) {
             diagnostics_path, update, stats, run_uuid, config_fingerprint,
             static_cast<uint64_t>(absl::GetFlag(FLAGS_seed)));
       }
+      // WO-PERF-TIMING. Path DERIVED from --diagnostics_path (no new path
+      // flag), and self-gated: WritePhaseTiming returns immediately unless
+      // --phase_timing_mode=phases armed the timer. `ppo_elapsed` is carried in
+      // so the sidecar records the figure its attribution is compared against.
+      open_spiel::WritePhaseTiming(diagnostics_path, update, stats, ppo_elapsed,
+                                   run_uuid,
+                                   absl::GetFlag(FLAGS_run_prefix));
     }
 
     // --- Search auxiliary distillation steps ---

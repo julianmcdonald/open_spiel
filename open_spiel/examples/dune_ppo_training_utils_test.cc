@@ -49,6 +49,7 @@
 
 #include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
+#include <chrono>
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 
@@ -1771,6 +1772,273 @@ int main() {
     bool is_val1 = IsValidationLabel(observation, actions, p_id);
     bool is_val2 = IsValidationLabel(observation, actions, p_id);
     CHECK_EQ(is_val1, is_val2);
+  } TEST_END();
+
+  // -----------------------------------------------------------------------
+  // WO-PERF-TIMING (2026-08-16): the phase timer and its sidecar.
+  //
+  // The CUDA-event path is exercised by the GPU acceptance run. These are the
+  // CPU-side contract: path derivation, field order, default-inertness, the
+  // TIMER's own bracket/accumulation logic, and the schema guarantees a
+  // consumer relies on. The timer is declared in the header rather than hidden
+  // in an anonymous namespace precisely so it is reachable from here.
+  // -----------------------------------------------------------------------
+
+  TEST_BEGIN("Phase-timing sidecar path derivation") {
+    CHECK_EQ(PhaseTimingPath(""), std::string(""));
+    CHECK_EQ(PhaseTimingPath("/tmp/somewhere/diagnostics.csv"),
+             std::string("/tmp/somewhere/phase_timing.jsonl"));
+    UTILS_CHECK(PhaseTimingPath("/tmp/x/diagnostics.csv").find(
+                    "diagnostics.csv") == std::string::npos);
+  } TEST_END();
+
+  TEST_BEGIN("Phase-timing contract lists 8 phases in order") {
+    const std::string contract = PhaseTimingContract();
+    UTILS_CHECK(contract.find("\"schema\":\"phase_timing.v1\"") !=
+                std::string::npos);
+    CHECK_EQ(kPhaseTimingNumPhases, 8);
+    const char* expected[8] = {"tensor_pack_h2d", "diag_prepass",
+                               "ppo_forward_loss", "backward",
+                               "grad_telemetry",  "grad_clip",
+                               "optimizer_step",  "scalar_reads"};
+    size_t cursor = 0;
+    for (int i = 0; i < 8; ++i) {
+      CHECK_EQ(std::string(kPhaseTimingNames[i]), std::string(expected[i]));
+      const size_t at = contract.find(expected[i], cursor);
+      UTILS_CHECK(at != std::string::npos);
+      cursor = at;
+    }
+  } TEST_END();
+
+  // The DISABLED timer must touch nothing and report nothing. This is the
+  // default path, so it is the load-bearing inertness test.
+  TEST_BEGIN("Phase timer disabled is wholly inert") {
+    PhaseTimer timer(/*enabled=*/false, torch::Device(torch::kCPU));
+    timer.Begin(kPhaseBackward);
+    timer.End(kPhaseBackward);
+    timer.Begin(kPhaseOptimizerStep);
+    timer.End(kPhaseOptimizerStep);
+
+    PpoPhaseTimings out;
+    timer.Finalize(&out);
+    UTILS_CHECK(!out.enabled);
+    CHECK_EQ(out.bracket_count, int64_t{0});
+    CHECK_EQ(out.events_recorded, int64_t{0});
+    CHECK_NEAR(out.total_attributed_s, 0.0, 1e-12);
+    CHECK_NEAR(out.total_host_attributed_s, 0.0, 1e-12);
+    for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+      CHECK_NEAR(out.device_s[i], 0.0, 1e-12);
+      CHECK_NEAR(out.host_s[i], 0.0, 1e-12);
+    }
+  } TEST_END();
+
+  // The ENABLED timer on CPU: brackets accumulate per phase, repeated brackets
+  // for one phase SUM rather than overwrite, totals are the sums they claim to
+  // be, and device_s mirrors host_s on the steady_clock fallback.
+  TEST_BEGIN("Phase timer accumulates brackets per phase") {
+    PhaseTimer timer(/*enabled=*/true, torch::Device(torch::kCPU));
+
+    auto spin = [](int ms) {
+      const auto until = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(ms);
+      while (std::chrono::steady_clock::now() < until) { /* busy */ }
+    };
+
+    // backward is bracketed TWICE, as it is once per minibatch in the real
+    // loop; grad_clip once. If End overwrote instead of accumulating, backward
+    // would come out shorter than grad_clip.
+    { PhaseScope s1(&timer, kPhaseBackward);   spin(12); }
+    { PhaseScope s2(&timer, kPhaseGradClip);   spin(8);  }
+    { PhaseScope s3(&timer, kPhaseBackward);   spin(12); }
+
+    PpoPhaseTimings out;
+    timer.Finalize(&out);
+
+    UTILS_CHECK(out.enabled);
+    UTILS_CHECK(!out.cuda);
+    CHECK_EQ(out.bracket_count, int64_t{3});
+    CHECK_EQ(out.events_recorded, int64_t{0});  // CPU records no CUDA events
+
+    // Two 12 ms brackets must sum to more than one 8 ms bracket. Timing is
+    // machine-dependent, so this asserts the ORDERING the accumulation implies,
+    // not a wall-clock value.
+    UTILS_CHECK(out.host_s[kPhaseBackward] > out.host_s[kPhaseGradClip]);
+    UTILS_CHECK(out.host_s[kPhaseBackward] >= 0.020);
+    UTILS_CHECK(out.host_s[kPhaseGradClip] >= 0.006);
+    // Phases never bracketed stay exactly zero.
+    CHECK_NEAR(out.host_s[kPhaseDiagPrepass], 0.0, 1e-12);
+    CHECK_NEAR(out.host_s[kPhaseOptimizerStep], 0.0, 1e-12);
+
+    double sum_host = 0.0, sum_dev = 0.0;
+    for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+      UTILS_CHECK(std::isfinite(out.host_s[i]));
+      UTILS_CHECK(std::isfinite(out.device_s[i]));
+      UTILS_CHECK(out.host_s[i] >= 0.0);
+      UTILS_CHECK(out.device_s[i] >= 0.0);
+      // steady_clock fallback: device mirrors host exactly on CPU.
+      CHECK_NEAR(out.device_s[i], out.host_s[i], 1e-12);
+      sum_host += out.host_s[i];
+      sum_dev += out.device_s[i];
+    }
+    CHECK_NEAR(out.total_host_attributed_s, sum_host, 1e-12);
+    CHECK_NEAR(out.total_attributed_s, sum_dev, 1e-12);
+  } TEST_END();
+
+  // An End with no matching Begin must be dropped, not indexed blindly.
+  TEST_BEGIN("Phase timer survives an unmatched End") {
+    PhaseTimer timer(/*enabled=*/true, torch::Device(torch::kCPU));
+    timer.End(kPhaseScalarReads);  // never Begun
+    PpoPhaseTimings out;
+    timer.Finalize(&out);
+    UTILS_CHECK(out.enabled);
+    UTILS_CHECK(std::isfinite(out.total_attributed_s));
+  } TEST_END();
+
+  TEST_BEGIN("Phase-timing writes nothing when disabled") {
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "dune_phase_timing_off")
+            .string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string diag = dir + "/diagnostics.csv";
+
+    PpoUpdateStats stats;  // phase_timings.enabled defaults to false
+    WritePhaseTiming(diag, 1, stats, 11.0, "uuid-off", "prefix-off");
+    UTILS_CHECK(!std::filesystem::exists(dir + "/phase_timing.jsonl"));
+
+    stats.phase_timings.enabled = true;
+    WritePhaseTiming("", 1, stats, 11.0, "uuid-off", "prefix-off");
+
+    std::filesystem::remove_all(dir);
+  } TEST_END();
+
+  // The WRITER, checked by PARSING what it emitted. The previous version of
+  // this test read back the same struct fields it had just assigned, which
+  // could not fail and proved nothing about the serializer.
+  TEST_BEGIN("Phase-timing sidecar schema, parsed") {
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "dune_phase_timing_on")
+            .string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string diag = dir + "/diagnostics.csv";
+    const std::string side = dir + "/phase_timing.jsonl";
+
+    PpoUpdateStats stats;
+    stats.minibatches = 45;
+    stats.phase_timings.enabled = true;
+    stats.phase_timings.cuda = false;
+    stats.phase_timings.bracket_count = 271;
+    stats.phase_timings.events_recorded = 0;
+    for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+      stats.phase_timings.device_s[i] = 0.125 * (i + 1);
+      stats.phase_timings.host_s[i] = 0.250 * (i + 1);
+      stats.phase_timings.total_attributed_s += stats.phase_timings.device_s[i];
+      stats.phase_timings.total_host_attributed_s += stats.phase_timings.host_s[i];
+    }
+    // A run_prefix containing a quote and a backslash, to exercise escaping.
+    WritePhaseTiming(diag, 25, stats, 11.5, "uuid-on", "pre\"fix\\on");
+    WritePhaseTiming(diag, 26, stats, 11.5, "uuid-on", "pre\"fix\\on");
+
+    std::ifstream in(side);
+    UTILS_CHECK(in.good());
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) lines.push_back(line);
+    // Header written once per FILE, then one record per update.
+    CHECK_EQ(static_cast<int>(lines.size()), 3);
+    UTILS_CHECK(lines[0].find("\"record\":\"header\"") != std::string::npos);
+
+    // Minimal scanner for the flat "key":number pairs this writer emits, plus
+    // the two nested one-level objects. Enough to prove the bytes parse and
+    // carry the values, without pulling a JSON library into this TU.
+    auto number_after = [](const std::string& s, const std::string& key,
+                           size_t from) -> double {
+      const size_t k = s.find("\"" + key + "\":", from);
+      if (k == std::string::npos) return std::nan("");
+      size_t v = k + key.size() + 3;
+      size_t e = s.find_first_of(",}", v);
+      if (e == std::string::npos) return std::nan("");
+      return std::atof(s.substr(v, e - v).c_str());
+    };
+
+    for (int rec = 1; rec <= 2; ++rec) {
+      const std::string& r = lines[rec];
+      // Braces balance -- a missing one would make this unparseable.
+      int depth = 0; bool ok = true; bool in_str = false; char prev = 0;
+      for (char c : r) {
+        if (c == '"' && prev != '\\') in_str = !in_str;
+        if (!in_str) { if (c == '{') ++depth; else if (c == '}') { --depth; if (depth < 0) ok = false; } }
+        prev = c;
+      }
+      UTILS_CHECK(ok);
+      CHECK_EQ(depth, 0);
+
+      // Provenance is on EVERY record, not just the header.
+      UTILS_CHECK(r.find("\"run_uuid\":\"uuid-on\"") != std::string::npos);
+      UTILS_CHECK(r.find("\"mode\":\"") != std::string::npos);
+      UTILS_CHECK(r.find("\"timer\":\"steady_clock\"") != std::string::npos);
+      UTILS_CHECK(r.find("\"nonfinite\":false") != std::string::npos);
+
+      // Every phase name appears in BOTH blocks, and the values round-trip.
+      const size_t dev_at = r.find("\"device_s\":{");
+      const size_t host_at = r.find("\"host_s\":{");
+      UTILS_CHECK(dev_at != std::string::npos);
+      UTILS_CHECK(host_at != std::string::npos);
+      for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+        const double d = number_after(r, kPhaseTimingNames[i], dev_at);
+        const double h = number_after(r, kPhaseTimingNames[i], host_at);
+        CHECK_NEAR(d, 0.125 * (i + 1), 1e-12);
+        CHECK_NEAR(h, 0.250 * (i + 1), 1e-12);
+      }
+      CHECK_NEAR(number_after(r, "ppo_elapsed_s", 0), 11.5, 1e-12);
+      CHECK_NEAR(number_after(r, "total_attributed_s", 0), 4.5, 1e-12);
+      CHECK_NEAR(number_after(r, "total_host_attributed_s", 0), 9.0, 1e-12);
+      // The residual is REPORTED, and it is ppo_elapsed minus attributed host.
+      CHECK_NEAR(number_after(r, "unattributed_host_s", 0), 11.5 - 9.0, 1e-12);
+      CHECK_NEAR(number_after(r, "minibatches", 0), 45.0, 1e-9);
+      CHECK_NEAR(number_after(r, "bracket_count", 0), 271.0, 1e-9);
+    }
+    CHECK_NEAR(number_after(lines[1], "update", 0), 25.0, 1e-9);
+    CHECK_NEAR(number_after(lines[2], "update", 0), 26.0, 1e-9);
+
+    std::filesystem::remove_all(dir);
+  } TEST_END();
+
+  // A non-finite timing must serialize as JSON null and raise the flag, never
+  // as the literal `nan`/`inf` that would make the file unparseable.
+  TEST_BEGIN("Phase-timing guards non-finite values") {
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "dune_phase_timing_nan")
+            .string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string diag = dir + "/diagnostics.csv";
+
+    PpoUpdateStats stats;
+    stats.phase_timings.enabled = true;
+    stats.phase_timings.device_s[kPhaseBackward] =
+        std::numeric_limits<double>::infinity();
+    stats.phase_timings.host_s[kPhaseGradClip] = std::nan("");
+    WritePhaseTiming(diag, 7, stats, 1.0, "uuid-nf", "prefix");
+
+    std::ifstream in(dir + "/phase_timing.jsonl");
+    std::string header, rec;
+    std::getline(in, header);
+    std::getline(in, rec);
+    UTILS_CHECK(rec.find("\"nonfinite\":true") != std::string::npos);
+    // Both offenders became JSON null.
+    UTILS_CHECK(rec.find("\"backward\":null") != std::string::npos);
+    UTILS_CHECK(rec.find("\"grad_clip\":null") != std::string::npos);
+    // No non-finite literal appears as a VALUE. Checking for the bare
+    // substrings would false-positive on any key or uuid containing them --
+    // which is exactly what an earlier revision of this test did to itself.
+    UTILS_CHECK(rec.find(":nan") == std::string::npos);
+    UTILS_CHECK(rec.find(":inf") == std::string::npos);
+    UTILS_CHECK(rec.find(":-inf") == std::string::npos);
+    UTILS_CHECK(rec.find(":-nan") == std::string::npos);
+
+    std::filesystem::remove_all(dir);
   } TEST_END();
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

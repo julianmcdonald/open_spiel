@@ -13,8 +13,12 @@
 #include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_seed_utils.h"
+#include <c10/core/Event.h>
+#include <c10/core/impl/VirtualGuardImpl.h>
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <cmath>
 
@@ -55,6 +59,22 @@ ABSL_FLAG(std::string, grad_telemetry_mode, "per_param",
           "minibatch (70 reads/minibatch at production size). 'accumulated': "
           "the six group sums stay on-device in float64 and are read back "
           "once per update; values are identical on CPU by construction.");
+// --- WO-PERF-TIMING (2026-08-16): per-phase PPO wall attribution. -----------
+// Declared here, beside the WO-PERF-1 flags, so it registers in every binary
+// linking this TU -- the same pattern for the same reason.
+ABSL_FLAG(std::string, phase_timing_mode, "off",
+          "off|phases -- per-phase PPO wall attribution. Default 'off' is "
+          "bit-for-bit today's behavior: no timers armed, no CUDA events "
+          "created, no clock read, no sidecar written. 'phases' brackets the "
+          "eight PPO phases with CUDA events on the compute stream (read once "
+          "after a single end-of-update synchronise) and writes a "
+          "phase_timing.jsonl sidecar beside --diagnostics_path. The mode "
+          "perturbs what it measures; the sidecar reports its own sync cost, "
+          "its event count and the trainer's PPO figure so the discrepancy is "
+          "visible. NOT part of ComputeConfigFingerprint(), so a checkpoint "
+          "manifest cannot detect a mid-run flip: every timed arm must be a "
+          "FRESH run, never a resume. Rejected with --pipeline=true, whose "
+          "background collection thread shares the compute stream.");
 #endif
 
 namespace open_spiel {
@@ -476,6 +496,127 @@ torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
                              logit_cap);
 }
 
+// --- WO-PERF-TIMING: the phase timer. ---------------------------------------
+//
+// Ordered exactly as the work order's §3.2 table. This array is the single
+// source of truth for the order; the sidecar's field list is generated from
+// it, so a reordering cannot silently mislabel a column.
+const char* const kPhaseTimingNames[kPhaseTimingNumPhases] = {
+    "tensor_pack_h2d", "diag_prepass",  "ppo_forward_loss", "backward",
+    "grad_telemetry",  "grad_clip",     "optimizer_step",   "scalar_reads",
+};
+
+namespace {
+
+// The CUDA event pool, REUSED across updates.
+//
+// PhaseTimer is a per-update local, so a pool owned by the timer would create
+// and destroy every event on every update -- at the production shape that is
+// ~2,100 cudaEventCreateWithFlags/cudaEventDestroy pairs per update, paid
+// forever, for no benefit. Hoisting the pool here makes the reuse the earlier
+// comment claimed but did not implement: events are created once, then
+// re-recorded each update. Re-recording is well defined (cudaEventRecord
+// overwrites) and safe here because Finalize reads every pair's elapsed time
+// before the update returns, so no pair is ever re-recorded between its record
+// and its read.
+//
+// thread_local, not a plain static: TrainPpoUpdate is called on one thread, but
+// a pool shared across threads would be a data race waiting for the first
+// caller that changes that.
+std::vector<c10::Event>& PhaseEventPool() {
+  static thread_local std::vector<c10::Event> pool;
+  return pool;
+}
+
+}  // namespace
+
+PhaseTimer::PhaseTimer(bool enabled, torch::Device device)
+    : enabled_(enabled),
+      cuda_(enabled && device.is_cuda()),
+      device_(device) {
+  for (int i = 0; i < kPhaseTimingNumPhases; ++i) open_event_[i] = kNoEvent;
+  if (cuda_) impl_.emplace(device.type());
+}
+
+size_t PhaseTimer::AcquirePair() {
+  auto& pool = PhaseEventPool();
+  while (next_free_ + 1 >= pool.size()) {
+    pool.emplace_back(device_.type(), c10::EventFlag::BACKEND_DEFAULT);
+    pool.emplace_back(device_.type(), c10::EventFlag::BACKEND_DEFAULT);
+  }
+  const size_t idx = next_free_;
+  next_free_ += 2;
+  return idx;
+}
+
+void PhaseTimer::Begin(int phase) {
+  if (!enabled_) return;
+  host_begin_[phase] = std::chrono::steady_clock::now();
+  if (!cuda_) return;
+  const size_t idx = AcquirePair();
+  open_event_[phase] = idx;
+  PhaseEventPool()[idx].record(impl_->getStream(device_));
+  ++events_recorded_;
+}
+
+void PhaseTimer::End(int phase) {
+  if (!enabled_) return;
+  if (cuda_) {
+    const size_t idx = open_event_[phase];
+    // An End without a matching Begin would otherwise index the pool blind.
+    // Dropping the bracket is the safe failure: it lands in the reported
+    // residual instead of fabricating an interval.
+    if (idx == kNoEvent) return;
+    PhaseEventPool()[idx + 1].record(impl_->getStream(device_));
+    ++events_recorded_;
+    pairs_.push_back({phase, idx});
+    last_recorded_ = idx + 1;
+    open_event_[phase] = kNoEvent;
+  }
+  host_s_[phase] += std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - host_begin_[phase])
+                        .count();
+  ++bracket_count_;
+}
+
+void PhaseTimer::Finalize(PpoPhaseTimings* out) {
+  if (!enabled_) return;
+  out->enabled = true;
+  out->cuda = cuda_;
+  out->bracket_count = bracket_count_;
+  out->events_recorded = events_recorded_;
+
+  if (cuda_ && last_recorded_ != kNoEvent) {
+    auto& pool = PhaseEventPool();
+    // Every event was recorded on the stream returned by getStream() for this
+    // device, and stream events complete in stream order, so waiting on the
+    // LAST one is sufficient for all of them. One synchronise, never one per
+    // phase -- a per-phase sync would serialise the pipeline and inflate the
+    // very total this is trying to attribute (work order §3.3).
+    const auto sync_begin = std::chrono::steady_clock::now();
+    pool[last_recorded_].synchronize();
+    out->sync_s = std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - sync_begin)
+                      .count();
+    for (const auto& p : pairs_) {
+      // elapsedTime is milliseconds on every backend that implements it.
+      out->device_s[p.phase] +=
+          pool[p.start].elapsedTime(pool[p.start + 1]) * 1e-3;
+    }
+  }
+
+  for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+    out->host_s[i] = host_s_[i];
+    // On CPU there is no second clock to consult: steady_clock IS the
+    // measurement, and the async hazard that motivates events does not arise.
+    // Populating the field keeps the sidecar schema uniform across devices
+    // instead of emitting nulls a consumer must special-case.
+    if (!cuda_) out->device_s[i] = host_s_[i];
+    out->total_attributed_s += out->device_s[i];
+    out->total_host_attributed_s += out->host_s[i];
+  }
+}
+
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, std::vector<PpoTransition>& batch,
@@ -494,6 +635,23 @@ PpoUpdateStats TrainPpoUpdate(
   auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
   auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
 
+  // WO-PERF-TIMING. Validated on EVERY path, including the default, so a typo
+  // is fatal at the first update rather than silently timing nothing for a
+  // whole run. Construction of a disabled timer allocates nothing.
+  const std::string phase_timing_mode =
+      ::absl::GetFlag(::FLAGS_phase_timing_mode);
+  const bool phase_timing_on = (phase_timing_mode == "phases");
+  if (!phase_timing_on && phase_timing_mode != "off") {
+    SpielFatalError("Unknown --phase_timing_mode: '" + phase_timing_mode +
+                    "' (expected 'off' or 'phases').");
+  }
+  // NOTE: the --pipeline incompatibility is enforced at startup in
+  // dune_ppo_train.cc, where both flags are defined. It cannot live here --
+  // FLAGS_pipeline is defined in the trainer's own TU, and six other targets
+  // link this file without it.
+  PhaseTimer phase_timer(phase_timing_on, device);
+
+  phase_timer.Begin(kPhaseTensorPackH2D);
   torch::Tensor states_cpu = torch::empty({n, obs_size}, cpu_float);
   torch::Tensor masks_cpu = torch::zeros({n, action_dim}, cpu_bool);
   torch::Tensor actions_cpu = torch::empty({n}, cpu_long);
@@ -533,6 +691,7 @@ PpoUpdateStats TrainPpoUpdate(
   torch::Tensor advantages = advantages_cpu.to(device);
   torch::Tensor returns = returns_cpu.to(device);
   torch::Tensor old_values = old_values_cpu.to(device);
+  phase_timer.End(kPhaseTensorPackH2D);
 
   int64_t minibatch_size =
       std::min<int64_t>(::absl::GetFlag(::FLAGS_ppo_minibatch_size), n);
@@ -610,6 +769,7 @@ PpoUpdateStats TrainPpoUpdate(
   // transitions" (0). Full mode measures every update, so it stays true there.
   bool kl_measured_this_update = true;
 
+  phase_timer.Begin(kPhaseDiagPrepass);
   if (!prepass_cadenced) {
     double value_near_one_count = 0;
 
@@ -713,6 +873,7 @@ PpoUpdateStats TrainPpoUpdate(
     }
     stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
   }
+  phase_timer.End(kPhaseDiagPrepass);
   stats.measured_transitions =
       kl_measured_this_update ? kl_before_nontrivial_count : int64_t{-1};
 
@@ -738,6 +899,12 @@ PpoUpdateStats TrainPpoUpdate(
   stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
 
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
+    // Populates phases 1-2 for a caller that wants them. NOTE: the only
+    // --diagnostics_only call site (dune_ppo_train.cc) writes diagnostics and
+    // then exits WITHOUT calling WritePhaseTiming, so no sidecar record is
+    // emitted on this path. Stated plainly rather than left to look like
+    // coverage that does not exist.
+    phase_timer.Finalize(&stats.phase_timings);
     return stats;
   }
 
@@ -1182,14 +1349,18 @@ PpoUpdateStats TrainPpoUpdate(
         }
       };
 
+      phase_timer.Begin(kPhasePpoForwardLoss);
       if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
         AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
         compute_loss();
       } else {
         compute_loss();
       }
+      phase_timer.End(kPhasePpoForwardLoss);
 
+      phase_timer.Begin(kPhaseBackward);
       total_loss.backward();
+      phase_timer.End(kPhaseBackward);
 
       // Phase 18B unclipped norm accounting (before the shared clip): the
       // accumulated grad now holds aux+ppo; ppo-only = total - aux (snapshot).
@@ -1230,6 +1401,7 @@ PpoUpdateStats TrainPpoUpdate(
         // "value_head", but a future head that did would have been captured by
         // the value branch. Testing the auxiliary names first makes the
         // classification independent of the other branches' patterns.
+        PhaseScope phase_scope_telemetry(&phase_timer, kPhaseGradTelemetry);
         if (!grad_telemetry_accumulated) {
           double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
           double final_vp_sq = 0.0, terminal_round_sq = 0.0, next_action_sq = 0.0;
@@ -1297,9 +1469,11 @@ PpoUpdateStats TrainPpoUpdate(
         }
       }
 
+      phase_timer.Begin(kPhaseGradClip);
       double grad_norm =
           torch::nn::utils::clip_grad_norm_(
               model->parameters(), ::absl::GetFlag(::FLAGS_grad_clip_norm));
+      phase_timer.End(kPhaseGradClip);
       if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
         stats.nonfinite_abort = true;
         std::cerr << "Fatal PPO gradient norm: " << grad_norm << "\n";
@@ -1310,8 +1484,11 @@ PpoUpdateStats TrainPpoUpdate(
       // clip_grad_norm_ returns the norm as measured BEFORE clipping, so this
       // max tracks the same unclipped quantity grad_norm_sum accumulates.
       if (grad_norm > stats.grad_norm_max) stats.grad_norm_max = grad_norm;
+      phase_timer.Begin(kPhaseOptimizerStep);
       optimizer.step();
+      phase_timer.End(kPhaseOptimizerStep);
 
+      phase_timer.Begin(kPhaseScalarReads);
       double kl = approx_kl.item<double>();
       value_loss_sum += value_loss.item<double>();
       if (value_clip_frac_t.defined()) {
@@ -1329,6 +1506,7 @@ PpoUpdateStats TrainPpoUpdate(
         epoch_kl_sum += kl * mb_num_nontrivial;
         epoch_kl_nontrivial_count += mb_num_nontrivial;
       }
+      phase_timer.End(kPhaseScalarReads);
 
       if (target_kl > 0.0 && kl > target_kl) {
         stats.early_stopped = true;
@@ -1435,6 +1613,8 @@ PpoUpdateStats TrainPpoUpdate(
   } else {
     stats.explained_variance = 0.0;
   }
+  // The single end-of-update synchronise and the one read of every event pair.
+  phase_timer.Finalize(&stats.phase_timings);
   return stats;
 }
 
@@ -1749,6 +1929,165 @@ void WritePwo5HeadTelemetry(const std::string& diagnostics_path,
       << ",\"next_own_action_head_grad_norm\":"
       << F17(stats.NextOwnActionHeadGradNormMean())
       << "}\n";
+}
+
+// --- WO-PERF-TIMING sidecar ------------------------------------------------
+
+std::string PhaseTimingPath(const std::string& diagnostics_path) {
+  if (diagnostics_path.empty()) return std::string();
+  std::filesystem::path p(diagnostics_path);
+  std::filesystem::path dir = p.parent_path();
+  return (dir / "phase_timing.jsonl").string();
+}
+
+std::string PhaseTimingContract() {
+  std::string s =
+      "{\"record\":\"header\",\"schema\":\"phase_timing.v1\","
+      "\"float_format\":\"%.17g\",\"phases\":[";
+  for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+    if (i) s += ",";
+    s += "\"";
+    s += kPhaseTimingNames[i];
+    s += "\"";
+  }
+  s += "]";
+  return s;
+}
+
+// %.17g of a non-finite double emits `inf`/`nan`, which is NOT valid JSON --
+// `json.loads('{"x":inf}')` rejects it. Gate T3 asks for finite values; this is
+// what makes a violation visible as data rather than as an unparseable file.
+std::string F17Finite(double v, bool* saw_nonfinite) {
+  if (!std::isfinite(v)) {
+    *saw_nonfinite = true;
+    return "null";
+  }
+  return F17(v);
+}
+
+// run_prefix and run_uuid are caller-supplied and land inside JSON strings.
+std::string JsonEscape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char c : in) {
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+void WritePhaseTiming(const std::string& diagnostics_path, int update,
+                      const PpoUpdateStats& stats, double ppo_elapsed_s,
+                      const std::string& run_uuid,
+                      const std::string& run_prefix) {
+  if (!stats.phase_timings.enabled) return;
+  const std::string path = PhaseTimingPath(diagnostics_path);
+  if (path.empty()) return;
+
+  const std::string contract = PhaseTimingContract();
+  bool needs_header = true;
+  {
+    std::ifstream in(path);
+    std::string first;
+    if (in && std::getline(in, first) && !first.empty()) {
+      needs_header = false;
+      if (first.compare(0, contract.size(), contract) != 0) {
+        SpielFatalError(
+            "Phase-timing schema mismatch at: " + path +
+            "\n  Existing header contract: " + first.substr(0, contract.size()) +
+            "\n  This binary writes:       " + contract +
+            "\n  Appending would produce records the header cannot describe.");
+      }
+    }
+  }
+
+  std::ofstream out(path, std::ios::app);
+  if (!out) {
+    SpielFatalError("Could not open phase-timing sidecar: " + path);
+  }
+  if (needs_header) {
+    out << contract << ",\"run_uuid\":\"" << JsonEscape(run_uuid)
+        << "\",\"run_prefix\":\"" << JsonEscape(run_prefix) << "\"}\n";
+  }
+
+  const PpoPhaseTimings& t = stats.phase_timings;
+  bool nonfinite = false;
+
+  // run_uuid is repeated on EVERY record, not just the header. The header is
+  // written once per FILE, so a resume or a second run pointed at the same
+  // --diagnostics_path directory would otherwise append its updates under the
+  // first run's header with no per-record identity -- and update numbers repeat
+  // across runs. WriteDiagnostics puts run_uuid on every CSV row for exactly
+  // this reason. It matters more here: --phase_timing_mode is deliberately
+  // absent from ComputeConfigFingerprint(), so a manifest cannot detect a
+  // mid-run mode flip and this field is the only provenance a record carries.
+  out << "{\"record\":\"update\",\"update\":" << update
+      << ",\"run_uuid\":\"" << JsonEscape(run_uuid) << "\""
+      << ",\"mode\":\"" << JsonEscape(::absl::GetFlag(::FLAGS_phase_timing_mode))
+      << "\",\"timer\":\"" << (t.cuda ? "cuda_event" : "steady_clock") << "\"";
+
+  out << ",\"device_s\":{";
+  for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+    if (i) out << ",";
+    out << "\"" << kPhaseTimingNames[i] << "\":"
+        << F17Finite(t.device_s[i], &nonfinite);
+  }
+  out << "}";
+
+  out << ",\"host_s\":{";
+  for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
+    if (i) out << ",";
+    out << "\"" << kPhaseTimingNames[i] << "\":"
+        << F17Finite(t.host_s[i], &nonfinite);
+  }
+  out << "}";
+
+  // The metadata that lets a reader see the attribution discrepancy directly
+  // rather than infer it (work order §3.3, gate T4).
+  //
+  // T4 asks for total_attributed_s to be within a declared tolerance of the
+  // trainer's PPO figure. DECLARED DEVIATION: on CUDA, total_attributed_s is
+  // sum(device_s), which deliberately excludes host-bound time and therefore
+  // CANNOT approach ppo_elapsed_s. The quantity that is comparable is
+  // total_host_attributed_s, and `unattributed_host_s` is its signed residual
+  // against the trainer's own figure. Declared tolerance: the residual is
+  // expected to be POSITIVE and to account for the unbracketed work named in
+  // the registration (the auxiliary-loss sections, the permutation draws, the
+  // per-minibatch index_select gathers and mb_nontrivial sync, the epoch
+  // bookkeeping, and this instrument's own sync). A NEGATIVE residual would
+  // mean a phase was double-counted and is a defect.
+  out << ",\"total_attributed_s\":" << F17Finite(t.total_attributed_s, &nonfinite)
+      << ",\"total_host_attributed_s\":"
+      << F17Finite(t.total_host_attributed_s, &nonfinite)
+      << ",\"sync_s\":" << F17Finite(t.sync_s, &nonfinite)
+      << ",\"ppo_elapsed_s\":" << F17Finite(ppo_elapsed_s, &nonfinite)
+      << ",\"unattributed_host_s\":"
+      << F17Finite(ppo_elapsed_s - t.total_host_attributed_s, &nonfinite)
+      << ",\"bracket_count\":" << t.bracket_count
+      << ",\"events_recorded\":" << t.events_recorded
+      << ",\"minibatches\":" << stats.minibatches
+      << ",\"nonfinite\":" << (nonfinite ? "true" : "false") << "}\n";
+
+  if (!out.good()) {
+    SpielFatalError("Failed to write phase-timing sidecar to: " + path);
+  }
+  out.close();
+  if (out.fail()) {
+    SpielFatalError("Failed to close phase-timing sidecar at: " + path);
+  }
 }
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
