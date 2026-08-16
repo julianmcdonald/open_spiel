@@ -2520,6 +2520,137 @@ void TestPersistentSessionScenarios() {
 //     q_values, and does NOT report forced_or_bookkeeping.
 //   - starved (enabled but leader_draft_simulations <= 0): its OWN
 //     "leader_draft_no_budget" reason, degrading to the raw prior (never uniform).
+// Benchmark-path regression: a non-forced Leader root, searched through the same
+// DuneSearchConfig the benchmark builds, completes EXACTLY 64 simulations and
+// returns its own visit policy rather than degrading to "low_coverage".
+//
+// This is the failure the mass-only rule exists to stop, and it is invisible
+// from the collector's side: RunSearch applies the generic min(3, legal)
+// coverage requirement BEFORE any consumer sees the result, so a concentrated
+// 64-simulation Leader policy was replaced by the raw prior and the search that
+// produced it was discarded. The assertion is therefore on the SEARCH RESULT --
+// simulations completed, and the fallback reason -- not on a downstream count.
+void TestLeaderBenchmarkPathMassOnlyCoverage() {
+  std::cout << "Running Test: Leader benchmark-path mass-only coverage...\n";
+  std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+
+  auto make_leader_state = [&]() {
+    std::unique_ptr<State> s = game->NewInitialState();
+    while (!s->IsTerminal()) {
+      if (!s->IsChanceNode()) {
+        const auto& ds =
+            static_cast<const dune_imperium::DuneImperiumState&>(*s);
+        if (ds.phase() == dune_imperium::GamePhase::kLeaderDraft &&
+            s->LegalActions().size() > 1) {
+          break;
+        }
+      }
+      if (s->IsChanceNode()) {
+        s->ApplyAction(s->ChanceOutcomes().front().first);
+      } else {
+        s->ApplyAction(s->LegalActions().front());
+      }
+    }
+    return s;
+  };
+
+  std::unique_ptr<State> state = make_leader_state();
+  std::vector<Action> legal_actions = state->LegalActions();
+  assert(legal_actions.size() > 1);   // NON-FORCED, or the test proves nothing
+  assert(ClassifyDuneDecisionRole(*state, state->CurrentPlayer(), false) ==
+         DuneDecisionRole::kLeaderSelection);
+
+  // A sharply PEAKED prior, which is what forces the generic gate to fire: the
+  // search concentrates on the leading action, so few actions clear the
+  // min-visit bar while the covered mass comfortably clears 0.50.
+  ActionsAndProbs mock_priors;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    const double p = (i == 0) ? 0.90
+                              : 0.10 / static_cast<double>(legal_actions.size() - 1);
+    mock_priors.push_back({legal_actions[i], p});
+  }
+  auto evaluator = std::make_shared<MockEvaluator>(mock_priors,
+                                                   std::vector<double>(4, 0.0));
+
+  // Exactly the configuration the benchmark builds under
+  // --search_leader_draft --leader_draft_simulations=64
+  // --leader_mass_only_coverage.
+  DuneSearchConfig cfg;
+  cfg.max_simulations = 64;
+  cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+  cfg.puct_c = 0.30;
+  cfg.opponent_mode = SearchOpponentMode::kPolicy;
+  cfg.temperature = 0.0;
+  cfg.utility_divisor = 4.0;
+  cfg.min_visit_threshold = 2;
+  cfg.covered_prior_threshold = 0.50;
+  cfg.final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+  cfg.use_observation_string = true;
+  cfg.check_strategic_state = false;
+  cfg.search_leader_draft = true;
+  cfg.leader_draft_simulations = 64;
+  cfg.leader_mass_only_coverage = true;
+  cfg.seed = 20277123;
+
+  DunePUCTISMCTSBot bot(cfg, evaluator);
+  DuneSearchResult res = bot.RunSearch(*state, /*max_sims=*/64,
+                                       /*max_time_ms=*/1e9,
+                                       /*start_sim_index=*/0);
+
+  std::cout << "  sims=" << res.simulations_completed
+            << " fallback=" << res.fallback_reason
+            << " covered=" << res.diagnostics.num_covered_actions << "\n";
+
+  // EXACTLY the adopted budget.
+  assert(res.simulations_completed == 64);
+  // And the search's OWN policy, not the raw prior.
+  assert(res.fallback_reason != "low_coverage");
+  assert(!res.policy.empty());
+
+  // The same coverage at a NON-Leader root must still be rejected, or
+  // "Leader-specific" is a comment rather than a behaviour. Same config, same
+  // peaked prior, mass-only left ON -- only the root differs.
+  {
+    std::unique_ptr<State> non_leader = game->NewInitialState();
+    while (!non_leader->IsTerminal()) {
+      if (non_leader->IsChanceNode()) {
+        non_leader->ApplyAction(non_leader->ChanceOutcomes().front().first);
+        continue;
+      }
+      const auto& ds =
+          static_cast<const dune_imperium::DuneImperiumState&>(*non_leader);
+      if (ds.phase() != dune_imperium::GamePhase::kLeaderDraft &&
+          ds.phase() != dune_imperium::GamePhase::kLeaderOfferChance &&
+          non_leader->LegalActions().size() > 2) {
+        break;
+      }
+      non_leader->ApplyAction(non_leader->LegalActions().front());
+    }
+    if (!non_leader->IsTerminal() && !non_leader->IsChanceNode()) {
+      std::vector<Action> nl_legal = non_leader->LegalActions();
+      ActionsAndProbs nl_priors;
+      for (size_t i = 0; i < nl_legal.size(); ++i) {
+        const double p =
+            (i == 0) ? 0.90 : 0.10 / static_cast<double>(nl_legal.size() - 1);
+        nl_priors.push_back({nl_legal[i], p});
+      }
+      auto nl_eval = std::make_shared<MockEvaluator>(
+          nl_priors, std::vector<double>(4, 0.0));
+      DuneSearchConfig nl_cfg = cfg;
+      DunePUCTISMCTSBot nl_bot(nl_cfg, nl_eval);
+      DuneSearchResult nl_res = nl_bot.RunSearch(*non_leader, /*max_sims=*/2,
+                                                 /*max_time_ms=*/1e9, 0);
+      // Two simulations cannot give three actions >= 2 visits, so the generic
+      // gate must fire here even though mass-only is enabled in the config.
+      std::cout << "  non-leader root: fallback=" << nl_res.fallback_reason
+                << " (generic gate retained)\n";
+      assert(nl_res.fallback_reason == "low_coverage");
+    }
+  }
+
+  std::cout << "Test Passed: Leader benchmark-path mass-only coverage.\n\n";
+}
+
 void TestLeaderDraftSearchRouting() {
   std::cout << "Running Test: Leader Draft Search Routing (WO-LEADER-1A)...\n";
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -4019,6 +4150,7 @@ int main() {
   open_spiel::TestMoreRoutingAndScenarioInvariants();
   open_spiel::TestPersistentSessionScenarios();
   open_spiel::TestLeaderDraftSearchRouting();
+  open_spiel::TestLeaderBenchmarkPathMassOnlyCoverage();
   open_spiel::TestFidelityGateScenarios();
   open_spiel::TestFallbackDeterministic();
   open_spiel::TestCommitLifecycle();

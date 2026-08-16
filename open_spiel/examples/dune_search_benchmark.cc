@@ -78,6 +78,14 @@ ABSL_FLAG(bool, search_leader_draft, false,
           "WO-LEADER-1A: make kLeaderDraft decisions search-eligible instead of "
           "short-circuiting to forced_or_bookkeeping (default false = today's "
           "routing bit-for-bit).");
+ABSL_FLAG(bool, leader_mass_only_coverage, false,
+          "Leader-only coverage rule: keep the 0.50 covered-prior-mass "
+          "threshold and the min-visit definition, but drop the generic "
+          "three-covered-actions clause AT LEADER ROOTS ONLY. Required "
+          "whenever --search_leader_draft is set: without it RunSearch rejects "
+          "a concentrated 64-simulation Leader policy as 'low_coverage' and "
+          "returns the raw prior, so the search runs and is discarded. Default "
+          "false preserves historical behaviour exactly.");
 ABSL_FLAG(int, leader_draft_simulations, 64,
           "WO-LEADER-1A: simulation budget for a searched leader draft. Consulted "
           "only when --search_leader_draft. Accepts at least 64/200/800; <=0 "
@@ -621,6 +629,8 @@ void WorkerThread(
         // WO-LEADER-1A: search-eligible leader drafts (default-inert).
         config.search_leader_draft = absl::GetFlag(FLAGS_search_leader_draft);
         config.leader_draft_simulations = absl::GetFlag(FLAGS_leader_draft_simulations);
+        config.leader_mass_only_coverage =
+            absl::GetFlag(FLAGS_leader_mass_only_coverage);
         config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
         config.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
         config.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
@@ -1796,6 +1806,15 @@ int RunCorpusRootBenchmark(
   }
   std::cout << "  checkpoint:      " << absl::GetFlag(FLAGS_model_checkpoint)
             << "\n";
+  // Leader provenance is printed ALWAYS, including when off, so a run log
+  // records which Leader semantics produced it rather than leaving a reader to
+  // infer it from the absence of a line.
+  std::cout << "  leader_search:   "
+            << (absl::GetFlag(FLAGS_search_leader_draft) ? "ON" : "off")
+            << " sims=" << absl::GetFlag(FLAGS_leader_draft_simulations)
+            << " mass_only="
+            << (absl::GetFlag(FLAGS_leader_mass_only_coverage) ? "true" : "false")
+            << "\n";
   std::cout << "  root_set_count:  " << roots.size() << "\n"
             << "  root_set_sha256: " << root_set_sha256 << "\n\n";
 
@@ -2251,6 +2270,31 @@ void ComputeVpMarginCI(const std::vector<double>& margins, double* mean, double*
 int main(int argc, char* argv[]) {
   auto run_start_time = std::chrono::steady_clock::now();
   absl::ParseCommandLine(argc, argv);
+
+  // Leader search is ADOPTED SEMANTICS, not a set of independent knobs. It was
+  // adopted at exactly 64 simulations with mass-only coverage; a benchmark that
+  // enabled it at some other budget, or without the coverage rule, would be
+  // measuring something the program never adopted -- and in the mass-only case
+  // would silently measure the RAW PRIOR, because RunSearch rejects the
+  // concentrated Leader policy as "low_coverage" and returns the prior instead.
+  // Rejected here rather than honoured quietly. Defaults are false/64/false, so
+  // every historical invocation is unaffected.
+  if (absl::GetFlag(FLAGS_search_leader_draft)) {
+    if (absl::GetFlag(FLAGS_leader_draft_simulations) != 64) {
+      open_spiel::SpielFatalError(absl::StrCat(
+          "--search_leader_draft is adopted at exactly 64 simulations; "
+          "--leader_draft_simulations=",
+          absl::GetFlag(FLAGS_leader_draft_simulations),
+          " is not an adjustable experimental knob."));
+    }
+    if (!absl::GetFlag(FLAGS_leader_mass_only_coverage)) {
+      open_spiel::SpielFatalError(
+          "--search_leader_draft requires --leader_mass_only_coverage=true: "
+          "without it the search-result path rejects the concentrated Leader "
+          "policy as 'low_coverage' and returns the raw prior, so the benchmark "
+          "would report a Leader search it then discarded.");
+    }
+  }
 
   // PWO-5 section 10.2: the reserved final-gate base-seed range. No training
   // OR EVALUATION seed may enter [9000000, 9999999]; checked before any work.
