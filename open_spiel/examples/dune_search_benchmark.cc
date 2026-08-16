@@ -2027,8 +2027,16 @@ int RunCorpusRootBenchmark(
       // reader can tell "measured zero" from "never measured".
       o["h2d_ms"] = t.h2d_ms;
       o["forward_ms"] = t.forward_ms;
+      o["output_cast_ms"] = t.output_cast_ms;
       o["d2h_ms"] = t.d2h_ms;
+      // Reported SEPARATELY and never folded into a percentage split with the
+      // four device intervals above: sync_ms is host wall time blocked in
+      // torch::cuda::synchronize(), which OVERLAPS the device work it waits on.
       o["sync_ms"] = t.sync_ms;
+      o["device_timing_note"] =
+          "h2d/forward/output_cast/d2h are CUDA-event intervals on the compute "
+          "stream; sync_ms is host blocked time and OVERLAPS them. Their sum is "
+          "not a total and percentages of that sum are meaningless.";
       o["device_timed_batches"] =
           static_cast<int64_t>(t.device_timed_batches);
       o["benchmark_raw_prior_calls"] = static_cast<int64_t>(raw_priors);

@@ -634,11 +634,18 @@ struct BatcherTelemetry {
     // includes stream idle. `sync_ms` is host wall time, because a
     // synchronise is a host-blocking call and host time is the honest measure
     // of it.
+    // THESE INTERVALS OVERLAP AND MUST NOT BE NORMALISED INTO ONE ADDITIVE
+    // PERCENTAGE SPLIT. h2d/forward/output_cast/d2h are CUDA-event intervals on
+    // the compute stream; sync_ms is HOST wall time spent blocked in
+    // torch::cuda::synchronize(). The host sync overlaps the device work it is
+    // waiting for, so (h2d + forward + output_cast + d2h + sync) is NOT a total
+    // and a percentage of that sum is meaningless. Report sync_ms separately.
     double h2d_ms = 0.0;
     double forward_ms = 0.0;
-    double d2h_ms = 0.0;
-    double sync_ms = 0.0;
-    uint64_t device_timed_batches = 0;   // batches contributing to the four above
+    double output_cast_ms = 0.0;  // AMP FP16/BF16 -> FP32 cast, device-side
+    double d2h_ms = 0.0;          // the device->host transfer ALONE
+    double sync_ms = 0.0;         // HOST wall time blocked; overlaps the above
+    uint64_t device_timed_batches = 0;   // batches contributing to the above
 };
 
 class BatchedEvaluator : public IGameEvaluator {
@@ -837,6 +844,7 @@ public:
         // WO-PERF-TIMING-BATCH: device-side split, microseconds -> milliseconds.
         t.h2d_ms = h2d_us_.load(std::memory_order_relaxed) / 1000.0;
         t.forward_ms = forward_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.output_cast_ms = output_cast_us_.load(std::memory_order_relaxed) / 1000.0;
         t.d2h_ms = d2h_us_.load(std::memory_order_relaxed) / 1000.0;
         t.sync_ms = sync_us_.load(std::memory_order_relaxed) / 1000.0;
         t.device_timed_batches =
@@ -941,6 +949,7 @@ private:
     // question across dispatch threads.
     std::atomic<uint64_t> h2d_us_{0};
     std::atomic<uint64_t> forward_us_{0};
+    std::atomic<uint64_t> output_cast_us_{0};
     std::atomic<uint64_t> d2h_us_{0};
     std::atomic<uint64_t> sync_us_{0};
     std::atomic<uint64_t> device_timed_batches_{0};
@@ -1110,20 +1119,27 @@ private:
             // this thread can re-record it.
             thread_local std::vector<c10::Event> dev_ev;
             if (time_device_ && dev_ev.empty()) {
-                for (int e = 0; e < 6; ++e) {
+                for (int e = 0; e < 8; ++e) {
                     dev_ev.emplace_back(c10::DeviceType::CUDA,
                                         c10::EventFlag::BACKEND_DEFAULT);
                 }
             }
-            c10::impl::VirtualGuardImpl dev_impl(c10::DeviceType::CUDA);
-            if (time_device_) dev_ev[0].record(dev_impl.getStream(device_));
+            // Constructed ONLY when timing is armed. An unconditional
+            // VirtualGuardImpl on the default path would touch the CUDA guard
+            // registry on every physical batch of every run, including CPU runs
+            // and runs with telemetry off.
+            std::optional<c10::impl::VirtualGuardImpl> dev_impl;
+            if (time_device_) {
+                dev_impl.emplace(c10::DeviceType::CUDA);
+                dev_ev[0].record(dev_impl->getStream(device_));
+            }
 
             // Non-blocking H2D transfer using .slice() for partial batches
             torch::Tensor device_obs = device_.is_cuda()
                 ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true)
                 : pinned_stacked_obs.slice(0, 0, batch_size);
 
-            if (time_device_) dev_ev[1].record(dev_impl.getStream(device_));
+            if (time_device_) dev_ev[1].record(dev_impl->getStream(device_));
 
             // B. FORWARD PASS WITH AMP (FP16/TF32) AND WRITE PROTECTION
             torch::Tensor pred_logits, pred_values;
@@ -1140,7 +1156,7 @@ private:
                     pred_values = outputs.values;
                 }
             }
-            if (time_device_) dev_ev[2].record(dev_impl.getStream(device_));
+            if (time_device_) dev_ev[2].record(dev_impl->getStream(device_));
 
             // Return raw logits. The tanh soft-cap must be applied after
             // legal-action centering, which requires the State's legal actions.
@@ -1149,11 +1165,15 @@ private:
             if (device_.is_cuda()) {
                 pred_logits = pred_logits.to(torch::kFloat32);
                 pred_values = pred_values.to(torch::kFloat32);
+                // Boundary AFTER the cast: without it, "d2h" silently included
+                // the AMP->FP32 conversion, which is device compute, not a
+                // transfer.
+                if (time_device_) dev_ev[3].record(dev_impl->getStream(device_));
                 std::chrono::steady_clock::time_point sync_t0, sync_t1;
                 if (device_synchronize_) {
                     pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
                     pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                    if (time_device_) dev_ev[3].record(dev_impl.getStream(device_));
+                    if (time_device_) dev_ev[4].record(dev_impl->getStream(device_));
 
                     // Wait for asynchronous transfers to complete before reading.
                     sync_t0 = std::chrono::steady_clock::now();
@@ -1162,7 +1182,7 @@ private:
                 } else {
                     pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/false).contiguous();
                     pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/false).contiguous();
-                    if (time_device_) dev_ev[3].record(dev_impl.getStream(device_));
+                    if (time_device_) dev_ev[4].record(dev_impl->getStream(device_));
                     sync_t0 = sync_t1 = std::chrono::steady_clock::now();
                 }
                 if (time_device_) {
@@ -1170,7 +1190,7 @@ private:
                     // torch::cuda::synchronize() drained the stream, or the D2H
                     // was blocking. So no additional synchronise is inserted --
                     // the instrument must not add the very stalls it measures.
-                    dev_ev[3].synchronize();
+                    dev_ev[4].synchronize();
                     auto us = [](double ms) {
                         return static_cast<uint64_t>(ms * 1000.0 + 0.5);
                     };
@@ -1178,7 +1198,9 @@ private:
                                       std::memory_order_relaxed);
                     forward_us_.fetch_add(us(dev_ev[1].elapsedTime(dev_ev[2])),
                                           std::memory_order_relaxed);
-                    d2h_us_.fetch_add(us(dev_ev[2].elapsedTime(dev_ev[3])),
+                    output_cast_us_.fetch_add(us(dev_ev[2].elapsedTime(dev_ev[3])),
+                                              std::memory_order_relaxed);
+                    d2h_us_.fetch_add(us(dev_ev[3].elapsedTime(dev_ev[4])),
                                       std::memory_order_relaxed);
                     sync_us_.fetch_add(
                         static_cast<uint64_t>(

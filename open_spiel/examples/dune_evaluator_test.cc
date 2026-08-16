@@ -438,6 +438,118 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Test 9: BatchedEvaluator device-timing telemetry (WO-PERF-TIMING-BATCH).
+  //
+  // Test 8 does NOT cover this: it stresses the DeterministicEvaluator, which
+  // has no batcher and no telemetry, so it cannot show whether the timing
+  // fields are wired, gated, or zeroed correctly. This test drives the
+  // BatchedEvaluator directly.
+  //
+  // Three claims, on CPU so it runs everywhere:
+  //   (a) with telemetry DISABLED the timing fields stay exactly zero;
+  //   (b) EnableBatcherTelemetry() arms the per-batch bookkeeping, so
+  //       physical_batches becomes nonzero and matches the rows submitted;
+  //   (c) on CPU the four DEVICE intervals stay zero even when armed, because
+  //       there is no CUDA stream to record events on -- "armed" must not be
+  //       confused with "measured".
+  {
+    std::cout << "=== Test 9: BatchedEvaluator telemetry gating and counts ===\n";
+    const int64_t kObs = 5580;
+    torch::manual_seed(20277001);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kObs, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    model->eval();
+    torch::Device cpu(torch::kCPU);
+    model->to(cpu);
+
+    std::vector<float> obs(kObs, 0.25f);
+
+    // (a) DISABLED: no EnableBatcherTelemetry() call at all.
+    {
+      std::shared_mutex sync_mutex;
+      BatchedEvaluator be(model, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                          cpu, &sync_mutex);
+      for (int i = 0; i < 8; ++i) (void)be.Evaluate(obs);
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+      assert(t.h2d_ms == 0.0);
+      assert(t.forward_ms == 0.0);
+      assert(t.output_cast_ms == 0.0);
+      assert(t.d2h_ms == 0.0);
+      assert(t.sync_ms == 0.0);
+      assert(t.device_timed_batches == 0);
+      // The always-on counters still move; only the opt-in sections are dark.
+      assert(t.submitted_rows == 8);
+      std::cout << "  disabled: all timing zero, submitted_rows="
+                << t.submitted_rows << "\n";
+    }
+
+    // (b)+(c) ENABLED on CPU.
+    {
+      std::shared_mutex sync_mutex;
+      BatchedEvaluator be(model, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                          cpu, &sync_mutex);
+      be.EnableBatcherTelemetry();
+      const int kCalls = 12;
+      for (int i = 0; i < kCalls; ++i) (void)be.Evaluate(obs);
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+
+      assert(t.submitted_rows == static_cast<uint64_t>(kCalls));
+      assert(t.single_row_calls == static_cast<uint64_t>(kCalls));
+      assert(t.physical_batches > 0);
+      // Every row lands in exactly one physical batch, so batches can never
+      // exceed rows and the mean must be a sane positive number.
+      assert(t.physical_batches <= t.submitted_rows);
+      assert(t.mean_batch_size > 0.0);
+      assert(t.max_batch_size >= 1);
+
+      // CPU: armed, but no CUDA events exist, so device time stays zero and
+      // device_timed_batches stays zero. This is the distinction the field was
+      // added for -- "measured zero" vs "never measured".
+      assert(t.h2d_ms == 0.0);
+      assert(t.forward_ms == 0.0);
+      assert(t.output_cast_ms == 0.0);
+      assert(t.d2h_ms == 0.0);
+      assert(t.device_timed_batches == 0);
+
+      std::cout << "  enabled(CPU): rows=" << t.submitted_rows
+                << " batches=" << t.physical_batches
+                << " mean=" << t.mean_batch_size
+                << " device_timed_batches=" << t.device_timed_batches
+                << " (0 expected on CPU)\n";
+    }
+
+    // On CUDA, device_timed_batches must equal physical_batches: every batch
+    // that runs is a batch that gets timed.
+    if (torch::cuda::is_available()) {
+      torch::Device gpu(torch::kCUDA, 0);
+      auto gmodel = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kObs, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+      gmodel->eval();
+      gmodel->to(gpu);
+      std::shared_mutex sync_mutex;
+      BatchedEvaluator be(gmodel, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                          gpu, &sync_mutex);
+      be.EnableBatcherTelemetry();
+      for (int i = 0; i < 12; ++i) (void)be.Evaluate(obs);
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+      assert(t.physical_batches > 0);
+      assert(t.device_timed_batches == t.physical_batches);
+      assert(t.forward_ms > 0.0);   // a real forward took real time
+      assert(t.h2d_ms >= 0.0);
+      assert(t.output_cast_ms >= 0.0);
+      assert(t.d2h_ms >= 0.0);
+      assert(t.sync_ms >= 0.0);
+      std::cout << "  enabled(CUDA): batches=" << t.physical_batches
+                << " timed=" << t.device_timed_batches
+                << " h2d=" << t.h2d_ms << "ms forward=" << t.forward_ms
+                << "ms cast=" << t.output_cast_ms << "ms d2h=" << t.d2h_ms
+                << "ms sync=" << t.sync_ms << "ms (sync OVERLAPS the rest)\n";
+    } else {
+      std::cout << "  CUDA unavailable: device-interval assertions skipped\n";
+    }
+    std::cout << "Test 9 Passed!\n\n";
+  }
+
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";
   return 0;
 }
