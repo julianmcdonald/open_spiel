@@ -550,6 +550,102 @@ int main(int argc, char* argv[]) {
     std::cout << "Test 9 Passed!\n\n";
   }
 
+  // Test 10: warm-up must not contaminate scored telemetry
+  // (WO-PERF-TIMING-BATCH regression).
+  //
+  // EnableBatcherTelemetry() arms the DETAILED per-batch sections. It does NOT
+  // reset the always-on counters. A warm-up run through the evaluator that then
+  // serves the scored run therefore leaves submitted_rows, physical_batches and
+  // the class counters already advanced, and -- because timing arms afterwards
+  // -- leaves device_timed_batches permanently short of physical_batches.
+  //
+  // This test asserts BOTH halves: that the contamination is real on a shared
+  // instance (so the fix is not cargo-culted), and that a fresh instance is
+  // clean (so the throwaway-evaluator pattern actually works).
+  {
+    std::cout << "=== Test 10: warm-up isolation and timing coverage ===\n";
+    const int64_t kObs = 5580;
+    torch::manual_seed(20277002);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kObs, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    model->eval();
+    torch::Device cpu(torch::kCPU);
+    model->to(cpu);
+    std::vector<float> obs(kObs, 0.25f);
+    const int kWarm = 5, kScored = 7;
+
+    // (a) SHARED instance -- the bug. Arming after use does not rewind.
+    {
+      std::shared_mutex m;
+      BatchedEvaluator be(model, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                          cpu, &m);
+      for (int i = 0; i < kWarm; ++i) (void)be.Evaluate(obs);   // "warm-up"
+      be.EnableBatcherTelemetry();                              // arm AFTER
+      for (int i = 0; i < kScored; ++i) (void)be.Evaluate(obs); // "scored"
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+      // The counters carry the warm-up rows: this is the contamination.
+      assert(t.submitted_rows == static_cast<uint64_t>(kWarm + kScored));
+      assert(t.single_row_calls == static_cast<uint64_t>(kWarm + kScored));
+      std::cout << "  shared instance: submitted_rows=" << t.submitted_rows
+                << " (warm " << kWarm << " + scored " << kScored
+                << ") -- EnableBatcherTelemetry does NOT reset\n";
+    }
+
+    // (b) FRESH instance -- the fix. Warm-up ran on a throwaway that is gone.
+    {
+      std::shared_mutex mw;
+      {
+        BatchedEvaluator warm(model, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                              cpu, &mw);
+        for (int i = 0; i < kWarm; ++i) (void)warm.Evaluate(obs);
+      }  // throwaway destroyed here
+      std::shared_mutex m;
+      BatchedEvaluator be(model, /*target_batch_size=*/4, /*timeout_ms=*/5,
+                          cpu, &m);
+      be.EnableBatcherTelemetry();
+      for (int i = 0; i < kScored; ++i) (void)be.Evaluate(obs);
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+      // Scored counters see ONLY scored work: warm-up contributed zero.
+      assert(t.submitted_rows == static_cast<uint64_t>(kScored));
+      assert(t.single_row_calls == static_cast<uint64_t>(kScored));
+      assert(t.physical_batches > 0);
+      assert(t.physical_batches <= t.submitted_rows);
+      std::cout << "  fresh instance:  submitted_rows=" << t.submitted_rows
+                << " batches=" << t.physical_batches
+                << " -- warm-up contributed ZERO scored rows\n";
+    }
+
+    // (c) On CUDA the coverage gate the sweep enforces must hold exactly.
+    if (torch::cuda::is_available()) {
+      torch::Device gpu(torch::kCUDA, 0);
+      auto gmodel = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kObs, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+      gmodel->eval();
+      gmodel->to(gpu);
+      std::shared_mutex mw;
+      {
+        BatchedEvaluator warm(gmodel, 4, 5, gpu, &mw);
+        for (int i = 0; i < kWarm; ++i) (void)warm.Evaluate(obs);
+      }
+      std::shared_mutex m;
+      BatchedEvaluator be(gmodel, 4, 5, gpu, &m);
+      be.EnableBatcherTelemetry();
+      for (int i = 0; i < kScored; ++i) (void)be.Evaluate(obs);
+      BatcherTelemetry t = be.GetBatcherTelemetry();
+      assert(t.submitted_rows == static_cast<uint64_t>(kScored));
+      // S6: every physical batch timed. This is the assertion that fails if
+      // warm-up ever shares the scored evaluator again.
+      assert(t.device_timed_batches == t.physical_batches);
+      assert(t.forward_ms > 0.0);
+      std::cout << "  fresh instance (CUDA): batches=" << t.physical_batches
+                << " timed=" << t.device_timed_batches
+                << " -- full coverage holds\n";
+    } else {
+      std::cout << "  CUDA unavailable: coverage assertion skipped\n";
+    }
+    std::cout << "Test 10 Passed!\n\n";
+  }
+
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";
   return 0;
 }

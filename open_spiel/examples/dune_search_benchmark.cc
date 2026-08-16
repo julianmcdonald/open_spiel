@@ -120,11 +120,13 @@ ABSL_FLAG(std::string, corpus_root_jsonl_path, "",
           "visit vector) for direct/batched parity comparison.");
 ABSL_FLAG(int, corpus_warmup_searches, 0,
           "WO-PERF-TIMING-BATCH: run this many discarded warm-up searches "
-          "before timing and before batcher telemetry is armed. Identical "
-          "across every arm of a sweep, so the first arm does not silently pay "
-          "for lazy CUDA context setup, cuBLAS autotuning and allocator growth "
-          "that later arms inherit for free. 0 = no warm-up (default, "
-          "reproducing today's behaviour).");
+          "before timing and before batcher telemetry is armed. Each arm is a "
+          "SEPARATE PROCESS and inherits nothing from the last, so this does "
+          "not amortise setup across arms: it moves THIS process's own lazy "
+          "CUDA context creation, cuBLAS/cuDNN autotuning and caching-allocator "
+          "growth out of its measured region, identically for every arm, so the "
+          "residual is comparable. 0 = no warm-up (default, reproducing "
+          "today's behaviour).");
 ABSL_FLAG(std::string, batcher_telemetry_json_path, "",
           "WO-PERF-3: path to write batcher telemetry JSON (batched mode only).");
 ABSL_FLAG(bool, nonlinear_value_head, false,
@@ -1797,30 +1799,40 @@ int RunCorpusRootBenchmark(
   std::cout << "  root_set_count:  " << roots.size() << "\n"
             << "  root_set_sha256: " << root_set_sha256 << "\n\n";
 
-  // The shared coordinator (batched mode only).
   std::shared_mutex model_mutex;
-  std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval;
-  if (batched) {
-    batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
-        search_model, target, timeout_ms, device, &model_mutex,
-        /*logit_cap=*/0.0f);
-  }
 
-  // --- Registered warm-up, BEFORE telemetry is armed and before the clock ---
+  // --- Registered warm-up, on a THROWAWAY evaluator ------------------------
   //
-  // Ordering is the whole point. Warm-up runs first, so the CUDA context
-  // creation, cuBLAS/cuDNN autotuning and caching-allocator growth it triggers
-  // are paid by every arm equally and counted by none: the batcher telemetry is
-  // armed AFTER it, and wall_start is taken after that. Without this the first
-  // arm of a sweep absorbs one-time costs that every later arm inherits free,
-  // which reads as the first configuration being slower.
+  // The warm-up MUST NOT share the evaluator the scored run uses.
+  // EnableBatcherTelemetry() arms the detailed per-batch sections; it does NOT
+  // reset the always-on counters. So a warm-up that ran through the scored
+  // BatchedEvaluator would leave total_requests, physical_batches,
+  // single_row_calls, group_rows and the timeout counts already advanced before
+  // a single scored row was submitted. Three checks break at once:
+  //
+  //   * group_rows would exceed the leaf-evaluation delta, because that delta is
+  //     snapshotted after warm-up while group_rows still carries warm-up rows
+  //     -- the B3 crosscheck fails;
+  //   * device_timed_batches < physical_batches, because timing arms after
+  //     warm-up while the batch counter does not reset -- the S6 coverage gate
+  //     fails;
+  //   * so the FIRST batched arm of every sweep fails S2/S6, and would look
+  //     like an instrument fault rather than a warm-up accounting error.
+  //
+  // The temporary evaluator is therefore destroyed before the scored one is
+  // constructed, which also releases its pinned staging buffers rather than
+  // holding them while the scored evaluator allocates its own.
   const int warmup_n = absl::GetFlag(FLAGS_corpus_warmup_searches);
   if (warmup_n > 0 && !roots.empty()) {
     torch::InferenceMode inference_guard;
+    std::shared_ptr<open_spiel::BatchedEvaluator> warm_batched;
     std::shared_ptr<algorithms::Evaluator> wu_eval;
     if (batched) {
+      warm_batched = std::make_shared<open_spiel::BatchedEvaluator>(
+          search_model, target, timeout_ms, device, &model_mutex,
+          /*logit_cap=*/0.0f);
       wu_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
-          batched_eval, candidate_logit_cap);
+          warm_batched, candidate_logit_cap);
     } else {
       wu_eval = std::make_shared<open_spiel::DuneNNEvaluator>(
           search_model, device, candidate_logit_cap);
@@ -1849,14 +1861,22 @@ int RunCorpusRootBenchmark(
                                  DuneSearchBudgetMode::kFixedSessionSimulations);
       (void)wsession.Search(*st);
     }
+    // Explicit teardown before the scored evaluator exists.
+    wu_eval.reset();
+    warm_batched.reset();
     std::cout << "  warm-up:         " << warmup_n
-              << " discarded searches (before telemetry and timing)\n";
+              << " discarded searches on a throwaway evaluator\n";
   }
 
+  // The shared coordinator (batched mode only) -- constructed FRESH, after
+  // warm-up, so every counter it reports starts at zero for the scored run.
+  std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval;
   if (batched) {
-    // R2: the corpus driver is the one consumer that reads the detailed
-    // batcher telemetry, so it alone arms the per-batch bookkeeping. Armed
-    // AFTER warm-up so warm-up rows are never counted.
+    batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
+        search_model, target, timeout_ms, device, &model_mutex,
+        /*logit_cap=*/0.0f);
+    // R2: the corpus driver is the one consumer that reads the detailed batcher
+    // telemetry, so it alone arms the per-batch bookkeeping.
     batched_eval->EnableBatcherTelemetry();
   }
 
@@ -2101,6 +2121,15 @@ int RunCorpusRootBenchmark(
       o["evaluator_mode"] = mode;
       // WO-PERF-R3 (deliverable 2): root-set identity, self-recorded.
       o["root_set_sha256"] = root_set_sha256;
+      // Latency percentiles and the warm-up count, so a consumer of this file
+      // can check the registered latency bound and confirm the arm warmed up
+      // without parsing stdout. (An earlier revision of the registration
+      // claimed these were emitted here when they were not.)
+      o["latency_p50_ms"] = lat_p50;
+      o["latency_p95_ms"] = lat_p95;
+      o["latency_p99_ms"] = lat_p99;
+      o["latency_max_ms"] = lat_max;
+      o["warmup_searches"] = static_cast<int64_t>(warmup_n);
       o["root_set_count"] = static_cast<int64_t>(roots.size());
       o["roots"] = static_cast<int64_t>(roots.size());
       o["workers"] = static_cast<int64_t>(workers);
