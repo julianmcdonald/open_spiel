@@ -1028,7 +1028,19 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     }
   }
 
-  int req_covered_actions = std::min<int>(3, legal_actions.size());
+  // Leader-specific mass-only coverage. Scoped by BOTH the opt-in flag and the
+  // root's actual phase, so an identical coverage pattern at any non-Leader
+  // root keeps the generic three-action rule and is still rejected.
+  bool leader_root = false;
+  if (config_.leader_mass_only_coverage) {
+    const auto& dune_state =
+        static_cast<const dune_imperium::DuneImperiumState&>(state);
+    const dune_imperium::GamePhase phase = dune_state.phase();
+    leader_root = (phase == dune_imperium::GamePhase::kLeaderDraft ||
+                   phase == dune_imperium::GamePhase::kLeaderOfferChance);
+  }
+  const int req_covered_actions =
+      leader_root ? 0 : std::min<int>(3, legal_actions.size());
   if (num_covered_actions < req_covered_actions || covered_prior_mass < config_.covered_prior_threshold) {
     // WO-15 / search finding 4: degrade to the RAW network prior, not to the
     // tree prior. At a noised root the tree prior is a 25% Dirichlet mixture

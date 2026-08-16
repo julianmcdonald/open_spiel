@@ -555,6 +555,13 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readwrite("use_observation_string", &open_spiel::DuneSearchConfig::use_observation_string)
       .def_readwrite("verbose_diagnostics", &open_spiel::DuneSearchConfig::verbose_diagnostics)
       .def_readwrite("check_strategic_state", &open_spiel::DuneSearchConfig::check_strategic_state)
+      // Leader-selection search (adopted 2026-08-16 at a fixed 64-simulation
+      // budget). All three are required together: enabling the search without
+      // mass-only coverage makes the search-result path reject the concentrated
+      // Leader policy as low_coverage and hand back the raw prior.
+      .def_readwrite("search_leader_draft", &open_spiel::DuneSearchConfig::search_leader_draft)
+      .def_readwrite("leader_draft_simulations", &open_spiel::DuneSearchConfig::leader_draft_simulations)
+      .def_readwrite("leader_mass_only_coverage", &open_spiel::DuneSearchConfig::leader_mass_only_coverage)
       .def_readwrite("fixed_continuation_reserve", &open_spiel::DuneSearchConfig::fixed_continuation_reserve)
       .def_readwrite("purchase_combat_budget", &open_spiel::DuneSearchConfig::purchase_combat_budget)
       .def_readwrite("live_continuation_reserve_seconds", &open_spiel::DuneSearchConfig::live_continuation_reserve_seconds)

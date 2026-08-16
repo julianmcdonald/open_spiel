@@ -115,6 +115,15 @@ struct DuneSearchConfig {
   // OWN "leader_draft_no_budget" fallback reason rather than reverting to the
   // bookkeeping path.
   int leader_draft_simulations = 64;
+
+  // Leader-specific MASS-ONLY coverage, applied to the SEARCH RESULT itself and
+  // not only to collector acceptance. Without it a 64-simulation Leader search
+  // that concentrates on a genuine correction is rejected here as
+  // "low_coverage", the raw prior is returned, and the search the caller paid
+  // for is discarded before any consumer sees it. The 0.50 covered-prior-mass
+  // threshold and the min-visit definition are unchanged; only the generic
+  // three-covered-actions clause is dropped, and only at Leader roots.
+  bool leader_mass_only_coverage = false;
 };
 
 struct SearchDiagnostics {

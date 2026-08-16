@@ -233,6 +233,28 @@ OnlineSearchCollector::OnlineSearchCollector(const OnlineSearchConfig& config,
   SPIEL_CHECK_GE(config_.search_probability, 0.0);
   SPIEL_CHECK_LE(config_.search_probability, 1.0);
   SPIEL_CHECK_GT(config_.max_simulations, config_.fixed_continuation_reserve);
+  // ADOPTED SEMANTICS, not adjustable knobs. Leader teaching was adopted at a
+  // fixed 64-simulation budget with mass-only coverage; a run that enables it
+  // at any other budget, or without the coverage rule, is not the adopted
+  // behaviour and would teach something nobody signed off. Rejected at startup
+  // rather than silently honoured.
+  if (config_.search_leader_draft) {
+    if (config_.leader_draft_simulations != OnlineSearchConfig::kAdoptedLeaderDraftSimulations) {
+      SpielFatalError(absl::StrCat(
+          "Leader teaching is adopted at exactly ",
+          OnlineSearchConfig::kAdoptedLeaderDraftSimulations,
+          " simulations; leader_draft_simulations=",
+          config_.leader_draft_simulations,
+          " is not an adjustable experimental knob."));
+    }
+    if (!config_.leader_mass_only_coverage) {
+      SpielFatalError(
+          "search_leader_draft requires leader_mass_only_coverage: the generic "
+          "three-covered-actions gate discards the concentrated Leader "
+          "correction the teacher exists to emit, so enabling Leader search "
+          "without it teaches the raw prior.");
+    }
+  }
   SPIEL_CHECK_LT(config_.max_search_decision_depth, 0);  // 18B is uncapped
   SPIEL_CHECK_EQ(config_.nonlinear_value_head, false);   // 18B uses baseline critic
   SPIEL_CHECK_GE(config_.swordmaster_grant_fraction, 0.0);
@@ -572,6 +594,12 @@ void OnlineSearchCollector::CollectUpdate(
             // alone is not enough: there are two gates and both are needed.
             cfg.search_leader_draft = true;
             cfg.leader_draft_simulations = config_.leader_draft_simulations;
+            // The same exception on the SEARCH-RESULT path, not just on
+            // collector acceptance: without it RunSearch rejects the search as
+            // "low_coverage" and hands back the raw prior, so the collector
+            // would be applying mass-only acceptance to a policy that is
+            // already the prior it was trying to correct.
+            cfg.leader_mass_only_coverage = config_.leader_mass_only_coverage;
           }
           cfg.seed = DeriveStream(config_.auxiliary_search_seed_domain, episode_id,
                                   this_decision, kStreamSearchSeed);

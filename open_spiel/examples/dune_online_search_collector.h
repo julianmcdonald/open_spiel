@@ -173,6 +173,10 @@ struct OnlineSearchConfig {
   // configuration -- flipping the default would silently introduce Leader
   // search into every training tool and evaluation consumer that constructs a
   // default OnlineSearchConfig.
+  // The ADOPTED Leader budget. Permanent: a run that enables Leader teaching at
+  // any other value is rejected at startup.
+  static constexpr int kAdoptedLeaderDraftSimulations = 64;
+
   bool search_leader_draft = false;
   // Fixed and permanent, not an experimental ladder. 64 simulations at every
   // non-forced Leader choice.
