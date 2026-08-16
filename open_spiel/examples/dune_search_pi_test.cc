@@ -10,6 +10,7 @@
 #include <iostream>
 #include <memory>
 #include <set>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -934,6 +935,429 @@ void Test15_Reproducibility(const std::shared_ptr<const Game>& game) {
             << "...)\n\n";
 }
 
+// Snapshot every parameter by name, so a test can say WHICH group moved.
+std::map<std::string, torch::Tensor> SnapshotParams(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& m) {
+  std::map<std::string, torch::Tensor> out;
+  for (const auto& item : m->named_parameters()) {
+    out[item.key()] = item.value().detach().clone();
+  }
+  return out;
+}
+
+// Did any parameter whose name starts with `prefix` change? Bitwise: the claim
+// under test is "this group received no gradient", and a group that received a
+// tiny gradient is a different fact from one that received none.
+bool GroupMoved(const std::shared_ptr<SharedDunePolicyValueNetImpl>& m,
+                const std::map<std::string, torch::Tensor>& before,
+                const std::string& prefix) {
+  for (const auto& item : m->named_parameters()) {
+    if (item.key().rfind(prefix, 0) != 0) continue;
+    auto it = before.find(item.key());
+    SPIEL_CHECK_TRUE(it != before.end());
+    if (!torch::equal(item.value().detach(), it->second)) return true;
+  }
+  return false;
+}
+
+// --- 16. The policy coefficient, and what "eliminated" means ---------------
+//
+// Three distinct claims, because the flag would look like it worked if only the
+// first held:
+//   (a) it SCALES     -- at 0.5 the reported policy gradient norm is exactly
+//                        half the norm at 1.0;
+//   (b) it ELIMINATES -- at 0 the backward does not run, and the policy head is
+//                        BITWISE unchanged afterwards. A multiply-by-zero would
+//                        also report norm 0, so the norm alone proves nothing;
+//                        an untouched head does;
+//   (c) it is INERT at 1.0 -- byte-identical weights to a run of the same rows
+//                        with the field left at its default, which is what lets
+//                        the matrix's anchor arm reproduce a run that predates
+//                        the flag.
+void Test16_PolicyCoefficient() {
+  std::cout << "Running Test16_PolicyCoefficient...\n";
+  const int64_t in_dim = 8, action_dim = 5;
+
+  std::vector<SearchPiRow> rows;
+  rows.push_back(MakeRow(in_dim, {0, 1, 2}, {0.5, 0.3, 0.2}, 0.5625, 0));
+  rows.push_back(MakeRow(in_dim, {1, 3, 4}, {0.1, 0.1, 0.8}, -0.4375, 1));
+
+  auto run = [&](double pcoef, double vcoef, double clip, double lr,
+                 std::shared_ptr<SharedDunePolicyValueNetImpl>* out_model,
+                 std::map<std::string, torch::Tensor>* out_before) {
+    auto model = TinyModel(in_dim, action_dim);
+    torch::optim::AdamW opt(model->parameters(),
+                            torch::optim::AdamWOptions(lr));
+    SearchPiLearnerConfig cfg;
+    cfg.minibatch_size = 2;  // one minibatch: norms are exact, not averaged
+    cfg.epochs = 1;
+    cfg.policy_coef = pcoef;
+    cfg.value_coef = vcoef;
+    cfg.grad_clip_norm = clip;
+    if (out_before != nullptr) *out_before = SnapshotParams(model);
+    SearchPiLearnerStats s = RunSearchPiLearner(
+        model, opt, rows, in_dim, action_dim, torch::kCPU, 7, 1, cfg);
+    if (out_model != nullptr) *out_model = model;
+    return s;
+  };
+
+  // (a) The coefficient scales the gradient. Clipping off, or the rescale would
+  // erase exactly the ratio under test.
+  SearchPiLearnerStats one = run(1.0, 1.0, 0.0, 1e-3, nullptr, nullptr);
+  SearchPiLearnerStats half = run(0.5, 1.0, 0.0, 1e-3, nullptr, nullptr);
+  SPIEL_CHECK_GT(one.policy_grad_norm, 0.0);
+  SPIEL_CHECK_LT(std::abs(half.policy_grad_norm - 0.5 * one.policy_grad_norm),
+                 1e-9 * one.policy_grad_norm);
+  // The value channel is untouched by the policy coefficient.
+  SPIEL_CHECK_LT(std::abs(half.value_grad_norm - one.value_grad_norm), 1e-9);
+  SPIEL_CHECK_TRUE(one.policy_backward_executed);
+  SPIEL_CHECK_TRUE(one.value_backward_executed);
+
+  // (b) At 0 the policy backward is skipped and the policy head does not move.
+  std::shared_ptr<SharedDunePolicyValueNetImpl> m0;
+  std::map<std::string, torch::Tensor> before0;
+  SearchPiLearnerStats zero = run(0.0, 1.0, 0.5, 1e-2, &m0, &before0);
+  SPIEL_CHECK_FALSE(zero.policy_backward_executed);
+  SPIEL_CHECK_TRUE(zero.value_backward_executed);
+  SPIEL_CHECK_FLOAT_EQ(zero.policy_grad_norm, 0.0);
+  SPIEL_CHECK_FLOAT_EQ(zero.policy_grad_norm_trunk, 0.0);
+  SPIEL_CHECK_FLOAT_EQ(zero.policy_grad_norm_policy_head, 0.0);
+  // The head that only the CE can reach is bitwise untouched...
+  SPIEL_CHECK_FALSE(GroupMoved(m0, before0, "policy_head"));
+  // ...while the value channel demonstrably did run, so this is an ablation
+  // rather than a learner that silently did nothing at all.
+  SPIEL_CHECK_TRUE(GroupMoved(m0, before0, "value_head"));
+  SPIEL_CHECK_TRUE(GroupMoved(m0, before0, "input_layer"));
+  SPIEL_CHECK_GT(zero.value_grad_norm, 0.0);
+  // CE is still REPORTED at coefficient 0 -- the forward runs, only the
+  // backward is skipped -- so the arm remains comparable on loss.
+  SPIEL_CHECK_TRUE(std::isfinite(zero.policy_ce));
+  SPIEL_CHECK_GT(zero.policy_ce, 0.0);
+
+  // The symmetric case: value_coef 0 leaves the value head untouched and lets
+  // the CE move the trunk. This is the A/D arms' configuration.
+  std::shared_ptr<SharedDunePolicyValueNetImpl> mv;
+  std::map<std::string, torch::Tensor> beforev;
+  SearchPiLearnerStats vzero = run(1.0, 0.0, 0.5, 1e-2, &mv, &beforev);
+  SPIEL_CHECK_TRUE(vzero.policy_backward_executed);
+  SPIEL_CHECK_FALSE(vzero.value_backward_executed);
+  SPIEL_CHECK_FLOAT_EQ(vzero.value_grad_norm, 0.0);
+  SPIEL_CHECK_FALSE(GroupMoved(mv, beforev, "value_head"));
+  SPIEL_CHECK_TRUE(GroupMoved(mv, beforev, "policy_head"));
+  SPIEL_CHECK_TRUE(GroupMoved(mv, beforev, "input_layer"));
+  // MSE is still reported, so a CE-only arm can still be read for critic drift.
+  SPIEL_CHECK_TRUE(std::isfinite(vzero.value_mse));
+
+  // (c) 1.0 is inert: identical weights to the default-constructed config.
+  auto ref_model = TinyModel(in_dim, action_dim);
+  torch::optim::AdamW ref_opt(ref_model->parameters(),
+                              torch::optim::AdamWOptions(1e-2));
+  SearchPiLearnerConfig ref_cfg;   // policy_coef defaults to 1.0
+  ref_cfg.minibatch_size = 2;
+  ref_cfg.epochs = 1;
+  RunSearchPiLearner(ref_model, ref_opt, rows, in_dim, action_dim, torch::kCPU,
+                     7, 1, ref_cfg);
+
+  auto exp_model = TinyModel(in_dim, action_dim);
+  torch::optim::AdamW exp_opt(exp_model->parameters(),
+                              torch::optim::AdamWOptions(1e-2));
+  SearchPiLearnerConfig exp_cfg = ref_cfg;
+  exp_cfg.policy_coef = 1.0;       // stated explicitly
+  RunSearchPiLearner(exp_model, exp_opt, rows, in_dim, action_dim, torch::kCPU,
+                     7, 1, exp_cfg);
+
+  auto ref_named = ref_model->named_parameters();
+  for (const auto& item : exp_model->named_parameters()) {
+    SPIEL_CHECK_TRUE(
+        torch::equal(item.value().detach(), ref_named[item.key()].detach()));
+  }
+
+  // The coefficient is part of the objective, so it must move the fingerprint;
+  // otherwise a resume could silently switch arms.
+  SearchPiConfig c;
+  SearchPiLearnerConfig l1, l0;
+  l0.policy_coef = 0.0;
+  SPIEL_CHECK_NE(SearchPiConfigFingerprint(c, l1),
+                 SearchPiConfigFingerprint(c, l0));
+  std::cout << "Test16 Passed! (|g_pol| 1.0->" << one.policy_grad_norm
+            << " 0.5->" << half.policy_grad_norm << " 0.0->"
+            << zero.policy_grad_norm << ")\n\n";
+}
+
+// --- 17. The two hash chains ----------------------------------------------
+//
+// The legacy chain is a provenance tie and must stay frozen; the extended chain
+// is the matrix's row-identity control. The test that matters is the SPLIT: for
+// every field the legacy chain omits, the legacy hash must be blind and the
+// extended hash must not be.
+void Test17_HashChains() {
+  std::cout << "Running Test17_HashChains...\n";
+  const int64_t in_dim = 8;
+  const SearchPiRow base = MakeRow(in_dim, {0, 1, 2}, {0.5, 0.3, 0.2}, 0.25, 0);
+
+  const std::string legacy0 = ChainSearchPiTargetHash("", base);
+  const std::string ext0 = ChainSearchPiExtendedRowHash("", base);
+  SPIEL_CHECK_EQ(legacy0.size(), 64u);
+  SPIEL_CHECK_EQ(ext0.size(), 64u);
+  SPIEL_CHECK_NE(legacy0, ext0);
+
+  // --- Fields the LEGACY chain does not cover. The asymmetry is the point:
+  // this is exactly why "byte-identical rows" could not be claimed from it.
+  {
+    SearchPiRow r = base;
+    r.observation[3] += 1.0f;             // the model's actual input
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.observation_is_information_state = !r.observation_is_information_state;
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.raw_policy[0] += 0.125;             // the frozen snapshot's own prior
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.simulations_completed += 1;         // provenance
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.inherited_root_visits += 1;
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.re_root_status = "miss";
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.fallback = SearchPiFallback::kZeroVisits;
+    SPIEL_CHECK_EQ(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.generation += 1;                    // legacy covers ids but not generation
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+  {
+    SearchPiRow r = base;
+    r.role = DuneDecisionRole::kAgentContinuation;
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  }
+
+  // --- Fields BOTH chains cover. The extended chain must not have lost
+  // sensitivity to anything the legacy chain had.
+  auto both_react = [&](const SearchPiRow& r) {
+    SPIEL_CHECK_NE(ChainSearchPiTargetHash("", r), legacy0);
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", r), ext0);
+  };
+  { SearchPiRow r = base; r.episode_id += 1;      both_react(r); }
+  { SearchPiRow r = base; r.decision_id += 1;     both_react(r); }
+  { SearchPiRow r = base; r.player = 1;           both_react(r); }
+  { SearchPiRow r = base; r.chosen_action = 2;    both_react(r); }
+  { SearchPiRow r = base; r.target_probs[0] += 0.01; both_react(r); }
+  { SearchPiRow r = base; r.value_target = -0.4375;  both_react(r); }
+  { SearchPiRow r = base; r.legal_actions = {0, 1, 3}; both_react(r); }
+
+  // --- Chaining is order-sensitive and prefix-sensitive in both formats.
+  const SearchPiRow other =
+      MakeRow(in_dim, {1, 3, 4}, {0.1, 0.1, 0.8}, -0.1875, 1);
+  SPIEL_CHECK_NE(
+      ChainSearchPiExtendedRowHash(ChainSearchPiExtendedRowHash("", base), other),
+      ChainSearchPiExtendedRowHash(ChainSearchPiExtendedRowHash("", other), base));
+  SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("x", base), ext0);
+
+  // --- Length prefixes are load-bearing. Moving one element between two
+  // variable-length vectors leaves the concatenated bytes identical; only the
+  // hashed lengths distinguish these rows.
+  {
+    SearchPiRow a = base;
+    a.legal_actions = {1, 2, 3};
+    a.raw_policy = {0.2, 0.3, 0.5};
+    a.target_probs = {0.2, 0.3, 0.5};
+    SearchPiRow b = a;
+    b.legal_actions = {1, 2};
+    b.raw_policy = {0.2, 0.3, 0.5};
+    b.target_probs = {0.2, 0.3, 0.5};
+    SPIEL_CHECK_NE(ChainSearchPiExtendedRowHash("", a),
+                   ChainSearchPiExtendedRowHash("", b));
+  }
+
+  // --- The legacy byte layout, pinned. A refactor that changes this breaks
+  // every recorded chain's comparability, including the anchor arm's tie to the
+  // pilot's generation 1 -- so it must fail loudly here rather than quietly
+  // there.
+  SPIEL_CHECK_EQ(legacy0,
+                 std::string("98a44b5d34567076b4b23d3ce4abf477"
+                             "d7dc041cb09035d42b9571469519e4ac"));
+  std::cout << "Test17 Passed! (legacy " << legacy0.substr(0, 16)
+            << "... ext " << ext0.substr(0, 16) << "...)\n\n";
+}
+
+// --- 18. The learner's new telemetry ---------------------------------------
+void Test18_LearnerTelemetry() {
+  std::cout << "Running Test18_LearnerTelemetry...\n";
+  const int64_t in_dim = 8, action_dim = 5;
+
+  // Four rows on the terminal ladder, two of them from the SAME episode: the
+  // outcome mix must count episodes, not rows.
+  std::vector<SearchPiRow> rows;
+  rows.push_back(MakeRow(in_dim, {0, 1, 2}, {0.5, 0.3, 0.2}, 0.5625, 0));
+  rows.push_back(MakeRow(in_dim, {1, 3, 4}, {0.1, 0.1, 0.8}, 0.5625, 0));
+  rows[1].decision_id = 1;                 // same episode 0, second decision
+  rows.push_back(MakeRow(in_dim, {0, 2, 4}, {0.3, 0.3, 0.4}, -0.4375, 1));
+  rows[2].episode_id = 1;
+  rows.push_back(MakeRow(in_dim, {0, 1, 4}, {0.2, 0.4, 0.4}, 0.0625, 2));
+  rows[3].episode_id = 2;
+
+  auto model = TinyModel(in_dim, action_dim);
+  torch::optim::AdamW opt(model->parameters(),
+                          torch::optim::AdamWOptions(1e-2));
+  SearchPiLearnerConfig cfg;
+  cfg.minibatch_size = 4;   // one minibatch, so norms are exact
+  cfg.epochs = 1;
+  SearchPiLearnerStats s = RunSearchPiLearner(model, opt, rows, in_dim,
+                                              action_dim, torch::kCPU, 7, 1, cfg);
+  SPIEL_CHECK_EQ(s.minibatches, 1);
+
+  // --- Value-target mean/sd, against the hand computation over ALL rows.
+  const double t[4] = {0.5625, 0.5625, -0.4375, 0.0625};
+  double m = 0.0;
+  for (double v : t) m += v;
+  m /= 4.0;
+  double var = 0.0;
+  for (double v : t) var += (v - m) * (v - m);
+  var /= 4.0;
+  SPIEL_CHECK_LT(std::abs(s.value_target_mean - m), 1e-6);
+  SPIEL_CHECK_LT(std::abs(s.value_target_sd - std::sqrt(var)), 1e-6);
+
+  // --- Outcome mix: three EPISODES, placements recovered from the ladder.
+  SPIEL_CHECK_EQ(s.outcome_episodes, 3);
+  SPIEL_CHECK_EQ(s.outcome_placements[0], 1);   // +0.5625 -> 1st
+  SPIEL_CHECK_EQ(s.outcome_placements[1], 1);   // +0.0625 -> 2nd
+  SPIEL_CHECK_EQ(s.outcome_placements[2], 0);
+  SPIEL_CHECK_EQ(s.outcome_placements[3], 1);   // -0.4375 -> 4th
+  SPIEL_CHECK_EQ(s.outcome_unmapped, 0);
+
+  // A target off the ladder is REPORTED as unmapped, never snapped to the
+  // nearest rung: an off-ladder value means the value pipeline changed.
+  {
+    std::vector<SearchPiRow> odd = rows;
+    odd[3].value_target = 0.1234;
+    auto m2 = TinyModel(in_dim, action_dim);
+    torch::optim::AdamW o2(m2->parameters(), torch::optim::AdamWOptions(1e-2));
+    SearchPiLearnerStats s2 = RunSearchPiLearner(
+        m2, o2, odd, in_dim, action_dim, torch::kCPU, 7, 1, cfg);
+    SPIEL_CHECK_EQ(s2.outcome_unmapped, 1);
+    SPIEL_CHECK_EQ(s2.outcome_episodes, 3);
+  }
+
+  // --- Critic predictions: measured, finite, and MOVED by a real step.
+  SPIEL_CHECK_TRUE(s.critic_pred_measured);
+  SPIEL_CHECK_TRUE(std::isfinite(s.critic_pred_mean_pre));
+  SPIEL_CHECK_TRUE(std::isfinite(s.critic_pred_sd_pre));
+  SPIEL_CHECK_TRUE(std::isfinite(s.critic_pred_mean_post));
+  SPIEL_CHECK_TRUE(std::isfinite(s.critic_pred_sd_post));
+  // tanh head, so predictions are inside (-1, 1) by construction.
+  SPIEL_CHECK_LT(std::abs(s.critic_pred_mean_pre), 1.0);
+  SPIEL_CHECK_LT(std::abs(s.critic_pred_mean_post), 1.0);
+  SPIEL_CHECK_NE(s.critic_pred_mean_pre, s.critic_pred_mean_post);
+
+  // At learning rate 0 the weights cannot move, so pre and post must agree
+  // EXACTLY. This is what proves the two passes bracket the update rather than
+  // measuring two unrelated things.
+  {
+    auto m3 = TinyModel(in_dim, action_dim);
+    torch::optim::AdamW o3(m3->parameters(), torch::optim::AdamWOptions(0.0));
+    SearchPiLearnerStats s3 = RunSearchPiLearner(
+        m3, o3, rows, in_dim, action_dim, torch::kCPU, 7, 1, cfg);
+    SPIEL_CHECK_FLOAT_EQ(s3.critic_pred_mean_pre, s3.critic_pred_mean_post);
+    SPIEL_CHECK_FLOAT_EQ(s3.critic_pred_sd_pre, s3.critic_pred_sd_post);
+  }
+
+  // --- Grouped gradient norms.
+  // The two cross terms are STRUCTURAL zeros: neither objective reaches the
+  // other's head. A nonzero here means ClassifyParam mis-grouped a parameter.
+  SPIEL_CHECK_FLOAT_EQ(s.policy_grad_norm_value_head, 0.0);
+  SPIEL_CHECK_FLOAT_EQ(s.value_grad_norm_policy_head, 0.0);
+  // Each objective reaches its own head and the shared trunk.
+  SPIEL_CHECK_GT(s.policy_grad_norm_policy_head, 0.0);
+  SPIEL_CHECK_GT(s.policy_grad_norm_trunk, 0.0);
+  SPIEL_CHECK_GT(s.value_grad_norm_value_head, 0.0);
+  SPIEL_CHECK_GT(s.value_grad_norm_trunk, 0.0);
+  // With one minibatch the groups recompose to the total exactly, which is what
+  // makes the split a decomposition rather than three unrelated numbers.
+  auto recompose = [](double a, double b, double c) {
+    return std::sqrt(a * a + b * b + c * c);
+  };
+  SPIEL_CHECK_LT(
+      std::abs(recompose(s.policy_grad_norm_trunk, s.policy_grad_norm_policy_head,
+                         s.policy_grad_norm_value_head) -
+               s.policy_grad_norm),
+      1e-9 * std::max(1.0, s.policy_grad_norm));
+  SPIEL_CHECK_LT(
+      std::abs(recompose(s.value_grad_norm_trunk, s.value_grad_norm_policy_head,
+                         s.value_grad_norm_value_head) -
+               s.value_grad_norm),
+      1e-9 * std::max(1.0, s.value_grad_norm));
+  std::cout << "Test18 Passed! (targets " << s.value_target_mean << "+-"
+            << s.value_target_sd << ", critic " << s.critic_pred_mean_pre
+            << "->" << s.critic_pred_mean_post << ")\n\n";
+}
+
+// --- 19. Manifest round trip for the new fields ---------------------------
+void Test19_StateRoundTrip() {
+  std::cout << "Running Test19_StateRoundTrip...\n";
+  SearchPiState s;
+  s.generation = 3;
+  s.next_episode_id = 48;
+  s.cum_rows = 1234;
+  s.target_hash_chain = std::string(64, 'a');
+  s.extended_hash_chain = std::string(64, 'b');
+  s.learner.policy_coef = 0.0;
+  s.learner.value_coef = 1.0;
+  s.config.seed_domain = 8160001;
+
+  json::Object o = WriteSearchPiState(s);
+  SearchPiState back;
+  std::string err;
+  SPIEL_CHECK_TRUE(ReadSearchPiState(o, &back, &err));
+  SPIEL_CHECK_EQ(back.extended_hash_chain, s.extended_hash_chain);
+  SPIEL_CHECK_EQ(back.target_hash_chain, s.target_hash_chain);
+  SPIEL_CHECK_FLOAT_EQ(back.learner.policy_coef, 0.0);
+  SPIEL_CHECK_EQ(back.generation, 3);
+
+  // A v1 manifest -- written before either field existed -- still loads, and
+  // reconstructs the objective those runs actually applied rather than
+  // approximating it. Losing the resume path to an added instrument would be a
+  // worse failure than the instrument is worth.
+  json::Object legacy = o;
+  legacy["schema_version"] = static_cast<int64_t>(1);
+  legacy.erase("extended_hash_chain");
+  legacy.erase("learner_policy_coef");
+  SearchPiState old;
+  SPIEL_CHECK_TRUE(ReadSearchPiState(legacy, &old, &err));
+  SPIEL_CHECK_TRUE(old.extended_hash_chain.empty());
+  SPIEL_CHECK_FLOAT_EQ(old.learner.policy_coef, 1.0);
+
+  // An unknown future version is rejected rather than silently misread.
+  json::Object future = o;
+  future["schema_version"] = static_cast<int64_t>(3);
+  SearchPiState never;
+  SPIEL_CHECK_FALSE(ReadSearchPiState(future, &never, &err));
+  std::cout << "Test19 Passed!\n\n";
+}
+
 // --- Pure-helper coverage used by several criteria -------------------------
 void TestScalarHelpers() {
   std::cout << "Running TestScalarHelpers...\n";
@@ -1009,6 +1433,10 @@ int main(int argc, char** argv) {
   Test12_CeMovesPolicy();
   Test13_ValueLossReachesValueHead();
   Test14_GradientTelemetryNumerics();
+  Test16_PolicyCoefficient();
+  Test17_HashChains();
+  Test18_LearnerTelemetry();
+  Test19_StateRoundTrip();
 
   // Game-driving tests last: they are the slow ones.
   Test03_04_RoleScoping(game);

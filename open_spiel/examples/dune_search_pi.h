@@ -177,6 +177,20 @@ struct SearchPiLearnerConfig {
   // objective is CE + value_coef * MSE with no PPO term, so the number means
   // something different here than it does inside a PPO total loss.
   double value_coef = 1.0;
+  // The CE's own coefficient, so the ablation matrix can run the value channel
+  // ALONE (arm B) the same way value_coef runs the CE channel alone (arms A/D).
+  //
+  // At exactly 0.0 the policy backward is SKIPPED, not scaled to zero. Scaling
+  // would still traverse the graph and write an all-zeros gradient, which is a
+  // different thing from "the policy objective contributed nothing": a zero
+  // times a non-finite gradient is NaN, and an optimizer that sees a defined
+  // zero gradient is not in the same state as one that sees none. The skip is
+  // what makes "eliminated" a structural claim rather than a numeric hope.
+  // value_coef == 0.0 skips the value backward symmetrically.
+  //
+  // At exactly 1.0 no multiply is inserted at all, so the anchor arm's numerics
+  // are bit-identical to the pilot's, which predates this field.
+  double policy_coef = 1.0;
   double grad_clip_norm = 0.5;
   double logit_cap = 10.0;
   // Decoupled AdamW weight decay, carried here so it enters the resume
@@ -299,7 +313,22 @@ struct SearchPiGenerationStats {
   int64_t leader_rows_emitted = 0;
 
   // Rolling SHA-256 over the emitted targets, for resume verification.
+  // LEGACY FORMAT, retained byte-for-byte: it is the only chain any prior run
+  // recorded, so it is the sole provenance tie back to the pilot's generations.
+  // Do not widen it -- widen the one below.
   std::string target_hash_chain;
+
+  // Rolling SHA-256 over EVERY learner and analysis input on the row: the
+  // observation tensor, the player/role/provenance, the legal actions, the raw
+  // snapshot prior, the target, the chosen action and the value target.
+  //
+  // The legacy chain covers targets only. It therefore proves target-stream
+  // identity, NOT row identity -- two collections could agree on every target
+  // while disagreeing on the observations those targets were attached to, and
+  // the legacy chain would call them equal. An ablation matrix whose whole
+  // design is "only the learner differs" needs the stronger statement, so this
+  // is the chain the cross-arm equality assertion tests.
+  std::string extended_hash_chain;
 };
 
 // ---------------------------------------------------------------------------
@@ -315,6 +344,32 @@ struct SearchPiLearnerStats {
   // it" was inference, not measurement (diagnosis section 2).
   double policy_grad_norm = 0.0;
   double value_grad_norm = 0.0;
+
+  // The same two norms, split across the three parameter groups. The totals
+  // above establish which objective carries more MASS; they cannot say where it
+  // lands, and "the value objective dominated the shared trunk" was a claim the
+  // lane had no instrument for -- it was read off total norms and had to be
+  // withdrawn (SEARCH_PI_LANE doc section 6). These six numbers are that
+  // instrument.
+  //
+  // Two of the six are STRUCTURAL ZEROS, not measurements: the CE never reaches
+  // the value head and the value MSE never reaches the policy head. They are
+  // emitted anyway, because an observed 0.0 there is the decomposition proving
+  // itself -- a nonzero would mean ClassifyParam had mis-grouped a parameter.
+  double policy_grad_norm_trunk = 0.0;
+  double policy_grad_norm_policy_head = 0.0;
+  double policy_grad_norm_value_head = 0.0;  // structural 0
+  double value_grad_norm_trunk = 0.0;
+  double value_grad_norm_policy_head = 0.0;  // structural 0
+  double value_grad_norm_value_head = 0.0;
+
+  // Whether each objective's backward actually ran. At coefficient 0 the lane
+  // SKIPS the backward rather than scaling it, so these record the structural
+  // fact directly instead of leaving a reader to infer it from a zero norm --
+  // which is also what a genuinely zero gradient would look like.
+  bool policy_backward_executed = false;
+  bool value_backward_executed = false;
+
   double grad_cosine_overall = 0.0;
   double grad_cosine_policy_head = 0.0;
   double grad_cosine_trunk = 0.0;
@@ -334,6 +389,36 @@ struct SearchPiLearnerStats {
   bool grad_cosine_policy_head_defined = false;
   bool grad_cosine_trunk_defined = false;
   bool grad_cosine_value_head_defined = false;
+
+  // --- What the critic was asked to fit, and what it already predicted. ---
+  //
+  // The lane logged neither, so "value MSE 0.33-0.54" could only be read against
+  // distribution-free bounds on the terminal ladder. Those bounds exclude a
+  // constant target but cannot separate a critic making confident wrong
+  // state-dependent reads from one whose outputs left the target range: both
+  // clear the same floor. Prediction mean/sd beside target mean/sd separates
+  // them in one line.
+  //
+  // Measured over ALL rows under no_grad, immediately before the first optimizer
+  // step and immediately after the last. Pre and post are what make the churn
+  // visible as movement rather than as a level.
+  double value_target_mean = 0.0;
+  double value_target_sd = 0.0;
+  double critic_pred_mean_pre = 0.0;
+  double critic_pred_sd_pre = 0.0;
+  double critic_pred_mean_post = 0.0;
+  double critic_pred_sd_post = 0.0;
+  bool critic_pred_measured = false;
+
+  // The searched seat's realized outcome mix, deduplicated to one entry per
+  // EPISODE -- the ~16 outcome samples a generation actually carries, not the
+  // ~1,450 rows that repeat them. Index 0..3 is placement 1st..4th, recovered
+  // from the value target against the terminal ladder {+2.25, +0.25, -0.75,
+  // -1.75}/4. A target that matches no rung increments `outcome_unmapped`
+  // rather than being forced onto the nearest one.
+  int64_t outcome_placements[4] = {0, 0, 0, 0};
+  int64_t outcome_episodes = 0;
+  int64_t outcome_unmapped = 0;
 
   int64_t distinct_rows = 0;
   int64_t presentations = 0;
@@ -473,6 +558,7 @@ struct SearchPiState {
   int64_t cum_primary_simulations = 0;
   int64_t cum_continuation_simulations = 0;
   std::string target_hash_chain;
+  std::string extended_hash_chain;
   SearchPiConfig config;
   SearchPiLearnerConfig learner;
 };
@@ -490,8 +576,19 @@ std::string SearchPiConfigFingerprint(const SearchPiConfig& config,
 
 // Rolling target hash: chain(prev, row) -- covers episode/decision ids, the
 // player, the legal actions, the target probabilities and the value target.
+// LEGACY. Frozen: prior runs' recorded chains are only comparable against this
+// exact byte layout, and reproducing the pilot's generation-1 chain is the
+// provenance tie for the matrix's anchor arm.
 std::string ChainSearchPiTargetHash(const std::string& prev,
                                     const SearchPiRow& row);
+
+// Rolling EXTENDED row hash: everything the legacy chain covers, plus the
+// observation tensor and its information-state flag, the decision role, the raw
+// snapshot prior, and the search provenance (new simulations, inherited visits,
+// re-root status, fallback class). This is the chain that can assert two
+// collections produced the same ROWS rather than merely the same targets.
+std::string ChainSearchPiExtendedRowHash(const std::string& prev,
+                                         const SearchPiRow& row);
 
 }  // namespace open_spiel
 

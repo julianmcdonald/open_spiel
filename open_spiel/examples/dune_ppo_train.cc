@@ -267,6 +267,13 @@ ABSL_FLAG(double, search_pi_value_coef, 1.0,
           "Weight on the value MSE in CE + value_coef * MSE. Stated explicitly "
           "rather than inherited from --value_coef, which means something "
           "different inside a PPO total loss.");
+ABSL_FLAG(double, search_pi_policy_coef, 1.0,
+          "Weight on the search CE in policy_coef * CE + value_coef * MSE. At "
+          "exactly 0 the policy backward is SKIPPED rather than scaled to zero, "
+          "so the policy objective contributes no gradient at all -- which is "
+          "what lets the value channel be ablated alone. At exactly 1 no "
+          "multiply is inserted, so the objective is bit-identical to the "
+          "runs that predate this flag.");
 
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
@@ -2906,7 +2913,12 @@ int main(int argc, char** argv) {
         }
         std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
       }
-      if (!absl::GetFlag(FLAGS_train_value_only)) {
+      if (absl::GetFlag(FLAGS_search_pi_mode)) {
+        // See the bootstrap path: this mode owns a separate optimizer and
+        // loads it itself, and only from its own lineage.
+        std::cout << "[search-PI] Skipping the PPO optimizer load here; the "
+                     "lane's own optimizer is handled in the search-PI branch.\n";
+      } else if (!absl::GetFlag(FLAGS_train_value_only)) {
         // PWO-5 section 7.2: a pre-head archive migrates; a post-head archive
         // loads normally.
         if (!open_spiel::LoadOptimizerCheckpointMigrating(
@@ -2977,7 +2989,18 @@ int main(int argc, char** argv) {
         }
         std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
       }
-      if (!absl::GetFlag(FLAGS_train_value_only)) {
+      if (absl::GetFlag(FLAGS_search_pi_mode)) {
+        // The search-PI lane never steps this optimizer -- it builds its own,
+        // and on a checkpoint with no search_pi block it deliberately starts
+        // that one FRESH rather than inheriting another objective's Adam
+        // moments. Loading the source optimizer here would therefore be reading
+        // an artifact the mode has already refused to use, and it fails outright
+        // when the source was written under a different parameter-group layout
+        // (e.g. a PWO-5 lineage's three groups against this run's two).
+        std::cout << "[search-PI] Skipping the PPO optimizer load: this mode "
+                     "takes WEIGHTS from the checkpoint and builds its own "
+                     "optimizer.\n";
+      } else if (!absl::GetFlag(FLAGS_train_value_only)) {
         // PWO-5 section 7.2: the bootstrap path is where the Branch-A u2450
         // optimizer -- written before the three heads existed -- is migrated.
         if (!open_spiel::LoadOptimizerCheckpointMigrating(
@@ -3299,6 +3322,16 @@ int main(int argc, char** argv) {
     pi_learn.minibatch_size = absl::GetFlag(FLAGS_search_pi_minibatch_size);
     pi_learn.epochs = absl::GetFlag(FLAGS_search_pi_epochs);
     pi_learn.value_coef = absl::GetFlag(FLAGS_search_pi_value_coef);
+    pi_learn.policy_coef = absl::GetFlag(FLAGS_search_pi_policy_coef);
+    // Both coefficients zero is not an ablation, it is a run that collects for
+    // 40 minutes and then steps nothing. Caught here rather than discovered in
+    // the telemetry afterwards.
+    if (pi_learn.policy_coef == 0.0 && pi_learn.value_coef == 0.0) {
+      SpielFatalError(
+          "search-PI: --search_pi_policy_coef and --search_pi_value_coef are "
+          "both 0, so neither objective would produce any gradient. Use "
+          "--search_pi_learning_rate=0 for a deliberate zero-step control.");
+    }
     pi_learn.grad_clip_norm = absl::GetFlag(FLAGS_grad_clip_norm);
     pi_learn.logit_cap = absl::GetFlag(FLAGS_logit_cap);
     // MakeOptimizer reads these two into the parameter groups, so they are part
@@ -3426,6 +3459,8 @@ int main(int argc, char** argv) {
           pi_stats.continuation.simulations_completed;
       pi_state.target_hash_chain = open_spiel::ComputeStringSHA256(
           pi_state.target_hash_chain + pi_stats.target_hash_chain);
+      pi_state.extended_hash_chain = open_spiel::ComputeStringSHA256(
+          pi_state.extended_hash_chain + pi_stats.extended_hash_chain);
       pi_state.config = pi_cfg;
       pi_state.learner = pi_learn;
 
@@ -3482,24 +3517,57 @@ int main(int argc, char** argv) {
         // resume validator reject the next generation, because that validator
         // compares the flag against the stored field. The lane's real
         // generation accounting lives in the "search_pi" block, not here.
+        const std::string flat_model = absl::GetFlag(FLAGS_model_checkpoint);
+        const std::string flat_optim = absl::GetFlag(FLAGS_optim_checkpoint);
+
+        // The resume path, written exactly as before. The manifest's own
+        // validator compares model_filename against this file, and the resume
+        // reader derives the manifest from --model_checkpoint, so this write
+        // must keep its original name for the lane to remain resumable.
         open_spiel::SaveCheckpoint(
-            training_model, pi_optimizer,
-            absl::GetFlag(FLAGS_model_checkpoint),
-            absl::GetFlag(FLAGS_optim_checkpoint), pi_generation,
+            training_model, pi_optimizer, flat_model, flat_optim, pi_generation,
             absl::GetFlag(FLAGS_target_end_update), total_env_steps.load(),
             next_episode_id.load(), master,
             absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
             search_label_fingerprint, run_uuid,
             /*aux_state=*/nullptr, &pi_state);
+
+        // The archival copy, at a path no other generation can claim. The pilot
+        // checkpointed every generation to the SAME path, so each overwrote the
+        // last and generations 1-4 no longer exist -- a ladder destroyed by its
+        // own save (SEARCH_PI_LANE doc section 6, and the same failure as
+        // `retention-ate-the-probe-ladder`). A second write is cheap; losing the
+        // rung is not recoverable except by re-running the whole arm.
+        //
+        // Written second on purpose: if the process dies mid-save, the file
+        // that resume depends on is already complete.
+        std::filesystem::path gen_model = flat_model;
+        std::filesystem::path gen_optim = flat_optim;
+        const std::string suffix = absl::StrCat("_gen", pi_generation);
+        gen_model.replace_filename(gen_model.stem().string() + suffix +
+                                   gen_model.extension().string());
+        gen_optim.replace_filename(gen_optim.stem().string() + suffix +
+                                   gen_optim.extension().string());
+        open_spiel::SaveCheckpoint(
+            training_model, pi_optimizer, gen_model.string(),
+            gen_optim.string(), pi_generation,
+            absl::GetFlag(FLAGS_target_end_update), total_env_steps.load(),
+            next_episode_id.load(), master,
+            absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+            search_label_fingerprint, run_uuid,
+            /*aux_state=*/nullptr, &pi_state);
+        std::cout << "[search-PI] archived generation " << pi_generation
+                  << " to " << gen_model.string() << "\n";
       }
     }
 
     std::cout << absl::StrFormat(
         "[search-PI] DONE | generations=%d cum_rows=%lld next_episode_id=%lld "
-        "chain=%s\n",
+        "chain=%s ext_chain=%s\n",
         pi_generation, (long long)pi_state.cum_rows,
         (long long)pi_state.next_episode_id,
-        pi_state.target_hash_chain.substr(0, 16));
+        pi_state.target_hash_chain.substr(0, 16),
+        pi_state.extended_hash_chain.substr(0, 16));
     return 0;
   }
 

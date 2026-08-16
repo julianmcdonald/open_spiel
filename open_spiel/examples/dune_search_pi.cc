@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <set>
 #include <sstream>
 
 #include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
@@ -744,11 +745,17 @@ void SearchPiGenerator::GenerateGeneration(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start)
           .count();
 
+  // Two chains over the same rows in the same order. The legacy one is the
+  // provenance tie to every generation recorded before this field existed; the
+  // extended one is the only one that can carry a cross-arm row-identity claim.
   std::string chain;
+  std::string ext_chain;
   for (size_t i = out_base; i < out->size(); ++i) {
     chain = ChainSearchPiTargetHash(chain, (*out)[i]);
+    ext_chain = ChainSearchPiExtendedRowHash(ext_chain, (*out)[i]);
   }
   stats->target_hash_chain = chain;
+  stats->extended_hash_chain = ext_chain;
 }
 
 // ---------------------------------------------------------------------------
@@ -799,6 +806,45 @@ struct CosineMean {
   double Mean() const { return n > 0 ? sum / static_cast<double>(n) : 0.0; }
   bool Defined() const { return n > 0; }
 };
+
+// Population mean and sd of a flat float tensor, at double precision. sd is the
+// population form (/n): these are complete descriptions of the generation's own
+// rows, not estimates of a wider distribution.
+void MeanSd(const torch::Tensor& flat, double* mean, double* sd) {
+  const int64_t n = flat.numel();
+  if (n <= 0) {
+    *mean = 0.0;
+    *sd = 0.0;
+    return;
+  }
+  const torch::Tensor d = flat.to(torch::kDouble).cpu();
+  const double m = d.mean().item<double>();
+  *mean = m;
+  *sd = n > 1 ? std::sqrt((d - m).pow(2).sum().item<double>() /
+                          static_cast<double>(n))
+              : 0.0;
+}
+
+// One no-grad forward over every row, returning the critic's scalar prediction
+// per row. Chunked at the learner's own minibatch size so the measurement never
+// has a larger memory profile than the training step it brackets.
+//
+// No RNG is consumed and no autocast guard is entered, so inserting this pass
+// cannot perturb the trained result -- which matters, because the anchor arm
+// has to reproduce a run recorded before this instrument existed.
+torch::Tensor PredictValues(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const torch::Tensor& states, int64_t chunk) {
+  torch::NoGradGuard no_grad;
+  const int64_t n = states.size(0);
+  std::vector<torch::Tensor> parts;
+  for (int64_t start = 0; start < n; start += chunk) {
+    const int64_t len = std::min<int64_t>(chunk, n - start);
+    parts.push_back(
+        model->forward(states.narrow(0, start, len)).values.squeeze(1).detach());
+  }
+  return parts.empty() ? torch::zeros({0}) : torch::cat(parts, 0);
+}
 
 }  // namespace
 
@@ -867,9 +913,56 @@ SearchPiLearnerStats RunSearchPiLearner(
     params.push_back(item.value());
   }
 
+  // Coefficient 0 SKIPS an objective's backward; it does not scale it to zero.
+  // See the header: a scaled-to-zero pass still walks the graph and installs a
+  // defined all-zeros gradient, which is not the same state as no gradient, and
+  // 0 * non-finite is NaN rather than 0. The skip is the elimination.
+  const bool policy_active = (cfg.policy_coef != 0.0);
+  const bool value_active = (cfg.value_coef != 0.0);
+  stats.policy_backward_executed = policy_active;
+  stats.value_backward_executed = value_active;
+
+  // --- Value targets and the searched seat's realized outcome mix ---
+  MeanSd(values, &stats.value_target_mean, &stats.value_target_sd);
+  {
+    // Placement recovered from the terminal ladder {+2.25, +0.25, -0.75,
+    // -1.75} / utility_divisor 4 (dune_imperium.cc:2383-2447). Deduplicated to
+    // one entry per EPISODE: the rows repeat a game's outcome once per
+    // decision, and the count that matters is how many independent outcomes the
+    // value regression actually saw.
+    static const double kLadder[4] = {0.5625, 0.0625, -0.1875, -0.4375};
+    std::set<int64_t> seen;
+    for (const SearchPiRow& row : rows) {
+      if (!seen.insert(row.episode_id).second) continue;
+      ++stats.outcome_episodes;
+      int rung = -1;
+      for (int k = 0; k < 4; ++k) {
+        if (std::abs(row.value_target - kLadder[k]) < 1e-9) {
+          rung = k;
+          break;
+        }
+      }
+      // Not snapped to the nearest rung: a target off the ladder means the
+      // value pipeline changed, and rounding it away would hide that.
+      if (rung < 0) {
+        ++stats.outcome_unmapped;
+      } else {
+        ++stats.outcome_placements[rung];
+      }
+    }
+  }
+
+  // --- Critic predictions BEFORE any optimizer step ---
+  MeanSd(PredictValues(model, states, cfg.minibatch_size),
+         &stats.critic_pred_mean_pre, &stats.critic_pred_sd_pre);
+
   CosineMean overall, g_policy, g_trunk, g_value;
   double ce_sum = 0.0, mse_sum = 0.0;
   double pol_norm_sum = 0.0, val_norm_sum = 0.0;
+  // Per-group squared-norm accumulators, summed over minibatches as norms (not
+  // as squares) so they average the same way the totals above do.
+  double pol_trunk_sum = 0.0, pol_phead_sum = 0.0, pol_vhead_sum = 0.0;
+  double val_trunk_sum = 0.0, val_phead_sum = 0.0, val_vhead_sum = 0.0;
   int64_t mb_count = 0;
 
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
@@ -911,28 +1004,48 @@ SearchPiLearnerStats RunSearchPiLearner(
       torch::Tensor ce = -(mb_targets * logp).sum(-1).mean();
       torch::Tensor pred_v = outputs.values.squeeze(1);
       torch::Tensor vmse = (pred_v - mb_values).pow(2).mean();
+
+      // At exactly 1.0 no multiply node is inserted, so the anchor arm's
+      // gradients are bit-identical to the pilot's, which ran before this
+      // coefficient existed. The value side keeps its original expression for
+      // the same reason.
+      torch::Tensor policy_term =
+          (cfg.policy_coef == 1.0) ? ce
+                                   : static_cast<float>(cfg.policy_coef) * ce;
       torch::Tensor value_term = static_cast<float>(cfg.value_coef) * vmse;
 
-      // Pass 1: the policy CE alone.
+      // Pass 1: the policy CE alone. Skipped entirely at coefficient 0, which
+      // leaves every ce_grads entry undefined -- the structural elimination.
       optimizer.zero_grad();
-      ce.backward(torch::Tensor(), /*retain_graph=*/true);
       std::vector<torch::Tensor> ce_grads(params.size());
-      for (size_t pi = 0; pi < params.size(); ++pi) {
-        auto g = params[pi].grad();
-        if (g.defined()) ce_grads[pi] = g.detach().clone();
+      if (policy_active) {
+        // retain_graph only matters when a second backward follows.
+        policy_term.backward(torch::Tensor(), /*retain_graph=*/value_active);
+        for (size_t pi = 0; pi < params.size(); ++pi) {
+          auto g = params[pi].grad();
+          if (g.defined()) ce_grads[pi] = g.detach().clone();
+        }
+        optimizer.zero_grad();
       }
 
-      // Pass 2: the (coefficient-scaled) value MSE alone.
-      optimizer.zero_grad();
-      value_term.backward();
+      // Pass 2: the (coefficient-scaled) value MSE alone. Symmetrically skipped.
       std::vector<torch::Tensor> v_grads(params.size());
-      for (size_t pi = 0; pi < params.size(); ++pi) {
-        auto g = params[pi].grad();
-        if (g.defined()) v_grads[pi] = g.detach().clone();
+      if (value_active) {
+        value_term.backward();
+        for (size_t pi = 0; pi < params.size(); ++pi) {
+          auto g = params[pi].grad();
+          if (g.defined()) v_grads[pi] = g.detach().clone();
+        }
+        optimizer.zero_grad();
       }
 
       // Norms, dots and the per-group cosines -- measured, not inferred.
       double pol_sq = 0.0, val_sq = 0.0;
+      // Same squares, kept per group: this is what turns "the value objective
+      // dominated the shared trunk" from an inference off total norms into a
+      // reading.
+      double pol_sq_trunk = 0.0, pol_sq_ph = 0.0, pol_sq_vh = 0.0;
+      double val_sq_trunk = 0.0, val_sq_ph = 0.0, val_sq_vh = 0.0;
       GroupAccum mb_overall, mb_policy, mb_trunk, mb_value;
       for (size_t pi = 0; pi < params.size(); ++pi) {
         const bool have_a = ce_grads[pi].defined();
@@ -949,13 +1062,31 @@ SearchPiLearnerStats RunSearchPiLearner(
         val_sq += bb;
         mb_overall.Add(dd, aa, bb);
         switch (groups[pi]) {
-          case ParamGroup::kPolicyHead: mb_policy.Add(dd, aa, bb); break;
-          case ParamGroup::kValueHead: mb_value.Add(dd, aa, bb); break;
-          case ParamGroup::kTrunk: mb_trunk.Add(dd, aa, bb); break;
+          case ParamGroup::kPolicyHead:
+            mb_policy.Add(dd, aa, bb);
+            pol_sq_ph += aa;
+            val_sq_ph += bb;
+            break;
+          case ParamGroup::kValueHead:
+            mb_value.Add(dd, aa, bb);
+            pol_sq_vh += aa;
+            val_sq_vh += bb;
+            break;
+          case ParamGroup::kTrunk:
+            mb_trunk.Add(dd, aa, bb);
+            pol_sq_trunk += aa;
+            val_sq_trunk += bb;
+            break;
         }
       }
       pol_norm_sum += std::sqrt(pol_sq);
       val_norm_sum += std::sqrt(val_sq);
+      pol_trunk_sum += std::sqrt(pol_sq_trunk);
+      pol_phead_sum += std::sqrt(pol_sq_ph);
+      pol_vhead_sum += std::sqrt(pol_sq_vh);
+      val_trunk_sum += std::sqrt(val_sq_trunk);
+      val_phead_sum += std::sqrt(val_sq_ph);
+      val_vhead_sum += std::sqrt(val_sq_vh);
       overall.Add(mb_overall);
       g_policy.Add(mb_policy);
       g_trunk.Add(mb_trunk);
@@ -994,6 +1125,12 @@ SearchPiLearnerStats RunSearchPiLearner(
     stats.value_mse = mse_sum / d;
     stats.policy_grad_norm = pol_norm_sum / d;
     stats.value_grad_norm = val_norm_sum / d;
+    stats.policy_grad_norm_trunk = pol_trunk_sum / d;
+    stats.policy_grad_norm_policy_head = pol_phead_sum / d;
+    stats.policy_grad_norm_value_head = pol_vhead_sum / d;  // structurally 0
+    stats.value_grad_norm_trunk = val_trunk_sum / d;
+    stats.value_grad_norm_policy_head = val_phead_sum / d;  // structurally 0
+    stats.value_grad_norm_value_head = val_vhead_sum / d;
     // Mean of the per-minibatch cosines -- the typical alignment, not the
     // alignment of the summed gradients -- over the minibatches where the group
     // had gradient from BOTH objectives. The *_defined flags say which of these
@@ -1009,6 +1146,13 @@ SearchPiLearnerStats RunSearchPiLearner(
     stats.grad_cosine_value_head_defined = g_value.Defined();
   }
   stats.minibatches = mb_count;
+
+  // --- Critic predictions AFTER the last optimizer step ---
+  // Paired with the pre-update pass over the SAME rows, so the difference is
+  // movement on a fixed state set rather than a level on two different ones.
+  MeanSd(PredictValues(model, states, cfg.minibatch_size),
+         &stats.critic_pred_mean_post, &stats.critic_pred_sd_post);
+  stats.critic_pred_measured = true;
   return stats;
 }
 
@@ -1020,7 +1164,10 @@ json::Object WriteSearchPiState(const SearchPiState& s) {
   const SearchPiConfig& c = s.config;
   const SearchPiLearnerConfig& l = s.learner;
   json::Object o;
-  o["schema_version"] = static_cast<int64_t>(1);
+  // v2 adds extended_hash_chain and learner_policy_coef. The reader accepts v1
+  // too and defaults both, so every checkpoint the pilot wrote stays readable:
+  // a run must not lose its resume path because an instrument was added.
+  o["schema_version"] = static_cast<int64_t>(2);
   o["generation"] = static_cast<int64_t>(s.generation);
   o["next_episode_id"] = static_cast<int64_t>(s.next_episode_id);
   o["cum_rows"] = static_cast<int64_t>(s.cum_rows);
@@ -1031,6 +1178,7 @@ json::Object WriteSearchPiState(const SearchPiState& s) {
   o["cum_continuation_simulations"] =
       static_cast<int64_t>(s.cum_continuation_simulations);
   o["target_hash_chain"] = s.target_hash_chain;
+  o["extended_hash_chain"] = s.extended_hash_chain;
 
   // Every search-configuration field, so a run's own artifact answers what it
   // searched with. Stored as strings at full %.17g precision where the value is
@@ -1070,6 +1218,7 @@ json::Object WriteSearchPiState(const SearchPiState& s) {
   o["learner_minibatch_size"] = static_cast<int64_t>(l.minibatch_size);
   o["learner_epochs"] = static_cast<int64_t>(l.epochs);
   o["learner_value_coef"] = F17(l.value_coef);
+  o["learner_policy_coef"] = F17(l.policy_coef);
   o["learner_grad_clip_norm"] = F17(l.grad_clip_norm);
   o["learner_logit_cap"] = F17(l.logit_cap);
   o["learner_weight_decay"] = F17(l.weight_decay);
@@ -1129,10 +1278,11 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
   SPIEL_CHECK_TRUE(out != nullptr);
   int64_t v = 0;
   if (!GetInt(o, "schema_version", &v, error)) return false;
-  if (v != 1) {
-    if (error != nullptr) *error = "search_pi.schema_version != 1";
+  if (v != 1 && v != 2) {
+    if (error != nullptr) *error = "search_pi.schema_version not in {1, 2}";
     return false;
   }
+  const bool v2 = (v >= 2);
   SearchPiState s;
   if (!GetInt(o, "generation", &v, error)) return false;
   s.generation = static_cast<int>(v);
@@ -1150,6 +1300,12 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
     return false;
   }
   if (!GetStr(o, "target_hash_chain", &s.target_hash_chain, error)) return false;
+  // A v1 manifest predates the extended chain. Empty is the honest value there:
+  // it says "this lineage recorded no extended chain", which a resume can carry
+  // forward, rather than inventing one that would chain against nothing.
+  if (v2 && !GetStr(o, "extended_hash_chain", &s.extended_hash_chain, error)) {
+    return false;
+  }
 
   SearchPiConfig& c = s.config;
   if (!GetInt(o, "games_per_generation", &v, error)) return false;
@@ -1224,6 +1380,13 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
   if (!GetInt(o, "learner_epochs", &v, error)) return false;
   l.epochs = static_cast<int>(v);
   if (!GetF17(o, "learner_value_coef", &l.value_coef, error)) return false;
+  // v1 predates the coefficient; 1.0 is what those runs actually applied, so
+  // defaulting to it reconstructs their objective rather than approximating it.
+  if (v2) {
+    if (!GetF17(o, "learner_policy_coef", &l.policy_coef, error)) return false;
+  } else {
+    l.policy_coef = 1.0;
+  }
   if (!GetF17(o, "learner_grad_clip_norm", &l.grad_clip_norm, error)) {
     return false;
   }
@@ -1240,7 +1403,10 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
 std::string SearchPiConfigFingerprint(const SearchPiConfig& c,
                                       const SearchPiLearnerConfig& l) {
   std::ostringstream ss;
-  ss << "search_pi_v1"
+  // v2: policy_coef joined the objective. The version string moves with the
+  // algorithm so a changed hash reads as a changed recipe rather than as an
+  // unexplained mismatch against a v1 artifact.
+  ss << "search_pi_v2"
      << "|games=" << c.games_per_generation
      << "|prim=" << c.primary_simulations
      << "|cont=" << c.continuation_simulations
@@ -1265,6 +1431,7 @@ std::string SearchPiConfigFingerprint(const SearchPiConfig& c,
      << "|mb=" << l.minibatch_size
      << "|epochs=" << l.epochs
      << "|vcoef=" << F17(l.value_coef)
+     << "|pcoef=" << F17(l.policy_coef)
      << "|clip=" << F17(l.grad_clip_norm)
      << "|logitcap=" << F17(l.logit_cap)
      << "|wd=" << F17(l.weight_decay)
@@ -1291,6 +1458,64 @@ std::string ChainSearchPiTargetHash(const std::string& prev,
   }
   for (double p : row.target_probs) AppendBytes(&digest, &p, sizeof(p));
   AppendBytes(&digest, &row.value_target, sizeof(row.value_target));
+  return ComputeStringSHA256(prev + digest);
+}
+
+std::string ChainSearchPiExtendedRowHash(const std::string& prev,
+                                         const SearchPiRow& row) {
+  std::string digest;
+  // A tag, so an extended chain can never be mistaken for a legacy one even if
+  // some future row shape made the two byte streams coincide.
+  digest.append("spi_ext_v1");
+
+  // Every length is hashed before its payload. Without that, {[1],[2,3]} and
+  // {[1,2],[3]} serialize identically and the chain would call two different
+  // rows equal.
+  auto put_i64 = [&digest](int64_t v) { AppendBytes(&digest, &v, sizeof(v)); };
+  auto put_f64 = [&digest](double v) { AppendBytes(&digest, &v, sizeof(v)); };
+
+  // --- Identity ---
+  put_i64(row.generation);
+  put_i64(row.episode_id);
+  put_i64(row.decision_id);
+  put_i64(static_cast<int64_t>(row.player));
+  put_i64(static_cast<int64_t>(row.role));
+
+  // --- Model input: the exact tensor forward() consumes, and which one it is.
+  // The observation is the input the legacy chain omits entirely, and it is the
+  // one a "same rows" claim most depends on: identical targets attached to
+  // different states is precisely the failure the assertion must catch.
+  put_i64(row.observation_is_information_state ? 1 : 0);
+  put_i64(static_cast<int64_t>(row.observation.size()));
+  for (float f : row.observation) AppendBytes(&digest, &f, sizeof(f));
+
+  // --- Legal actions (the mask, in its aligned form) ---
+  put_i64(static_cast<int64_t>(row.legal_actions.size()));
+  for (Action a : row.legal_actions) put_i64(static_cast<int64_t>(a));
+
+  // --- Raw snapshot prior: the frozen network's own read of this state. Two
+  // arms that collected from the same snapshot must agree on it exactly.
+  put_i64(static_cast<int64_t>(row.raw_policy.size()));
+  for (double p : row.raw_policy) put_f64(p);
+
+  // --- Target and executed action ---
+  put_i64(static_cast<int64_t>(row.target_probs.size()));
+  for (double p : row.target_probs) put_f64(p);
+  put_i64(static_cast<int64_t>(row.chosen_action));
+
+  // --- Value target ---
+  put_i64(row.value_target_attached ? 1 : 0);
+  put_f64(row.value_target);
+
+  // --- Search provenance: how this row was produced, not just what it says.
+  // A row reached by a different budget or a re-root miss is a different row
+  // even when its target happens to match.
+  put_i64(row.simulations_completed);
+  put_i64(row.inherited_root_visits);
+  put_i64(static_cast<int64_t>(row.fallback));
+  put_i64(static_cast<int64_t>(row.re_root_status.size()));
+  digest.append(row.re_root_status);
+
   return ComputeStringSHA256(prev + digest);
 }
 
@@ -1357,7 +1582,11 @@ void WriteSearchPiTelemetry(const std::string& diagnostics_path,
      << ",\"rows_total\":" << g.rows_total
      << ",\"collection_wall_time_s\":" << F17Json(g.collection_wall_time_s)
      << ",\"inference_calls\":" << g.inference_calls
-     << ",\"target_hash_chain\":\"" << g.target_hash_chain << "\"";
+     << ",\"target_hash_chain\":\"" << g.target_hash_chain << "\""
+     // The legacy chain above ties this generation to runs recorded before the
+     // extended one existed; the extended chain below is the one a cross-arm
+     // row-identity assertion tests.
+     << ",\"extended_hash_chain\":\"" << g.extended_hash_chain << "\"";
   EmitRole(os, "primary", g.primary);
   EmitRole(os, "continuation", g.continuation);
   for (int i = 0; i < 7; ++i) {
@@ -1371,6 +1600,48 @@ void WriteSearchPiTelemetry(const std::string& diagnostics_path,
      << ",\"value_mse\":" << F17Json(s.value_mse)
      << ",\"policy_grad_norm\":" << F17Json(s.policy_grad_norm)
      << ",\"value_grad_norm\":" << F17Json(s.value_grad_norm)
+     // Each objective's norm split across the three parameter groups. The two
+     // cross terms (policy at the value head, value at the policy head) are
+     // structural zeros; a nonzero there would mean the grouping is wrong.
+     << ",\"policy_grad_norm_trunk\":" << F17Json(s.policy_grad_norm_trunk)
+     << ",\"policy_grad_norm_policy_head\":"
+     << F17Json(s.policy_grad_norm_policy_head)
+     << ",\"policy_grad_norm_value_head\":"
+     << F17Json(s.policy_grad_norm_value_head)
+     << ",\"value_grad_norm_trunk\":" << F17Json(s.value_grad_norm_trunk)
+     << ",\"value_grad_norm_policy_head\":"
+     << F17Json(s.value_grad_norm_policy_head)
+     << ",\"value_grad_norm_value_head\":"
+     << F17Json(s.value_grad_norm_value_head)
+     // Whether each backward RAN. A zero norm and a skipped pass are different
+     // facts and the coefficient ablation depends on telling them apart.
+     << ",\"policy_backward_executed\":"
+     << (s.policy_backward_executed ? "true" : "false")
+     << ",\"value_backward_executed\":"
+     << (s.value_backward_executed ? "true" : "false")
+     // What the critic was asked to fit, and what it predicted before and
+     // after. null when unmeasured, so an absent measurement never reads as 0.
+     << ",\"value_target_mean\":" << F17Json(s.value_target_mean)
+     << ",\"value_target_sd\":" << F17Json(s.value_target_sd)
+     << ",\"critic_pred_mean_pre\":"
+     << (s.critic_pred_measured ? F17Json(s.critic_pred_mean_pre)
+                                : std::string("null"))
+     << ",\"critic_pred_sd_pre\":"
+     << (s.critic_pred_measured ? F17Json(s.critic_pred_sd_pre)
+                                : std::string("null"))
+     << ",\"critic_pred_mean_post\":"
+     << (s.critic_pred_measured ? F17Json(s.critic_pred_mean_post)
+                                : std::string("null"))
+     << ",\"critic_pred_sd_post\":"
+     << (s.critic_pred_measured ? F17Json(s.critic_pred_sd_post)
+                                : std::string("null"))
+     // The searched seat's realized outcome mix, one entry per episode.
+     << ",\"outcome_first\":" << s.outcome_placements[0]
+     << ",\"outcome_second\":" << s.outcome_placements[1]
+     << ",\"outcome_third\":" << s.outcome_placements[2]
+     << ",\"outcome_fourth\":" << s.outcome_placements[3]
+     << ",\"outcome_episodes\":" << s.outcome_episodes
+     << ",\"outcome_unmapped\":" << s.outcome_unmapped
      // null where the group carries gradient from only one objective, so an
      // undefined cosine can never be read as a measured orthogonality.
      << ",\"grad_cosine_overall\":"
@@ -1407,6 +1678,7 @@ void WriteSearchPiTelemetry(const std::string& diagnostics_path,
      << (c.search_leader_draft ? "true" : "false")
      << ",\"cfg_learner_lr\":" << F17Json(l.learning_rate)
      << ",\"cfg_learner_value_coef\":" << F17Json(l.value_coef)
+     << ",\"cfg_learner_policy_coef\":" << F17Json(l.policy_coef)
      << ",\"cfg_fingerprint\":\"" << SearchPiConfigFingerprint(c, l) << "\""
      << "}\n";
 }
