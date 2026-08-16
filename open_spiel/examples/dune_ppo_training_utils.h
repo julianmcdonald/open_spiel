@@ -729,8 +729,13 @@ struct OnlineCollectionState {
   // Exact-resume cursor + cumulative counters + chained accepted-target hash.
   uint64_t next_auxiliary_episode_id = 0;
   int64_t cum_accepted = 0, cum_rejected = 0;
-  int64_t cum_role_searches[3] = {0, 0, 0};
-  int64_t cum_role_accepted[3] = {0, 0, 0};
+  // 0=primary, 1=continuation, 2=purchase, 3=leader_selection. Leader was added
+  // when it became a searched, labelled decision; an older manifest carries
+  // three entries and the reader leaves the leader slot at zero, so resuming a
+  // pre-Leader run is unaffected.
+  static constexpr int kNumSearchRoles = 4;
+  int64_t cum_role_searches[kNumSearchRoles] = {0, 0, 0, 0};
+  int64_t cum_role_accepted[kNumSearchRoles] = {0, 0, 0, 0};
   int64_t cum_granted = 0, cum_organic = 0;
   std::string accepted_hash_chain;
 };

@@ -2041,6 +2041,99 @@ int main() {
     std::filesystem::remove_all(dir);
   } TEST_END();
 
+  // Test: a leader_selection label reaches the training minibatch and
+  // contributes a NONZERO, CORRECTLY CLASSIFIED auxiliary policy loss.
+  //
+  // This is the leg that makes the Leader teacher a training change rather than
+  // a collection change: a label the collector accepts but the loss never sees
+  // teaches the policy head nothing.
+  TEST_BEGIN("Leader label reaches the minibatch and produces nonzero aux loss") {
+    const int64_t obs = 8, act = 4;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 16, act, 1);
+    model->train();
+    torch::optim::AdamW opt(model->parameters(),
+                            torch::optim::AdamWOptions(1e-3));
+
+    std::vector<PpoTransition> batch(6);
+    for (int i = 0; i < 6; ++i) {
+      batch[i].state = std::vector<float>(obs, 0.1f * (i + 1));
+      batch[i].legal_actions = {0, 1, 2, 3};
+      batch[i].action = i % 4;
+      batch[i].old_log_prob = -1.386f;
+      batch[i].reward = 0.1f;
+      batch[i].value = 0.0f;
+      batch[i].advantage = (i % 2) ? 0.5f : -0.5f;
+      batch[i].return_value = 0.2f;
+      batch[i].player_id = 0;
+      batch[i].episode_id = i;
+    }
+
+    // Six labels, ALL classified leader_selection, carrying the fixed budget.
+    std::vector<SearchTrainingExample> ex;
+    for (int i = 0; i < 6; ++i) {
+      SearchTrainingExample e;
+      e.observation = std::vector<float>(obs, 0.2f * (i + 1));
+      e.player = 0;
+      e.legal_actions = {0, 1, 2, 3};
+      // A peaked leader target -- the search's correction, not the flat prior.
+      e.normalized_visits = {0.85, 0.05, 0.05, 0.05};
+      e.value_target = 0.25;
+      e.value_target_attached = true;
+      e.simulations_completed = 64;
+      e.role = DuneDecisionRole::kLeaderSelection;
+      ex.push_back(e);
+    }
+    for (const auto& e : ex) {
+      UTILS_CHECK(e.role == DuneDecisionRole::kLeaderSelection);
+      CHECK_EQ(e.simulations_completed, 64);
+    }
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 3);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+    absl::SetFlag(&FLAGS_normalize_advantages, true);
+    absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+    absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+    absl::SetFlag(&FLAGS_value_coef, 0.5);
+    absl::SetFlag(&FLAGS_logit_cap, 10.0);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_amp, false);
+    absl::SetFlag(&FLAGS_grad_clip_norm, 100.0);
+    absl::SetFlag(&FLAGS_diagnostics_only, false);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+
+    torch::manual_seed(4242);
+    PpoUpdateStats s =
+        TrainPpoUpdate(model, opt, batch, obs, act, torch::kCPU,
+                       /*master=*/7, /*global_update=*/2, nullptr, ex,
+                       /*search_loss_coef=*/0.5, /*abort_grad_norm_ratio=*/0.0);
+
+    // The labels REACHED the minibatch...
+    CHECK_EQ(s.aux_examples_used, 6);
+    CHECK_NEAR(s.aux_search_loss_coef, 0.5, 1e-12);
+    // ...and produced a real, finite, nonzero cross-entropy.
+    UTILS_CHECK(std::isfinite(s.aux_ce));
+    UTILS_CHECK(s.aux_ce > 0.0);
+    // The auxiliary gradient is nonzero, i.e. it actually moved the policy.
+    UTILS_CHECK(std::isfinite(s.aux_grad_norm_mean));
+    UTILS_CHECK(s.aux_grad_norm_mean > 0.0);
+
+    // Control: the SAME labels with coefficient 0 contribute nothing, so the
+    // nonzero result above is attributable to the leader labels and not to the
+    // PPO batch they ride along with.
+    auto model0 = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 16, act, 1);
+    model0->train();
+    torch::optim::AdamW opt0(model0->parameters(),
+                             torch::optim::AdamWOptions(1e-3));
+    torch::manual_seed(4242);
+    PpoUpdateStats s0 =
+        TrainPpoUpdate(model0, opt0, batch, obs, act, torch::kCPU,
+                       /*master=*/7, /*global_update=*/2, nullptr, ex,
+                       /*search_loss_coef=*/0.0, /*abort_grad_norm_ratio=*/0.0);
+    CHECK_EQ(s0.aux_examples_used, 0);
+    CHECK_NEAR(s0.aux_ce, 0.0, 1e-12);
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

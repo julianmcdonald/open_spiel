@@ -300,6 +300,13 @@ bool ComputeSearchAcceptance(const std::vector<int>& visit_counts,
   if (covered_prior_mass_out != nullptr) {
     *covered_prior_mass_out = covered_prior_mass;
   }
+  // min_coverage <= 0 means MASS-ONLY: the action-count clause is dropped and
+  // acceptance rests on covered prior mass alone. Used at Leader nodes, where
+  // requiring three covered actions discards a genuine concentrated correction.
+  // Mass can only accrue from actions at >= min_visits_per_action, so a
+  // mass-only accept still implies at least one properly visited action and the
+  // downstream "acceptance implies visited actions" invariant holds.
+  if (min_coverage <= 0) return covered_prior_mass >= min_prior_mass;
   const int required = std::min(min_coverage, legal_count);
   return num_covered >= required && covered_prior_mass >= min_prior_mass;
 }
@@ -315,8 +322,23 @@ bool OnlineSearchCollector::AcceptSearch(const std::vector<int>& visit_counts,
                                          const std::vector<double>& root_priors,
                                          int legal_count, int* num_covered_out,
                                          double* covered_prior_mass_out) const {
+  return AcceptSearchForRole(visit_counts, root_priors, legal_count,
+                             DuneDecisionRole::kAgentPrimary, num_covered_out,
+                             covered_prior_mass_out);
+}
+
+bool OnlineSearchCollector::AcceptSearchForRole(
+    const std::vector<int>& visit_counts,
+    const std::vector<double>& root_priors, int legal_count,
+    DuneDecisionRole role, int* num_covered_out,
+    double* covered_prior_mass_out) const {
+  // The exception is scoped STRICTLY to Leader selection, and only when the run
+  // asked for it. Every other role keeps the generic gate unchanged.
+  const bool mass_only = config_.leader_mass_only_coverage &&
+                         role == DuneDecisionRole::kLeaderSelection;
+  const int min_coverage = mass_only ? 0 : config_.min_coverage;
   return ComputeSearchAcceptance(
-      visit_counts, root_priors, legal_count, config_.min_coverage,
+      visit_counts, root_priors, legal_count, min_coverage,
       config_.min_visits_per_action, config_.min_prior_mass, num_covered_out,
       covered_prior_mass_out);
 }
@@ -392,6 +414,10 @@ void OnlineSearchCollector::CollectUpdate(
   for (int g = 0; g < config_.auxiliary_games; ++g) {
     const int64_t episode_id = first_episode_id + g;
     const Player searched_seat = SearchedSeatForEpisode(episode_id, num_players);
+    // At most ONE Leader choice is searched per auxiliary game, for that game's
+    // designated searched seat only. Not all four seats: the other three are
+    // simulated opponents and their Leader picks are not training targets.
+    bool leader_searched_this_game = false;
 
     // Swordmaster endowment curriculum: deterministic per-episode selection on
     // its own stream (no draw at all when the fraction is 0, so the existing
@@ -469,15 +495,27 @@ void OnlineSearchCollector::CollectUpdate(
       // policy->full gap recovered) showed the search lever lives in the
       // non-agent-phase decisions, so purchases stay in. Combat/other-optional
       // are a later tranche, not this pilot.
+      // A Leader choice is searched only for THIS game's designated searched
+      // seat (we are already inside the `cur == searched_seat` branch), at most
+      // ONCE per auxiliary game, and never when the pick is forced --
+      // ClassifyDuneDecisionRole already returns kForcedOrBookkeeping for a
+      // single legal action, so a forced Leader pick can never reach here.
+      const bool is_leader = role == DuneDecisionRole::kLeaderSelection;
+      const bool leader_target =
+          is_leader && config_.search_leader_draft && !leader_searched_this_game;
+
       const bool is_search_target =
           role == DuneDecisionRole::kAgentPrimary ||
           role == DuneDecisionRole::kAgentContinuation ||
-          role == DuneDecisionRole::kPurchase;
-      // Per-role telemetry index: 0=primary, 1=continuation, 2=purchase, else -1.
+          role == DuneDecisionRole::kPurchase ||
+          leader_target;
+      // Per-role telemetry index: 0=primary, 1=continuation, 2=purchase,
+      // 3=leader_selection, else -1.
       const int role_idx =
           role == DuneDecisionRole::kAgentPrimary      ? 0
           : role == DuneDecisionRole::kAgentContinuation ? 1
           : role == DuneDecisionRole::kPurchase          ? 2
+          : leader_target                                ? 3
                                                          : -1;
 
       Action chosen = kInvalidAction;  // set by an accepted search; else raw below.
@@ -485,7 +523,16 @@ void OnlineSearchCollector::CollectUpdate(
       if (is_search_target) {
         ++stats->strategic_roots_seen;
         if (role_idx >= 0) ++stats->by_role[role_idx].roots_seen;
-        if (ShouldSearchAtRoot(episode_id, this_decision)) {
+        // Leader is searched UNCONDITIONALLY, not Bernoulli-sampled. The
+        // network needs a Leader label from every auxiliary game to learn the
+        // decision; sampling 25% of them would teach it from a quarter of the
+        // games while the other three quarters trained on the raw prior.
+        if (leader_target || ShouldSearchAtRoot(episode_id, this_decision)) {
+          // Marked as soon as the search RUNS, not when it is accepted: a
+          // rejected Leader search still consumed this game's single Leader
+          // opportunity, and retrying at the next Leader node would break the
+          // one-per-game guarantee.
+          if (leader_target) leader_searched_this_game = true;
           ++stats->searches_selected;
           if (role_idx >= 0) ++stats->by_role[role_idx].searches;
 
@@ -495,6 +542,37 @@ void OnlineSearchCollector::CollectUpdate(
           // while keeping the Bernoulli-sampled roots independent — no
           // persistent-session re-root state to corrupt across skipped roots.
           DuneSearchConfig cfg = base_cfg;
+          if (leader_target) {
+            // Fixed and permanent: exactly leader_draft_simulations (64) at
+            // every non-forced Leader choice. Set on BOTH budget fields because
+            // a Leader node is a short-window decision and would otherwise be
+            // governed by purchase_combat_budget.
+            cfg.fixed_session_limit = config_.leader_draft_simulations;
+            cfg.purchase_combat_budget = config_.leader_draft_simulations;
+            cfg.fixed_continuation_reserve = 0;
+            // AND the strategic-state bypass must be OFF at a Leader node.
+            //
+            // IsStrategicState accepts a state only if one of its legal actions
+            // has a STRATEGIC action string (dune_puct_is_mcts.cc:59-72). A
+            // Leader-draft action is not one, so with check_strategic_state
+            // left true the search is bypassed at :818, returns no visits, and
+            // the collector accepts nothing. Every Leader search would run,
+            // report itself as searched, and produce zero labels -- the feature
+            // would be silently inert rather than visibly broken.
+            //
+            // Scoped to the Leader search config alone: the global predicate is
+            // untouched and every other role keeps the bypass.
+            cfg.check_strategic_state = false;
+            // AND the SESSION's own leader gate must be opened. WO-LEADER-1A
+            // Part A made the leader node search-eligible behind
+            // DuneSearchConfig::search_leader_draft; without it
+            // DuneSearchSession returns the policy-only
+            // "forced_or_bookkeeping" result at :339 and the search never runs
+            // -- which is exactly what sims=0 meant. Setting the collector flag
+            // alone is not enough: there are two gates and both are needed.
+            cfg.search_leader_draft = true;
+            cfg.leader_draft_simulations = config_.leader_draft_simulations;
+          }
           cfg.seed = DeriveStream(config_.auxiliary_search_seed_domain, episode_id,
                                   this_decision, kStreamSearchSeed);
           DuneSearchSession session(cfg, evaluator,
@@ -558,8 +636,9 @@ void OnlineSearchCollector::CollectUpdate(
           if (legal_count > 0 &&
               diag.visit_counts.size() == acceptance_priors.size() &&
               diag.actions.size() == diag.visit_counts.size()) {
-            accept = AcceptSearch(diag.visit_counts, acceptance_priors,
-                                  legal_count, &covered, &covered_mass);
+            accept = AcceptSearchForRole(diag.visit_counts, acceptance_priors,
+                                         legal_count, role, &covered,
+                                         &covered_mass);
           }
           sum_covered_mass += covered_mass;
 
@@ -620,6 +699,8 @@ void OnlineSearchCollector::CollectUpdate(
             ex.covered_prior_mass = covered_mass;
             ex.mean_depth = diag.mean_depth;
             ex.terminal_leaf_fraction = diag.terminal_leaf_fraction;
+
+            ex.role = role;   // so a Leader row stays leader_selection downstream
 
             emitted_indices.push_back(out->size());
             out->push_back(std::move(ex));

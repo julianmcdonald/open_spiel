@@ -162,6 +162,27 @@ ABSL_FLAG(std::string, collector_acceptance_prior, "",
           "(pre-WO-20 post-noise behavior). Must be stated EXPLICITLY when "
           "resuming a checkpoint whose manifest predates the field, because its "
           "cumulative counters were accumulated under tree_prior.");
+// --- Leader-selection search teacher (adopted 2026-08-16; fixed budget) ------
+// Leader picks were never searched, so the policy head learned Leader selection
+// from nothing but its own prior. These make the Leader decision a searched,
+// LABELLED training target. All three default OFF/inert: a run that wants
+// Leader teaching states so explicitly, and they are pinned into the config
+// fingerprint so a resume cannot silently change the teacher.
+ABSL_FLAG(bool, search_leader_draft, false,
+          "Search the Leader choice for each auxiliary game's designated "
+          "searched seat and emit it as a leader_selection training label. "
+          "At most ONE Leader choice per auxiliary game; a forced "
+          "one-legal-action pick is never searched and produces no label.");
+ABSL_FLAG(int, leader_draft_simulations, 64,
+          "Simulations at each non-forced Leader choice. FIXED at 64 -- the "
+          "adopted permanent budget, not an experimental arm.");
+ABSL_FLAG(bool, leader_mass_only_coverage, false,
+          "Leader-only acceptance rule: keep the 0.50 covered-prior-mass "
+          "threshold and the min-visit definition, but drop the generic "
+          "three-covered-actions requirement AT LEADER NODES ONLY. Without it "
+          "a concentrated 64-simulation Leader correction is discarded for "
+          "covering too few distinct actions and the raw prior is taught "
+          "instead. No other role is affected.");
 ABSL_FLAG(double, search_loss_coef, 0.10,
           "Target auxiliary search-loss coefficient (warms 0 -> target).");
 ABSL_FLAG(int, search_loss_warmup_update, 25,
@@ -946,6 +967,23 @@ std::string ComputeLegacyConfigFingerprint() {
   config_obj["target_sharpen_exponent"] = absl::GetFlag(FLAGS_target_sharpen_exponent);
   config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
   config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
+  // Leader teacher: pinned into the fingerprint so a resume cannot silently
+  // change what the network is being taught at Leader nodes.
+  //
+  // Added CONDITIONALLY, and that is deliberate. An unconditional key would
+  // change config_fingerprint for every existing run -- including runs whose
+  // flags are entirely unchanged -- and every one of them would fail its resume
+  // integrity check against a checkpoint written before this field existed.
+  // With the flag off the object is byte-identical to before, so pre-Leader
+  // runs resume untouched; with it on the fingerprint differs, which is exactly
+  // the detection this pinning is for.
+  if (absl::GetFlag(FLAGS_search_leader_draft)) {
+    config_obj["search_leader_draft"] = true;
+    config_obj["leader_draft_simulations"] =
+        absl::GetFlag(FLAGS_leader_draft_simulations);
+    config_obj["leader_mass_only_coverage"] =
+        absl::GetFlag(FLAGS_leader_mass_only_coverage);
+  }
 
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
@@ -998,6 +1036,23 @@ std::string ComputeConfigFingerprint() {
   config_obj["target_sharpen_exponent"] = absl::GetFlag(FLAGS_target_sharpen_exponent);
   config_obj["swordmaster_grant_fraction"] = absl::GetFlag(FLAGS_swordmaster_grant_fraction);
   config_obj["swordmaster_grant_round"] = absl::GetFlag(FLAGS_swordmaster_grant_round);
+  // Leader teacher: pinned into the fingerprint so a resume cannot silently
+  // change what the network is being taught at Leader nodes.
+  //
+  // Added CONDITIONALLY, and that is deliberate. An unconditional key would
+  // change config_fingerprint for every existing run -- including runs whose
+  // flags are entirely unchanged -- and every one of them would fail its resume
+  // integrity check against a checkpoint written before this field existed.
+  // With the flag off the object is byte-identical to before, so pre-Leader
+  // runs resume untouched; with it on the fingerprint differs, which is exactly
+  // the detection this pinning is for.
+  if (absl::GetFlag(FLAGS_search_leader_draft)) {
+    config_obj["search_leader_draft"] = true;
+    config_obj["leader_draft_simulations"] =
+        absl::GetFlag(FLAGS_leader_draft_simulations);
+    config_obj["leader_mass_only_coverage"] =
+        absl::GetFlag(FLAGS_leader_mass_only_coverage);
+  }
   // Acceptance prior source is training semantics, not a launcher detail: it
   // decides which searches become CE targets. Fingerprinted so two runs that
   // measure coverage differently cannot stamp their examples with the same
@@ -2504,8 +2559,10 @@ int main(int argc, char** argv) {
   // from so episode ids neither repeat nor skip.
   uint64_t aux_next_episode_id_persist = 0;
   int64_t aux_cum_accepted = 0, aux_cum_rejected = 0;
-  int64_t aux_cum_role_searches[3] = {0, 0, 0};
-  int64_t aux_cum_role_accepted[3] = {0, 0, 0};
+  int64_t aux_cum_role_searches[open_spiel::OnlineCollectionState::kNumSearchRoles] =
+      {0, 0, 0, 0};
+  int64_t aux_cum_role_accepted[open_spiel::OnlineCollectionState::kNumSearchRoles] =
+      {0, 0, 0, 0};
   int64_t aux_cum_granted = 0, aux_cum_organic = 0;
   std::string aux_hash_chain = "";
   int start_update = 1;
@@ -2711,7 +2768,8 @@ int main(int argc, char** argv) {
         aux_cum_rejected = restored.cum_rejected;
         aux_cum_granted = restored.cum_granted;
         aux_cum_organic = restored.cum_organic;
-        for (int r = 0; r < 3; ++r) {
+        for (int r = 0; r < open_spiel::OnlineCollectionState::kNumSearchRoles;
+             ++r) {
           aux_cum_role_searches[r] = restored.cum_role_searches[r];
           aux_cum_role_accepted[r] = restored.cum_role_accepted[r];
         }
@@ -3055,6 +3113,18 @@ int main(int argc, char** argv) {
         absl::GetFlag(FLAGS_swordmaster_grant_fraction);
     aux_config.swordmaster_grant_round =
         absl::GetFlag(FLAGS_swordmaster_grant_round);
+    // Leader teacher: explicit, never an implicit library default.
+    aux_config.search_leader_draft = absl::GetFlag(FLAGS_search_leader_draft);
+    aux_config.leader_draft_simulations =
+        absl::GetFlag(FLAGS_leader_draft_simulations);
+    aux_config.leader_mass_only_coverage =
+        absl::GetFlag(FLAGS_leader_mass_only_coverage);
+    if (aux_config.search_leader_draft &&
+        aux_config.leader_draft_simulations <= 0) {
+      SpielFatalError(
+          "--leader_draft_simulations must be positive when "
+          "--search_leader_draft is enabled.");
+    }
     // Exact resume: continue the aux episode cursor from the manifest.
     aux_config.next_auxiliary_episode_id =
         static_cast<int64_t>(aux_next_episode_id_persist);
@@ -3101,7 +3171,7 @@ int main(int argc, char** argv) {
     aux_cum_rejected += st.rejected_incomplete;
     aux_cum_granted += st.swordmaster_granted_games;
     aux_cum_organic += st.swordmaster_organic_games;
-    for (int r = 0; r < 3; ++r) {
+    for (int r = 0; r < open_spiel::OnlineCollectionState::kNumSearchRoles; ++r) {
       aux_cum_role_searches[r] += st.by_role[r].searches;
       aux_cum_role_accepted[r] += st.by_role[r].accepted;
     }
@@ -3141,7 +3211,8 @@ int main(int argc, char** argv) {
     s.next_auxiliary_episode_id = aux_next_episode_id_persist;
     s.cum_accepted = aux_cum_accepted;
     s.cum_rejected = aux_cum_rejected;
-    for (int r = 0; r < 3; ++r) {
+    for (int r = 0; r < open_spiel::OnlineCollectionState::kNumSearchRoles;
+         ++r) {
       s.cum_role_searches[r] = aux_cum_role_searches[r];
       s.cum_role_accepted[r] = aux_cum_role_accepted[r];
     }

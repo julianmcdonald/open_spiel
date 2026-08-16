@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -34,6 +35,40 @@ class UniformMockEvaluator : public algorithms::Evaluator {
     out.reserve(legal.size());
     const double p = legal.empty() ? 0.0 : 1.0 / static_cast<double>(legal.size());
     for (Action a : legal) out.push_back({a, p});
+    return out;
+  }
+
+ private:
+  const int num_players_;
+};
+
+// A PEAKED prior, which is what a trained network actually produces and what
+// the Leader mass-only rule is designed for. The uniform mock above cannot
+// exercise it: with a uniform prior over N actions, any covered subset carries
+// mass covered/N, so a search that concentrates its visits can never clear a
+// 0.50 mass threshold unless it also covers half the actions -- which is the
+// very thing mass-only exists to stop requiring. That is a property of the
+// fixture, not of the rule.
+class PeakedMockEvaluator : public algorithms::Evaluator {
+ public:
+  explicit PeakedMockEvaluator(int num_players) : num_players_(num_players) {}
+  std::vector<double> Evaluate(const State& state) override {
+    return std::vector<double>(num_players_, 0.0);
+  }
+  ActionsAndProbs Prior(const State& state) override {
+    std::vector<Action> legal = state.LegalActions();
+    ActionsAndProbs out;
+    out.reserve(legal.size());
+    if (legal.empty()) return out;
+    // 0.70 on the leading action, the rest shared. One or two covered actions
+    // therefore clear a 0.50 mass threshold, exactly as a real peaked prior does.
+    const double head = 0.70;
+    const double tail = legal.size() > 1
+                            ? (1.0 - head) / static_cast<double>(legal.size() - 1)
+                            : 0.0;
+    for (size_t i = 0; i < legal.size(); ++i) {
+      out.push_back({legal[i], i == 0 ? head : tail});
+    }
     return out;
   }
 
@@ -808,6 +843,185 @@ void TestCollectUpdateSwordmasterPartial() {
 }
 
 }  // namespace
+// ---------------------------------------------------------------------------
+// Leader-selection search teacher (adopted 2026-08-16, fixed 64-sim budget).
+// ---------------------------------------------------------------------------
+
+// The mass-only rule is scoped STRICTLY to Leader. The same visit/prior pattern
+// that a Leader node accepts must still be REJECTED at every other role --
+// otherwise "Leader-specific" is a comment rather than a behaviour.
+void TestLeaderMassOnlyCoverageIsLeaderScoped() {
+  OnlineSearchConfig c = FastCollectConfig();
+  c.min_coverage = 3;            // the generic gate: three covered actions
+  c.min_visits_per_action = 2;
+  c.min_prior_mass = 0.50;
+  c.leader_mass_only_coverage = true;
+  OnlineSearchCollector col(c, "ckpt-leader-cov");
+
+  // The real shape that motivated this: a 64-simulation search concentrated on
+  // ONE action carrying 0.60 of the prior mass. Mass clears 0.50; only one
+  // action has >= 2 visits, so the generic three-action clause fails it.
+  const std::vector<int> visits = {64, 0, 0, 0};
+  const std::vector<double> priors = {0.60, 0.20, 0.15, 0.05};
+  const int legal = 4;
+
+  int cov = 0; double mass = 0.0;
+  const bool leader = col.AcceptSearchForRole(
+      visits, priors, legal, DuneDecisionRole::kLeaderSelection, &cov, &mass);
+  assert(cov == 1);
+  assert(mass > 0.59 && mass < 0.61);
+  assert(leader);   // ACCEPTED: mass-only
+
+  // Identical numbers at every other role must still be rejected.
+  for (DuneDecisionRole r : {DuneDecisionRole::kAgentPrimary,
+                             DuneDecisionRole::kAgentContinuation,
+                             DuneDecisionRole::kPurchase,
+                             DuneDecisionRole::kOtherOptional}) {
+    assert(!col.AcceptSearchForRole(visits, priors, legal, r));
+  }
+  // And the legacy role-free entry point keeps the generic gate.
+  assert(!col.AcceptSearch(visits, priors, legal, nullptr, nullptr));
+
+  // A GENUINE mass failure is still rejected at Leader: mass-only relaxes the
+  // action-count clause, it does not relax the 0.50 threshold.
+  const std::vector<int> thin_visits = {64, 0, 0, 0};
+  const std::vector<double> thin_priors = {0.10, 0.40, 0.30, 0.20};
+  assert(!col.AcceptSearchForRole(thin_visits, thin_priors, legal,
+                                  DuneDecisionRole::kLeaderSelection));
+
+  // With the exception switched off, Leader falls back to the generic gate.
+  OnlineSearchConfig c_off = c;
+  c_off.leader_mass_only_coverage = false;
+  OnlineSearchCollector col_off(c_off, "ckpt-leader-cov-off");
+  assert(!col_off.AcceptSearchForRole(visits, priors, legal,
+                                      DuneDecisionRole::kLeaderSelection));
+  std::cout << "TestLeaderMassOnlyCoverageIsLeaderScoped Passed!\n\n";
+}
+
+// End-to-end: real auxiliary games produce ACCEPTED leader_selection labels, at
+// exactly the fixed budget, at most one per game, for the rotating searched seat.
+void TestCollectUpdateLeaderLabels() {
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig c = FastCollectConfig();
+  c.search_probability = 0.0;   // NOTHING else is searched: isolates Leader
+  c.search_leader_draft = true;
+  c.leader_draft_simulations = 64;
+  c.leader_mass_only_coverage = true;
+  c.min_coverage = 3;           // generic gate left strict on purpose
+  c.min_visits_per_action = 2;
+  c.min_prior_mass = 0.50;
+
+  OnlineSearchCollector col(c, "ckpt-leader-e2e");
+  std::vector<SearchTrainingExample> out;
+  OnlineSearchCollectionStats s;
+  col.CollectUpdate(/*update_id=*/11, game, eval, &out, &s);
+
+  const int leader_idx = OnlineSearchCollectionStats::kLeaderRoleIndex;
+  std::cout << "  leader roots=" << s.by_role[leader_idx].roots_seen
+            << " searches=" << s.by_role[leader_idx].searches
+            << " accepted=" << s.by_role[leader_idx].accepted
+            << " labels=" << out.size() << std::endl;
+
+  // search_probability = 0 means every non-Leader root fell through to raw
+  // policy, so any label that exists is a Leader label.
+  assert(s.by_role[leader_idx].searches > 0);
+  assert(s.by_role[leader_idx].accepted > 0);
+  assert(!out.empty());
+
+  // AT MOST ONE Leader search per auxiliary game.
+  assert(s.by_role[leader_idx].searches <= c.auxiliary_games);
+
+  std::set<int64_t> episodes_with_leader;
+  for (const auto& ex : out) {
+    // Every emitted label is classified leader_selection -- never OtherOption.
+    assert(ex.role == DuneDecisionRole::kLeaderSelection);
+    // The FIXED budget, at every non-forced Leader choice.
+    assert(ex.simulations_completed == 64);
+    // Never a forced pick: a single legal action classifies as
+    // kForcedOrBookkeeping and cannot reach the Leader path.
+    assert(ex.legal_actions.size() > 1);
+    // One per game.
+    assert(episodes_with_leader.insert(ex.episode_id).second);
+    // The target is a real distribution over the root's legal actions.
+    assert(ex.normalized_visits.size() == ex.legal_actions.size());
+    double tot = 0.0;
+    for (double v : ex.normalized_visits) { assert(v >= 0.0); tot += v; }
+    assert(std::abs(tot - 1.0) < 1e-9);
+  }
+  std::cout << "TestCollectUpdateLeaderLabels Passed!\n\n";
+}
+
+// The Leader label follows the game's EXISTING rotating designated searched
+// seat, so seats are covered in balance rather than one seat being taught.
+void TestLeaderFollowsRotatingSearchedSeat() {
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+  const int num_players = game->NumPlayers();
+
+  OnlineSearchConfig c = FastCollectConfig();
+  c.auxiliary_games = 8;        // two full seat rotations
+  c.search_probability = 0.0;
+  c.search_leader_draft = true;
+  c.leader_draft_simulations = 64;
+  c.leader_mass_only_coverage = true;
+
+  OnlineSearchCollector col(c, "ckpt-leader-seat");
+  std::vector<SearchTrainingExample> out;
+  OnlineSearchCollectionStats s;
+  col.CollectUpdate(/*update_id=*/12, game, eval, &out, &s);
+
+  for (const auto& ex : out) {
+    // The label's seat IS the episode's designated searched seat.
+    // Compared against the collector's OWN rule, not a restatement of it.
+    assert(ex.player == OnlineSearchCollector::SearchedSeatForEpisode(
+                            ex.episode_id, num_players));
+  }
+  std::cout << "  leader labels over " << out.size() << " games" << std::endl;
+  std::cout << "TestLeaderFollowsRotatingSearchedSeat Passed!\n\n";
+}
+
+// Default OFF: without the flag the collector behaves exactly as before, so no
+// training tool or policy-only consumer picks up Leader search implicitly.
+void TestLeaderDisabledByDefaultIsInert() {
+  auto game = LoadGame("dune_imperium");
+  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
+
+  OnlineSearchConfig base = FastCollectConfig();
+  assert(!base.search_leader_draft);            // library default is OFF
+  assert(base.leader_draft_simulations == 64);  // fixed budget, still declared
+  assert(!base.leader_mass_only_coverage);
+
+  base.search_probability = 1.0;
+  base.min_coverage = 1;
+  base.min_visits_per_action = 1;
+  base.min_prior_mass = 0.0;
+
+  OnlineSearchCollector col_a(base, "ckpt-leader-inert");
+  std::vector<SearchTrainingExample> o1;
+  OnlineSearchCollectionStats s1;
+  col_a.CollectUpdate(/*update_id=*/13, game, eval, &o1, &s1);
+
+  // Toggling the LEADER budget while leader search is OFF must change nothing.
+  OnlineSearchConfig other = base;
+  other.leader_draft_simulations = 800;
+  other.leader_mass_only_coverage = true;
+  OnlineSearchCollector col_b(other, "ckpt-leader-inert");
+  std::vector<SearchTrainingExample> o2;
+  OnlineSearchCollectionStats s2;
+  col_b.CollectUpdate(/*update_id=*/13, game, eval, &o2, &s2);
+
+  assert(RunSignature(o1, s1) == RunSignature(o2, s2));
+  const int leader_idx = OnlineSearchCollectionStats::kLeaderRoleIndex;
+  assert(s1.by_role[leader_idx].searches == 0);
+  assert(s1.by_role[leader_idx].accepted == 0);
+  for (const auto& ex : o1) {
+    assert(ex.role != DuneDecisionRole::kLeaderSelection);
+  }
+  std::cout << "TestLeaderDisabledByDefaultIsInert Passed!\n\n";
+}
+
 }  // namespace open_spiel
 
 int main() {
@@ -828,6 +1042,10 @@ int main() {
   open_spiel::TestCollectUpdateSwordmasterGrantAll();
   open_spiel::TestCollectUpdateSwordmasterInert();
   open_spiel::TestCollectUpdateSwordmasterPartial();
+  open_spiel::TestLeaderMassOnlyCoverageIsLeaderScoped();
+  open_spiel::TestCollectUpdateLeaderLabels();
+  open_spiel::TestLeaderFollowsRotatingSearchedSeat();
+  open_spiel::TestLeaderDisabledByDefaultIsInert();
   std::cout << "All Dune online search collector tests passed!\n";
   return 0;
 }

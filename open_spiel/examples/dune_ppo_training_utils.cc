@@ -346,7 +346,7 @@ void WriteOnlineCollectionState(json::Object& manifest_obj,
   o["cum_accepted"] = static_cast<int64_t>(st.cum_accepted);
   o["cum_rejected"] = static_cast<int64_t>(st.cum_rejected);
   json::Array rs, ra;
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < OnlineCollectionState::kNumSearchRoles; ++i) {
     rs.push_back(static_cast<int64_t>(st.cum_role_searches[i]));
     ra.push_back(static_cast<int64_t>(st.cum_role_accepted[i]));
   }
@@ -403,7 +403,12 @@ bool ReadOnlineCollectionState(const std::string& manifest_path,
     auto f = o.find(k);
     if (f != o.end() && f->second.IsArray()) {
       const auto& a = f->second.GetArray();
-      for (int i = 0; i < 3 && i < static_cast<int>(a.size()); ++i) {
+      // Bounded by BOTH the array we are filling and the array on disk, so a
+      // three-entry pre-Leader manifest reads cleanly and leaves leader at zero.
+      for (int i = 0;
+           i < OnlineCollectionState::kNumSearchRoles &&
+           i < static_cast<int>(a.size());
+           ++i) {
         if (a[i].IsInt()) arr[i] = a[i].GetInt();
       }
     }

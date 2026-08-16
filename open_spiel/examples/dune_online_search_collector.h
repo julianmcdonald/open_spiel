@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "open_spiel/spiel.h"
+#include "dune_search_routing.h"  // DuneDecisionRole, carried on each label
 
 namespace open_spiel {
 
@@ -131,6 +132,13 @@ struct SearchTrainingExample {
   double covered_prior_mass = 0.0;
   double mean_depth = 0.0;
   double terminal_leaf_fraction = 0.0;
+
+  // The decision role this label was collected at. Carried ON THE LABEL rather
+  // than re-derived downstream, because re-deriving it requires the State, which
+  // no longer exists by the time the label reaches a minibatch. Without it a
+  // Leader row is indistinguishable from any other and silently lands in
+  // `OtherOption` in retained-label accounting, diagnostics and analysis.
+  DuneDecisionRole role = DuneDecisionRole::kOtherOptional;
 };
 
 // Frozen 18B collection configuration. Defaults encode the baseline/uncapped
@@ -152,6 +160,33 @@ struct OnlineSearchConfig {
   int max_simulations = 64;             // fixed_session_limit
   int fixed_continuation_reserve = 0;   // reserve unused (one cold session per root)
   int purchase_combat_budget = 64;      // short-window (purchase) roots also get 64
+
+  // --- Leader-selection teacher (adopted 2026-08-16, fixed budget) ----------
+  //
+  // Leader picks were never searched: ClassifyDuneDecisionRole returns
+  // kLeaderSelection, and kLeaderSelection was absent from the search-target
+  // set, so every Leader decision executed the raw prior and taught the network
+  // nothing. This turns Leader into a searched, LABELLED decision so the policy
+  // head actually learns Leader selection.
+  //
+  // Default OFF. Enabling it is a deliberate, pinned choice in a run's own
+  // configuration -- flipping the default would silently introduce Leader
+  // search into every training tool and evaluation consumer that constructs a
+  // default OnlineSearchConfig.
+  bool search_leader_draft = false;
+  // Fixed and permanent, not an experimental ladder. 64 simulations at every
+  // non-forced Leader choice.
+  int leader_draft_simulations = 64;
+  // Leader-specific MASS-ONLY acceptance. The generic gate requires
+  // min(3, legal_count) actions at >= min_visits_per_action AND covered prior
+  // mass >= min_prior_mass. At a Leader node the first clause is the wrong
+  // test: the observed 64-simulation search concentrated its visits on a
+  // genuine correction, cleared the mass threshold, and was DISCARDED for
+  // covering too few distinct actions -- so the raw prior was taught instead of
+  // the search result. This drops the action-count clause at Leader nodes ONLY;
+  // the 0.50 mass threshold and the min-visit definition are unchanged, and no
+  // other role is affected.
+  bool leader_mass_only_coverage = false;
   int max_search_decision_depth = -1;   // UNCAPPED (Step 1 winner). Do not cap.
   double puct_c = 0.30;                 // calibrated (Stage 3 / Step 1 winner)
   bool use_opponent_model = true;       // policy opponent model
@@ -239,8 +274,13 @@ struct OnlineSearchCollectionStats {
   int searches_selected = 0;            // Bernoulli(0.25) selected
   int accepted_targets = 0;
   int rejected_incomplete = 0;          // searched but failed acceptance
-  // Per-role telemetry, index 0=primary, 1=continuation, 2=purchase.
-  PerRoleSearchStats by_role[3];
+  // Per-role telemetry, index 0=primary, 1=continuation, 2=purchase,
+  // 3=leader_selection. Leader has its OWN slot rather than sharing one: it is
+  // searched on a different rule (always, once per game, mass-only acceptance),
+  // so folding it into another role's counters would misreport both.
+  static constexpr int kNumTelemetryRoles = 4;
+  static constexpr int kLeaderRoleIndex = 3;
+  PerRoleSearchStats by_role[kNumTelemetryRoles];
   // Swordmaster endowment curriculum telemetry.
   int64_t swordmaster_granted_games = 0;  // grants that actually fired
   int64_t swordmaster_organic_games = 0;  // searched seat owns SM at terminal
@@ -310,6 +350,14 @@ class OnlineSearchCollector {
   // `root_priors` must be the prior named by `config.acceptance_prior_source`
   // (CollectUpdate selects it); this function is a pure predicate over whatever
   // it is handed and does not re-derive it.
+  // Role-aware acceptance. Leader nodes use the mass-only rule when the run
+  // enables it; every other role uses the generic gate unchanged.
+  bool AcceptSearchForRole(const std::vector<int>& visit_counts,
+                           const std::vector<double>& root_priors,
+                           int legal_count, DuneDecisionRole role,
+                           int* num_covered_out = nullptr,
+                           double* covered_prior_mass_out = nullptr) const;
+
   bool AcceptSearch(const std::vector<int>& visit_counts,
                     const std::vector<double>& root_priors, int legal_count,
                     int* num_covered_out, double* covered_prior_mass_out) const;
