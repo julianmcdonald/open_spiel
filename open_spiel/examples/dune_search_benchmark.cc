@@ -2021,6 +2021,16 @@ int RunCorpusRootBenchmark(
       o["single_wait_ms_max"] = t.single_wait_ms_max;
       o["group_wait_ms_mean"] = t.group_wait_ms_mean;
       o["group_wait_ms_max"] = t.group_wait_ms_max;
+      // WO-PERF-TIMING-BATCH: the device-side split the Phase-2 promotion gate
+      // asks for. Zero on CPU and zero without EnableBatcherTelemetry();
+      // `device_timed_batches` says how many physical batches contributed, so a
+      // reader can tell "measured zero" from "never measured".
+      o["h2d_ms"] = t.h2d_ms;
+      o["forward_ms"] = t.forward_ms;
+      o["d2h_ms"] = t.d2h_ms;
+      o["sync_ms"] = t.sync_ms;
+      o["device_timed_batches"] =
+          static_cast<int64_t>(t.device_timed_batches);
       o["benchmark_raw_prior_calls"] = static_cast<int64_t>(raw_priors);
       o["implied_opponent_prior_calls"] = opponent_calls;
       o["leaf_value_records_delta"] = static_cast<int64_t>(leaf_evals_delta);

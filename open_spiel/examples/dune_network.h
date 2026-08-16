@@ -615,6 +615,30 @@ struct BatcherTelemetry {
     double group_wait_ms_mean = 0.0;
     double group_wait_ms_max = 0.0;
     uint64_t group_wait_n = 0;
+    // --- Device-side time (WO-PERF-TIMING-BATCH, 2026-08-16) ----------------
+    //
+    // Cumulative milliseconds across physical batches, measured with CUDA
+    // events on the compute stream. Zero on CPU and zero unless
+    // EnableBatcherTelemetry() armed the batcher, exactly like the sections
+    // above.
+    //
+    // These exist because the Phase-2 promotion gate asks for the H2D /
+    // forward / D2H / synchronisation split, and the original WO-PERF-3
+    // telemetry deliberately omitted it: that work was done under a no-GPU
+    // constraint, so it was deferred as a "GPU follow-up deliverable". Without
+    // these fields the gate cannot be satisfied, and reporting the split as
+    // "unavailable" is not the same as measuring it.
+    //
+    // Read them the way the trainer's phase timer documents: a CUDA event pair
+    // spans the interval between two markers EXECUTING on the stream, so it
+    // includes stream idle. `sync_ms` is host wall time, because a
+    // synchronise is a host-blocking call and host time is the honest measure
+    // of it.
+    double h2d_ms = 0.0;
+    double forward_ms = 0.0;
+    double d2h_ms = 0.0;
+    double sync_ms = 0.0;
+    uint64_t device_timed_batches = 0;   // batches contributing to the four above
 };
 
 class BatchedEvaluator : public IGameEvaluator {
@@ -810,6 +834,13 @@ public:
         t.group_calls = group_calls_.load(std::memory_order_relaxed);
         t.group_rows = group_rows_.load(std::memory_order_relaxed);
         t.leaf_groups_split = leaf_groups_split_.load(std::memory_order_relaxed);
+        // WO-PERF-TIMING-BATCH: device-side split, microseconds -> milliseconds.
+        t.h2d_ms = h2d_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.forward_ms = forward_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.d2h_ms = d2h_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.sync_ms = sync_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.device_timed_batches =
+            device_timed_batches_.load(std::memory_order_relaxed);
 
         std::vector<uint32_t> sizes;
         {
@@ -903,6 +934,16 @@ private:
     std::atomic<bool> batcher_telemetry_enabled_{false};
     mutable std::mutex telemetry_mutex_;          // guards physical_batch_sizes_
     std::vector<uint32_t> physical_batch_sizes_;  // one entry per physical batch
+
+    // WO-PERF-TIMING-BATCH: cumulative device-side microseconds. Integer
+    // microseconds rather than double milliseconds so the accumulation is a
+    // plain atomic add with no read-modify-write race and no float ordering
+    // question across dispatch threads.
+    std::atomic<uint64_t> h2d_us_{0};
+    std::atomic<uint64_t> forward_us_{0};
+    std::atomic<uint64_t> d2h_us_{0};
+    std::atomic<uint64_t> sync_us_{0};
+    std::atomic<uint64_t> device_timed_batches_{0};
     // Runner-thread-only maps for split-leaf-group detection. A leaf group's
     // rows are contiguous in the deque, so within one physical batch a group is
     // a single run; a group counted in a second physical batch is a split.
@@ -1057,10 +1098,32 @@ private:
                 }
             }
 
+            // WO-PERF-TIMING-BATCH: arm the device-side split for this batch.
+            // Opt-in with the rest of the batcher telemetry, CUDA only, so the
+            // default path creates no events and reads no clock.
+            const bool time_device_ =
+                device_.is_cuda() &&
+                batcher_telemetry_enabled_.load(std::memory_order_relaxed);
+            // thread_local so the events are created once per dispatch thread
+            // and reused, rather than created and destroyed per physical batch.
+            // Reuse is safe: every pair is read below, before the next batch on
+            // this thread can re-record it.
+            thread_local std::vector<c10::Event> dev_ev;
+            if (time_device_ && dev_ev.empty()) {
+                for (int e = 0; e < 6; ++e) {
+                    dev_ev.emplace_back(c10::DeviceType::CUDA,
+                                        c10::EventFlag::BACKEND_DEFAULT);
+                }
+            }
+            c10::impl::VirtualGuardImpl dev_impl(c10::DeviceType::CUDA);
+            if (time_device_) dev_ev[0].record(dev_impl.getStream(device_));
+
             // Non-blocking H2D transfer using .slice() for partial batches
             torch::Tensor device_obs = device_.is_cuda()
                 ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true)
                 : pinned_stacked_obs.slice(0, 0, batch_size);
+
+            if (time_device_) dev_ev[1].record(dev_impl.getStream(device_));
 
             // B. FORWARD PASS WITH AMP (FP16/TF32) AND WRITE PROTECTION
             torch::Tensor pred_logits, pred_values;
@@ -1077,6 +1140,7 @@ private:
                     pred_values = outputs.values;
                 }
             }
+            if (time_device_) dev_ev[2].record(dev_impl.getStream(device_));
 
             // Return raw logits. The tanh soft-cap must be applied after
             // legal-action centering, which requires the State's legal actions.
@@ -1085,15 +1149,43 @@ private:
             if (device_.is_cuda()) {
                 pred_logits = pred_logits.to(torch::kFloat32);
                 pred_values = pred_values.to(torch::kFloat32);
+                std::chrono::steady_clock::time_point sync_t0, sync_t1;
                 if (device_synchronize_) {
                     pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
                     pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
+                    if (time_device_) dev_ev[3].record(dev_impl.getStream(device_));
 
                     // Wait for asynchronous transfers to complete before reading.
+                    sync_t0 = std::chrono::steady_clock::now();
                     torch::cuda::synchronize();
+                    sync_t1 = std::chrono::steady_clock::now();
                 } else {
                     pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/false).contiguous();
                     pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/false).contiguous();
+                    if (time_device_) dev_ev[3].record(dev_impl.getStream(device_));
+                    sync_t0 = sync_t1 = std::chrono::steady_clock::now();
+                }
+                if (time_device_) {
+                    // Every event above is complete by here: either
+                    // torch::cuda::synchronize() drained the stream, or the D2H
+                    // was blocking. So no additional synchronise is inserted --
+                    // the instrument must not add the very stalls it measures.
+                    dev_ev[3].synchronize();
+                    auto us = [](double ms) {
+                        return static_cast<uint64_t>(ms * 1000.0 + 0.5);
+                    };
+                    h2d_us_.fetch_add(us(dev_ev[0].elapsedTime(dev_ev[1])),
+                                      std::memory_order_relaxed);
+                    forward_us_.fetch_add(us(dev_ev[1].elapsedTime(dev_ev[2])),
+                                          std::memory_order_relaxed);
+                    d2h_us_.fetch_add(us(dev_ev[2].elapsedTime(dev_ev[3])),
+                                      std::memory_order_relaxed);
+                    sync_us_.fetch_add(
+                        static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                sync_t1 - sync_t0).count()),
+                        std::memory_order_relaxed);
+                    device_timed_batches_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 pred_logits = pred_logits.contiguous();
