@@ -1972,6 +1972,13 @@ int RunCorpusRootBenchmark(
   };
 
   auto wall_start = std::chrono::steady_clock::now();
+  // Absolute wall-clock bounds of the SCORED window, so an external sampler
+  // (nvidia-smi, /proc/stat) can be cropped to exactly this interval. Without
+  // it those samplers necessarily span model load and warm-up as well, because
+  // they must be running before the process starts.
+  const double scored_start_unix =
+      std::chrono::duration<double>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
   std::vector<std::thread> threads;
   threads.reserve(workers);
   for (int i = 0; i < workers; ++i) threads.emplace_back(worker_fn);
@@ -1979,6 +1986,11 @@ int RunCorpusRootBenchmark(
   double wall_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start)
           .count();
+  const double scored_end_unix =
+      std::chrono::duration<double>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+  std::cout << absl::StrFormat("scored_window_unix: %.3f %.3f\n",
+                               scored_start_unix, scored_end_unix);
 
   const uint64_t leaf_evals_delta =
       open_spiel::DuneNNEvaluator::global_num_leaf_evaluations.load() -
@@ -2130,6 +2142,8 @@ int RunCorpusRootBenchmark(
       o["latency_p99_ms"] = lat_p99;
       o["latency_max_ms"] = lat_max;
       o["warmup_searches"] = static_cast<int64_t>(warmup_n);
+      o["scored_window_unix_start"] = scored_start_unix;
+      o["scored_window_unix_end"] = scored_end_unix;
       o["root_set_count"] = static_cast<int64_t>(roots.size());
       o["roots"] = static_cast<int64_t>(roots.size());
       o["workers"] = static_cast<int64_t>(workers);
