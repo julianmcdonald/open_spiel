@@ -16,7 +16,21 @@ enum class DuneSearchBudgetMode {
   kPolicyOnly = 0,
   kFixedSessionSimulations = 1,
   kTrainingFullFast = 2,
-  kLiveDeadline = 3
+  kLiveDeadline = 3,
+  // Training-only, for the agent-turn search policy-iteration lane
+  // (dune_search_pi.{h,cc}). The one property that distinguishes it from
+  // kFixedSessionSimulations: primary and continuation draw from INDEPENDENT
+  // budgets (DuneSearchConfig::pi_primary_simulations and
+  // ::pi_continuation_simulations) rather than from one session pool, so the
+  // primary cannot consume the continuations' simulations. Under
+  // kFixedSessionSimulations the primary spends fixed_session_limit and every
+  // continuation then reports fixed_session_limit_exceeded -- which is exactly
+  // what the n=100 inference cell measured and why "64-sim search" there meant
+  // 64 sims on the primary only.
+  //
+  // Not reachable from any inference-time or play-time path: nothing outside
+  // the search-PI generator constructs a session in this mode.
+  kTrainingPolicyIteration = 4
 };
 
 struct ControllerDecision {
@@ -117,7 +131,8 @@ class DuneSearchSession {
   // emitted 0.0/0 and the searched path emitted a hardcoded 52000.0.
   // `is_full_session_` is read live, so these must be called at the point the
   // value is needed, not precomputed.
-  int ConfiguredHardSimLimit(bool is_short_window_role) const;
+  int ConfiguredHardSimLimit(bool is_short_window_role,
+                             DuneDecisionRole role) const;
   double ConfiguredHardTimeLimitMs(double resolved_live_deadline_ms) const;
 
   DuneSearchConfig config_;

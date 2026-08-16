@@ -5,7 +5,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
 
-  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc dune_search_pi.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
@@ -39,6 +39,22 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_collector_smoke.cc dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_collector_smoke dune_search ${TORCH_LIBRARIES})
+
+  # Agent-turn search policy-iteration lane. A STANDALONE target rather than an
+  # addition to the dune_search static library: several targets that link
+  # dune_search (dune_search_benchmark, dune_pwo3_teacher_audit) are byte-frozen
+  # instruments whose sha256 is a registered quantity, and extending the library
+  # would relink them.
+  #
+  # dune_search_pi.cc pulls dune_ppo_training_utils.cc for CenterAndCapLogitsTensor,
+  # which in turn needs dune_online_search_collector.cc for the flag definitions
+  # it declares -- the same pairing every other training-utils consumer uses.
+  add_executable(dune_search_pi_test
+    dune_search_pi_test.cc dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_search_pi_test COMMAND dune_search_pi_test)
 
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})

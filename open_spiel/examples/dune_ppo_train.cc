@@ -42,6 +42,7 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
+#include "dune_search_pi.h"  // agent-turn search policy-iteration lane
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
@@ -198,6 +199,74 @@ ABSL_FLAG(double, swordmaster_grant_fraction, 0.0,
           "seat a free Swordmaster.");
 ABSL_FLAG(int, swordmaster_grant_round, 2,
           "Round at which a selected game's Swordmaster grant fires.");
+
+// --- Agent-turn search policy iteration (search-PI) -----------------------
+//
+// A RUN-SCOPED mode: a run is either ordinary PPO or search-PI, never both and
+// never interleaved per update. Search generates the behaviour trajectory, the
+// search visit policy is the first-class policy target, terminal results from
+// that trajectory train the value head, and NO PPO objective touches these
+// rows. Mutually exclusive with --online_search_collection, --search_label_dir
+// and --pipeline; enforced at startup, not at first use.
+//
+// This is NOT the closed PF-C mode. It shares no configuration with it: it
+// builds its own DuneSearchConfig, and in particular it does not import the
+// production Leader-teacher pins.
+ABSL_FLAG(bool, search_pi_mode, false,
+          "Enable the agent-turn search policy-iteration lane (run-scoped; "
+          "mutually exclusive with PPO training, --online_search_collection, "
+          "--search_label_dir and --pipeline).");
+ABSL_FLAG(int, search_pi_generations, 1,
+          "Number of frozen-collect -> learn -> sync generations to run.");
+ABSL_FLAG(int, search_pi_games_per_generation, 16,
+          "Complete games played per generation (must be a multiple of 4 for "
+          "seat balance).");
+ABSL_FLAG(int, search_pi_primary_simulations, 200,
+          "NEW simulations at each kAgentPrimary root.");
+ABSL_FLAG(int, search_pi_continuation_simulations, 64,
+          "NEW simulations at each kAgentContinuation root. Independent of the "
+          "primary budget: the primary cannot consume it.");
+ABSL_FLAG(double, search_pi_puct_c, 0.30, "PUCT exploration constant.");
+ABSL_FLAG(double, search_pi_opponent_temperature, 1.0,
+          "Policy opponent-model temperature inside the search.");
+ABSL_FLAG(double, search_pi_root_prior_temperature, 1.0,
+          "Root prior temperature.");
+ABSL_FLAG(double, search_pi_dirichlet_epsilon, 0.0,
+          "Root Dirichlet noise weight. 0 disables the exploration package.");
+ABSL_FLAG(double, search_pi_dirichlet_alpha_total, 10.83,
+          "Per-root alpha = total / N_legal. Inert while epsilon is 0.");
+ABSL_FLAG(double, search_pi_forced_playouts_k, 0.0,
+          "KataGo forced-playout coefficient. Must stay 0 while epsilon is 0: "
+          "with no noise there are no forced visits to prune, and an armed "
+          "pruner would subtract organic visits from the target.");
+ABSL_FLAG(bool, search_pi_root_noise_fpu_zero, false,
+          "FPU = 0 at the noised root. Inert while epsilon is 0.");
+ABSL_FLAG(double, search_pi_target_sharpen_exponent, 1.0,
+          "Target sharpening exponent. 1.0 = inert.");
+ABSL_FLAG(std::string, search_pi_continuation_target, "total_visits",
+          "How a continuation's target normalizes root visits after a re-root: "
+          "total_visits (inherited + new; the tree-reuse convention) or "
+          "new_visits_only.");
+ABSL_FLAG(double, search_pi_behavior_temperature, 0.0,
+          "Temperature for the EXECUTED action, drawn from the unpruned visit "
+          "counts. 0 = argmax, so the trajectory reflects the stronger "
+          "controller.");
+ABSL_FLAG(double, search_pi_non_search_temperature, 1.0,
+          "Raw-policy temperature for the non-searched opponent seats.");
+ABSL_FLAG(double, search_pi_unsearched_role_temperature, 1.0,
+          "Raw-policy temperature for the SEARCHED seat's own non-searched "
+          "decisions (leader, purchase, combat-intrigue, other-optional).");
+ABSL_FLAG(uint64_t, search_pi_seed_domain, 0,
+          "Domain-separated seed stream for the lane (required nonzero).");
+ABSL_FLAG(double, search_pi_learning_rate, 1.0e-4,
+          "Learning rate for the DEDICATED search-PI optimizer. Independent of "
+          "--learning_rate, which this mode never uses.");
+ABSL_FLAG(int, search_pi_minibatch_size, 256, "Search-PI learner minibatch size.");
+ABSL_FLAG(int, search_pi_epochs, 1, "Search-PI learner epochs per generation.");
+ABSL_FLAG(double, search_pi_value_coef, 1.0,
+          "Weight on the value MSE in CE + value_coef * MSE. Stated explicitly "
+          "rather than inherited from --value_coef, which means something "
+          "different inside a PPO total loss.");
 
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
@@ -1187,7 +1256,8 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     const std::string& config_fingerprint,
                     const std::string& search_label_fingerprint,
                     const std::string& run_uuid,
-                    const open_spiel::OnlineCollectionState* aux_state = nullptr) {
+                    const open_spiel::OnlineCollectionState* aux_state = nullptr,
+                    const open_spiel::SearchPiState* search_pi_state = nullptr) {
   std::string model_tmp = model_path + ".tmp";
   std::string optim_tmp = optim_path + ".tmp";
 
@@ -1236,6 +1306,13 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     // Phase 18B: persist online-collection state for exact resume (plan §18C).
     if (aux_state != nullptr) {
       open_spiel::WriteOnlineCollectionState(manifest_obj, *aux_state);
+    }
+    // Search-PI: the resume cursor and the full search configuration live HERE,
+    // in the manifest, not in diagnostics.csv. Conditional, so a manifest
+    // written by any other mode is byte-identical to before.
+    if (search_pi_state != nullptr) {
+      manifest_obj["search_pi"] =
+          json::Value(open_spiel::WriteSearchPiState(*search_pi_state));
     }
 
     {
@@ -2565,6 +2642,9 @@ int main(int argc, char** argv) {
       {0, 0, 0, 0};
   int64_t aux_cum_granted = 0, aux_cum_organic = 0;
   std::string aux_hash_chain = "";
+  // Search-PI resume state, restored from the manifest's own "search_pi" block.
+  open_spiel::SearchPiState search_pi_resume;
+  bool search_pi_resume_present = false;
   int start_update = 1;
   int target_end_update = absl::GetFlag(FLAGS_target_end_update);
 
@@ -2780,6 +2860,39 @@ int main(int argc, char** argv) {
             (unsigned long long)aux_next_episode_id_persist,
             (long long)aux_cum_accepted, (long long)aux_cum_granted,
             (long long)aux_cum_organic);
+      }
+    }
+
+    // Search-PI exact resume: the generation counter, the episode cursor, the
+    // cumulative row/simulation counts and the target hash chain all come from
+    // the manifest. Absent block = a checkpoint from another mode, which is not
+    // an error here; the mode branch below decides whether that is acceptable.
+    {
+      std::ifstream mf(manifest_path);
+      if (mf) {
+        std::stringstream buf;
+        buf << mf.rdbuf();
+        auto parsed = json::FromString(buf.str());
+        if (parsed.has_value() && parsed->IsObject()) {
+          const json::Object& root = parsed->GetObject();
+          auto it = root.find("search_pi");
+          if (it != root.end() && it->second.IsObject()) {
+            std::string sp_err;
+            if (!open_spiel::ReadSearchPiState(it->second.GetObject(),
+                                               &search_pi_resume, &sp_err)) {
+              SpielFatalError("Failed to read search_pi manifest state: " +
+                              sp_err);
+            }
+            search_pi_resume_present = true;
+            std::cout << absl::StrFormat(
+                "[search-PI] Restored state: generation=%d "
+                "next_episode_id=%lld cum_rows=%lld chain=%s\n",
+                search_pi_resume.generation,
+                (long long)search_pi_resume.next_episode_id,
+                (long long)search_pi_resume.cum_rows,
+                search_pi_resume.target_hash_chain.substr(0, 16).c_str());
+          }
+        }
       }
     }
 
@@ -3074,6 +3187,320 @@ int main(int argc, char** argv) {
         inference_model, absl::GetFlag(FLAGS_eval_batch_size),
         absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
         absl::GetFlag(FLAGS_evaluator_device_synchronize));
+  }
+
+  // =========================================================================
+  // Agent-turn search policy iteration (search-PI)
+  // =========================================================================
+  //
+  // RUN-SCOPED and terminal: this branch owns the whole run and returns. It
+  // never reaches the PPO rollout below, never calls TrainPpoUpdate, and never
+  // constructs a PPO surrogate, ratio, clip, entropy bonus, advantage term or
+  // target-KL stop. That is the point -- PF-C's failure was that a competing
+  // PPO policy objective was applied to the same weights at the same time.
+  if (absl::GetFlag(FLAGS_search_pi_mode)) {
+    // --- Mutual exclusion, enforced at startup rather than at first use -----
+    if (absl::GetFlag(FLAGS_online_search_collection)) {
+      SpielFatalError(
+          "--search_pi_mode and --online_search_collection are mutually "
+          "exclusive: the second is the closed PF-C combined-optimization mode "
+          "(0.10 * (CE + 0.5*value_MSE) alongside PPO), and running both would "
+          "reintroduce exactly the competing objective this lane removes.");
+    }
+    if (!absl::GetFlag(FLAGS_search_label_dir).empty()) {
+      SpielFatalError(
+          "--search_pi_mode and --search_label_dir are mutually exclusive "
+          "(legacy offline distillation runs its own optimizer step).");
+    }
+    if (absl::GetFlag(FLAGS_pipeline)) {
+      SpielFatalError(
+          "--search_pi_mode and --pipeline are mutually exclusive. Pipelining "
+          "collects generation N+1 against the snapshot while generation N is "
+          "still learning, which breaks the frozen-collect -> learn -> sync "
+          "boundary this mode is defined by. Re-enabling it requires PROVING "
+          "the snapshot semantics, not assuming them.");
+    }
+    if (absl::GetFlag(FLAGS_search_leader_draft)) {
+      SpielFatalError(
+          "--search_leader_draft is not applicable in --search_pi_mode: this "
+          "lane searches agent-turn decisions only, and its scope is not a "
+          "tunable knob. The Leader teacher's production pins must not leak "
+          "in; the manifest records search_leader_draft=false.");
+    }
+    if (absl::GetFlag(FLAGS_search_pi_seed_domain) == 0) {
+      SpielFatalError(
+          "--search_pi_seed_domain must be set nonzero (no silent default).");
+    }
+    if (absl::GetFlag(FLAGS_diagnostics_path).empty()) {
+      // REQUIRED, not optional. Every scientific instrument this lane exists to
+      // provide -- the CE/value split, the two gradient norms, the per-module
+      // cosines, the per-role target and raw entropy, KL(target||raw), the
+      // zero-simulation-by-role proof and the kept-despite-the-old-gate count --
+      // lives only in the sidecar beside this path. The manifest carries the
+      // cursor and the config, not the measurements. PF-C's per-update telemetry
+      // is gone and its diagnosis tables are no longer reproducible from
+      // artifacts; a run that silently produces none is not worth having.
+      SpielFatalError(
+          "--diagnostics_path is required with --search_pi_mode: the lane's "
+          "learner and per-role telemetry are written to "
+          "<diagnostics_path minus extension>_search_pi.jsonl, and without it "
+          "the generation would leave no durable measurements.");
+    }
+    if (absl::GetFlag(FLAGS_train_value_only)) {
+      // train_value_only rebuilds the optimizer with a single parameter group
+      // and freezes the policy head -- incoherent with a lane whose primary
+      // objective is a policy-target cross-entropy.
+      SpielFatalError(
+          "--train_value_only is incompatible with --search_pi_mode: this lane's "
+          "first-class objective is the search-visit policy target.");
+    }
+
+    open_spiel::SearchPiConfig pi_cfg;
+    pi_cfg.games_per_generation =
+        absl::GetFlag(FLAGS_search_pi_games_per_generation);
+    pi_cfg.primary_simulations =
+        absl::GetFlag(FLAGS_search_pi_primary_simulations);
+    pi_cfg.continuation_simulations =
+        absl::GetFlag(FLAGS_search_pi_continuation_simulations);
+    pi_cfg.puct_c = absl::GetFlag(FLAGS_search_pi_puct_c);
+    pi_cfg.max_search_decision_depth = -1;  // uncapped, not a flag
+    pi_cfg.use_opponent_model = true;
+    pi_cfg.opponent_model_temperature =
+        absl::GetFlag(FLAGS_search_pi_opponent_temperature);
+    pi_cfg.root_prior_temperature =
+        absl::GetFlag(FLAGS_search_pi_root_prior_temperature);
+    pi_cfg.utility_divisor = 4.0;  // the model's own value scale
+    pi_cfg.dirichlet_epsilon = absl::GetFlag(FLAGS_search_pi_dirichlet_epsilon);
+    pi_cfg.dirichlet_alpha_total =
+        absl::GetFlag(FLAGS_search_pi_dirichlet_alpha_total);
+    pi_cfg.forced_playouts_k = absl::GetFlag(FLAGS_search_pi_forced_playouts_k);
+    pi_cfg.root_noise_fpu_zero =
+        absl::GetFlag(FLAGS_search_pi_root_noise_fpu_zero);
+    pi_cfg.target_sharpen_exponent =
+        absl::GetFlag(FLAGS_search_pi_target_sharpen_exponent);
+    if (!open_spiel::ParseSearchPiContinuationTarget(
+            absl::GetFlag(FLAGS_search_pi_continuation_target),
+            &pi_cfg.continuation_target)) {
+      SpielFatalError("Unrecognized --search_pi_continuation_target: '" +
+                      absl::GetFlag(FLAGS_search_pi_continuation_target) +
+                      "' (expected total_visits|new_visits_only).");
+    }
+    pi_cfg.behavior_temperature =
+        absl::GetFlag(FLAGS_search_pi_behavior_temperature);
+    pi_cfg.non_search_temperature =
+        absl::GetFlag(FLAGS_search_pi_non_search_temperature);
+    pi_cfg.searched_seat_unsearched_temperature =
+        absl::GetFlag(FLAGS_search_pi_unsearched_role_temperature);
+    pi_cfg.search_leader_draft = false;  // structural, and manifested as such
+    pi_cfg.seed_domain = absl::GetFlag(FLAGS_search_pi_seed_domain);
+
+    open_spiel::SearchPiLearnerConfig pi_learn;
+    pi_learn.learning_rate = absl::GetFlag(FLAGS_search_pi_learning_rate);
+    pi_learn.minibatch_size = absl::GetFlag(FLAGS_search_pi_minibatch_size);
+    pi_learn.epochs = absl::GetFlag(FLAGS_search_pi_epochs);
+    pi_learn.value_coef = absl::GetFlag(FLAGS_search_pi_value_coef);
+    pi_learn.grad_clip_norm = absl::GetFlag(FLAGS_grad_clip_norm);
+    pi_learn.logit_cap = absl::GetFlag(FLAGS_logit_cap);
+    // MakeOptimizer reads these two into the parameter groups, so they are part
+    // of this lane's objective and must be fingerprinted with the rest of it.
+    pi_learn.weight_decay = absl::GetFlag(FLAGS_weight_decay);
+    pi_learn.policy_weight_decay = absl::GetFlag(FLAGS_policy_weight_decay);
+
+    const std::string pi_fingerprint =
+        open_spiel::SearchPiConfigFingerprint(pi_cfg, pi_learn);
+
+    int pi_generation = 0;
+    open_spiel::SearchPiState pi_state;
+    if (search_pi_resume_present) {
+      const std::string prior_fp = open_spiel::SearchPiConfigFingerprint(
+          search_pi_resume.config, search_pi_resume.learner);
+      if (prior_fp != pi_fingerprint) {
+        SpielFatalError(absl::StrFormat(
+            "search_pi config fingerprint mismatch on resume: checkpoint=%s "
+            "current=%s. A search-PI resume may not silently change the search "
+            "budgets, puct_c, the exploration package, the target exponent or "
+            "the learner's hyperparameters.",
+            prior_fp, pi_fingerprint));
+      }
+      pi_state = search_pi_resume;
+      pi_generation = search_pi_resume.generation;
+      pi_cfg.next_episode_id = search_pi_resume.next_episode_id;
+    }
+
+    // The DEDICATED optimizer: its own instance and its own learning rate. The
+    // PPO optimizer built above is never stepped in this mode; reusing it would
+    // couple two objectives' Adam moments.
+    //
+    // Built through MakeOptimizer rather than as a flat parameter list, so the
+    // parameter-GROUP layout (policy / other / aux heads) matches everything
+    // else that saves and loads an optimizer here. A one-group optimizer writes
+    // a state dict the loader rejects with "different number of parameter
+    // groups", which is how this was found.
+    std::unique_ptr<torch::optim::AdamW> pi_optimizer_owner =
+        MakeOptimizer(training_model);
+    torch::optim::AdamW& pi_optimizer = *pi_optimizer_owner;
+    SetOptimizerLearningRate(pi_optimizer, pi_learn.learning_rate);
+
+    // Adam moments are inherited ONLY from a search-PI lineage. A checkpoint
+    // with no search_pi block was written by some other mode, and seeding this
+    // lane's optimizer from PPO's moments is precisely the cross-objective
+    // contamination the dedicated-optimizer requirement exists to prevent -- so
+    // that case starts fresh, loudly.
+    if (init_mode == "checkpoint") {
+      if (search_pi_resume_present) {
+        const std::string pi_optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+        try {
+          // Same two-step as the PPO resume path: a pre-head archive migrates,
+          // a post-head archive loads normally.
+          if (!open_spiel::LoadOptimizerCheckpointMigrating(
+                  training_model, pi_optimizer, pi_optim_path, device)) {
+            torch::load(pi_optimizer, pi_optim_path, device);
+          }
+        } catch (const c10::Error& e) {
+          SpielFatalError("search-PI optimizer resume failed: " +
+                          std::string(e.msg()));
+        }
+        SetOptimizerLearningRate(pi_optimizer, pi_learn.learning_rate);
+        std::cout << "[search-PI] Inherited optimizer moments from the "
+                     "search-PI lineage.\n";
+      } else {
+        std::cout << "[search-PI] Checkpoint carries no search_pi block: "
+                     "starting the dedicated optimizer FRESH rather than "
+                     "inheriting another objective's Adam moments.\n";
+      }
+    }
+
+    const int generations = absl::GetFlag(FLAGS_search_pi_generations);
+    std::cout << absl::StrFormat(
+        "[search-PI] ON | generations=%d games/gen=%d primary_sims=%d "
+        "continuation_sims=%d puct_c=%.3f eps=%.3f forced_k=%.3f sharpen=%.3f "
+        "behavior_temp=%.3f cont_target=%s lr=%.3g mb=%d epochs=%d "
+        "value_coef=%.3f leader=false seed_domain=%llu fp=%s\n",
+        generations, pi_cfg.games_per_generation, pi_cfg.primary_simulations,
+        pi_cfg.continuation_simulations, pi_cfg.puct_c,
+        pi_cfg.dirichlet_epsilon, pi_cfg.forced_playouts_k,
+        pi_cfg.target_sharpen_exponent, pi_cfg.behavior_temperature,
+        open_spiel::SearchPiContinuationTargetName(pi_cfg.continuation_target),
+        pi_learn.learning_rate, pi_learn.minibatch_size, pi_learn.epochs,
+        pi_learn.value_coef,
+        (unsigned long long)pi_cfg.seed_domain, pi_fingerprint.substr(0, 16));
+
+    const std::string pi_diag_path = absl::GetFlag(FLAGS_diagnostics_path);
+
+    for (int gi = 0; gi < generations; ++gi) {
+      ++pi_generation;
+
+      // 1. FREEZE. inference_model already carries the pre-generation weights
+      //    (SyncModels ran above, and again at the end of each generation).
+      //    Every search and every opponent draw in this generation reads this
+      //    snapshot; the training model is not touched until step 3.
+      auto pi_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
+          inference_model, device,
+          static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
+
+      // 2. COLLECT: complete games, search-generated trajectory.
+      open_spiel::SearchPiGenerator pi_generator(pi_cfg);
+      std::vector<open_spiel::SearchPiRow> pi_rows;
+      open_spiel::SearchPiGenerationStats pi_stats;
+      pi_generator.GenerateGeneration(pi_generation, game, pi_evaluator,
+                                      &pi_rows, &pi_stats);
+      pi_cfg.next_episode_id = pi_stats.next_episode_id;
+
+      // 3. LEARN: the dedicated AlphaZero-style objective, current-generation
+      //    data only (no replay buffer in this slice).
+      open_spiel::SearchPiLearnerStats pi_lstats =
+          open_spiel::RunSearchPiLearner(training_model, pi_optimizer, pi_rows,
+                                         obs_size, action_size, device, master,
+                                         pi_generation, pi_learn);
+
+      // 4. SYNC: the next generation collects against the new weights.
+      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+
+      pi_state.generation = pi_generation;
+      pi_state.next_episode_id = pi_stats.next_episode_id;
+      pi_state.cum_rows += pi_stats.rows_total;
+      pi_state.cum_primary_rows += pi_stats.primary.rows_emitted;
+      pi_state.cum_continuation_rows += pi_stats.continuation.rows_emitted;
+      pi_state.cum_primary_simulations += pi_stats.primary.simulations_completed;
+      pi_state.cum_continuation_simulations +=
+          pi_stats.continuation.simulations_completed;
+      pi_state.target_hash_chain = open_spiel::ComputeStringSHA256(
+          pi_state.target_hash_chain + pi_stats.target_hash_chain);
+      pi_state.config = pi_cfg;
+      pi_state.learner = pi_learn;
+
+      std::cout << absl::StrFormat(
+          "[search-PI] gen %d | rows=%lld (primary %lld / cont %lld) "
+          "sims=%lld/%lld fallbacks=%lld/%lld re_root hit/miss=%lld/%lld "
+          "kept_vs_legacy_gate=%lld/%lld | CE=%.5f MSE=%.5f "
+          "|g_pol|=%.4f |g_val|=%.4f cos=%.4f (pol %.4f trunk %.4f val %.4f) "
+          "| collect=%.1fs\n",
+          pi_generation, (long long)pi_stats.rows_total,
+          (long long)pi_stats.primary.rows_emitted,
+          (long long)pi_stats.continuation.rows_emitted,
+          (long long)pi_stats.primary.simulations_completed,
+          (long long)pi_stats.continuation.simulations_completed,
+          (long long)pi_stats.primary.fallbacks,
+          (long long)pi_stats.continuation.fallbacks,
+          (long long)pi_stats.continuation.re_root_hits,
+          (long long)pi_stats.continuation.re_root_misses,
+          (long long)pi_stats.primary.kept_despite_legacy_gate,
+          (long long)pi_stats.continuation.kept_despite_legacy_gate,
+          pi_lstats.policy_ce, pi_lstats.value_mse, pi_lstats.policy_grad_norm,
+          pi_lstats.value_grad_norm, pi_lstats.grad_cosine_overall,
+          pi_lstats.grad_cosine_policy_head, pi_lstats.grad_cosine_trunk,
+          pi_lstats.grad_cosine_value_head, pi_stats.collection_wall_time_s);
+
+      // Zero-simulation invariant, checked every generation rather than only in
+      // the unit tests: a routing regression must stop the run, not quietly
+      // start teaching Leader or purchase rows.
+      const int off_scope[] = {0, 1, 4, 5, 6};
+      for (int r : off_scope) {
+        if (pi_stats.simulations_by_role[r] != 0) {
+          SpielFatalError(absl::StrFormat(
+              "search-PI scope violation: role %d ran %lld simulations; only "
+              "kAgentPrimary(2) and kAgentContinuation(3) may be searched.",
+              r, (long long)pi_stats.simulations_by_role[r]));
+        }
+      }
+      if (pi_stats.leader_rows_emitted != 0) {
+        SpielFatalError("search-PI emitted a Leader row; the lane's scope is "
+                        "agent-turn decisions only.");
+      }
+
+      open_spiel::WriteSearchPiTelemetry(pi_diag_path, pi_cfg, pi_learn,
+                                         pi_stats, pi_lstats);
+
+      const int ckpt_interval = absl::GetFlag(FLAGS_checkpoint_interval);
+      const bool last = (gi == generations - 1);
+      if ((ckpt_interval > 0 && pi_generation % ckpt_interval == 0) ||
+          (last && absl::GetFlag(FLAGS_save_final_checkpoint))) {
+        // global_update carries the generation counter (a monotone count of
+        // optimizer-stepping passes, which is what it means here), but
+        // target_end_update is passed through from the FLAG unchanged. Writing
+        // `generations` into it instead would make the manifest's own PPO
+        // resume validator reject the next generation, because that validator
+        // compares the flag against the stored field. The lane's real
+        // generation accounting lives in the "search_pi" block, not here.
+        open_spiel::SaveCheckpoint(
+            training_model, pi_optimizer,
+            absl::GetFlag(FLAGS_model_checkpoint),
+            absl::GetFlag(FLAGS_optim_checkpoint), pi_generation,
+            absl::GetFlag(FLAGS_target_end_update), total_env_steps.load(),
+            next_episode_id.load(), master,
+            absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+            search_label_fingerprint, run_uuid,
+            /*aux_state=*/nullptr, &pi_state);
+      }
+    }
+
+    std::cout << absl::StrFormat(
+        "[search-PI] DONE | generations=%d cum_rows=%lld next_episode_id=%lld "
+        "chain=%s\n",
+        pi_generation, (long long)pi_state.cum_rows,
+        (long long)pi_state.next_episode_id,
+        pi_state.target_hash_chain.substr(0, 16));
+    return 0;
   }
 
   // --- Phase 18B online auxiliary-search collection setup ---

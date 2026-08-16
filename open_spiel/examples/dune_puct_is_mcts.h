@@ -72,6 +72,14 @@ struct DuneSearchConfig {
   double root_prior_temperature = 1.0;
   double training_root_prior_temperature = 1.0;
 
+  // --- Search-PI training budgets (DuneSearchBudgetMode::kTrainingPolicyIteration) --
+  // Read ONLY in that mode. Independent per-role counts of NEW simulations, not
+  // shares of a session pool: whatever the primary spends, each continuation
+  // still gets its own full budget. Inert in every other budget mode, so no
+  // existing path changes. Neither field enters the transposition key.
+  int pi_primary_simulations = 200;
+  int pi_continuation_simulations = 64;
+
   // Session calibration parameters
   int fixed_continuation_reserve = 0;
   int purchase_combat_budget = 16;

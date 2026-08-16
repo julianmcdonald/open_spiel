@@ -136,13 +136,23 @@ void DuneSearchSession::HandleReRootMismatch(const std::string& reason) {
   last_reset_reason_ = reason;
 }
 
-int DuneSearchSession::ConfiguredHardSimLimit(bool is_short_window_role) const {
+int DuneSearchSession::ConfiguredHardSimLimit(bool is_short_window_role,
+                                             DuneDecisionRole role) const {
   if (is_short_window_role) return config_.purchase_combat_budget;
   switch (budget_mode_) {
     case DuneSearchBudgetMode::kTrainingFullFast:
       return is_full_session_ ? 64 : 8;
     case DuneSearchBudgetMode::kFixedSessionSimulations:
       return config_.fixed_session_limit;
+    case DuneSearchBudgetMode::kTrainingPolicyIteration:
+      // PER-ROLE, because in this mode the two agent-turn roles have genuinely
+      // different configured caps. Reporting the primary's budget on a
+      // continuation row would make every continuation look budget-starved to
+      // any consumer computing `simulations_completed < hard_sim_limit` -- and
+      // continuations are the majority of the rows this lane emits.
+      return role == DuneDecisionRole::kAgentContinuation
+                 ? config_.pi_continuation_simulations
+                 : config_.pi_primary_simulations;
     default:
       return config_.max_simulations;
   }
@@ -290,7 +300,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     // here, which made ~62% of live-mode search.jsonl rows indistinguishable
     // from "zero budget configured" -- see the README note on grouping by
     // hard_time_limit_ms in historical runs.
-    res.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role);
+    res.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role, role);
     res.diagnostics.soft_sim_limit = 0;
     res.diagnostics.hard_time_limit_ms =
         ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
@@ -431,6 +441,24 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         limit_exceeded = true;
         limit_reason = "training_full_fast_limit_exceeded";
       }
+    } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingPolicyIteration) {
+      // INDEPENDENT per-role budgets. Deliberately no subtraction of
+      // session_new_simulations_completed_ or short_sims_completed_: that
+      // subtraction is what makes kFixedSessionSimulations a session POOL, and
+      // pooling is exactly the property this mode exists to remove. The primary
+      // spends pi_primary_simulations; every continuation then gets a full
+      // pi_continuation_simulations of NEW simulations on the retained tree.
+      max_sims = (role == DuneDecisionRole::kAgentPrimary)
+                     ? config_.pi_primary_simulations
+                     : config_.pi_continuation_simulations;
+      if (max_sims <= 0) {
+        max_sims = 0;
+        limit_exceeded = true;
+        limit_reason = "search_pi_budget_not_configured";
+      }
+      // A fixed-simulation search stops on the COUNT; the time budget is only a
+      // runaway guard, as on the leader path.
+      max_time_ms = config_.relative_time_budget_ms;
     } else if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
       if (!live_deadline_initialized_) {
         absolute_live_deadline_ =
@@ -530,7 +558,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   result.diagnostics.phase = LocalPhaseToString(dune_state.phase());
   result.diagnostics.decision_role = absl::StrCat(static_cast<int>(role));
   result.diagnostics.budget_mode = absl::StrCat(static_cast<int>(budget_mode_));
-  result.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role);
+  result.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role, role);
   result.diagnostics.soft_sim_limit = max_sims;
   result.diagnostics.hard_time_limit_ms =
       ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
