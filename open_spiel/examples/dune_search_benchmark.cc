@@ -713,10 +713,17 @@ void WorkerThread(
     bool turn_had_fallback = false;
     std::string turn_fallback_reason = "none";
 
-    // Probe telemetry (3b): the searched seat's Swordmaster-acquisition round and
-    // its solari trajectory by round. Forced funding/acquisition decisions bypass
-    // the search log, so this in-loop sampling is the only place they surface.
-    int sm_acquire_round = -1;
+    // Probe telemetry (3b): the Swordmaster-acquisition round and the searched
+    // seat's solari trajectory by round. Forced funding/acquisition decisions
+    // bypass the search log, so this in-loop sampling is the only place they
+    // surface. Acquisition is now sampled for ALL FOUR seats (live-eval
+    // telemetry): opponents acquire Swordmaster too, and the round they do it
+    // is not recoverable from terminal state -- HasSwordmaster is a terminal
+    // bool. -1 means never acquired. The searched seat's entry is what the
+    // legacy scalar `search_seat_swordmaster_round` reports, so the two can
+    // never disagree.
+    std::array<int, 4> sm_acquire_round_by_seat;
+    sm_acquire_round_by_seat.fill(-1);
     std::map<int, int> search_seat_solari_by_round;
     // Third-agent utilization (arm B-endow diagnostic): per round, the agents the
     // searched seat DEPLOYED (counted as agents_remaining decrements) and its peak
@@ -760,8 +767,10 @@ void WorkerThread(
       if (const auto* trk = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get())) {
         const int trk_round = trk->GetCurrentRound();
         search_seat_solari_by_round[trk_round] = trk->GetPlayerSolari(search_seat);
-        if (sm_acquire_round < 0 && trk->HasSwordmaster(search_seat)) {
-          sm_acquire_round = trk_round;
+        for (int p = 0; p < 4; ++p) {
+          if (sm_acquire_round_by_seat[p] < 0 && trk->HasSwordmaster(p)) {
+            sm_acquire_round_by_seat[p] = trk_round;
+          }
         }
         // Per-round third-agent utilization: track peak available agents and
         // count deployments as decrements in agents_remaining. A grant/round
@@ -1417,7 +1426,15 @@ void WorkerThread(
         game_obj["search_steps"] = static_cast<int64_t>(thread_stats.search_steps_count);
         game_obj["search_swordmasters"] = dune_state->HasSwordmaster(search_seat);
         game_obj["search_seat_leader"] = static_cast<int64_t>(dune_state->PlayerLeader(search_seat));
-        game_obj["search_seat_swordmaster_round"] = static_cast<int64_t>(sm_acquire_round);
+        game_obj["search_seat_swordmaster_round"] =
+            static_cast<int64_t>(sm_acquire_round_by_seat[search_seat]);
+        // Same quantity for all four seats, seat-indexed (-1 = never acquired).
+        open_spiel::json::Array sm_rounds_arr;
+        for (int p = 0; p < 4; ++p) {
+          sm_rounds_arr.push_back(
+              static_cast<int64_t>(sm_acquire_round_by_seat[p]));
+        }
+        game_obj["swordmaster_rounds"] = sm_rounds_arr;
         open_spiel::json::Array sbr_rounds, sbr_solari;
         for (const auto& kv : search_seat_solari_by_round) {
           sbr_rounds.push_back(static_cast<int64_t>(kv.first));
@@ -1447,6 +1464,89 @@ void WorkerThread(
           }
         }
         game_obj["opponent_swordmasters"] = opp_sm_arr;
+
+        // --- Per-seat terminal VP decomposition -----------------------------
+        // WHAT IS EXACT AND WHAT IS AN ATTRIBUTION. The engine keeps no
+        // per-event VP ledger, so only the first split below is an identity:
+        //
+        //   final_scored_vp = vp_track + endgame_vp
+        //
+        // holds by construction -- FinalScoredVp is `vp_[p] + ComputeEndgameVp(p)`
+        // (dune_imperium.cc:2403), so `endgame_vp` is taken as the DIFFERENCE
+        // rather than recomputed. This file must never reimplement endgame
+        // scoring; see dune_terminal_vp_report.h for why that rule exists.
+        //
+        // Everything else is an attribution of components *within* vp_track,
+        // reconstructed from terminal state, and it is NOT forced to sum:
+        //
+        //  - conflict_vp is the engine's own cumulative counter, measured as the
+        //    vp_ delta across conflict resolution (dune_imperium.cc:4744). Exact
+        //    for conflict, but it absorbs any other vp_ change inside that same
+        //    window.
+        //  - alliance_vp counts alliances held AT THE END, +1 each. It is a
+        //    snapshot, not a history: alliances change hands, and the loss path
+        //    floors at zero (`vp_[old] = max(vp_[old] - 1, 0)`,
+        //    dune_imperium_state_util.cc:361), so a seat that lost an alliance
+        //    while at 0 VP never paid it back. This term can therefore both
+        //    over- and under-state the true contribution.
+        //  - tleilaxu_vp derives from the terminal track position: the scarab
+        //    track grants gain_vp at positions 4 and 7 (kScarabTrackRewards) and
+        //    only ever advances, so cumulative VP is a function of where it
+        //    stopped.
+        //
+        // unattributed_track_vp is the REMAINDER, not a component -- card,
+        // space, and leader effects that terminal state cannot separate. It may
+        // legitimately be negative (see the alliance floor above). Do not
+        // "correct" it.
+        static const char* kFactionNames[4] = {"emperor", "spacing_guild",
+                                               "bene_gesserit", "fremen"};
+        open_spiel::json::Array vp_breakdown_arr;
+        for (int p = 0; p < 4; ++p) {
+          open_spiel::json::Object vb;
+          const int final_vp = static_cast<int>(GetTrueFinalVp(dune_state, p));
+          const int vp_track = dune_state->GetPlayerVp(p);
+          const int conflict_vp = dune_state->ConflictVpDelta(p);
+
+          open_spiel::json::Object alliances_obj;
+          int alliance_vp = 0;
+          for (int f = 0; f < 4; ++f) {
+            // `HasAlliance(p, f)` is private; its public equivalent is this
+            // comparison -- the method body is exactly
+            // `alliance_owner_[faction] == player`
+            // (dune_imperium_state_util.cc:889). The two differ only in the
+            // out-of-range guard HasAlliance adds, and p and f are both loop
+            // indices over [0, 4) here, so the guard can never fire.
+            const bool held = dune_state->GetAllianceOwnerForTesting(f) == p;
+            alliances_obj[kFactionNames[f]] = held;
+            if (held) ++alliance_vp;
+          }
+
+          const int tl_track = dune_state->GetTleilaxuTrackForTesting(p);
+          const int tleilaxu_vp = (tl_track >= 4 ? 1 : 0) + (tl_track >= 7 ? 1 : 0);
+
+          open_spiel::json::Array tech_arr;
+          for (int tile : dune_state->GetPlayerTechTilesForTesting(p)) {
+            tech_arr.push_back(static_cast<int64_t>(tile));
+          }
+
+          vb["seat"] = static_cast<int64_t>(p);
+          vb["final_scored_vp"] = static_cast<int64_t>(final_vp);
+          vb["vp_track"] = static_cast<int64_t>(vp_track);
+          vb["endgame_vp"] = static_cast<int64_t>(final_vp - vp_track);
+          vb["conflict_vp"] = static_cast<int64_t>(conflict_vp);
+          vb["alliances"] = alliances_obj;
+          vb["alliance_vp"] = static_cast<int64_t>(alliance_vp);
+          vb["tleilaxu_track"] = static_cast<int64_t>(tl_track);
+          vb["tleilaxu_vp"] = static_cast<int64_t>(tleilaxu_vp);
+          vb["unattributed_track_vp"] = static_cast<int64_t>(
+              vp_track - conflict_vp - alliance_vp - tleilaxu_vp);
+          vb["tech_tiles"] = tech_arr;
+          vb["has_swordmaster"] = dune_state->HasSwordmaster(p);
+          vb["leader"] = static_cast<int64_t>(dune_state->PlayerLeader(p));
+          vp_breakdown_arr.push_back(vb);
+        }
+        game_obj["vp_breakdown"] = vp_breakdown_arr;
+
         game_obj["wall_time_s"] = game_duration_s;
 
         // --- WO-1 Phase 2: per-seat controller provenance -------------------
