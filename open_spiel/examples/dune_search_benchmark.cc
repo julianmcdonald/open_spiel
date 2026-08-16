@@ -1529,17 +1529,50 @@ void WorkerThread(
             tech_arr.push_back(static_cast<int64_t>(tile));
           }
 
+          // --- the ledger: exact, complete, non-overlapping attribution -----
+          // Every vp_ mutation is recorded at its source by
+          // DuneImperiumState::AddVp, so these sum to vp_track EXACTLY, with no
+          // residual. Emitted both as the raw event stream (round-by-round) and
+          // as per-source totals.
+          //
+          // This supersedes the terminal-state reconstruction that used to live
+          // here. That reconstruction could not work: it double-counted
+          // (cumulative_conflict_vp_delta_ absorbs the friendship and alliance
+          // grants that fire inside its own window) and it could not see the 12
+          // sources that leave no terminal trace at all.
+          open_spiel::json::Array ledger_arr;
+          std::map<std::string, int> by_source;
+          int ledger_sum = 0;
+          for (const auto& ev : dune_state->GetVpEvents(p)) {
+            open_spiel::json::Object e;
+            e["round"] = static_cast<int64_t>(ev.round);
+            e["source"] = std::string(dune_imperium::VpSourceName(ev.source));
+            e["delta"] = static_cast<int64_t>(ev.delta);
+            ledger_arr.push_back(e);
+            by_source[dune_imperium::VpSourceName(ev.source)] += ev.delta;
+            ledger_sum += ev.delta;
+          }
+          open_spiel::json::Object by_source_obj;
+          for (const auto& kv : by_source) {
+            by_source_obj[kv.first] = static_cast<int64_t>(kv.second);
+          }
+
           vb["seat"] = static_cast<int64_t>(p);
           vb["final_scored_vp"] = static_cast<int64_t>(final_vp);
           vb["vp_track"] = static_cast<int64_t>(vp_track);
           vb["endgame_vp"] = static_cast<int64_t>(final_vp - vp_track);
-          vb["conflict_vp"] = static_cast<int64_t>(conflict_vp);
+          vb["vp_ledger"] = ledger_arr;
+          vb["vp_by_source"] = by_source_obj;
+          vb["vp_ledger_sum"] = static_cast<int64_t>(ledger_sum);
+          // Must be 0. Non-zero means some site mutates vp_ without going
+          // through AddVp -- a defect, not a measurement.
+          vb["vp_ledger_residual"] = static_cast<int64_t>(vp_track - ledger_sum);
+          // Terminal-state descriptors, kept for context. These are POSITIONS,
+          // not attribution -- the ledger above is the attribution.
+          vb["conflict_vp_counter"] = static_cast<int64_t>(conflict_vp);
           vb["alliances"] = alliances_obj;
-          vb["alliance_vp"] = static_cast<int64_t>(alliance_vp);
+          vb["alliances_held"] = static_cast<int64_t>(alliance_vp);
           vb["tleilaxu_track"] = static_cast<int64_t>(tl_track);
-          vb["tleilaxu_vp"] = static_cast<int64_t>(tleilaxu_vp);
-          vb["unattributed_track_vp"] = static_cast<int64_t>(
-              vp_track - conflict_vp - alliance_vp - tleilaxu_vp);
           vb["tech_tiles"] = tech_arr;
           vb["has_swordmaster"] = dune_state->HasSwordmaster(p);
           vb["leader"] = static_cast<int64_t>(dune_state->PlayerLeader(p));

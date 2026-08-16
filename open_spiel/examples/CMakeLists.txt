@@ -198,6 +198,13 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_test(NAME dune_endgame_vp_reporting_test
     COMMAND dune_endgame_vp_reporting_test)
 
+  # Invariant tests for the per-event VP attribution ledger. Lives here, not in
+  # games/dune_imperium/, for the same tree-hash reason as the test above.
+  add_executable(dune_vp_ledger_test
+    dune_vp_ledger_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_vp_ledger_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_vp_ledger_test COMMAND dune_vp_ledger_test)
+
   add_executable(dune_pwo3_immutability_test dune_pwo3_immutability_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo3_immutability_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo3_immutability_test COMMAND dune_pwo3_immutability_test)
