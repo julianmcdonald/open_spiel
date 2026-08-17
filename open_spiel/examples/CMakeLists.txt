@@ -56,6 +56,17 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_search_pi_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_test COMMAND dune_search_pi_test)
 
+  # The rung-3 teacher audit. Same source set as the test target above, for the
+  # same reason: it CALLS SearchPiGenerator::GenerateGeneration rather than
+  # re-implementing the controller, which is what makes the controller-parity
+  # smoke a proof about collection instead of about a copy of it. No add_test --
+  # it loads a checkpoint and plays complete games, which is not a unit test.
+  add_executable(dune_search_pi_audit
+    dune_search_pi_audit.cc dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_audit dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 

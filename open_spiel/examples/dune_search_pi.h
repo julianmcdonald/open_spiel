@@ -70,6 +70,79 @@ enum class SearchPiFallback {
 // Stable, log/JSON-safe names. PERSISTED in row telemetry -- do not rename.
 const char* SearchPiFallbackName(SearchPiFallback reason);
 
+// ---------------------------------------------------------------------------
+// Early-exit taxonomy -- ORTHOGONAL to the fallback taxonomy above
+// ---------------------------------------------------------------------------
+//
+// The simulation loop has three early exits (dune_puct_is_mcts.cc:982-1005):
+// the deadline break, the max_nodes break, and a simulation that returned
+// nothing. All three leave a USABLE tree, and ClassifySearchPiResult returns
+// kNone for any search with at least one root visit -- so a truncated search
+// emits a perfectly normal row and reports zero fallbacks. Only budget
+// arithmetic could detect it.
+//
+// That is exactly the instrument gap rung 2's Amendment 1 recorded: arm D
+// generation 4 completed 86,971 of 87,000 configured primary simulations,
+// which the gate caught as a count, but the artifacts could not say which exit
+// fired or at which root. This enum is the attribution the artifacts lacked.
+//
+// It classifies the STOP, never the row's fate. Nothing here suppresses a
+// target, changes an executed action, or turns a usable search into a fallback:
+// a short search still teaches, exactly as it did before, and now it announces
+// itself.
+enum class SearchPiEarlyExit {
+  kNone = 0,           // spent its full configured budget
+  kNoSearchRun,        // no budget was requested (an off-scope role)
+  kTimeout,            // deadline break, or a simulation that returned nothing
+  kMaxNodes,           // node-pool cap (DuneSearchConfig::max_nodes)
+  kSingleLegalAction,  // forced root: RunSearch returns before the loop
+  kEmptyOrZeroVisits,  // ran, produced no usable root visits
+  kSessionBudget,      // a session-level budget clamp reported the truncation
+  kUnclassified,       // SHORT with no recognised cause -- an instrument defect
+};
+inline constexpr int kSearchPiEarlyExitCount = 8;
+
+// Stable, log/JSON-safe names. PERSISTED in telemetry -- do not rename.
+const char* SearchPiEarlyExitName(SearchPiEarlyExit reason);
+
+// Classify one completed search against the budget it was ASKED to spend.
+// `requested_simulations` is the session's own `soft_sim_limit`, i.e. the count
+// it handed RunSearch -- not the lane's configured budget. Reading the
+// session's number is what lets a disagreement between configuration and
+// session show up as a classified early exit instead of being papered over by
+// re-deriving the expectation from the same config that produced it.
+SearchPiEarlyExit ClassifySearchPiEarlyExit(
+    const DuneSearchResult& result, const std::vector<Action>& legal_actions,
+    int requested_simulations);
+
+// ---------------------------------------------------------------------------
+// Which controller drives the searched seat
+// ---------------------------------------------------------------------------
+//
+// The teacher audit (rung-3 §7a) needs the strength of the SEARCHED controller
+// measured against the raw policy on the same protocol, and the repository had
+// no evaluation path that measured it: dune_search_benchmark spends a
+// cumulative session budget and starves continuations, and dune_population_eval
+// is the raw controller with no session at all. Both measure a different
+// controller than collection measures.
+//
+// So the audit runs the collection generator itself, and the only thing this
+// selects is which action the searched seat EXECUTES at kAgentPrimary and
+// kAgentContinuation. Everything else -- session activation and re-rooting,
+// role classification, the searched seat's off-scope decisions, the opponents,
+// the chance stream and every seed derivation -- is shared between the two arms
+// by construction rather than by care.
+//
+// Deliberately NOT a SearchPiConfig field: the config is fingerprinted into
+// every checkpoint manifest and a resume compares that fingerprint, so adding a
+// field here would invalidate every artifact rung 1 and rung 2 recorded. It is
+// a per-call argument whose default is the collection controller.
+enum class SearchPiArm {
+  kSearched = 0,  // the collection controller: the search picks the action
+  kRawArgmax,     // the matched control: raw-prior argmax, zero simulations
+};
+const char* SearchPiArmName(SearchPiArm arm);
+
 // Which root visit vector a continuation's target normalizes.
 //
 // After a re-root the root's child visit counts include visits INHERITED from
@@ -240,6 +313,13 @@ struct SearchPiRow {
 
   // --- Search provenance ---
   int simulations_completed = 0;       // NEW simulations this search
+  // What the session asked RunSearch for, so a row records its own budget
+  // rather than leaving a reader to look it up in the configuration. Neither
+  // this nor `early_exit` enters either hash chain: they describe how a row was
+  // produced in a way the chains already cover through simulations_completed,
+  // and widening a chain would void every recorded one.
+  int simulations_requested = 0;
+  SearchPiEarlyExit early_exit = SearchPiEarlyExit::kNone;
   int inherited_root_visits = 0;
   std::vector<int> visits_pre_search;  // retention snapshot, when valid
   bool retention_snapshots_valid = false;
@@ -280,6 +360,47 @@ struct SearchPiRoleStats {
   int64_t rows_emitted = 0;
   int64_t fallbacks = 0;
   int64_t simulations_completed = 0;
+
+  // --- Early-exit accounting (closes Amendment 1's instrument gap) ---
+  //
+  // `simulations_requested` is the sum of what the session asked for, so the
+  // shortfall is a subtraction rather than a multiplication against an assumed
+  // per-root budget -- the arithmetic that was the ONLY detector of D4's 29
+  // missing simulations. The counters then say which exit produced it, and the
+  // `first_short_*` fields name the root, which no artifact could do before.
+  int64_t simulations_requested = 0;
+  int64_t searches_short_of_budget = 0;
+  int64_t simulation_shortfall = 0;
+  int64_t early_exit_counts[kSearchPiEarlyExitCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int64_t first_short_episode_id = -1;
+  int64_t first_short_decision_id = -1;
+  int first_short_simulations_completed = -1;
+  int first_short_simulations_requested = -1;
+  // BOTH reason strings at that root, carried verbatim. They come from
+  // different places and only one of them can name a kSessionBudget exit:
+  // `first_short_bot_reason` is RunSearch's own ("timeout", "max_nodes",
+  // "low_coverage", "zero_visits"), while `first_short_session_reason` is
+  // DuneSearchSession's budget_limit_reason, the SOLE discriminator for
+  // kSessionBudget. Carrying only one would reintroduce Amendment 1's gap one
+  // level down: the class named, the cause dropped.
+  std::string first_short_bot_reason;
+  std::string first_short_session_reason;
+
+  // --- Deadline headroom ---
+  //
+  // Every searched root runs under a live wall-clock deadline: the lane never
+  // sets DuneSearchConfig::relative_time_budget_ms, so it stays at its 10,000 ms
+  // default and dune_puct_is_mcts.cc:982 breaks the simulation loop on it. That
+  // is a runaway guard at one game per process, but it is NOT inert under
+  // concurrency -- parallel games share one CUDA stream, per-simulation latency
+  // rises, and a truncated search weakens ONLY the arm that searches.
+  //
+  // A zero shortfall says the deadline did not fire. These say how close it
+  // came, which is the difference between "it held this time" and "it holds".
+  double max_search_elapsed_ms = 0.0;
+  double sum_search_elapsed_ms = 0.0;
+  double configured_time_limit_ms = 0.0;  // what the deadline actually was
+
   int64_t inherited_visits = 0;
   int64_t re_root_hits = 0;
   int64_t re_root_misses = 0;
@@ -290,6 +411,41 @@ struct SearchPiRoleStats {
   double sum_kl_target_given_raw = 0.0;
   int64_t target_argmax_overrides = 0;
 };
+
+// ---------------------------------------------------------------------------
+// One game's outcome
+// ---------------------------------------------------------------------------
+//
+// The generator always played complete games and always read Returns() at the
+// end -- to attach value targets -- but it kept none of it, because a training
+// generation only ever needed the aggregate. A strength measurement needs the
+// per-game record: the audit's contrast is a PAIRED test on shared episode ids,
+// and pairing is a per-episode join.
+struct SearchPiGameOutcome {
+  int64_t episode_id = -1;
+  Player searched_seat = kInvalidPlayer;
+  std::vector<double> returns;       // engine Returns(), every seat
+  double searched_seat_return = 0.0;
+  // 1..4 off the terminal ladder {+2.25, +0.25, -0.75, -1.75}; 0 means the
+  // return matched no rung, which is reported rather than snapped to the
+  // nearest one -- an off-ladder return means the value pipeline changed.
+  int searched_seat_placement = 0;
+  int64_t searched_seat_decisions = 0;
+  int64_t rows_emitted = 0;
+  int64_t primary_roots = 0;
+  int64_t continuation_roots = 0;
+  int64_t primary_simulations = 0;
+  int64_t continuation_simulations = 0;
+  int64_t fallbacks = 0;
+  int64_t searches_short_of_budget = 0;
+  int64_t off_scope_simulations = 0;  // structurally 0; carried so it is checked
+};
+
+// Placement 1..4 from an engine return, or 0 when it sits on no rung.
+// `utility_divisor` scales the ladder the same way SearchPiRow::value_target
+// does, so one helper serves a raw Returns() value (divisor 1.0) and a value
+// target (divisor as configured).
+int SearchPiPlacementFromReturn(double engine_return, double utility_divisor);
 
 struct SearchPiGenerationStats {
   int generation = -1;
@@ -311,6 +467,11 @@ struct SearchPiGenerationStats {
 
   // Leader rows emitted. Structurally always 0 in this lane; asserted by tests.
   int64_t leader_rows_emitted = 0;
+
+  // Which controller drove the searched seat, and one entry per game in
+  // episode order. Empty for no generation the generator ran.
+  SearchPiArm arm = SearchPiArm::kSearched;
+  std::vector<SearchPiGameOutcome> games_played;
 
   // Rolling SHA-256 over the emitted targets, for resume verification.
   // LEGACY FORMAT, retained byte-for-byte: it is the only chain any prior run
@@ -502,11 +663,17 @@ class SearchPiGenerator {
   // does. The designated seat drives ONE persistent DuneSearchSession across
   // each placement activation; all other seats play the frozen raw policy at
   // `non_search_temperature`.
+  //
+  // `arm` selects the searched seat's controller and nothing else. It defaults
+  // to the collection controller, so the trainer's call site says what it has
+  // always said and the training lane cannot acquire a new behaviour by
+  // omission.
   void GenerateGeneration(int generation,
                           const std::shared_ptr<const Game>& game,
                           const std::shared_ptr<algorithms::Evaluator>& evaluator,
                           std::vector<SearchPiRow>* out,
-                          SearchPiGenerationStats* stats);
+                          SearchPiGenerationStats* stats,
+                          SearchPiArm arm = SearchPiArm::kSearched);
 
   static Player SearchedSeatForEpisode(int64_t episode_id, int num_players);
 

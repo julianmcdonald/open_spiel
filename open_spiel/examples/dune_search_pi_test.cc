@@ -9,6 +9,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <set>
 #include <map>
 #include <string>
@@ -1417,6 +1418,416 @@ void TestScalarHelpers() {
   std::cout << "TestScalarHelpers Passed!\n\n";
 }
 
+// SPIEL_CHECK_EQ needs an operator<< for its operands and a scoped enum has
+// none, so these compare the STABLE NAMES instead. That is not a workaround: a
+// failure then prints "timeout vs max_nodes" rather than two integers, which is
+// the whole reason the names are persisted in the first place.
+void CheckEarlyExit(SearchPiEarlyExit got, SearchPiEarlyExit want) {
+  SPIEL_CHECK_EQ(std::string(SearchPiEarlyExitName(got)),
+                 std::string(SearchPiEarlyExitName(want)));
+}
+void CheckFallback(SearchPiFallback got, SearchPiFallback want) {
+  SPIEL_CHECK_EQ(std::string(SearchPiFallbackName(got)),
+                 std::string(SearchPiFallbackName(want)));
+}
+void CheckArm(SearchPiArm got, SearchPiArm want) {
+  SPIEL_CHECK_EQ(std::string(SearchPiArmName(got)),
+                 std::string(SearchPiArmName(want)));
+}
+
+// --- 20. Early exits are NAMED, not left to budget arithmetic --------------
+//
+// Rung 2's Amendment 1: arm D generation 4 completed 86,971 of 87,000
+// configured primary simulations. ClassifySearchPiResult returns kNone for any
+// search with at least one visit, so the truncated search emitted a normal row
+// and reported zero fallbacks -- the shortfall was visible ONLY as a
+// multiplication the gate happened to perform, and no artifact could say which
+// of the three early exits fired.
+//
+// Two halves, because either alone would be vacuous: the classifier's own
+// table, and a REAL truncation driven through the real search code.
+void Test20_EarlyExitClassification(const std::shared_ptr<const Game>& game) {
+  std::cout << "Running Test20_EarlyExitClassification...\n";
+
+  // (a) The classifier's table, on hand-built results.
+  auto result_with = [](int completed, const std::string& reason,
+                        bool timeout_status, int n_actions, int visits_each) {
+    DuneSearchResult r;
+    r.simulations_completed = completed;
+    r.fallback_reason = reason;
+    r.timeout_status = timeout_status;
+    for (int i = 0; i < n_actions; ++i) {
+      r.diagnostics.actions.push_back(static_cast<Action>(100 + i));
+      r.diagnostics.visit_counts.push_back(visits_each);
+    }
+    return r;
+  };
+  const std::vector<Action> two_legal = {100, 101};
+  const std::vector<Action> one_legal = {100};
+
+  // A search that spent its whole budget is not an early exit, whatever else
+  // the session said about its coverage.
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(200, "none", false, 2, 100), two_legal, 200),
+                 SearchPiEarlyExit::kNone);
+  CheckEarlyExit(
+      ClassifySearchPiEarlyExit(result_with(200, "low_coverage", false, 2, 100),
+                                two_legal, 200),
+      SearchPiEarlyExit::kNone);
+  // The three real early exits, each named.
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(171, "timeout", true, 2, 85), two_legal, 200),
+                 SearchPiEarlyExit::kTimeout);
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(171, "max_nodes", false, 2, 85), two_legal, 200),
+                 SearchPiEarlyExit::kMaxNodes);
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(0, "none", false, 1, 0), one_legal, 200),
+                 SearchPiEarlyExit::kSingleLegalAction);
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(3, "none", false, 2, 0), two_legal, 200),
+                 SearchPiEarlyExit::kEmptyOrZeroVisits);
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(0, "none", false, 0, 0), two_legal, 0),
+                 SearchPiEarlyExit::kNoSearchRun);
+  {
+    DuneSearchResult r = result_with(64, "none", false, 2, 32);
+    r.diagnostics.budget_limit_reason = "fixed_session_limit_exceeded";
+    CheckEarlyExit(ClassifySearchPiEarlyExit(r, two_legal, 200),
+                   SearchPiEarlyExit::kSessionBudget);
+  }
+  // The one that must never be reachable silently: short, with a cause the
+  // instrument does not recognise. It reports its own ignorance rather than
+  // picking the nearest known class.
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(171, "some_future_reason", false, 2, 85),
+                     two_legal, 200),
+                 SearchPiEarlyExit::kUnclassified);
+  // And it stays kUnclassified even when the result's SHAPE matches a known
+  // class. RunSearch's non_strategic_state return is short, carries an
+  // unrecognised reason, and leaves diagnostics DEFAULT-CONSTRUCTED -- so its
+  // actions are empty and, without the reason-string guard, it would be
+  // absorbed into kEmptyOrZeroVisits and read as a known cause. Unreachable
+  // today (check_strategic_state is false), asserted anyway: a zero
+  // unclassified count is a manipulation check, and it only means something if
+  // the class cannot quietly borrow another's name.
+  CheckEarlyExit(ClassifySearchPiEarlyExit(
+                     result_with(0, "non_strategic_state", false, 0, 0),
+                     two_legal, 200),
+                 SearchPiEarlyExit::kUnclassified);
+  // A genuinely empty result with NO reason still classifies structurally.
+  CheckEarlyExit(ClassifySearchPiEarlyExit(result_with(0, "none", false, 0, 0),
+                                           two_legal, 200),
+                 SearchPiEarlyExit::kEmptyOrZeroVisits);
+
+  // (b) A REAL truncation, through the real search. max_nodes is a
+  // DuneSearchConfig field the lane leaves at its 50,000 default, so shrinking
+  // it here forces the node-pool break at dune_puct_is_mcts.cc:989 without
+  // touching any lane configuration -- and therefore without touching the
+  // fingerprint every recorded artifact is compared against.
+  SearchPiConfig c = FastConfig();
+  c.primary_simulations = 8;
+  c.continuation_simulations = 3;
+  DuneSearchConfig scfg = SearchPiSearchConfigFor(c, /*search_seed=*/12345);
+  scfg.max_nodes = 2;
+  auto ev = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+  DuneSearchSession session(scfg, ev,
+                            DuneSearchBudgetMode::kTrainingPolicyIteration);
+  session.SetEpisodeId(0);
+  session.SetUpdateId(1);
+
+  std::unique_ptr<State> state = game->NewInitialState();
+  std::mt19937 rng(7);
+  bool saw_truncation = false;
+  int guard = 0;
+  while (!state->IsTerminal() && guard++ < 4000 && !saw_truncation) {
+    if (state->IsChanceNode()) {
+      ActionsAndProbs outcomes = state->ChanceOutcomes();
+      state->ApplyAction(outcomes[rng() % outcomes.size()].first);
+      continue;
+    }
+    const Player cur = state->CurrentPlayer();
+    const std::vector<Action> legal = state->LegalActions();
+    if (cur != 0) {
+      state->ApplyAction(legal[rng() % legal.size()]);
+      continue;
+    }
+    const DuneDecisionRole role =
+        ClassifyDuneDecisionRole(*state, cur, session.HasActiveSession());
+    DuneSearchResult res = session.Search(*state);
+    if (IsSearchPiSearchRole(role)) {
+      const int requested = res.diagnostics.soft_sim_limit;
+      const SearchPiEarlyExit ee =
+          ClassifySearchPiEarlyExit(res, legal, requested);
+      if (res.simulations_completed < requested) {
+        // The whole point: this row is NOT a fallback -- it has visits, so
+        // ClassifySearchPiResult still calls it usable and it would still be
+        // taught -- and yet it is short, and the instrument says why.
+        CheckFallback(ClassifySearchPiResult(res, legal),
+                      SearchPiFallback::kNone);
+        CheckEarlyExit(ee, SearchPiEarlyExit::kMaxNodes);
+        SPIEL_CHECK_EQ(res.fallback_reason, std::string("max_nodes"));
+        std::cout << "  real truncation: " << res.simulations_completed << "/"
+                  << requested << " sims, early_exit="
+                  << SearchPiEarlyExitName(ee)
+                  << ", fallback=" << SearchPiFallbackName(
+                                          ClassifySearchPiResult(res, legal))
+                  << "\n";
+        saw_truncation = true;
+      }
+    }
+    ControllerDecision dec;
+    Action chosen = legal[0];
+    dec.selected_action = chosen;
+    dec.raw_reference_action = chosen;
+    dec.mcts_proposed_action = res.diagnostics.selected_action;
+    session.CommitAction(dec);
+    state->ApplyAction(chosen);
+  }
+  // Non-vacuous: the shrunk node pool must actually have produced one.
+  SPIEL_CHECK_TRUE(saw_truncation);
+
+  // (c) An ordinary generation reports the instrument reading ZERO, and reports
+  // the requested total from the SESSION's own number rather than from the
+  // configuration this test just wrote.
+  SearchPiGenerator gen(c);
+  std::vector<SearchPiRow> rows;
+  SearchPiGenerationStats st;
+  gen.GenerateGeneration(1, game, ev, &rows, &st);
+  for (const SearchPiRoleStats* rs : {&st.primary, &st.continuation}) {
+    SPIEL_CHECK_GT(rs->searches_run, 0);
+    SPIEL_CHECK_EQ(rs->searches_short_of_budget, 0);
+    SPIEL_CHECK_EQ(rs->simulation_shortfall, 0);
+    SPIEL_CHECK_EQ(rs->first_short_episode_id, -1);
+    SPIEL_CHECK_EQ(rs->early_exit_counts[
+                       static_cast<int>(SearchPiEarlyExit::kNone)],
+                   rs->searches_run);
+    for (int i = 1; i < kSearchPiEarlyExitCount; ++i) {
+      SPIEL_CHECK_EQ(rs->early_exit_counts[i], 0);
+    }
+    SPIEL_CHECK_EQ(rs->simulations_requested, rs->simulations_completed);
+  }
+  SPIEL_CHECK_EQ(st.primary.simulations_requested,
+                 st.primary.roots_seen * c.primary_simulations);
+  SPIEL_CHECK_EQ(st.continuation.simulations_requested,
+                 st.continuation.roots_seen * c.continuation_simulations);
+
+  // (d) Deadline headroom is MEASURED, not assumed inert. Every searched root
+  // runs under a live wall-clock deadline -- the lane never sets
+  // relative_time_budget_ms, so it keeps DuneSearchConfig's 10,000 ms default --
+  // and that guard is inert at one game per process but not under concurrency,
+  // where a truncated search would weaken only the arm that searches. A zero
+  // shortfall says it did not fire; these fields say by how much, which is what
+  // makes a thread count auditable instead of hopeful.
+  for (const SearchPiRoleStats* rs : {&st.primary, &st.continuation}) {
+    SPIEL_CHECK_GT(rs->configured_time_limit_ms, 0.0);
+    SPIEL_CHECK_GE(rs->max_search_elapsed_ms, 0.0);
+    SPIEL_CHECK_LT(rs->max_search_elapsed_ms, rs->configured_time_limit_ms);
+    // The max is a max over the searches that ran, so it cannot sit below the
+    // mean -- the cheapest check that the two are not the same accumulator.
+    SPIEL_CHECK_GE(rs->max_search_elapsed_ms,
+                   rs->sum_search_elapsed_ms /
+                       static_cast<double>(rs->searches_run));
+  }
+  std::cout << "  deadline: worst primary " << st.primary.max_search_elapsed_ms
+            << " ms against " << st.primary.configured_time_limit_ms
+            << " ms configured\n";
+  std::cout << "Test20 Passed!\n\n";
+}
+
+// --- 21. The matched raw arm ----------------------------------------------
+//
+// The audit's control is only matched if the ONLY thing it changes is which
+// action the searched seat executes at kAgentPrimary and kAgentContinuation.
+// The failure this test exists to catch is the tempting shortcut: drop the
+// session in the raw arm because there is no tree to keep. Role classification
+// reads has_active_session(), so a session-less arm would classify every
+// agent-turn decision as a primary -- and the seat's off-scope decisions, which
+// both arms must play identically at T=1, would change with it.
+void Test21_MatchedRawArm(const std::shared_ptr<const Game>& game) {
+  std::cout << "Running Test21_MatchedRawArm...\n";
+  SearchPiConfig c = FastConfig();
+  auto ev = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+
+  std::vector<SearchPiRow> searched_rows, raw_rows;
+  SearchPiGenerationStats searched, raw;
+  SearchPiGenerator(c).GenerateGeneration(1, game, ev, &searched_rows, &searched,
+                                          SearchPiArm::kSearched);
+  SearchPiGenerator(c).GenerateGeneration(1, game, ev, &raw_rows, &raw,
+                                          SearchPiArm::kRawArgmax);
+
+  CheckArm(searched.arm, SearchPiArm::kSearched);
+  CheckArm(raw.arm, SearchPiArm::kRawArgmax);
+
+  // The raw arm spends nothing, anywhere.
+  SPIEL_CHECK_EQ(raw.primary.simulations_completed, 0);
+  SPIEL_CHECK_EQ(raw.continuation.simulations_completed, 0);
+  for (int i = 0; i < 7; ++i) SPIEL_CHECK_EQ(raw.simulations_by_role[i], 0);
+  SPIEL_CHECK_TRUE(raw_rows.empty());
+  SPIEL_CHECK_EQ(raw.rows_total, 0);
+  // A control that ran no search cannot have had a search FAIL. Zero fallbacks
+  // here is a structural claim, not a lucky run.
+  SPIEL_CHECK_EQ(raw.primary.fallbacks, 0);
+  SPIEL_CHECK_EQ(raw.continuation.fallbacks, 0);
+  SPIEL_CHECK_EQ(raw.primary.searches_run, 0);
+  SPIEL_CHECK_EQ(raw.continuation.searches_run, 0);
+  SPIEL_CHECK_EQ(raw.primary.early_exit_counts[
+                     static_cast<int>(SearchPiEarlyExit::kNoSearchRun)],
+                 raw.primary.roots_seen);
+
+  // THE decisive one: both arms reach BOTH agent-turn roles. A raw arm that had
+  // lost the session would report continuation roots of zero here.
+  SPIEL_CHECK_GT(raw.primary.roots_seen, 0);
+  SPIEL_CHECK_GT(raw.continuation.roots_seen, 0);
+  SPIEL_CHECK_GT(searched.primary.roots_seen, 0);
+  SPIEL_CHECK_GT(searched.continuation.roots_seen, 0);
+  // ... and both reach the OFF-SCOPE roles they must play IDENTICALLY. Asserted
+  // per role, not as a count: kForcedOrBookkeeping (role 0) is non-zero in every
+  // Dune game, so "at least one of the five" is a tautology that would pass with
+  // the three interesting roles at zero.
+  for (int r : {static_cast<int>(DuneDecisionRole::kPurchase),
+                static_cast<int>(DuneDecisionRole::kCombatIntrigue),
+                static_cast<int>(DuneDecisionRole::kOtherOptional)}) {
+    SPIEL_CHECK_GT(raw.decisions_by_role[r], 0);
+    SPIEL_CHECK_GT(searched.decisions_by_role[r], 0);
+    SPIEL_CHECK_EQ(raw.simulations_by_role[r], 0);
+    SPIEL_CHECK_EQ(searched.simulations_by_role[r], 0);
+  }
+
+  // The searched arm is unchanged by the argument's existence: an explicit
+  // kSearched and the default must be the same run.
+  std::vector<SearchPiRow> default_rows;
+  SearchPiGenerationStats defaulted;
+  SearchPiGenerator(c).GenerateGeneration(1, game, ev, &default_rows, &defaulted);
+  SPIEL_CHECK_EQ(defaulted.extended_hash_chain, searched.extended_hash_chain);
+  SPIEL_CHECK_EQ(defaulted.target_hash_chain, searched.target_hash_chain);
+
+  // Per-game outcomes: one per game, in episode order, paired across arms.
+  SPIEL_CHECK_EQ(static_cast<int>(searched.games_played.size()),
+                 c.games_per_generation);
+  SPIEL_CHECK_EQ(searched.games_played.size(), raw.games_played.size());
+  for (size_t i = 0; i < searched.games_played.size(); ++i) {
+    const SearchPiGameOutcome& s = searched.games_played[i];
+    const SearchPiGameOutcome& r = raw.games_played[i];
+    // Pairing: same episode id AND the same measured seat, which is what makes
+    // a per-episode join a controlled contrast rather than a coincidence.
+    SPIEL_CHECK_EQ(s.episode_id, static_cast<int64_t>(i));
+    SPIEL_CHECK_EQ(s.episode_id, r.episode_id);
+    SPIEL_CHECK_EQ(s.searched_seat, r.searched_seat);
+    SPIEL_CHECK_EQ(static_cast<int>(s.returns.size()), game->NumPlayers());
+    SPIEL_CHECK_EQ(static_cast<int>(r.returns.size()), game->NumPlayers());
+    SPIEL_CHECK_GE(s.searched_seat_placement, 1);
+    SPIEL_CHECK_LE(s.searched_seat_placement, 4);
+    SPIEL_CHECK_GE(r.searched_seat_placement, 1);
+    SPIEL_CHECK_LE(r.searched_seat_placement, 4);
+    SPIEL_CHECK_EQ(s.off_scope_simulations, 0);
+    SPIEL_CHECK_EQ(r.off_scope_simulations, 0);
+    SPIEL_CHECK_EQ(r.primary_simulations + r.continuation_simulations, 0);
+    SPIEL_CHECK_EQ(s.primary_simulations,
+                   s.primary_roots * c.primary_simulations);
+    SPIEL_CHECK_EQ(s.continuation_simulations,
+                   s.continuation_roots * c.continuation_simulations);
+    SPIEL_CHECK_GT(s.searched_seat_decisions, 0);
+    SPIEL_CHECK_GT(r.searched_seat_decisions, 0);
+  }
+
+  // The ladder helper both arms read placement through.
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(2.25, 1.0), 1);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(0.25, 1.0), 2);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(-0.75, 1.0), 3);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(-1.75, 1.0), 4);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(0.5625, 4.0), 1);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(-0.4375, 4.0), 4);
+  // Off the ladder is REPORTED as off the ladder, never snapped to a rung: a
+  // return that sits nowhere means the value pipeline changed.
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(1.0, 1.0), 0);
+  SPIEL_CHECK_EQ(SearchPiPlacementFromReturn(2.24, 1.0), 0);
+
+  std::cout << "  searched P/C roots=" << searched.primary.roots_seen << "/"
+            << searched.continuation.roots_seen << " rows=" << searched.rows_total
+            << " | raw P/C roots=" << raw.primary.roots_seen << "/"
+            << raw.continuation.roots_seen << " sims=0\n";
+  std::cout << "Test21 Passed!\n\n";
+}
+
+// --- 22. games_per_generation is a real configuration surface --------------
+//
+// Rung 3b runs 64 games per generation against rung 2's 16. The flag existed
+// before this commit; what did not exist was evidence that anything other than
+// 16 works end to end, and "the default has always been 16" is exactly how a
+// hidden assumption survives to bite a five-generation run.
+//
+// SCOPE, stated rather than implied: this drives 4, 8 and 16 games, NOT 64 --
+// 64 real games is a minutes-long run and does not belong in a unit test. What
+// it establishes is that nothing in the generator is tied to any particular
+// count: the cursor, the episode ids, the seat balance and the per-role budgets
+// all follow games_per_generation. The fingerprint assertion at the end is
+// weaker still and is labelled where it sits.
+void Test22_GamesPerGenerationSurface(const std::shared_ptr<const Game>& game) {
+  std::cout << "Running Test22_GamesPerGenerationSurface...\n";
+  const int num_players = game->NumPlayers();
+  auto ev = std::make_shared<PeakedMockEvaluator>(num_players);
+
+  for (int games : {4, 8, 16}) {
+    SearchPiConfig c = FastConfig();
+    c.games_per_generation = games;
+    c.next_episode_id = 100;  // a nonzero cursor, so the arithmetic is exercised
+    SearchPiGenerator gen(c);
+    std::vector<SearchPiRow> rows;
+    SearchPiGenerationStats st;
+    gen.GenerateGeneration(3, game, ev, &rows, &st);
+
+    SPIEL_CHECK_EQ(st.games, games);
+    SPIEL_CHECK_EQ(st.first_episode_id, 100);
+    SPIEL_CHECK_EQ(st.next_episode_id, 100 + games);
+    SPIEL_CHECK_EQ(gen.config().next_episode_id, 100 + games);
+    SPIEL_CHECK_EQ(static_cast<int>(st.games_played.size()), games);
+
+    // Seat balance, which is the reason the multiple-of-four check exists: every
+    // seat must be the measured one an equal number of times, or a generation
+    // silently over-samples some seats' decision distributions.
+    std::vector<int> seat_counts(num_players, 0);
+    for (int i = 0; i < games; ++i) {
+      SPIEL_CHECK_EQ(st.games_played[i].episode_id, 100 + i);
+      seat_counts[st.games_played[i].searched_seat]++;
+    }
+    for (int p = 0; p < num_players; ++p) {
+      SPIEL_CHECK_EQ(seat_counts[p], games / num_players);
+    }
+    // A larger generation is more rows and more simulations, not a truncation.
+    SPIEL_CHECK_GT(st.rows_total, 0);
+    SPIEL_CHECK_EQ(st.primary.simulations_requested,
+                   st.primary.roots_seen * c.primary_simulations);
+    SPIEL_CHECK_EQ(st.primary.searches_short_of_budget, 0);
+    std::cout << "  games=" << games << " eps[" << st.first_episode_id << ".."
+              << st.next_episode_id << ") rows=" << st.rows_total
+              << " seats balanced at " << (games / num_players) << " each\n";
+  }
+
+  // The fingerprint MOVES with the count, so 3b cannot resume from a rung-2
+  // lineage by accident. Weak evidence and labelled as such: the fingerprint is
+  // a SHA-256 over a string containing "|games=16" versus "|games=64", so this
+  // inequality is close to trivial. It is here to pin the FIELD's presence in
+  // the fingerprint, not to say anything about running 64 games.
+  SearchPiConfig c16 = FastConfig();
+  c16.games_per_generation = 16;
+  SearchPiConfig c64 = c16;
+  c64.games_per_generation = 64;
+  SearchPiLearnerConfig l;
+  SPIEL_CHECK_NE(SearchPiConfigFingerprint(c16, l),
+                 SearchPiConfigFingerprint(c64, l));
+  // And it survives the manifest round trip, so a resume compares the count it
+  // actually ran with.
+  SearchPiState st64;
+  st64.config = c64;
+  st64.learner = l;
+  SearchPiState back;
+  std::string err;
+  SPIEL_CHECK_TRUE(ReadSearchPiState(WriteSearchPiState(st64), &back, &err));
+  SPIEL_CHECK_EQ(back.config.games_per_generation, 64);
+  std::cout << "Test22 Passed!\n\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -1445,6 +1856,9 @@ int main(int argc, char** argv) {
   Test09_AlignmentAndNormalization(game);
   Test11_TerminalValueTargets(game);
   Test15_Reproducibility(game);
+  Test20_EarlyExitClassification(game);
+  Test21_MatchedRawArm(game);
+  Test22_GamesPerGenerationSurface(game);
 
   std::cout << "All dune search-PI tests passed!\n";
   return 0;

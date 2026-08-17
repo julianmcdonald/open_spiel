@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -140,6 +142,90 @@ const char* SearchPiFallbackName(SearchPiFallback reason) {
     case SearchPiFallback::kEmptyPolicy: return "empty_policy";
   }
   return "unknown";
+}
+
+const char* SearchPiEarlyExitName(SearchPiEarlyExit reason) {
+  switch (reason) {
+    case SearchPiEarlyExit::kNone: return "none";
+    case SearchPiEarlyExit::kNoSearchRun: return "no_search_run";
+    case SearchPiEarlyExit::kTimeout: return "timeout";
+    case SearchPiEarlyExit::kMaxNodes: return "max_nodes";
+    case SearchPiEarlyExit::kSingleLegalAction: return "single_legal_action";
+    case SearchPiEarlyExit::kEmptyOrZeroVisits: return "empty_or_zero_visits";
+    case SearchPiEarlyExit::kSessionBudget: return "session_budget";
+    case SearchPiEarlyExit::kUnclassified: return "unclassified";
+  }
+  return "unknown";
+}
+
+SearchPiEarlyExit ClassifySearchPiEarlyExit(
+    const DuneSearchResult& result, const std::vector<Action>& legal_actions,
+    int requested_simulations) {
+  // A session-level clamp is reported first even when the (clamped) budget was
+  // then spent in full: "the session cut this search short" is the cause, and
+  // the count it was cut to is not evidence against it. Inert under
+  // kTrainingPolicyIteration, whose whole point is that the two role budgets are
+  // never drawn from a shared pool -- carried explicitly so that if it ever DOES
+  // fire, it is named rather than silently reclassified as a timeout.
+  const std::string& limit = result.diagnostics.budget_limit_reason;
+  if (!limit.empty() && limit != "none") return SearchPiEarlyExit::kSessionBudget;
+
+  if (requested_simulations <= 0) return SearchPiEarlyExit::kNoSearchRun;
+  if (result.simulations_completed >= requested_simulations) {
+    return SearchPiEarlyExit::kNone;
+  }
+
+  // Short. Name the cause. The loop is `for (; sim < actual_max_sims; ++sim)`
+  // and reports `simulations_completed = sim`, so short is equivalent to "a
+  // break fired, or RunSearch returned before the loop".
+  const std::string& r = result.fallback_reason;
+  if (result.timeout_status || r == "timeout") return SearchPiEarlyExit::kTimeout;
+  if (r == "max_nodes") return SearchPiEarlyExit::kMaxNodes;
+
+  // From here down the bot gave NO cause, so anything we conclude is inferred
+  // from the result's shape. Guard that inference on the reason string actually
+  // being absent: a short search carrying an unrecognised reason must reach
+  // kUnclassified, because kUnclassified means "the instrument does not know"
+  // and an unknown cause is exactly that. Without this guard the
+  // `non_strategic_state` return -- short, unrecognised reason, and a
+  // DEFAULT-CONSTRUCTED diagnostics block whose actions are therefore empty --
+  // would be absorbed into kEmptyOrZeroVisits and read as a known case.
+  // (Unreachable today: SearchPiSearchConfigFor sets check_strategic_state
+  // false. Guarded anyway, because the enum's contract is what makes a zero
+  // unclassified count mean anything.)
+  if (!r.empty() && r != "none") return SearchPiEarlyExit::kUnclassified;
+
+  // Checked AFTER the reason strings because RunSearch's forced-root return
+  // leaves fallback_reason at its "none" default (dune_puct_is_mcts.cc:809-816),
+  // so this case is invisible in the string and would otherwise land in
+  // kUnclassified -- which must mean "the instrument does not know", not "a
+  // known case the instrument forgot to ask about".
+  if (legal_actions.size() <= 1) return SearchPiEarlyExit::kSingleLegalAction;
+  if (result.diagnostics.actions.empty()) {
+    return SearchPiEarlyExit::kEmptyOrZeroVisits;
+  }
+  int64_t total_visits = 0;
+  for (int v : result.diagnostics.visit_counts) total_visits += v;
+  if (total_visits <= 0) return SearchPiEarlyExit::kEmptyOrZeroVisits;
+
+  return SearchPiEarlyExit::kUnclassified;
+}
+
+const char* SearchPiArmName(SearchPiArm arm) {
+  return arm == SearchPiArm::kRawArgmax ? "raw_argmax" : "searched";
+}
+
+int SearchPiPlacementFromReturn(double engine_return, double utility_divisor) {
+  if (!(utility_divisor > 0.0)) return 0;
+  // dune_imperium.cc:2383-2447. Scaled the same way SearchPiRow::value_target
+  // is, so one helper reads a raw return and a value target alike.
+  static const double kLadder[4] = {2.25, 0.25, -0.75, -1.75};
+  for (int k = 0; k < 4; ++k) {
+    if (std::abs(engine_return - kLadder[k] / utility_divisor) < 1e-9) {
+      return k + 1;
+    }
+  }
+  return 0;
 }
 
 const char* SearchPiContinuationTargetName(SearchPiContinuationTarget mode) {
@@ -490,7 +576,8 @@ Player SearchPiGenerator::SearchedSeatForEpisode(int64_t episode_id,
 void SearchPiGenerator::GenerateGeneration(
     int generation, const std::shared_ptr<const Game>& game,
     const std::shared_ptr<algorithms::Evaluator>& evaluator,
-    std::vector<SearchPiRow>* out, SearchPiGenerationStats* stats) {
+    std::vector<SearchPiRow>* out, SearchPiGenerationStats* stats,
+    SearchPiArm arm) {
   SPIEL_CHECK_TRUE(game != nullptr);
   SPIEL_CHECK_TRUE(evaluator != nullptr);
   SPIEL_CHECK_TRUE(out != nullptr);
@@ -512,6 +599,14 @@ void SearchPiGenerator::GenerateGeneration(
   stats->generation = generation;
   stats->games = config_.games_per_generation;
   stats->first_episode_id = first_episode_id;
+  stats->arm = arm;
+  stats->games_played.reserve(config_.games_per_generation);
+
+  // Short searches should be zero; rung 2 saw 29 missing simulations across 14
+  // cells. The cap is generous enough that a real occurrence is fully named and
+  // small enough that a pathological generation cannot bury run.log.
+  constexpr int kMaxShortSearchLogLines = 32;
+  int short_searches_logged = 0;
 
   for (int g = 0; g < config_.games_per_generation; ++g) {
     const int64_t episode_id = first_episode_id + g;
@@ -528,8 +623,19 @@ void SearchPiGenerator::GenerateGeneration(
     DuneSearchConfig scfg = SearchPiSearchConfigFor(
         config_,
         DeriveStream(config_.seed_domain, episode_id, 0, kStreamPiSearchSeed));
+    // The matched control keeps the SESSION and changes only the budget mode.
+    // It is not an optimisation to drop the session: role classification reads
+    // has_active_session() to tell kAgentPrimary from kAgentContinuation
+    // (dune_search_routing.cc:9), and the two roles are exactly the ones this
+    // arm plays differently from the seat's off-scope decisions. Without a
+    // session every agent-turn decision would classify as a primary and the
+    // control would stop being matched. kPolicyOnly returns before the budget
+    // is resolved (dune_search_session.cc:399-401) while the session start,
+    // re-root and commit bookkeeping above it all still run.
     DuneSearchSession session(scfg, evaluator,
-                              DuneSearchBudgetMode::kTrainingPolicyIteration);
+                              arm == SearchPiArm::kRawArgmax
+                                  ? DuneSearchBudgetMode::kPolicyOnly
+                                  : DuneSearchBudgetMode::kTrainingPolicyIteration);
     session.SetEpisodeId(static_cast<int>(episode_id));
     session.SetUpdateId(generation);
 
@@ -537,6 +643,10 @@ void SearchPiGenerator::GenerateGeneration(
     std::vector<size_t> emitted_indices;
     int64_t decision_index = 0;
     int64_t chance_index = 0;
+
+    SearchPiGameOutcome outcome;
+    outcome.episode_id = episode_id;
+    outcome.searched_seat = searched_seat;
 
     while (!state->IsTerminal()) {
       if (state->IsChanceNode()) {
@@ -574,9 +684,13 @@ void SearchPiGenerator::GenerateGeneration(
           ClassifyDuneDecisionRole(*state, cur, session.HasActiveSession());
       const int role_idx = static_cast<int>(role);
       stats->decisions_by_role[role_idx]++;
+      outcome.searched_seat_decisions++;
 
       DuneSearchResult res = session.Search(*state);
       stats->simulations_by_role[role_idx] += res.simulations_completed;
+      if (!IsSearchPiSearchRole(role)) {
+        outcome.off_scope_simulations += res.simulations_completed;
+      }
       stats->inference_calls += res.inference_count;
 
       const bool is_search_role = IsSearchPiSearchRole(role);
@@ -591,11 +705,110 @@ void SearchPiGenerator::GenerateGeneration(
       if (is_search_role) {
         SPIEL_CHECK_TRUE(rs != nullptr);
         rs->roots_seen++;
+        if (role == DuneDecisionRole::kAgentPrimary) {
+          outcome.primary_roots++;
+          outcome.primary_simulations += res.simulations_completed;
+        } else {
+          outcome.continuation_roots++;
+          outcome.continuation_simulations += res.simulations_completed;
+        }
+      }
+
+      if (is_search_role && arm == SearchPiArm::kRawArgmax) {
+        // The matched control. kPolicyOnly returned the frozen network's own
+        // prior with no simulation spent, so there is no search result to
+        // classify, no target to build and no row to emit -- the arm exists to
+        // measure a controller, not to teach one. `chosen` is left invalid on
+        // purpose: the shared path below plays the raw-prior ARGMAX for a
+        // searched role, which is exactly the one behaviour this arm changes.
+        //
+        // Recorded as an early exit rather than as a fallback: a fallback is a
+        // technical failure of a search that ran, and no search ran here.
+        rs->early_exit_counts[
+            static_cast<int>(SearchPiEarlyExit::kNoSearchRun)]++;
+      } else if (is_search_role) {
         rs->searches_run++;
         rs->simulations_completed += res.simulations_completed;
         rs->inherited_visits += res.diagnostics.inherited_root_visits;
         if (res.diagnostics.re_root_status == "hit") rs->re_root_hits++;
         if (res.diagnostics.re_root_status == "miss") rs->re_root_misses++;
+
+        // --- Early-exit accounting, BEFORE the fallback classification ---
+        //
+        // Deliberately covers every searched root, including the ones that go
+        // on to fall back: a search that was BOTH truncated and unusable is two
+        // facts, and folding it into the fallback count loses the first one.
+        // The requested count comes from the session's own soft_sim_limit, so
+        // this arithmetic cannot agree with itself by construction.
+        const int requested = res.diagnostics.soft_sim_limit;
+        const SearchPiEarlyExit early_exit =
+            ClassifySearchPiEarlyExit(res, legal_actions, requested);
+        rs->simulations_requested += requested;
+        rs->early_exit_counts[static_cast<int>(early_exit)]++;
+
+        // Deadline headroom. A zero shortfall says the wall-clock guard did not
+        // fire; these say by how much, which is what distinguishes "it held" from
+        // "it holds". The configured limit is read back from the session rather
+        // than assumed, so the margin is against the deadline actually in force.
+        const double elapsed = res.diagnostics.elapsed_search_time_ms;
+        rs->sum_search_elapsed_ms += elapsed;
+        if (elapsed > rs->max_search_elapsed_ms) {
+          rs->max_search_elapsed_ms = elapsed;
+        }
+        rs->configured_time_limit_ms = res.diagnostics.soft_time_limit_ms;
+
+        if (res.simulations_completed < requested) {
+          rs->searches_short_of_budget++;
+          rs->simulation_shortfall += requested - res.simulations_completed;
+          outcome.searches_short_of_budget++;
+          if (rs->first_short_episode_id < 0) {
+            rs->first_short_episode_id = episode_id;
+            rs->first_short_decision_id = this_decision;
+            rs->first_short_simulations_completed = res.simulations_completed;
+            rs->first_short_simulations_requested = requested;
+            rs->first_short_bot_reason = res.fallback_reason;
+            rs->first_short_session_reason = res.diagnostics.budget_limit_reason;
+          }
+          // One line per short search, capped, so a forensic run NAMES the root
+          // in its own run.log instead of leaving the aggregate to be divided
+          // by an assumed per-root budget. The cap exists because the aggregate
+          // is already in telemetry; this is the attribution, not the count.
+          //
+          // Built as ONE string under a lock and emitted in a single insertion.
+          // Chained operator<< synchronises each field separately, so on the
+          // multi-threaded audit path the fields of concurrent lines interleave
+          // -- and a line whose entire purpose is to name one root is worth
+          // nothing shuffled with another root's.
+          if (short_searches_logged < kMaxShortSearchLogLines) {
+            ++short_searches_logged;
+            std::ostringstream line;
+            line << "[search-PI] SHORT SEARCH gen=" << generation
+                 << " episode=" << episode_id
+                 << " decision=" << this_decision
+                 << " role=" << static_cast<int>(role)
+                 << " sims=" << res.simulations_completed << "/" << requested
+                 << " early_exit=" << SearchPiEarlyExitName(early_exit)
+                 << " bot_reason=" << res.fallback_reason
+                 << " session_reason=" << res.diagnostics.budget_limit_reason
+                 << " elapsed_ms=" << elapsed
+                 << " time_limit_ms=" << res.diagnostics.soft_time_limit_ms
+                 << " tree_nodes=" << res.diagnostics.tree_node_count
+                 << " legal=" << legal_actions.size()
+                 << " inherited=" << res.diagnostics.inherited_root_visits
+                 << " re_root=" << res.diagnostics.re_root_status << "\n";
+            static std::mutex short_log_mutex;
+            std::lock_guard<std::mutex> lk(short_log_mutex);
+            std::cout << line.str() << std::flush;
+          } else if (short_searches_logged == kMaxShortSearchLogLines) {
+            ++short_searches_logged;
+            static std::mutex cap_log_mutex;
+            std::lock_guard<std::mutex> lk(cap_log_mutex);
+            std::cout << "[search-PI] SHORT SEARCH log capped at "
+                      << kMaxShortSearchLogLines
+                      << " lines; the per-role totals in the telemetry sidecar "
+                         "carry the rest.\n" << std::flush;
+          }
+        }
 
         fallback = ClassifySearchPiResult(res, legal_actions);
 
@@ -649,6 +862,8 @@ void SearchPiGenerator::GenerateGeneration(
           row.episode_id = episode_id;
           row.decision_id = static_cast<int>(this_decision);
           row.simulations_completed = res.simulations_completed;
+          row.simulations_requested = requested;
+          row.early_exit = early_exit;
           row.inherited_root_visits = res.diagnostics.inherited_root_visits;
           row.retention_snapshots_valid =
               res.diagnostics.retention_snapshots_valid;
@@ -687,11 +902,13 @@ void SearchPiGenerator::GenerateGeneration(
           emitted_indices.push_back(out->size());
           out->push_back(std::move(row));
           rs->rows_emitted++;
+          outcome.rows_emitted++;
           if (role == DuneDecisionRole::kLeaderSelection) {
             stats->leader_rows_emitted++;  // structurally unreachable
           }
         } else {
           rs->fallbacks++;
+          outcome.fallbacks++;
         }
       }
 
@@ -736,6 +953,17 @@ void SearchPiGenerator::GenerateGeneration(
       row.value_target = returns[row.player] / config_.utility_divisor;
       row.value_target_attached = true;
     }
+
+    // The same Returns() the value targets come from, kept per game so a paired
+    // strength test has something to join on. Placement is read off the ladder
+    // at divisor 1.0 because these are raw returns, not scaled targets.
+    outcome.returns = returns;
+    SPIEL_CHECK_GE(searched_seat, 0);
+    SPIEL_CHECK_LT(searched_seat, static_cast<int>(returns.size()));
+    outcome.searched_seat_return = returns[searched_seat];
+    outcome.searched_seat_placement =
+        SearchPiPlacementFromReturn(outcome.searched_seat_return, 1.0);
+    stats->games_played.push_back(std::move(outcome));
   }
 
   config_.next_episode_id = first_episode_id + config_.games_per_generation;
@@ -1535,6 +1763,20 @@ std::string SearchPiTelemetryPath(const std::string& diagnostics_path) {
 
 namespace {
 
+// A JSON string literal with the two characters that would break the sidecar
+// escaped. The reason strings are a fixed identifier set today; a future one
+// carrying a quote would otherwise emit a line no parser can read, and a
+// telemetry file that cannot be parsed is a lost measurement.
+std::string JsonQuoted(const std::string& s) {
+  std::string out = "\"";
+  for (char c : s) {
+    if (c == '"' || c == '\\') out += '\\';
+    out += c;
+  }
+  out += '"';
+  return out;
+}
+
 void EmitRole(std::ostream& os, const char* prefix,
               const SearchPiRoleStats& r) {
   // A role with no rows emits its means as null, not 0: "no rows this
@@ -1561,7 +1803,53 @@ void EmitRole(std::ostream& os, const char* prefix,
      << ",\"" << prefix << "_mean_kl_target_given_raw\":"
      << mean(r.sum_kl_target_given_raw)
      << ",\"" << prefix << "_target_argmax_overrides\":"
-     << r.target_argmax_overrides;
+     << r.target_argmax_overrides
+     // --- Early exits. `simulations_requested` is what the session asked for,
+     // so `_simulation_shortfall` is a subtraction and not a comparison against
+     // an assumed per-root budget. A truncated search used to emit a normal row
+     // and report nothing; these fields are what it now announces.
+     << ",\"" << prefix << "_simulations_requested\":" << r.simulations_requested
+     << ",\"" << prefix << "_searches_short_of_budget\":"
+     << r.searches_short_of_budget
+     << ",\"" << prefix << "_simulation_shortfall\":" << r.simulation_shortfall;
+  for (int i = 0; i < kSearchPiEarlyExitCount; ++i) {
+    os << ",\"" << prefix << "_early_exit_"
+       << SearchPiEarlyExitName(static_cast<SearchPiEarlyExit>(i)) << "\":"
+       << r.early_exit_counts[i];
+  }
+  // The first short search, NAMED. null rather than a sentinel when none
+  // occurred: -1 for an episode id reads as data, and "there was no such root"
+  // is not a root at index -1.
+  // Deadline headroom beside the shortfall: a run that spent its budget with
+  // 200 ms to spare and one that spent it with 7,000 ms to spare report the
+  // same zero, and only the second says the guard is not about to fire.
+  os << ",\"" << prefix << "_max_search_elapsed_ms\":"
+     << F17Json(r.max_search_elapsed_ms)
+     << ",\"" << prefix << "_mean_search_elapsed_ms\":"
+     << (r.searches_run > 0
+             ? F17Json(r.sum_search_elapsed_ms /
+                       static_cast<double>(r.searches_run))
+             : std::string("null"))
+     << ",\"" << prefix << "_configured_time_limit_ms\":"
+     << F17Json(r.configured_time_limit_ms);
+
+  const bool short_seen = r.first_short_episode_id >= 0;
+  auto or_null = [&](int64_t v) -> std::string {
+    return short_seen ? absl::StrCat(v) : std::string("null");
+  };
+  os << ",\"" << prefix << "_first_short_episode_id\":"
+     << or_null(r.first_short_episode_id)
+     << ",\"" << prefix << "_first_short_decision_id\":"
+     << or_null(r.first_short_decision_id)
+     << ",\"" << prefix << "_first_short_simulations_completed\":"
+     << or_null(r.first_short_simulations_completed)
+     << ",\"" << prefix << "_first_short_simulations_requested\":"
+     << or_null(r.first_short_simulations_requested)
+     << ",\"" << prefix << "_first_short_bot_reason\":"
+     << (short_seen ? JsonQuoted(r.first_short_bot_reason) : std::string("null"))
+     << ",\"" << prefix << "_first_short_session_reason\":"
+     << (short_seen ? JsonQuoted(r.first_short_session_reason)
+                    : std::string("null"));
 }
 
 }  // namespace
