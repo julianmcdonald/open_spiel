@@ -511,9 +511,26 @@ struct SearchPiGenerationStats {
   SearchPiRoleStats primary;
   SearchPiRoleStats continuation;
 
+  // The WIDE teacher's three additional roles, each with its own full role
+  // stats rather than a null bucket.
+  //
+  // These exist because the alternative was silence. Before them, a search at
+  // kPurchase / kCombatIntrigue / kOtherOptional had `rs == nullptr`, so its
+  // simulations_requested, searches_short_of_budget, early-exit classes and
+  // fallbacks were all skipped -- meaning a wide-role search that completed 1
+  // of 64 simulations incremented nothing, failed no invariant, and could not
+  // fire --fail_on_short_search. The exact-budget invariant is the gate that
+  // protects this audit, and an invariant that cannot see two thirds of the
+  // wide teacher's roots is not a gate. Structurally zero for the narrow
+  // teacher, which is asserted.
+  SearchPiRoleStats purchase;
+  SearchPiRoleStats combat_intrigue;
+  SearchPiRoleStats other_optional;
+
   // Zero-simulation proof for every role this lane must not search. Indexed by
-  // DuneDecisionRole. A nonzero entry outside primary/continuation is a bug,
-  // and the tests assert it is zero.
+  // DuneDecisionRole. Which entries are legitimately nonzero is now
+  // SCOPE-DEPENDENT: narrow searches {2,3} only, wide searches {2,3,4,5,6},
+  // and {0,1} are structurally zero in both.
   int64_t simulations_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
   int64_t decisions_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
 
@@ -655,9 +672,35 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
                                          uint64_t search_seed);
 
 // Is this a role the lane searches?
-inline bool IsSearchPiSearchRole(DuneDecisionRole role) {
-  return role == DuneDecisionRole::kAgentPrimary ||
-         role == DuneDecisionRole::kAgentContinuation;
+// SCOPE-CONDITIONAL. Agent turns are always searched; the three short-window
+// roles are searched exactly when the wide teacher's budget is armed.
+//
+// This predicate does far more than name a role, which is why it is the one
+// place the scope axis is decided. It gates, in SearchPiGenerator: whether the
+// searched action is PLAYED at all, whether the raw control plays argmax or a
+// T=1 sample, whether a row is emitted, and whether role stats are recorded.
+//
+// It was previously hard-coded to agent turns, and `purchase_combat_budget`
+// only reached DuneSearchSession. The result was a wide teacher that ran its
+// simulations and then DISCARDED them: `chosen` stayed invalid, so the generic
+// tail played SampleRawPolicyAction and the search survived only as
+// `mcts_proposed_action`, recorded and never played. A wide arm would have
+// played the narrow arm's actions at a 1.392x compute bill, and no test,
+// invariant or analyzer check could have detected it.
+//
+// The default of 0 is the narrow teacher, so every existing caller keeps
+// agent-turn-only semantics bit-for-bit and the recorded parity chains stay
+// valid references.
+inline bool IsSearchPiSearchRole(DuneDecisionRole role,
+                                 int purchase_combat_budget = 0) {
+  if (role == DuneDecisionRole::kAgentPrimary ||
+      role == DuneDecisionRole::kAgentContinuation) {
+    return true;
+  }
+  if (purchase_combat_budget <= 0) return false;
+  return role == DuneDecisionRole::kPurchase ||
+         role == DuneDecisionRole::kCombatIntrigue ||
+         role == DuneDecisionRole::kOtherOptional;
 }
 
 // Classify a completed search as usable or a specific technical failure.

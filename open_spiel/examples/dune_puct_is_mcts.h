@@ -83,6 +83,23 @@ struct DuneSearchConfig {
   // Session calibration parameters
   int fixed_continuation_reserve = 0;
   int purchase_combat_budget = 16;
+  // EXACT PER-ROOT budgets at the three short-window roles (kPurchase,
+  // kCombatIntrigue, kOtherOptional). Default false = the historical
+  // interactive behaviour, unchanged for every existing consumer.
+  //
+  // The historical behaviour is a POOL, not a per-root budget: short_sims_
+  // completed_ resets only when the short-window ROLE changes, so consecutive
+  // roots of the same role share one purchase_combat_budget and the second gets
+  // max_sims = budget - budget = 0. It is also capped by a hard-coded 500 ms
+  // window rather than relative_time_budget_ms. Both are right for a live
+  // interactive session, where the budget is a latency allowance.
+  //
+  // They are wrong for an AUDIT, which needs an exact-simulation teacher: a
+  // registered "64 simulations at every in-scope root" cannot be delivered by a
+  // shared pool under a 500 ms wall, and the shortfall would not even be
+  // counted. When true: every in-scope root gets its full budget, and the only
+  // time authority is relative_time_budget_ms.
+  bool exact_short_window_budgets = false;
   double live_continuation_reserve_seconds = 0.0;
   int fixed_session_limit = 200;
   std::string model_checkpoint_path = "";

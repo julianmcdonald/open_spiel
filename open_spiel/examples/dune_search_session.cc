@@ -228,7 +228,17 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
                                role == DuneDecisionRole::kCombatIntrigue ||
                                role == DuneDecisionRole::kOtherOptional);
   if (is_short_window_role) {
-    if (last_role_ != role) {
+    // Under exact per-root budgets the pool resets at EVERY in-scope root, not
+    // only when the role changes -- otherwise two consecutive roots of the same
+    // short-window role share one budget and the second receives zero.
+    // The extra condition is deliberately ALSO gated on the budget being armed.
+    // With a zero budget these roles return policy-only immediately below, so
+    // resetting more often could only differ by a side effect of
+    // short_bot_->Reset() -- and the narrow teacher must stay bit-identical for
+    // the recorded parity chains to remain references.
+    if (last_role_ != role ||
+        (config_.exact_short_window_budgets &&
+         config_.purchase_combat_budget > 0)) {
       short_bot_->Reset();
       short_window_start_time_ = std::chrono::steady_clock::now();
       short_sims_completed_ = 0;
@@ -380,9 +390,18 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
 
     auto now = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - short_window_start_time_).count();
-    max_time_ms = (config_.relative_time_budget_ms == std::numeric_limits<double>::infinity())
-        ? std::numeric_limits<double>::infinity()
-        : (500.0 - elapsed_ms);
+    if (config_.exact_short_window_budgets) {
+      // The registered watchdog is the ONLY time authority. The 500 ms window
+      // below is a latency allowance for a live session; against an audit's
+      // 64-simulation root it is a truncation nobody asked for and, because
+      // these roles report through no role-stats bucket in the caller, one
+      // nobody would see.
+      max_time_ms = config_.relative_time_budget_ms;
+    } else {
+      max_time_ms = (config_.relative_time_budget_ms == std::numeric_limits<double>::infinity())
+          ? std::numeric_limits<double>::infinity()
+          : (500.0 - elapsed_ms);
+    }
 
     if (max_sims <= 0 || max_time_ms <= 0.0) {
       // Budget exhausted for this short window (e.g. the primary decision

@@ -215,6 +215,10 @@ struct ArmResult {
   std::vector<SearchPiGameOutcome> games;
   SearchPiRoleStats primary;
   SearchPiRoleStats continuation;
+  // The wide teacher's three roles. Zero for a narrow arm, by construction.
+  SearchPiRoleStats purchase;
+  SearchPiRoleStats combat_intrigue;
+  SearchPiRoleStats other_optional;
   int64_t simulations_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
   int64_t decisions_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
   int64_t leader_rows_emitted = 0;
@@ -622,6 +626,9 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
     const SearchPiGenerationStats& s = chunk_stats[ci];
     MergeRole(&r.primary, s.primary);
     MergeRole(&r.continuation, s.continuation);
+    MergeRole(&r.purchase, s.purchase);
+    MergeRole(&r.combat_intrigue, s.combat_intrigue);
+    MergeRole(&r.other_optional, s.other_optional);
     for (int i = 0; i < 7; ++i) {
       r.simulations_by_role[i] += s.simulations_by_role[i];
       r.decisions_by_role[i] += s.decisions_by_role[i];
@@ -749,6 +756,14 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      << ",\"first_place_rate\":" << F17(static_cast<double>(place[1]) / n);
   EmitRoleJson(os, "primary", r.primary);
   EmitRoleJson(os, "continuation", r.continuation);
+  // The wide teacher's three roles, emitted for EVERY arm. All-zero blocks in a
+  // narrow arm are the evidence that narrow searched nothing there; without
+  // them the analyzer could only infer scope from sims_role_N, which cannot
+  // distinguish a correctly-narrow arm from a wide arm whose searches silently
+  // did nothing -- the exact defect the 2026-08-18 review found.
+  EmitRoleJson(os, "purchase", r.purchase);
+  EmitRoleJson(os, "combat_intrigue", r.combat_intrigue);
+  EmitRoleJson(os, "other_optional", r.other_optional);
   for (int i = 0; i < 7; ++i) {
     os << ",\"sims_role_" << i << "\":" << r.simulations_by_role[i]
        << ",\"decisions_role_" << i << "\":" << r.decisions_by_role[i];
@@ -818,12 +833,34 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
     ok = false;
   };
 
-  // Scope, both arms: five of the seven roles run zero simulations
-  // STRUCTURALLY, and the searched roles are indices 2 and 3.
-  for (int i : {0, 1, 4, 5, 6}) {
+  // Scope, ARM-CONDITIONAL. Which roles may legitimately run simulations is a
+  // property of the teacher under test, so a single hard-coded set cannot gate
+  // both. Narrow searches {2,3} and must be structurally zero at {0,1,4,5,6};
+  // wide searches {2,3,4,5,6} and must be structurally zero at {0,1}. Leader
+  // selection and forced/bookkeeping are never searched by either.
+  //
+  // The previous unconditional {0,1,4,5,6} check would have hard-failed EVERY
+  // wide run -- the arm is registered to search exactly the roles it forbade.
+  const int pcb = absl::GetFlag(FLAGS_search_pi_purchase_combat_budget);
+  const bool wide_scope = pcb > 0;
+  for (int i : (wide_scope ? std::vector<int>{0, 1}
+                           : std::vector<int>{0, 1, 4, 5, 6})) {
     if (r.simulations_by_role[i] != 0) {
       fail(absl::StrCat("off-scope role ", i, " ran ", r.simulations_by_role[i],
                         " simulations"));
+    }
+  }
+  // And the converse, which is the check that would have caught the defect the
+  // review found: a wide arm that runs ZERO simulations at a role it is
+  // registered to search is a null arm wearing a wide label. Only asserted for
+  // the searched arm -- the wide-matched raw control legitimately runs zero
+  // everywhere, and is checked by the arm-consistency gate instead.
+  if (wide_scope && r.arm == SearchPiArm::kSearched) {
+    for (int i : {4, 5, 6}) {
+      if (r.decisions_by_role[i] > 0 && r.simulations_by_role[i] == 0) {
+        fail(absl::StrCat("wide arm saw ", r.decisions_by_role[i], " role-", i,
+                          " decisions and ran ZERO simulations at it"));
+      }
     }
   }
   if (r.leader_rows_emitted != 0) fail("Leader rows were emitted");

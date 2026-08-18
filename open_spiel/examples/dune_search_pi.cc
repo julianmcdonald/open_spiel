@@ -294,6 +294,12 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   // not part of the scope axis under test, and SearchPiGenerator's constructor
   // fatals if it is ever true here.
   cfg.purchase_combat_budget = config.purchase_combat_budget;
+  // This lane is an AUDIT of an exact-simulation teacher, so the short-window
+  // roles get exact per-root budgets under the registered watchdog rather than
+  // a shared pool under a hard-coded 500 ms wall. Inert for the narrow teacher,
+  // whose budget is 0 and whose short-window roles return policy-only before
+  // any budget is resolved.
+  cfg.exact_short_window_budgets = true;
   cfg.fixed_continuation_reserve = 0;
   cfg.search_leader_draft = false;
   cfg.leader_mass_only_coverage = false;
@@ -703,15 +709,23 @@ void SearchPiGenerator::GenerateGeneration(
 
       DuneSearchResult res = session.Search(*state);
       stats->simulations_by_role[role_idx] += res.simulations_completed;
-      if (!IsSearchPiSearchRole(role)) {
+      if (!IsSearchPiSearchRole(role, config_.purchase_combat_budget)) {
         outcome.off_scope_simulations += res.simulations_completed;
       }
       stats->inference_calls += res.inference_count;
 
-      const bool is_search_role = IsSearchPiSearchRole(role);
+      const bool is_search_role =
+          IsSearchPiSearchRole(role, config_.purchase_combat_budget);
+      // Every searched role now has a real bucket. The three short-window roles
+      // resolve to their own stats only when the wide budget is armed; with the
+      // narrow default IsSearchPiSearchRole is false for them, is_search_role
+      // gates every use below, and these buckets stay untouched at zero.
       SearchPiRoleStats* rs =
-          role == DuneDecisionRole::kAgentPrimary      ? &stats->primary
+          role == DuneDecisionRole::kAgentPrimary        ? &stats->primary
           : role == DuneDecisionRole::kAgentContinuation ? &stats->continuation
+          : role == DuneDecisionRole::kPurchase          ? &stats->purchase
+          : role == DuneDecisionRole::kCombatIntrigue    ? &stats->combat_intrigue
+          : role == DuneDecisionRole::kOtherOptional     ? &stats->other_optional
                                                          : nullptr;
 
       Action chosen = kInvalidAction;

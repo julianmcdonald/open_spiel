@@ -1888,6 +1888,95 @@ void Test23_ScopeAndWatchdogSurface() {
   std::cout << "Test23 Passed!\n\n";
 }
 
+// The WIDE teacher actually searches AND PLAYS its three extra roles, at an
+// EXACT per-root dose, with real telemetry -- and narrow is untouched.
+//
+// One test per defect the 2026-08-18 review found, because all three were
+// invisible: the wide arm ran its simulations and discarded them, the dose was
+// a shared pool under a hard-coded 500 ms wall, and neither degradation
+// incremented any counter. A wide arm would have played the narrow arm's moves
+// at a 1.392x compute bill and passed every gate that existed.
+void Test24_WideScopeIsSearchedPlayedAndCounted(
+    const std::shared_ptr<const open_spiel::Game>& game) {
+  std::cout << "Running Test24_WideScopeIsSearchedPlayedAndCounted...\n";
+  using namespace open_spiel;
+  const int kWide = 6;  // small but >1, so the per-root/pooled distinction bites
+
+  auto run = [&](int budget, std::vector<SearchPiRow>* rows,
+                 SearchPiGenerationStats* st) {
+    SearchPiConfig c = FastConfig();
+    c.purchase_combat_budget = budget;
+    c.next_episode_id = 700000;
+    SearchPiGenerator gen(c);
+    auto ev = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+    gen.GenerateGeneration(1, game, ev, rows, st, SearchPiArm::kSearched);
+  };
+
+  std::vector<SearchPiRow> nrows, wrows;
+  SearchPiGenerationStats nst, wst;
+  run(0, &nrows, &nst);        // narrow
+  run(kWide, &wrows, &wst);    // wide
+
+  // DEFECT 3 -- the three roles now have real buckets, not a null pointer.
+  // DEFECT 2 -- the dose is EXACT and PER ROOT. Under the old shared pool the
+  // second consecutive root of a role received budget-budget = 0, so
+  // completed would fall strictly below roots x budget. kOtherOptional is the
+  // frequent one (~25/game) and is where consecutive roots actually occur.
+  const SearchPiRoleStats* wide_buckets[3] = {&wst.purchase, &wst.combat_intrigue,
+                                              &wst.other_optional};
+  int64_t total_wide_roots = 0;
+  for (const SearchPiRoleStats* b : wide_buckets) {
+    total_wide_roots += b->roots_seen;
+    SPIEL_CHECK_EQ(b->simulations_requested, b->roots_seen * kWide);
+    SPIEL_CHECK_EQ(b->simulations_completed, b->roots_seen * kWide);
+    SPIEL_CHECK_EQ(b->searches_short_of_budget, 0);
+    SPIEL_CHECK_EQ(b->fallbacks, 0);
+  }
+  SPIEL_CHECK_GT(total_wide_roots, 0);
+  // At least one role must have had MORE roots than games, which is what makes
+  // the per-root assertion above a real test of the pooling defect rather than
+  // a coincidence of one-root-per-role.
+  SPIEL_CHECK_GT(wst.other_optional.roots_seen, wst.games);
+
+  // DEFECT 1 -- the searched action is PLAYED. If the wide arm discarded its
+  // searches (the defect) it would play exactly the narrow arm's actions from
+  // the same seeds, so the trajectories would coincide. They must not.
+  bool any_outcome_differs = false;
+  SPIEL_CHECK_EQ(nst.games_played.size(), wst.games_played.size());
+  for (size_t i = 0; i < wst.games_played.size(); ++i) {
+    SPIEL_CHECK_EQ(nst.games_played[i].episode_id, wst.games_played[i].episode_id);
+    if (nst.games_played[i].returns != wst.games_played[i].returns) {
+      any_outcome_differs = true;
+    }
+  }
+  SPIEL_CHECK_TRUE(any_outcome_differs);
+
+  // NARROW IS UNTOUCHED: zero roots, zero simulations, zero rows at all three.
+  SPIEL_CHECK_EQ(nst.purchase.roots_seen, 0);
+  SPIEL_CHECK_EQ(nst.combat_intrigue.roots_seen, 0);
+  SPIEL_CHECK_EQ(nst.other_optional.roots_seen, 0);
+  for (int r : {4, 5, 6}) SPIEL_CHECK_EQ(nst.simulations_by_role[r], 0);
+  // ...and the wide arm is structurally zero exactly where BOTH must be.
+  for (int r : {0, 1}) {
+    SPIEL_CHECK_EQ(nst.simulations_by_role[r], 0);
+    SPIEL_CHECK_EQ(wst.simulations_by_role[r], 0);
+  }
+  SPIEL_CHECK_EQ(wst.leader_rows_emitted, 0);
+
+  // The predicate itself, both directions.
+  SPIEL_CHECK_FALSE(IsSearchPiSearchRole(DuneDecisionRole::kPurchase, 0));
+  SPIEL_CHECK_TRUE(IsSearchPiSearchRole(DuneDecisionRole::kPurchase, 64));
+  SPIEL_CHECK_TRUE(IsSearchPiSearchRole(DuneDecisionRole::kAgentPrimary, 0));
+  SPIEL_CHECK_FALSE(IsSearchPiSearchRole(DuneDecisionRole::kLeaderSelection, 64));
+  SPIEL_CHECK_FALSE(IsSearchPiSearchRole(DuneDecisionRole::kForcedOrBookkeeping, 64));
+
+  std::cout << "  wide roots P/C/O = " << wst.purchase.roots_seen << "/"
+            << wst.combat_intrigue.roots_seen << "/"
+            << wst.other_optional.roots_seen << " all at exactly " << kWide
+            << " sims; trajectories diverge from narrow\n";
+  std::cout << "Test24 Passed!\n\n";
+}
+
 int main(int argc, char** argv) {
   using namespace open_spiel;
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -1917,6 +2006,7 @@ int main(int argc, char** argv) {
   Test20_EarlyExitClassification(game);
   Test21_MatchedRawArm(game);
   Test22_GamesPerGenerationSurface(game);
+  Test24_WideScopeIsSearchedPlayedAndCounted(game);
 
   std::cout << "All dune search-PI tests passed!\n";
   return 0;
