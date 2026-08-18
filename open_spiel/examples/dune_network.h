@@ -744,6 +744,16 @@ public:
         const std::vector<std::vector<float>>& observations) override {
         std::vector<EvalResult> results(observations.size());
         if (observations.empty()) return results;
+        // A logical leaf group larger than the configured physical target used
+        // to be admitted whole. That silently violated max-batch provenance and
+        // became unsafe once the trainer joined the audit as a general
+        // production consumer. Reject it in the class that owns the contract.
+        if (observations.size() > static_cast<size_t>(target_batch_size_)) {
+            SpielFatalError("BatchedEvaluator::EvaluateBatch group size " +
+                            std::to_string(observations.size()) +
+                            " exceeds configured target " +
+                            std::to_string(target_batch_size_));
+        }
         for (const auto& obs : observations) {
             CheckEvalObsSize(obs.size(), model_input_dim_);
         }
@@ -998,10 +1008,8 @@ private:
                 // dependent kernels could otherwise give the four players in
                 // one leaf slightly different numerical contexts. Back off to
                 // the start of the boundary group. (A group larger than the
-                // configured target is admitted whole to guarantee progress;
-                // the Search-PI caller's group size is four and its validated
-                // target is at least four, so that fallback is unreachable in
-                // this lane.)
+                // configured target is rejected by EvaluateBatch() before it
+                // reaches this queue.)
                 size_t actual_batch =
                     std::min((size_t)target_batch_size_, requests_.size());
                 if (actual_batch > 0 && actual_batch < requests_.size() &&

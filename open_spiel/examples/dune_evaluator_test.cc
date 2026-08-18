@@ -67,6 +67,30 @@ bool EvalRejectsObsSize(
   return threw;
 }
 
+// The group-cap guard must fire synchronously in the caller, before any rows
+// are queued. A throwing handler makes that fatal contract observable here.
+bool BatchRejectsOversizedGroup(
+    std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model,
+    torch::Device device, int target, int group_size, int64_t obs_len) {
+  std::shared_mutex sync_mutex;
+  open_spiel::BatchedEvaluator be(model, target, /*timeout_ms=*/5, device,
+                                  &sync_mutex);
+  std::vector<std::vector<float>> observations(
+      static_cast<size_t>(group_size),
+      std::vector<float>(static_cast<size_t>(obs_len), 0.5f));
+  bool threw = false;
+  open_spiel::SetErrorHandler(
+      [](const std::string& msg) { throw std::runtime_error(msg); });
+  try {
+    (void)be.EvaluateBatch(observations);
+  } catch (const std::exception& e) {
+    threw = std::string(e.what()).find("exceeds configured target") !=
+            std::string::npos;
+  }
+  open_spiel::SetErrorHandler(ExitingErrorHandler);
+  return threw;
+}
+
 int main(int argc, char* argv[]) {
   std::string checkpoint_path = "";
   for (int i = 1; i < argc; ++i) {
@@ -682,6 +706,24 @@ int main(int argc, char* argv[]) {
     assert(t.leaf_groups_split == 0);
     std::cout << "  rows=6 batches=2 max=4 split=0\n";
     std::cout << "Test 11 Passed!\n\n";
+  }
+
+  // Test 12: one logical group larger than the physical target is invalid.
+  // It cannot be made whole by the runner and must never be admitted and
+  // silently split across forwards.
+  {
+    std::cout << "=== Test 12: oversized leaf group is rejected ===\n";
+    const int64_t kObs = 16;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kObs, /*hidden_dim=*/8, /*action_dim=*/4, /*num_blocks=*/1);
+    model->eval();
+    torch::Device cpu(torch::kCPU);
+    model->to(cpu);
+    assert(!BatchRejectsOversizedGroup(model, cpu, /*target=*/4,
+                                       /*group_size=*/4, kObs));
+    assert(BatchRejectsOversizedGroup(model, cpu, /*target=*/4,
+                                      /*group_size=*/5, kObs));
+    std::cout << "Test 12 Passed!\n\n";
   }
 
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";

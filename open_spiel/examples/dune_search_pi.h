@@ -185,6 +185,20 @@ struct SearchPiConfig {
   int games_per_generation = 16;   // multiple of 4 (seat balance)
   int64_t next_episode_id = 0;     // persisted cursor, advanced per generation
 
+  // Production collection geometry. Older schema versions reconstruct these
+  // as their historical serial values; schema v3 fingerprints every field.
+  int collection_games_per_generation = 16;
+  int training_games_per_generation = 16;
+  int concurrent_workers = 1;
+  int batch_target = 0;
+  int batcher_timeout_ms = 2;
+  int chunk_games = 4;
+  int warmup_games = 0;
+  int max_filler_timeout_episodes = 0;
+  std::string subset_rule = "episode_id_prefix";
+  std::string frozen_collector_sha256;
+  std::string frozen_collector_digest;
+
   // --- Training-only search budget. Independent, NOT a shared session pool. ---
   // PF-C ran a uniform cold 64 sims at every root and built a FRESH session per
   // root, so nothing was ever reused. Here one persistent session spans a
@@ -502,6 +516,15 @@ struct SearchPiGameOutcome {
   // timeout-before-useful-search only on a discarded episode without allowing
   // an unrelated technical fallback to hide beside it.
   int64_t watchdog_fallbacks = 0;
+  // Every root whose independently classified early exit was the named
+  // wall-clock timeout, including a truncated search that still produced a
+  // usable row. Training's D2 filler rule discards by episode on this field;
+  // watchdog_fallbacks alone is only the subset that also technically failed.
+  int64_t watchdog_timeouts = 0;
+  // Any searched-root early exit other than kNone or kTimeout. This closes the
+  // per-episode attribution seam needed by the training contract: a filler may
+  // discard a named timeout and no other early-exit class.
+  int64_t non_timeout_early_exits = 0;
   int64_t searches_short_of_budget = 0;
   int64_t off_scope_simulations = 0;  // structurally 0; carried so it is checked
 
@@ -942,10 +965,18 @@ struct SearchPiState {
   int64_t cum_rows = 0;
   int64_t cum_primary_rows = 0;
   int64_t cum_continuation_rows = 0;
+  int64_t cum_purchase_rows = 0;
+  int64_t cum_combat_intrigue_rows = 0;
+  int64_t cum_other_optional_rows = 0;
+  int64_t cum_filler_timeout_episodes = 0;
   int64_t cum_primary_simulations = 0;
   int64_t cum_continuation_simulations = 0;
   std::string target_hash_chain;
   std::string extended_hash_chain;
+  std::string collected_target_hash_chain;
+  std::string collected_extended_hash_chain;
+  std::string trained_target_hash_chain;
+  std::string trained_extended_hash_chain;
   SearchPiConfig config;
   SearchPiLearnerConfig learner;
 };

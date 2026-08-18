@@ -909,6 +909,11 @@ void SearchPiGenerator::GenerateGeneration(
             ClassifySearchPiEarlyExit(res, legal_actions, requested);
         rs->simulations_requested += requested;
         rs->early_exit_counts[static_cast<int>(early_exit)]++;
+        if (early_exit == SearchPiEarlyExit::kTimeout) {
+          outcome.watchdog_timeouts++;
+        } else if (early_exit != SearchPiEarlyExit::kNone) {
+          outcome.non_timeout_early_exits++;
+        }
 
         // The same quantity per episode, incremented here rather than derived
         // downstream, so the per-episode and summary views cannot disagree.
@@ -1645,29 +1650,58 @@ json::Object WriteSearchPiState(const SearchPiState& s) {
   const SearchPiConfig& c = s.config;
   const SearchPiLearnerConfig& l = s.learner;
   json::Object o;
-  // v2 adds extended_hash_chain and learner_policy_coef. The reader accepts v1
-  // too and defaults both, so every checkpoint the pilot wrote stays readable:
+  // v3 adds frozen-collector/concurrent geometry and separate collected/trained
+  // chains. The reader accepts v1/v2 and reconstructs their historical serial
+  // geometry, so every checkpoint the pilot wrote stays readable:
   // a run must not lose its resume path because an instrument was added.
-  o["schema_version"] = static_cast<int64_t>(2);
+  o["schema_version"] = static_cast<int64_t>(3);
   o["generation"] = static_cast<int64_t>(s.generation);
   o["next_episode_id"] = static_cast<int64_t>(s.next_episode_id);
   o["cum_rows"] = static_cast<int64_t>(s.cum_rows);
   o["cum_primary_rows"] = static_cast<int64_t>(s.cum_primary_rows);
   o["cum_continuation_rows"] = static_cast<int64_t>(s.cum_continuation_rows);
+  o["cum_purchase_rows"] = static_cast<int64_t>(s.cum_purchase_rows);
+  o["cum_combat_intrigue_rows"] =
+      static_cast<int64_t>(s.cum_combat_intrigue_rows);
+  o["cum_other_optional_rows"] =
+      static_cast<int64_t>(s.cum_other_optional_rows);
+  o["cum_filler_timeout_episodes"] =
+      static_cast<int64_t>(s.cum_filler_timeout_episodes);
   o["cum_primary_simulations"] =
       static_cast<int64_t>(s.cum_primary_simulations);
   o["cum_continuation_simulations"] =
       static_cast<int64_t>(s.cum_continuation_simulations);
   o["target_hash_chain"] = s.target_hash_chain;
   o["extended_hash_chain"] = s.extended_hash_chain;
+  o["collected_target_hash_chain"] = s.collected_target_hash_chain;
+  o["collected_extended_hash_chain"] = s.collected_extended_hash_chain;
+  o["trained_target_hash_chain"] = s.trained_target_hash_chain;
+  o["trained_extended_hash_chain"] = s.trained_extended_hash_chain;
 
   // Every search-configuration field, so a run's own artifact answers what it
   // searched with. Stored as strings at full %.17g precision where the value is
   // a double: json.cc floors floats under 5e-7 to exactly 0.0.
   o["games_per_generation"] = static_cast<int64_t>(c.games_per_generation);
+  o["collection_games_per_generation"] =
+      static_cast<int64_t>(c.collection_games_per_generation);
+  o["training_games_per_generation"] =
+      static_cast<int64_t>(c.training_games_per_generation);
+  o["concurrent_workers"] = static_cast<int64_t>(c.concurrent_workers);
+  o["batch_target"] = static_cast<int64_t>(c.batch_target);
+  o["batcher_timeout_ms"] = static_cast<int64_t>(c.batcher_timeout_ms);
+  o["chunk_games"] = static_cast<int64_t>(c.chunk_games);
+  o["warmup_games"] = static_cast<int64_t>(c.warmup_games);
+  o["max_filler_timeout_episodes"] =
+      static_cast<int64_t>(c.max_filler_timeout_episodes);
+  o["subset_rule"] = c.subset_rule;
+  o["frozen_collector_sha256"] = c.frozen_collector_sha256;
+  o["frozen_collector_digest"] = c.frozen_collector_digest;
   o["primary_simulations"] = static_cast<int64_t>(c.primary_simulations);
   o["continuation_simulations"] =
       static_cast<int64_t>(c.continuation_simulations);
+  o["purchase_combat_budget"] =
+      static_cast<int64_t>(c.purchase_combat_budget);
+  o["relative_time_budget_ms"] = F17(c.relative_time_budget_ms);
   o["puct_c"] = F17(c.puct_c);
   o["max_search_decision_depth"] =
       static_cast<int64_t>(c.max_search_decision_depth);
@@ -1759,11 +1793,12 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
   SPIEL_CHECK_TRUE(out != nullptr);
   int64_t v = 0;
   if (!GetInt(o, "schema_version", &v, error)) return false;
-  if (v != 1 && v != 2) {
-    if (error != nullptr) *error = "search_pi.schema_version not in {1, 2}";
+  if (v != 1 && v != 2 && v != 3) {
+    if (error != nullptr) *error = "search_pi.schema_version not in {1, 2, 3}";
     return false;
   }
   const bool v2 = (v >= 2);
+  const bool v3 = (v >= 3);
   SearchPiState s;
   if (!GetInt(o, "generation", &v, error)) return false;
   s.generation = static_cast<int>(v);
@@ -1772,6 +1807,17 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
   if (!GetInt(o, "cum_primary_rows", &s.cum_primary_rows, error)) return false;
   if (!GetInt(o, "cum_continuation_rows", &s.cum_continuation_rows, error)) {
     return false;
+  }
+  if (v3) {
+    if (!GetInt(o, "cum_purchase_rows", &s.cum_purchase_rows, error) ||
+        !GetInt(o, "cum_combat_intrigue_rows", &s.cum_combat_intrigue_rows,
+                error) ||
+        !GetInt(o, "cum_other_optional_rows", &s.cum_other_optional_rows,
+                error) ||
+        !GetInt(o, "cum_filler_timeout_episodes",
+                &s.cum_filler_timeout_episodes, error)) {
+      return false;
+    }
   }
   if (!GetInt(o, "cum_primary_simulations", &s.cum_primary_simulations, error)) {
     return false;
@@ -1787,14 +1833,61 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
   if (v2 && !GetStr(o, "extended_hash_chain", &s.extended_hash_chain, error)) {
     return false;
   }
+  if (v3 &&
+      (!GetStr(o, "collected_target_hash_chain",
+               &s.collected_target_hash_chain, error) ||
+       !GetStr(o, "collected_extended_hash_chain",
+               &s.collected_extended_hash_chain, error) ||
+       !GetStr(o, "trained_target_hash_chain", &s.trained_target_hash_chain,
+               error) ||
+       !GetStr(o, "trained_extended_hash_chain",
+               &s.trained_extended_hash_chain, error))) {
+    return false;
+  }
 
   SearchPiConfig& c = s.config;
   if (!GetInt(o, "games_per_generation", &v, error)) return false;
   c.games_per_generation = static_cast<int>(v);
+  if (v3) {
+    if (!GetInt(o, "collection_games_per_generation", &v, error)) return false;
+    c.collection_games_per_generation = static_cast<int>(v);
+    if (!GetInt(o, "training_games_per_generation", &v, error)) return false;
+    c.training_games_per_generation = static_cast<int>(v);
+    if (!GetInt(o, "concurrent_workers", &v, error)) return false;
+    c.concurrent_workers = static_cast<int>(v);
+    if (!GetInt(o, "batch_target", &v, error)) return false;
+    c.batch_target = static_cast<int>(v);
+    if (!GetInt(o, "batcher_timeout_ms", &v, error)) return false;
+    c.batcher_timeout_ms = static_cast<int>(v);
+    if (!GetInt(o, "chunk_games", &v, error)) return false;
+    c.chunk_games = static_cast<int>(v);
+    if (!GetInt(o, "warmup_games", &v, error)) return false;
+    c.warmup_games = static_cast<int>(v);
+    if (!GetInt(o, "max_filler_timeout_episodes", &v, error)) return false;
+    c.max_filler_timeout_episodes = static_cast<int>(v);
+    if (!GetStr(o, "subset_rule", &c.subset_rule, error) ||
+        !GetStr(o, "frozen_collector_sha256", &c.frozen_collector_sha256,
+                error) ||
+        !GetStr(o, "frozen_collector_digest", &c.frozen_collector_digest,
+                error)) {
+      return false;
+    }
+  } else {
+    c.collection_games_per_generation = c.games_per_generation;
+    c.training_games_per_generation = c.games_per_generation;
+  }
   if (!GetInt(o, "primary_simulations", &v, error)) return false;
   c.primary_simulations = static_cast<int>(v);
   if (!GetInt(o, "continuation_simulations", &v, error)) return false;
   c.continuation_simulations = static_cast<int>(v);
+  if (v3) {
+    if (!GetInt(o, "purchase_combat_budget", &v, error)) return false;
+    c.purchase_combat_budget = static_cast<int>(v);
+    if (!GetF17(o, "relative_time_budget_ms", &c.relative_time_budget_ms,
+                error)) {
+      return false;
+    }
+  }
   if (!GetF17(o, "puct_c", &c.puct_c, error)) return false;
   if (!GetInt(o, "max_search_decision_depth", &v, error)) return false;
   c.max_search_decision_depth = static_cast<int>(v);
@@ -1887,10 +1980,23 @@ std::string SearchPiConfigFingerprint(const SearchPiConfig& c,
   // v2: policy_coef joined the objective. The version string moves with the
   // algorithm so a changed hash reads as a changed recipe rather than as an
   // unexplained mismatch against a v1 artifact.
-  ss << "search_pi_v2"
+  ss << "search_pi_v3"
      << "|games=" << c.games_per_generation
+     << "|collection_games=" << c.collection_games_per_generation
+     << "|training_games=" << c.training_games_per_generation
+     << "|workers=" << c.concurrent_workers
+     << "|batch_target=" << c.batch_target
+     << "|batch_timeout_ms=" << c.batcher_timeout_ms
+     << "|chunk_games=" << c.chunk_games
+     << "|warmup_games=" << c.warmup_games
+     << "|max_filler_timeouts=" << c.max_filler_timeout_episodes
+     << "|subset_rule=" << c.subset_rule
+     << "|collector_sha=" << c.frozen_collector_sha256
+     << "|collector_digest=" << c.frozen_collector_digest
      << "|prim=" << c.primary_simulations
      << "|cont=" << c.continuation_simulations
+     << "|purchase_combat=" << c.purchase_combat_budget
+     << "|watchdog_ms=" << F17(c.relative_time_budget_ms)
      << "|puct=" << F17(c.puct_c)
      << "|depth=" << c.max_search_decision_depth
      << "|oppmodel=" << (c.use_opponent_model ? 1 : 0)

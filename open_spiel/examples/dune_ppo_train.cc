@@ -43,6 +43,7 @@
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
+#include "dune_search_pi_concurrent.h"
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
@@ -217,10 +218,41 @@ ABSL_FLAG(bool, search_pi_mode, false,
           "mutually exclusive with PPO training, --online_search_collection, "
           "--search_label_dir and --pipeline).");
 ABSL_FLAG(int, search_pi_generations, 1,
-          "Number of frozen-collect -> learn -> sync generations to run.");
+          "Number of frozen-collector -> learn -> checkpoint generations.");
 ABSL_FLAG(int, search_pi_games_per_generation, 16,
-          "Complete games played per generation (must be a multiple of 4 for "
-          "seat balance).");
+          "Outcome-blind prefix of collection episode IDs exposed to the "
+          "learner. Historical mode also uses this as collection size.");
+ABSL_FLAG(int, search_pi_collection_games_per_generation, 0,
+          "Complete games collected per generation. 0 preserves the historical "
+          "value of --search_pi_games_per_generation; post-Gate-8 registers 512.");
+ABSL_FLAG(int, search_pi_concurrent_workers, 1,
+          "Exact concurrent game workers G; never silently capped.");
+ABSL_FLAG(int, search_pi_batch_target, 0,
+          "Shared collector batch target. 0 is historical serial/reference mode; "
+          "post-Gate-8 registers 64.");
+ABSL_FLAG(int, search_pi_batcher_timeout_ms, 2,
+          "Shared collector batcher flush timeout in milliseconds.");
+ABSL_FLAG(int, search_pi_chunk_games, 4,
+          "Seat-balanced games per concurrent work unit.");
+ABSL_FLAG(int, search_pi_warmup_games, 0,
+          "Discarded throwaway collector warm-up games; registered value is 0.");
+ABSL_FLAG(int, search_pi_purchase_combat_budget, 0,
+          "0 selects the narrow teacher; 64 selects the wide teacher.");
+ABSL_FLAG(double, search_pi_relative_time_budget_ms, 10000.0,
+          "Per-root runaway watchdog. Post-Gate-8 requires 60000 ms.");
+ABSL_FLAG(std::string, search_pi_collector_model_checkpoint, "",
+          "Immutable model archive loaded into the collector, distinct from the "
+          "mutable student model.");
+ABSL_FLAG(std::string, search_pi_collector_model_sha256, "",
+          "Required SHA-256 of the immutable collector archive.");
+ABSL_FLAG(std::string, search_pi_generation_manifest_dir, "",
+          "Fresh directory for immutable per-generation collection manifests.");
+ABSL_FLAG(int, search_pi_max_filler_timeout_episodes, 0,
+          "Named watchdog-timeout filler episodes allowed per generation. The "
+          "registered 512-game lane fixes 2; every other failure still STOPs.");
+ABSL_FLAG(int64_t, search_pi_first_episode_id, 0,
+          "First collection episode ID for a fresh Search-PI lineage. Resume "
+          "uses the committed search_pi cursor and requires this value to match.");
 ABSL_FLAG(int, search_pi_primary_simulations, 200,
           "NEW simulations at each kAgentPrimary root.");
 ABSL_FLAG(int, search_pi_continuation_simulations, 64,
@@ -3281,10 +3313,30 @@ int main(int argc, char** argv) {
     open_spiel::SearchPiConfig pi_cfg;
     pi_cfg.games_per_generation =
         absl::GetFlag(FLAGS_search_pi_games_per_generation);
+    pi_cfg.training_games_per_generation = pi_cfg.games_per_generation;
+    pi_cfg.collection_games_per_generation =
+        absl::GetFlag(FLAGS_search_pi_collection_games_per_generation) > 0
+            ? absl::GetFlag(FLAGS_search_pi_collection_games_per_generation)
+            : pi_cfg.games_per_generation;
+    pi_cfg.concurrent_workers =
+        absl::GetFlag(FLAGS_search_pi_concurrent_workers);
+    pi_cfg.batch_target = absl::GetFlag(FLAGS_search_pi_batch_target);
+    pi_cfg.batcher_timeout_ms =
+        absl::GetFlag(FLAGS_search_pi_batcher_timeout_ms);
+    pi_cfg.chunk_games = absl::GetFlag(FLAGS_search_pi_chunk_games);
+    pi_cfg.warmup_games = absl::GetFlag(FLAGS_search_pi_warmup_games);
+    pi_cfg.max_filler_timeout_episodes =
+        absl::GetFlag(FLAGS_search_pi_max_filler_timeout_episodes);
+    pi_cfg.next_episode_id =
+        absl::GetFlag(FLAGS_search_pi_first_episode_id);
     pi_cfg.primary_simulations =
         absl::GetFlag(FLAGS_search_pi_primary_simulations);
     pi_cfg.continuation_simulations =
         absl::GetFlag(FLAGS_search_pi_continuation_simulations);
+    pi_cfg.purchase_combat_budget =
+        absl::GetFlag(FLAGS_search_pi_purchase_combat_budget);
+    pi_cfg.relative_time_budget_ms =
+        absl::GetFlag(FLAGS_search_pi_relative_time_budget_ms);
     pi_cfg.puct_c = absl::GetFlag(FLAGS_search_pi_puct_c);
     pi_cfg.max_search_decision_depth = -1;  // uncapped, not a flag
     pi_cfg.use_opponent_model = true;
@@ -3317,6 +3369,80 @@ int main(int argc, char** argv) {
     pi_cfg.search_leader_draft = false;  // structural, and manifested as such
     pi_cfg.seed_domain = absl::GetFlag(FLAGS_search_pi_seed_domain);
 
+    const std::string collector_path =
+        absl::GetFlag(FLAGS_search_pi_collector_model_checkpoint);
+    const std::string collector_expected_sha =
+        absl::GetFlag(FLAGS_search_pi_collector_model_sha256);
+    const bool production_concurrent = pi_cfg.batch_target > 0;
+    std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> collector_model;
+    std::string collector_digest;
+    if (production_concurrent || !collector_path.empty() ||
+        !collector_expected_sha.empty()) {
+      constexpr char kRegisteredCollectorSha256[] =
+          "68febee771509f88446286cc50983afd22d64f7772f6866def77bafd4aae36d2";
+      // The approved continuation has one exact production geometry. Enforcing
+      // it in the consumer prevents a launcher typo from creating a substitute
+      // experiment that merely resembles the registration.
+      if (pi_cfg.collection_games_per_generation != 512 ||
+          pi_cfg.training_games_per_generation != 64 ||
+          pi_cfg.concurrent_workers != 128 || pi_cfg.batch_target != 64 ||
+          pi_cfg.batcher_timeout_ms != 2 || pi_cfg.chunk_games != 4 ||
+          pi_cfg.warmup_games != 0 ||
+          pi_cfg.max_filler_timeout_episodes != 2 ||
+          pi_cfg.relative_time_budget_ms != 60000.0 ||
+          (pi_cfg.purchase_combat_budget != 0 &&
+           pi_cfg.purchase_combat_budget != 64)) {
+        SpielFatalError(
+            "post-Gate-8 Search-PI geometry must be collection=512, "
+            "training=64, G=128, target=64, timeout=2ms, chunks=4, "
+            "warmup=0, watchdog=60000ms, filler cap=2 and scope in {0,64}");
+      }
+      if (absl::GetFlag(FLAGS_search_pi_generations) != 1) {
+        SpielFatalError(
+            "the post-Gate-8 trainer accepts exactly one generation per "
+            "invocation so the durable supervisor must run evaluation and the "
+            "decline rail before the next collection");
+      }
+      if (collector_path.empty() || collector_expected_sha.empty()) {
+        SpielFatalError(
+            "post-Gate-8 Search-PI requires the frozen collector archive and "
+            "its registered SHA-256");
+      }
+      if (collector_expected_sha != kRegisteredCollectorSha256) {
+        SpielFatalError(
+            "post-Gate-8 collector SHA is not the registered u15828 archive: " +
+            collector_expected_sha);
+      }
+      const std::string actual_sha =
+          open_spiel::ComputeFileSHA256(collector_path);
+      if (actual_sha != collector_expected_sha) {
+        SpielFatalError("frozen collector archive SHA-256 mismatch: expected " +
+                        collector_expected_sha + " actual " + actual_sha);
+      }
+      collector_model = std::make_shared<
+          open_spiel::SharedDunePolicyValueNetImpl>(
+          obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+          absl::GetFlag(FLAGS_num_blocks),
+          absl::GetFlag(FLAGS_nonlinear_value_head));
+      collector_model->to(device);
+      try {
+        torch::load(collector_model, collector_path, device);
+      } catch (const c10::Error& e) {
+        SpielFatalError("frozen collector load failed: " +
+                        std::string(e.msg()));
+      }
+      collector_model->to(device);
+      collector_model->eval();
+      collector_digest =
+          open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
+      pi_cfg.frozen_collector_sha256 = actual_sha;
+      pi_cfg.frozen_collector_digest = collector_digest;
+      if (absl::GetFlag(FLAGS_search_pi_generation_manifest_dir).empty()) {
+        SpielFatalError(
+            "post-Gate-8 Search-PI requires --search_pi_generation_manifest_dir");
+      }
+    }
+
     open_spiel::SearchPiLearnerConfig pi_learn;
     pi_learn.learning_rate = absl::GetFlag(FLAGS_search_pi_learning_rate);
     pi_learn.minibatch_size = absl::GetFlag(FLAGS_search_pi_minibatch_size);
@@ -3339,6 +3465,39 @@ int main(int argc, char** argv) {
     pi_learn.weight_decay = absl::GetFlag(FLAGS_weight_decay);
     pi_learn.policy_weight_decay = absl::GetFlag(FLAGS_policy_weight_decay);
 
+    if (production_concurrent) {
+      // Pin the complete shared teacher and rung-2 learner identity in the
+      // consumer. A committed launcher is necessary provenance, but it is not
+      // a substitute for refusing a disarming argument at runtime.
+      if (pi_cfg.primary_simulations != 200 ||
+          pi_cfg.continuation_simulations != 64 || pi_cfg.puct_c != 0.30 ||
+          pi_cfg.continuation_target !=
+              open_spiel::SearchPiContinuationTarget::kTotalVisits ||
+          pi_cfg.behavior_temperature != 0.0 ||
+          pi_cfg.root_prior_temperature != 1.0 ||
+          pi_cfg.dirichlet_epsilon != 0.0 ||
+          pi_cfg.forced_playouts_k != 0.0 ||
+          pi_cfg.target_sharpen_exponent != 1.0 ||
+          pi_cfg.seed_domain != 8160001 || pi_learn.logit_cap != 10.0 ||
+          pi_learn.learning_rate != 1.0e-5 ||
+          pi_learn.minibatch_size != 256 || pi_learn.epochs != 1 ||
+          pi_learn.policy_coef != 1.0 || pi_learn.value_coef != 0.0 ||
+          pi_learn.grad_clip_norm != 0.5 || pi_learn.weight_decay != 0.0 ||
+          pi_learn.policy_weight_decay != 0.0) {
+        SpielFatalError(
+            "post-Gate-8 Search-PI teacher/learner arguments differ from the "
+            "registered 200/64, puct=.30, total_visits, deterministic, "
+            "seed-domain=8160001, CE-only lr=1e-5 one-epoch minibatch-256 "
+            "package");
+      }
+      if (absl::GetFlag(FLAGS_checkpoint_interval) != 1 ||
+          !absl::GetFlag(FLAGS_save_final_checkpoint)) {
+        SpielFatalError(
+            "post-Gate-8 Search-PI requires checkpoint_interval=1 and "
+            "save_final_checkpoint=true");
+      }
+    }
+
     const std::string pi_fingerprint =
         open_spiel::SearchPiConfigFingerprint(pi_cfg, pi_learn);
 
@@ -3358,6 +3517,28 @@ int main(int argc, char** argv) {
       pi_state = search_pi_resume;
       pi_generation = search_pi_resume.generation;
       pi_cfg.next_episode_id = search_pi_resume.next_episode_id;
+    }
+    if (production_concurrent) {
+      if (init_mode != "checkpoint") {
+        SpielFatalError(
+            "post-Gate-8 Search-PI must start/resume from a checkpoint");
+      }
+      if (!search_pi_resume_present) {
+        const std::string initial_student_digest =
+            open_spiel::CanonicalSearchPiModuleDigest(*training_model);
+        if (initial_student_digest != collector_digest) {
+          SpielFatalError(
+              "fresh post-Gate-8 student is not the registered frozen "
+              "u15828 collector snapshot");
+        }
+        if (pi_cfg.next_episode_id != 600000) {
+          SpielFatalError(
+              "fresh post-Gate-8 lineage must begin at episode 600000");
+        }
+      } else if (pi_generation < 1 || pi_generation >= 5) {
+        SpielFatalError(
+            "post-Gate-8 resume generation must be a completed boundary 1..4");
+      }
     }
 
     // The DEDICATED optimizer: its own instance and its own learning rate. The
@@ -3423,56 +3604,314 @@ int main(int argc, char** argv) {
     for (int gi = 0; gi < generations; ++gi) {
       ++pi_generation;
 
-      // 1. FREEZE. inference_model already carries the pre-generation weights
-      //    (SyncModels ran above, and again at the end of each generation).
-      //    Every search and every opponent draw in this generation reads this
-      //    snapshot; the training model is not touched until step 3.
-      auto pi_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
-          inference_model, device,
-          static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
-
-      // 2. COLLECT: complete games, search-generated trajectory.
-      open_spiel::SearchPiGenerator pi_generator(pi_cfg);
       std::vector<open_spiel::SearchPiRow> pi_rows;
       open_spiel::SearchPiGenerationStats pi_stats;
-      pi_generator.GenerateGeneration(pi_generation, game, pi_evaluator,
-                                      &pi_rows, &pi_stats);
-      pi_cfg.next_episode_id = pi_stats.next_episode_id;
+      open_spiel::SearchPiTrainingCollectionValidation collection_validation;
+      std::filesystem::path generation_manifest_dir;
+      std::string student_digest_before_learn;
+      std::string student_digest_after_learn;
+
+      if (production_concurrent) {
+        const int64_t registered_first =
+            600000 + static_cast<int64_t>(pi_generation - 1) * 512;
+        if (pi_cfg.next_episode_id != registered_first) {
+          SpielFatalError(absl::StrFormat(
+              "generation %d cursor is %d, registered %d",
+              pi_generation, pi_cfg.next_episode_id, registered_first));
+        }
+        const std::string digest_before_collection =
+            open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
+        if (digest_before_collection != collector_digest) {
+          SpielFatalError("frozen collector digest changed before collection");
+        }
+        generation_manifest_dir =
+            std::filesystem::path(absl::GetFlag(
+                FLAGS_search_pi_generation_manifest_dir)) /
+            absl::StrCat("generation_", pi_generation);
+        if (std::filesystem::exists(generation_manifest_dir)) {
+          SpielFatalError("generation output already exists: " +
+                          generation_manifest_dir.string());
+        }
+        const std::filesystem::path collection_dir =
+            generation_manifest_dir / "collection";
+
+        open_spiel::ConcurrentSearchPiCollectionConfig collect_cfg;
+        collect_cfg.search = pi_cfg;
+        collect_cfg.search.next_episode_id = registered_first;
+        collect_cfg.generation = pi_generation;
+        collect_cfg.collection_games =
+            pi_cfg.collection_games_per_generation;
+        collect_cfg.chunk_games = pi_cfg.chunk_games;
+        collect_cfg.requested_workers = pi_cfg.concurrent_workers;
+        collect_cfg.batch_target = pi_cfg.batch_target;
+        collect_cfg.batcher_timeout_ms = pi_cfg.batcher_timeout_ms;
+        collect_cfg.warmup_games = pi_cfg.warmup_games;
+        collect_cfg.retain_rows = true;
+        collect_cfg.logit_cap = static_cast<float>(pi_learn.logit_cap);
+        collect_cfg.output_dir = collection_dir.string();
+        collect_cfg.arm = open_spiel::SearchPiArm::kSearched;
+        open_spiel::ConcurrentSearchPiCollectionResult collected =
+            open_spiel::CollectSearchPiConcurrent(
+                collect_cfg, game, collector_model, device);
+
+        // The prefix split is the first operation performed on rows inside the
+        // validator and reads only episode IDs. Outcomes cannot influence dose.
+        open_spiel::SearchPiTrainingCollectionContract contract;
+        contract.first_episode_id = registered_first;
+        contract.collection_games = pi_cfg.collection_games_per_generation;
+        contract.training_games = pi_cfg.training_games_per_generation;
+        contract.requested_workers = pi_cfg.concurrent_workers;
+        contract.batch_target = pi_cfg.batch_target;
+        contract.batcher_timeout_ms = pi_cfg.batcher_timeout_ms;
+        contract.primary_simulations = pi_cfg.primary_simulations;
+        contract.continuation_simulations = pi_cfg.continuation_simulations;
+        contract.purchase_combat_budget = pi_cfg.purchase_combat_budget;
+        contract.max_filler_timeout_episodes =
+            pi_cfg.max_filler_timeout_episodes;
+        collection_validation =
+            open_spiel::ValidateSearchPiTrainingCollection(collected, contract);
+        pi_rows = collection_validation.training_rows;
+
+        pi_stats.generation = pi_generation;
+        pi_stats.games = pi_cfg.collection_games_per_generation;
+        pi_stats.first_episode_id = registered_first;
+        pi_stats.next_episode_id = registered_first +
+                                   pi_cfg.collection_games_per_generation;
+        pi_stats.collection_wall_time_s = collected.wall_time_s;
+        pi_stats.inference_calls = collected.inference_calls;
+        pi_stats.rows_total = collected.rows_total;
+        pi_stats.primary = collected.primary;
+        pi_stats.continuation = collected.continuation;
+        pi_stats.purchase = collected.purchase;
+        pi_stats.combat_intrigue = collected.combat_intrigue;
+        pi_stats.other_optional = collected.other_optional;
+        for (int role = 0; role < 7; ++role) {
+          pi_stats.simulations_by_role[role] =
+              collected.simulations_by_role[role];
+          pi_stats.decisions_by_role[role] = collected.decisions_by_role[role];
+        }
+        pi_stats.leader_rows_emitted = collected.leader_rows_emitted;
+        pi_stats.arm = collected.arm;
+        pi_stats.games_played = collected.games;
+        pi_stats.target_hash_chain = collected.target_hash_chain;
+        pi_stats.extended_hash_chain = collected.extended_hash_chain;
+        pi_cfg.next_episode_id = pi_stats.next_episode_id;
+
+        const std::string digest_after_collection =
+            open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
+        if (digest_after_collection != collector_digest) {
+          collection_validation.errors.push_back(
+              "frozen collector digest changed during collection");
+          collection_validation.ok = false;
+        }
+
+        // Durable collection transaction, written before any learner call.
+        open_spiel::json::Object manifest;
+        manifest["schema_version"] = static_cast<int64_t>(1);
+        manifest["generation"] = static_cast<int64_t>(pi_generation);
+        manifest["validation_pass"] = collection_validation.ok;
+        manifest["first_episode_id"] = registered_first;
+        manifest["next_episode_id"] = pi_stats.next_episode_id;
+        manifest["collection_games"] =
+            static_cast<int64_t>(pi_cfg.collection_games_per_generation);
+        manifest["training_games"] =
+            static_cast<int64_t>(pi_cfg.training_games_per_generation);
+        manifest["requested_workers"] =
+            static_cast<int64_t>(collected.requested_workers);
+        manifest["actual_workers"] =
+            static_cast<int64_t>(collected.actual_workers);
+        manifest["batch_target"] =
+            static_cast<int64_t>(collected.configured_batch_target);
+        manifest["batcher_timeout_ms"] =
+            static_cast<int64_t>(collected.configured_batcher_timeout_ms);
+        manifest["max_inflight_rows"] =
+            static_cast<int64_t>(collected.max_inflight_rows);
+        manifest["purchase_combat_budget"] =
+            static_cast<int64_t>(pi_cfg.purchase_combat_budget);
+        manifest["collector_archive_sha256"] =
+            pi_cfg.frozen_collector_sha256;
+        manifest["collector_digest_before"] = digest_before_collection;
+        manifest["collector_digest_after"] = digest_after_collection;
+        manifest["collected_target_hash"] =
+            collection_validation.collected_target_hash;
+        manifest["collected_extended_hash"] =
+            collection_validation.collected_extended_hash;
+        manifest["trained_target_hash"] =
+            collection_validation.trained_target_hash;
+        manifest["trained_extended_hash"] =
+            collection_validation.trained_extended_hash;
+        manifest["collected_rows"] =
+            static_cast<int64_t>(collected.retained_rows.size());
+        manifest["trained_rows"] = static_cast<int64_t>(pi_rows.size());
+        open_spiel::json::Array filler;
+        for (int64_t episode :
+             collection_validation.filler_timeout_episode_ids) {
+          filler.push_back(episode);
+        }
+        manifest["filler_timeout_episode_ids"] = std::move(filler);
+        open_spiel::json::Array errors;
+        for (const std::string& error : collection_validation.errors) {
+          errors.push_back(error);
+        }
+        manifest["errors"] = std::move(errors);
+        open_spiel::json::Object trained_by_role;
+        for (int role = 0; role < 7; ++role) {
+          trained_by_role[absl::StrCat(role)] =
+              collection_validation.trained_rows_by_role[role];
+        }
+        manifest["trained_rows_by_role"] = std::move(trained_by_role);
+        std::filesystem::create_directories(generation_manifest_dir);
+        const std::filesystem::path manifest_path =
+            generation_manifest_dir / "collection_manifest.json";
+        const std::filesystem::path manifest_tmp =
+            generation_manifest_dir / ".collection_manifest.json.tmp";
+        {
+          std::ofstream out(manifest_tmp, std::ios::trunc);
+          out << open_spiel::json::ToString(manifest, true) << "\n";
+          out.flush();
+          if (!out) SpielFatalError("collection manifest write failed");
+        }
+        std::filesystem::rename(manifest_tmp, manifest_path);
+        if (!collection_validation.ok) {
+          std::string joined;
+          for (const std::string& error : collection_validation.errors) {
+            joined += "\n  - " + error;
+          }
+          SpielFatalError("collection validation failed before learner:" +
+                          joined);
+        }
+      } else {
+        // Historical reference path retained for old checkpoints and parity.
+        auto pi_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
+            inference_model, device,
+            static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
+        open_spiel::SearchPiGenerator(pi_cfg).GenerateGeneration(
+            pi_generation, game, pi_evaluator, &pi_rows, &pi_stats);
+        pi_cfg.next_episode_id = pi_stats.next_episode_id;
+      }
 
       // 3. LEARN: the dedicated AlphaZero-style objective, current-generation
       //    data only (no replay buffer in this slice).
+      if (production_concurrent) {
+        student_digest_before_learn =
+            open_spiel::CanonicalSearchPiModuleDigest(*training_model);
+      }
       open_spiel::SearchPiLearnerStats pi_lstats =
           open_spiel::RunSearchPiLearner(training_model, pi_optimizer, pi_rows,
                                          obs_size, action_size, device, master,
                                          pi_generation, pi_learn);
-
-      // 4. SYNC: the next generation collects against the new weights.
-      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+      if (!std::isfinite(pi_lstats.policy_grad_norm) ||
+          pi_lstats.policy_grad_norm <= 0.0) {
+        SpielFatalError("Search-PI policy gradient is zero or non-finite");
+      }
+      if (production_concurrent) {
+        if (!pi_lstats.policy_backward_executed ||
+            pi_lstats.value_backward_executed ||
+            pi_lstats.value_grad_norm != 0.0) {
+          SpielFatalError(
+              "registered CE-only learner manipulation check failed");
+        }
+        student_digest_after_learn =
+            open_spiel::CanonicalSearchPiModuleDigest(*training_model);
+        if (student_digest_after_learn == student_digest_before_learn) {
+          SpielFatalError(
+              "learner reported a policy gradient but the student module "
+              "digest did not advance");
+        }
+        const std::string digest_after_learn =
+            open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
+        if (digest_after_learn != collector_digest) {
+          SpielFatalError("frozen collector digest changed during learning");
+        }
+      } else {
+        // Historical evolving-teacher behavior only. The approved production
+        // lane never syncs the student into its collector.
+        open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+      }
 
       pi_state.generation = pi_generation;
       pi_state.next_episode_id = pi_stats.next_episode_id;
-      pi_state.cum_rows += pi_stats.rows_total;
-      pi_state.cum_primary_rows += pi_stats.primary.rows_emitted;
-      pi_state.cum_continuation_rows += pi_stats.continuation.rows_emitted;
+      const int64_t trained_rows = production_concurrent
+          ? static_cast<int64_t>(pi_rows.size()) : pi_stats.rows_total;
+      pi_state.cum_rows += trained_rows;
+      pi_state.cum_primary_rows += production_concurrent
+          ? collection_validation.trained_rows_by_role[2]
+          : pi_stats.primary.rows_emitted;
+      pi_state.cum_continuation_rows += production_concurrent
+          ? collection_validation.trained_rows_by_role[3]
+          : pi_stats.continuation.rows_emitted;
+      pi_state.cum_purchase_rows += production_concurrent
+          ? collection_validation.trained_rows_by_role[4]
+          : pi_stats.purchase.rows_emitted;
+      pi_state.cum_combat_intrigue_rows += production_concurrent
+          ? collection_validation.trained_rows_by_role[5]
+          : pi_stats.combat_intrigue.rows_emitted;
+      pi_state.cum_other_optional_rows += production_concurrent
+          ? collection_validation.trained_rows_by_role[6]
+          : pi_stats.other_optional.rows_emitted;
+      pi_state.cum_filler_timeout_episodes += production_concurrent
+          ? collection_validation.filler_timeout_episode_ids.size() : 0;
       pi_state.cum_primary_simulations += pi_stats.primary.simulations_completed;
       pi_state.cum_continuation_simulations +=
           pi_stats.continuation.simulations_completed;
+      const std::string generation_target_hash = production_concurrent
+          ? collection_validation.trained_target_hash
+          : pi_stats.target_hash_chain;
+      const std::string generation_extended_hash = production_concurrent
+          ? collection_validation.trained_extended_hash
+          : pi_stats.extended_hash_chain;
+      if (generation_target_hash.empty() || generation_extended_hash.empty()) {
+        SpielFatalError("Search-PI generation has an empty target/row hash");
+      }
       pi_state.target_hash_chain = open_spiel::ComputeStringSHA256(
-          pi_state.target_hash_chain + pi_stats.target_hash_chain);
+          pi_state.target_hash_chain + generation_target_hash);
       pi_state.extended_hash_chain = open_spiel::ComputeStringSHA256(
-          pi_state.extended_hash_chain + pi_stats.extended_hash_chain);
+          pi_state.extended_hash_chain + generation_extended_hash);
+      if (production_concurrent) {
+        pi_state.collected_target_hash_chain =
+            open_spiel::ComputeStringSHA256(
+                pi_state.collected_target_hash_chain +
+                collection_validation.collected_target_hash);
+        pi_state.collected_extended_hash_chain =
+            open_spiel::ComputeStringSHA256(
+                pi_state.collected_extended_hash_chain +
+                collection_validation.collected_extended_hash);
+        pi_state.trained_target_hash_chain =
+            open_spiel::ComputeStringSHA256(
+                pi_state.trained_target_hash_chain +
+                collection_validation.trained_target_hash);
+        pi_state.trained_extended_hash_chain =
+            open_spiel::ComputeStringSHA256(
+                pi_state.trained_extended_hash_chain +
+                collection_validation.trained_extended_hash);
+      }
       pi_state.config = pi_cfg;
       pi_state.learner = pi_learn;
 
       std::cout << absl::StrFormat(
-          "[search-PI] gen %d | rows=%lld (primary %lld / cont %lld) "
+          "[search-PI] gen %d | trained_rows=%lld collected_rows=%lld "
+          "(primary %lld / cont %lld / purchase %lld / combat %lld / other %lld) "
           "sims=%lld/%lld fallbacks=%lld/%lld re_root hit/miss=%lld/%lld "
           "kept_vs_legacy_gate=%lld/%lld | CE=%.5f MSE=%.5f "
           "|g_pol|=%.4f |g_val|=%.4f cos=%.4f (pol %.4f trunk %.4f val %.4f) "
           "| collect=%.1fs\n",
-          pi_generation, (long long)pi_stats.rows_total,
-          (long long)pi_stats.primary.rows_emitted,
-          (long long)pi_stats.continuation.rows_emitted,
+          pi_generation, (long long)trained_rows,
+          (long long)pi_stats.rows_total,
+          (long long)(production_concurrent
+              ? collection_validation.trained_rows_by_role[2]
+              : pi_stats.primary.rows_emitted),
+          (long long)(production_concurrent
+              ? collection_validation.trained_rows_by_role[3]
+              : pi_stats.continuation.rows_emitted),
+          (long long)(production_concurrent
+              ? collection_validation.trained_rows_by_role[4]
+              : pi_stats.purchase.rows_emitted),
+          (long long)(production_concurrent
+              ? collection_validation.trained_rows_by_role[5]
+              : pi_stats.combat_intrigue.rows_emitted),
+          (long long)(production_concurrent
+              ? collection_validation.trained_rows_by_role[6]
+              : pi_stats.other_optional.rows_emitted),
           (long long)pi_stats.primary.simulations_completed,
           (long long)pi_stats.continuation.simulations_completed,
           (long long)pi_stats.primary.fallbacks,
@@ -3489,12 +3928,15 @@ int main(int argc, char** argv) {
       // Zero-simulation invariant, checked every generation rather than only in
       // the unit tests: a routing regression must stop the run, not quietly
       // start teaching Leader or purchase rows.
-      const int off_scope[] = {0, 1, 4, 5, 6};
+      std::vector<int> off_scope = {0, 1};
+      if (pi_cfg.purchase_combat_budget == 0) {
+        off_scope.insert(off_scope.end(), {4, 5, 6});
+      }
       for (int r : off_scope) {
         if (pi_stats.simulations_by_role[r] != 0) {
           SpielFatalError(absl::StrFormat(
               "search-PI scope violation: role %d ran %lld simulations; only "
-              "kAgentPrimary(2) and kAgentContinuation(3) may be searched.",
+              "this role is outside the selected teacher scope.",
               r, (long long)pi_stats.simulations_by_role[r]));
         }
       }
@@ -3556,6 +3998,98 @@ int main(int argc, char** argv) {
             absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
             search_label_fingerprint, run_uuid,
             /*aux_state=*/nullptr, &pi_state);
+        if (production_concurrent) {
+          const std::string collector_digest_at_checkpoint =
+              open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
+          if (collector_digest_at_checkpoint != collector_digest) {
+            SpielFatalError(
+                "frozen collector digest changed at checkpoint boundary");
+          }
+
+          auto file_record = [](const std::filesystem::path& path) {
+            size_t size = 0;
+            const std::string sha =
+                open_spiel::ComputeFileSHA256(path.string(), &size);
+            open_spiel::json::Object record;
+            record["path"] = path.string();
+            record["size"] = static_cast<int64_t>(size);
+            record["sha256"] = sha;
+            return record;
+          };
+          std::filesystem::path gen_checkpoint_manifest = gen_model;
+          gen_checkpoint_manifest.replace_extension(".json");
+          const std::filesystem::path collection_manifest =
+              generation_manifest_dir / "collection_manifest.json";
+
+          // This marker is written last. Its presence means collection was
+          // validated, exactly one learner call completed, and the immutable
+          // model/optimizer/state triple is hash-bound. The supervisor resumes
+          // only from this boundary and never from a PID or a flat checkpoint.
+          open_spiel::json::Object complete;
+          complete["schema_version"] = static_cast<int64_t>(1);
+          complete["phase"] = "generation_checkpoint_complete";
+          complete["generation"] = static_cast<int64_t>(pi_generation);
+          complete["learner_calls"] = static_cast<int64_t>(1);
+          complete["config_fingerprint"] = pi_fingerprint;
+          complete["first_episode_id"] = pi_stats.first_episode_id;
+          complete["next_episode_id"] = pi_stats.next_episode_id;
+          complete["collection_games"] = static_cast<int64_t>(
+              pi_cfg.collection_games_per_generation);
+          complete["training_games"] = static_cast<int64_t>(
+              pi_cfg.training_games_per_generation);
+          complete["purchase_combat_budget"] =
+              static_cast<int64_t>(pi_cfg.purchase_combat_budget);
+          complete["collector_archive_sha256"] =
+              pi_cfg.frozen_collector_sha256;
+          complete["collector_digest"] = collector_digest_at_checkpoint;
+          complete["student_digest_before_learn"] =
+              student_digest_before_learn;
+          complete["student_digest_after_learn"] = student_digest_after_learn;
+          complete["policy_backward_executed"] =
+              pi_lstats.policy_backward_executed;
+          complete["value_backward_executed"] =
+              pi_lstats.value_backward_executed;
+          complete["policy_grad_norm"] = pi_lstats.policy_grad_norm;
+          complete["value_grad_norm"] = pi_lstats.value_grad_norm;
+          complete["collected_target_hash"] =
+              collection_validation.collected_target_hash;
+          complete["collected_extended_hash"] =
+              collection_validation.collected_extended_hash;
+          complete["trained_target_hash"] =
+              collection_validation.trained_target_hash;
+          complete["trained_extended_hash"] =
+              collection_validation.trained_extended_hash;
+          complete["cumulative_collected_target_hash_chain"] =
+              pi_state.collected_target_hash_chain;
+          complete["cumulative_collected_extended_hash_chain"] =
+              pi_state.collected_extended_hash_chain;
+          complete["cumulative_trained_target_hash_chain"] =
+              pi_state.trained_target_hash_chain;
+          complete["cumulative_trained_extended_hash_chain"] =
+              pi_state.trained_extended_hash_chain;
+          complete["collection_manifest"] =
+              open_spiel::json::Value(file_record(collection_manifest));
+          complete["model_checkpoint"] =
+              open_spiel::json::Value(file_record(gen_model));
+          complete["optimizer_checkpoint"] =
+              open_spiel::json::Value(file_record(gen_optim));
+          complete["checkpoint_manifest"] = open_spiel::json::Value(
+              file_record(gen_checkpoint_manifest));
+
+          const std::filesystem::path complete_path =
+              generation_manifest_dir / "generation_complete.json";
+          const std::filesystem::path complete_tmp =
+              generation_manifest_dir / ".generation_complete.json.tmp";
+          {
+            std::ofstream out(complete_tmp, std::ios::trunc);
+            out << open_spiel::json::ToString(complete, true) << "\n";
+            out.flush();
+            if (!out) {
+              SpielFatalError("generation-complete manifest write failed");
+            }
+          }
+          std::filesystem::rename(complete_tmp, complete_path);
+        }
         std::cout << "[search-PI] archived generation " << pi_generation
                   << " to " << gen_model.string() << "\n";
       }

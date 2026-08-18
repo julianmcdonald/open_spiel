@@ -1328,9 +1328,16 @@ void Test19_StateRoundTrip() {
   s.cum_rows = 1234;
   s.target_hash_chain = std::string(64, 'a');
   s.extended_hash_chain = std::string(64, 'b');
+  s.collected_target_hash_chain = std::string(64, 'c');
+  s.trained_target_hash_chain = std::string(64, 'd');
   s.learner.policy_coef = 0.0;
   s.learner.value_coef = 1.0;
   s.config.seed_domain = 8160001;
+  s.config.collection_games_per_generation = 512;
+  s.config.training_games_per_generation = 64;
+  s.config.concurrent_workers = 128;
+  s.config.batch_target = 64;
+  s.config.frozen_collector_sha256 = std::string(64, 'e');
 
   json::Object o = WriteSearchPiState(s);
   SearchPiState back;
@@ -1340,6 +1347,14 @@ void Test19_StateRoundTrip() {
   SPIEL_CHECK_EQ(back.target_hash_chain, s.target_hash_chain);
   SPIEL_CHECK_FLOAT_EQ(back.learner.policy_coef, 0.0);
   SPIEL_CHECK_EQ(back.generation, 3);
+  SPIEL_CHECK_EQ(back.config.collection_games_per_generation, 512);
+  SPIEL_CHECK_EQ(back.config.training_games_per_generation, 64);
+  SPIEL_CHECK_EQ(back.config.concurrent_workers, 128);
+  SPIEL_CHECK_EQ(back.config.batch_target, 64);
+  SPIEL_CHECK_EQ(back.collected_target_hash_chain,
+                 s.collected_target_hash_chain);
+  SPIEL_CHECK_EQ(back.trained_target_hash_chain,
+                 s.trained_target_hash_chain);
 
   // A v1 manifest -- written before either field existed -- still loads, and
   // reconstructs the objective those runs actually applied rather than
@@ -1356,7 +1371,7 @@ void Test19_StateRoundTrip() {
 
   // An unknown future version is rejected rather than silently misread.
   json::Object future = o;
-  future["schema_version"] = static_cast<int64_t>(3);
+  future["schema_version"] = static_cast<int64_t>(4);
   SearchPiState never;
   SPIEL_CHECK_FALSE(ReadSearchPiState(future, &never, &err));
   std::cout << "Test19 Passed!\n\n";

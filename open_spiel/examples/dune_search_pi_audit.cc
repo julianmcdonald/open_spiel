@@ -63,6 +63,7 @@
 #include "dune_evaluator.h"
 #include "dune_network.h"
 #include "dune_search_pi.h"
+#include "dune_search_pi_concurrent.h"
 #include "dune_seed_utils.h"
 
 // --- What to measure -------------------------------------------------------
@@ -212,50 +213,13 @@ ABSL_FLAG(std::string, expect_target_chain, "",
 namespace open_spiel {
 namespace {
 
-// One arm's merged result. Chunks are merged in EPISODE order, never in
-// completion order, so the artifacts and both hash chains are independent of
-// how the work happened to be scheduled.
-struct ArmResult {
-  SearchPiArm arm = SearchPiArm::kSearched;
-  int requested_threads = 0;
-  int actual_workers = 0;
-  int configured_batch_target = 0;
-  int max_inflight_rows = 0;
-  std::vector<SearchPiGameOutcome> games;
-  SearchPiRoleStats primary;
-  SearchPiRoleStats continuation;
-  // The wide teacher's three roles. Zero for a narrow arm, by construction.
-  SearchPiRoleStats purchase;
-  SearchPiRoleStats combat_intrigue;
-  SearchPiRoleStats other_optional;
-  int64_t simulations_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
-  int64_t decisions_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
-  int64_t leader_rows_emitted = 0;
-  int64_t inference_calls = 0;
-  int64_t rows_total = 0;
-  std::string target_hash_chain;    // empty unless --retain_rows
-  std::string extended_hash_chain;  // empty unless --retain_rows
-  std::vector<SearchPiRow> retained_rows;  // gate-only; empty for the audit
-  double wall_time_s = 0.0;
-
-  // Batcher telemetry, CAPTURED here and written by WriteArm.
-  //
-  // It used to be written straight from RunArm to --batcher_telemetry_json_path.
-  // With --arm=both that is ONE path for TWO arms, so the second silently
-  // overwrote the first and one batched arm's telemetry did not exist -- while
-  // the registration makes telemetry ABSENCE on a batched arm a STOP. Carried
-  // on the result and emitted per arm under the same stem as every other
-  // artifact, so the launcher cannot get it wrong.
-  bool telemetry_valid = false;
-  bool telemetry_device_applicable = false;
-  open_spiel::BatcherTelemetry telemetry;
-};
+using ArmResult = ConcurrentSearchPiCollectionResult;
 
 // Every leaf group BatchedNNEvaluator submits is exactly NumPlayers rows wide:
 // Evaluate() and PriorAndEvaluate() build one observation per seat and hand the
 // lot to EvaluateBatch() (dune_batched_evaluator.h:28-33, :100-105). Asserted
 // against the loaded game in main rather than trusted.
-constexpr int64_t kBatchedLeafGroupRows = 4;
+constexpr int64_t kBatchedLeafGroupRows = kSearchPiBatchedLeafGroupRows;
 
 // --- Batcher telemetry self-consistency ------------------------------------
 //
@@ -264,9 +228,7 @@ constexpr int64_t kBatchedLeafGroupRows = 4;
 // read it cannot drift apart.
 
 bool BatcherRowsIdentityOk(const open_spiel::BatcherTelemetry& t) {
-  // Every submitted row arrived either as a single Evaluate() or inside an
-  // EvaluateBatch() group (Phase-2 S7 rule 2).
-  return t.submitted_rows == (t.single_row_calls + t.group_rows);
+  return SearchPiBatcherRowsIdentityOk(t);
 }
 
 // NO leaf_rows_crosscheck_ok. Read this before adding one back.
@@ -299,11 +261,7 @@ bool BatcherRowsIdentityOk(const open_spiel::BatcherTelemetry& t) {
 
 bool BatcherDeviceTimingComplete(const open_spiel::BatcherTelemetry& t,
                                  bool device_applicable) {
-  // A mean over a SUBSET of batches reads exactly like a mean over all of them
-  // (Phase-2 S6). Only meaningful on CUDA; on CPU the device fields are
-  // legitimately zero, so applicability is reported rather than silently
-  // passing or silently failing.
-  return !device_applicable || (t.device_timed_batches == t.physical_batches);
+  return SearchPiBatcherDeviceTimingComplete(t, device_applicable);
 }
 
 void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
@@ -360,40 +318,6 @@ void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
     << ",\n";
   o << "  \"leaf_rows_crosscheck_ok\": null\n";
   o << "}\n";
-}
-
-void MergeRole(SearchPiRoleStats* dst, const SearchPiRoleStats& src) {
-  dst->roots_seen += src.roots_seen;
-  dst->searches_run += src.searches_run;
-  dst->rows_emitted += src.rows_emitted;
-  dst->fallbacks += src.fallbacks;
-  dst->simulations_completed += src.simulations_completed;
-  dst->simulations_requested += src.simulations_requested;
-  dst->searches_short_of_budget += src.searches_short_of_budget;
-  dst->simulation_shortfall += src.simulation_shortfall;
-  for (int i = 0; i < kSearchPiEarlyExitCount; ++i) {
-    dst->early_exit_counts[i] += src.early_exit_counts[i];
-  }
-  // "First" is the first in EPISODE order, and chunks merge in episode order,
-  // so the first chunk that saw one wins. Keeping the earliest rather than the
-  // last is what makes the field reproducible under any thread count.
-  if (dst->first_short_episode_id < 0 && src.first_short_episode_id >= 0) {
-    dst->first_short_episode_id = src.first_short_episode_id;
-    dst->first_short_decision_id = src.first_short_decision_id;
-    dst->first_short_simulations_completed = src.first_short_simulations_completed;
-    dst->first_short_simulations_requested = src.first_short_simulations_requested;
-    dst->first_short_bot_reason = src.first_short_bot_reason;
-    dst->first_short_session_reason = src.first_short_session_reason;
-  }
-  MergeSearchPiLatencyStats(dst, src);
-  dst->inherited_visits += src.inherited_visits;
-  dst->re_root_hits += src.re_root_hits;
-  dst->re_root_misses += src.re_root_misses;
-  dst->kept_despite_legacy_gate += src.kept_despite_legacy_gate;
-  dst->sum_target_entropy_norm += src.sum_target_entropy_norm;
-  dst->sum_raw_entropy_norm += src.sum_raw_entropy_norm;
-  dst->sum_kl_target_given_raw += src.sum_kl_target_given_raw;
-  dst->target_argmax_overrides += src.target_argmax_overrides;
 }
 
 std::string F17(double v) {
@@ -528,317 +452,41 @@ SearchPiConfig BuildConfig() {
 ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
                  const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
                  torch::Device device) {
-  const int games = absl::GetFlag(FLAGS_games);
-  const int chunk = absl::GetFlag(FLAGS_chunk_games);
-  const int64_t first = absl::GetFlag(FLAGS_first_episode_id);
-  const int generation = absl::GetFlag(FLAGS_generation);
-  const bool retain = absl::GetFlag(FLAGS_retain_rows);
-  const int num_chunks = games / chunk;
+  ConcurrentSearchPiCollectionConfig config;
+  config.search = BuildConfig();
+  config.search.next_episode_id = absl::GetFlag(FLAGS_first_episode_id);
+  config.generation = absl::GetFlag(FLAGS_generation);
+  config.collection_games = absl::GetFlag(FLAGS_games);
+  config.chunk_games = absl::GetFlag(FLAGS_chunk_games);
+  config.requested_workers = absl::GetFlag(FLAGS_threads);
+  config.batch_target = absl::GetFlag(FLAGS_batch_target);
+  config.batcher_timeout_ms = absl::GetFlag(FLAGS_batcher_timeout_ms);
+  config.warmup_games = absl::GetFlag(FLAGS_warmup_games);
+  config.retain_rows = absl::GetFlag(FLAGS_retain_rows);
+  config.logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+  config.output_dir = absl::GetFlag(FLAGS_output_dir);
+  config.arm = arm;
 
-  std::vector<SearchPiGenerationStats> chunk_stats(num_chunks);
-  std::vector<std::vector<SearchPiRow>> chunk_rows(retain ? num_chunks : 0);
-  std::atomic<int> next_chunk{0};
-  std::mutex log_mutex;
+  ArmResult result =
+      CollectSearchPiConcurrent(config, game, model, device);
 
-  // Uncapped, machine-readable first-fire-per-episode stream for the live
-  // union watcher. It is updated after each completed chunk, while the arm is
-  // still running, and contains one line per affected episode regardless of
-  // how many roots fired in that episode. The human SHORT SEARCH log remains
-  // capped forensic detail and is deliberately not a launch dependency.
-  const std::string output_dir = absl::GetFlag(FLAGS_output_dir);
-  if (output_dir.empty()) {
-    SpielFatalError("--output_dir is required for the short-episode stream");
-  }
-  std::error_code stream_ec;
-  std::filesystem::create_directories(output_dir, stream_ec);
-  const std::string short_stream_path =
-      output_dir + "/" + SearchPiArmName(arm) + "_short_episodes.jsonl";
-  std::ofstream short_stream(short_stream_path, std::ios::trunc);
-  if (!short_stream) {
-    SpielFatalError(absl::StrCat("cannot open short-episode stream: ",
-                                short_stream_path));
-  }
-
-  // main() rejects requested_threads > num_chunks before model/GPU setup. Do
-  // not silently clamp here: a capped G=24/32 cell paired with batch_target
-  // 96/128 is a timeout-flush experiment, not characterization of that G.
-  const int requested_threads = absl::GetFlag(FLAGS_threads);
-  const int nthreads = requested_threads;
-
-  // One evaluator per worker, all constructed HERE, on this thread, before any
-  // worker starts. Following dune_search_benchmark: the evaluator holds no
-  // mutable state, allocates its own input tensor per call and opens its own
-  // InferenceMode region, so many of them may read one shared model, which is
-  // loaded once and never mutated (that is also what makes the autocast weight
-  // cache safe -- dune_network.h:313-316). Constructing them up front rather
-  // than inside each worker avoids the one write the constructor does perform:
-  // DuneNNEvaluator's ctor calls model_->eval() on the SHARED model, which would
-  // otherwise race against another worker already inside forward().
-  // --- Reference mode vs production batched mode ---------------------------
-  //
-  // batch_target == 0 keeps the historical arrangement EXACTLY: N independent
-  // batch-1 DuneNNEvaluators, which is what reproduces the rung-2 hash chains.
-  // batch_target > 0 replaces them with ONE shared asynchronous BatchedEvaluator
-  // fronted by a per-worker BatchedNNEvaluator adapter -- so leaf inference from
-  // DIFFERENT GAMES coalesces into one physical forward.
-  //
-  // Cross-game batching is the whole mechanism, and it is worth being precise
-  // about why the wrapper alone would buy nothing: BatchedNNEvaluator already
-  // submits 4 rows per leaf (one observation per player), but those 4 rows are
-  // one leaf of ONE game and are already submitted together today. The speedup
-  // comes from many GAMES' leaf groups being resident in the queue at once,
-  // which is a property of nthreads > 1 sharing ONE batcher.
-  //
-  // Per-game search semantics are untouched either way: each worker still runs
-  // sequential PUCT, one simulation at a time, and blocks on leaf evaluation
-  // exactly where it previously blocked on a batch-1 forward. No virtual loss,
-  // no delayed backup, no within-search leaf collection -- that would be design
-  // (b), a different teacher.
-  const int batch_target = absl::GetFlag(FLAGS_batch_target);
-  const bool batched = batch_target > 0;
-  // 4*workers is the maximum number of rows that can be resident, not a useful
-  // target in general: every worker would have to reach a four-row leaf call at
-  // the same instant. main() bounds the independently tuned target by that
-  // physical capacity and records both values in every artifact.
-  const int max_inflight_rows =
-      batched ? static_cast<int>(kBatchedLeafGroupRows) * nthreads : 0;
-  const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
-
-  // Guards the shared model against the batcher's runner thread. Must outlive
-  // every evaluator below, so it is declared before them.
-  static std::shared_mutex model_mutex;
-
-  // --- Registered warm-up, on a THROWAWAY evaluator ------------------------
-  //
-  // Destroyed before the scored evaluator exists. See --warmup_games: sharing
-  // the scored batcher would advance its always-on counters before the first
-  // scored row and break the Phase-2 B3/S6 crosschecks, making a correct
-  // instrument look faulty. Warm-up episodes come from the reserved 900,000+
-  // range, disjoint from every scored episode, mirroring Phase-2's
-  // seed + 900000 convention.
-  const int warmup_games = absl::GetFlag(FLAGS_warmup_games);
-  // Validated HERE, before any GPU work, rather than left to fire inside the
-  // generator. SearchPiGenerator asserts games_per_generation % 4 == 0 for seat
-  // balance (dune_search_pi.cc:553), so an odd --warmup_games would abort the
-  // run at the warm-up -- cheap here, but the same flag reaches a multi-hour
-  // audit, and a fatal that arrives after the model has loaded reads like an
-  // instrument fault rather than a typo.
-  if (warmup_games % 4 != 0) {
-    SpielFatalError(absl::StrCat(
-        "--warmup_games must be a multiple of 4 for seat balance (got ",
-        warmup_games, ")"));
-  }
-  if (warmup_games > 0) {
-    torch::InferenceMode guard;
-    std::shared_ptr<open_spiel::BatchedEvaluator> warm_batched;
-    std::shared_ptr<algorithms::Evaluator> warm_eval;
-    if (batched) {
-      warm_batched = std::make_shared<open_spiel::BatchedEvaluator>(
-          model, batch_target, absl::GetFlag(FLAGS_batcher_timeout_ms), device,
-          &model_mutex, /*logit_cap=*/0.0f);
-      warm_eval =
-          std::make_shared<open_spiel::BatchedNNEvaluator>(warm_batched, logit_cap);
-    } else {
-      warm_eval = std::make_shared<DuneNNEvaluator>(model, device, logit_cap);
-    }
-    SearchPiConfig wcfg = BuildConfig();
-    wcfg.games_per_generation = warmup_games;
-    wcfg.next_episode_id = 900000;
-    SearchPiGenerator wgen(wcfg);
-    std::vector<SearchPiRow> wrows;
-    SearchPiGenerationStats wstats;
-    wgen.GenerateGeneration(generation, game, warm_eval, &wrows, &wstats, arm);
-    // Explicit teardown BEFORE the scored evaluator is constructed.
-    warm_eval.reset();
-    warm_batched.reset();
-    std::cout << "[audit] " << SearchPiArmName(arm) << " warm-up " << warmup_games
-              << " discarded games on a throwaway evaluator" << std::endl;
-  }
-
-  // The throughput gate is scored work only. Keep the registered warm-up, but
-  // do not charge its deliberately serial throwaway games to the scored arm.
-  const auto scored_wall_start = std::chrono::steady_clock::now();
-
-  // The shared batcher, constructed FRESH after warm-up so every counter it
-  // reports starts at zero for the scored run.
-  std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval;
-  if (batched) {
-    batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
-        model, batch_target, absl::GetFlag(FLAGS_batcher_timeout_ms), device,
-        &model_mutex, /*logit_cap=*/0.0f);
-    batched_eval->EnableBatcherTelemetry();
-  }
-
-  std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators;
-  evaluators.reserve(nthreads);
-  for (int t = 0; t < nthreads; ++t) {
-    if (batched) {
-      evaluators.push_back(
-          std::make_shared<open_spiel::BatchedNNEvaluator>(batched_eval, logit_cap));
-    } else {
-      evaluators.push_back(
-          std::make_shared<DuneNNEvaluator>(model, device, logit_cap));
+  // Preserve the legacy explicitly requested telemetry destination used by
+  // older parity launchers. The per-arm sidecar written by WriteArm remains the
+  // authoritative artifact.
+  const std::string legacy_path =
+      absl::GetFlag(FLAGS_batcher_telemetry_json_path);
+  if (result.telemetry_valid && !legacy_path.empty()) {
+    std::ofstream out(legacy_path, std::ios::trunc);
+    if (out) {
+      WriteBatcherTelemetryJson(
+          out, arm, result.telemetry, result.telemetry_device_applicable,
+          result.inference_calls, result.requested_workers,
+          result.actual_workers, result.configured_batch_target,
+          result.max_inflight_rows);
     }
   }
-
-  auto worker = [&](int slot) {
-    torch::InferenceMode guard;
-    std::shared_ptr<algorithms::Evaluator> evaluator = evaluators[slot];
-    for (;;) {
-      const int ci = next_chunk.fetch_add(1);
-      if (ci >= num_chunks) break;
-      SearchPiConfig cfg = BuildConfig();
-      cfg.games_per_generation = chunk;
-      cfg.next_episode_id = first + static_cast<int64_t>(ci) * chunk;
-      SearchPiGenerator gen(cfg);
-      std::vector<SearchPiRow> rows;
-      gen.GenerateGeneration(generation, game, evaluator, &rows,
-                             &chunk_stats[ci], arm);
-      if (retain) chunk_rows[ci] = std::move(rows);
-      {
-        std::lock_guard<std::mutex> lk(log_mutex);
-        for (const SearchPiGameOutcome& game_outcome :
-             chunk_stats[ci].games_played) {
-          if (game_outcome.searches_short_of_budget > 0) {
-            short_stream << "{\"episode_id\":" << game_outcome.episode_id
-                         << ",\"root_fires\":"
-                         << game_outcome.searches_short_of_budget << "}\n";
-          }
-        }
-        short_stream.flush();
-        if (!short_stream) {
-          SpielFatalError(absl::StrCat("write failed for short-episode stream: ",
-                                      short_stream_path));
-        }
-        std::cout << "[audit] " << SearchPiArmName(arm) << " chunk " << (ci + 1)
-                  << "/" << num_chunks << " episodes ["
-                  << chunk_stats[ci].first_episode_id << ".."
-                  << chunk_stats[ci].next_episode_id << ") rows="
-                  << chunk_stats[ci].rows_total << " P="
-                  << chunk_stats[ci].primary.simulations_completed << "/"
-                  << chunk_stats[ci].primary.simulations_requested << " C="
-                  << chunk_stats[ci].continuation.simulations_completed << "/"
-                  << chunk_stats[ci].continuation.simulations_requested
-                  << " in " << std::fixed << std::setprecision(1)
-                  << chunk_stats[ci].collection_wall_time_s << "s" << std::endl;
-      }
-    }
-  };
-
-  std::vector<std::thread> pool;
-  for (int t = 1; t < nthreads; ++t) pool.emplace_back(worker, t);
-  worker(0);
-  for (auto& th : pool) th.join();
-
-  // --- Batcher telemetry ---------------------------------------------------
-  //
-  // Read ONCE after the workload, per GetBatcherTelemetry()'s contract. Its
-  // absence on a batched arm is a Phase-2 S2 STOP, so the path is written
-  // whenever one exists. Two self-consistency gates travel with it:
-  //
-  //   rows_identity_ok      -- every submitted row arrived either as a single
-  //                            Evaluate() or inside an EvaluateBatch() group.
-  //                            If this is false the telemetry is not
-  //                            self-consistent and NO throughput claim may rest
-  //                            on it (Phase-2 S7 rule 2).
-  //   device_timing_complete -- device_timed_batches == physical_batches. A mean
-  //                            over a SUBSET of batches reads exactly like a
-  //                            mean over all of them (S6). Only meaningful on
-  //                            CUDA; on CPU the device fields are legitimately
-  //                            zero, so applicability is reported rather than
-  //                            silently passing or silently failing.
-  ArmResult r;
-  r.arm = arm;
-  r.requested_threads = requested_threads;
-  r.actual_workers = nthreads;
-  r.configured_batch_target = batch_target;
-  r.max_inflight_rows = max_inflight_rows;
-  if (batched) {
-    r.telemetry = batched_eval->GetBatcherTelemetry();
-    r.telemetry_valid = true;
-    r.telemetry_device_applicable = device.is_cuda();
-    const std::string legacy_path =
-        absl::GetFlag(FLAGS_batcher_telemetry_json_path);
-    if (!legacy_path.empty()) {
-      // Legacy single-arm destination, kept so the parity and pre-measure
-      // scripts that already pass it keep working. With --arm=both it holds
-      // whichever arm ran LAST; the per-arm copy WriteArm emits is the one the
-      // analyzer reads.
-      std::ofstream o(legacy_path, std::ios::trunc);
-      if (!o) {
-        std::cerr << "[audit] cannot open legacy telemetry path " << legacy_path
-                  << std::endl;
-      } else {
-        // std::ios::trunc matters: without it a shorter document over a longer
-        // pre-existing file leaves trailing bytes and the result does not parse.
-        WriteBatcherTelemetryJson(o, arm, r.telemetry,
-                                  r.telemetry_device_applicable,
-                                  r.inference_calls, r.requested_threads,
-                                  r.actual_workers,
-                                  r.configured_batch_target,
-                                  r.max_inflight_rows);
-        o.flush();
-        if (!o) {
-          std::cerr << "[audit] write failed for " << legacy_path << std::endl;
-        }
-      }
-    }
-    std::cout << "[audit] " << SearchPiArmName(arm) << " batcher: rows="
-              << r.telemetry.submitted_rows << " batches="
-              << r.telemetry.physical_batches << " mean_batch=" << std::fixed
-              << std::setprecision(2) << r.telemetry.mean_batch_size
-              << " occupancy=" << r.telemetry.target_occupancy
-              << " rows_identity_ok="
-              << (BatcherRowsIdentityOk(r.telemetry) ? "1" : "0")
-              << " search_inference_calls=" << r.inference_calls
-              << " evaluator_calls="
-              << (r.telemetry.group_calls + r.telemetry.single_row_calls)
-              << " leaf_groups_split=" << r.telemetry.leaf_groups_split
-              << " device_timing_complete="
-              << (BatcherDeviceTimingComplete(r.telemetry,
-                                              r.telemetry_device_applicable)
-                      ? "1" : "0")
-              << std::endl;
-  }
-  for (int ci = 0; ci < num_chunks; ++ci) {
-    const SearchPiGenerationStats& s = chunk_stats[ci];
-    MergeRole(&r.primary, s.primary);
-    MergeRole(&r.continuation, s.continuation);
-    MergeRole(&r.purchase, s.purchase);
-    MergeRole(&r.combat_intrigue, s.combat_intrigue);
-    MergeRole(&r.other_optional, s.other_optional);
-    for (int i = 0; i < 7; ++i) {
-      r.simulations_by_role[i] += s.simulations_by_role[i];
-      r.decisions_by_role[i] += s.decisions_by_role[i];
-    }
-    r.leader_rows_emitted += s.leader_rows_emitted;
-    r.inference_calls += s.inference_calls;
-    r.rows_total += s.rows_total;
-    for (const SearchPiGameOutcome& g : s.games_played) r.games.push_back(g);
-  }
-  if (retain) {
-    // Recomputed over the concatenation in episode order rather than composed
-    // from per-chunk chains: a rolling hash does not compose, and the value
-    // that has to be reproduced is the one a single undivided generation would
-    // have produced.
-    std::string tc, ec;
-    for (int ci = 0; ci < num_chunks; ++ci) {
-      for (const SearchPiRow& row : chunk_rows[ci]) {
-        tc = ChainSearchPiTargetHash(tc, row);
-        ec = ChainSearchPiExtendedRowHash(ec, row);
-        r.retained_rows.push_back(row);
-      }
-    }
-    r.target_hash_chain = tc;
-    r.extended_hash_chain = ec;
-  }
-  r.wall_time_s =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    scored_wall_start)
-          .count();
-  return r;
+  return result;
 }
-
 // Returns false if anything could not be written. An instrument that reports
 // success while having produced no artifact is the failure mode this lane's
 // rules exist to prevent: a mistyped --output_dir used to give zero files, no
@@ -883,6 +531,8 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          << ",\"continuation_simulations\":" << g.continuation_simulations
          << ",\"fallbacks\":" << g.fallbacks
          << ",\"watchdog_fallbacks\":" << g.watchdog_fallbacks
+         << ",\"watchdog_timeouts\":" << g.watchdog_timeouts
+         << ",\"non_timeout_early_exits\":" << g.non_timeout_early_exits
          << ",\"searches_short_of_budget\":" << g.searches_short_of_budget
          << ",\"off_scope_simulations\":" << g.off_scope_simulations
          // Per-episode budget accounting. The registration's exact invariant
@@ -957,7 +607,7 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      << ",\"first_episode_id\":" << absl::GetFlag(FLAGS_first_episode_id)
      << ",\"generation\":" << absl::GetFlag(FLAGS_generation)
      << ",\"threads\":" << absl::GetFlag(FLAGS_threads)
-     << ",\"requested_threads\":" << r.requested_threads
+     << ",\"requested_threads\":" << r.requested_workers
      << ",\"actual_workers\":" << r.actual_workers
      << ",\"chunk_games\":" << absl::GetFlag(FLAGS_chunk_games)
      << ",\"wall_time_s\":" << F17(r.wall_time_s)
@@ -1104,7 +754,7 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
     }
     WriteBatcherTelemetryJson(ot, r.arm, r.telemetry,
                               r.telemetry_device_applicable, r.inference_calls,
-                              r.requested_threads, r.actual_workers,
+                              r.requested_workers, r.actual_workers,
                               r.configured_batch_target,
                               r.max_inflight_rows);
     ot.flush();
