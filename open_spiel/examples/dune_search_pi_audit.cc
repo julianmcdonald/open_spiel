@@ -50,6 +50,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
@@ -704,6 +705,32 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          << ",\"fallbacks\":" << g.fallbacks
          << ",\"searches_short_of_budget\":" << g.searches_short_of_budget
          << ",\"off_scope_simulations\":" << g.off_scope_simulations
+         // Per-episode budget accounting. The registration's exact invariant
+         // has to be assertable over the RETAINED episodes, not over summary
+         // totals that still contain the discarded ones -- otherwise a single
+         // tolerated watchdog fire makes the totals unequal, the cell reads
+         // INVALID, and the discard rule §9 registers can never be reached.
+         << ",\"primary_simulations_requested\":"
+         << g.primary_simulations_requested
+         << ",\"continuation_simulations_requested\":"
+         << g.continuation_simulations_requested
+         // The wide teacher's three roles, no longer folded into continuation.
+         << ",\"wide_roots\":" << g.wide_roots
+         << ",\"wide_simulations\":" << g.wide_simulations
+         << ",\"wide_simulations_requested\":" << g.wide_simulations_requested
+         // The played-action manipulation check: roots where the action
+         // actually applied to the state differs from the raw-prior argmax the
+         // matched control would have played. A wide arm reading zero here
+         // played the control's moves -- the 2026-08-18 defect, which every
+         // other counter in this artifact survived.
+         << ",\"agent_roots_played_differs_from_raw\":"
+         << g.agent_roots_played_differs_from_raw
+         << ",\"wide_roots_played_differs_from_raw\":"
+         << g.wide_roots_played_differs_from_raw
+         // Trajectory identity. A divergence detector, NOT a parity reference.
+         << ",\"played_action_digest\":\"" << std::hex << std::setw(16)
+         << std::setfill('0') << g.played_action_digest << std::dec
+         << std::setfill(' ') << "\""
          // Additive game-shape telemetry (Fable, 2026-08-18). final_round is
          // the round ACTUALLY PLAYED (the engine's counter has already advanced
          // past it at kTerminal); final_vp is FinalScoredVp, the expression
@@ -724,8 +751,11 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
   }
 
   int64_t place[5] = {0, 0, 0, 0, 0};
+  int64_t agent_differs = 0, wide_differs = 0;
   for (const SearchPiGameOutcome& g : r.games) {
     place[g.searched_seat_placement]++;  // index 0 collects off-ladder returns
+    agent_differs += g.agent_roots_played_differs_from_raw;
+    wide_differs += g.wide_roots_played_differs_from_raw;
   }
   const double n = r.games.empty() ? 1.0 : static_cast<double>(r.games.size());
 
@@ -753,7 +783,14 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      << ",\"placement_1st\":" << place[1] << ",\"placement_2nd\":" << place[2]
      << ",\"placement_3rd\":" << place[3] << ",\"placement_4th\":" << place[4]
      << ",\"placement_offladder\":" << place[0]
-     << ",\"first_place_rate\":" << F17(static_cast<double>(place[1]) / n);
+     << ",\"first_place_rate\":" << F17(static_cast<double>(place[1]) / n)
+     // The played-action manipulation check, aggregated. Reported for EVERY
+     // arm: the raw controls must read exactly zero (they play the raw-prior
+     // argmax at their searched roles by construction, so a nonzero count is a
+     // defect in the check or in the control), and a searched arm reading zero
+     // at a role class it is registered to search played the control's moves.
+     << ",\"agent_roots_played_differs_from_raw\":" << agent_differs
+     << ",\"wide_roots_played_differs_from_raw\":" << wide_differs;
   EmitRoleJson(os, "primary", r.primary);
   EmitRoleJson(os, "continuation", r.continuation);
   // The wide teacher's three roles, emitted for EVERY arm. All-zero blocks in a
@@ -879,17 +916,23 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
   }
 
   if (r.arm == SearchPiArm::kRawArgmax) {
-    // Read simulations_by_role[2] and [3] -- the SEARCHED role indices -- and
-    // not the role-stats counters. Those counters are only ever incremented
-    // inside the branch this arm skips, so they are structurally zero here and
-    // would keep reading zero even if kPolicyOnly stopped short-circuiting and
-    // the control started spending real simulations. A check that cannot fail
-    // is not a check.
-    const int64_t searched_role_sims =
-        r.simulations_by_role[2] + r.simulations_by_role[3];
-    if (searched_role_sims != 0) {
-      fail(absl::StrCat("the raw control ran ", searched_role_sims,
-                        " simulations at the searched roles"));
+    // Read simulations_by_role[] -- the ROLE INDICES -- and not the role-stats
+    // counters. Those counters are only ever incremented inside the branch this
+    // arm skips, so they are structurally zero here and would keep reading zero
+    // even if kPolicyOnly stopped short-circuiting and the control started
+    // spending real simulations. A check that cannot fail is not a check.
+    //
+    // ALL SEVEN roles, not just {2,3}. The wide-matched control (raw at
+    // purchase_combat_budget = 64) reaches roles 4/5/6 as SEARCH roles, so the
+    // {2,3}-only check left the exact three roles that distinguish it from the
+    // narrow-matched control ungated. Fable's ruling is explicit: the
+    // arm-consistency gate covers both controls at zero simulations at EVERY
+    // role.
+    int64_t control_sims = 0;
+    for (int i = 0; i < 7; ++i) control_sims += r.simulations_by_role[i];
+    if (control_sims != 0) {
+      fail(absl::StrCat("the raw control ran ", control_sims,
+                        " simulations (must be zero at every role)"));
     }
     if (r.rows_total != 0) {
       fail(absl::StrCat("the raw control emitted ", r.rows_total, " rows"));
@@ -901,20 +944,87 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
                         r.continuation.roots_seen,
                         " continuation roots; both must be positive"));
     }
+    // A control PLAYS the raw-prior argmax at every role it treats as searched,
+    // so any divergence from it is a defect in the control or in the check.
+    // Asserted rather than assumed, because this same counter is the floor the
+    // wide teacher has to clear and a check that is only ever read in one
+    // direction is half a check.
+    int64_t differs = 0;
+    for (const SearchPiGameOutcome& g : r.games) {
+      differs += g.agent_roots_played_differs_from_raw +
+                 g.wide_roots_played_differs_from_raw;
+    }
+    if (differs != 0) {
+      fail(absl::StrCat("the raw control played something other than the "
+                        "raw-prior argmax at ", differs, " searched roots"));
+    }
     return ok;
   }
 
   // --- The searched arm ---
-  if (r.primary.fallbacks + r.continuation.fallbacks != 0) {
-    fail(absl::StrCat(r.primary.fallbacks + r.continuation.fallbacks,
-                      " technical fallbacks"));
+  //
+  // Every SEARCHED role bucket, arm-conditionally: {primary, continuation} for
+  // narrow, plus {purchase, combat_intrigue, other_optional} for wide. The
+  // buckets were added by the wide-arm fix but this loop was not extended to
+  // them, so the exact-budget invariant, the early-exit classes and
+  // --fail_on_short_search were all blind to two thirds of the wide teacher's
+  // roots -- which is the same shape of gap the fix was written to close.
+  std::vector<std::pair<const SearchPiRoleStats*, int>> roles = {
+      {&r.primary, absl::GetFlag(FLAGS_search_pi_primary_simulations)},
+      {&r.continuation, absl::GetFlag(FLAGS_search_pi_continuation_simulations)}};
+  std::vector<const char*> role_names = {"primary", "continuation"};
+  if (wide_scope) {
+    roles.push_back({&r.purchase, pcb});
+    roles.push_back({&r.combat_intrigue, pcb});
+    roles.push_back({&r.other_optional, pcb});
+    role_names.push_back("purchase");
+    role_names.push_back("combat_intrigue");
+    role_names.push_back("other_optional");
+  } else {
+    // And the converse for narrow: the three buckets must be untouched. A
+    // narrow arm with a leaked budget would otherwise show up nowhere.
+    for (const std::pair<const SearchPiRoleStats*, const char*>& b :
+         {std::make_pair(&r.purchase, "purchase"),
+          std::make_pair(&r.combat_intrigue, "combat_intrigue"),
+          std::make_pair(&r.other_optional, "other_optional")}) {
+      if (b.first->roots_seen != 0 || b.first->simulations_requested != 0) {
+        fail(absl::StrCat("narrow arm touched the ", b.second, " bucket: ",
+                          b.first->roots_seen, " roots, ",
+                          b.first->simulations_requested, " requested"));
+      }
+    }
   }
-  const int prim = absl::GetFlag(FLAGS_search_pi_primary_simulations);
-  const int cont = absl::GetFlag(FLAGS_search_pi_continuation_simulations);
-  const std::pair<const SearchPiRoleStats*, int> roles[2] = {
-      {&r.primary, prim}, {&r.continuation, cont}};
-  const char* role_names[2] = {"primary", "continuation"};
-  for (int i = 0; i < 2; ++i) {
+  int64_t all_fallbacks = 0;
+  for (const std::pair<const SearchPiRoleStats*, int>& rp : roles) {
+    all_fallbacks += rp.first->fallbacks;
+  }
+  if (all_fallbacks != 0) {
+    fail(absl::StrCat(all_fallbacks, " technical fallbacks"));
+  }
+  // The played-action floor. A searched arm that never played anything other
+  // than the raw-prior argmax at a role class it is registered to search did
+  // not test that class -- it billed for it. Asserted per class, because the
+  // 2026-08-18 defect was exactly a wide arm whose AGENT roles diverged
+  // normally while its three wide roles were inert.
+  int64_t agent_differs = 0, wide_differs = 0;
+  for (const SearchPiGameOutcome& g : r.games) {
+    agent_differs += g.agent_roots_played_differs_from_raw;
+    wide_differs += g.wide_roots_played_differs_from_raw;
+  }
+  if (agent_differs == 0) {
+    fail("the searched arm never played anything but the raw-prior argmax at "
+         "its agent roots -- it played the control's moves");
+  }
+  if (wide_scope && wide_differs == 0) {
+    fail("the WIDE arm never played anything but the raw-prior argmax at "
+         "kPurchase/kCombatIntrigue/kOtherOptional -- it searched them and "
+         "discarded the result, which is the 2026-08-18 defect");
+  }
+  if (!wide_scope && wide_differs != 0) {
+    fail(absl::StrCat("the NARROW arm diverged from raw at ", wide_differs,
+                      " wide roots it must never have searched"));
+  }
+  for (size_t i = 0; i < roles.size(); ++i) {
     const SearchPiRoleStats& rs = *roles[i].first;
     const int64_t want = rs.roots_seen * roles[i].second;
     if (rs.roots_seen <= 0) fail(absl::StrCat("no ", role_names[i], " roots"));

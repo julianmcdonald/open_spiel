@@ -549,6 +549,41 @@ Action RawPriorArgmaxAction(const ActionsAndProbs& prior,
   return best;
 }
 
+Action RawPriorArgmaxFromDiagnostics(const SearchDiagnostics& d) {
+  // The raw-prior argmax the MATCHED CONTROL would have played at this root,
+  // recomputed from the search's own diagnostics. Deliberately not a second
+  // Prior() call: an extra inference per searched root would perturb both
+  // inference_calls and the throughput this audit is gated on.
+  //
+  // Same source expression the emitted row uses for `raw_policy` (raw_priors
+  // when present, priors otherwise) and the same FIRST-WINS tie-break as
+  // RawPriorArgmaxAction, so on the raw arm -- where diagnostics.priors is
+  // filled from the identical Prior() call, in the identical order -- the two
+  // agree exactly rather than approximately.
+  const std::vector<double>& p =
+      d.raw_priors.empty() ? d.priors : d.raw_priors;
+  if (d.actions.empty() || p.size() != d.actions.size()) return kInvalidAction;
+  size_t best = 0;
+  for (size_t i = 1; i < p.size(); ++i) {
+    if (p[i] > p[best]) best = i;
+  }
+  return d.actions[best];
+}
+
+uint64_t MixPlayedAction(uint64_t h, int64_t decision_id, Action action) {
+  // FNV-1a 64 over the (decision_id, action) pair. A divergence detector; the
+  // lane's bitwise claims live in the sha256 row chains and nowhere else.
+  const uint64_t vals[2] = {static_cast<uint64_t>(decision_id),
+                            static_cast<uint64_t>(action)};
+  for (uint64_t v : vals) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= (v >> (8 * b)) & 0xFFull;
+      h *= 0x100000001b3ull;
+    }
+  }
+  return h;
+}
+
 // ---------------------------------------------------------------------------
 // Generator
 // ---------------------------------------------------------------------------
@@ -737,9 +772,17 @@ void SearchPiGenerator::GenerateGeneration(
         if (role == DuneDecisionRole::kAgentPrimary) {
           outcome.primary_roots++;
           outcome.primary_simulations += res.simulations_completed;
-        } else {
+        } else if (role == DuneDecisionRole::kAgentContinuation) {
           outcome.continuation_roots++;
           outcome.continuation_simulations += res.simulations_completed;
+        } else {
+          // kPurchase / kCombatIntrigue / kOtherOptional, reachable only when
+          // the wide budget is armed. Before this branch existed they fell into
+          // the continuation arm of a two-way split, so a wide episode reported
+          // ~55 phantom continuation roots and its per-episode counters could
+          // not be reconciled against the summary role buckets.
+          outcome.wide_roots++;
+          outcome.wide_simulations += res.simulations_completed;
         }
       }
 
@@ -774,6 +817,16 @@ void SearchPiGenerator::GenerateGeneration(
             ClassifySearchPiEarlyExit(res, legal_actions, requested);
         rs->simulations_requested += requested;
         rs->early_exit_counts[static_cast<int>(early_exit)]++;
+
+        // The same quantity per episode, incremented here rather than derived
+        // downstream, so the per-episode and summary views cannot disagree.
+        if (role == DuneDecisionRole::kAgentPrimary) {
+          outcome.primary_simulations_requested += requested;
+        } else if (role == DuneDecisionRole::kAgentContinuation) {
+          outcome.continuation_simulations_requested += requested;
+        } else {
+          outcome.wide_simulations_requested += requested;
+        }
 
         // Deadline headroom. A zero shortfall says the wall-clock guard did not
         // fire; these say by how much, which is what distinguishes "it held" from
@@ -965,6 +1018,28 @@ void SearchPiGenerator::GenerateGeneration(
       }
 
       SPIEL_CHECK_NE(chosen, kInvalidAction);
+
+      // --- The played-action manipulation check (Fable, 2026-08-18) ---------
+      //
+      // Counted HERE, on the action about to be applied to the state, and not
+      // anywhere upstream: the defect this exists to catch is precisely a
+      // search whose result never reaches this line. Searched roles only --
+      // the narrow arm's off-scope decisions are T=1 samples and their
+      // divergence from argmax measures the sampler, not the teacher.
+      if (is_search_role) {
+        const Action raw_ref = RawPriorArgmaxFromDiagnostics(res.diagnostics);
+        if (raw_ref != kInvalidAction && chosen != raw_ref) {
+          if (role == DuneDecisionRole::kAgentPrimary ||
+              role == DuneDecisionRole::kAgentContinuation) {
+            outcome.agent_roots_played_differs_from_raw++;
+          } else {
+            outcome.wide_roots_played_differs_from_raw++;
+          }
+        }
+      }
+      outcome.played_action_digest =
+          MixPlayedAction(outcome.played_action_digest, this_decision, chosen);
+
       ControllerDecision dec;
       dec.selected_action = chosen;
       dec.raw_reference_action = chosen;

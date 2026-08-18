@@ -374,6 +374,27 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     if (config_.purchase_combat_budget <= 0) {
       return get_policy_only_result("policy_only_purchase_combat");
     }
+    // kPolicyOnly means policy-only at EVERY role, not only the agent ones.
+    //
+    // This check lived solely in the kAgentPrimary/kAgentContinuation branch
+    // below, which was invisible for as long as the only raw control ever run
+    // was the NARROW one: at purchase_combat_budget == 0 the short-window roles
+    // took the early return immediately above and never reached a budget. The
+    // moment the WIDE-MATCHED control (raw at budget 64) exists, the same
+    // branch falls straight through to RunSearch -- so the control ran a real
+    // 64-simulation search at every kPurchase / kCombatIntrigue /
+    // kOtherOptional root, then discarded the result and played the raw-prior
+    // argmax anyway. Behaviourally the arm was still a control; it simply paid
+    // a searched arm's compute bill to be one, reported zero requested
+    // simulations against nonzero completed ones, and would have failed the
+    // registered "the control spent nothing" gate at hour N of the audit.
+    //
+    // Ordered AFTER the budget test on purpose, so the narrow control keeps
+    // emitting "policy_only_purchase_combat" and nothing about the existing
+    // instrument moves.
+    if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly) {
+      return get_policy_only_result("policy_only_mode");
+    }
     max_sims = config_.purchase_combat_budget - short_sims_completed_;
     if (budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) {
       int overall_remaining = config_.fixed_session_limit - session_new_simulations_completed_ - short_sims_completed_;

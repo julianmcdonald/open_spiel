@@ -491,6 +491,63 @@ struct SearchPiGameOutcome {
   // helper.
   int final_round = 0;
   std::vector<int> final_vp;  // FinalScoredVp per seat, engine order
+
+  // --- Per-episode budget accounting (2026-08-18) ---------------------------
+  //
+  // The registration's exact invariant is `completed == requested` at every
+  // searched root. It was assertable only over SUMMARY TOTALS, which include
+  // the very episodes the watchdog discard removes -- so a single tolerated
+  // fire made the totals unequal and the cell INVALID, and the whole discard
+  // rule was unreachable. Requested is carried per episode so the invariant can
+  // be asserted over the RETAINED set, which is what §9 actually registers.
+  //
+  // `*_requested` comes from the session's own soft_sim_limit, never from
+  // roots x budget, so `requested == roots x budget` stays a real check rather
+  // than an identity. Structurally zero in the raw arms: they take the branch
+  // that never resolves a budget, exactly as their role stats do.
+  int64_t primary_simulations_requested = 0;
+  int64_t continuation_simulations_requested = 0;
+
+  // The WIDE teacher's three roles, kept SEPARATE from continuation. They were
+  // previously absorbed by the `else` branch that splits primary from
+  // continuation, so in a wide arm `continuation_roots` silently counted
+  // ~55 extra roots per game and the per-episode split disagreed with the
+  // summary role buckets it is supposed to reconcile against.
+  int64_t wide_roots = 0;
+  int64_t wide_simulations = 0;
+  int64_t wide_simulations_requested = 0;
+
+  // --- The played-action manipulation check (Fable, 2026-08-18) -------------
+  //
+  // The 2026-08-18 review found a wide arm that ran its simulations and
+  // DISCARDED them: it played the narrow arm's moves at a 1.392x compute bill
+  // and passed every gate that existed. What makes that failure invisible is
+  // that the searched arm's telemetry is all about the search, not about what
+  // was PLAYED -- mcts_proposed_action is precisely the field that can diverge
+  // from the action applied to the state.
+  //
+  // So this counts, per searched role class, the roots where the action
+  // ACTUALLY PLAYED differs from the raw-prior argmax that the matched control
+  // would have played at the same root. It is a floor, not a target: a wide arm
+  // whose count is zero played the control's moves. The raw arms are
+  // structurally zero here by construction, and that is asserted rather than
+  // assumed.
+  //
+  // The argmax is recomputed from the search's own diagnostics -- no extra
+  // Prior() call, so no extra inference and no perturbation of throughput --
+  // with the same first-wins tie-break as RawPriorArgmaxAction.
+  int64_t agent_roots_played_differs_from_raw = 0;
+  int64_t wide_roots_played_differs_from_raw = 0;
+
+  // FNV-1a 64 over the searched seat's (decision_id, played action) sequence.
+  //
+  // A DIVERGENCE DETECTOR, not a parity reference: the lane's bitwise claims
+  // are the sha256 target/extended row chains and nothing else. Its one job is
+  // to make "wide played the same trajectory as narrow on episode X" a fact
+  // that can be read off two artifacts instead of inferred from coinciding
+  // returns. A silently null wide arm reproduces narrow's digest on EVERY
+  // episode; a partially null one reproduces it on some.
+  uint64_t played_action_digest = 0xcbf29ce484222325ull;  // FNV offset basis
 };
 
 // Placement 1..4 from an engine return, or 0 when it sits on no rung.

@@ -1977,6 +1977,169 @@ void Test24_WideScopeIsSearchedPlayedAndCounted(
   std::cout << "Test24 Passed!\n\n";
 }
 
+// FOUR ARMS, and the per-episode telemetry that has to reconcile against the
+// summary buckets. Three things are pinned here that nothing else pins:
+//
+//  1. The wide roles no longer land in the per-episode CONTINUATION counters.
+//     They did, silently, because the split was `primary : else` -- so a wide
+//     episode reported ~55 phantom continuation roots and no check could see
+//     it, since every existing check reads the summary buckets instead.
+//  2. `*_simulations_requested` is carried per episode, which is what makes the
+//     registration's exact invariant assertable over the RETAINED set rather
+//     than over totals that still contain the discarded episodes.
+//  3. The played-action counter, in BOTH directions: nonzero for a wide arm
+//     that actually plays its searches, and structurally zero for both raw
+//     controls. Zero on a wide arm is the 2026-08-18 defect.
+//
+// And the WIDE-MATCHED control (raw at budget 64) is exercised at all, which
+// nothing did before: it is a fourth arm, not a re-run of the third.
+void Test25_FourArmsPerEpisodeAccounting(
+    const std::shared_ptr<const open_spiel::Game>& game) {
+  std::cout << "Running Test25_FourArmsPerEpisodeAccounting...\n";
+  using namespace open_spiel;
+  const int kWide = 6;
+
+  auto run = [&](int budget, SearchPiArm arm, std::vector<SearchPiRow>* rows,
+                 SearchPiGenerationStats* st) {
+    SearchPiConfig c = FastConfig();
+    c.purchase_combat_budget = budget;
+    c.next_episode_id = 710000;
+    SearchPiGenerator gen(c);
+    auto ev = std::make_shared<PeakedMockEvaluator>(game->NumPlayers());
+    gen.GenerateGeneration(1, game, ev, rows, st, arm);
+  };
+
+  std::vector<SearchPiRow> rows[4];
+  SearchPiGenerationStats raw_nm, narrow, raw_wm, wide;
+  run(0,     SearchPiArm::kRawArgmax, &rows[0], &raw_nm);
+  run(0,     SearchPiArm::kSearched,  &rows[1], &narrow);
+  run(kWide, SearchPiArm::kRawArgmax, &rows[2], &raw_wm);
+  run(kWide, SearchPiArm::kSearched,  &rows[3], &wide);
+
+  // (1) Per-episode buckets reconcile against the summary role buckets, which
+  // is only true once the wide roles stop being counted as continuations.
+  auto sum = [](const SearchPiGenerationStats& s, auto field) {
+    int64_t t = 0;
+    for (const SearchPiGameOutcome& g : s.games_played) t += g.*field;
+    return t;
+  };
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::continuation_roots),
+                 wide.continuation.roots_seen);
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::primary_roots),
+                 wide.primary.roots_seen);
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::wide_roots),
+                 wide.purchase.roots_seen + wide.combat_intrigue.roots_seen +
+                     wide.other_optional.roots_seen);
+  SPIEL_CHECK_GT(sum(wide, &SearchPiGameOutcome::wide_roots), 0);
+  // The narrow arm must reconcile too, and must have no wide roots at all --
+  // the assertion that would have failed under the old two-way split only if
+  // the wide budget were armed, which is why narrow alone never caught it.
+  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::continuation_roots),
+                 narrow.continuation.roots_seen);
+  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::wide_roots), 0);
+
+  // (2) Requested, per episode, exact and equal to roots x dose.
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::wide_simulations_requested),
+                 sum(wide, &SearchPiGameOutcome::wide_roots) * kWide);
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::wide_simulations),
+                 sum(wide, &SearchPiGameOutcome::wide_simulations_requested));
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::primary_simulations_requested),
+                 wide.primary.simulations_requested);
+  SPIEL_CHECK_EQ(
+      sum(narrow, &SearchPiGameOutcome::continuation_simulations_requested),
+      narrow.continuation.simulations_requested);
+  // Both controls resolve no budget at all, exactly as their role stats do.
+  for (const SearchPiGenerationStats* c : {&raw_nm, &raw_wm}) {
+    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::primary_simulations_requested), 0);
+    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::wide_simulations_requested), 0);
+    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::wide_simulations), 0);
+    for (int r = 0; r < 7; ++r) SPIEL_CHECK_EQ(c->simulations_by_role[r], 0);
+  }
+
+  // (3) The played-action check.
+  //
+  // The counter's SEMANTICS are cross-checked against the emitted rows, which
+  // are an independent witness: each carries its own raw_policy and the action
+  // that was actually played. Deliberately NOT "the searched arm must diverge
+  // somewhere" -- under a peaked mock evaluator a 200-simulation agent root
+  // converges on the prior's own argmax, so such an assertion would be testing
+  // the mock. The audit binary carries the null-arm floor for real runs, and
+  // the pre-measure sets the operative one.
+  SPIEL_CHECK_EQ(narrow.primary.fallbacks + narrow.continuation.fallbacks, 0);
+  SPIEL_CHECK_EQ(wide.primary.fallbacks + wide.continuation.fallbacks, 0);
+  auto differs_from_rows = [](const std::vector<SearchPiRow>& rs, bool wide_roles) {
+    int64_t k = 0;
+    for (const SearchPiRow& row : rs) {
+      const bool is_wide = row.role == DuneDecisionRole::kPurchase ||
+                           row.role == DuneDecisionRole::kCombatIntrigue ||
+                           row.role == DuneDecisionRole::kOtherOptional;
+      if (is_wide != wide_roles) continue;
+      if (row.raw_policy.size() != row.legal_actions.size()) continue;
+      size_t best = 0;
+      for (size_t i = 1; i < row.raw_policy.size(); ++i) {
+        if (row.raw_policy[i] > row.raw_policy[best]) best = i;
+      }
+      if (row.chosen_action != row.legal_actions[best]) k++;
+    }
+    return k;
+  };
+  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::agent_roots_played_differs_from_raw),
+                 differs_from_rows(rows[1], false));
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::agent_roots_played_differs_from_raw),
+                 differs_from_rows(rows[3], false));
+  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw),
+                 differs_from_rows(rows[3], true));
+  // The one direction the mock DOES exercise: a 6-simulation wide root does not
+  // reproduce the prior's argmax, so a wide arm that discarded its searches
+  // would read zero here. That is the 2026-08-18 defect, and it is the reading
+  // the audit binary hard-fails on.
+  SPIEL_CHECK_GT(sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
+  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
+  // Both controls are structurally zero: they play the raw-prior argmax at
+  // every role they treat as searched, by construction.
+  for (const SearchPiGenerationStats* c : {&raw_nm, &raw_wm}) {
+    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::agent_roots_played_differs_from_raw), 0);
+    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
+  }
+
+  // The two controls are DIFFERENT ARMS. raw_wm plays argmax at the three wide
+  // roles where raw_nm samples at T=1, which is the whole reason Fable required
+  // a fourth arm: without it, wide - raw_nm bundles "search at three roles"
+  // with "argmax instead of sampling at three roles".
+  bool controls_differ = false, wide_differs_from_narrow = false;
+  SPIEL_CHECK_EQ(raw_nm.games_played.size(), raw_wm.games_played.size());
+  for (size_t i = 0; i < raw_nm.games_played.size(); ++i) {
+    SPIEL_CHECK_EQ(raw_nm.games_played[i].episode_id,
+                   raw_wm.games_played[i].episode_id);
+    if (raw_nm.games_played[i].played_action_digest !=
+        raw_wm.games_played[i].played_action_digest) {
+      controls_differ = true;
+    }
+    if (narrow.games_played[i].played_action_digest !=
+        wide.games_played[i].played_action_digest) {
+      wide_differs_from_narrow = true;
+    }
+  }
+  SPIEL_CHECK_TRUE(controls_differ);
+  SPIEL_CHECK_TRUE(wide_differs_from_narrow);
+
+  // The digest is a function of the played sequence and nothing else: a rerun
+  // of the same arm reproduces it, or it cannot certify a divergence.
+  std::vector<SearchPiRow> again_rows;
+  SearchPiGenerationStats again;
+  run(kWide, SearchPiArm::kSearched, &again_rows, &again);
+  for (size_t i = 0; i < wide.games_played.size(); ++i) {
+    SPIEL_CHECK_EQ(again.games_played[i].played_action_digest,
+                   wide.games_played[i].played_action_digest);
+  }
+
+  std::cout << "  wide roots " << sum(wide, &SearchPiGameOutcome::wide_roots)
+            << ", played != raw at "
+            << sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw)
+            << " of them; both controls at 0; four distinct trajectories\n";
+  std::cout << "Test25 Passed!\n\n";
+}
+
 int main(int argc, char** argv) {
   using namespace open_spiel;
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -2007,6 +2170,7 @@ int main(int argc, char** argv) {
   Test21_MatchedRawArm(game);
   Test22_GamesPerGenerationSurface(game);
   Test24_WideScopeIsSearchedPlayedAndCounted(game);
+  Test25_FourArmsPerEpisodeAccounting(game);
 
   std::cout << "All dune search-PI tests passed!\n";
   return 0;
