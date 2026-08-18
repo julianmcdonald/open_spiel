@@ -188,6 +188,30 @@ struct SearchPiConfig {
   int primary_simulations = 200;       // NEW simulations at kAgentPrimary
   int continuation_simulations = 64;   // NEW simulations per kAgentContinuation
 
+  // --- Scope: the wide teacher's one axis. ---
+  // NEW simulations at kPurchase, kCombatIntrigue and kOtherOptional -- one
+  // budget covers all three, because <= 0 makes DuneSearchSession::Search
+  // return policy_only_purchase_combat before any budget is resolved
+  // (dune_search_session.cc:354-355). The default 0 is the NARROW teacher and
+  // is exactly what this lane has always run, so leaving it alone reproduces
+  // rung 1/2/3a behaviour bit-for-bit; the batched lane's wide arm registers 64
+  // (SEARCH_PI_BATCHED_TEACHER_REGISTRATION_2026_08_18.md §3.3). It is a
+  // parameter of the wide teacher's IDENTITY, not a tuning knob: scope and
+  // batching must never vary in the same cell.
+  int purchase_combat_budget = 0;
+
+  // --- Runaway watchdog, NOT a budget. ---
+  // The lane historically never set DuneSearchConfig::relative_time_budget_ms,
+  // so it inherited the 10,000 ms struct default (dune_puct_is_mcts.h:34) -- a
+  // default that was never this lane's decision and that bit twice (D4's
+  // shortfall, 3a's three clips). The default here is that same 10,000 ms so
+  // that not setting it is behaviourally identical to the historical lane and
+  // the batch-1 parity references still reproduce; the batched teacher sets
+  // 60,000 ms explicitly as a FATAL watchdog with no shortfall tolerance.
+  // Whatever the value, the gate that protects the science is the budget
+  // invariant (simulations_completed == simulations_requested), not this clock.
+  double relative_time_budget_ms = 10000.0;
+
   // --- Search core ---
   double puct_c = 0.30;
   int max_search_decision_depth = -1;  // uncapped

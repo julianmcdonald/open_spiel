@@ -1406,6 +1406,11 @@ void TestScalarHelpers() {
   SearchPiConfig c = FastConfig();
   DuneSearchConfig sc = SearchPiSearchConfigFor(c, 42);
   SPIEL_CHECK_EQ(sc.purchase_combat_budget, 0);
+  // The watchdog default. Both of these are now read from SearchPiConfig rather
+  // than hard-coded/unset, so they are pinned HERE at their historical values:
+  // an unflagged lane must stay bit-for-bit identical to rungs 1/2/3a, which is
+  // what makes the recorded parity chains usable as references at all.
+  SPIEL_CHECK_FLOAT_EQ(sc.relative_time_budget_ms, 10000.0);
   SPIEL_CHECK_FALSE(sc.search_leader_draft);
   SPIEL_CHECK_EQ(sc.pi_primary_simulations, c.primary_simulations);
   SPIEL_CHECK_EQ(sc.pi_continuation_simulations, c.continuation_simulations);
@@ -1831,6 +1836,58 @@ void Test22_GamesPerGenerationSurface(const std::shared_ptr<const Game>& game) {
 }  // namespace
 }  // namespace open_spiel
 
+// The batched teacher's two new config surfaces: the SCOPE axis (the wide arm's
+// only difference from narrow) and the runaway WATCHDOG. Both were previously
+// hard-coded or left unset in SearchPiSearchConfigFor.
+//
+// The first half of this test is the one that matters most, and it is not about
+// the new feature at all: it asserts that NOT using the feature reproduces the
+// historical lane exactly. The batch-1 parity references (rung-2 arm D gen 1)
+// are only meaningful as references if a default-configured run is unchanged,
+// so a regression in the defaults would silently invalidate the hard gate
+// rather than fail it.
+void Test23_ScopeAndWatchdogSurface() {
+  std::cout << "Running Test23_ScopeAndWatchdogSurface...\n";
+  using namespace open_spiel;
+
+  // 1. Defaults ARE the historical narrow teacher.
+  SearchPiConfig narrow = FastConfig();
+  SPIEL_CHECK_EQ(narrow.purchase_combat_budget, 0);
+  SPIEL_CHECK_FLOAT_EQ(narrow.relative_time_budget_ms, 10000.0);
+  DuneSearchConfig ns = SearchPiSearchConfigFor(narrow, 7);
+  SPIEL_CHECK_EQ(ns.purchase_combat_budget, 0);
+  SPIEL_CHECK_FLOAT_EQ(ns.relative_time_budget_ms, 10000.0);
+
+  // 2. The registered WIDE dose propagates, and is the ONLY thing that moves.
+  SearchPiConfig wide = FastConfig();
+  wide.purchase_combat_budget = 64;
+  DuneSearchConfig ws = SearchPiSearchConfigFor(wide, 7);
+  SPIEL_CHECK_EQ(ws.purchase_combat_budget, 64);
+  SPIEL_CHECK_EQ(ws.pi_primary_simulations, ns.pi_primary_simulations);
+  SPIEL_CHECK_EQ(ws.pi_continuation_simulations, ns.pi_continuation_simulations);
+  SPIEL_CHECK_FLOAT_EQ(ws.puct_c, ns.puct_c);
+  SPIEL_CHECK_FLOAT_EQ(ws.relative_time_budget_ms, ns.relative_time_budget_ms);
+  SPIEL_CHECK_EQ(ws.fixed_continuation_reserve, 0);
+
+  // 3. Widening scope must NOT widen to leader picks. Leader selection is not
+  //    part of the scope axis under test, and the generator fatals if it were.
+  SPIEL_CHECK_FALSE(ws.search_leader_draft);
+  SPIEL_CHECK_FALSE(ws.leader_mass_only_coverage);
+
+  // 4. The 60,000 ms fatal watchdog propagates independently of scope.
+  SearchPiConfig batched = FastConfig();
+  batched.relative_time_budget_ms = 60000.0;
+  DuneSearchConfig bs = SearchPiSearchConfigFor(batched, 7);
+  SPIEL_CHECK_FLOAT_EQ(bs.relative_time_budget_ms, 60000.0);
+  SPIEL_CHECK_EQ(bs.purchase_combat_budget, 0);  // scope unchanged by watchdog
+
+  std::cout << "  narrow pcb=" << ns.purchase_combat_budget << " watchdog="
+            << ns.relative_time_budget_ms << " ms | wide pcb="
+            << ws.purchase_combat_budget << " | batched watchdog="
+            << bs.relative_time_budget_ms << " ms\n";
+  std::cout << "Test23 Passed!\n\n";
+}
+
 int main(int argc, char** argv) {
   using namespace open_spiel;
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
@@ -1848,6 +1905,7 @@ int main(int argc, char** argv) {
   Test17_HashChains();
   Test18_LearnerTelemetry();
   Test19_StateRoundTrip();
+  Test23_ScopeAndWatchdogSurface();
 
   // Game-driving tests last: they are the slow ones.
   Test03_04_RoleScoping(game);

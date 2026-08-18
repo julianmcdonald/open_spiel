@@ -46,6 +46,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -56,6 +57,7 @@
 #include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
+#include "dune_batched_evaluator.h"
 #include "dune_evaluator.h"
 #include "dune_network.h"
 #include "dune_search_pi.h"
@@ -126,6 +128,53 @@ ABSL_FLAG(int, seed, 20276001,
           "Master seed. Feeds torch::manual_seed exactly as the trainer does; "
           "it does not seed the game, which draws from --search_pi_seed_domain.");
 ABSL_FLAG(bool, deterministic, true, "Strict LibTorch deterministic algorithms.");
+// --- The batched teacher ---------------------------------------------------
+//
+// EVERY DEFAULT BELOW REPRODUCES THE HISTORICAL UNBATCHED LANE EXACTLY. A run
+// that passes none of these flags is the rung-3a instrument bit-for-bit, which
+// is what lets the batch-1 parity references stay meaningful references.
+ABSL_FLAG(int, batch_target, 0,
+          "0 = REFERENCE MODE: one unbatched DuneNNEvaluator per worker, the "
+          "historical path, which is what reproduces the rung-2 hash chains "
+          "bitwise. >0 = production batched mode: ONE shared BatchedEvaluator "
+          "with this target row count, serving every worker. Registered as "
+          "4*G for G concurrent games, since a leaf group is 4 rows "
+          "(num_players). Routing batch-1 through the unbatched path is the "
+          "allowance recorded in proposal §8.1 Q4 -- preserving a reference "
+          "mode, not evading the check.");
+ABSL_FLAG(int, batcher_timeout_ms, 2,
+          "Batcher flush timeout. Phase-2's registered operating point; it "
+          "swept {0,1,2,5}. Inert unless --batch_target > 0.");
+ABSL_FLAG(int, warmup_games, 0,
+          "Discarded warm-up games, run on a THROWAWAY evaluator that is "
+          "destroyed before the scored one is constructed. This is not "
+          "optional hygiene: EnableBatcherTelemetry() arms the per-batch "
+          "sections but does NOT reset the always-on counters, so a warm-up "
+          "sharing the scored batcher would leave group_rows above the "
+          "leaf-evaluation delta and device_timed_batches permanently below "
+          "physical_batches -- making every first batched arm look like an "
+          "instrument fault. Warm-up episodes come from the reserved 900,000+ "
+          "range so they never replay a scored episode.");
+ABSL_FLAG(std::string, batcher_telemetry_json_path, "",
+          "Where to write batcher telemetry. Its ABSENCE on a batched arm is a "
+          "STOP (Phase-2 S2), so a batched run should always set it.");
+
+ABSL_FLAG(int, search_pi_purchase_combat_budget, 0,
+          "NEW simulations at kPurchase / kCombatIntrigue / kOtherOptional -- "
+          "one budget covers all three. 0 = the NARROW teacher (agent turns "
+          "only), which is what rungs 1/2/3a measured. The registered WIDE arm "
+          "is 64: the lane's own continuation budget, with PF-C precedent, at "
+          "1.392x the narrow arm's simulation load. The out-of-lane default of "
+          "16 is 1.098x -- a token budget that would test 10% more compute "
+          "rather than scope. A parameter of the wide teacher's IDENTITY.");
+ABSL_FLAG(double, search_pi_relative_time_budget_ms, 10000.0,
+          "Per-root wall-clock watchdog. 10,000 ms is the historical inherited "
+          "struct default and is kept as the flag default so an unflagged run "
+          "matches history. The batched teacher registers 60,000 ms as a FATAL "
+          "watchdog with NO shortfall tolerance -- its only function is runaway "
+          "protection, and the gate that protects the science is the budget "
+          "invariant (completed == requested), not this clock.");
+
 ABSL_FLAG(int, threads, 1,
           "Concurrent game workers. NOT a free throughput knob: every searched "
           "root runs under a live 10,000 ms wall-clock deadline (the lane never "
@@ -323,8 +372,15 @@ SearchPiConfig BuildConfig() {
   c.searched_seat_unsearched_temperature =
       absl::GetFlag(FLAGS_search_pi_unsearched_role_temperature);
   c.seed_domain = absl::GetFlag(FLAGS_search_pi_seed_domain);
+  // The scope axis (0 = narrow) and the runaway watchdog. Both default to the
+  // historical values, so an unflagged BuildConfig is the rung-3a config.
+  c.purchase_combat_budget =
+      absl::GetFlag(FLAGS_search_pi_purchase_combat_budget);
+  c.relative_time_budget_ms =
+      absl::GetFlag(FLAGS_search_pi_relative_time_budget_ms);
   // The Leader teacher is never armed here. The lane's scope is agent-turn
   // decisions, and SearchPiGenerator's constructor fatals if this is true.
+  // Widening purchase/combat/optional does NOT widen to leader picks.
   c.search_leader_draft = false;
   return c;
 }
@@ -356,16 +412,95 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   // than inside each worker avoids the one write the constructor does perform:
   // DuneNNEvaluator's ctor calls model_->eval() on the SHARED model, which would
   // otherwise race against another worker already inside forward().
-  std::vector<std::shared_ptr<DuneNNEvaluator>> evaluators;
+  // --- Reference mode vs production batched mode ---------------------------
+  //
+  // batch_target == 0 keeps the historical arrangement EXACTLY: N independent
+  // batch-1 DuneNNEvaluators, which is what reproduces the rung-2 hash chains.
+  // batch_target > 0 replaces them with ONE shared asynchronous BatchedEvaluator
+  // fronted by a per-worker BatchedNNEvaluator adapter -- so leaf inference from
+  // DIFFERENT GAMES coalesces into one physical forward.
+  //
+  // Cross-game batching is the whole mechanism, and it is worth being precise
+  // about why the wrapper alone would buy nothing: BatchedNNEvaluator already
+  // submits 4 rows per leaf (one observation per player), but those 4 rows are
+  // one leaf of ONE game and are already submitted together today. The speedup
+  // comes from many GAMES' leaf groups being resident in the queue at once,
+  // which is a property of nthreads > 1 sharing ONE batcher.
+  //
+  // Per-game search semantics are untouched either way: each worker still runs
+  // sequential PUCT, one simulation at a time, and blocks on leaf evaluation
+  // exactly where it previously blocked on a batch-1 forward. No virtual loss,
+  // no delayed backup, no within-search leaf collection -- that would be design
+  // (b), a different teacher.
+  const int batch_target = absl::GetFlag(FLAGS_batch_target);
+  const bool batched = batch_target > 0;
+  const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+
+  // Guards the shared model against the batcher's runner thread. Must outlive
+  // every evaluator below, so it is declared before them.
+  static std::shared_mutex model_mutex;
+
+  // --- Registered warm-up, on a THROWAWAY evaluator ------------------------
+  //
+  // Destroyed before the scored evaluator exists. See --warmup_games: sharing
+  // the scored batcher would advance its always-on counters before the first
+  // scored row and break the Phase-2 B3/S6 crosschecks, making a correct
+  // instrument look faulty. Warm-up episodes come from the reserved 900,000+
+  // range, disjoint from every scored episode, mirroring Phase-2's
+  // seed + 900000 convention.
+  const int warmup_games = absl::GetFlag(FLAGS_warmup_games);
+  if (warmup_games > 0) {
+    torch::InferenceMode guard;
+    std::shared_ptr<open_spiel::BatchedEvaluator> warm_batched;
+    std::shared_ptr<algorithms::Evaluator> warm_eval;
+    if (batched) {
+      warm_batched = std::make_shared<open_spiel::BatchedEvaluator>(
+          model, batch_target, absl::GetFlag(FLAGS_batcher_timeout_ms), device,
+          &model_mutex, /*logit_cap=*/0.0f);
+      warm_eval =
+          std::make_shared<open_spiel::BatchedNNEvaluator>(warm_batched, logit_cap);
+    } else {
+      warm_eval = std::make_shared<DuneNNEvaluator>(model, device, logit_cap);
+    }
+    SearchPiConfig wcfg = BuildConfig();
+    wcfg.games_per_generation = warmup_games;
+    wcfg.next_episode_id = 900000;
+    SearchPiGenerator wgen(wcfg);
+    std::vector<SearchPiRow> wrows;
+    SearchPiGenerationStats wstats;
+    wgen.GenerateGeneration(generation, game, warm_eval, &wrows, &wstats, arm);
+    // Explicit teardown BEFORE the scored evaluator is constructed.
+    warm_eval.reset();
+    warm_batched.reset();
+    std::cout << "[audit] " << SearchPiArmName(arm) << " warm-up " << warmup_games
+              << " discarded games on a throwaway evaluator" << std::endl;
+  }
+
+  // The shared batcher, constructed FRESH after warm-up so every counter it
+  // reports starts at zero for the scored run.
+  std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval;
+  if (batched) {
+    batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
+        model, batch_target, absl::GetFlag(FLAGS_batcher_timeout_ms), device,
+        &model_mutex, /*logit_cap=*/0.0f);
+    batched_eval->EnableBatcherTelemetry();
+  }
+
+  std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators;
   evaluators.reserve(nthreads);
   for (int t = 0; t < nthreads; ++t) {
-    evaluators.push_back(std::make_shared<DuneNNEvaluator>(
-        model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap))));
+    if (batched) {
+      evaluators.push_back(
+          std::make_shared<open_spiel::BatchedNNEvaluator>(batched_eval, logit_cap));
+    } else {
+      evaluators.push_back(
+          std::make_shared<DuneNNEvaluator>(model, device, logit_cap));
+    }
   }
 
   auto worker = [&](int slot) {
     torch::InferenceMode guard;
-    std::shared_ptr<DuneNNEvaluator> evaluator = evaluators[slot];
+    std::shared_ptr<algorithms::Evaluator> evaluator = evaluators[slot];
     for (;;) {
       const int ci = next_chunk.fetch_add(1);
       if (ci >= num_chunks) break;
@@ -398,6 +533,77 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   for (int t = 1; t < nthreads; ++t) pool.emplace_back(worker, t);
   worker(0);
   for (auto& th : pool) th.join();
+
+  // --- Batcher telemetry ---------------------------------------------------
+  //
+  // Read ONCE after the workload, per GetBatcherTelemetry()'s contract. Its
+  // absence on a batched arm is a Phase-2 S2 STOP, so the path is written
+  // whenever one exists. Two self-consistency gates travel with it:
+  //
+  //   rows_identity_ok      -- every submitted row arrived either as a single
+  //                            Evaluate() or inside an EvaluateBatch() group.
+  //                            If this is false the telemetry is not
+  //                            self-consistent and NO throughput claim may rest
+  //                            on it (Phase-2 S7 rule 2).
+  //   device_timing_complete -- device_timed_batches == physical_batches. A mean
+  //                            over a SUBSET of batches reads exactly like a
+  //                            mean over all of them (S6). Only meaningful on
+  //                            CUDA; on CPU the device fields are legitimately
+  //                            zero, so applicability is reported rather than
+  //                            silently passing or silently failing.
+  const std::string telemetry_path =
+      absl::GetFlag(FLAGS_batcher_telemetry_json_path);
+  if (batched && !telemetry_path.empty()) {
+    const open_spiel::BatcherTelemetry t = batched_eval->GetBatcherTelemetry();
+    const bool rows_identity_ok =
+        t.submitted_rows == (t.single_row_calls + t.group_rows);
+    const bool device_applicable = device.is_cuda();
+    const bool device_timing_complete =
+        !device_applicable || (t.device_timed_batches == t.physical_batches);
+    std::ofstream o(telemetry_path);
+    o << std::setprecision(10);
+    o << "{\n";
+    o << "  \"arm\": \"" << SearchPiArmName(arm) << "\",\n";
+    o << "  \"submitted_rows\": " << t.submitted_rows << ",\n";
+    o << "  \"physical_batches\": " << t.physical_batches << ",\n";
+    o << "  \"mean_batch_size\": " << t.mean_batch_size << ",\n";
+    o << "  \"p50_batch_size\": " << t.p50_batch_size << ",\n";
+    o << "  \"p95_batch_size\": " << t.p95_batch_size << ",\n";
+    o << "  \"max_batch_size\": " << t.max_batch_size << ",\n";
+    o << "  \"target_batch_size\": " << t.target_batch_size << ",\n";
+    o << "  \"timeout_ms\": " << t.timeout_ms << ",\n";
+    o << "  \"target_occupancy\": " << t.target_occupancy << ",\n";
+    o << "  \"timeout_flush_batches\": " << t.timeout_flush_batches << ",\n";
+    o << "  \"single_row_calls\": " << t.single_row_calls << ",\n";
+    o << "  \"group_calls\": " << t.group_calls << ",\n";
+    o << "  \"group_rows\": " << t.group_rows << ",\n";
+    o << "  \"leaf_groups_split\": " << t.leaf_groups_split << ",\n";
+    o << "  \"single_wait_ms_mean\": " << t.single_wait_ms_mean << ",\n";
+    o << "  \"single_wait_ms_max\": " << t.single_wait_ms_max << ",\n";
+    o << "  \"group_wait_ms_mean\": " << t.group_wait_ms_mean << ",\n";
+    o << "  \"group_wait_ms_max\": " << t.group_wait_ms_max << ",\n";
+    o << "  \"h2d_ms\": " << t.h2d_ms << ",\n";
+    o << "  \"forward_ms\": " << t.forward_ms << ",\n";
+    o << "  \"output_cast_ms\": " << t.output_cast_ms << ",\n";
+    o << "  \"d2h_ms\": " << t.d2h_ms << ",\n";
+    o << "  \"sync_ms\": " << t.sync_ms << ",\n";
+    o << "  \"device_timed_batches\": " << t.device_timed_batches << ",\n";
+    o << "  \"device_timing_applicable\": "
+      << (device_applicable ? "true" : "false") << ",\n";
+    o << "  \"device_timing_complete\": "
+      << (device_timing_complete ? "true" : "false") << ",\n";
+    o << "  \"rows_identity_ok\": " << (rows_identity_ok ? "true" : "false")
+      << "\n";
+    o << "}\n";
+    o.close();
+    std::cout << "[audit] " << SearchPiArmName(arm) << " batcher: rows="
+              << t.submitted_rows << " batches=" << t.physical_batches
+              << " mean_batch=" << std::fixed << std::setprecision(2)
+              << t.mean_batch_size << " occupancy=" << t.target_occupancy
+              << " rows_identity_ok=" << (rows_identity_ok ? "1" : "0")
+              << " device_timing_complete=" << (device_timing_complete ? "1" : "0")
+              << std::endl;
+  }
 
   ArmResult r;
   r.arm = arm;

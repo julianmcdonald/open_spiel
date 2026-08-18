@@ -276,7 +276,7 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   cfg.pi_primary_simulations = config.primary_simulations;
   cfg.pi_continuation_simulations = config.continuation_simulations;
 
-  // ZERO simulations at every role this lane must not search.
+  // Simulations at the three roles the NARROW teacher must not search.
   //
   // purchase_combat_budget <= 0 makes DuneSearchSession::Search return the
   // policy-only "policy_only_purchase_combat" result before any budget is
@@ -284,11 +284,24 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   // kCombatIntrigue and kOtherOptional. search_leader_draft == false sends
   // kLeaderSelection down the "forced_or_bookkeeping" early return
   // (dune_search_session.cc:339-341). kForcedOrBookkeeping returns there too.
-  // Three roles, two guards, all structural rather than budget-driven.
-  cfg.purchase_combat_budget = 0;
+  //
+  // This was a hard-coded 0 through rung 3a. It is now read from the config so
+  // the WIDE arm can register a nonzero dose -- the SearchPiConfig default is
+  // still 0, so every caller that does not set it is unchanged bit-for-bit.
+  // search_leader_draft stays structurally false regardless: leader picks are
+  // not part of the scope axis under test, and SearchPiGenerator's constructor
+  // fatals if it is ever true here.
+  cfg.purchase_combat_budget = config.purchase_combat_budget;
   cfg.fixed_continuation_reserve = 0;
   cfg.search_leader_draft = false;
   cfg.leader_mass_only_coverage = false;
+
+  // The runaway watchdog. Previously never assigned, so it inherited
+  // DuneSearchConfig's own 10,000 ms default; SearchPiConfig's default is that
+  // same 10,000 ms, which makes this assignment a no-op for every historical
+  // caller and keeps the rung-2 parity chains reproducible. The batched teacher
+  // registers 60,000 ms.
+  cfg.relative_time_budget_ms = config.relative_time_budget_ms;
 
   // The search result itself must not be discarded for covering few actions --
   // that is exactly the PF-C behaviour this lane exists to remove. A
