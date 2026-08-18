@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cassert>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -644,6 +645,43 @@ int main(int argc, char* argv[]) {
       std::cout << "  CUDA unavailable: coverage assertion skipped\n";
     }
     std::cout << "Test 10 Passed!\n\n";
+  }
+
+  // Test 11: a physical target boundary must never split one logical
+  // EvaluateBatch() leaf group. Two singles followed by one four-row group
+  // create a six-row queue against target four. The correct dispatch is 2+4;
+  // the former min(target, queue_size) scoop dispatched 4+2 and split the
+  // logical group across both forwards.
+  {
+    std::cout << "=== Test 11: leaf groups survive target boundaries ===\n";
+    const int64_t kObs = 5580;
+    torch::manual_seed(20277003);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kObs, /*hidden_dim=*/32, /*action_dim=*/8, /*num_blocks=*/1);
+    model->eval();
+    torch::Device cpu(torch::kCPU);
+    model->to(cpu);
+    std::shared_mutex m;
+    BatchedEvaluator be(model, /*target_batch_size=*/4, /*timeout_ms=*/100,
+                        cpu, &m);
+    be.EnableBatcherTelemetry();
+    std::vector<float> obs(kObs, 0.25f);
+    std::thread single_a([&] { (void)be.Evaluate(obs); });
+    std::thread single_b([&] { (void)be.Evaluate(obs); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::thread group([&] {
+      (void)be.EvaluateBatch({obs, obs, obs, obs});
+    });
+    single_a.join();
+    single_b.join();
+    group.join();
+    BatcherTelemetry t = be.GetBatcherTelemetry();
+    assert(t.submitted_rows == 6);
+    assert(t.physical_batches == 2);
+    assert(t.max_batch_size == 4);
+    assert(t.leaf_groups_split == 0);
+    std::cout << "  rows=6 batches=2 max=4 split=0\n";
+    std::cout << "Test 11 Passed!\n\n";
   }
 
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";

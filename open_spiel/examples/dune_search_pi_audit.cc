@@ -139,9 +139,10 @@ ABSL_FLAG(int, batch_target, 0,
           "0 = REFERENCE MODE: one unbatched DuneNNEvaluator per worker, the "
           "historical path, which is what reproduces the rung-2 hash chains "
           "bitwise. >0 = production batched mode: ONE shared BatchedEvaluator "
-          "with this target row count, serving every worker. Registered as "
-          "4*G for G concurrent games, since a leaf group is 4 rows "
-          "(num_players). Routing batch-1 through the unbatched path is the "
+          "with this target row count, serving every worker. Must be a multiple "
+          "of four and no greater than 4*actual_workers; that latter value is "
+          "the physical capacity, not an implied operating target. Routing "
+          "batch-1 through the unbatched path is the "
           "allowance recorded in proposal §8.1 Q4 -- preserving a reference "
           "mode, not evading the check.");
 ABSL_FLAG(int, batcher_timeout_ms, 2,
@@ -216,6 +217,10 @@ namespace {
 // how the work happened to be scheduled.
 struct ArmResult {
   SearchPiArm arm = SearchPiArm::kSearched;
+  int requested_threads = 0;
+  int actual_workers = 0;
+  int configured_batch_target = 0;
+  int max_inflight_rows = 0;
   std::vector<SearchPiGameOutcome> games;
   SearchPiRoleStats primary;
   SearchPiRoleStats continuation;
@@ -304,10 +309,17 @@ bool BatcherDeviceTimingComplete(const open_spiel::BatcherTelemetry& t,
 void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
                                const open_spiel::BatcherTelemetry& t,
                                bool device_applicable,
-                               int64_t search_inference_calls) {
+                               int64_t search_inference_calls,
+                               int requested_threads, int actual_workers,
+                               int configured_batch_target,
+                               int max_inflight_rows) {
   o << std::setprecision(10);
   o << "{\n";
   o << "  \"arm\": \"" << SearchPiArmName(arm) << "\",\n";
+  o << "  \"requested_threads\": " << requested_threads << ",\n";
+  o << "  \"actual_workers\": " << actual_workers << ",\n";
+  o << "  \"configured_batch_target\": " << configured_batch_target << ",\n";
+  o << "  \"max_inflight_rows\": " << max_inflight_rows << ",\n";
   o << "  \"submitted_rows\": " << t.submitted_rows << ",\n";
   o << "  \"physical_batches\": " << t.physical_batches << ",\n";
   o << "  \"mean_batch_size\": " << t.mean_batch_size << ",\n";
@@ -522,7 +534,6 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   const int generation = absl::GetFlag(FLAGS_generation);
   const bool retain = absl::GetFlag(FLAGS_retain_rows);
   const int num_chunks = games / chunk;
-  const auto wall_start = std::chrono::steady_clock::now();
 
   std::vector<SearchPiGenerationStats> chunk_stats(num_chunks);
   std::vector<std::vector<SearchPiRow>> chunk_rows(retain ? num_chunks : 0);
@@ -548,7 +559,11 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
                                 short_stream_path));
   }
 
-  const int nthreads = std::max(1, std::min(absl::GetFlag(FLAGS_threads), num_chunks));
+  // main() rejects requested_threads > num_chunks before model/GPU setup. Do
+  // not silently clamp here: a capped G=24/32 cell paired with batch_target
+  // 96/128 is a timeout-flush experiment, not characterization of that G.
+  const int requested_threads = absl::GetFlag(FLAGS_threads);
+  const int nthreads = requested_threads;
 
   // One evaluator per worker, all constructed HERE, on this thread, before any
   // worker starts. Following dune_search_benchmark: the evaluator holds no
@@ -581,6 +596,12 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   // (b), a different teacher.
   const int batch_target = absl::GetFlag(FLAGS_batch_target);
   const bool batched = batch_target > 0;
+  // 4*workers is the maximum number of rows that can be resident, not a useful
+  // target in general: every worker would have to reach a four-row leaf call at
+  // the same instant. main() bounds the independently tuned target by that
+  // physical capacity and records both values in every artifact.
+  const int max_inflight_rows =
+      batched ? static_cast<int>(kBatchedLeafGroupRows) * nthreads : 0;
   const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
 
   // Guards the shared model against the batcher's runner thread. Must outlive
@@ -633,6 +654,10 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
     std::cout << "[audit] " << SearchPiArmName(arm) << " warm-up " << warmup_games
               << " discarded games on a throwaway evaluator" << std::endl;
   }
+
+  // The throughput gate is scored work only. Keep the registered warm-up, but
+  // do not charge its deliberately serial throwaway games to the scored arm.
+  const auto scored_wall_start = std::chrono::steady_clock::now();
 
   // The shared batcher, constructed FRESH after warm-up so every counter it
   // reports starts at zero for the scored run.
@@ -724,6 +749,10 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   //                            silently passing or silently failing.
   ArmResult r;
   r.arm = arm;
+  r.requested_threads = requested_threads;
+  r.actual_workers = nthreads;
+  r.configured_batch_target = batch_target;
+  r.max_inflight_rows = max_inflight_rows;
   if (batched) {
     r.telemetry = batched_eval->GetBatcherTelemetry();
     r.telemetry_valid = true;
@@ -744,7 +773,10 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
         // pre-existing file leaves trailing bytes and the result does not parse.
         WriteBatcherTelemetryJson(o, arm, r.telemetry,
                                   r.telemetry_device_applicable,
-                                  r.inference_calls);
+                                  r.inference_calls, r.requested_threads,
+                                  r.actual_workers,
+                                  r.configured_batch_target,
+                                  r.max_inflight_rows);
         o.flush();
         if (!o) {
           std::cerr << "[audit] write failed for " << legacy_path << std::endl;
@@ -801,7 +833,8 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
     r.extended_hash_chain = ec;
   }
   r.wall_time_s =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start)
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    scored_wall_start)
           .count();
   return r;
 }
@@ -924,6 +957,8 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      << ",\"first_episode_id\":" << absl::GetFlag(FLAGS_first_episode_id)
      << ",\"generation\":" << absl::GetFlag(FLAGS_generation)
      << ",\"threads\":" << absl::GetFlag(FLAGS_threads)
+     << ",\"requested_threads\":" << r.requested_threads
+     << ",\"actual_workers\":" << r.actual_workers
      << ",\"chunk_games\":" << absl::GetFlag(FLAGS_chunk_games)
      << ",\"wall_time_s\":" << F17(r.wall_time_s)
      << ",\"seconds_per_game\":" << F17(r.wall_time_s / n)
@@ -996,7 +1031,8 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      // path); >0 is production batched. Recorded so a run states which
      // inference mode produced it -- the teachers and the raw control must all
      // report the SAME mode, which is what §8.2 requires of the control.
-     << ",\"cfg_batch_target\":" << absl::GetFlag(FLAGS_batch_target)
+     << ",\"cfg_batch_target\":" << r.configured_batch_target
+     << ",\"max_inflight_rows\":" << r.max_inflight_rows
      << ",\"cfg_batcher_timeout_ms\":" << absl::GetFlag(FLAGS_batcher_timeout_ms)
      << ",\"cfg_warmup_games\":" << absl::GetFlag(FLAGS_warmup_games)
      << ",\"target_hash_chain\":"
@@ -1067,7 +1103,10 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
       return false;
     }
     WriteBatcherTelemetryJson(ot, r.arm, r.telemetry,
-                              r.telemetry_device_applicable, r.inference_calls);
+                              r.telemetry_device_applicable, r.inference_calls,
+                              r.requested_threads, r.actual_workers,
+                              r.configured_batch_target,
+                              r.max_inflight_rows);
     ot.flush();
     if (!ot) {
       std::cerr << "[audit] write failed for " << tp << std::endl;
@@ -1385,6 +1424,38 @@ int main(int argc, char** argv) {
                  "tile the episode range exactly." << std::endl;
     return 2;
   }
+  const int requested_threads = absl::GetFlag(FLAGS_threads);
+  const int available_chunks = games / chunk;
+  if (requested_threads <= 0) {
+    std::cerr << "--threads must be positive." << std::endl;
+    return 2;
+  }
+  if (requested_threads > available_chunks) {
+    std::cerr << "--threads=" << requested_threads << " but only "
+              << available_chunks << " scored chunks exist (games=" << games
+              << ", chunk_games=" << chunk
+              << "); refusing to cap actual workers below requested G."
+              << std::endl;
+    return 2;
+  }
+  const int requested_batch_target = absl::GetFlag(FLAGS_batch_target);
+  const int max_inflight_rows =
+      requested_batch_target > 0
+          ? static_cast<int>(kBatchedLeafGroupRows) * requested_threads
+          : 0;
+  if (requested_batch_target != 0 &&
+      (requested_batch_target <= 0 || requested_batch_target % 4 != 0)) {
+    std::cerr << "--batch_target must be zero (reference mode) or a positive "
+                 "multiple of four."
+              << std::endl;
+    return 2;
+  }
+  if (requested_batch_target > max_inflight_rows) {
+    std::cerr << "--batch_target=" << requested_batch_target
+              << " exceeds max_inflight_rows=4*actual_workers="
+              << max_inflight_rows << "." << std::endl;
+    return 2;
+  }
   const std::string arm_flag = absl::GetFlag(FLAGS_arm);
   if (arm_flag != "searched" && arm_flag != "raw_argmax" && arm_flag != "both") {
     std::cerr << "--arm must be searched | raw_argmax | both." << std::endl;
@@ -1393,12 +1464,12 @@ int main(int argc, char** argv) {
 
   auto game = open_spiel::LoadGame("dune_imperium");
   if (game->NumPlayers() != kBatchedLeafGroupRows) {
-    // target_batch_size=4*G is registered from one in-flight NumPlayers-row
-    // evaluation group per game. Keep that parameter identity explicit even
-    // though the former leaf_rows_crosscheck telemetry gate is withdrawn.
+    // max_inflight_rows=4*G is derived from one in-flight NumPlayers-row
+    // evaluation group per game. Keep that capacity identity explicit even
+    // though the independently tuned target may be below the maximum.
     std::cerr << "kBatchedLeafGroupRows is " << kBatchedLeafGroupRows
               << " but the game has " << game->NumPlayers()
-              << " players; registered batch_target=4*G is invalid."
+              << " players; max_inflight_rows=4*G is invalid."
               << std::endl;
     return 2;
   }

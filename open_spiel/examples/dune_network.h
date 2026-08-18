@@ -991,8 +991,39 @@ private:
                 timeout_flush = !stop_ &&
                                 requests_.size() < (size_t)target_batch_size_;
 
-                // 4. Scoop up the batch
-                size_t actual_batch = std::min((size_t)target_batch_size_, requests_.size());
+                // 4. Scoop up the batch. EvaluateBatch() inserts every logical
+                // leaf group atomically and contiguously. Do not let the target
+                // boundary cut one of those groups across two physical
+                // forwards: besides wasting a second launch, batch-size-
+                // dependent kernels could otherwise give the four players in
+                // one leaf slightly different numerical contexts. Back off to
+                // the start of the boundary group. (A group larger than the
+                // configured target is admitted whole to guarantee progress;
+                // the Search-PI caller's group size is four and its validated
+                // target is at least four, so that fallback is unreachable in
+                // this lane.)
+                size_t actual_batch =
+                    std::min((size_t)target_batch_size_, requests_.size());
+                if (actual_batch > 0 && actual_batch < requests_.size() &&
+                    requests_[actual_batch - 1].is_group &&
+                    requests_[actual_batch].is_group &&
+                    requests_[actual_batch - 1].group_id ==
+                        requests_[actual_batch].group_id) {
+                    const uint64_t boundary_gid = requests_[actual_batch].group_id;
+                    size_t group_start = actual_batch;
+                    while (group_start > 0 &&
+                           requests_[group_start - 1].group_id == boundary_gid) {
+                        --group_start;
+                    }
+                    if (group_start > 0) {
+                        actual_batch = group_start;
+                    } else {
+                        while (actual_batch < requests_.size() &&
+                               requests_[actual_batch].group_id == boundary_gid) {
+                            ++actual_batch;
+                        }
+                    }
+                }
                 batch.reserve(actual_batch);
                 for (size_t i = 0; i < actual_batch; ++i) {
                     batch.push_back(std::move(requests_.front()));
