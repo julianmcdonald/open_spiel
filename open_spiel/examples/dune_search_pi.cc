@@ -304,6 +304,13 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   // whose budget is 0 and whose short-window roles return policy-only before
   // any budget is resolved.
   cfg.exact_short_window_budgets = true;
+  // This lane's raw arms are CONTROLS: kPolicyOnly must mean policy-only at
+  // every role, or the wide-matched control runs a full 64-simulation search at
+  // each of its three short-window roots, discards it, plays the raw-prior
+  // argmax anyway, and fails the registered "the control spent nothing" gate
+  // after ~43 GPU-hours. Opt-in rather than a default flip, because
+  // DuneSearchSession is shared with a live advisor.
+  cfg.policy_only_covers_short_window = true;
   cfg.fixed_continuation_reserve = 0;
   cfg.search_leader_draft = false;
   cfg.leader_mass_only_coverage = false;
@@ -841,6 +848,15 @@ void SearchPiGenerator::GenerateGeneration(
         if (elapsed > rs->max_search_elapsed_ms) {
           rs->max_search_elapsed_ms = elapsed;
         }
+        {
+          const int bin =
+              elapsed <= 0.0
+                  ? 0
+                  : std::min(static_cast<int>(elapsed /
+                                              SearchPiRoleStats::kLatencyBinMs),
+                             SearchPiRoleStats::kLatencyBins);
+          rs->search_elapsed_hist[bin]++;
+        }
         rs->configured_time_limit_ms = res.diagnostics.soft_time_limit_ms;
 
         if (res.simulations_completed < requested) {
@@ -1009,6 +1025,34 @@ void SearchPiGenerator::GenerateGeneration(
         //     combat, other-optional): raw policy at T=1, matching the
         //     opponents, so those decisions are drawn from the same
         //     distribution everyone else plays.
+        // THE RAW ARM READS THE FORWARD IT ALREADY PAID FOR.
+        //
+        // It used to call Prior() a SECOND time here, having already had one
+        // inside DuneSearchSession::Search's policy-only path
+        // (dune_search_session.cc:290). Two forwards of the same observation
+        // are not guaranteed to agree bit-for-bit under production batching:
+        // BatchedEvaluator has no result cache, so the two rows land in
+        // physical batches of different composition, i.e. different GEMM M --
+        // and with TF32 and BF16 autocast, batch-shape-dependent rounding is
+        // ordinary. --deterministic pins determinism PER SHAPE, not across
+        // shapes.
+        //
+        // That was survivable while nothing compared the two. The played-action
+        // gate compares them at zero tolerance: one last-ulp flip between two
+        // near-tied legal actions makes `chosen != raw_ref`, and the control
+        // reads INVALID after ~43 GPU-hours over ~14,000 zero-tolerance trials.
+        // Reading the diagnostics makes `chosen` and the reference the SAME
+        // vector by construction, and saves one inference per raw searched root.
+        //
+        // Deliberately scoped to the raw arm. The searched arm reaches this
+        // branch only on a technical fallback, which the manipulation check
+        // already forbids -- and leaving that path byte-identical keeps the
+        // batch-1 parity gate reproducing a code path this change never touched.
+        if (is_search_role && arm == SearchPiArm::kRawArgmax) {
+          chosen = RawPriorArgmaxFromDiagnostics(res.diagnostics);
+        }
+      }
+      if (chosen == kInvalidAction) {
         ActionsAndProbs prior = evaluator->Prior(*state);
         if (is_search_role) {
           chosen = RawPriorArgmaxAction(prior, legal_actions);
@@ -1033,12 +1077,7 @@ void SearchPiGenerator::GenerateGeneration(
       if (is_search_role) {
         const Action raw_ref = RawPriorArgmaxFromDiagnostics(res.diagnostics);
         if (raw_ref != kInvalidAction && chosen != raw_ref) {
-          if (role == DuneDecisionRole::kAgentPrimary ||
-              role == DuneDecisionRole::kAgentContinuation) {
-            outcome.agent_roots_played_differs_from_raw++;
-          } else {
-            outcome.wide_roots_played_differs_from_raw++;
-          }
+          outcome.roots_played_differs_from_raw[role_idx]++;
         }
       }
       outcome.played_action_digest =

@@ -392,7 +392,8 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     // Ordered AFTER the budget test on purpose, so the narrow control keeps
     // emitting "policy_only_purchase_combat" and nothing about the existing
     // instrument moves.
-    if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly) {
+    if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly &&
+        config_.policy_only_covers_short_window) {
       return get_policy_only_result("policy_only_mode");
     }
     max_sims = config_.purchase_combat_budget - short_sims_completed_;

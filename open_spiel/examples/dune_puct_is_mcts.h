@@ -100,6 +100,27 @@ struct DuneSearchConfig {
   // counted. When true: every in-scope root gets its full budget, and the only
   // time authority is relative_time_budget_ms.
   bool exact_short_window_budgets = false;
+
+  // Whether kPolicyOnly suppresses search at the SHORT-WINDOW roles too.
+  //
+  // Default false, which preserves the historical behaviour exactly: the
+  // kPolicyOnly short-circuit has only ever lived in the agent-role branch, so
+  // a caller combining kPolicyOnly with a nonzero purchase_combat_budget has
+  // always run a real search at kPurchase / kCombatIntrigue / kOtherOptional.
+  //
+  // That is a defect, but it is not THIS lane's defect to fix unilaterally:
+  // DuneSearchSession is shared, and at least two out-of-lane callers rely on
+  // the current behaviour by configuration --
+  //   * dune_search_benchmark, where --policy_only defaults
+  //     --purchase_combat_budget to 16 and the flag's own help says "Pair with
+  //     --purchase_combat_budget=0", so any recorded policy-only baseline taken
+  //     without that pairing searched those roles; and
+  //   * the Steam-bridge advisor, which sets purchase_combat_budget regardless
+  //     of search mode and whose destination-probing branch keys on the visits
+  //     those searches produce.
+  // Flipping the default would silently change a live tool. The search-PI lane
+  // sets this true; the general defect is reported separately.
+  bool policy_only_covers_short_window = false;
   double live_continuation_reserve_seconds = 0.0;
   int fixed_session_limit = 200;
   std::string model_checkpoint_path = "";

@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -178,9 +179,11 @@ ABSL_FLAG(double, search_pi_relative_time_budget_ms, 10000.0,
 
 ABSL_FLAG(int, threads, 1,
           "Concurrent game workers. NOT a free throughput knob: every searched "
-          "root runs under a live 10,000 ms wall-clock deadline (the lane never "
-          "sets DuneSearchConfig::relative_time_budget_ms, so it keeps its "
-          "default, and dune_puct_is_mcts.cc:982 breaks the simulation loop on "
+          "root runs under the wall-clock deadline set by "
+          "--search_pi_relative_time_budget_ms, whose FLAG DEFAULT is the "
+          "historical 10,000 ms; the batched-teacher audit registers 60,000 ms "
+          "and its analyzer FAILS any cell whose artifact does not manifest "
+          "that value (dune_puct_is_mcts.cc:982 breaks the simulation loop on "
           "it). Parallel games share one CUDA stream, per-simulation latency "
           "rises, and a truncated search weakens ONLY the arm that searches -- a "
           "one-sided bias toward 'no teacher edge'. Raise this only after a "
@@ -260,25 +263,33 @@ bool BatcherRowsIdentityOk(const open_spiel::BatcherTelemetry& t) {
   return t.submitted_rows == (t.single_row_calls + t.group_rows);
 }
 
-bool BatcherLeafRowsCrosscheckOk(const open_spiel::BatcherTelemetry& t) {
-  // THE SEARCH-PI DEFINITION, and it is not Phase-2's.
-  //
-  // Phase-2's leaf_rows_crosscheck_ok compared the driver's own
-  // `benchmark_raw_prior_calls` and `implied_opponent_prior_calls` against the
-  // submitted rows. Those are counters of the BENCHMARK DRIVER; they do not
-  // exist in this binary, so the registration imported a STOP condition the
-  // instrument structurally could not report -- and a STOP that cannot be
-  // reported is not a STOP.
-  //
-  // What IS exactly checkable here is the submission SHAPE. BatchedNNEvaluator
-  // has exactly two paths: Prior() submits ONE row via Evaluate(), and
-  // Evaluate()/PriorAndEvaluate() submit a group of NumPlayers rows via
-  // EvaluateBatch(). Every group is therefore exactly kBatchedLeafGroupRows
-  // wide, so group_rows must be an exact multiple of it and must agree with
-  // group_calls. A split or double-counted leaf group breaks this identity,
-  // which is the failure mode the check exists for.
-  return t.group_rows == t.group_calls * kBatchedLeafGroupRows;
-}
+// NO leaf_rows_crosscheck_ok. Read this before adding one back.
+//
+// Phase-2's leaf_rows_crosscheck_ok compares the driver's own
+// `benchmark_raw_prior_calls` and `implied_opponent_prior_calls` against the
+// submitted rows. Those are counters of the BENCHMARK DRIVER; they do not exist
+// in this binary. The registration imported the STOP anyway, so it named a
+// condition this instrument structurally could not report.
+//
+// A first attempt to give it a search-PI definition asserted
+// `group_rows == group_calls * kBatchedLeafGroupRows`. THAT WAS A TAUTOLOGY and
+// is withdrawn: dune_network.h:774-775 increments both counters two lines
+// apart, inside one critical section, from the same `gsize`, and the only two
+// EvaluateBatch callers reachable here both pass exactly NumPlayers
+// observations. No input to this binary can falsify it. Worse, the failure it
+// claimed to catch is outside its reach -- the Runner's split accounting
+// (dune_network.h:1060-1082) touches only leaf_groups_split_,
+// group_batches_seen_ and group_rows_left_, never group_calls_/group_rows_, so
+// a split run and an unsplit run emit byte-identical values.
+//
+// Replacing an unreportable STOP with an unfailable one is worse than either.
+// So: no STOP here; `leaf_groups_split` is emitted as the diagnostic that
+// actually carries the signal; and the genuinely independent quantity -- the
+// SEARCH's own inference count against the BATCHER's call count, two
+// accumulators in different objects incremented by different code -- is emitted
+// as a pair to be CHARACTERISED at the pre-measure. It is not registered as a
+// STOP until it has been observed holding, because this lane does not register
+// gates it has never seen bind.
 
 bool BatcherDeviceTimingComplete(const open_spiel::BatcherTelemetry& t,
                                  bool device_applicable) {
@@ -291,7 +302,8 @@ bool BatcherDeviceTimingComplete(const open_spiel::BatcherTelemetry& t,
 
 void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
                                const open_spiel::BatcherTelemetry& t,
-                               bool device_applicable) {
+                               bool device_applicable,
+                               int64_t search_inference_calls) {
   o << std::setprecision(10);
   o << "{\n";
   o << "  \"arm\": \"" << SearchPiArmName(arm) << "\",\n";
@@ -327,8 +339,13 @@ void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
     << ",\n";
   o << "  \"rows_identity_ok\": "
     << (BatcherRowsIdentityOk(t) ? "true" : "false") << ",\n";
-  o << "  \"leaf_rows_crosscheck_ok\": "
-    << (BatcherLeafRowsCrosscheckOk(t) ? "true" : "false") << "\n";
+  // The independent cross-check, REPORTED AND NOT GATED (see the note above).
+  // search_inference_calls comes from the MCTS's own counter, evaluator_calls
+  // from the batcher's: different objects, different code.
+  o << "  \"search_inference_calls\": " << search_inference_calls << ",\n";
+  o << "  \"evaluator_calls\": " << (t.group_calls + t.single_row_calls)
+    << ",\n";
+  o << "  \"leaf_rows_crosscheck_ok\": null\n";
   o << "}\n";
 }
 
@@ -682,9 +699,21 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
       // scripts that already pass it keep working. With --arm=both it holds
       // whichever arm ran LAST; the per-arm copy WriteArm emits is the one the
       // analyzer reads.
-      std::ofstream o(legacy_path);
-      WriteBatcherTelemetryJson(o, arm, r.telemetry,
-                                r.telemetry_device_applicable);
+      std::ofstream o(legacy_path, std::ios::trunc);
+      if (!o) {
+        std::cerr << "[audit] cannot open legacy telemetry path " << legacy_path
+                  << std::endl;
+      } else {
+        // std::ios::trunc matters: without it a shorter document over a longer
+        // pre-existing file leaves trailing bytes and the result does not parse.
+        WriteBatcherTelemetryJson(o, arm, r.telemetry,
+                                  r.telemetry_device_applicable,
+                                  r.inference_calls);
+        o.flush();
+        if (!o) {
+          std::cerr << "[audit] write failed for " << legacy_path << std::endl;
+        }
+      }
     }
     std::cout << "[audit] " << SearchPiArmName(arm) << " batcher: rows="
               << r.telemetry.submitted_rows << " batches="
@@ -693,8 +722,10 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
               << " occupancy=" << r.telemetry.target_occupancy
               << " rows_identity_ok="
               << (BatcherRowsIdentityOk(r.telemetry) ? "1" : "0")
-              << " leaf_rows_crosscheck_ok="
-              << (BatcherLeafRowsCrosscheckOk(r.telemetry) ? "1" : "0")
+              << " search_inference_calls=" << r.inference_calls
+              << " evaluator_calls="
+              << (r.telemetry.group_calls + r.telemetry.single_row_calls)
+              << " leaf_groups_split=" << r.telemetry.leaf_groups_split
               << " device_timing_complete="
               << (BatcherDeviceTimingComplete(r.telemetry,
                                               r.telemetry_device_applicable)
@@ -757,25 +788,6 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
   }
   const std::string name = SearchPiArmName(r.arm);
 
-  // Batcher telemetry, PER ARM, under the same stem as every other artifact.
-  // Its absence on a batched arm is a registered STOP, so it is written where
-  // the analyzer looks rather than wherever a launcher flag happened to point.
-  if (r.telemetry_valid) {
-    const std::string tp = dir + "/" + name + "_batcher_telemetry.json";
-    std::ofstream ot(tp, std::ios::trunc);
-    if (!ot) {
-      std::cerr << "[audit] cannot open " << tp << std::endl;
-      return false;
-    }
-    WriteBatcherTelemetryJson(ot, r.arm, r.telemetry,
-                              r.telemetry_device_applicable);
-    ot.flush();
-    if (!ot) {
-      std::cerr << "[audit] write failed for " << tp << std::endl;
-      return false;
-    }
-  }
-
   {
     const std::string p = dir + "/" + name + "_games.jsonl";
     std::ofstream os(p, std::ios::trunc);
@@ -820,10 +832,11 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          // matched control would have played. A wide arm reading zero here
          // played the control's moves -- the 2026-08-18 defect, which every
          // other counter in this artifact survived.
-         << ",\"agent_roots_played_differs_from_raw\":"
-         << g.agent_roots_played_differs_from_raw
-         << ",\"wide_roots_played_differs_from_raw\":"
-         << g.wide_roots_played_differs_from_raw
+         << ",\"roots_played_differs_from_raw\":[";
+      for (int rr = 0; rr < 7; ++rr) {
+        os << (rr ? "," : "") << g.roots_played_differs_from_raw[rr];
+      }
+      os << "]"
          // Trajectory identity. A divergence detector, NOT a parity reference.
          << ",\"played_action_digest\":\"" << std::hex << std::setw(16)
          << std::setfill('0') << g.played_action_digest << std::dec
@@ -848,11 +861,12 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
   }
 
   int64_t place[5] = {0, 0, 0, 0, 0};
-  int64_t agent_differs = 0, wide_differs = 0;
+  int64_t differs_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
   for (const SearchPiGameOutcome& g : r.games) {
     place[g.searched_seat_placement]++;  // index 0 collects off-ladder returns
-    agent_differs += g.agent_roots_played_differs_from_raw;
-    wide_differs += g.wide_roots_played_differs_from_raw;
+    for (int rr = 0; rr < 7; ++rr) {
+      differs_by_role[rr] += g.roots_played_differs_from_raw[rr];
+    }
   }
   const double n = r.games.empty() ? 1.0 : static_cast<double>(r.games.size());
 
@@ -886,8 +900,13 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      // argmax at their searched roles by construction, so a nonzero count is a
      // defect in the check or in the control), and a searched arm reading zero
      // at a role class it is registered to search played the control's moves.
-     << ",\"agent_roots_played_differs_from_raw\":" << agent_differs
-     << ",\"wide_roots_played_differs_from_raw\":" << wide_differs;
+     << ",\"played_differs_from_raw_total\":"
+     << (differs_by_role[2] + differs_by_role[3] + differs_by_role[4]
+         + differs_by_role[5] + differs_by_role[6]);
+  for (int rr = 0; rr < 7; ++rr) {
+    os << ",\"played_differs_role_" << rr << "\":" << differs_by_role[rr];
+  }
+  os << "";
   EmitRoleJson(os, "primary", r.primary);
   EmitRoleJson(os, "continuation", r.continuation);
   // The wide teacher's three roles, emitted for EVERY arm. All-zero blocks in a
@@ -952,6 +971,31 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
   if (!os) {
     std::cerr << "[audit] write failed for " << sp << std::endl;
     return false;
+  }
+
+  // Batcher telemetry, PER ARM, under the same stem as every other artifact.
+  // Its absence on a batched arm is a registered STOP, so it is written where
+  // the analyzer looks rather than wherever a launcher flag happened to point.
+  //
+  // Written LAST on purpose. It used to be written first, so a full disk or a
+  // permission problem on this one path returned false BEFORE games.jsonl and
+  // summary.json were opened -- discarding a completed multi-hour arm's entire
+  // per-episode record to protect a sidecar. The sidecar is a STOP; it is not
+  // worth the data.
+  if (r.telemetry_valid) {
+    const std::string tp = dir + "/" + name + "_batcher_telemetry.json";
+    std::ofstream ot(tp, std::ios::trunc);
+    if (!ot) {
+      std::cerr << "[audit] cannot open " << tp << std::endl;
+      return false;
+    }
+    WriteBatcherTelemetryJson(ot, r.arm, r.telemetry,
+                              r.telemetry_device_applicable, r.inference_calls);
+    ot.flush();
+    if (!ot) {
+      std::cerr << "[audit] write failed for " << tp << std::endl;
+      return false;
+    }
   }
   return true;
 }
@@ -1048,8 +1092,7 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
     // direction is half a check.
     int64_t differs = 0;
     for (const SearchPiGameOutcome& g : r.games) {
-      differs += g.agent_roots_played_differs_from_raw +
-                 g.wide_roots_played_differs_from_raw;
+      for (int rr = 0; rr < 7; ++rr) differs += g.roots_played_differs_from_raw[rr];
     }
     if (differs != 0) {
       fail(absl::StrCat("the raw control played something other than the "
@@ -1103,28 +1146,57 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
   // not test that class -- it billed for it. Asserted per class, because the
   // 2026-08-18 defect was exactly a wide arm whose AGENT roles diverged
   // normally while its three wide roles were inert.
-  int64_t agent_differs = 0, wide_differs = 0;
+  // PER ROLE, and conditioned on the role having been REACHED. The lumped
+  // agent/wide pair this replaced asserted over a union: with the observed role
+  // frequencies, a wide arm whose kPurchase and kCombatIntrigue searches were
+  // entirely inert still showed a healthy count from kOtherOptional alone and
+  // passed -- billing for three roles while testing one.
+  int64_t differs_by_role[7] = {0, 0, 0, 0, 0, 0, 0};
   for (const SearchPiGameOutcome& g : r.games) {
-    agent_differs += g.agent_roots_played_differs_from_raw;
-    wide_differs += g.wide_roots_played_differs_from_raw;
+    for (int rr = 0; rr < 7; ++rr) differs_by_role[rr] += g.roots_played_differs_from_raw[rr];
   }
-  if (agent_differs == 0) {
-    fail("the searched arm never played anything but the raw-prior argmax at "
-         "its agent roots -- it played the control's moves");
+  const std::vector<int> searched_role_idx =
+      wide_scope ? std::vector<int>{2, 3, 4, 5, 6} : std::vector<int>{2, 3};
+  for (int rr : searched_role_idx) {
+    if (r.simulations_by_role[rr] > 0 && differs_by_role[rr] == 0) {
+      fail(absl::StrCat("role ", rr, ": the searched arm ran ",
+                        r.simulations_by_role[rr], " simulations and NEVER "
+                        "played anything but the raw-prior argmax -- it "
+                        "searched this role and discarded the result, which is "
+                        "the 2026-08-18 defect"));
+    }
   }
-  if (wide_scope && wide_differs == 0) {
-    fail("the WIDE arm never played anything but the raw-prior argmax at "
-         "kPurchase/kCombatIntrigue/kOtherOptional -- it searched them and "
-         "discarded the result, which is the 2026-08-18 defect");
+  for (int rr = 0; rr < 7; ++rr) {
+    const bool searchable =
+        std::find(searched_role_idx.begin(), searched_role_idx.end(), rr)
+        != searched_role_idx.end();
+    if (!searchable && differs_by_role[rr] != 0) {
+      fail(absl::StrCat("role ", rr, ": diverged from raw at ",
+                        differs_by_role[rr], " roots it must never have "
+                        "searched"));
+    }
   }
-  if (!wide_scope && wide_differs != 0) {
-    fail(absl::StrCat("the NARROW arm diverged from raw at ", wide_differs,
-                      " wide roots it must never have searched"));
-  }
+  // Role index per bucket, so a zero-root role can be distinguished from a role
+  // the arm never reached.
+  std::vector<int> role_idx = {2, 3};
+  if (wide_scope) { role_idx.push_back(4); role_idx.push_back(5); role_idx.push_back(6); }
   for (size_t i = 0; i < roles.size(); ++i) {
     const SearchPiRoleStats& rs = *roles[i].first;
     const int64_t want = rs.roots_seen * roles[i].second;
-    if (rs.roots_seen <= 0) fail(absl::StrCat("no ", role_names[i], " roots"));
+    // A role with ZERO ROOTS is a defect only if the arm REACHED it. Whole
+    // generations are observed with zero kCombatIntrigue decisions -- that is a
+    // property of the game, not of the measurement, and hard-failing on it
+    // would mark a valid multi-hour cell INVALID for a draw. The correctly
+    // guarded form already exists above, at the converse scope check.
+    if (rs.roots_seen <= 0) {
+      if (r.decisions_by_role[role_idx[i]] > 0) {
+        fail(absl::StrCat(role_names[i], ": ",
+                          r.decisions_by_role[role_idx[i]],
+                          " decisions reached this role and NONE became a "
+                          "searched root"));
+      }
+      continue;
+    }
     if (rs.simulations_requested != want) {
       fail(absl::StrCat(role_names[i], ": the session requested ",
                         rs.simulations_requested, " simulations, not ",

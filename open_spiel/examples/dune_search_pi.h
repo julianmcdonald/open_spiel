@@ -425,6 +425,23 @@ struct SearchPiRoleStats {
   // came, which is the difference between "it held this time" and "it holds".
   double max_search_elapsed_ms = 0.0;
   double sum_search_elapsed_ms = 0.0;
+
+  // PER-ROOT LATENCY DISTRIBUTION, as a fixed-bin histogram.
+  //
+  // The registration makes the latency TAIL an acceptance criterion per
+  // searched arm -- P50, P95 and max against the 60,000 ms watchdog -- and the
+  // instrument reported only the max and the mean. A mean cannot see a tail,
+  // and a max is one root. The criterion existed with nothing able to report
+  // it, which is the same defect class as a STOP the instrument cannot raise.
+  //
+  // A histogram rather than a reservoir or a sorted vector: exact quantiles
+  // would mean retaining ~200k doubles per role per arm, and these are read
+  // once at the end. 10 ms bins to 60 s, plus an overflow bin, gives P95 to
+  // within 10 ms against a 60,000 ms limit -- three orders of magnitude finer
+  // than any decision it feeds.
+  static constexpr int kLatencyBins = 6001;   // [0,10) .. [59990,60000), +over
+  static constexpr double kLatencyBinMs = 10.0;
+  int64_t search_elapsed_hist[kLatencyBins + 1] = {0};
   double configured_time_limit_ms = 0.0;  // what the deadline actually was
 
   int64_t inherited_visits = 0;
@@ -538,8 +555,19 @@ struct SearchPiGameOutcome {
   // The argmax is recomputed from the search's own diagnostics -- no extra
   // Prior() call, so no extra inference and no perturbation of throughput --
   // with the same first-wins tie-break as RawPriorArgmaxAction.
-  int64_t agent_roots_played_differs_from_raw = 0;
-  int64_t wide_roots_played_differs_from_raw = 0;
+  // PER ROLE, indexed by DuneDecisionRole. Deliberately not the two lumped
+  // counters this started as. Those claimed to assert "per class" while
+  // asserting over a union, and the union hides the exact failure they exist
+  // to catch: with the observed role frequencies a wide arm whose kPurchase
+  // and kCombatIntrigue searches are entirely inert still shows a healthy
+  // count from kOtherOptional alone, passes, and bills for three roles while
+  // testing one. The same hole applied across kAgentPrimary and
+  // kAgentContinuation.
+  //
+  // A per-role floor must be conditioned on the role having been REACHED --
+  // kCombatIntrigue is observed at zero roots in whole generations, which is a
+  // property of the game and not of the measurement.
+  int64_t roots_played_differs_from_raw[7] = {0, 0, 0, 0, 0, 0, 0};
 
   // FNV-1a 64 over the searched seat's (decision_id, played action) sequence.
   //

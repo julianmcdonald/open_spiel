@@ -2023,6 +2023,19 @@ void Test25_FourArmsPerEpisodeAccounting(
     for (const SearchPiGameOutcome& g : s.games_played) t += g.*field;
     return t;
   };
+  // Per-role played-action divergence, summed over episodes. `roles` is a set
+  // of DuneDecisionRole indices.
+  auto differs = [](const SearchPiGenerationStats& s,
+                    const std::vector<int>& roles) {
+    int64_t t = 0;
+    for (const SearchPiGameOutcome& g : s.games_played) {
+      for (int r : roles) t += g.roots_played_differs_from_raw[r];
+    }
+    return t;
+  };
+  auto wst_sims = [](const SearchPiGenerationStats& s, int role) {
+    return s.simulations_by_role[role];
+  };
   SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::continuation_roots),
                  wide.continuation.roots_seen);
   SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::primary_roots),
@@ -2058,15 +2071,29 @@ void Test25_FourArmsPerEpisodeAccounting(
 
   // (3) The played-action check.
   //
-  // The counter's SEMANTICS are cross-checked against the emitted rows, which
-  // are an independent witness: each carries its own raw_policy and the action
-  // that was actually played. Deliberately NOT "the searched arm must diverge
-  // somewhere" -- under a peaked mock evaluator a 200-simulation agent root
-  // converges on the prior's own argmax, so such an assertion would be testing
-  // the mock. The audit binary carries the null-arm floor for real runs, and
-  // the pre-measure sets the operative one.
+  // The counter is cross-checked against the emitted rows. THIS IS A
+  // BOOKKEEPING CHECK, NOT AN INDEPENDENT WITNESS, and saying so matters:
+  // row.legal_actions and row.raw_policy are assigned from the SAME two
+  // diagnostics expressions RawPriorArgmaxFromDiagnostics reads, so if the
+  // production function took the wrong prior vector the row would carry the
+  // same wrong vector and this would still pass. What it does establish is that
+  // the counter fires on the right SET of roots and attributes them to the
+  // right role -- which is the defect class it exists for.
+  //
+  // Deliberately NOT "the searched arm must diverge somewhere" at agent roots:
+  // under a peaked mock a 200-simulation agent root converges on the prior's
+  // own argmax, so that assertion would be testing the mock. The audit binary
+  // carries the null-arm floor for real runs and the pre-measure sets the
+  // operative one -- which means the binary's agent-role gate is NOT pinned by
+  // any test here, and that gap is recorded rather than papered over.
+  // ALL FIVE searched buckets, not just the agent pair. Rows are emitted only
+  // when fallback == kNone while the counter increments on EVERY searched root,
+  // so a wide-role fallback breaks the identity the cross-check asserts. The
+  // earlier form guarded only primary+continuation and held by luck of the mock.
   SPIEL_CHECK_EQ(narrow.primary.fallbacks + narrow.continuation.fallbacks, 0);
   SPIEL_CHECK_EQ(wide.primary.fallbacks + wide.continuation.fallbacks, 0);
+  SPIEL_CHECK_EQ(wide.purchase.fallbacks + wide.combat_intrigue.fallbacks +
+                     wide.other_optional.fallbacks, 0);
   auto differs_from_rows = [](const std::vector<SearchPiRow>& rs, bool wide_roles) {
     int64_t k = 0;
     for (const SearchPiRow& row : rs) {
@@ -2083,23 +2110,32 @@ void Test25_FourArmsPerEpisodeAccounting(
     }
     return k;
   };
-  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::agent_roots_played_differs_from_raw),
-                 differs_from_rows(rows[1], false));
-  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::agent_roots_played_differs_from_raw),
-                 differs_from_rows(rows[3], false));
-  SPIEL_CHECK_EQ(sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw),
-                 differs_from_rows(rows[3], true));
+  SPIEL_CHECK_EQ(differs(narrow, {2, 3}), differs_from_rows(rows[1], false));
+  SPIEL_CHECK_EQ(differs(wide, {2, 3}), differs_from_rows(rows[3], false));
+  SPIEL_CHECK_EQ(differs(wide, {4, 5, 6}), differs_from_rows(rows[3], true));
   // The one direction the mock DOES exercise: a 6-simulation wide root does not
   // reproduce the prior's argmax, so a wide arm that discarded its searches
   // would read zero here. That is the 2026-08-18 defect, and it is the reading
   // the audit binary hard-fails on.
-  SPIEL_CHECK_GT(sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
-  SPIEL_CHECK_EQ(sum(narrow, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
+  SPIEL_CHECK_GT(differs(wide, {4, 5, 6}), 0);
+  SPIEL_CHECK_EQ(differs(narrow, {4, 5, 6}), 0);
+  // PER ROLE, which the lumped counter could not express: every wide role that
+  // actually ran simulations must have played something other than the raw
+  // argmax at least once. This is the assertion that catches a wide arm whose
+  // kPurchase and kCombatIntrigue searches are inert while kOtherOptional
+  // carries the union count on its own.
+  for (int r : {4, 5, 6}) {
+    if (wst_sims(wide, r) > 0) SPIEL_CHECK_GT(differs(wide, {r}), 0);
+    SPIEL_CHECK_EQ(differs(narrow, {r}), 0);
+  }
+  // And nothing diverges where nothing is searched, in any arm.
+  for (const SearchPiGenerationStats* s : {&raw_nm, &narrow, &raw_wm, &wide}) {
+    SPIEL_CHECK_EQ(differs(*s, {0, 1}), 0);
+  }
   // Both controls are structurally zero: they play the raw-prior argmax at
   // every role they treat as searched, by construction.
   for (const SearchPiGenerationStats* c : {&raw_nm, &raw_wm}) {
-    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::agent_roots_played_differs_from_raw), 0);
-    SPIEL_CHECK_EQ(sum(*c, &SearchPiGameOutcome::wide_roots_played_differs_from_raw), 0);
+    SPIEL_CHECK_EQ(differs(*c, {0, 1, 2, 3, 4, 5, 6}), 0);
   }
 
   // The two controls are DIFFERENT ARMS. raw_wm plays argmax at the three wide
@@ -2135,7 +2171,7 @@ void Test25_FourArmsPerEpisodeAccounting(
 
   std::cout << "  wide roots " << sum(wide, &SearchPiGameOutcome::wide_roots)
             << ", played != raw at "
-            << sum(wide, &SearchPiGameOutcome::wide_roots_played_differs_from_raw)
+            << differs(wide, {4, 5, 6})
             << " of them; both controls at 0; four distinct trajectories\n";
   std::cout << "Test25 Passed!\n\n";
 }
