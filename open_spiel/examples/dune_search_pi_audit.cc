@@ -449,6 +449,17 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   // range, disjoint from every scored episode, mirroring Phase-2's
   // seed + 900000 convention.
   const int warmup_games = absl::GetFlag(FLAGS_warmup_games);
+  // Validated HERE, before any GPU work, rather than left to fire inside the
+  // generator. SearchPiGenerator asserts games_per_generation % 4 == 0 for seat
+  // balance (dune_search_pi.cc:553), so an odd --warmup_games would abort the
+  // run at the warm-up -- cheap here, but the same flag reaches a multi-hour
+  // audit, and a fatal that arrives after the model has loaded reads like an
+  // instrument fault rather than a typo.
+  if (warmup_games % 4 != 0) {
+    SpielFatalError(absl::StrCat(
+        "--warmup_games must be a multiple of 4 for seat balance (got ",
+        warmup_games, ")"));
+  }
   if (warmup_games > 0) {
     torch::InferenceMode guard;
     std::shared_ptr<open_spiel::BatchedEvaluator> warm_batched;
@@ -685,7 +696,18 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          << ",\"continuation_simulations\":" << g.continuation_simulations
          << ",\"fallbacks\":" << g.fallbacks
          << ",\"searches_short_of_budget\":" << g.searches_short_of_budget
-         << ",\"off_scope_simulations\":" << g.off_scope_simulations << "}\n";
+         << ",\"off_scope_simulations\":" << g.off_scope_simulations
+         // Additive game-shape telemetry (Fable, 2026-08-18). final_round is
+         // the round ACTUALLY PLAYED (the engine's counter has already advanced
+         // past it at kTerminal); final_vp is FinalScoredVp, the expression
+         // Returns() ranks on, NOT the reporting helper that overstates by 1
+         // without tech tile 8. Both derivations are argued at
+         // SearchPiGameOutcome's declaration.
+         << ",\"final_round\":" << g.final_round << ",\"final_vp\":[";
+      for (size_t i = 0; i < g.final_vp.size(); ++i) {
+        os << (i ? "," : "") << g.final_vp[i];
+      }
+      os << "]}\n";
     }
     os.flush();
     if (!os) {

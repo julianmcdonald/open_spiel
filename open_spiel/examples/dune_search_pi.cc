@@ -14,6 +14,8 @@
 #include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/algorithms/mcts.h"
+#include "open_spiel/games/dune_imperium/dune_imperium.h"  // FinalScoredVp,
+                                                           // GetCurrentRound
 #include "open_spiel/spiel_utils.h"
 #include "dune_online_search_collector.h"  // PruneForcedPlayouts, SharpenVisitTarget,
                                            // ComputeSearchAcceptance (telemetry only)
@@ -971,6 +973,27 @@ void SearchPiGenerator::GenerateGeneration(
     // strength test has something to join on. Placement is read off the ladder
     // at divisor 1.0 because these are raw returns, not scaled targets.
     outcome.returns = returns;
+
+    // Game-shape telemetry, from GAME TRUTH rather than the convenient reads.
+    // See SearchPiGameOutcome for why each of these two has a wrong derivation
+    // that looks right: the round counter has already advanced past the round
+    // actually played, and the widely-copied final-VP reporting helper
+    // overstates by 1 whenever a seat holds all four factions at >= 3 influence
+    // without tech tile 8.
+    {
+      const auto* dune =
+          dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      // A dynamic_cast rather than a down_cast, and checked: this lane is
+      // game-agnostic everywhere else, and a silent nullptr deref here would
+      // be a crash in the middle of a multi-hour audit.
+      SPIEL_CHECK_TRUE(dune != nullptr);
+      outcome.final_round = dune->GetCurrentRound() - 1;
+      outcome.final_vp.resize(returns.size());
+      for (int p = 0; p < static_cast<int>(returns.size()); ++p) {
+        outcome.final_vp[p] = dune->FinalScoredVp(p);
+      }
+    }
+
     SPIEL_CHECK_GE(searched_seat, 0);
     SPIEL_CHECK_LT(searched_seat, static_cast<int>(returns.size()));
     outcome.searched_seat_return = returns[searched_seat];

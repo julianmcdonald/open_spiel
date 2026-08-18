@@ -463,6 +463,34 @@ struct SearchPiGameOutcome {
   int64_t fallbacks = 0;
   int64_t searches_short_of_budget = 0;
   int64_t off_scope_simulations = 0;  // structurally 0; carried so it is checked
+
+  // --- Additive game-shape telemetry (Fable, 2026-08-18) -------------------
+  // Requested pre-registration so a game-length criterion is a STANDING column
+  // in every audit and readout rather than a bespoke re-analysis. Costs one
+  // integer and four VPs per game and changes no contrast.
+  //
+  // BOTH of these have a wrong derivation that looks right, so both are taken
+  // from game truth:
+  //
+  // `final_round` is GetCurrentRound() - 1. The engine increments round_
+  // (dune_imperium.cc:8960) BEFORE the end-game test immediately below it, so
+  // at kTerminal the counter has already moved past the round actually played.
+  // A game decided on round 7 reports GetCurrentRound() == 8. Emitting the raw
+  // counter would put every game-length criterion off by exactly one, silently
+  // and in the same direction, which is indistinguishable from a real effect.
+  //
+  // `final_vp` is DuneImperiumState::FinalScoredVp(p) -- vp_[p] plus
+  // ComputeEndgameVp(p) -- which is the expression Returns() itself ranks
+  // placements on. It is NOT the GetTrueFinalVp reporting helper copied around
+  // several example binaries: that helper awards the "all four factions >= 3
+  // influence" bonus unconditionally while the engine gates it behind owning
+  // tech tile 8, so the helper overstates by exactly 1 for any seat with all
+  // factions >= 3 and no tile 8. They disagree on 212 of 1,600 (game, seat)
+  // pairs, and that divergence is a registered STOP elsewhere in this program
+  // (docs/PWO5_GATE3_STOP_FINAL_VP_TARGET.md). Nothing scores a game with the
+  // helper.
+  int final_round = 0;
+  std::vector<int> final_vp;  // FinalScoredVp per seat, engine order
 };
 
 // Placement 1..4 from an engine return, or 0 when it sits on no rung.
