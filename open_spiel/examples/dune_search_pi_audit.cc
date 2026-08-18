@@ -228,7 +228,109 @@ struct ArmResult {
   std::string target_hash_chain;    // empty unless --retain_rows
   std::string extended_hash_chain;  // empty unless --retain_rows
   double wall_time_s = 0.0;
+
+  // Batcher telemetry, CAPTURED here and written by WriteArm.
+  //
+  // It used to be written straight from RunArm to --batcher_telemetry_json_path.
+  // With --arm=both that is ONE path for TWO arms, so the second silently
+  // overwrote the first and one batched arm's telemetry did not exist -- while
+  // the registration makes telemetry ABSENCE on a batched arm a STOP. Carried
+  // on the result and emitted per arm under the same stem as every other
+  // artifact, so the launcher cannot get it wrong.
+  bool telemetry_valid = false;
+  bool telemetry_device_applicable = false;
+  open_spiel::BatcherTelemetry telemetry;
 };
+
+// Every leaf group BatchedNNEvaluator submits is exactly NumPlayers rows wide:
+// Evaluate() and PriorAndEvaluate() build one observation per seat and hand the
+// lot to EvaluateBatch() (dune_batched_evaluator.h:28-33, :100-105). Asserted
+// against the loaded game in main rather than trusted.
+constexpr int64_t kBatchedLeafGroupRows = 4;
+
+// --- Batcher telemetry self-consistency ------------------------------------
+//
+// Three predicates, each a registered STOP, each with its definition here
+// rather than inline at a call site so the emitted JSON and the checks that
+// read it cannot drift apart.
+
+bool BatcherRowsIdentityOk(const open_spiel::BatcherTelemetry& t) {
+  // Every submitted row arrived either as a single Evaluate() or inside an
+  // EvaluateBatch() group (Phase-2 S7 rule 2).
+  return t.submitted_rows == (t.single_row_calls + t.group_rows);
+}
+
+bool BatcherLeafRowsCrosscheckOk(const open_spiel::BatcherTelemetry& t) {
+  // THE SEARCH-PI DEFINITION, and it is not Phase-2's.
+  //
+  // Phase-2's leaf_rows_crosscheck_ok compared the driver's own
+  // `benchmark_raw_prior_calls` and `implied_opponent_prior_calls` against the
+  // submitted rows. Those are counters of the BENCHMARK DRIVER; they do not
+  // exist in this binary, so the registration imported a STOP condition the
+  // instrument structurally could not report -- and a STOP that cannot be
+  // reported is not a STOP.
+  //
+  // What IS exactly checkable here is the submission SHAPE. BatchedNNEvaluator
+  // has exactly two paths: Prior() submits ONE row via Evaluate(), and
+  // Evaluate()/PriorAndEvaluate() submit a group of NumPlayers rows via
+  // EvaluateBatch(). Every group is therefore exactly kBatchedLeafGroupRows
+  // wide, so group_rows must be an exact multiple of it and must agree with
+  // group_calls. A split or double-counted leaf group breaks this identity,
+  // which is the failure mode the check exists for.
+  return t.group_rows == t.group_calls * kBatchedLeafGroupRows;
+}
+
+bool BatcherDeviceTimingComplete(const open_spiel::BatcherTelemetry& t,
+                                 bool device_applicable) {
+  // A mean over a SUBSET of batches reads exactly like a mean over all of them
+  // (Phase-2 S6). Only meaningful on CUDA; on CPU the device fields are
+  // legitimately zero, so applicability is reported rather than silently
+  // passing or silently failing.
+  return !device_applicable || (t.device_timed_batches == t.physical_batches);
+}
+
+void WriteBatcherTelemetryJson(std::ostream& o, SearchPiArm arm,
+                               const open_spiel::BatcherTelemetry& t,
+                               bool device_applicable) {
+  o << std::setprecision(10);
+  o << "{\n";
+  o << "  \"arm\": \"" << SearchPiArmName(arm) << "\",\n";
+  o << "  \"submitted_rows\": " << t.submitted_rows << ",\n";
+  o << "  \"physical_batches\": " << t.physical_batches << ",\n";
+  o << "  \"mean_batch_size\": " << t.mean_batch_size << ",\n";
+  o << "  \"p50_batch_size\": " << t.p50_batch_size << ",\n";
+  o << "  \"p95_batch_size\": " << t.p95_batch_size << ",\n";
+  o << "  \"max_batch_size\": " << t.max_batch_size << ",\n";
+  o << "  \"target_batch_size\": " << t.target_batch_size << ",\n";
+  o << "  \"timeout_ms\": " << t.timeout_ms << ",\n";
+  o << "  \"target_occupancy\": " << t.target_occupancy << ",\n";
+  o << "  \"timeout_flush_batches\": " << t.timeout_flush_batches << ",\n";
+  o << "  \"single_row_calls\": " << t.single_row_calls << ",\n";
+  o << "  \"group_calls\": " << t.group_calls << ",\n";
+  o << "  \"group_rows\": " << t.group_rows << ",\n";
+  o << "  \"leaf_group_rows\": " << kBatchedLeafGroupRows << ",\n";
+  o << "  \"leaf_groups_split\": " << t.leaf_groups_split << ",\n";
+  o << "  \"single_wait_ms_mean\": " << t.single_wait_ms_mean << ",\n";
+  o << "  \"single_wait_ms_max\": " << t.single_wait_ms_max << ",\n";
+  o << "  \"group_wait_ms_mean\": " << t.group_wait_ms_mean << ",\n";
+  o << "  \"group_wait_ms_max\": " << t.group_wait_ms_max << ",\n";
+  o << "  \"h2d_ms\": " << t.h2d_ms << ",\n";
+  o << "  \"forward_ms\": " << t.forward_ms << ",\n";
+  o << "  \"output_cast_ms\": " << t.output_cast_ms << ",\n";
+  o << "  \"d2h_ms\": " << t.d2h_ms << ",\n";
+  o << "  \"sync_ms\": " << t.sync_ms << ",\n";
+  o << "  \"device_timed_batches\": " << t.device_timed_batches << ",\n";
+  o << "  \"device_timing_applicable\": "
+    << (device_applicable ? "true" : "false") << ",\n";
+  o << "  \"device_timing_complete\": "
+    << (BatcherDeviceTimingComplete(t, device_applicable) ? "true" : "false")
+    << ",\n";
+  o << "  \"rows_identity_ok\": "
+    << (BatcherRowsIdentityOk(t) ? "true" : "false") << ",\n";
+  o << "  \"leaf_rows_crosscheck_ok\": "
+    << (BatcherLeafRowsCrosscheckOk(t) ? "true" : "false") << "\n";
+  o << "}\n";
+}
 
 void MergeRole(SearchPiRoleStats* dst, const SearchPiRoleStats& src) {
   dst->roots_seen += src.roots_seen;
@@ -567,62 +669,38 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   //                            CUDA; on CPU the device fields are legitimately
   //                            zero, so applicability is reported rather than
   //                            silently passing or silently failing.
-  const std::string telemetry_path =
-      absl::GetFlag(FLAGS_batcher_telemetry_json_path);
-  if (batched && !telemetry_path.empty()) {
-    const open_spiel::BatcherTelemetry t = batched_eval->GetBatcherTelemetry();
-    const bool rows_identity_ok =
-        t.submitted_rows == (t.single_row_calls + t.group_rows);
-    const bool device_applicable = device.is_cuda();
-    const bool device_timing_complete =
-        !device_applicable || (t.device_timed_batches == t.physical_batches);
-    std::ofstream o(telemetry_path);
-    o << std::setprecision(10);
-    o << "{\n";
-    o << "  \"arm\": \"" << SearchPiArmName(arm) << "\",\n";
-    o << "  \"submitted_rows\": " << t.submitted_rows << ",\n";
-    o << "  \"physical_batches\": " << t.physical_batches << ",\n";
-    o << "  \"mean_batch_size\": " << t.mean_batch_size << ",\n";
-    o << "  \"p50_batch_size\": " << t.p50_batch_size << ",\n";
-    o << "  \"p95_batch_size\": " << t.p95_batch_size << ",\n";
-    o << "  \"max_batch_size\": " << t.max_batch_size << ",\n";
-    o << "  \"target_batch_size\": " << t.target_batch_size << ",\n";
-    o << "  \"timeout_ms\": " << t.timeout_ms << ",\n";
-    o << "  \"target_occupancy\": " << t.target_occupancy << ",\n";
-    o << "  \"timeout_flush_batches\": " << t.timeout_flush_batches << ",\n";
-    o << "  \"single_row_calls\": " << t.single_row_calls << ",\n";
-    o << "  \"group_calls\": " << t.group_calls << ",\n";
-    o << "  \"group_rows\": " << t.group_rows << ",\n";
-    o << "  \"leaf_groups_split\": " << t.leaf_groups_split << ",\n";
-    o << "  \"single_wait_ms_mean\": " << t.single_wait_ms_mean << ",\n";
-    o << "  \"single_wait_ms_max\": " << t.single_wait_ms_max << ",\n";
-    o << "  \"group_wait_ms_mean\": " << t.group_wait_ms_mean << ",\n";
-    o << "  \"group_wait_ms_max\": " << t.group_wait_ms_max << ",\n";
-    o << "  \"h2d_ms\": " << t.h2d_ms << ",\n";
-    o << "  \"forward_ms\": " << t.forward_ms << ",\n";
-    o << "  \"output_cast_ms\": " << t.output_cast_ms << ",\n";
-    o << "  \"d2h_ms\": " << t.d2h_ms << ",\n";
-    o << "  \"sync_ms\": " << t.sync_ms << ",\n";
-    o << "  \"device_timed_batches\": " << t.device_timed_batches << ",\n";
-    o << "  \"device_timing_applicable\": "
-      << (device_applicable ? "true" : "false") << ",\n";
-    o << "  \"device_timing_complete\": "
-      << (device_timing_complete ? "true" : "false") << ",\n";
-    o << "  \"rows_identity_ok\": " << (rows_identity_ok ? "true" : "false")
-      << "\n";
-    o << "}\n";
-    o.close();
-    std::cout << "[audit] " << SearchPiArmName(arm) << " batcher: rows="
-              << t.submitted_rows << " batches=" << t.physical_batches
-              << " mean_batch=" << std::fixed << std::setprecision(2)
-              << t.mean_batch_size << " occupancy=" << t.target_occupancy
-              << " rows_identity_ok=" << (rows_identity_ok ? "1" : "0")
-              << " device_timing_complete=" << (device_timing_complete ? "1" : "0")
-              << std::endl;
-  }
-
   ArmResult r;
   r.arm = arm;
+  if (batched) {
+    r.telemetry = batched_eval->GetBatcherTelemetry();
+    r.telemetry_valid = true;
+    r.telemetry_device_applicable = device.is_cuda();
+    const std::string legacy_path =
+        absl::GetFlag(FLAGS_batcher_telemetry_json_path);
+    if (!legacy_path.empty()) {
+      // Legacy single-arm destination, kept so the parity and pre-measure
+      // scripts that already pass it keep working. With --arm=both it holds
+      // whichever arm ran LAST; the per-arm copy WriteArm emits is the one the
+      // analyzer reads.
+      std::ofstream o(legacy_path);
+      WriteBatcherTelemetryJson(o, arm, r.telemetry,
+                                r.telemetry_device_applicable);
+    }
+    std::cout << "[audit] " << SearchPiArmName(arm) << " batcher: rows="
+              << r.telemetry.submitted_rows << " batches="
+              << r.telemetry.physical_batches << " mean_batch=" << std::fixed
+              << std::setprecision(2) << r.telemetry.mean_batch_size
+              << " occupancy=" << r.telemetry.target_occupancy
+              << " rows_identity_ok="
+              << (BatcherRowsIdentityOk(r.telemetry) ? "1" : "0")
+              << " leaf_rows_crosscheck_ok="
+              << (BatcherLeafRowsCrosscheckOk(r.telemetry) ? "1" : "0")
+              << " device_timing_complete="
+              << (BatcherDeviceTimingComplete(r.telemetry,
+                                              r.telemetry_device_applicable)
+                      ? "1" : "0")
+              << std::endl;
+  }
   for (int ci = 0; ci < num_chunks; ++ci) {
     const SearchPiGenerationStats& s = chunk_stats[ci];
     MergeRole(&r.primary, s.primary);
@@ -678,6 +756,25 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
     return false;
   }
   const std::string name = SearchPiArmName(r.arm);
+
+  // Batcher telemetry, PER ARM, under the same stem as every other artifact.
+  // Its absence on a batched arm is a registered STOP, so it is written where
+  // the analyzer looks rather than wherever a launcher flag happened to point.
+  if (r.telemetry_valid) {
+    const std::string tp = dir + "/" + name + "_batcher_telemetry.json";
+    std::ofstream ot(tp, std::ios::trunc);
+    if (!ot) {
+      std::cerr << "[audit] cannot open " << tp << std::endl;
+      return false;
+    }
+    WriteBatcherTelemetryJson(ot, r.arm, r.telemetry,
+                              r.telemetry_device_applicable);
+    ot.flush();
+    if (!ot) {
+      std::cerr << "[audit] write failed for " << tp << std::endl;
+      return false;
+    }
+  }
 
   {
     const std::string p = dir + "/" + name + "_games.jsonl";
@@ -1120,6 +1217,16 @@ int main(int argc, char** argv) {
   }
 
   auto game = open_spiel::LoadGame("dune_imperium");
+  if (game->NumPlayers() != kBatchedLeafGroupRows) {
+    // The leaf-rows crosscheck is `group_rows == group_calls x NumPlayers`. If
+    // the game's seat count ever moves, that identity silently stops being the
+    // check it claims to be rather than failing.
+    std::cerr << "kBatchedLeafGroupRows is " << kBatchedLeafGroupRows
+              << " but the game has " << game->NumPlayers()
+              << " players; the leaf-rows crosscheck would be vacuous."
+              << std::endl;
+    return 2;
+  }
   const int64_t obs_size = game->GetType().provides_information_state_tensor
                                ? game->InformationStateTensorSize()
                                : game->ObservationTensorSize();
