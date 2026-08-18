@@ -105,6 +105,13 @@ inline constexpr int kSearchPiEarlyExitCount = 8;
 // Stable, log/JSON-safe names. PERSISTED in telemetry -- do not rename.
 const char* SearchPiEarlyExitName(SearchPiEarlyExit reason);
 
+// The registered four-arm audit discards the complete episode quadruplet when
+// a wall-clock watchdog fires. Only that named early exit may therefore reach
+// the analyzer when fail_on_short_search is disabled; every other early exit
+// remains an instrument failure.
+bool SearchPiAuditToleratesEarlyExit(SearchPiEarlyExit reason,
+                                     bool fail_on_short_search);
+
 // Classify one completed search against the budget it was ASKED to spend.
 // `requested_simulations` is the session's own `soft_sim_limit`, i.e. the count
 // it handed RunSearch -- not the lane's configured budget. Reading the
@@ -336,6 +343,10 @@ struct SearchPiRow {
   int generation = -1;
   int64_t episode_id = -1;
   int decision_id = -1;
+  // SHA-256 of State::Serialize() immediately before this searched decision.
+  // Gates 3/4 join targets on this exact state identity, never on an ordinal
+  // decision id that can name different states after trajectories diverge.
+  std::string state_fingerprint;
 
   // --- Search provenance ---
   int simulations_completed = 0;       // NEW simulations this search
@@ -486,6 +497,11 @@ struct SearchPiGameOutcome {
   int64_t primary_simulations = 0;
   int64_t continuation_simulations = 0;
   int64_t fallbacks = 0;
+  // Subset of fallbacks produced at a root whose independently classified
+  // early exit was kTimeout. This is the attribution needed to tolerate a
+  // timeout-before-useful-search only on a discarded episode without allowing
+  // an unrelated technical fallback to hide beside it.
+  int64_t watchdog_fallbacks = 0;
   int64_t searches_short_of_budget = 0;
   int64_t off_scope_simulations = 0;  // structurally 0; carried so it is checked
 

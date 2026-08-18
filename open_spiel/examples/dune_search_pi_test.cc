@@ -835,6 +835,9 @@ void Test15_Reproducibility(const std::shared_ptr<const Game>& game) {
   for (size_t i = 0; i < rows_a.size(); ++i) {
     SPIEL_CHECK_EQ(rows_a[i].episode_id, rows_b[i].episode_id);
     SPIEL_CHECK_EQ(rows_a[i].decision_id, rows_b[i].decision_id);
+    SPIEL_CHECK_EQ(rows_a[i].state_fingerprint,
+                   rows_b[i].state_fingerprint);
+    SPIEL_CHECK_EQ(rows_a[i].state_fingerprint.size(), 64);
     SPIEL_CHECK_EQ(rows_a[i].chosen_action, rows_b[i].chosen_action);
     SPIEL_CHECK_EQ(rows_a[i].target_probs.size(), rows_b[i].target_probs.size());
     for (size_t j = 0; j < rows_a[i].target_probs.size(); ++j) {
@@ -1389,6 +1392,14 @@ void TestScalarHelpers() {
                  std::string("none"));
   SPIEL_CHECK_EQ(std::string(SearchPiFallbackName(SearchPiFallback::kZeroVisits)),
                  std::string("zero_visits"));
+  // Audit mode may carry a named watchdog timeout through to the registered
+  // episode-quadruplet discard. It may not turn off any other early-exit gate.
+  SPIEL_CHECK_TRUE(SearchPiAuditToleratesEarlyExit(
+      SearchPiEarlyExit::kTimeout, /*fail_on_short_search=*/false));
+  SPIEL_CHECK_FALSE(SearchPiAuditToleratesEarlyExit(
+      SearchPiEarlyExit::kTimeout, /*fail_on_short_search=*/true));
+  SPIEL_CHECK_FALSE(SearchPiAuditToleratesEarlyExit(
+      SearchPiEarlyExit::kMaxNodes, /*fail_on_short_search=*/false));
   SearchPiContinuationTarget ct;
   SPIEL_CHECK_TRUE(ParseSearchPiContinuationTarget("total_visits", &ct));
   SPIEL_CHECK_TRUE(ct == SearchPiContinuationTarget::kTotalVisits);

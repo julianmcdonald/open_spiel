@@ -160,6 +160,11 @@ const char* SearchPiEarlyExitName(SearchPiEarlyExit reason) {
   return "unknown";
 }
 
+bool SearchPiAuditToleratesEarlyExit(SearchPiEarlyExit reason,
+                                     bool fail_on_short_search) {
+  return !fail_on_short_search && reason == SearchPiEarlyExit::kTimeout;
+}
+
 SearchPiEarlyExit ClassifySearchPiEarlyExit(
     const DuneSearchResult& result, const std::vector<Action>& legal_actions,
     int requested_simulations) {
@@ -1033,6 +1038,11 @@ void SearchPiGenerator::GenerateGeneration(
           row.generation = generation;
           row.episode_id = episode_id;
           row.decision_id = static_cast<int>(this_decision);
+          // State::Serialize() is OpenSpiel's reconstructable exact state
+          // representation for this explicit-chance, sequential game. Hash it
+          // before applying the selected action so retained Gate 3/4 rows can
+          // be joined only when they describe the same game state.
+          row.state_fingerprint = ComputeStringSHA256(state->Serialize());
           row.simulations_completed = res.simulations_completed;
           row.simulations_requested = requested;
           row.early_exit = early_exit;
@@ -1081,6 +1091,9 @@ void SearchPiGenerator::GenerateGeneration(
         } else {
           rs->fallbacks++;
           outcome.fallbacks++;
+          if (early_exit == SearchPiEarlyExit::kTimeout) {
+            outcome.watchdog_fallbacks++;
+          }
         }
       }
 

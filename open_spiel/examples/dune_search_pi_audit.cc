@@ -849,6 +849,7 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          << ",\"primary_simulations\":" << g.primary_simulations
          << ",\"continuation_simulations\":" << g.continuation_simulations
          << ",\"fallbacks\":" << g.fallbacks
+         << ",\"watchdog_fallbacks\":" << g.watchdog_fallbacks
          << ",\"searches_short_of_budget\":" << g.searches_short_of_budget
          << ",\"off_scope_simulations\":" << g.off_scope_simulations
          // Per-episode budget accounting. The registration's exact invariant
@@ -1015,8 +1016,9 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
 
   // Stable gate-only row representation. Large audits run with
   // --retain_rows=false, so this file never burdens the registered n=2,344
-  // endpoint. Gates 3 and 4 retain >=64 games and join rows by
-  // (episode_id, decision_id, player, role).
+  // endpoint. Gates 3 and 4 retain >=64 games and join rows by the exact
+  // pre-decision serialized-state SHA-256 (plus episode/player/role), never by
+  // ordinal decision id after trajectories have diverged.
   if (!r.retained_rows.empty()) {
     const std::string rp = dir + "/" + name + "_rows.jsonl";
     std::ofstream ro(rp, std::ios::trunc);
@@ -1027,6 +1029,7 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
     for (const SearchPiRow& row : r.retained_rows) {
       ro << "{\"episode_id\":" << row.episode_id
          << ",\"decision_id\":" << row.decision_id
+         << ",\"state_fingerprint\":\"" << row.state_fingerprint << "\""
          << ",\"player\":" << row.player
          << ",\"role\":" << static_cast<int>(row.role)
          << ",\"chosen_action\":" << row.chosen_action
@@ -1208,12 +1211,26 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
       }
     }
   }
+  const bool fail_on_short = absl::GetFlag(FLAGS_fail_on_short_search);
   int64_t all_fallbacks = 0;
   for (const std::pair<const SearchPiRoleStats*, int>& rp : roles) {
     all_fallbacks += rp.first->fallbacks;
   }
-  if (all_fallbacks != 0) {
-    fail(absl::StrCat(all_fallbacks, " technical fallbacks"));
+  bool fallback_outside_watchdog = false;
+  for (const SearchPiGameOutcome& g : r.games) {
+    if (g.fallbacks != g.watchdog_fallbacks ||
+        g.watchdog_fallbacks > g.searches_short_of_budget) {
+      fallback_outside_watchdog = true;
+      break;
+    }
+  }
+  if (all_fallbacks != 0 &&
+      (fail_on_short || fallback_outside_watchdog)) {
+    fail(absl::StrCat(all_fallbacks, " technical fallbacks",
+                      fallback_outside_watchdog
+                          ? " including a fallback not attributable to a "
+                            "named watchdog timeout"
+                          : ""));
   }
   // The played-action floor. A searched arm that never played anything other
   // than the raw-prior argmax at a role class it is registered to search did
@@ -1276,14 +1293,26 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
                         rs.simulations_requested, " simulations, not ",
                         rs.roots_seen, "x", roles[i].second, " = ", want));
     }
+    int64_t tolerated_timeouts = 0;
     for (int k = 0; k < kSearchPiEarlyExitCount; ++k) {
-      if (static_cast<SearchPiEarlyExit>(k) == SearchPiEarlyExit::kNone) continue;
+      const SearchPiEarlyExit reason = static_cast<SearchPiEarlyExit>(k);
+      if (reason == SearchPiEarlyExit::kNone) continue;
+      if (SearchPiAuditToleratesEarlyExit(reason, fail_on_short)) {
+        tolerated_timeouts += rs.early_exit_counts[k];
+        continue;
+      }
       if (rs.early_exit_counts[k] != 0) {
         fail(absl::StrCat(
             role_names[i], ": ", rs.early_exit_counts[k], " '",
-            SearchPiEarlyExitName(static_cast<SearchPiEarlyExit>(k)),
+            SearchPiEarlyExitName(reason),
             "' early exits"));
       }
+    }
+    if (!fail_on_short && tolerated_timeouts != rs.searches_short_of_budget) {
+      fail(absl::StrCat(role_names[i], ": ", tolerated_timeouts,
+                        " timeout exits but ", rs.searches_short_of_budget,
+                        " searches short of budget; tolerated audit discards "
+                        "must be attributable exactly to the watchdog"));
     }
     if (rs.searches_short_of_budget != 0) {
       // The one-sided contamination. Truncation costs the searched arm strength
@@ -1300,7 +1329,7 @@ bool ArmPassesManipulationCheck(const ArmResult& r) {
                 << rs.first_short_session_reason << "'). Worst search took "
                 << rs.max_search_elapsed_ms << " ms against a "
                 << rs.configured_time_limit_ms << " ms deadline." << std::endl;
-      if (absl::GetFlag(FLAGS_fail_on_short_search)) {
+      if (fail_on_short) {
         fail(absl::StrCat(role_names[i], ": ", rs.searches_short_of_budget,
                           " searches short of budget (see above). This cell is "
                           "INVALID, not weak: truncation weakens only the arm "
