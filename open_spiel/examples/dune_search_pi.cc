@@ -282,10 +282,14 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   //
   // purchase_combat_budget <= 0 makes DuneSearchSession::Search return the
   // policy-only "policy_only_purchase_combat" result before any budget is
-  // resolved (dune_search_session.cc:354-355), which covers kPurchase,
+  // resolved (dune_search_session.cc:375, the `policy_only_purchase_combat`
+  // return; the previous :354-355 pointed at a different branch's comment),
+  // which covers kPurchase,
   // kCombatIntrigue and kOtherOptional. search_leader_draft == false sends
   // kLeaderSelection down the "forced_or_bookkeeping" early return
-  // (dune_search_session.cc:339-341). kForcedOrBookkeeping returns there too.
+  // (dune_search_session.cc:356-361, the two `forced_or_bookkeeping` returns;
+  // :339-341 was a misread and is inside get_policy_only_result's body).
+  // kForcedOrBookkeeping returns there too.
   //
   // This was a hard-coded 0 through rung 3a. It is now read from the config so
   // the WIDE arm can register a nonzero dose -- the SearchPiConfig default is

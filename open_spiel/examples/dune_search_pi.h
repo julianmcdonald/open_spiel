@@ -192,7 +192,9 @@ struct SearchPiConfig {
   // NEW simulations at kPurchase, kCombatIntrigue and kOtherOptional -- one
   // budget covers all three, because <= 0 makes DuneSearchSession::Search
   // return policy_only_purchase_combat before any budget is resolved
-  // (dune_search_session.cc:354-355). The default 0 is the NARROW teacher and
+  // (dune_search_session.cc:375, the `policy_only_purchase_combat` return --
+  // :354-355 was a misread and is the comment above a DIFFERENT early return).
+  // The default 0 is the NARROW teacher and
   // is exactly what this lane has always run, so leaving it alone reproduces
   // rung 1/2/3a behaviour bit-for-bit; the batched lane's wide arm registers 64
   // (SEARCH_PI_BATCHED_TEACHER_REGISTRATION_2026_08_18.md §3.3). It is a
