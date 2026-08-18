@@ -1076,6 +1076,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   Action final_proposed_action = GetRootArgmaxAction(root_node_, legal_actions);
 
   result.diagnostics = GetRootDiagnostics(state, min_visits);
+  result.diagnostics.max_sim_duration_ms = max_sim_duration_ms;
   result.diagnostics.leaf_histories = current_search_leaf_histories_;
   result.diagnostics.sampled_leaf_states = current_search_sampled_leaf_states_;
   result.diagnostics.stability_checkpoint_action = stability_checkpoint_action;

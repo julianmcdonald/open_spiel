@@ -230,6 +230,7 @@ struct ArmResult {
   int64_t rows_total = 0;
   std::string target_hash_chain;    // empty unless --retain_rows
   std::string extended_hash_chain;  // empty unless --retain_rows
+  std::vector<SearchPiRow> retained_rows;  // gate-only; empty for the audit
   double wall_time_s = 0.0;
 
   // Batcher telemetry, CAPTURED here and written by WriteArm.
@@ -253,7 +254,7 @@ constexpr int64_t kBatchedLeafGroupRows = 4;
 
 // --- Batcher telemetry self-consistency ------------------------------------
 //
-// Three predicates, each a registered STOP, each with its definition here
+// Two predicates, each a registered STOP, each with its definition here
 // rather than inline at a call site so the emitted JSON and the checks that
 // read it cannot drift apart.
 
@@ -372,14 +373,7 @@ void MergeRole(SearchPiRoleStats* dst, const SearchPiRoleStats& src) {
     dst->first_short_bot_reason = src.first_short_bot_reason;
     dst->first_short_session_reason = src.first_short_session_reason;
   }
-  dst->max_search_elapsed_ms =
-      std::max(dst->max_search_elapsed_ms, src.max_search_elapsed_ms);
-  dst->sum_search_elapsed_ms += src.sum_search_elapsed_ms;
-  // The deadline is a configuration constant, identical in every chunk; taking
-  // the max rather than the last keeps a chunk that ran no searches (and so left
-  // it at 0) from erasing it.
-  dst->configured_time_limit_ms =
-      std::max(dst->configured_time_limit_ms, src.configured_time_limit_ms);
+  MergeSearchPiLatencyStats(dst, src);
   dst->inherited_visits += src.inherited_visits;
   dst->re_root_hits += src.re_root_hits;
   dst->re_root_misses += src.re_root_misses;
@@ -434,12 +428,22 @@ void EmitRoleJson(std::ostream& os, const char* prefix,
   // the instrument that makes --threads auditable rather than hopeful.
   os << ",\"" << prefix << "_max_search_elapsed_ms\":"
      << F17(r.max_search_elapsed_ms)
+     << ",\"" << prefix << "_p50_search_elapsed_ms\":"
+     << (r.searches_run > 0
+             ? F17(SearchPiLatencyQuantileUpperMs(r, 0.50))
+             : std::string("null"))
+     << ",\"" << prefix << "_p95_search_elapsed_ms\":"
+     << (r.searches_run > 0
+             ? F17(SearchPiLatencyQuantileUpperMs(r, 0.95))
+             : std::string("null"))
      << ",\"" << prefix << "_mean_search_elapsed_ms\":"
      << (r.searches_run > 0
              ? F17(r.sum_search_elapsed_ms / static_cast<double>(r.searches_run))
              : std::string("null"))
      << ",\"" << prefix << "_configured_time_limit_ms\":"
      << F17(r.configured_time_limit_ms)
+     << ",\"" << prefix << "_max_sim_duration_ms\":"
+     << F17(r.max_sim_duration_ms)
      << ",\"" << prefix << "_deadline_headroom_frac\":"
      << (r.configured_time_limit_ms > 0.0
              ? F17(1.0 - r.max_search_elapsed_ms / r.configured_time_limit_ms)
@@ -524,6 +528,25 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   std::vector<std::vector<SearchPiRow>> chunk_rows(retain ? num_chunks : 0);
   std::atomic<int> next_chunk{0};
   std::mutex log_mutex;
+
+  // Uncapped, machine-readable first-fire-per-episode stream for the live
+  // union watcher. It is updated after each completed chunk, while the arm is
+  // still running, and contains one line per affected episode regardless of
+  // how many roots fired in that episode. The human SHORT SEARCH log remains
+  // capped forensic detail and is deliberately not a launch dependency.
+  const std::string output_dir = absl::GetFlag(FLAGS_output_dir);
+  if (output_dir.empty()) {
+    SpielFatalError("--output_dir is required for the short-episode stream");
+  }
+  std::error_code stream_ec;
+  std::filesystem::create_directories(output_dir, stream_ec);
+  const std::string short_stream_path =
+      output_dir + "/" + SearchPiArmName(arm) + "_short_episodes.jsonl";
+  std::ofstream short_stream(short_stream_path, std::ios::trunc);
+  if (!short_stream) {
+    SpielFatalError(absl::StrCat("cannot open short-episode stream: ",
+                                short_stream_path));
+  }
 
   const int nthreads = std::max(1, std::min(absl::GetFlag(FLAGS_threads), num_chunks));
 
@@ -649,6 +672,19 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
       if (retain) chunk_rows[ci] = std::move(rows);
       {
         std::lock_guard<std::mutex> lk(log_mutex);
+        for (const SearchPiGameOutcome& game_outcome :
+             chunk_stats[ci].games_played) {
+          if (game_outcome.searches_short_of_budget > 0) {
+            short_stream << "{\"episode_id\":" << game_outcome.episode_id
+                         << ",\"root_fires\":"
+                         << game_outcome.searches_short_of_budget << "}\n";
+          }
+        }
+        short_stream.flush();
+        if (!short_stream) {
+          SpielFatalError(absl::StrCat("write failed for short-episode stream: ",
+                                      short_stream_path));
+        }
         std::cout << "[audit] " << SearchPiArmName(arm) << " chunk " << (ci + 1)
                   << "/" << num_chunks << " episodes ["
                   << chunk_stats[ci].first_episode_id << ".."
@@ -758,6 +794,7 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
       for (const SearchPiRow& row : chunk_rows[ci]) {
         tc = ChainSearchPiTargetHash(tc, row);
         ec = ChainSearchPiExtendedRowHash(ec, row);
+        r.retained_rows.push_back(row);
       }
     }
     r.target_hash_chain = tc;
@@ -840,6 +877,9 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
          // Trajectory identity. A divergence detector, NOT a parity reference.
          << ",\"played_action_digest\":\"" << std::hex << std::setw(16)
          << std::setfill('0') << g.played_action_digest << std::dec
+         << std::setfill(' ') << "\""
+         << ",\"full_trajectory_digest\":\"" << std::hex << std::setw(16)
+         << std::setfill('0') << g.full_trajectory_digest << std::dec
          << std::setfill(' ') << "\""
          // Additive game-shape telemetry (Fable, 2026-08-18). final_round is
          // the round ACTUALLY PLAYED (the engine's counter has already advanced
@@ -971,6 +1011,40 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
   if (!os) {
     std::cerr << "[audit] write failed for " << sp << std::endl;
     return false;
+  }
+
+  // Stable gate-only row representation. Large audits run with
+  // --retain_rows=false, so this file never burdens the registered n=2,344
+  // endpoint. Gates 3 and 4 retain >=64 games and join rows by
+  // (episode_id, decision_id, player, role).
+  if (!r.retained_rows.empty()) {
+    const std::string rp = dir + "/" + name + "_rows.jsonl";
+    std::ofstream ro(rp, std::ios::trunc);
+    if (!ro) {
+      std::cerr << "[audit] cannot open " << rp << std::endl;
+      return false;
+    }
+    for (const SearchPiRow& row : r.retained_rows) {
+      ro << "{\"episode_id\":" << row.episode_id
+         << ",\"decision_id\":" << row.decision_id
+         << ",\"player\":" << row.player
+         << ",\"role\":" << static_cast<int>(row.role)
+         << ",\"chosen_action\":" << row.chosen_action
+         << ",\"legal_actions\":[";
+      for (size_t i = 0; i < row.legal_actions.size(); ++i) {
+        ro << (i ? "," : "") << row.legal_actions[i];
+      }
+      ro << "],\"target_probs\":[";
+      for (size_t i = 0; i < row.target_probs.size(); ++i) {
+        ro << (i ? "," : "") << F17(row.target_probs[i]);
+      }
+      ro << "]}\n";
+    }
+    ro.flush();
+    if (!ro) {
+      std::cerr << "[audit] write failed for " << rp << std::endl;
+      return false;
+    }
   }
 
   // Batcher telemetry, PER ARM, under the same stem as every other artifact.
@@ -1290,12 +1364,12 @@ int main(int argc, char** argv) {
 
   auto game = open_spiel::LoadGame("dune_imperium");
   if (game->NumPlayers() != kBatchedLeafGroupRows) {
-    // The leaf-rows crosscheck is `group_rows == group_calls x NumPlayers`. If
-    // the game's seat count ever moves, that identity silently stops being the
-    // check it claims to be rather than failing.
+    // target_batch_size=4*G is registered from one in-flight NumPlayers-row
+    // evaluation group per game. Keep that parameter identity explicit even
+    // though the former leaf_rows_crosscheck telemetry gate is withdrawn.
     std::cerr << "kBatchedLeafGroupRows is " << kBatchedLeafGroupRows
               << " but the game has " << game->NumPlayers()
-              << " players; the leaf-rows crosscheck would be vacuous."
+              << " players; registered batch_target=4*G is invalid."
               << std::endl;
     return 2;
   }

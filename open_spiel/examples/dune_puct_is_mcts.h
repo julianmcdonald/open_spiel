@@ -229,6 +229,11 @@ struct SearchDiagnostics {
   double hard_time_limit_ms = 0.0;
   double soft_time_limit_ms = 0.0;
   double elapsed_search_time_ms = 0.0;
+  // Largest per-simulation duration observed by RunSearch. This is the
+  // predictor margin used by the watchdog check
+  //   elapsed_ms + max_sim_duration_ms >= actual_max_time_ms
+  // and therefore belongs beside elapsed_search_time_ms in the artifact.
+  double max_sim_duration_ms = 0.0;
   double observation_wait_time_ms = 0.0;
   int inherited_root_visits = 0;
   int newly_completed_simulations = 0;

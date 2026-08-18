@@ -595,6 +595,74 @@ uint64_t MixPlayedAction(uint64_t h, int64_t decision_id, Action action) {
   return h;
 }
 
+uint64_t MixAppliedAction(uint64_t h, int64_t transition_id, Player actor,
+                          Action action) {
+  // Include the transition ordinal and actor as well as the action. Action ids
+  // alone cover the sequence in today's game, but the complete witness should
+  // remain unambiguous if a future engine reuses an action id across player and
+  // chance nodes.
+  const uint64_t vals[3] = {static_cast<uint64_t>(transition_id),
+                            static_cast<uint64_t>(static_cast<int64_t>(actor)),
+                            static_cast<uint64_t>(action)};
+  for (uint64_t v : vals) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= static_cast<uint8_t>((v >> (8 * b)) & 0xff);
+      h *= 1099511628211ull;
+    }
+  }
+  return h;
+}
+
+void AddSearchPiLatencySample(SearchPiRoleStats* stats, double elapsed_ms) {
+  SPIEL_CHECK_TRUE(stats != nullptr);
+  const double nonnegative = std::max(0.0, elapsed_ms);
+  const int finite_bin = static_cast<int>(
+      nonnegative / SearchPiRoleStats::kLatencyBinMs);
+  const int bin = std::min(finite_bin,
+                           SearchPiRoleStats::kLatencyFiniteBins);
+  stats->search_elapsed_hist[bin]++;
+}
+
+double SearchPiLatencyQuantileUpperMs(const SearchPiRoleStats& stats,
+                                      double quantile) {
+  if (!(quantile > 0.0 && quantile <= 1.0)) return 0.0;
+  int64_t total = 0;
+  for (int i = 0; i < SearchPiRoleStats::kLatencyBins; ++i) {
+    total += stats.search_elapsed_hist[i];
+  }
+  if (total <= 0) return 0.0;
+  const int64_t rank = static_cast<int64_t>(
+      std::ceil(quantile * static_cast<double>(total)));
+  int64_t cumulative = 0;
+  for (int i = 0; i < SearchPiRoleStats::kLatencyBins; ++i) {
+    cumulative += stats.search_elapsed_hist[i];
+    if (cumulative >= rank) {
+      if (i == SearchPiRoleStats::kLatencyFiniteBins) {
+        return SearchPiRoleStats::kLatencyFiniteBins *
+               SearchPiRoleStats::kLatencyBinMs;
+      }
+      return (i + 1) * SearchPiRoleStats::kLatencyBinMs;
+    }
+  }
+  return SearchPiRoleStats::kLatencyFiniteBins *
+         SearchPiRoleStats::kLatencyBinMs;
+}
+
+void MergeSearchPiLatencyStats(SearchPiRoleStats* dst,
+                               const SearchPiRoleStats& src) {
+  SPIEL_CHECK_TRUE(dst != nullptr);
+  dst->max_search_elapsed_ms =
+      std::max(dst->max_search_elapsed_ms, src.max_search_elapsed_ms);
+  dst->sum_search_elapsed_ms += src.sum_search_elapsed_ms;
+  dst->max_sim_duration_ms =
+      std::max(dst->max_sim_duration_ms, src.max_sim_duration_ms);
+  for (int i = 0; i < SearchPiRoleStats::kLatencyBins; ++i) {
+    dst->search_elapsed_hist[i] += src.search_elapsed_hist[i];
+  }
+  dst->configured_time_limit_ms =
+      std::max(dst->configured_time_limit_ms, src.configured_time_limit_ms);
+}
+
 // ---------------------------------------------------------------------------
 // Generator
 // ---------------------------------------------------------------------------
@@ -710,6 +778,7 @@ void SearchPiGenerator::GenerateGeneration(
     std::vector<size_t> emitted_indices;
     int64_t decision_index = 0;
     int64_t chance_index = 0;
+    int64_t transition_index = 0;
 
     SearchPiGameOutcome outcome;
     outcome.episode_id = episode_id;
@@ -720,7 +789,11 @@ void SearchPiGenerator::GenerateGeneration(
         ActionsAndProbs outcomes = state->ChanceOutcomes();
         const double r = UnitDouble(DeriveStream(
             config_.seed_domain, episode_id, chance_index++, kStreamPiChance));
-        state->ApplyAction(SampleActionFromPrior(outcomes, r));
+        const Action action = SampleActionFromPrior(outcomes, r);
+        outcome.full_trajectory_digest = MixAppliedAction(
+            outcome.full_trajectory_digest, transition_index++,
+            state->CurrentPlayer(), action);
+        state->ApplyAction(action);
         continue;
       }
 
@@ -731,11 +804,14 @@ void SearchPiGenerator::GenerateGeneration(
       if (cur != searched_seat) {
         // Every other seat plays the frozen raw policy at temperature 1.0.
         ActionsAndProbs prior = evaluator->Prior(*state);
-        state->ApplyAction(SampleRawPolicyAction(
+        const Action action = SampleRawPolicyAction(
             prior, config_.non_search_temperature,
             DeriveStream(config_.seed_domain, episode_id, this_decision,
                          kStreamPiOpponentPolicy),
-            legal_actions));
+            legal_actions);
+        outcome.full_trajectory_digest = MixAppliedAction(
+            outcome.full_trajectory_digest, transition_index++, cur, action);
+        state->ApplyAction(action);
         continue;
       }
 
@@ -848,15 +924,9 @@ void SearchPiGenerator::GenerateGeneration(
         if (elapsed > rs->max_search_elapsed_ms) {
           rs->max_search_elapsed_ms = elapsed;
         }
-        {
-          const int bin =
-              elapsed <= 0.0
-                  ? 0
-                  : std::min(static_cast<int>(elapsed /
-                                              SearchPiRoleStats::kLatencyBinMs),
-                             SearchPiRoleStats::kLatencyBins);
-          rs->search_elapsed_hist[bin]++;
-        }
+        AddSearchPiLatencySample(rs, elapsed);
+        rs->max_sim_duration_ms = std::max(
+            rs->max_sim_duration_ms, res.diagnostics.max_sim_duration_ms);
         rs->configured_time_limit_ms = res.diagnostics.soft_time_limit_ms;
 
         if (res.simulations_completed < requested) {
@@ -1082,6 +1152,8 @@ void SearchPiGenerator::GenerateGeneration(
       }
       outcome.played_action_digest =
           MixPlayedAction(outcome.played_action_digest, this_decision, chosen);
+      outcome.full_trajectory_digest = MixAppliedAction(
+          outcome.full_trajectory_digest, transition_index++, cur, chosen);
 
       ControllerDecision dec;
       dec.selected_action = chosen;

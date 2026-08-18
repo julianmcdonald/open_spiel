@@ -425,6 +425,7 @@ struct SearchPiRoleStats {
   // came, which is the difference between "it held this time" and "it holds".
   double max_search_elapsed_ms = 0.0;
   double sum_search_elapsed_ms = 0.0;
+  double max_sim_duration_ms = 0.0;
 
   // PER-ROOT LATENCY DISTRIBUTION, as a fixed-bin histogram.
   //
@@ -439,9 +440,14 @@ struct SearchPiRoleStats {
   // once at the end. 10 ms bins to 60 s, plus an overflow bin, gives P95 to
   // within 10 ms against a 60,000 ms limit -- three orders of magnitude finer
   // than any decision it feeds.
-  static constexpr int kLatencyBins = 6001;   // [0,10) .. [59990,60000), +over
+  static constexpr int kLatencyFiniteBins = 6000;
+  static constexpr int kLatencyBins = kLatencyFiniteBins + 1;
   static constexpr double kLatencyBinMs = 10.0;
-  int64_t search_elapsed_hist[kLatencyBins + 1] = {0};
+  // Bins 0..5999 are [0,10) through [59990,60000). Bin 6000 is
+  // [60000,+inf). A value exactly on a boundary belongs to the bin beginning
+  // at that boundary; this makes 60000 ms overflow rather than masquerade as
+  // being below the registered watchdog.
+  int64_t search_elapsed_hist[kLatencyBins] = {0};
   double configured_time_limit_ms = 0.0;  // what the deadline actually was
 
   int64_t inherited_visits = 0;
@@ -578,7 +584,23 @@ struct SearchPiGameOutcome {
   // returns. A silently null wide arm reproduces narrow's digest on EVERY
   // episode; a partially null one reproduces it on some.
   uint64_t played_action_digest = 0xcbf29ce484222325ull;  // FNV offset basis
+
+  // FNV-1a 64 over EVERY action applied to the game state, including chance,
+  // all opponents, and the searched seat. The searched-seat-only digest above
+  // remains the played-action manipulation diagnostic; this is the complete
+  // game-noise/repeatability witness used by Gates 3 and 4.
+  uint64_t full_trajectory_digest = 0xcbf29ce484222325ull;
 };
+
+// Fixed-histogram helpers shared by the generator, audit emitter and focused
+// unit tests. The returned quantile is a conservative upper edge in ms. If the
+// requested rank lands in the overflow bin it returns the overflow boundary
+// (60000 ms), meaning "at least 60000", never a fabricated finite tail value.
+void AddSearchPiLatencySample(SearchPiRoleStats* stats, double elapsed_ms);
+double SearchPiLatencyQuantileUpperMs(const SearchPiRoleStats& stats,
+                                      double quantile);
+void MergeSearchPiLatencyStats(SearchPiRoleStats* dst,
+                               const SearchPiRoleStats& src);
 
 // Placement 1..4 from an engine return, or 0 when it sits on no rung.
 // `utility_divisor` scales the ladder the same way SearchPiRow::value_target

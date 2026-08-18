@@ -605,6 +605,9 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
   result.diagnostics.soft_time_limit_ms = max_time_ms;
   result.diagnostics.elapsed_search_time_ms = result.elapsed_time_ms;
+  // max_sim_duration_ms is populated by DunePUCTISMCTSBot::RunSearch and is
+  // deliberately left intact here: it is the predictor margin the watchdog
+  // actually used, not a session-level reconstruction.
   result.diagnostics.inherited_root_visits = inherited_visits;
   result.diagnostics.newly_completed_simulations = result.simulations_completed;
   result.diagnostics.session_cumulative_simulations = session_new_simulations_completed_;

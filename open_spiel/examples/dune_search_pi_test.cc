@@ -2167,13 +2167,57 @@ void Test25_FourArmsPerEpisodeAccounting(
   for (size_t i = 0; i < wide.games_played.size(); ++i) {
     SPIEL_CHECK_EQ(again.games_played[i].played_action_digest,
                    wide.games_played[i].played_action_digest);
+    SPIEL_CHECK_EQ(again.games_played[i].full_trajectory_digest,
+                   wide.games_played[i].full_trajectory_digest);
   }
+
+  // The watchdog predictor margin is no longer trapped inside RunSearch.
+  SPIEL_CHECK_GE(wide.primary.max_sim_duration_ms, 10.0);
+  SPIEL_CHECK_GE(wide.continuation.max_sim_duration_ms, 10.0);
 
   std::cout << "  wide roots " << sum(wide, &SearchPiGameOutcome::wide_roots)
             << ", played != raw at "
             << differs(wide, {4, 5, 6})
             << " of them; both controls at 0; four distinct trajectories\n";
   std::cout << "Test25 Passed!\n\n";
+}
+
+void Test26_LatencyHistogramMergeAndQuantiles() {
+  std::cout << "Running Test26_LatencyHistogramMergeAndQuantiles...\n";
+  using namespace open_spiel;
+  SearchPiRoleStats a, b;
+  for (double x : {0.0, 9.999, 10.0, 19.999}) {
+    AddSearchPiLatencySample(&a, x);
+  }
+  for (double x : {20.0, 59999.999, 60000.0}) {
+    AddSearchPiLatencySample(&b, x);
+  }
+  a.max_search_elapsed_ms = 19.999;
+  a.sum_search_elapsed_ms = 39.998;
+  a.max_sim_duration_ms = 12.0;
+  a.configured_time_limit_ms = 60000.0;
+  b.max_search_elapsed_ms = 60000.0;
+  b.sum_search_elapsed_ms = 120019.999;
+  b.max_sim_duration_ms = 44.0;
+  b.configured_time_limit_ms = 60000.0;
+
+  // Boundary semantics: exact multiples begin the next bin; 60000 overflows.
+  SPIEL_CHECK_EQ(a.search_elapsed_hist[0], 2);
+  SPIEL_CHECK_EQ(a.search_elapsed_hist[1], 2);
+  SPIEL_CHECK_EQ(b.search_elapsed_hist[2], 1);
+  SPIEL_CHECK_EQ(b.search_elapsed_hist[5999], 1);
+  SPIEL_CHECK_EQ(b.search_elapsed_hist[6000], 1);
+
+  MergeSearchPiLatencyStats(&a, b);
+  // Seven samples: nearest-rank P50 is sample 4 (19.999 -> upper edge 20),
+  // and P95 is sample 7 in the overflow bin (reported conservatively as 60000).
+  SPIEL_CHECK_FLOAT_EQ(SearchPiLatencyQuantileUpperMs(a, 0.50), 20.0);
+  SPIEL_CHECK_FLOAT_EQ(SearchPiLatencyQuantileUpperMs(a, 0.95), 60000.0);
+  SPIEL_CHECK_FLOAT_EQ(a.max_search_elapsed_ms, 60000.0);
+  SPIEL_CHECK_FLOAT_EQ(a.max_sim_duration_ms, 44.0);
+  SPIEL_CHECK_FLOAT_EQ(a.configured_time_limit_ms, 60000.0);
+  std::cout << "  merged P50=20ms P95>=60000ms; boundary bins exact\n";
+  std::cout << "Test26 Passed!\n\n";
 }
 
 int main(int argc, char** argv) {
@@ -2194,6 +2238,7 @@ int main(int argc, char** argv) {
   Test18_LearnerTelemetry();
   Test19_StateRoundTrip();
   Test23_ScopeAndWatchdogSurface();
+  Test26_LatencyHistogramMergeAndQuantiles();
 
   // Game-driving tests last: they are the slow ones.
   Test03_04_RoleScoping(game);
