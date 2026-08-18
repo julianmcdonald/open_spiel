@@ -754,6 +754,20 @@ bool WriteArm(const ArmResult& r, const std::string& dir) {
      << ",\"cfg_logit_cap\":" << F17(absl::GetFlag(FLAGS_logit_cap))
      << ",\"cfg_hidden_dim\":" << absl::GetFlag(FLAGS_hidden_dim)
      << ",\"cfg_num_blocks\":" << absl::GetFlag(FLAGS_num_blocks)
+     // The scope axis and the watchdog. These two decide WHICH TEACHER this
+     // arm is -- narrow (0) or wide (64) -- so the three-arm analyzer must be
+     // able to read the arm's own claim about its scope rather than infer it
+     // from sims_role_4/5/6 being nonzero. An inferred scope cannot tell a
+     // correctly-configured wide arm from a narrow arm with a leaked budget.
+     << ",\"cfg_purchase_combat_budget\":" << c.purchase_combat_budget
+     << ",\"cfg_relative_time_budget_ms\":" << F17(c.relative_time_budget_ms)
+     // Batching provenance. batch_target 0 is reference mode (the unbatched
+     // path); >0 is production batched. Recorded so a run states which
+     // inference mode produced it -- the teachers and the raw control must all
+     // report the SAME mode, which is what §8.2 requires of the control.
+     << ",\"cfg_batch_target\":" << absl::GetFlag(FLAGS_batch_target)
+     << ",\"cfg_batcher_timeout_ms\":" << absl::GetFlag(FLAGS_batcher_timeout_ms)
+     << ",\"cfg_warmup_games\":" << absl::GetFlag(FLAGS_warmup_games)
      << ",\"target_hash_chain\":"
      << (r.target_hash_chain.empty()
              ? std::string("null")
