@@ -281,7 +281,7 @@ DuneSearchConfig SearchPiSearchConfigFor(const SearchPiConfig& config,
   // Simulations at the three roles the NARROW teacher must not search.
   //
   // purchase_combat_budget <= 0 makes DuneSearchSession::Search return the
-  // policy-only "policy_only_purchase_combat" result before any budget is
+  // policy-only "policy_only_purchase_combat" result before any SHORT-WINDOW budget is
   // resolved (dune_search_session.cc:375, the `policy_only_purchase_combat`
   // return; the previous :354-355 pointed at a different branch's comment),
   // which covers kPurchase,

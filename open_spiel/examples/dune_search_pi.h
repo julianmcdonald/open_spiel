@@ -191,7 +191,7 @@ struct SearchPiConfig {
   // --- Scope: the wide teacher's one axis. ---
   // NEW simulations at kPurchase, kCombatIntrigue and kOtherOptional -- one
   // budget covers all three, because <= 0 makes DuneSearchSession::Search
-  // return policy_only_purchase_combat before any budget is resolved
+  // return policy_only_purchase_combat before any SHORT-WINDOW budget is resolved
   // (dune_search_session.cc:375, the `policy_only_purchase_combat` return --
   // :354-355 was a misread and is the comment above a DIFFERENT early return).
   // The default 0 is the NARROW teacher and
