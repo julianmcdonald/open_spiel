@@ -3496,8 +3496,23 @@ int main(int argc, char** argv) {
     if (origin_reset_requested && origin_reset_fingerprint.empty()) {
       SpielFatalError(
           "an origin reset requires the origin config fingerprint: without it "
-          "the authorising triple collapses to a generation and a cursor, "
+          "the authorising predicate collapses to a generation and a cursor, "
           "which many checkpoints share.");
+    }
+    // A reset routes the lineage into the FRESH-lineage arm, and the launcher
+    // derives the episode base and the registered base from one value, so that
+    // arm's base check compares a constant against itself. The expected student
+    // digest is therefore the ONLY check that ties the loaded weights to the
+    // intended origin, and it is skipped when empty. Requiring it here turns a
+    // fail-OPEN default into a fail-closed one: a hand-launched reset that
+    // omitted it would otherwise train whatever checkpoint it was handed, under
+    // the registered profile's name, with no identity check at all.
+    if (origin_reset_requested &&
+        absl::GetFlag(FLAGS_search_pi_expected_initial_student_sha256).empty()) {
+      SpielFatalError(
+          "an origin reset requires the expected initial student digest: it is "
+          "the only remaining check that binds the loaded weights to the "
+          "registered origin checkpoint.");
     }
 
     // rung4_replay: capture on one side, train-only on the other. They are two
@@ -3787,9 +3802,16 @@ int main(int argc, char** argv) {
             absl::GetFlag(FLAGS_search_pi_origin_next_episode_id);
         reset_request.origin_config_fingerprint = origin_reset_fingerprint;
         // The base the LAUNCHER stated, read before the resume block below
-        // overwrites pi_cfg.next_episode_id. Passing registered_first_episode_id
-        // here instead would make the fresh-lineage base check compare a
-        // constant against itself and stop detecting a mis-stated launch.
+        // overwrites pi_cfg.next_episode_id.
+        //
+        // This preserves the POSSIBILITY that the fresh-lineage base check
+        // binds, for a caller that states the two bases independently. Note
+        // that the supervisor does NOT: it derives --search_pi_first_episode_id
+        // and --search_pi_registered_first_episode_id from one manifest key
+        // precisely so they cannot disagree, so under the supervisor that check
+        // compares a constant against itself. Do not read it as a second
+        // independent guard on a supervised launch -- there, the expected
+        // initial student digest (required above) is the one that binds.
         reset_request.new_first_episode_id = pi_cfg.next_episode_id;
         reset_request.new_config_fingerprint = pi_fingerprint;
         std::string reset_error;

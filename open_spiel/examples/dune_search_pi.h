@@ -1066,12 +1066,23 @@ std::string SearchPiConfigFingerprint(const SearchPiConfig& config,
 // moments it is about to inherit. Re-basing the bookkeeping must not become a
 // way to launder a changed objective.
 struct SearchPiOriginResetRequest {
-  // The exact endpoint this reset is authorised against. All three must match
-  // the state, because any one alone is satisfiable by a checkpoint someone
-  // happens to point at: the generation is a small integer many lineages share,
-  // the cursor is shared by every re-run of the same generation, and the
-  // fingerprint is shared by every generation of the same recipe. The TRIPLE is
-  // what identifies one endpoint of one lineage.
+  // The endpoint this reset is authorised against. In practice the GENERATION
+  // and the CURSOR are what discriminate: together they name one endpoint of
+  // one lineage, and neither alone does.
+  //
+  // The fingerprint is a weaker third condition than it looks, and the honest
+  // statement is that IT CANNOT FAIL FOR THE INTENDED CALLER. It is compared
+  // against a value recomputed from the same document the caller read it out
+  // of, so it can only disagree if that document disagrees with itself. It also
+  // does not distinguish rung 4 from 3b: SearchPiConfigFingerprint contains no
+  // profile-dependent field and the successor deliberately inherits every
+  // fingerprinted knob, so a rung-4 checkpoint's fingerprint EQUALS 3b's.
+  //
+  // It is kept because it is the condition that would start binding the moment
+  // a successor changed a fingerprinted knob -- at which point re-basing must
+  // not be allowed to launder the changed objective onto inherited Adam
+  // moments. Treat it as a tripwire for a future edit, not as present-day
+  // identity evidence.
   int expected_origin_generation = 0;
   int64_t expected_origin_next_episode = 0;
   // Compared against SearchPiConfigFingerprint(state.config, state.learner) --
