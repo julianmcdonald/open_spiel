@@ -65,10 +65,24 @@
 #include "dune_search_pi.h"
 #include "dune_search_pi_concurrent.h"
 #include "dune_seed_utils.h"
+#include "dune_sha256.h"
 
 // --- What to measure -------------------------------------------------------
 ABSL_FLAG(std::string, model_checkpoint, "",
           "Model whose teacher is audited. Loaded once, never written.");
+// Rung 4A. With a policy-prior checkpoint set, the searched seat runs the
+// HYBRID controller: MCTS policy priors come from this model while every leaf
+// value still comes from --model_checkpoint. The three opponent seats and the
+// searched seat's off-scope decisions stay on --model_checkpoint either way,
+// so two audit runs that differ only in this flag are the exact paired
+// searched-controller contrast the rung-4A gate needs, played against the same
+// frozen opponent panel. Empty restores the single-model controller exactly.
+ABSL_FLAG(std::string, search_pi_policy_prior_model_checkpoint, "",
+          "Rung 4A candidate supplying MCTS policy priors. Empty means the "
+          "audited model supplies both priors and leaf values, as before.");
+ABSL_FLAG(std::string, search_pi_policy_prior_model_sha256, "",
+          "Required whenever a policy-prior checkpoint is set. Verified "
+          "against the file before any game is played.");
 ABSL_FLAG(std::string, arm, "both",
           "searched | raw_argmax | both. 'both' runs the searched arm first so "
           "a run killed part-way still leaves the expensive arm complete.");
@@ -451,7 +465,9 @@ SearchPiConfig BuildConfig() {
 
 ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
                  const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
-                 torch::Device device) {
+                 torch::Device device,
+                 const std::shared_ptr<SharedDunePolicyValueNetImpl>&
+                     policy_prior_model = nullptr) {
   ConcurrentSearchPiCollectionConfig config;
   config.search = BuildConfig();
   config.search.next_episode_id = absl::GetFlag(FLAGS_first_episode_id);
@@ -467,8 +483,11 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   config.output_dir = absl::GetFlag(FLAGS_output_dir);
   config.arm = arm;
 
+  // A null policy-prior model is the single-model controller: the collection
+  // path takes its historical branch and this audit reproduces exactly what it
+  // audited before rung 4A existed.
   ArmResult result =
-      CollectSearchPiConcurrent(config, game, model, device);
+      CollectSearchPiConcurrent(config, game, model, device, policy_prior_model);
 
   // Preserve the legacy explicitly requested telemetry destination used by
   // older parity launchers. The per-arm sidecar written by WriteArm remains the
@@ -1154,6 +1173,48 @@ int main(int argc, char** argv) {
   model->to(device);
   model->eval();
 
+  // --- Rung 4A hybrid controller ------------------------------------------
+  //
+  // Loaded and hash-verified BEFORE any game is played, for the same reason the
+  // trainer verifies its collector archive up front: a gate arm that discovers
+  // it was pointed at the wrong candidate after the games exist has already
+  // spent the budget. The SHA here is caller-supplied rather than a pinned
+  // constant, because the candidate changes from attempt to attempt while the
+  // frozen leaf evaluator does not.
+  std::shared_ptr<SharedDunePolicyValueNetImpl> policy_prior_model;
+  const std::string prior_ckpt =
+      absl::GetFlag(FLAGS_search_pi_policy_prior_model_checkpoint);
+  const std::string prior_sha =
+      absl::GetFlag(FLAGS_search_pi_policy_prior_model_sha256);
+  if (!prior_ckpt.empty() || !prior_sha.empty()) {
+    if (prior_ckpt.empty() || prior_sha.empty()) {
+      std::cerr << "a policy-prior checkpoint and its sha256 must be given "
+                   "together, or neither." << std::endl;
+      return 2;
+    }
+    const std::string actual = open_spiel::ComputeFileSHA256(prior_ckpt);
+    if (actual != prior_sha) {
+      std::cerr << "policy-prior checkpoint sha256 " << actual << " does not "
+                << "match the expected " << prior_sha << "." << std::endl;
+      return 2;
+    }
+    policy_prior_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+        absl::GetFlag(FLAGS_num_blocks),
+        absl::GetFlag(FLAGS_nonlinear_value_head));
+    policy_prior_model->to(device);
+    try {
+      torch::load(policy_prior_model, prior_ckpt, device);
+    } catch (const c10::Error& e) {
+      std::cerr << "Failed to load " << prior_ckpt << ":\n" << e.msg()
+                << std::endl;
+      return 2;
+    }
+    policy_prior_model->to(device);
+    policy_prior_model->eval();
+    std::cout << "[audit] hybrid policy prior=" << prior_ckpt << std::endl;
+  }
+
   std::cout << "[audit] model=" << ckpt << " device="
             << (device.is_cuda() ? "cuda" : "cpu") << " obs=" << obs_size
             << " games=" << games << " chunk=" << chunk
@@ -1170,7 +1231,8 @@ int main(int argc, char** argv) {
   // The searched arm runs FIRST under --arm=both: it is the expensive one and
   // the one a partial run most wants to have finished.
   if (arm_flag == "searched" || arm_flag == "both") {
-    ArmResult r = RunArm(SearchPiArm::kSearched, game, model, device);
+    ArmResult r = RunArm(SearchPiArm::kSearched, game, model, device,
+                         policy_prior_model);
     if (!WriteArm(r, dir)) rc = 1;
     if (!ArmPassesManipulationCheck(r)) rc = 1;
     // The deadline margin, printed whether or not it fired. A run that spent
@@ -1236,6 +1298,10 @@ int main(int argc, char** argv) {
   }
 
   if (arm_flag == "raw_argmax" || arm_flag == "both") {
+    // Deliberately NOT given the policy-prior model. The raw arm never searches,
+    // so its behaviour comes from the generator's behaviour evaluator, which is
+    // the frozen model in both controllers -- passing the candidate here would
+    // be inert at best and a silent scope change at worst.
     ArmResult r = RunArm(SearchPiArm::kRawArgmax, game, model, device);
     if (!WriteArm(r, dir)) rc = 1;
     if (!ArmPassesManipulationCheck(r)) rc = 1;

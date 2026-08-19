@@ -41,7 +41,30 @@ struct ConcurrentSearchPiCollectionResult {
   int actual_workers = 0;
   int configured_batch_target = 0;
   int configured_batcher_timeout_ms = 0;
+  // Capacity of the FROZEN batcher, in rows: four leaf-group rows per worker,
+  // because a worker thread blocks on exactly one evaluator request at a time
+  // and its largest request is the four-player leaf group. Unchanged by the
+  // hybrid mode below -- leaf values never leave the frozen batcher.
   int max_inflight_rows = 0;
+  // Set when a policy-prior model was supplied, i.e. when priors inside the
+  // searched seat's tree came from a candidate rather than the frozen model.
+  // The RESULT declares this, not the caller, so a validator cannot be talked
+  // out of the hybrid-only checks by a contract that predates the mode.
+  bool hybrid_policy_prior = false;
+  // Capacity of the POLICY batcher, in rows. ONE row per worker, not four: the
+  // split evaluator routes only Prior() to the policy source
+  // (dune_split_evaluator.h:86-88), and BatchedNNEvaluator::Prior submits a
+  // single row (dune_batched_evaluator.h:51). Leaf groups are the frozen
+  // batcher's alone. Zero when not hybrid.
+  int policy_max_inflight_rows = 0;
+  bool policy_telemetry_valid = false;
+  BatcherTelemetry policy_telemetry;
+  // Canonical digests of the two models a hybrid generation actually ran, so
+  // provenance names both. Populated ONLY in hybrid mode: the incumbent path
+  // must not acquire a per-generation full-parameter hash it never paid for,
+  // and its callers already record the frozen digest themselves.
+  std::string frozen_model_digest;
+  std::string policy_prior_model_digest;
   std::vector<SearchPiGameOutcome> games;
   SearchPiRoleStats primary;
   SearchPiRoleStats continuation;
@@ -68,11 +91,25 @@ bool SearchPiBatcherDeviceTimingComplete(const BatcherTelemetry& telemetry,
 
 // Returns all games/rows in episode order, independent of worker completion
 // order. Invalid geometry is rejected before an evaluator or worker is made.
+//
+// `policy_prior_model` is the HYBRID switch and defaults to absent. Null means
+// the incumbent single-model collection, unchanged in every observable respect:
+// one batcher, one evaluator per worker, one telemetry record. Non-null adds a
+// SECOND batcher over that model and hands the searched seat's session a
+// SplitPolicyValueEvaluator whose priors are the candidate's and whose leaf
+// values remain the frozen model's; opponent seats and the searched seat's
+// off-scope decisions stay frozen either way (dune_search_pi.cc, the session
+// construction comment). The defaulted argument keeps both existing call sites
+// -- dune_ppo_train.cc:3654 and dune_search_pi_audit.cc:471 -- on the incumbent
+// path without an edit, so the running registered experiment cannot acquire the
+// hybrid geometry by recompilation.
 ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
     const ConcurrentSearchPiCollectionConfig& config,
     const std::shared_ptr<const Game>& game,
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& frozen_model,
-    torch::Device device);
+    torch::Device device,
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& policy_prior_model =
+        nullptr);
 
 struct SearchPiTrainingCollectionContract {
   int64_t first_episode_id = 0;
@@ -85,6 +122,12 @@ struct SearchPiTrainingCollectionContract {
   int continuation_simulations = 64;
   int purchase_combat_budget = 0;
   int max_filler_timeout_episodes = 2;
+  // Which collection geometry this contract was written for. Defaults to the
+  // incumbent, so a hybrid result submitted against an unmodified contract
+  // FAILS rather than being waved through by checks that only ever knew about
+  // one batcher. The comparison runs in both directions: an incumbent result
+  // cannot satisfy a contract that registered a hybrid run either.
+  bool expect_hybrid_policy_prior = false;
 };
 
 struct SearchPiTrainingCollectionValidation {

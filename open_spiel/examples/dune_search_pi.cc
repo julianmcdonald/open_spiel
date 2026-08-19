@@ -713,13 +713,34 @@ Player SearchPiGenerator::SearchedSeatForEpisode(int64_t episode_id,
       ((episode_id % num_players) + num_players) % num_players);
 }
 
+// The incumbent entry point, preserved as a delegator that aliases ONE
+// evaluator into both roles. Every pre-hybrid call site resolves here, so the
+// single-model path keeps its exact former meaning: the session, the opponent
+// seats and the fallback branch all receive the identical pointer they received
+// before the split existed. A generator cannot acquire hybrid behaviour by
+// omitting an argument -- it has to be asked for by naming two evaluators.
 void SearchPiGenerator::GenerateGeneration(
     int generation, const std::shared_ptr<const Game>& game,
     const std::shared_ptr<algorithms::Evaluator>& evaluator,
     std::vector<SearchPiRow>* out, SearchPiGenerationStats* stats,
     SearchPiArm arm) {
+  GenerateGeneration(generation, game, /*behavior_evaluator=*/evaluator,
+                     /*search_evaluator=*/evaluator, out, stats, arm);
+}
+
+void SearchPiGenerator::GenerateGeneration(
+    int generation, const std::shared_ptr<const Game>& game,
+    const std::shared_ptr<algorithms::Evaluator>& behavior_evaluator,
+    const std::shared_ptr<algorithms::Evaluator>& search_evaluator,
+    std::vector<SearchPiRow>* out, SearchPiGenerationStats* stats,
+    SearchPiArm arm) {
   SPIEL_CHECK_TRUE(game != nullptr);
-  SPIEL_CHECK_TRUE(evaluator != nullptr);
+  // Both are checked, and separately. A null SEARCH evaluator would surface
+  // thousands of simulations in, and a null BEHAVIOR evaluator would surface
+  // only at the first opponent decision -- both after the generation's
+  // configuration is already committed and its episode cursor has moved.
+  SPIEL_CHECK_TRUE(behavior_evaluator != nullptr);
+  SPIEL_CHECK_TRUE(search_evaluator != nullptr);
   SPIEL_CHECK_TRUE(out != nullptr);
   SPIEL_CHECK_TRUE(stats != nullptr);
 
@@ -772,7 +793,42 @@ void SearchPiGenerator::GenerateGeneration(
     // control would stop being matched. kPolicyOnly returns before the budget
     // is resolved (dune_search_session.cc:399-401) while the session start,
     // re-root and commit bookkeeping above it all still run.
-    DuneSearchSession session(scfg, evaluator,
+    //
+    // THE SPLIT IS CONFINED TO THIS LINE, DELIBERATELY.
+    //
+    // `search_evaluator` is the ONLY evaluator use in this function that may be
+    // a SplitPolicyValueEvaluator (dune_split_evaluator.h). The other two uses
+    // -- the opponent seats' raw policy below, and the fallback/off-scope Prior
+    // further down -- take `behavior_evaluator`, so under the hybrid arm they
+    // remain exactly the frozen teacher's behaviour they are today. That
+    // confinement is the whole design: it leaves the hybrid arm differing from
+    // the incumbent in exactly ONE respect -- which model supplies the priors
+    // that steer the searched seat's tree -- so a difference measured against
+    // the incumbent has one candidate cause rather than three. Widen the split
+    // to either of the other two uses and the arm silently starts measuring a
+    // changed opponent population as well, which no diagnostic here separates.
+    //
+    // KNOWN, ACCEPTED LIMITATION -- the search's INTERNAL opponent model.
+    //
+    // This single-evaluator constructor broadcasts its argument into all four
+    // per-seat slots (dune_search_session.cc:81), so inside the tree the
+    // simulated opponents draw their priors from the split evaluator too:
+    // DunePUCTISMCTSBot's kPolicy opponent path calls
+    // `evaluators_[cur_player]->Prior(state)` (dune_puct_is_mcts.cc:582), which
+    // routes to the CANDIDATE, not the frozen model. So the hybrid arm's
+    // in-tree opponents are candidate-prior opponents. This is accepted, not
+    // overlooked, and it does not touch leaf VALUES -- those stay frozen
+    // through the split's Evaluate().
+    //
+    // Per-seat evaluators were rejected on cost, plainly: the four-slot vector
+    // constructor exists (dune_search_session.h:80-83), but
+    // dune_puct_is_mcts.cc:323-339 compares the seat evaluator POINTERS at every
+    // expansion and, the moment they differ, abandons the fused leaf result and
+    // runs a per-player `Evaluate()` loop instead -- quadrupling leaf-value
+    // forward passes for the entire search. Handing the frozen evaluator to the
+    // three opponent slots would therefore buy a frozen in-tree opponent prior
+    // at 4x the leaf-value inference cost of every generation.
+    DuneSearchSession session(scfg, search_evaluator,
                               arm == SearchPiArm::kRawArgmax
                                   ? DuneSearchBudgetMode::kPolicyOnly
                                   : DuneSearchBudgetMode::kTrainingPolicyIteration);
@@ -808,7 +864,10 @@ void SearchPiGenerator::GenerateGeneration(
 
       if (cur != searched_seat) {
         // Every other seat plays the frozen raw policy at temperature 1.0.
-        ActionsAndProbs prior = evaluator->Prior(*state);
+        // `behavior_evaluator`, never the search one: under the hybrid arm the
+        // opponent population must stay the frozen teacher's, or the arm would
+        // change the environment it is being measured in.
+        ActionsAndProbs prior = behavior_evaluator->Prior(*state);
         const Action action = SampleRawPolicyAction(
             prior, config_.non_search_temperature,
             DeriveStream(config_.seed_domain, episode_id, this_decision,
@@ -1141,7 +1200,12 @@ void SearchPiGenerator::GenerateGeneration(
         }
       }
       if (chosen == kInvalidAction) {
-        ActionsAndProbs prior = evaluator->Prior(*state);
+        // `behavior_evaluator` for BOTH populations described above. Neither is
+        // a search product: the searched role reaching here means the search
+        // technically failed, and the off-scope decisions are outside the arm's
+        // scope by construction. Both are frozen-teacher behaviour today and
+        // stay frozen-teacher behaviour under the hybrid arm.
+        ActionsAndProbs prior = behavior_evaluator->Prior(*state);
         if (is_search_role) {
           chosen = RawPriorArgmaxAction(prior, legal_actions);
         } else {

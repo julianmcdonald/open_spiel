@@ -28,6 +28,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_split.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 
 #include "open_spiel/games/dune_imperium/dune_imperium_util.h"
@@ -44,6 +45,7 @@
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
 #include "dune_search_pi_concurrent.h"
+#include "dune_search_pi_replay.h"  // row shards + uniform replay-window sampler
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "open_spiel/utils/json.h"
@@ -306,6 +308,72 @@ ABSL_FLAG(double, search_pi_policy_coef, 1.0,
           "what lets the value channel be ablated alone. At exactly 1 no "
           "multiply is inserted, so the objective is bit-identical to the "
           "runs that predate this flag.");
+
+// --- Search-PI registration profiles --------------------------------------
+//
+// The lane below hard-pins ONE registered experiment ("post-Gate-8 3b"): the
+// collector SHA-256, the 512/64/G=128 collection geometry, the episode base
+// 600000, the 512 stride and the 1..4 resume window. Those pins are what stop
+// a launcher typo from producing a substitute experiment that merely resembles
+// the registration, and they must keep firing byte-for-byte for the arm that is
+// live right now.
+//
+// A profile does not LOOSEN a pin; it selects which registered constants apply:
+//   post_gate8_3b  today's behaviour, and the only profile that requires the
+//                  fresh student to BE the frozen collector snapshot.
+//   rung4a         hybrid two-model collection -- the pinned teacher still
+//                  drives search, a second frozen archive supplies the policy
+//                  prior, and the student starts from a trained checkpoint.
+//   rung4_replay   row-shard capture, and the train-only replay arm that never
+//                  collects at all.
+// The teacher and the collection geometry are DELIBERATELY identical across all
+// three: rung 4 varies the learner's diet, not the teacher, so the collector-SHA
+// pin, the geometry pin and the one-generation-per-invocation rule stay armed in
+// every profile.
+ABSL_FLAG(std::string, search_pi_registration_profile, "post_gate8_3b",
+          "Registered Search-PI experiment this invocation belongs to: "
+          "post_gate8_3b (default; unchanged behaviour), rung4a or "
+          "rung4_replay. Any other value is fatal at startup.");
+ABSL_FLAG(int64_t, search_pi_registered_first_episode_id, 600000,
+          "Episode-ID base of the registered lineage: generation N collects "
+          "from base + (N-1) * collection games. Pinned to the default value "
+          "under the post_gate8_3b profile.");
+ABSL_FLAG(int, search_pi_max_generation, 5,
+          "Exclusive upper bound on a resumable generation, so a resume must "
+          "carry a completed boundary in 1..max-1. Pinned to the default value "
+          "under the post_gate8_3b profile.");
+ABSL_FLAG(std::string, search_pi_expected_initial_student_sha256, "",
+          "Canonical module digest (CanonicalSearchPiModuleDigest, not a file "
+          "hash) that a FRESH rung4 student must have. Empty disables the "
+          "check. A rung4 arm starts from a TRAINED student, so 3b's rule -- "
+          "fresh student == frozen collector snapshot -- cannot apply to it; "
+          "that rule is unchanged for 3b itself.");
+ABSL_FLAG(std::string, search_pi_policy_prior_model_checkpoint, "",
+          "rung4a only: a SECOND immutable archive supplying the search's "
+          "policy prior while the frozen collector keeps supplying value and "
+          "opponent inference. Empty selects the single-model collection every "
+          "other profile uses.");
+ABSL_FLAG(std::string, search_pi_policy_prior_model_sha256, "",
+          "Required SHA-256 of the policy-prior archive. Caller-supplied and "
+          "checked against the file only -- unlike the collector hash, which "
+          "must ALSO equal the one registered constant.");
+ABSL_FLAG(std::string, search_pi_row_shard_out, "",
+          "rung4_replay only: path the outcome-blind training prefix is "
+          "written to once collection validates and BEFORE the learner runs, "
+          "so a 512-game cohort survives a learner failure. Mutually exclusive "
+          "with training from shards.");
+ABSL_FLAG(std::string, search_pi_train_from_shards, "",
+          "rung4_replay only: comma-separated ordered shard paths. Non-empty "
+          "SKIPS collection entirely and trains on a uniform sample of the "
+          "flattened window instead.");
+ABSL_FLAG(int, search_pi_row_sample_count, 0,
+          "Rows drawn from the replay window. Required positive when training "
+          "from shards, and fatal if it exceeds the rows the window holds. The "
+          "equal row count is what keeps the replay arm from also being a "
+          "more-optimisation arm.");
+ABSL_FLAG(uint64_t, search_pi_row_sample_seed, 0,
+          "Seed for the uniform replay draw. Recorded in the generation marker "
+          "so a sample is reproducible from artifacts alone.");
 
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
@@ -3310,6 +3378,102 @@ int main(int argc, char** argv) {
           "first-class objective is the search-visit policy target.");
     }
 
+    // --- Registration profile, resolved before anything reads a pin ---------
+    //
+    // Every pin below branches on this, so it is resolved first and exactly
+    // once. The default reproduces the live post-Gate-8 3b path; the two rung-4
+    // profiles change only what they are documented to change, and neither can
+    // reach a check the other profile owns.
+    const std::string registration_profile =
+        absl::GetFlag(FLAGS_search_pi_registration_profile);
+    const bool profile_3b = registration_profile == "post_gate8_3b";
+    const bool profile_rung4a = registration_profile == "rung4a";
+    const bool profile_rung4_replay = registration_profile == "rung4_replay";
+    if (!profile_3b && !profile_rung4a && !profile_rung4_replay) {
+      SpielFatalError("unrecognized --search_pi_registration_profile value '" +
+                      registration_profile +
+                      "' (expected post_gate8_3b, rung4a or rung4_replay).");
+    }
+    // Both rung-4 profiles are production-lane runs by construction. The pin
+    // block below is only ENTERED on the concurrent path, so a rung-4 launch
+    // that left the batch target at 0 would run with no geometry pin, no
+    // collector pin and none of the learner manipulation checks -- a substitute
+    // experiment wearing the profile's name. Refused rather than tolerated.
+    if (!profile_3b && absl::GetFlag(FLAGS_search_pi_batch_target) <= 0) {
+      SpielFatalError(
+          "a rung4 profile requires the concurrent production lane: at a zero "
+          "batch target the collector pin, the geometry pin and the learner "
+          "manipulation checks are all skipped.");
+    }
+
+    const int64_t registered_first_episode_id =
+        absl::GetFlag(FLAGS_search_pi_registered_first_episode_id);
+    const int registered_max_generation =
+        absl::GetFlag(FLAGS_search_pi_max_generation);
+    const std::string expected_initial_student_digest =
+        absl::GetFlag(FLAGS_search_pi_expected_initial_student_sha256);
+    // Under 3b these three are not knobs. Honouring them there would let a NEW
+    // flag disarm an OLD pin the live run depends on -- max_generation=99 would
+    // erase the 1..4 resume window, and a restated episode base would let a
+    // second lineage overwrite the registered one. They are inert by
+    // construction rather than by launcher discipline.
+    if (profile_3b && (registered_first_episode_id != 600000 ||
+                       registered_max_generation != 5 ||
+                       !expected_initial_student_digest.empty())) {
+      SpielFatalError(
+          "the post_gate8_3b profile pins the episode base 600000, the 1..4 "
+          "resume window and the fresh-student identity; restating any of them "
+          "requires a rung4 profile.");
+    }
+
+    // rung4a: the second frozen archive. Its SHA is verified against the file
+    // like the collector's, but it is caller-supplied rather than one
+    // registered constant, because rung 4a's whole question is which prior is
+    // paired with the pinned teacher.
+    const std::string policy_prior_path =
+        absl::GetFlag(FLAGS_search_pi_policy_prior_model_checkpoint);
+    const std::string policy_prior_expected_sha =
+        absl::GetFlag(FLAGS_search_pi_policy_prior_model_sha256);
+    if (!policy_prior_path.empty() && !profile_rung4a) {
+      SpielFatalError(
+          "a policy-prior archive is legal only under the rung4a profile; this "
+          "invocation selected the profile " + registration_profile + ".");
+    }
+    if (policy_prior_path.empty() != policy_prior_expected_sha.empty()) {
+      SpielFatalError(
+          "the policy-prior archive and its SHA-256 are set together or not at "
+          "all: an archive without a hash is an unverified second teacher, and "
+          "a hash without an archive verifies nothing.");
+    }
+
+    // rung4_replay: capture on one side, train-only on the other. They are two
+    // halves of the same experiment and never the same invocation -- capture
+    // produces the cohort a later training step consumes.
+    const std::string row_shard_out =
+        absl::GetFlag(FLAGS_search_pi_row_shard_out);
+    const std::string train_from_shards =
+        absl::GetFlag(FLAGS_search_pi_train_from_shards);
+    const bool replay_train = !train_from_shards.empty();
+    const int row_sample_count = absl::GetFlag(FLAGS_search_pi_row_sample_count);
+    if ((!row_shard_out.empty() || replay_train) && !profile_rung4_replay) {
+      SpielFatalError(
+          "row-shard capture and shard training are legal only under the "
+          "rung4_replay profile; this invocation selected the profile " +
+          registration_profile + ".");
+    }
+    if (!row_shard_out.empty() && replay_train) {
+      SpielFatalError(
+          "shard capture and shard training are mutually exclusive: the first "
+          "collects a cohort and writes it, the second never collects at all.");
+    }
+    if (replay_train && row_sample_count <= 0) {
+      SpielFatalError(
+          "training from shards requires a positive row sample count: an "
+          "unstated count would let the replay arm take a different number of "
+          "SGD steps than the fresh arm, which confounds replay with more "
+          "optimisation.");
+    }
+
     open_spiel::SearchPiConfig pi_cfg;
     pi_cfg.games_per_generation =
         absl::GetFlag(FLAGS_search_pi_games_per_generation);
@@ -3443,6 +3607,41 @@ int main(int argc, char** argv) {
       }
     }
 
+    // --- rung4a: the SECOND frozen model ------------------------------------
+    //
+    // Loaded exactly the way the collector above is loaded -- same constructor
+    // arguments, same to(device) before and after, the same torch::load
+    // try/catch and the same eval() -- so a hybrid run cannot differ from a
+    // single-model run in how either archive reaches the device. Loaded OUTSIDE
+    // the collector block so the failure is about this flag and not about which
+    // branch happened to be taken.
+    std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> policy_prior_model;
+    std::string policy_prior_digest;
+    std::string policy_prior_sha;
+    if (!policy_prior_path.empty()) {
+      policy_prior_sha = open_spiel::ComputeFileSHA256(policy_prior_path);
+      if (policy_prior_sha != policy_prior_expected_sha) {
+        SpielFatalError("policy-prior archive SHA-256 mismatch: expected " +
+                        policy_prior_expected_sha + " actual " +
+                        policy_prior_sha);
+      }
+      policy_prior_model =
+          std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+              obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+              absl::GetFlag(FLAGS_num_blocks),
+              absl::GetFlag(FLAGS_nonlinear_value_head));
+      policy_prior_model->to(device);
+      try {
+        torch::load(policy_prior_model, policy_prior_path, device);
+      } catch (const c10::Error& e) {
+        SpielFatalError("policy-prior load failed: " + std::string(e.msg()));
+      }
+      policy_prior_model->to(device);
+      policy_prior_model->eval();
+      policy_prior_digest =
+          open_spiel::CanonicalSearchPiModuleDigest(*policy_prior_model);
+    }
+
     open_spiel::SearchPiLearnerConfig pi_learn;
     pi_learn.learning_rate = absl::GetFlag(FLAGS_search_pi_learning_rate);
     pi_learn.minibatch_size = absl::GetFlag(FLAGS_search_pi_minibatch_size);
@@ -3526,18 +3725,41 @@ int main(int argc, char** argv) {
       if (!search_pi_resume_present) {
         const std::string initial_student_digest =
             open_spiel::CanonicalSearchPiModuleDigest(*training_model);
-        if (initial_student_digest != collector_digest) {
-          SpielFatalError(
-              "fresh post-Gate-8 student is not the registered frozen "
-              "u15828 collector snapshot");
+        if (profile_3b) {
+          if (initial_student_digest != collector_digest) {
+            SpielFatalError(
+                "fresh post-Gate-8 student is not the registered frozen "
+                "u15828 collector snapshot");
+          }
+        } else if (!expected_initial_student_digest.empty() &&
+                   initial_student_digest != expected_initial_student_digest) {
+          // 3b's identity cannot apply to a rung-4 arm: those runs start from a
+          // TRAINED student, so demanding it equal the teacher would refuse
+          // every legitimate launch. The named digest replaces it -- the same
+          // fail-closed shape against a different registered value.
+          SpielFatalError("fresh " + registration_profile +
+                          " student is not the registered initial student: "
+                          "expected " + expected_initial_student_digest +
+                          " actual " + initial_student_digest);
         }
-        if (pi_cfg.next_episode_id != 600000) {
+        if (pi_cfg.next_episode_id != registered_first_episode_id) {
           SpielFatalError(
-              "fresh post-Gate-8 lineage must begin at episode 600000");
+              profile_3b
+                  ? std::string(
+                        "fresh post-Gate-8 lineage must begin at episode 600000")
+                  : absl::StrFormat("fresh %s lineage must begin at episode %d",
+                                    registration_profile,
+                                    registered_first_episode_id));
         }
-      } else if (pi_generation < 1 || pi_generation >= 5) {
+      } else if (pi_generation < 1 ||
+                 pi_generation >= registered_max_generation) {
         SpielFatalError(
-            "post-Gate-8 resume generation must be a completed boundary 1..4");
+            profile_3b
+                ? std::string("post-Gate-8 resume generation must be a "
+                              "completed boundary 1..4")
+                : absl::StrFormat(
+                      "%s resume generation must be a completed boundary 1..%d",
+                      registration_profile, registered_max_generation - 1));
       }
     }
 
@@ -3598,6 +3820,20 @@ int main(int argc, char** argv) {
         pi_learn.learning_rate, pi_learn.minibatch_size, pi_learn.epochs,
         pi_learn.value_coef,
         (unsigned long long)pi_cfg.seed_domain, pi_fingerprint.substr(0, 16));
+    // Printed only OFF the default profile, so the live 3b run's stdout stays
+    // byte-identical to what its supervisor already parses.
+    if (!profile_3b) {
+      std::cout << absl::StrFormat(
+          "[search-PI] profile=%s episode_base=%d max_gen=%d policy_prior=%s "
+          "shard_out=%s train_from_shards=%s sample=%d seed=%llu\n",
+          registration_profile, registered_first_episode_id,
+          registered_max_generation,
+          policy_prior_path.empty() ? std::string("none") : policy_prior_path,
+          row_shard_out.empty() ? std::string("none") : row_shard_out,
+          train_from_shards.empty() ? std::string("none") : train_from_shards,
+          row_sample_count,
+          (unsigned long long)absl::GetFlag(FLAGS_search_pi_row_sample_seed));
+    }
 
     const std::string pi_diag_path = absl::GetFlag(FLAGS_diagnostics_path);
 
@@ -3610,10 +3846,110 @@ int main(int argc, char** argv) {
       std::filesystem::path generation_manifest_dir;
       std::string student_digest_before_learn;
       std::string student_digest_after_learn;
+      std::string policy_prior_digest_before;
+      std::string policy_prior_digest_after;
+      // Carried out of the collection branch so the marker, which is written
+      // after `collected` has gone out of scope, can state which controller
+      // produced the cohort without recomputing anything.
+      bool collected_hybrid_policy_prior = false;
+      std::string collected_frozen_model_digest;
+      std::string collected_policy_prior_model_digest;
+      int replay_shards_read = 0;
+      int64_t replay_window_rows = 0;
 
-      if (production_concurrent) {
+      if (replay_train) {
+        // --- rung4_replay: a training step with no teacher in the process ----
+        //
+        // The cohort was collected AND validated by an earlier invocation, so
+        // everything collection owns is skipped rather than run with empty
+        // arguments: no CollectSearchPiConcurrent, no 512->64 validator, no
+        // episode-cursor advance and no collection directory. What is NOT
+        // skipped is the learner and every manipulation check on it -- this arm
+        // differs from the fresh arm only in where its rows came from, and a
+        // weaker check here would make the two arms incomparable.
+        const std::vector<std::string> shard_paths =
+            absl::StrSplit(train_from_shards, ',');
+        std::vector<std::vector<open_spiel::SearchPiRow>> window;
+        window.reserve(shard_paths.size());
+        for (const std::string& shard_path : shard_paths) {
+          std::vector<open_spiel::SearchPiRow> cohort;
+          std::string shard_error;
+          if (!open_spiel::ReadSearchPiRowShard(shard_path, &cohort,
+                                                &shard_error)) {
+            // ReadSearchPiRowShard reports damage instead of aborting, and
+            // leaves `cohort` EMPTY on failure. Continuing past it would train
+            // a short window and call it a replay result.
+            SpielFatalError("search-PI replay shard read failed for " +
+                            shard_path + ": " + shard_error);
+          }
+          replay_window_rows += static_cast<int64_t>(cohort.size());
+          window.push_back(std::move(cohort));
+        }
+        replay_shards_read = static_cast<int>(shard_paths.size());
+        // The sampler's documented precondition, checked HERE so the failure
+        // names the window: before the 8-cohort window has filled, the caller
+        // -- this -- must clamp the request to what the window actually holds.
+        if (static_cast<int64_t>(row_sample_count) > replay_window_rows) {
+          SpielFatalError(absl::StrFormat(
+              "replay sample of %d rows exceeds the %d rows held by %d shards",
+              row_sample_count, replay_window_rows, replay_shards_read));
+        }
+        pi_rows = open_spiel::SampleUniformReplayWindow(
+            window, static_cast<size_t>(row_sample_count),
+            absl::GetFlag(FLAGS_search_pi_row_sample_seed));
+
+        // Stand in for the collection validator's OUTPUTS -- the per-role
+        // tallies and the trained hashes -- so the accounting, the generation
+        // print and the state chains below need no replay branch of their own.
+        // Every one of those fields means "what was trained on", which is
+        // exactly what these values are; none of them claims a collection ran.
+        for (const open_spiel::SearchPiRow& row : pi_rows) {
+          const int role = static_cast<int>(row.role);
+          if (role < 0 || role >= 7) {
+            SpielFatalError(absl::StrFormat(
+                "replay row carries an out-of-range decision role %d", role));
+          }
+          collection_validation.trained_rows_by_role[role]++;
+          collection_validation.trained_target_hash =
+              open_spiel::ChainSearchPiTargetHash(
+                  collection_validation.trained_target_hash, row);
+          collection_validation.trained_extended_hash =
+              open_spiel::ChainSearchPiExtendedRowHash(
+                  collection_validation.trained_extended_hash, row);
+        }
+        collection_validation.ok = true;
+        pi_stats.generation = pi_generation;
+        pi_stats.rows_total = static_cast<int64_t>(pi_rows.size());
+        pi_stats.target_hash_chain = collection_validation.trained_target_hash;
+        pi_stats.extended_hash_chain =
+            collection_validation.trained_extended_hash;
+        // The cursor does NOT advance: this invocation consumed no episodes,
+        // and an advance here would silently skip a 512-game block for whatever
+        // collecting invocation resumes this lineage next.
+        pi_stats.first_episode_id = pi_cfg.next_episode_id;
+        pi_stats.next_episode_id = pi_cfg.next_episode_id;
+
+        // The marker still needs a home. Same fresh-directory rule as the
+        // collecting path: a generation never writes into another's directory.
+        generation_manifest_dir =
+            std::filesystem::path(
+                absl::GetFlag(FLAGS_search_pi_generation_manifest_dir)) /
+            absl::StrCat("generation_", pi_generation);
+        if (std::filesystem::exists(generation_manifest_dir)) {
+          SpielFatalError("generation output already exists: " +
+                          generation_manifest_dir.string());
+        }
+        std::filesystem::create_directories(generation_manifest_dir);
+      } else if (production_concurrent) {
+        // The base and the stride are the registered lineage's, not literals:
+        // the stride IS the collection size, so a profile that collects a
+        // different number of games per generation still lands on contiguous,
+        // non-overlapping episode blocks. Under post_gate8_3b the geometry pin
+        // above forces 512, so this is exactly 600000 + (N-1) * 512.
         const int64_t registered_first =
-            600000 + static_cast<int64_t>(pi_generation - 1) * 512;
+            registered_first_episode_id +
+            static_cast<int64_t>(pi_generation - 1) *
+                pi_cfg.collection_games_per_generation;
         if (pi_cfg.next_episode_id != registered_first) {
           SpielFatalError(absl::StrFormat(
               "generation %d cursor is %d, registered %d",
@@ -3623,6 +3959,17 @@ int main(int argc, char** argv) {
             open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
         if (digest_before_collection != collector_digest) {
           SpielFatalError("frozen collector digest changed before collection");
+        }
+        // A hybrid run proves BOTH models at every boundary. Proving only the
+        // collector would leave the prior free to drift, and a drifted prior is
+        // a silently different teacher producing targets that are attributed to
+        // the registered one.
+        if (policy_prior_model != nullptr) {
+          policy_prior_digest_before =
+              open_spiel::CanonicalSearchPiModuleDigest(*policy_prior_model);
+          if (policy_prior_digest_before != policy_prior_digest) {
+            SpielFatalError("policy-prior digest changed before collection");
+          }
         }
         generation_manifest_dir =
             std::filesystem::path(absl::GetFlag(
@@ -3650,9 +3997,13 @@ int main(int argc, char** argv) {
         collect_cfg.logit_cap = static_cast<float>(pi_learn.logit_cap);
         collect_cfg.output_dir = collection_dir.string();
         collect_cfg.arm = open_spiel::SearchPiArm::kSearched;
+        // The trailing argument is the rung4a hybrid: a null shared_ptr is the
+        // single-model collection every other profile runs, so the call site is
+        // one call rather than two branches that could drift apart.
         open_spiel::ConcurrentSearchPiCollectionResult collected =
             open_spiel::CollectSearchPiConcurrent(
-                collect_cfg, game, collector_model, device);
+                collect_cfg, game, collector_model, device,
+                policy_prior_model);
 
         // The prefix split is the first operation performed on rows inside the
         // validator and reads only episode IDs. Outcomes cannot influence dose.
@@ -3668,6 +4019,12 @@ int main(int argc, char** argv) {
         contract.purchase_combat_budget = pi_cfg.purchase_combat_budget;
         contract.max_filler_timeout_episodes =
             pi_cfg.max_filler_timeout_episodes;
+        // Which collection geometry this generation registered. The validator
+        // compares it against the RESULT in both directions, so a hybrid run
+        // cannot be waved through by contract checks that only know one
+        // batcher, and an incumbent result cannot satisfy a hybrid contract
+        // (dune_search_pi_concurrent.h:125-130).
+        contract.expect_hybrid_policy_prior = (policy_prior_model != nullptr);
         collection_validation =
             open_spiel::ValidateSearchPiTrainingCollection(collected, contract);
         pi_rows = collection_validation.training_rows;
@@ -3704,6 +4061,41 @@ int main(int argc, char** argv) {
               "frozen collector digest changed during collection");
           collection_validation.ok = false;
         }
+        // Reported through the validation record rather than fataling on the
+        // spot, exactly as the collector's is: the manifest below is the
+        // durable evidence of WHY the generation refused to learn.
+        if (policy_prior_model != nullptr) {
+          policy_prior_digest_after =
+              open_spiel::CanonicalSearchPiModuleDigest(*policy_prior_model);
+          if (policy_prior_digest_after != policy_prior_digest) {
+            collection_validation.errors.push_back(
+                "policy-prior digest changed during collection");
+            collection_validation.ok = false;
+          }
+          collected_hybrid_policy_prior = collected.hybrid_policy_prior;
+          collected_frozen_model_digest = collected.frozen_model_digest;
+          collected_policy_prior_model_digest =
+              collected.policy_prior_model_digest;
+          // The RESULT declares the mode, not the caller. A prior that was
+          // handed over and then ignored would produce an INCUMBENT cohort
+          // recorded as a hybrid one -- the exact misattribution rung 4a is
+          // asking a question about.
+          if (!collected_hybrid_policy_prior) {
+            collection_validation.errors.push_back(
+                "policy-prior model was supplied but the collection reports "
+                "the incumbent single-model geometry");
+            collection_validation.ok = false;
+          }
+          // Both models the collection actually ran, as the collector itself
+          // hashed them, agreeing with the two identities this process holds.
+          if (collected_frozen_model_digest != collector_digest ||
+              collected_policy_prior_model_digest != policy_prior_digest) {
+            collection_validation.errors.push_back(
+                "collection-reported model digests disagree with the loaded "
+                "frozen/policy-prior identities");
+            collection_validation.ok = false;
+          }
+        }
 
         // Durable collection transaction, written before any learner call.
         open_spiel::json::Object manifest;
@@ -3732,6 +4124,21 @@ int main(int argc, char** argv) {
             pi_cfg.frozen_collector_sha256;
         manifest["collector_digest_before"] = digest_before_collection;
         manifest["collector_digest_after"] = digest_after_collection;
+        // Written only when a prior was loaded, so a post_gate8_3b manifest is
+        // byte-identical to the ones its supervisor already reads. Every
+        // existing key keeps its name and its meaning.
+        if (policy_prior_model != nullptr) {
+          manifest["policy_prior_archive_sha256"] = policy_prior_sha;
+          manifest["policy_prior_digest_before"] = policy_prior_digest_before;
+          manifest["policy_prior_digest_after"] = policy_prior_digest_after;
+          // The collector's own account of what it ran, recorded beside this
+          // process's boundary hashes rather than in place of them: the pair
+          // asserts the two models were the same before, during and after.
+          manifest["hybrid_policy_prior"] = collected_hybrid_policy_prior;
+          manifest["frozen_model_digest"] = collected_frozen_model_digest;
+          manifest["policy_prior_model_digest"] =
+              collected_policy_prior_model_digest;
+        }
         manifest["collected_target_hash"] =
             collection_validation.collected_target_hash;
         manifest["collected_extended_hash"] =
@@ -3780,6 +4187,22 @@ int main(int argc, char** argv) {
           SpielFatalError("collection validation failed before learner:" +
                           joined);
         }
+        // rung4_replay capture. Written AFTER validation passes -- an invalid
+        // cohort must never enter a replay window -- and BEFORE the learner
+        // runs, so a 512-game collection survives a learner failure instead of
+        // having to be re-collected. The rows are exactly the outcome-blind
+        // 64-game training prefix the fresh arm trains on, so the two arms draw
+        // from the same population by construction.
+        if (!row_shard_out.empty()) {
+          std::string shard_error;
+          if (!open_spiel::WriteSearchPiRowShard(row_shard_out, pi_rows,
+                                                 &shard_error)) {
+            SpielFatalError("search-PI row shard write failed for " +
+                            row_shard_out + ": " + shard_error);
+          }
+          std::cout << "[search-PI] wrote cohort shard " << row_shard_out
+                    << " (" << pi_rows.size() << " rows)\n";
+        }
       } else {
         // Historical reference path retained for old checkpoints and parity.
         auto pi_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
@@ -3822,6 +4245,11 @@ int main(int argc, char** argv) {
             open_spiel::CanonicalSearchPiModuleDigest(*collector_model);
         if (digest_after_learn != collector_digest) {
           SpielFatalError("frozen collector digest changed during learning");
+        }
+        if (policy_prior_model != nullptr &&
+            open_spiel::CanonicalSearchPiModuleDigest(*policy_prior_model) !=
+                policy_prior_digest) {
+          SpielFatalError("policy-prior digest changed during learning");
         }
       } else {
         // Historical evolving-teacher behavior only. The approved production
@@ -3868,14 +4296,21 @@ int main(int argc, char** argv) {
       pi_state.extended_hash_chain = open_spiel::ComputeStringSHA256(
           pi_state.extended_hash_chain + generation_extended_hash);
       if (production_concurrent) {
-        pi_state.collected_target_hash_chain =
-            open_spiel::ComputeStringSHA256(
-                pi_state.collected_target_hash_chain +
-                collection_validation.collected_target_hash);
-        pi_state.collected_extended_hash_chain =
-            open_spiel::ComputeStringSHA256(
-                pi_state.collected_extended_hash_chain +
-                collection_validation.collected_extended_hash);
+        // The COLLECTED chain advances only when something was collected. A
+        // replay step contributes the empty string, and chaining that in would
+        // move a collection-provenance chain forward on a generation that
+        // collected nothing -- an unfalsifiable record. The TRAINED chain does
+        // advance: it is the record of what this step learned from.
+        if (!replay_train) {
+          pi_state.collected_target_hash_chain =
+              open_spiel::ComputeStringSHA256(
+                  pi_state.collected_target_hash_chain +
+                  collection_validation.collected_target_hash);
+          pi_state.collected_extended_hash_chain =
+              open_spiel::ComputeStringSHA256(
+                  pi_state.collected_extended_hash_chain +
+                  collection_validation.collected_extended_hash);
+        }
         pi_state.trained_target_hash_chain =
             open_spiel::ComputeStringSHA256(
                 pi_state.trained_target_hash_chain +
@@ -3938,6 +4373,18 @@ int main(int argc, char** argv) {
               "search-PI scope violation: role %d ran %lld simulations; only "
               "this role is outside the selected teacher scope.",
               r, (long long)pi_stats.simulations_by_role[r]));
+        }
+        // A replay step runs no simulations at all, so the check above is
+        // vacuous for it. The equivalent statement about a sampled cohort is
+        // that no off-scope ROW reached the learner -- the validator's own rule
+        // (dune_search_pi_concurrent.cc, "out-of-scope role N reached the
+        // learner subset"), applied here because a shard list is caller-supplied
+        // and could name a cohort collected under a different scope.
+        if (replay_train && collection_validation.trained_rows_by_role[r] != 0) {
+          SpielFatalError(absl::StrFormat(
+              "search-PI replay scope violation: %lld sampled rows carry the "
+              "off-scope role %d.",
+              (long long)collection_validation.trained_rows_by_role[r], r));
         }
       }
       if (pi_stats.leader_rows_emitted != 0) {
@@ -4005,6 +4452,16 @@ int main(int argc, char** argv) {
             SpielFatalError(
                 "frozen collector digest changed at checkpoint boundary");
           }
+          // The fourth and last boundary for the hybrid's second model. With
+          // the three above it, a rung4a generation proves both frozen
+          // identities before collection, after collection, after learning and
+          // at the checkpoint that makes the generation durable.
+          if (policy_prior_model != nullptr &&
+              open_spiel::CanonicalSearchPiModuleDigest(*policy_prior_model) !=
+                  policy_prior_digest) {
+            SpielFatalError(
+                "policy-prior digest changed at checkpoint boundary");
+          }
 
           auto file_record = [](const std::filesystem::path& path) {
             size_t size = 0;
@@ -4042,6 +4499,16 @@ int main(int argc, char** argv) {
           complete["collector_archive_sha256"] =
               pi_cfg.frozen_collector_sha256;
           complete["collector_digest"] = collector_digest_at_checkpoint;
+          // New keys only, and only when the hybrid is armed: the 3b marker the
+          // supervisor already checks keeps exactly its current key set.
+          if (policy_prior_model != nullptr) {
+            complete["policy_prior_archive_sha256"] = policy_prior_sha;
+            complete["policy_prior_digest"] = policy_prior_digest;
+            complete["hybrid_policy_prior"] = collected_hybrid_policy_prior;
+            complete["frozen_model_digest"] = collected_frozen_model_digest;
+            complete["policy_prior_model_digest"] =
+                collected_policy_prior_model_digest;
+          }
           complete["student_digest_before_learn"] =
               student_digest_before_learn;
           complete["student_digest_after_learn"] = student_digest_after_learn;
@@ -4051,10 +4518,12 @@ int main(int argc, char** argv) {
               pi_lstats.value_backward_executed;
           complete["policy_grad_norm"] = pi_lstats.policy_grad_norm;
           complete["value_grad_norm"] = pi_lstats.value_grad_norm;
-          complete["collected_target_hash"] =
-              collection_validation.collected_target_hash;
-          complete["collected_extended_hash"] =
-              collection_validation.collected_extended_hash;
+          if (!replay_train) {
+            complete["collected_target_hash"] =
+                collection_validation.collected_target_hash;
+            complete["collected_extended_hash"] =
+                collection_validation.collected_extended_hash;
+          }
           complete["trained_target_hash"] =
               collection_validation.trained_target_hash;
           complete["trained_extended_hash"] =
@@ -4067,8 +4536,23 @@ int main(int argc, char** argv) {
               pi_state.trained_target_hash_chain;
           complete["cumulative_trained_extended_hash_chain"] =
               pi_state.trained_extended_hash_chain;
-          complete["collection_manifest"] =
-              open_spiel::json::Value(file_record(collection_manifest));
+          if (!replay_train) {
+            complete["collection_manifest"] =
+                open_spiel::json::Value(file_record(collection_manifest));
+          } else {
+            // What a replay step IS, stated in the marker rather than left to
+            // be inferred from an absent collection manifest. The seed goes out
+            // as a decimal STRING because json.cc has no unsigned 64-bit
+            // number, and a wrapped-negative seed would not reproduce the draw.
+            complete["replay_arm_training_step"] = true;
+            complete["replay_shards_read"] =
+                static_cast<int64_t>(replay_shards_read);
+            complete["replay_window_rows"] = replay_window_rows;
+            complete["replay_sample_count"] =
+                static_cast<int64_t>(pi_rows.size());
+            complete["replay_sample_seed"] = absl::StrCat(
+                absl::GetFlag(FLAGS_search_pi_row_sample_seed));
+          }
           complete["model_checkpoint"] =
               open_spiel::json::Value(file_record(gen_model));
           complete["optimizer_checkpoint"] =

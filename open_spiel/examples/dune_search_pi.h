@@ -918,6 +918,29 @@ class SearchPiGenerator {
                           SearchPiGenerationStats* stats,
                           SearchPiArm arm = SearchPiArm::kSearched);
 
+  // Two-evaluator form, for the hybrid arm that searches with a CANDIDATE
+  // model's policy priors while every leaf value stays the FROZEN model's
+  // (SplitPolicyValueEvaluator, dune_split_evaluator.h).
+  //
+  // The split is a property of the SEARCH, not of the generator, so exactly one
+  // of this function's evaluator uses takes `search_evaluator`: the
+  // DuneSearchSession construction. Everything the generator plays outside the
+  // tree -- the three opponent seats, and the searched seat's off-scope and
+  // technical-fallback decisions -- takes `behavior_evaluator`. That routing is
+  // what makes the hybrid arm differ from the incumbent in exactly one respect,
+  // and it is enumerated at the two call sites in dune_search_pi.cc.
+  //
+  // The six-argument overload above delegates here with `evaluator` in BOTH
+  // roles. Aliasing is well defined (dune_split_evaluator.h:46-51) and makes the
+  // incumbent path byte-identical: every existing call site keeps its current
+  // meaning, and a hybrid behaviour cannot be acquired by omission.
+  void GenerateGeneration(
+      int generation, const std::shared_ptr<const Game>& game,
+      const std::shared_ptr<algorithms::Evaluator>& behavior_evaluator,
+      const std::shared_ptr<algorithms::Evaluator>& search_evaluator,
+      std::vector<SearchPiRow>* out, SearchPiGenerationStats* stats,
+      SearchPiArm arm = SearchPiArm::kSearched);
+
   static Player SearchedSeatForEpisode(int64_t episode_id, int num_players);
 
   const SearchPiConfig& config() const { return config_; }

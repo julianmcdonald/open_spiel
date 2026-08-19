@@ -5,7 +5,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
 
-  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc ${OPEN_SPIEL_OBJECTS})
+  # dune_search_pi_replay.cc joins this target for the rung-4 replay profile: the
+  # trainer both WRITES a cohort shard after collection and READS a replay window
+  # back in its train-only invocation, so the row codec has to live in the same
+  # binary as the learner that consumes the rows.
+  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc dune_search_pi_replay.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
@@ -62,6 +66,28 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_concurrent_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_concurrent_test COMMAND dune_search_pi_concurrent_test)
+
+  # Rung 4A: the two-model search controller. The class under test is a pure
+  # composition of two algorithms::Evaluator instances, so the test needs no
+  # torch model at all -- it drives two counting mocks and proves that priors
+  # and leaf values leave through different doors. That independence is the
+  # whole safety property of the hybrid arm, and a fused PriorAndEvaluate would
+  # silently route the candidate's value head into search without it.
+  add_executable(dune_split_evaluator_test
+    dune_split_evaluator_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_split_evaluator_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_split_evaluator_test COMMAND dune_split_evaluator_test)
+
+  # Rung 4 replay route: the row shard codec and the uniform replay-window
+  # sampler. Same source pairing as dune_search_pi_test because SearchPiRow and
+  # its enums are defined alongside the generator.
+  add_executable(dune_search_pi_replay_test
+    dune_search_pi_replay_test.cc dune_search_pi_replay.cc
+    dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_replay_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_search_pi_replay_test COMMAND dune_search_pi_replay_test)
 
   # The rung-3 teacher audit. Same source set as the test target above, for the
   # same reason: it CALLS SearchPiGenerator::GenerateGeneration rather than
