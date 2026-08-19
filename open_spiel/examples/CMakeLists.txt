@@ -96,7 +96,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # it loads a checkpoint and plays complete games, which is not a unit test.
   add_executable(dune_search_pi_audit
     dune_search_pi_audit.cc dune_search_pi_concurrent.cc dune_search_pi.cc dune_ppo_training_utils.cc
-    dune_online_search_collector.cc
+    dune_online_search_collector.cc dune_search_pi_replay.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_audit dune_search ${TORCH_LIBRARIES})
 

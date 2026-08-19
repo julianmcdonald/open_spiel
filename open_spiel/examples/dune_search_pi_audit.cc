@@ -66,6 +66,7 @@
 #include "dune_search_pi_concurrent.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_search_pi_replay.h"
 
 // --- What to measure -------------------------------------------------------
 ABSL_FLAG(std::string, model_checkpoint, "",
@@ -83,6 +84,9 @@ ABSL_FLAG(std::string, search_pi_policy_prior_model_checkpoint, "",
 ABSL_FLAG(std::string, search_pi_policy_prior_model_sha256, "",
           "Required whenever a policy-prior checkpoint is set. Verified "
           "against the file before any game is played.");
+ABSL_FLAG(std::string, search_pi_row_shard_out, "",
+          "Rung-4 replay seeding: write the searched arm's retained rows to "
+          "this shard path. Requires row retention. Empty writes nothing.");
 ABSL_FLAG(std::string, arm, "both",
           "searched | raw_argmax | both. 'both' runs the searched arm first so "
           "a run killed part-way still leaves the expensive arm complete.");
@@ -1266,6 +1270,29 @@ int main(int argc, char** argv) {
               << " wall=" << std::fixed << std::setprecision(1) << r.wall_time_s
               << "s (" << (r.wall_time_s / std::max<size_t>(1, r.games.size()))
               << " s/game)" << std::endl;
+    // Rung-4 replay seeding. The replay arm's window has to start already
+    // holding the registered 3b generation 1-5 training prefixes, and those
+    // cohorts are 64 games each -- far below the 512-game geometry the trainer
+    // is pinned to. Producing them here re-collects those exact episode ids
+    // with the frozen teacher through the REAL generator, which is what makes
+    // the seeded cohorts the registered ones rather than lookalikes.
+    const std::string shard_out = absl::GetFlag(FLAGS_search_pi_row_shard_out);
+    if (!shard_out.empty()) {
+      if (!absl::GetFlag(FLAGS_retain_rows)) {
+        std::cerr << "a row shard cannot be written with row retention off."
+                  << std::endl;
+        return 2;
+      }
+      std::string shard_error;
+      if (!open_spiel::WriteSearchPiRowShard(shard_out, r.retained_rows,
+                                             &shard_error)) {
+        std::cerr << "failed to write the row shard: " << shard_error
+                  << std::endl;
+        return 2;
+      }
+      std::cout << "[audit] wrote " << r.retained_rows.size() << " rows to "
+                << shard_out << std::endl;
+    }
     if (!r.extended_hash_chain.empty()) {
       std::cout << "[audit] target_hash_chain   " << r.target_hash_chain
                 << "\n[audit] extended_hash_chain " << r.extended_hash_chain
