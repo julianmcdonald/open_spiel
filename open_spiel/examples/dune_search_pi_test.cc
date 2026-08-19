@@ -1377,6 +1377,321 @@ void Test19_StateRoundTrip() {
   std::cout << "Test19 Passed!\n\n";
 }
 
+// --- Origin reset: re-basing an inherited lineage ---------------------------
+//
+// Pure state manipulation: no model, no optimizer, no game, no GPU. The whole
+// point of factoring ApplySearchPiOriginReset out of the trainer is that the
+// rule which decides whether a rung-4 successor may re-base onto the 3b
+// generation-5 endpoint is decidable here, without a 40-minute collection.
+
+// The fields the reset is allowed to touch, captured so a REFUSAL can be shown
+// to have touched none of them. Asserting "the error was non-empty" says
+// nothing about a partial mutation, and a half-re-based lineage that a retry
+// then accepts as an origin is the dangerous failure in this function.
+struct OriginResetMutableFields {
+  int generation;
+  int64_t next_episode_id;
+  int64_t cum_rows;
+  int64_t cum_primary_rows;
+  int64_t cum_continuation_rows;
+  int64_t cum_purchase_rows;
+  int64_t cum_combat_intrigue_rows;
+  int64_t cum_other_optional_rows;
+  int64_t cum_filler_timeout_episodes;
+  int64_t cum_primary_simulations;
+  int64_t cum_continuation_simulations;
+  std::string target_hash_chain;
+  std::string extended_hash_chain;
+  std::string collected_target_hash_chain;
+  std::string collected_extended_hash_chain;
+  std::string trained_target_hash_chain;
+  std::string trained_extended_hash_chain;
+  int origin_reset_generation;
+  int64_t origin_reset_next_episode_id;
+  std::string origin_reset_config_fingerprint;
+  std::string origin_reset_new_config_fingerprint;
+};
+
+OriginResetMutableFields CaptureOriginResetFields(const SearchPiState& s) {
+  return OriginResetMutableFields{
+      s.generation,
+      s.next_episode_id,
+      s.cum_rows,
+      s.cum_primary_rows,
+      s.cum_continuation_rows,
+      s.cum_purchase_rows,
+      s.cum_combat_intrigue_rows,
+      s.cum_other_optional_rows,
+      s.cum_filler_timeout_episodes,
+      s.cum_primary_simulations,
+      s.cum_continuation_simulations,
+      s.target_hash_chain,
+      s.extended_hash_chain,
+      s.collected_target_hash_chain,
+      s.collected_extended_hash_chain,
+      s.trained_target_hash_chain,
+      s.trained_extended_hash_chain,
+      s.origin_reset_generation,
+      s.origin_reset_next_episode_id,
+      s.origin_reset_config_fingerprint,
+      s.origin_reset_new_config_fingerprint};
+}
+
+void CheckOriginResetFieldsEqual(const OriginResetMutableFields& got,
+                                 const OriginResetMutableFields& want) {
+  SPIEL_CHECK_EQ(got.generation, want.generation);
+  SPIEL_CHECK_EQ(got.next_episode_id, want.next_episode_id);
+  SPIEL_CHECK_EQ(got.cum_rows, want.cum_rows);
+  SPIEL_CHECK_EQ(got.cum_primary_rows, want.cum_primary_rows);
+  SPIEL_CHECK_EQ(got.cum_continuation_rows, want.cum_continuation_rows);
+  SPIEL_CHECK_EQ(got.cum_purchase_rows, want.cum_purchase_rows);
+  SPIEL_CHECK_EQ(got.cum_combat_intrigue_rows, want.cum_combat_intrigue_rows);
+  SPIEL_CHECK_EQ(got.cum_other_optional_rows, want.cum_other_optional_rows);
+  SPIEL_CHECK_EQ(got.cum_filler_timeout_episodes,
+                 want.cum_filler_timeout_episodes);
+  SPIEL_CHECK_EQ(got.cum_primary_simulations, want.cum_primary_simulations);
+  SPIEL_CHECK_EQ(got.cum_continuation_simulations,
+                 want.cum_continuation_simulations);
+  SPIEL_CHECK_EQ(got.target_hash_chain, want.target_hash_chain);
+  SPIEL_CHECK_EQ(got.extended_hash_chain, want.extended_hash_chain);
+  SPIEL_CHECK_EQ(got.collected_target_hash_chain,
+                 want.collected_target_hash_chain);
+  SPIEL_CHECK_EQ(got.collected_extended_hash_chain,
+                 want.collected_extended_hash_chain);
+  SPIEL_CHECK_EQ(got.trained_target_hash_chain, want.trained_target_hash_chain);
+  SPIEL_CHECK_EQ(got.trained_extended_hash_chain,
+                 want.trained_extended_hash_chain);
+  SPIEL_CHECK_EQ(got.origin_reset_generation, want.origin_reset_generation);
+  SPIEL_CHECK_EQ(got.origin_reset_next_episode_id,
+                 want.origin_reset_next_episode_id);
+  SPIEL_CHECK_EQ(got.origin_reset_config_fingerprint,
+                 want.origin_reset_config_fingerprint);
+  SPIEL_CHECK_EQ(got.origin_reset_new_config_fingerprint,
+                 want.origin_reset_new_config_fingerprint);
+}
+
+// A stand-in for the 3b generation-5 endpoint: non-zero in every field the
+// reset must clear, so "zeroed" is a change rather than a coincidence.
+SearchPiState MakeOriginState() {
+  SearchPiState s;
+  s.generation = 5;
+  s.next_episode_id = 602560;
+  s.cum_rows = 36831;
+  s.cum_primary_rows = 6538;
+  s.cum_continuation_rows = 15458;
+  s.cum_purchase_rows = 3292;
+  s.cum_combat_intrigue_rows = 4390;
+  s.cum_other_optional_rows = 7153;
+  s.cum_filler_timeout_episodes = 2;
+  s.cum_primary_simulations = 10411200;
+  s.cum_continuation_simulations = 8051968;
+  s.target_hash_chain = std::string(64, '1');
+  s.extended_hash_chain = std::string(64, '2');
+  s.collected_target_hash_chain = std::string(64, '3');
+  s.collected_extended_hash_chain = std::string(64, '4');
+  s.trained_target_hash_chain = std::string(64, '5');
+  s.trained_extended_hash_chain = std::string(64, '6');
+  s.config.collection_games_per_generation = 512;
+  s.config.training_games_per_generation = 64;
+  s.config.concurrent_workers = 128;
+  s.config.batch_target = 64;
+  s.config.primary_simulations = 200;
+  s.config.continuation_simulations = 64;
+  s.config.seed_domain = 8160001;
+  s.config.frozen_collector_sha256 = std::string(64, '7');
+  s.learner.learning_rate = 1.0e-5;
+  s.learner.value_coef = 0.0;
+  return s;
+}
+
+void Test27_OriginReset() {
+  std::cout << "Running Test27_OriginReset...\n";
+  const SearchPiState origin = MakeOriginState();
+  // The fingerprint the origin state actually has -- RECOMPUTED, exactly as
+  // WriteSearchPiState records it and as the trainer's resume check derives it.
+  const std::string origin_fp =
+      SearchPiConfigFingerprint(origin.config, origin.learner);
+  SPIEL_CHECK_FALSE(origin_fp.empty());
+  const std::string successor_fp = std::string(64, 'f');
+
+  SearchPiOriginResetRequest request;
+  request.expected_origin_generation = 5;
+  request.expected_origin_next_episode = 602560;
+  request.origin_config_fingerprint = origin_fp;
+  request.new_first_episode_id = 2600000;
+  request.new_config_fingerprint = successor_fp;
+
+  // --- 1. The exact origin triple re-bases -------------------------------
+  {
+    SearchPiState s = origin;
+    std::string err = "pre-existing";
+    SPIEL_CHECK_TRUE(ApplySearchPiOriginReset(&s, request, &err));
+    // Generation 0, not 1: the trainer increments before it collects, so 0 is
+    // what makes the successor's first collected generation its generation 1.
+    SPIEL_CHECK_EQ(s.generation, 0);
+    SPIEL_CHECK_EQ(s.next_episode_id, 2600000);
+
+    // Cumulative counters zeroed: they described 3b's 36,831 rows and 18.4M
+    // simulations, and carrying them would make every later readout of the
+    // successor a sum over two experiments.
+    SPIEL_CHECK_EQ(s.cum_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_primary_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_continuation_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_purchase_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_combat_intrigue_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_other_optional_rows, 0);
+    SPIEL_CHECK_EQ(s.cum_filler_timeout_episodes, 0);
+    SPIEL_CHECK_EQ(s.cum_primary_simulations, 0);
+    SPIEL_CHECK_EQ(s.cum_continuation_simulations, 0);
+
+    // ALL SIX chains, not just the collected pair: each is folded over the
+    // origin lineage's rows, so continuing any of them yields a digest only
+    // reproducible by replaying 3b first.
+    SPIEL_CHECK_TRUE(s.target_hash_chain.empty());
+    SPIEL_CHECK_TRUE(s.extended_hash_chain.empty());
+    SPIEL_CHECK_TRUE(s.collected_target_hash_chain.empty());
+    SPIEL_CHECK_TRUE(s.collected_extended_hash_chain.empty());
+    SPIEL_CHECK_TRUE(s.trained_target_hash_chain.empty());
+    SPIEL_CHECK_TRUE(s.trained_extended_hash_chain.empty());
+
+    // Provenance: a later reader can tell this lineage was re-based, and from
+    // what, without the launcher script.
+    SPIEL_CHECK_EQ(s.origin_reset_generation, 5);
+    SPIEL_CHECK_EQ(s.origin_reset_next_episode_id, 602560);
+    SPIEL_CHECK_EQ(s.origin_reset_config_fingerprint, origin_fp);
+    SPIEL_CHECK_EQ(s.origin_reset_new_config_fingerprint, successor_fp);
+
+    // config/learner are deliberately untouched, so the trainer's own resume
+    // fingerprint check still runs against what the checkpoint recorded and
+    // still refuses a successor that changed the fingerprinted objective it is
+    // inheriting Adam moments from.
+    SPIEL_CHECK_EQ(SearchPiConfigFingerprint(s.config, s.learner), origin_fp);
+    SPIEL_CHECK_EQ(s.config.primary_simulations, 200);
+    SPIEL_CHECK_EQ(s.config.collection_games_per_generation, 512);
+    SPIEL_CHECK_TRUE(err.empty());
+  }
+
+  // --- 2. Wrong generation: refused, and NOTHING mutated -----------------
+  {
+    SearchPiState s = origin;
+    const OriginResetMutableFields before = CaptureOriginResetFields(s);
+    SearchPiOriginResetRequest bad = request;
+    bad.expected_origin_generation = 4;
+    std::string err;
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&s, bad, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+    CheckOriginResetFieldsEqual(CaptureOriginResetFields(s), before);
+  }
+
+  // --- 3. Wrong cursor: refused, and NOTHING mutated ---------------------
+  {
+    SearchPiState s = origin;
+    const OriginResetMutableFields before = CaptureOriginResetFields(s);
+    SearchPiOriginResetRequest bad = request;
+    bad.expected_origin_next_episode = 602048;  // the generation-4 cursor
+    std::string err;
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&s, bad, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+    CheckOriginResetFieldsEqual(CaptureOriginResetFields(s), before);
+  }
+
+  // --- 4. Wrong fingerprint: refused, and NOTHING mutated ----------------
+  {
+    SearchPiState s = origin;
+    const OriginResetMutableFields before = CaptureOriginResetFields(s);
+    SearchPiOriginResetRequest bad = request;
+    bad.origin_config_fingerprint = std::string(64, '0');
+    std::string err;
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&s, bad, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+    CheckOriginResetFieldsEqual(CaptureOriginResetFields(s), before);
+  }
+
+  // --- 5. An empty origin fingerprint authorises nothing ------------------
+  // It would reduce the triple to a pair, and it is also the value a state
+  // carries when it was never re-based, which would make the provenance marker
+  // ambiguous.
+  {
+    SearchPiState s = origin;
+    const OriginResetMutableFields before = CaptureOriginResetFields(s);
+    SearchPiOriginResetRequest bad = request;
+    bad.origin_config_fingerprint.clear();
+    std::string err;
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&s, bad, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+    CheckOriginResetFieldsEqual(CaptureOriginResetFields(s), before);
+  }
+
+  // --- 6. ONE-SHOT: a second attempt on an already-reset state refuses ----
+  //
+  // The generation predicate is what fires (0 != 5), and the cursor predicate
+  // would fire too. The FINGERPRINT predicate does NOT: the reset leaves
+  // config/learner alone, and dune_ppo_train.cc builds an identical
+  // fingerprinted package for all three registration profiles, so a rung-4
+  // checkpoint's fingerprint equals 3b's. Asserted here so that reasoning is
+  // pinned to a test rather than left as a claim in a comment.
+  {
+    SearchPiState s = origin;
+    std::string err;
+    SPIEL_CHECK_TRUE(ApplySearchPiOriginReset(&s, request, &err));
+    SPIEL_CHECK_EQ(SearchPiConfigFingerprint(s.config, s.learner),
+                   request.origin_config_fingerprint);
+    const OriginResetMutableFields once = CaptureOriginResetFields(s);
+    err.clear();
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&s, request, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+    CheckOriginResetFieldsEqual(CaptureOriginResetFields(s), once);
+
+    // And the state after one completed successor generation -- generation 1 at
+    // the next episode block -- is refused too, which is the case that actually
+    // occurs when a supervisor re-runs the launcher.
+    SearchPiState advanced = s;
+    advanced.generation = 1;
+    advanced.next_episode_id = 2600000 + 512;
+    err.clear();
+    SPIEL_CHECK_FALSE(ApplySearchPiOriginReset(&advanced, request, &err));
+    SPIEL_CHECK_FALSE(err.empty());
+  }
+
+  // --- 7. Provenance round-trips through the manifest --------------------
+  {
+    SearchPiState s = origin;
+    std::string err;
+    SPIEL_CHECK_TRUE(ApplySearchPiOriginReset(&s, request, &err));
+    json::Object o = WriteSearchPiState(s);
+    SearchPiState back;
+    SPIEL_CHECK_TRUE(ReadSearchPiState(o, &back, &err));
+    SPIEL_CHECK_EQ(back.origin_reset_generation, 5);
+    SPIEL_CHECK_EQ(back.origin_reset_next_episode_id, 602560);
+    SPIEL_CHECK_EQ(back.origin_reset_config_fingerprint, origin_fp);
+    SPIEL_CHECK_EQ(back.origin_reset_new_config_fingerprint, successor_fp);
+    SPIEL_CHECK_EQ(back.generation, 0);
+    SPIEL_CHECK_EQ(back.next_episode_id, 2600000);
+    SPIEL_CHECK_EQ(back.cum_rows, 0);
+    SPIEL_CHECK_TRUE(back.trained_extended_hash_chain.empty());
+
+    // A lineage that was never re-based emits NO provenance keys, so a manifest
+    // written by the live post_gate8_3b run is byte-identical to what it wrote
+    // before these fields existed, and still reads back as "never re-based".
+    json::Object plain = WriteSearchPiState(origin);
+    SPIEL_CHECK_TRUE(plain.find("origin_reset_generation") == plain.end());
+    SPIEL_CHECK_TRUE(plain.find("origin_reset_next_episode_id") == plain.end());
+    SPIEL_CHECK_TRUE(plain.find("origin_reset_config_fingerprint") ==
+                     plain.end());
+    SPIEL_CHECK_TRUE(plain.find("origin_reset_new_config_fingerprint") ==
+                     plain.end());
+    SearchPiState never;
+    SPIEL_CHECK_TRUE(ReadSearchPiState(plain, &never, &err));
+    SPIEL_CHECK_TRUE(never.origin_reset_config_fingerprint.empty());
+    SPIEL_CHECK_EQ(never.origin_reset_generation, 0);
+    SPIEL_CHECK_EQ(never.origin_reset_next_episode_id, 0);
+  }
+
+  std::cout << "  re-based gen 5 @602560 -> gen 0 @2600000; refusals leave the "
+               "state untouched; one-shot holds\n";
+  std::cout << "Test27 Passed!\n\n";
+}
+
 // --- Pure-helper coverage used by several criteria -------------------------
 void TestScalarHelpers() {
   std::cout << "Running TestScalarHelpers...\n";
@@ -2263,6 +2578,7 @@ int main(int argc, char** argv) {
   Test17_HashChains();
   Test18_LearnerTelemetry();
   Test19_StateRoundTrip();
+  Test27_OriginReset();
   Test23_ScopeAndWatchdogSurface();
   Test26_LatencyHistogramMergeAndQuantiles();
 

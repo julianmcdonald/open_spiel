@@ -1804,6 +1804,23 @@ json::Object WriteSearchPiState(const SearchPiState& s) {
   o["learner_policy_weight_decay"] = F17(l.policy_weight_decay);
 
   o["config_fingerprint"] = SearchPiConfigFingerprint(c, l);
+
+  // Origin-reset provenance, emitted ONLY by a lineage that was actually
+  // re-based. Conditional for the same reason the whole search_pi block is
+  // conditional at dune_ppo_train.cc:1446-1452: a manifest written by a lineage
+  // that never hit this path stays byte-identical to what it wrote before these
+  // keys existed, so the live post_gate8_3b run's artifacts do not change under
+  // it. The reader treats all four as optional, so no existing checkpoint loses
+  // its resume path either.
+  if (!s.origin_reset_config_fingerprint.empty()) {
+    o["origin_reset_generation"] =
+        static_cast<int64_t>(s.origin_reset_generation);
+    o["origin_reset_next_episode_id"] =
+        static_cast<int64_t>(s.origin_reset_next_episode_id);
+    o["origin_reset_config_fingerprint"] = s.origin_reset_config_fingerprint;
+    o["origin_reset_new_config_fingerprint"] =
+        s.origin_reset_new_config_fingerprint;
+  }
   return o;
 }
 
@@ -2034,6 +2051,28 @@ bool ReadSearchPiState(const json::Object& o, SearchPiState* out,
     return false;
   }
 
+  // Origin-reset provenance. OPTIONAL at every schema version rather than
+  // gated on a new one: it is present only in checkpoints a rung-4 successor
+  // wrote, absent in every 3b and pilot checkpoint, and both must keep loading.
+  // Bumping schema_version instead would make every existing manifest unreadable
+  // by this reader, which is the failure the v1/v2/v3 acceptance above exists to
+  // avoid. Read as a group keyed on the fingerprint, so a half-written block
+  // cannot present as a re-based lineage with a zero origin.
+  if (o.find("origin_reset_config_fingerprint") != o.end()) {
+    if (!GetStr(o, "origin_reset_config_fingerprint",
+                &s.origin_reset_config_fingerprint, error) ||
+        !GetStr(o, "origin_reset_new_config_fingerprint",
+                &s.origin_reset_new_config_fingerprint, error) ||
+        !GetInt(o, "origin_reset_generation", &v, error)) {
+      return false;
+    }
+    s.origin_reset_generation = static_cast<int>(v);
+    if (!GetInt(o, "origin_reset_next_episode_id",
+                &s.origin_reset_next_episode_id, error)) {
+      return false;
+    }
+  }
+
   *out = s;
   return true;
 }
@@ -2088,6 +2127,97 @@ std::string SearchPiConfigFingerprint(const SearchPiConfig& c,
      << "|wd=" << F17(l.weight_decay)
      << "|polwd=" << F17(l.policy_weight_decay);
   return ComputeStringSHA256(ss.str());
+}
+
+bool ApplySearchPiOriginReset(SearchPiState* state,
+                              const SearchPiOriginResetRequest& request,
+                              std::string* error) {
+  SPIEL_CHECK_TRUE(state != nullptr);
+  auto fail = [error](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+
+  // Refused rather than treated as "no fingerprint requirement": an empty
+  // expected fingerprint would reduce the authorising triple to a pair, and it
+  // is also the value SearchPiState carries when it was never re-based, which
+  // would make the provenance marker ambiguous.
+  if (request.origin_config_fingerprint.empty()) {
+    return fail(
+        "search-PI origin reset requires a non-empty origin config "
+        "fingerprint; an empty one authorises against nothing.");
+  }
+
+  // EVERY predicate is evaluated against the UNMODIFIED state, and the state is
+  // written only after all of them pass. A partial mutation on a refusal path
+  // would leave a half-re-based lineage that the caller is about to treat as
+  // fatal-and-exit, but that a retry, or any caller that logged and continued,
+  // would then see as a legitimate origin.
+  const std::string actual_fingerprint =
+      SearchPiConfigFingerprint(state->config, state->learner);
+  if (state->generation != request.expected_origin_generation) {
+    return fail(absl::StrFormat(
+        "search-PI origin reset expects generation %d, checkpoint carries %d.",
+        request.expected_origin_generation, state->generation));
+  }
+  if (state->next_episode_id != request.expected_origin_next_episode) {
+    return fail(absl::StrFormat(
+        "search-PI origin reset expects next_episode_id %d, checkpoint "
+        "carries %d.",
+        request.expected_origin_next_episode, state->next_episode_id));
+  }
+  if (actual_fingerprint != request.origin_config_fingerprint) {
+    return fail(absl::StrFormat(
+        "search-PI origin reset expects config fingerprint %s, checkpoint "
+        "carries %s.",
+        request.origin_config_fingerprint, actual_fingerprint));
+  }
+
+  // --- Committed from here: no further failure path ------------------------
+  //
+  // Provenance FIRST, from the values still in place, so the recorded origin is
+  // the state that was actually verified rather than a copy of the request.
+  state->origin_reset_generation = state->generation;
+  state->origin_reset_next_episode_id = state->next_episode_id;
+  state->origin_reset_config_fingerprint = actual_fingerprint;
+  state->origin_reset_new_config_fingerprint = request.new_config_fingerprint;
+
+  // Generation 0, not 1: the trainer increments before it collects
+  // (dune_ppo_train.cc:3955), so 0 here is what makes the first collected
+  // generation of the successor its generation 1.
+  state->generation = 0;
+  state->next_episode_id = request.new_first_episode_id;
+
+  // The cumulative counters describe the ORIGIN lineage's 36,831 rows and its
+  // 18.4M simulations. Carried forward, every later readout of the successor
+  // would silently be a sum over two experiments, and no downstream consumer
+  // could subtract them back out.
+  state->cum_rows = 0;
+  state->cum_primary_rows = 0;
+  state->cum_continuation_rows = 0;
+  state->cum_purchase_rows = 0;
+  state->cum_combat_intrigue_rows = 0;
+  state->cum_other_optional_rows = 0;
+  state->cum_filler_timeout_episodes = 0;
+  state->cum_primary_simulations = 0;
+  state->cum_continuation_simulations = 0;
+
+  // ALL SIX chains, not only the collected pair. Each is a rolling hash folded
+  // over the origin lineage's rows; continuing to chain onto it would produce a
+  // digest that is reproducible only by replaying 3b first, which defeats the
+  // reason the chains exist. Empty is the honest starting value and is already
+  // what a fresh lineage carries, so a successor's chains stay comparable
+  // against an independently re-run successor.
+  state->target_hash_chain.clear();
+  state->extended_hash_chain.clear();
+  state->collected_target_hash_chain.clear();
+  state->collected_extended_hash_chain.clear();
+  state->trained_target_hash_chain.clear();
+  state->trained_extended_hash_chain.clear();
+
+  // `config` and `learner` are INTENTIONALLY untouched; see the header comment.
+  if (error != nullptr) error->clear();
+  return true;
 }
 
 std::string ChainSearchPiTargetHash(const std::string& prev,

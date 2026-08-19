@@ -1002,6 +1002,26 @@ struct SearchPiState {
   std::string trained_extended_hash_chain;
   SearchPiConfig config;
   SearchPiLearnerConfig learner;
+
+  // --- Origin-reset provenance ---------------------------------------------
+  //
+  // Written ONLY by ApplySearchPiOriginReset (below), and carried by every
+  // checkpoint the re-based lineage goes on to write, so the answer to "is this
+  // generation 1 a genuine first generation, or the same weights re-based from
+  // another experiment" is legible from the artifact alone rather than from a
+  // launcher script that may not have been committed.
+  //
+  // `origin_reset_config_fingerprint` empty IS the "never re-based" marker: the
+  // reset refuses an empty expected fingerprint, so a non-empty value here can
+  // only have come from a successful reset. That keeps the marker a single
+  // field rather than a bool that could disagree with the values beside it.
+  int origin_reset_generation = 0;
+  int64_t origin_reset_next_episode_id = 0;
+  std::string origin_reset_config_fingerprint;
+  // The fingerprint the lineage was re-based INTO. Recorded next to the origin
+  // one so a reader sees both ends of the boundary in one place; the run's own
+  // live fingerprint is still written separately by WriteSearchPiState.
+  std::string origin_reset_new_config_fingerprint;
 };
 
 // Every search-configuration field, including the budgets, puct_c,
@@ -1014,6 +1034,85 @@ bool ReadSearchPiState(const json::Object& obj, SearchPiState* out,
 // Stable fingerprint over the fields a resume must not silently change.
 std::string SearchPiConfigFingerprint(const SearchPiConfig& config,
                                       const SearchPiLearnerConfig& learner);
+
+// ---------------------------------------------------------------------------
+// Origin reset: re-basing a successor experiment onto an inherited student
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM. A rung-4 successor boots from the 3b generation-5 student and
+// deliberately inherits BOTH its weights and its dedicated Adam moments. The
+// moments can only be inherited from a checkpoint that carries a search_pi
+// block -- dune_ppo_train.cc:3894-3921 starts the optimizer fresh otherwise,
+// because seeding this lane from PPO's moments is exactly the cross-objective
+// contamination the dedicated-optimizer requirement exists to prevent. So the
+// block cannot simply be dropped.
+//
+// But that block also carries 3b's LINEAGE BOOKKEEPING: generation 5, the
+// episode cursor at the end of 3b's domain, and 3b's cumulative row and
+// simulation counts. Resumed verbatim, the successor would run as 3b's
+// generation 6 in 3b's episode domain, and its telemetry would describe two
+// experiments added together.
+//
+// THE SPLIT. This function separates the two: the model and the optimizer are
+// inherited, the bookkeeping is re-based to a fresh experiment origin. It is
+// deliberately PURE state manipulation -- no model, no optimizer, no I/O -- so
+// the re-basing rule is testable without a GPU or a game.
+//
+// WHAT IT DOES NOT TOUCH. `config` and `learner` are left exactly as the
+// checkpoint carried them. The trainer's own resume fingerprint check
+// (dune_ppo_train.cc:3813-3822) therefore still runs against the config the
+// checkpoint actually recorded, and still refuses a successor whose
+// fingerprinted teacher/learner package differs from the lineage whose Adam
+// moments it is about to inherit. Re-basing the bookkeeping must not become a
+// way to launder a changed objective.
+struct SearchPiOriginResetRequest {
+  // The exact endpoint this reset is authorised against. All three must match
+  // the state, because any one alone is satisfiable by a checkpoint someone
+  // happens to point at: the generation is a small integer many lineages share,
+  // the cursor is shared by every re-run of the same generation, and the
+  // fingerprint is shared by every generation of the same recipe. The TRIPLE is
+  // what identifies one endpoint of one lineage.
+  int expected_origin_generation = 0;
+  int64_t expected_origin_next_episode = 0;
+  // Compared against SearchPiConfigFingerprint(state.config, state.learner) --
+  // the value RECOMPUTED from what the checkpoint carries, which is the same
+  // value WriteSearchPiState records and the same one the trainer's resume
+  // check compares. Must be non-empty.
+  std::string origin_config_fingerprint;
+
+  // Where the re-based lineage starts counting episodes. The caller passes the
+  // episode base its launcher stated, so the trainer's existing registered-base
+  // check stays load-bearing instead of comparing a constant against itself.
+  int64_t new_first_episode_id = 0;
+  // This run's own fingerprint. Recorded as provenance only; see the comment on
+  // "WHAT IT DOES NOT TOUCH" above for why the reset does not use it to
+  // overwrite anything the trainer later checks.
+  std::string new_config_fingerprint;
+};
+
+// Returns false and sets `*error` (non-empty) without modifying `*state` unless
+// the state IS the requested origin. On success:
+//   - generation  <- 0, so the trainer's `++pi_generation` at the top of its
+//     loop (dune_ppo_train.cc:3955) makes the first collected generation 1;
+//   - next_episode_id <- request.new_first_episode_id;
+//   - every cumulative counter and all six hash chains <- zero/empty, because
+//     they describe the ORIGIN lineage and would otherwise keep accumulating
+//     across the experiment boundary;
+//   - the origin_reset_* provenance fields <- the origin triple.
+//
+// ONE-SHOT. Re-applying this to a state the successor has already written is
+// refused, because a completed rung-4 generation moves BOTH the generation (0
+// -> 1) and the cursor (new base -> new base + collection games) off the origin
+// triple. Note that the fingerprint predicate is NOT what supplies that
+// property today: dune_ppo_train.cc builds an identical fingerprinted package
+// for all three registration profiles (nothing profile-dependent reaches
+// SearchPiConfigFingerprint), so a rung-4 checkpoint's fingerprint EQUALS 3b's.
+// The generation and cursor predicates are the ones that fire; the fingerprint
+// predicate becomes a third independent guard only if a successor ever changes
+// a fingerprinted knob, at which point it should refuse anyway.
+bool ApplySearchPiOriginReset(SearchPiState* state,
+                              const SearchPiOriginResetRequest& request,
+                              std::string* error);
 
 // Rolling target hash: chain(prev, row) -- covers episode/decision ids, the
 // player, the legal actions, the target probabilities and the value target.

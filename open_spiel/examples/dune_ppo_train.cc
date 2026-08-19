@@ -375,6 +375,35 @@ ABSL_FLAG(uint64_t, search_pi_row_sample_seed, 0,
           "Seed for the uniform replay draw. Recorded in the generation marker "
           "so a sample is reproducible from artifacts alone.");
 
+// --- Origin reset: inherit the student, re-base the lineage -----------------
+//
+// A rung-4 successor boots from the 3b generation-5 student and inherits its
+// dedicated Adam moments, which is only possible from a checkpoint that carries
+// a search_pi block (the fresh-optimizer refusal below this file's dedicated
+// optimizer). That block also carries 3b's generation counter, episode cursor
+// and cumulative totals, which the successor must NOT continue. These flags
+// select ApplySearchPiOriginReset (dune_search_pi.h) to split the two.
+//
+// Default false, so every existing invocation -- including the live 3b run --
+// reaches identical code. The reset is fatal under post_gate8_3b: re-basing 3b
+// onto itself has no meaning, and a profile check is what stops the flag from
+// being available to the arm it would damage.
+ABSL_FLAG(bool, search_pi_origin_reset, false,
+          "Re-base an inherited search-PI lineage onto a fresh experiment "
+          "origin: keep the model and the optimizer moments, restart the "
+          "generation counter, the episode cursor, the cumulative totals and "
+          "the hash chains. Legal only under a rung4 profile.");
+ABSL_FLAG(int, search_pi_origin_generation, 5,
+          "Generation the inherited checkpoint must carry for the origin reset "
+          "to fire. One third of the triple that identifies the origin.");
+ABSL_FLAG(int64_t, search_pi_origin_next_episode_id, 602560,
+          "Episode cursor the inherited checkpoint must carry for the origin "
+          "reset to fire. Second third of the origin triple.");
+ABSL_FLAG(std::string, search_pi_origin_config_fingerprint, "",
+          "Search-PI config fingerprint the inherited checkpoint must carry "
+          "for the origin reset to fire. Required non-empty when the reset is "
+          "requested: it is the final third of the origin triple.");
+
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
@@ -3446,6 +3475,31 @@ int main(int argc, char** argv) {
           "a hash without an archive verifies nothing.");
     }
 
+    // --- Origin reset: legality, checked HERE ------------------------------
+    //
+    // Beside the other profile-legality checks and BEFORE any checkpoint is
+    // read, so an illegal request fails on the flag rather than deep inside the
+    // resume path -- and so it fails even when the checkpoint carries no
+    // search_pi block at all, where the reset call site below is never reached.
+    // A request that silently did nothing is the worse outcome: the run would
+    // proceed in the wrong episode domain wearing the profile's name.
+    const bool origin_reset_requested =
+        absl::GetFlag(FLAGS_search_pi_origin_reset);
+    const std::string origin_reset_fingerprint =
+        absl::GetFlag(FLAGS_search_pi_origin_config_fingerprint);
+    if (origin_reset_requested && !profile_rung4a && !profile_rung4_replay) {
+      SpielFatalError(
+          "an origin reset is legal only under the rung4a and rung4_replay "
+          "profiles; this invocation selected the profile " +
+          registration_profile + ".");
+    }
+    if (origin_reset_requested && origin_reset_fingerprint.empty()) {
+      SpielFatalError(
+          "an origin reset requires the origin config fingerprint: without it "
+          "the authorising triple collapses to a generation and a cursor, "
+          "which many checkpoints share.");
+    }
+
     // rung4_replay: capture on one side, train-only on the other. They are two
     // halves of the same experiment and never the same invocation -- capture
     // produces the cohort a later training step consumes.
@@ -3702,7 +3756,60 @@ int main(int argc, char** argv) {
 
     int pi_generation = 0;
     open_spiel::SearchPiState pi_state;
+    // True once the inherited lineage has been re-based. Distinct from
+    // `search_pi_resume_present`, which must STAY true: it is what lets the
+    // dedicated optimizer inherit this lane's Adam moments below, and that
+    // inheritance is the entire reason the successor reads a search_pi block at
+    // all rather than starting from a block-less checkpoint.
+    bool pi_origin_reset_applied = false;
     if (search_pi_resume_present) {
+      // --- Origin reset, applied BEFORE both existing resume checks ---------
+      //
+      // Ordering is load-bearing. The fingerprint check immediately below and
+      // the resume-generation bound further down must see the RE-BASED state,
+      // not 3b's, so each keeps deciding on its own terms:
+      //   - the fingerprint check still compares the checkpoint's recorded
+      //     config against this run's, because the reset deliberately leaves
+      //     `config` and `learner` alone (dune_search_pi.h). A successor that
+      //     changed a fingerprinted knob is still refused here, which is
+      //     correct: it would be inheriting Adam moments across a changed
+      //     objective;
+      //   - the generation bound sees generation 0 and therefore routes to the
+      //     fresh-lineage branch, whose two checks -- the registered initial
+      //     student digest and the registered episode base -- are the ones that
+      //     actually bind a re-based lineage. A completed-boundary check in
+      //     1..max-1 has nothing to say about a lineage that is starting over.
+      if (origin_reset_requested) {
+        open_spiel::SearchPiOriginResetRequest reset_request;
+        reset_request.expected_origin_generation =
+            absl::GetFlag(FLAGS_search_pi_origin_generation);
+        reset_request.expected_origin_next_episode =
+            absl::GetFlag(FLAGS_search_pi_origin_next_episode_id);
+        reset_request.origin_config_fingerprint = origin_reset_fingerprint;
+        // The base the LAUNCHER stated, read before the resume block below
+        // overwrites pi_cfg.next_episode_id. Passing registered_first_episode_id
+        // here instead would make the fresh-lineage base check compare a
+        // constant against itself and stop detecting a mis-stated launch.
+        reset_request.new_first_episode_id = pi_cfg.next_episode_id;
+        reset_request.new_config_fingerprint = pi_fingerprint;
+        std::string reset_error;
+        if (!open_spiel::ApplySearchPiOriginReset(&search_pi_resume,
+                                                  reset_request, &reset_error)) {
+          SpielFatalError("search-PI origin reset refused: " + reset_error);
+        }
+        pi_origin_reset_applied = true;
+        std::cout << absl::StrFormat(
+            "[search-PI] Origin reset: re-based the inherited lineage from "
+            "generation=%d next_episode_id=%lld fp=%s onto profile=%s "
+            "generation=0 next_episode_id=%lld fp=%s; model and optimizer "
+            "moments inherited, cumulative counters and hash chains zeroed.\n",
+            search_pi_resume.origin_reset_generation,
+            (long long)search_pi_resume.origin_reset_next_episode_id,
+            search_pi_resume.origin_reset_config_fingerprint.substr(0, 16),
+            registration_profile,
+            (long long)search_pi_resume.next_episode_id,
+            pi_fingerprint.substr(0, 16));
+      }
       const std::string prior_fp = open_spiel::SearchPiConfigFingerprint(
           search_pi_resume.config, search_pi_resume.learner);
       if (prior_fp != pi_fingerprint) {
@@ -3722,7 +3829,14 @@ int main(int argc, char** argv) {
         SpielFatalError(
             "post-Gate-8 Search-PI must start/resume from a checkpoint");
       }
-      if (!search_pi_resume_present) {
+      // A re-based lineage is a FRESH lineage for every purpose this branch
+      // decides. It has generation 0 and a cursor at its own registered base,
+      // so the resume arm's completed-boundary rule (1..max-1) would reject it
+      // for the one property that makes it correct. Routing it here does not
+      // weaken anything: it substitutes two checks that bind -- the registered
+      // initial student digest and the registered episode base -- for one that
+      // is inapplicable, and it is reachable only via the rung4-gated flag.
+      if (!search_pi_resume_present || pi_origin_reset_applied) {
         const std::string initial_student_digest =
             open_spiel::CanonicalSearchPiModuleDigest(*training_model);
         if (profile_3b) {
