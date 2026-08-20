@@ -99,6 +99,27 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_target_fit_forensic dune_search ${TORCH_LIBRARIES})
 
+  # Frozen post-Rung-4N offline changed-state weighting experiment.  This is
+  # an offline-only executable with no collector or resume entry point; the
+  # shared sources below provide the retained-row codec/hash and the learner's
+  # exact legal-centering transform.  Its own learner constructs fresh AdamW
+  # state and changes only per-row CE weights between C and T.
+  add_executable(dune_offline_changed_state
+    dune_offline_changed_state_main.cc dune_offline_changed_state.cc
+    dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_offline_changed_state
+    dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_offline_changed_state_test
+    dune_offline_changed_state_test.cc dune_offline_changed_state.cc
+    dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_offline_changed_state_test
+    dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_offline_changed_state_test
+    COMMAND dune_offline_changed_state_test)
+
   # The rung-3 teacher audit. Same source set as the test target above, for the
   # same reason: it CALLS SearchPiGenerator::GenerateGeneration rather than
   # re-implementing the controller, which is what makes the controller-parity
