@@ -86,6 +86,274 @@ bool ScratchCollectorOwnedByOptimizer(
   return false;
 }
 
+RegularizedQTargetResult BuildNormalizedCmpoTarget(
+    const std::vector<Action>& legal_actions,
+    const std::vector<double>& raw_prior, const std::vector<int>& visits,
+    const std::vector<double>& q_values, double root_value, double sigma,
+    double max_kl) {
+  RegularizedQTargetResult out;
+  auto fail = [&out](const char* name) {
+    out.error = name;
+    return out;
+  };
+  const size_t n = legal_actions.size();
+  if (n == 0 || raw_prior.size() != n || visits.size() != n ||
+      q_values.size() != n) {
+    return fail("vector_alignment");
+  }
+  if (!std::isfinite(root_value) || !std::isfinite(sigma) ||
+      !(sigma > 0.0) || !std::isfinite(max_kl) || !(max_kl >= 0.0)) {
+    return fail("invalid_normalization_parameters");
+  }
+
+  constexpr double kPriorFloor = 1e-12;
+  std::vector<double> prior(n);
+  std::vector<double> completed_q(n);
+  double prior_sum = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(raw_prior[i]) || raw_prior[i] < 0.0) {
+      return fail("invalid_prior");
+    }
+    if (visits[i] < 0 || !std::isfinite(q_values[i])) {
+      return fail("invalid_q_inputs");
+    }
+    prior[i] = std::max(kPriorFloor, raw_prior[i]);
+    prior_sum += prior[i];
+    completed_q[i] = visits[i] > 0 ? q_values[i] : root_value;
+    if (visits[i] > 0) ++out.direct_visit_count;
+  }
+  if (!(prior_sum > 0.0) || !std::isfinite(prior_sum)) {
+    return fail("invalid_prior_sum");
+  }
+  for (double& value : prior) value /= prior_sum;
+
+  double baseline = 0.0;
+  for (size_t i = 0; i < n; ++i) baseline += prior[i] * completed_q[i];
+  if (!std::isfinite(baseline)) return fail("nonfinite_baseline");
+  out.prior_expected_q = baseline;
+  const auto mm = std::minmax_element(completed_q.begin(), completed_q.end());
+  out.q_range = *mm.second - *mm.first;
+  out.normalized_sigma = sigma;
+
+  std::vector<double> z(n);
+  int clipped_low = 0;
+  int clipped_high = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const double unbounded = (completed_q[i] - baseline) / sigma;
+    if (!std::isfinite(unbounded)) return fail("nonfinite_normalized_advantage");
+    if (unbounded <= -1.0) ++clipped_low;
+    if (unbounded >= 1.0) ++clipped_high;
+    z[i] = std::clamp(unbounded, -1.0, 1.0);
+  }
+  out.normalized_clip_low_fraction =
+      static_cast<double>(clipped_low) / static_cast<double>(n);
+  out.normalized_clip_high_fraction =
+      static_cast<double>(clipped_high) / static_cast<double>(n);
+
+  auto make_target = [&](double scale, std::vector<double>* target,
+                         double* kl) -> bool {
+    target->resize(n);
+    double max_log_weight = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < n; ++i) {
+      const double log_weight = std::log(prior[i]) + scale * z[i];
+      (*target)[i] = log_weight;
+      max_log_weight = std::max(max_log_weight, log_weight);
+    }
+    double normalizer = 0.0;
+    for (double& log_weight : *target) {
+      log_weight = std::exp(log_weight - max_log_weight);
+      normalizer += log_weight;
+    }
+    if (!(normalizer > 0.0) || !std::isfinite(normalizer)) return false;
+    *kl = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      (*target)[i] /= normalizer;
+      const double probability = (*target)[i];
+      if (!std::isfinite(probability) || probability < 0.0) return false;
+      if (probability > 0.0) {
+        *kl += probability * std::log(probability / prior[i]);
+      }
+    }
+    return std::isfinite(*kl);
+  };
+
+  std::vector<double> target;
+  double kl = 0.0;
+  if (!make_target(1.0, &target, &kl)) return fail("target_failure");
+  double scale = 1.0;
+  if (kl > max_kl) {
+    double low = 0.0;
+    double high = 1.0;
+    for (int iteration = 0; iteration < 48; ++iteration) {
+      const double mid = low + (high - low) * 0.5;
+      std::vector<double> candidate;
+      double candidate_kl = 0.0;
+      if (!make_target(mid, &candidate, &candidate_kl)) {
+        return fail("bisection_failure");
+      }
+      if (candidate_kl <= max_kl) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    scale = low;
+    if (!make_target(scale, &target, &kl)) return fail("target_failure");
+  }
+
+  double target_sum = 0.0;
+  double target_expected_q = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    target_sum += target[i];
+    target_expected_q += target[i] * completed_q[i];
+  }
+  if (!std::isfinite(target_sum) || std::abs(target_sum - 1.0) > 1e-12 ||
+      kl > max_kl + 1e-12 || !std::isfinite(target_expected_q)) {
+    return fail("target_postcondition");
+  }
+  out.ok = true;
+  out.error = "none";
+  out.target = std::move(target);
+  out.normalized_scale = scale;
+  out.beta = scale;
+  out.kl = kl;
+  out.target_expected_q = target_expected_q;
+  return out;
+}
+
+bool ApplyNormalizedCmpoTargets(
+    std::vector<SearchPiRow>* rows, NormalizedCmpoGenerationStats* stats,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (rows == nullptr || stats == nullptr) {
+    if (error != nullptr) *error = "null_normalized_cmpo_output";
+    return false;
+  }
+  *stats = NormalizedCmpoGenerationStats();
+  double variance_sum = 0.0;
+  int64_t full_count = 0;
+  for (const SearchPiRow& row : *rows) {
+    if (row.search_budget_class == "cheap") {
+      ++stats->cheap_rows;
+      continue;
+    }
+    if (row.search_budget_class != "full") {
+      if (error != nullptr) *error = "unknown_budget_class";
+      return false;
+    }
+    ++stats->full_rows;
+    const size_t n = row.legal_actions.size();
+    if (n == 0 || row.raw_policy.size() != n || row.raw_visits.size() != n ||
+        row.q_values.size() != n || !std::isfinite(row.root_value)) {
+      if (error != nullptr) *error = "unaligned_full_row";
+      return false;
+    }
+    std::vector<double> prior(n);
+    double prior_sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!std::isfinite(row.raw_policy[i]) || row.raw_policy[i] < 0.0 ||
+          row.raw_visits[i] < 0 || !std::isfinite(row.q_values[i])) {
+        if (error != nullptr) *error = "invalid_full_row_inputs";
+        return false;
+      }
+      prior[i] = std::max(1e-12, row.raw_policy[i]);
+      prior_sum += prior[i];
+    }
+    if (!(prior_sum > 0.0) || !std::isfinite(prior_sum)) {
+      if (error != nullptr) *error = "invalid_full_row_prior";
+      return false;
+    }
+    for (double& value : prior) value /= prior_sum;
+    double baseline = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double q = row.raw_visits[i] > 0 ? row.q_values[i]
+                                             : row.root_value;
+      baseline += prior[i] * q;
+    }
+    double variance = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double q = row.raw_visits[i] > 0 ? row.q_values[i]
+                                             : row.root_value;
+      variance += prior[i] * (q - baseline) * (q - baseline);
+    }
+    variance_sum += variance;
+    ++full_count;
+  }
+  if (full_count > 0) {
+    stats->sigma = std::sqrt(std::max(0.0, variance_sum /
+                                               static_cast<double>(full_count)));
+    if (!std::isfinite(stats->sigma) || stats->sigma < 1e-6) {
+      stats->sigma = 1e-6;
+    }
+  }
+
+  double prior_sum = 0.0;
+  double target_sum = 0.0;
+  double q_range_sum = 0.0;
+  double direct_visits_sum = 0.0;
+  double raw_entropy_sum = 0.0;
+  double target_entropy_sum = 0.0;
+  for (SearchPiRow& row : *rows) {
+    auto result = BuildNormalizedCmpoTarget(
+        row.legal_actions, row.raw_policy, row.raw_visits, row.q_values,
+        row.root_value, stats->sigma);
+    if (!result.ok) {
+      if (error != nullptr) *error = result.error;
+      return false;
+    }
+    row.target_type = "normalized_cmpo";
+    row.regularized_q_valid = true;
+    row.regularized_q_error = "none";
+    row.regularized_q_target = std::move(result.target);
+    row.regularized_q_beta = result.normalized_scale;
+    row.regularized_q_kl = result.kl;
+    row.regularized_q_prior_expected_q = result.prior_expected_q;
+    row.regularized_q_target_expected_q = result.target_expected_q;
+    row.regularized_q_q_range = result.q_range;
+    row.regularized_q_direct_visit_count = result.direct_visit_count;
+    row.regularized_q_entropy_norm = NormalizedEntropy(row.regularized_q_target);
+    if (row.search_budget_class == "full") {
+      stats->advantage_count += static_cast<int64_t>(row.legal_actions.size());
+      stats->clipped_low += static_cast<int64_t>(
+          std::round(result.normalized_clip_low_fraction * row.legal_actions.size()));
+      stats->clipped_high += static_cast<int64_t>(
+          std::round(result.normalized_clip_high_fraction * row.legal_actions.size()));
+    }
+    if (row.search_budget_class == "full") {
+      stats->target_kls.push_back(result.kl);
+      prior_sum += result.prior_expected_q;
+      target_sum += result.target_expected_q;
+      q_range_sum += result.q_range;
+      direct_visits_sum += result.direct_visit_count;
+      raw_entropy_sum += NormalizedEntropy(row.raw_policy);
+      target_entropy_sum += row.regularized_q_entropy_norm;
+    }
+  }
+  const double denominator =
+      std::max<int64_t>(1, stats->full_rows);
+  stats->prior_expected_q_mean = prior_sum / denominator;
+  stats->target_expected_q_mean = target_sum / denominator;
+  stats->q_range_mean = q_range_sum / denominator;
+  stats->direct_visit_count_mean = direct_visits_sum / denominator;
+  stats->raw_entropy_mean = raw_entropy_sum / denominator;
+  stats->target_entropy_mean = target_entropy_sum / denominator;
+  return true;
+}
+
+std::vector<std::vector<SearchPiRow>> FilterNormalizedCmpoReplayWindow(
+    const std::vector<std::vector<SearchPiRow>>& replay_window) {
+  std::vector<std::vector<SearchPiRow>> full_only(replay_window.size());
+  for (size_t cohort = 0; cohort < replay_window.size(); ++cohort) {
+    for (const SearchPiRow& row : replay_window[cohort]) {
+      if (row.search_budget_class == "full" &&
+          row.policy_target_weight > 0.0) {
+        full_only[cohort].push_back(row);
+      }
+    }
+  }
+  return full_only;
+}
+
 ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     torch::optim::Optimizer& optimizer, const std::vector<SearchPiRow>& rows,
@@ -115,7 +383,8 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
   for (int64_t i = 0; i < n; ++i) {
     const SearchPiRow& row = rows[i];
     SPIEL_CHECK_EQ(row.row_schema_version, 2);
-    SPIEL_CHECK_EQ(row.target_type, "regularized_q_kl");
+    SPIEL_CHECK_TRUE(row.target_type == "regularized_q_kl" ||
+                     row.target_type == "normalized_cmpo");
     SPIEL_CHECK_TRUE(row.value_target_attached);
     SPIEL_CHECK_TRUE(std::isfinite(row.value_target));
     SPIEL_CHECK_TRUE(row.policy_target_weight == 0.0 ||

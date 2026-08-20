@@ -553,7 +553,7 @@ ScratchSearchBudgetAssignment AssignScratchSearchBudget(
     const SearchPiConfig& config, int64_t episode_id, int decision_id,
     Player acting_player, DuneDecisionRole role) {
   ScratchSearchBudgetAssignment out;
-  if (!config.scratch_q_v1) return out;
+  if (!config.scratch_q_v1 && !config.normalized_cmpo) return out;
   SPIEL_CHECK_GE(config.scratch_full_root_probability, 0.0);
   SPIEL_CHECK_LE(config.scratch_full_root_probability, 1.0);
   uint64_t draw = DeriveStream(config.seed_domain, episode_id, decision_id,
@@ -837,7 +837,7 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   // is not a multiple of four searches some seats more than others. Scratch
   // concurrent collection enforces this over the COMPLETE generation while
   // scheduling one game per worker chunk to reach the audited G=128 geometry.
-  if (!config_.scratch_q_v1) {
+  if (!config_.scratch_q_v1 && !config_.normalized_cmpo) {
     SPIEL_CHECK_EQ(config_.games_per_generation % 4, 0);
   }
   SPIEL_CHECK_GT(config_.primary_simulations, 0);
@@ -866,7 +866,7 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   if (config_.dirichlet_epsilon <= 0.0) {
     SPIEL_CHECK_EQ(config_.forced_playouts_k, 0.0);
   }
-  if (config_.scratch_q_v1) {
+  if (config_.scratch_q_v1 || config_.normalized_cmpo) {
     SPIEL_CHECK_GE(config_.scratch_full_root_probability, 0.0);
     SPIEL_CHECK_LE(config_.scratch_full_root_probability, 1.0);
     SPIEL_CHECK_GT(config_.scratch_full_primary_simulations, 0);
@@ -874,7 +874,11 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
     SPIEL_CHECK_GT(config_.scratch_cheap_primary_simulations, 0);
     SPIEL_CHECK_GT(config_.scratch_cheap_other_simulations, 0);
     SPIEL_CHECK_EQ(config_.target_sharpen_exponent, 1.0);
-    SPIEL_CHECK_EQ(config_.behavior_temperature, 1.0);
+    if (config_.normalized_cmpo) {
+      SPIEL_CHECK_EQ(config_.behavior_temperature, 0.0);
+    } else {
+      SPIEL_CHECK_EQ(config_.behavior_temperature, 1.0);
+    }
   }
 }
 
@@ -1068,7 +1072,7 @@ void SearchPiGenerator::GenerateGeneration(
       const bool role_is_search =
           IsSearchPiSearchRole(role, config_.purchase_combat_budget);
       ScratchSearchBudgetAssignment scratch_budget;
-      if (config_.scratch_q_v1 && role_is_search) {
+      if ((config_.scratch_q_v1 || config_.normalized_cmpo) && role_is_search) {
         scratch_budget = AssignScratchSearchBudget(
             config_, episode_id, static_cast<int>(this_decision), cur, role);
         const int primary = scratch_budget.full
@@ -1247,7 +1251,8 @@ void SearchPiGenerator::GenerateGeneration(
                                  &target_probs)) {
           fallback = SearchPiFallback::kZeroVisits;
         }
-        if (fallback == SearchPiFallback::kNone && config_.scratch_q_v1) {
+        if (fallback == SearchPiFallback::kNone &&
+            (config_.scratch_q_v1 || config_.normalized_cmpo)) {
           const std::vector<double>& raw_priors =
               res.diagnostics.raw_priors.empty() ? res.diagnostics.priors
                                                  : res.diagnostics.raw_priors;
@@ -1316,7 +1321,7 @@ void SearchPiGenerator::GenerateGeneration(
           row.root_value = res.diagnostics.root_value;
           row.q_values = res.diagnostics.q_values;
 
-          if (config_.scratch_q_v1) {
+          if (config_.scratch_q_v1 || config_.normalized_cmpo) {
             row.row_schema_version = 2;
             row.target_type = "regularized_q_kl";
             row.search_budget_class = scratch_budget.full ? "full" : "cheap";

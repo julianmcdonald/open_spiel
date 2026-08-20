@@ -505,8 +505,9 @@ bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
   };
   const size_t n = row.legal_actions.size();
   if (row.row_schema_version != 2) return fail("scratch row schema is not 2.");
-  if (row.target_type != "regularized_q_kl") {
-    return fail("scratch row target_type is not regularized_q_kl.");
+  if (row.target_type != "regularized_q_kl" &&
+      row.target_type != "normalized_cmpo") {
+    return fail("scratch row target_type is not a supported Q target.");
   }
   if (row.search_budget_class != "full" &&
       row.search_budget_class != "cheap") {
@@ -895,7 +896,7 @@ bool ReadScratchSearchPiRowShardV2(const std::string& path,
                         absl::Hex(kSearchPiShardMagic), "."));
   } else if (version != kScratchSearchPiShardVersion) {
     r.Fail(absl::StrCat("version is ", version,
-                        ", but scratch_q_v1 reads only version ",
+                        ", but Search-PI Q profiles read only version ",
                         kScratchSearchPiShardVersion, "."));
   } else if (row_count > r.remaining() / kMinSerializedRowBytes) {
     r.Fail(absl::StrCat("header declares ", row_count,

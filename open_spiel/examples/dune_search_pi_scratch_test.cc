@@ -148,6 +148,75 @@ void TestRegularizedQ() {
   }
 }
 
+void TestNormalizedCmpo() {
+  const std::vector<Action> actions = {10, 11, 12};
+  const std::vector<double> prior = {0.5, 0.3, 0.2};
+  const std::vector<int> visits = {1, 1, 1};
+  const std::vector<double> q = {1.0, 2.0, 3.0};
+  auto target = BuildNormalizedCmpoTarget(actions, prior, visits, q, 1.0, 1.0);
+  SPIEL_CHECK_TRUE(target.ok);
+  SPIEL_CHECK_LE(target.kl, 0.10 + 1e-12);
+  SPIEL_CHECK_GT(target.target[2] / target.target[0], prior[2] / prior[0]);
+  double sum = 0.0;
+  for (double probability : target.target) {
+    SPIEL_CHECK_TRUE(std::isfinite(probability));
+    SPIEL_CHECK_GE(probability, 0.0);
+    sum += probability;
+  }
+  SPIEL_CHECK_FLOAT_EQ(sum, 1.0);
+
+  auto constant = BuildNormalizedCmpoTarget(
+      actions, prior, visits, {7.0, 7.0, 7.0}, 7.0, 2.0);
+  SPIEL_CHECK_TRUE(constant.ok);
+  for (size_t i = 0; i < prior.size(); ++i) {
+    SPIEL_CHECK_LE(std::abs(constant.target[i] - prior[i]), 1e-12);
+  }
+
+  auto scaled = BuildNormalizedCmpoTarget(
+      actions, prior, visits, {10.0, 20.0, 30.0}, 10.0, 10.0);
+  auto unscaled = BuildNormalizedCmpoTarget(
+      actions, prior, visits, q, 1.0, 1.0);
+  SPIEL_CHECK_TRUE(scaled.ok);
+  SPIEL_CHECK_TRUE(unscaled.ok);
+  for (size_t i = 0; i < prior.size(); ++i) {
+    SPIEL_CHECK_LE(std::abs(scaled.target[i] - unscaled.target[i]), 1e-12);
+  }
+
+  auto capped = BuildNormalizedCmpoTarget(
+      actions, prior, visits, {-100.0, 0.0, 100.0}, 0.0, 1.0);
+  SPIEL_CHECK_TRUE(capped.ok);
+  SPIEL_CHECK_LE(capped.kl, 0.10 + 1e-12);
+  SPIEL_CHECK_LT(capped.normalized_scale, 1.0);
+
+  SearchPiConfig safe = ScratchConfig();
+  safe.normalized_cmpo = true;
+  safe.behavior_temperature = 0.0;
+  safe.dirichlet_epsilon = 0.0;
+  safe.forced_playouts_k = 0.0;
+  safe.root_noise_fpu_zero = false;
+  SPIEL_CHECK_EQ(safe.behavior_temperature, 0.0);
+  SPIEL_CHECK_EQ(safe.dirichlet_epsilon, 0.0);
+  SPIEL_CHECK_EQ(safe.forced_playouts_k, 0.0);
+  SPIEL_CHECK_FALSE(safe.root_noise_fpu_zero);
+
+  SearchPiRow full = Row(true, 1, 1);
+  SearchPiRow cheap = Row(false, 2, 2);
+  std::vector<SearchPiRow> rows = {full, cheap};
+  NormalizedCmpoGenerationStats stats;
+  std::string error;
+  SPIEL_CHECK_TRUE(ApplyNormalizedCmpoTargets(&rows, &stats, &error));
+  SPIEL_CHECK_TRUE(error.empty());
+  SPIEL_CHECK_EQ(stats.full_rows, 1);
+  SPIEL_CHECK_EQ(stats.cheap_rows, 1);
+  SPIEL_CHECK_GT(stats.sigma, 0.0);
+  SPIEL_CHECK_EQ(rows[0].target_type, "normalized_cmpo");
+  SPIEL_CHECK_EQ(rows[1].target_type, "normalized_cmpo");
+  SPIEL_CHECK_LE(static_cast<double>(stats.clipped_low),
+                 static_cast<double>(stats.advantage_count));
+  SPIEL_CHECK_LE(static_cast<double>(stats.clipped_high),
+                 static_cast<double>(stats.advantage_count));
+}
+
 void TestBudgets() {
   SearchPiConfig config = ScratchConfig();
   const auto a = AssignScratchSearchBudget(
@@ -196,6 +265,16 @@ void TestLearnerMaskingAndTarget() {
   SPIEL_CHECK_FALSE(value_stats.policy_backward_executed);
   SPIEL_CHECK_TRUE(value_stats.value_backward_executed);
   SPIEL_CHECK_NE(before, CanonicalSearchPiModuleDigest(*cheap_model));
+
+  config.value_coef = 0.0;
+  auto mixed_model = TinyModel(10);
+  auto mixed_optimizer = Optimizer(mixed_model);
+  auto mixed_stats = RunScratchSearchPiLearner(
+      mixed_model, *mixed_optimizer, {Row(true, 3, 1), Row(false, 4, 2)},
+      4, 4, torch::kCPU, 99, 1, config);
+  SPIEL_CHECK_TRUE(mixed_stats.policy_backward_executed);
+  SPIEL_CHECK_FALSE(mixed_stats.value_backward_executed);
+  SPIEL_CHECK_EQ(mixed_stats.policy_weight_rows, 1);
 
   config.value_coef = 0.0;
   auto first = TinyModel(17);
@@ -255,6 +334,17 @@ void TestV2AndReplay() {
     }
   }
   SPIEL_CHECK_EQ(current_full, 3);
+
+  const std::vector<std::vector<SearchPiRow>> full_only_window =
+      FilterNormalizedCmpoReplayWindow(window);
+  auto full_only = SampleScratchSearchPiReplayWindow(
+      full_only_window, 2, 100, 123, &error);
+  SPIEL_CHECK_TRUE(error.empty());
+  SPIEL_CHECK_EQ(full_only.size(), 3u);
+  for (const SearchPiRow& row : full_only) {
+    SPIEL_CHECK_EQ(row.search_budget_class, "full");
+    SPIEL_CHECK_GT(row.policy_target_weight, 0.0);
+  }
 
   rows[0].q_values[0] = std::numeric_limits<double>::quiet_NaN();
   SPIEL_CHECK_FALSE(WriteScratchSearchPiRowShardV2(
@@ -337,6 +427,7 @@ void TestScratchOneGameChunksPreserveBalancedGeneration() {
 
 int main() {
   open_spiel::TestRegularizedQ();
+  open_spiel::TestNormalizedCmpo();
   open_spiel::TestBudgets();
   open_spiel::TestLearnerMaskingAndTarget();
   open_spiel::TestV2AndReplay();

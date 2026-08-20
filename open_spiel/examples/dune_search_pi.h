@@ -292,6 +292,10 @@ struct SearchPiConfig {
   // The legacy config fingerprint intentionally excludes them; scratch_q_v1
   // owns a separate profile/config fingerprint in dune_search_pi_scratch.
   bool scratch_q_v1 = false;
+  // The mature-safe warm-start lane shares scratch collection/replay mechanics
+  // but replaces the per-row clipped-Q target with a generation-normalized
+  // CMPO target. Historical profiles leave this false.
+  bool normalized_cmpo = false;
   double scratch_full_root_probability = 0.25;
   int scratch_full_primary_simulations = 200;
   int scratch_full_other_simulations = 64;
@@ -913,6 +917,10 @@ struct RegularizedQTargetResult {
   double target_expected_q = 0.0;
   double q_range = 0.0;
   int direct_visit_count = 0;
+  double normalized_sigma = 0.0;
+  double normalized_scale = 0.0;
+  double normalized_clip_low_fraction = 0.0;
+  double normalized_clip_high_fraction = 0.0;
 };
 
 RegularizedQTargetResult BuildRegularizedQKlTarget(

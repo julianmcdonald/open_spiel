@@ -15,6 +15,36 @@ namespace open_spiel {
 
 inline constexpr char kScratchSearchPiProfile[] = "scratch_q_v1";
 inline constexpr char kWarmSearchPiProfile[] = "ppo_warm_q_v1";
+inline constexpr char kWarmNormalizedCmpoProfile[] = "ppo_warm_cmpo_norm_v1";
+
+struct NormalizedCmpoGenerationStats {
+  double sigma = 1e-6;
+  int64_t full_rows = 0;
+  int64_t cheap_rows = 0;
+  int64_t advantage_count = 0;
+  int64_t clipped_low = 0;
+  int64_t clipped_high = 0;
+  std::vector<double> target_kls;
+  double prior_expected_q_mean = 0.0;
+  double target_expected_q_mean = 0.0;
+  double q_range_mean = 0.0;
+  double direct_visit_count_mean = 0.0;
+  double raw_entropy_mean = 0.0;
+  double target_entropy_mean = 0.0;
+};
+
+RegularizedQTargetResult BuildNormalizedCmpoTarget(
+    const std::vector<Action>& legal_actions,
+    const std::vector<double>& raw_prior, const std::vector<int>& visits,
+    const std::vector<double>& q_values, double root_value, double sigma,
+    double max_kl = 0.10);
+
+bool ApplyNormalizedCmpoTargets(
+    std::vector<SearchPiRow>* rows, NormalizedCmpoGenerationStats* stats,
+    std::string* error);
+
+std::vector<std::vector<SearchPiRow>> FilterNormalizedCmpoReplayWindow(
+    const std::vector<std::vector<SearchPiRow>>& replay_window);
 
 struct ScratchSearchPiLearnerStats {
   double policy_ce = 0.0;
