@@ -69,6 +69,7 @@ namespace open_spiel {
 inline constexpr uint32_t kSearchPiShardMagic = 0x52505344u;         // "DSPR"
 inline constexpr uint32_t kSearchPiShardTrailerMagic = 0x444E4553u;  // "SEND"
 inline constexpr uint32_t kSearchPiShardVersion = 1u;
+inline constexpr uint32_t kScratchSearchPiShardVersion = 2u;
 inline constexpr size_t kSearchPiShardHeaderBytes = 16;
 
 // The retained replay window, in cohorts. Eight is the registered window for
@@ -111,6 +112,15 @@ bool WriteSearchPiRowShard(const std::string& path,
 bool ReadSearchPiRowShard(const std::string& path,
                           std::vector<SearchPiRow>* rows, std::string* error);
 
+// Isolated scratch_q_v1 codec. The legacy version-1 functions above remain
+// byte-for-byte on their original format and reject these version-2 shards.
+bool WriteScratchSearchPiRowShardV2(const std::string& path,
+                                    const std::vector<SearchPiRow>& rows,
+                                    std::string* error);
+bool ReadScratchSearchPiRowShardV2(const std::string& path,
+                                   std::vector<SearchPiRow>* rows,
+                                   std::string* error);
+
 // ---------------------------------------------------------------------------
 // Uniform replay-window sampler
 // ---------------------------------------------------------------------------
@@ -149,6 +159,18 @@ bool ReadSearchPiRowShard(const std::string& path,
 std::vector<SearchPiRow> SampleUniformReplayWindow(
     const std::vector<std::vector<SearchPiRow>>& window, size_t sample_count,
     uint64_t seed);
+
+// scratch_q_v1 replay selection: retain every current-generation full-policy
+// row, then fill uniformly without replacement from every remaining row in the
+// flattened recent window. Returns empty and sets error if required full rows
+// alone exceed max_rows or if any row is not schema version 2.
+std::vector<SearchPiRow> SampleScratchSearchPiReplayWindow(
+    const std::vector<std::vector<SearchPiRow>>& window,
+    int current_generation, size_t max_rows, uint64_t seed,
+    std::string* error);
+
+std::string ScratchSearchPiShardPathForGeneration(const std::string& dir,
+                                                  int generation);
 
 // ---------------------------------------------------------------------------
 // Retention

@@ -84,6 +84,13 @@ class DuneSearchSession {
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
 
+  // scratch_q_v1 assigns a full/cheap class independently at every root while
+  // retaining one session (and therefore one reusable tree) across an agent
+  // activation. Historical callers never invoke this setter.
+  void SetTrainingPolicyIterationBudgets(int primary_simulations,
+                                         int continuation_simulations,
+                                         int short_window_simulations);
+
   ControllerDecision SelectControllerAction(
       const State& state,
       const DuneSearchResult& search_result,

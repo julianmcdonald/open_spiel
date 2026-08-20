@@ -89,6 +89,24 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_search_pi_replay_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_replay_test COMMAND dune_search_pi_replay_test)
 
+  # Search-PI v2 reusable Q-target/weighted-learner lane. Historical v1 shard
+  # and learner entry points remain separate and are linked unchanged above.
+  add_executable(dune_search_pi_scratch
+    dune_search_pi_scratch_main.cc dune_search_pi_scratch.cc
+    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_scratch dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_search_pi_scratch_test
+    dune_search_pi_scratch_test.cc dune_search_pi_scratch.cc
+    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_scratch_test
+    dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_search_pi_scratch_test COMMAND dune_search_pi_scratch_test)
+
   # Post-termination descriptive forensic for Rung-4N. This is a separate
   # read-only instrument: it reconstructs and hashes the exact rows presented
   # to a completed F/W update, then brackets that update with its archived

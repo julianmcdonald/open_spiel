@@ -286,6 +286,17 @@ struct SearchPiConfig {
   int telemetry_min_coverage = 3;
   int telemetry_min_visits_per_action = 2;
   double telemetry_min_prior_mass = 0.50;
+
+  // --- scratch_q_v1 isolation -------------------------------------------
+  // Historical profiles leave this false and never consult the fields below.
+  // The legacy config fingerprint intentionally excludes them; scratch_q_v1
+  // owns a separate profile/config fingerprint in dune_search_pi_scratch.
+  bool scratch_q_v1 = false;
+  double scratch_full_root_probability = 0.25;
+  int scratch_full_primary_simulations = 200;
+  int scratch_full_other_simulations = 64;
+  int scratch_cheap_primary_simulations = 32;
+  int scratch_cheap_other_simulations = 16;
 };
 
 // The dedicated learner's configuration. Independent of every PPO knob.
@@ -400,6 +411,26 @@ struct SearchPiRow {
   int num_covered_actions = 0;
   double covered_prior_mass = 0.0;
   bool would_pass_legacy_coverage_gate = false;
+
+  // --- scratch schema-v2 extension --------------------------------------
+  // Version-1 shards deliberately do not serialize these fields. They are
+  // written only by WriteScratchSearchPiRowShardV2, and the scratch learner
+  // rejects any row whose row_schema_version is not exactly 2.
+  int row_schema_version = 1;
+  std::string target_type;
+  std::string search_budget_class;  // "full" | "cheap" for scratch rows
+  uint64_t search_budget_draw = 0;
+  double policy_target_weight = 0.0;
+  bool regularized_q_valid = false;
+  std::string regularized_q_error;
+  std::vector<double> regularized_q_target;
+  double regularized_q_beta = 0.0;
+  double regularized_q_kl = 0.0;
+  double regularized_q_prior_expected_q = 0.0;
+  double regularized_q_target_expected_q = 0.0;
+  double regularized_q_q_range = 0.0;
+  int regularized_q_direct_visit_count = 0;
+  double regularized_q_entropy_norm = 0.0;
 };
 
 // ---------------------------------------------------------------------------
@@ -506,6 +537,9 @@ struct SearchPiGameOutcome {
   int searched_seat_placement = 0;
   int64_t searched_seat_decisions = 0;
   int64_t rows_emitted = 0;
+  // Complete applied transitions (chance plus every player's decisions).
+  // Used by scratch_q_v1 resource telemetry; legacy shard rows are unchanged.
+  int64_t trajectory_transitions = 0;
   int64_t primary_roots = 0;
   int64_t continuation_roots = 0;
   int64_t primary_simulations = 0;
@@ -865,6 +899,39 @@ double NormalizedEntropy(const std::vector<double>& probs);
 // non-positive raw prior and the tiny floor was used instead of diverging.
 double KlTargetGivenRaw(const std::vector<double>& target,
                         const std::vector<double>& raw, bool* floored);
+
+// The conservative scratch_q_v1 policy-improvement target. This is separate
+// from BuildSearchPiTarget: the latter is the frozen historical visit-label
+// contract and must remain unchanged.
+struct RegularizedQTargetResult {
+  bool ok = false;
+  std::string error;
+  std::vector<double> target;
+  double beta = 0.0;
+  double kl = 0.0;
+  double prior_expected_q = 0.0;
+  double target_expected_q = 0.0;
+  double q_range = 0.0;
+  int direct_visit_count = 0;
+};
+
+RegularizedQTargetResult BuildRegularizedQKlTarget(
+    const std::vector<Action>& legal_actions,
+    const std::vector<double>& raw_prior,
+    const std::vector<int>& visits,
+    const std::vector<double>& q_values, double root_value,
+    double prior_floor = 1e-8, double advantage_clip = 0.25,
+    double max_beta = 4.0, double max_kl = 0.10);
+
+struct ScratchSearchBudgetAssignment {
+  bool full = false;
+  uint64_t draw = 0;
+  int simulations = 0;
+};
+
+ScratchSearchBudgetAssignment AssignScratchSearchBudget(
+    const SearchPiConfig& config, int64_t episode_id, int decision_id,
+    Player acting_player, DuneDecisionRole role);
 
 // Build the policy target from root visits: select the visit vector per the
 // continuation convention, prune when the exploration package is armed, sharpen,

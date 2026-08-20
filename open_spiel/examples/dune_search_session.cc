@@ -631,6 +631,24 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   return result;
 }
 
+void DuneSearchSession::SetTrainingPolicyIterationBudgets(
+    int primary_simulations, int continuation_simulations,
+    int short_window_simulations) {
+  if (budget_mode_ != DuneSearchBudgetMode::kTrainingPolicyIteration) {
+    SpielFatalError(
+        "SetTrainingPolicyIterationBudgets requires the policy-iteration "
+        "budget mode.");
+  }
+  if (primary_simulations <= 0 || continuation_simulations <= 0 ||
+      short_window_simulations <= 0) {
+    SpielFatalError(
+        "scratch policy-iteration budgets must all be strictly positive.");
+  }
+  config_.pi_primary_simulations = primary_simulations;
+  config_.pi_continuation_simulations = continuation_simulations;
+  config_.purchase_combat_budget = short_window_simulations;
+}
+
 std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
     const std::string& checkpoint_path,
     const std::string& device_str,

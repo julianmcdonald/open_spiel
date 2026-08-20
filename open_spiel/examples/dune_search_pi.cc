@@ -37,6 +37,7 @@ constexpr uint64_t kStreamPiOpponentPolicy = 0x5002;
 constexpr uint64_t kStreamPiSearchSeed = 0x5003;
 constexpr uint64_t kStreamPiBehavior = 0x5004;
 constexpr uint64_t kStreamPiUnsearchedSeat = 0x5005;
+constexpr uint64_t kStreamPiScratchBudgetClass = 0x5007;
 
 uint64_t Splitmix64(uint64_t x) {
   x += 0x9E3779B97F4A7C15ULL;
@@ -415,6 +416,163 @@ double KlTargetGivenRaw(const std::vector<double>& target,
   return kl;
 }
 
+RegularizedQTargetResult BuildRegularizedQKlTarget(
+    const std::vector<Action>& legal_actions,
+    const std::vector<double>& raw_prior, const std::vector<int>& visits,
+    const std::vector<double>& q_values, double root_value,
+    double prior_floor, double advantage_clip, double max_beta,
+    double max_kl) {
+  RegularizedQTargetResult out;
+  auto fail = [&out](const char* name) {
+    out.error = name;
+    return out;
+  };
+  const size_t n = legal_actions.size();
+  if (n == 0) return fail("empty_legal_actions");
+  if (raw_prior.size() != n || visits.size() != n || q_values.size() != n) {
+    return fail("vector_alignment");
+  }
+  if (!(prior_floor > 0.0) || !(advantage_clip >= 0.0) ||
+      !(max_beta >= 0.0) || !(max_kl >= 0.0) ||
+      !std::isfinite(prior_floor) || !std::isfinite(advantage_clip) ||
+      !std::isfinite(max_beta) || !std::isfinite(max_kl)) {
+    return fail("invalid_target_parameters");
+  }
+  if (!std::isfinite(root_value)) return fail("nonfinite_root_value");
+
+  std::vector<double> p_safe(n);
+  std::vector<double> completed_q(n);
+  double prior_sum = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!std::isfinite(raw_prior[i])) return fail("nonfinite_prior");
+    if (raw_prior[i] < 0.0) return fail("negative_prior");
+    if (visits[i] < 0) return fail("negative_visit");
+    if (!std::isfinite(q_values[i])) return fail("nonfinite_q");
+    p_safe[i] = std::max(prior_floor, raw_prior[i]);
+    prior_sum += p_safe[i];
+    completed_q[i] = visits[i] > 0 ? q_values[i] : root_value;
+    if (visits[i] > 0) ++out.direct_visit_count;
+  }
+  if (!(prior_sum > 0.0) || !std::isfinite(prior_sum)) {
+    return fail("invalid_prior_sum");
+  }
+  for (double& p : p_safe) p /= prior_sum;
+
+  double baseline = 0.0;
+  for (size_t i = 0; i < n; ++i) baseline += p_safe[i] * completed_q[i];
+  if (!std::isfinite(baseline)) return fail("nonfinite_baseline");
+  out.prior_expected_q = baseline;
+  const auto mm = std::minmax_element(completed_q.begin(), completed_q.end());
+  out.q_range = *mm.second - *mm.first;
+
+  std::vector<double> advantage(n);
+  for (size_t i = 0; i < n; ++i) {
+    advantage[i] = std::clamp(completed_q[i] - baseline, -advantage_clip,
+                              advantage_clip);
+  }
+
+  auto make_target = [&](double beta, std::vector<double>* target,
+                         double* kl) -> bool {
+    target->resize(n);
+    double max_log_weight = -std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < n; ++i) {
+      const double lw = std::log(p_safe[i]) + beta * advantage[i];
+      (*target)[i] = lw;
+      max_log_weight = std::max(max_log_weight, lw);
+    }
+    double z = 0.0;
+    for (double& lw : *target) {
+      lw = std::exp(lw - max_log_weight);
+      z += lw;
+    }
+    if (!(z > 0.0) || !std::isfinite(z)) return false;
+    *kl = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      (*target)[i] /= z;
+      const double t = (*target)[i];
+      if (!std::isfinite(t) || t < 0.0) return false;
+      if (t > 0.0) *kl += t * std::log(t / p_safe[i]);
+    }
+    return std::isfinite(*kl);
+  };
+
+  std::vector<double> candidate;
+  double candidate_kl = 0.0;
+  if (!make_target(max_beta, &candidate, &candidate_kl)) {
+    return fail("numerical_target_failure");
+  }
+  double beta = max_beta;
+  if (candidate_kl > max_kl) {
+    double low = 0.0;
+    double high = max_beta;
+    for (int iter = 0; iter < 48; ++iter) {
+      const double mid = low + (high - low) * 0.5;
+      std::vector<double> mid_target;
+      double mid_kl = 0.0;
+      if (!make_target(mid, &mid_target, &mid_kl)) {
+        return fail("numerical_bisection_failure");
+      }
+      if (mid_kl <= max_kl) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    beta = low;
+    if (!make_target(beta, &candidate, &candidate_kl)) {
+      return fail("numerical_target_failure");
+    }
+  }
+
+  double target_sum = 0.0;
+  double target_expected_q = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    target_sum += candidate[i];
+    target_expected_q += candidate[i] * completed_q[i];
+  }
+  if (!std::isfinite(target_sum) || std::abs(target_sum - 1.0) > 1e-12) {
+    return fail("target_normalization_postcondition");
+  }
+  if (candidate_kl > max_kl + 1e-12) {
+    return fail("target_kl_postcondition");
+  }
+  if (!std::isfinite(target_expected_q) ||
+      target_expected_q < baseline - 1e-12) {
+    return fail("target_expected_q_postcondition");
+  }
+  out.ok = true;
+  out.error = "none";
+  out.target = std::move(candidate);
+  out.beta = beta;
+  out.kl = candidate_kl;
+  out.target_expected_q = target_expected_q;
+  return out;
+}
+
+ScratchSearchBudgetAssignment AssignScratchSearchBudget(
+    const SearchPiConfig& config, int64_t episode_id, int decision_id,
+    Player acting_player, DuneDecisionRole role) {
+  ScratchSearchBudgetAssignment out;
+  if (!config.scratch_q_v1) return out;
+  SPIEL_CHECK_GE(config.scratch_full_root_probability, 0.0);
+  SPIEL_CHECK_LE(config.scratch_full_root_probability, 1.0);
+  uint64_t draw = DeriveStream(config.seed_domain, episode_id, decision_id,
+                               kStreamPiScratchBudgetClass);
+  draw = Splitmix64(draw ^ static_cast<uint64_t>(acting_player));
+  out.draw = draw;
+  out.full = UnitDouble(draw) < config.scratch_full_root_probability;
+  if (!IsSearchPiSearchRole(role, config.purchase_combat_budget)) return out;
+  const bool primary = role == DuneDecisionRole::kAgentPrimary;
+  if (out.full) {
+    out.simulations = primary ? config.scratch_full_primary_simulations
+                              : config.scratch_full_other_simulations;
+  } else {
+    out.simulations = primary ? config.scratch_cheap_primary_simulations
+                              : config.scratch_cheap_other_simulations;
+  }
+  return out;
+}
+
 void FillSearchPiRowScalars(SearchPiRow* row) {
   SPIEL_CHECK_TRUE(row != nullptr);
   row->raw_policy_entropy_norm = NormalizedEntropy(row->raw_policy);
@@ -676,8 +834,12 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
     : config_(config) {
   SPIEL_CHECK_GT(config_.games_per_generation, 0);
   // Seat balance: the searched seat rotates by episode id, so a generation that
-  // is not a multiple of four searches some seats more than others.
-  SPIEL_CHECK_EQ(config_.games_per_generation % 4, 0);
+  // is not a multiple of four searches some seats more than others. Scratch
+  // concurrent collection enforces this over the COMPLETE generation while
+  // scheduling one game per worker chunk to reach the audited G=128 geometry.
+  if (!config_.scratch_q_v1) {
+    SPIEL_CHECK_EQ(config_.games_per_generation % 4, 0);
+  }
   SPIEL_CHECK_GT(config_.primary_simulations, 0);
   SPIEL_CHECK_GT(config_.continuation_simulations, 0);
   SPIEL_CHECK_GT(config_.seed_domain, 0u);
@@ -703,6 +865,16 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   // Forced playouts without noise would prune organic visits out of the target.
   if (config_.dirichlet_epsilon <= 0.0) {
     SPIEL_CHECK_EQ(config_.forced_playouts_k, 0.0);
+  }
+  if (config_.scratch_q_v1) {
+    SPIEL_CHECK_GE(config_.scratch_full_root_probability, 0.0);
+    SPIEL_CHECK_LE(config_.scratch_full_root_probability, 1.0);
+    SPIEL_CHECK_GT(config_.scratch_full_primary_simulations, 0);
+    SPIEL_CHECK_GT(config_.scratch_full_other_simulations, 0);
+    SPIEL_CHECK_GT(config_.scratch_cheap_primary_simulations, 0);
+    SPIEL_CHECK_GT(config_.scratch_cheap_other_simulations, 0);
+    SPIEL_CHECK_EQ(config_.target_sharpen_exponent, 1.0);
+    SPIEL_CHECK_EQ(config_.behavior_temperature, 1.0);
   }
 }
 
@@ -893,6 +1065,21 @@ void SearchPiGenerator::GenerateGeneration(
       stats->decisions_by_role[role_idx]++;
       outcome.searched_seat_decisions++;
 
+      const bool role_is_search =
+          IsSearchPiSearchRole(role, config_.purchase_combat_budget);
+      ScratchSearchBudgetAssignment scratch_budget;
+      if (config_.scratch_q_v1 && role_is_search) {
+        scratch_budget = AssignScratchSearchBudget(
+            config_, episode_id, static_cast<int>(this_decision), cur, role);
+        const int primary = scratch_budget.full
+                                ? config_.scratch_full_primary_simulations
+                                : config_.scratch_cheap_primary_simulations;
+        const int other = scratch_budget.full
+                              ? config_.scratch_full_other_simulations
+                              : config_.scratch_cheap_other_simulations;
+        session.SetTrainingPolicyIterationBudgets(primary, other, other);
+      }
+
       DuneSearchResult res = session.Search(*state);
       stats->simulations_by_role[role_idx] += res.simulations_completed;
       if (!IsSearchPiSearchRole(role, config_.purchase_combat_budget)) {
@@ -900,8 +1087,7 @@ void SearchPiGenerator::GenerateGeneration(
       }
       stats->inference_calls += res.inference_count;
 
-      const bool is_search_role =
-          IsSearchPiSearchRole(role, config_.purchase_combat_budget);
+      const bool is_search_role = role_is_search;
       // Every searched role now has a real bucket. The three short-window roles
       // resolve to their own stats only when the wide budget is armed; with the
       // narrow default IsSearchPiSearchRole is false for them, is_search_role
@@ -1055,10 +1241,20 @@ void SearchPiGenerator::GenerateGeneration(
 
         std::vector<int> target_visits;
         std::vector<double> target_probs;
+        RegularizedQTargetResult regularized_q;
         if (fallback == SearchPiFallback::kNone &&
             !BuildSearchPiTarget(config_, role, res.diagnostics, &target_visits,
                                  &target_probs)) {
           fallback = SearchPiFallback::kZeroVisits;
+        }
+        if (fallback == SearchPiFallback::kNone && config_.scratch_q_v1) {
+          const std::vector<double>& raw_priors =
+              res.diagnostics.raw_priors.empty() ? res.diagnostics.priors
+                                                 : res.diagnostics.raw_priors;
+          regularized_q = BuildRegularizedQKlTarget(
+              res.diagnostics.actions, raw_priors,
+              res.diagnostics.visit_counts, res.diagnostics.q_values,
+              res.diagnostics.root_value);
         }
 
         if (fallback == SearchPiFallback::kNone) {
@@ -1119,6 +1315,31 @@ void SearchPiGenerator::GenerateGeneration(
           row.search_fallback_reason = res.fallback_reason;
           row.root_value = res.diagnostics.root_value;
           row.q_values = res.diagnostics.q_values;
+
+          if (config_.scratch_q_v1) {
+            row.row_schema_version = 2;
+            row.target_type = "regularized_q_kl";
+            row.search_budget_class = scratch_budget.full ? "full" : "cheap";
+            row.search_budget_draw = scratch_budget.draw;
+            row.regularized_q_valid = regularized_q.ok;
+            row.regularized_q_error = regularized_q.error;
+            row.regularized_q_target = std::move(regularized_q.target);
+            row.regularized_q_beta = regularized_q.beta;
+            row.regularized_q_kl = regularized_q.kl;
+            row.regularized_q_prior_expected_q =
+                regularized_q.prior_expected_q;
+            row.regularized_q_target_expected_q =
+                regularized_q.target_expected_q;
+            row.regularized_q_q_range = regularized_q.q_range;
+            row.regularized_q_direct_visit_count =
+                regularized_q.direct_visit_count;
+            row.regularized_q_entropy_norm =
+                regularized_q.ok
+                    ? NormalizedEntropy(row.regularized_q_target)
+                    : 0.0;
+            row.policy_target_weight =
+                (scratch_budget.full && regularized_q.ok) ? 1.0 : 0.0;
+          }
 
           // Coverage: recorded, never acted on. A search this lane keeps but the
           // PF-C gate would have discarded is counted, because that difference
@@ -1283,6 +1504,7 @@ void SearchPiGenerator::GenerateGeneration(
     SPIEL_CHECK_GE(searched_seat, 0);
     SPIEL_CHECK_LT(searched_seat, static_cast<int>(returns.size()));
     outcome.searched_seat_return = returns[searched_seat];
+    outcome.trajectory_transitions = transition_index;
     outcome.searched_seat_placement =
         SearchPiPlacementFromReturn(outcome.searched_seat_return, 1.0);
     stats->games_played.push_back(std::move(outcome));

@@ -55,6 +55,8 @@ ABSL_FLAG(std::string, opponent_checkpoints, "",
           "Empty or \"random\" for random opponents.");
 ABSL_FLAG(int, num_games, 5000,
           "Total number of evaluation games to play.");
+ABSL_FLAG(int, start_episode_id, 0,
+          "First evaluation episode ID. Default 0 preserves historical runs.");
 ABSL_FLAG(uint64_t, base_seed, 42,
           "Base seed for deterministic evaluation.");
 ABSL_FLAG(std::string, domain, "EVAL_BASELINE",
@@ -532,6 +534,7 @@ void WorkerThread(
     bool provides_info_state_tensor,
     bool provides_observations_tensor,
     std::atomic<int>& next_game_id,
+    int start_episode_id,
     int total_games,
     uint64_t base_seed,
     uint64_t domain,
@@ -551,8 +554,9 @@ void WorkerThread(
   std::vector<float> obs(obs_size, 0.0f);
 
   while (true) {
-    int episode_id = next_game_id++;
-    if (episode_id >= total_games) break;
+    const int result_index = next_game_id++;
+    if (result_index >= total_games) break;
+    const int episode_id = start_episode_id + result_index;
 
     // Log progress every 100 completed games
     int completed = next_game_id.load();
@@ -743,7 +747,7 @@ void WorkerThread(
       placement = 4;
     }
 
-    GameResult& gr = results[episode_id];
+    GameResult& gr = results[result_index];
     gr.episode_id = episode_id;
     gr.seat = model_player;
 
@@ -877,6 +881,7 @@ void RunEvaluation() {
   const std::string model_checkpoint = absl::GetFlag(FLAGS_model_checkpoint);
   const std::string opponent_str = absl::GetFlag(FLAGS_opponent_checkpoints);
   const int total_games = absl::GetFlag(FLAGS_num_games);
+  const int start_episode_id = absl::GetFlag(FLAGS_start_episode_id);
   const uint64_t base_seed = absl::GetFlag(FLAGS_base_seed);
   const std::string domain_str = absl::GetFlag(FLAGS_domain);
   const bool greedy = absl::GetFlag(FLAGS_greedy);
@@ -1116,7 +1121,7 @@ void RunEvaluation() {
         WorkerThread, static_cast<int>(t), game, model_evaluator,
         std::cref(opponent_evaluators), std::cref(opponent_names), obs_size,
         provides_info_state_tensor, provides_observations_tensor,
-        std::ref(next_game_id), total_games,
+        std::ref(next_game_id), start_episode_id, total_games,
         base_seed, domain, greedy, temperature,
         has_opponent_greedy, opponent_greedy,
         has_opponent_temperature, opponent_temperature,
@@ -1321,6 +1326,7 @@ void RunEvaluation() {
               << "  \"domain\": \"" << domain_str << "\",\n"
               << "  \"base_seed\": " << base_seed << ",\n"
               << "  \"num_games\": " << total_games << ",\n"
+              << "  \"start_episode_id\": " << start_episode_id << ",\n"
               << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n"
               << "  \"opponent_greedy\": "
               << (has_opponent_greedy ? (opponent_greedy ? "true" : "false")

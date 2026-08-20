@@ -121,7 +121,11 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   SPIEL_CHECK_GT(config.collection_games, 0);
   SPIEL_CHECK_EQ(config.collection_games % 4, 0);
   SPIEL_CHECK_GT(config.chunk_games, 0);
-  SPIEL_CHECK_EQ(config.chunk_games % 4, 0);
+  if (config.search.scratch_q_v1) {
+    SPIEL_CHECK_EQ(config.chunk_games, 1);
+  } else {
+    SPIEL_CHECK_EQ(config.chunk_games % 4, 0);
+  }
   SPIEL_CHECK_EQ(config.collection_games % config.chunk_games, 0);
   SPIEL_CHECK_GT(config.requested_workers, 0);
   const int num_chunks = config.collection_games / config.chunk_games;

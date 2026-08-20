@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -57,6 +58,7 @@ static_assert(sizeof(Player) == 4, "shard format writes 4-byte Player");
 // sharing a stream between two samplers drawing different populations is
 // forbidden. This sampler draws yet a third population (rows across cohorts).
 constexpr uint64_t kStreamPiReplaySample = 0x5006;
+constexpr uint64_t kStreamPiScratchReplaySample = 0x5008;
 
 // --- Row size floor ---------------------------------------------------------
 //
@@ -233,6 +235,25 @@ void SerializeRow(ShardWriter* w, const SearchPiRow& row) {
   w->PutI32(row.num_covered_actions);
   w->PutF64(row.covered_prior_mass);
   w->PutBool(row.would_pass_legacy_coverage_gate);
+}
+
+void SerializeScratchRowV2(ShardWriter* w, const SearchPiRow& row) {
+  SerializeRow(w, row);
+  w->PutI32(row.row_schema_version);
+  w->PutString(row.target_type);
+  w->PutString(row.search_budget_class);
+  w->PutU64(row.search_budget_draw);
+  w->PutF64(row.policy_target_weight);
+  w->PutBool(row.regularized_q_valid);
+  w->PutString(row.regularized_q_error);
+  w->PutPodVector(row.regularized_q_target);
+  w->PutF64(row.regularized_q_beta);
+  w->PutF64(row.regularized_q_kl);
+  w->PutF64(row.regularized_q_prior_expected_q);
+  w->PutF64(row.regularized_q_target_expected_q);
+  w->PutF64(row.regularized_q_q_range);
+  w->PutI32(row.regularized_q_direct_visit_count);
+  w->PutF64(row.regularized_q_entropy_norm);
 }
 
 // ===========================================================================
@@ -424,6 +445,122 @@ bool DeserializeRow(ShardReader* r, SearchPiRow* row) {
   if (!r->Bool(&row->would_pass_legacy_coverage_gate,
                "would_pass_legacy_coverage_gate")) {
     return false;
+  }
+  return true;
+}
+
+bool DeserializeScratchRowV2(ShardReader* r, SearchPiRow* row) {
+  if (!DeserializeRow(r, row)) return false;
+  if (!r->I32(&row->row_schema_version, "row_schema_version")) return false;
+  if (!r->Str(&row->target_type, "target_type")) return false;
+  if (!r->Str(&row->search_budget_class, "search_budget_class")) return false;
+  if (!r->U64(&row->search_budget_draw, "search_budget_draw")) return false;
+  if (!r->F64(&row->policy_target_weight, "policy_target_weight")) {
+    return false;
+  }
+  if (!r->Bool(&row->regularized_q_valid, "regularized_q_valid")) {
+    return false;
+  }
+  if (!r->Str(&row->regularized_q_error, "regularized_q_error")) return false;
+  if (!r->PodVector(&row->regularized_q_target,
+                    "regularized_q_target")) {
+    return false;
+  }
+  if (!r->F64(&row->regularized_q_beta, "regularized_q_beta")) return false;
+  if (!r->F64(&row->regularized_q_kl, "regularized_q_kl")) return false;
+  if (!r->F64(&row->regularized_q_prior_expected_q,
+              "regularized_q_prior_expected_q")) {
+    return false;
+  }
+  if (!r->F64(&row->regularized_q_target_expected_q,
+              "regularized_q_target_expected_q")) {
+    return false;
+  }
+  if (!r->F64(&row->regularized_q_q_range,
+              "regularized_q_q_range")) {
+    return false;
+  }
+  if (!r->I32(&row->regularized_q_direct_visit_count,
+              "regularized_q_direct_visit_count")) {
+    return false;
+  }
+  return r->F64(&row->regularized_q_entropy_norm,
+                "regularized_q_entropy_norm");
+}
+
+bool AllFinite(const std::vector<double>& values) {
+  return std::all_of(values.begin(), values.end(),
+                     [](double value) { return std::isfinite(value); });
+}
+
+bool AllFinite(const std::vector<float>& values) {
+  return std::all_of(values.begin(), values.end(),
+                     [](float value) { return std::isfinite(value); });
+}
+
+bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
+  auto fail = [error](const std::string& message) {
+    SetError(error, message);
+    return false;
+  };
+  const size_t n = row.legal_actions.size();
+  if (row.row_schema_version != 2) return fail("scratch row schema is not 2.");
+  if (row.target_type != "regularized_q_kl") {
+    return fail("scratch row target_type is not regularized_q_kl.");
+  }
+  if (row.search_budget_class != "full" &&
+      row.search_budget_class != "cheap") {
+    return fail("scratch row budget class is neither full nor cheap.");
+  }
+  if (n == 0 || row.raw_policy.size() != n || row.raw_visits.size() != n ||
+      row.target_visits.size() != n || row.target_probs.size() != n ||
+      row.q_values.size() != n) {
+    return fail("scratch row legacy vectors are not aligned.");
+  }
+  if (!AllFinite(row.observation) || !AllFinite(row.raw_policy) ||
+      !AllFinite(row.target_probs) || !AllFinite(row.q_values) ||
+      !std::isfinite(row.root_value) || !std::isfinite(row.value_target) ||
+      !std::isfinite(row.policy_target_weight) ||
+      !std::isfinite(row.regularized_q_beta) ||
+      !std::isfinite(row.regularized_q_kl) ||
+      !std::isfinite(row.regularized_q_prior_expected_q) ||
+      !std::isfinite(row.regularized_q_target_expected_q) ||
+      !std::isfinite(row.regularized_q_q_range) ||
+      !std::isfinite(row.regularized_q_entropy_norm)) {
+    return fail("scratch row contains a non-finite numeric field.");
+  }
+  if (!row.value_target_attached) {
+    return fail("scratch row lacks its terminal value target.");
+  }
+  if (row.simulations_requested < 0 || row.simulations_completed < 0 ||
+      row.simulations_completed > row.simulations_requested) {
+    return fail("scratch row simulation accounting is invalid.");
+  }
+  if (row.policy_target_weight != 0.0 && row.policy_target_weight != 1.0) {
+    return fail("scratch row policy weight is not 0 or 1.");
+  }
+  if (row.regularized_q_valid) {
+    if (row.regularized_q_error != "none" ||
+        row.regularized_q_target.size() != n ||
+        !AllFinite(row.regularized_q_target)) {
+      return fail("valid scratch target is malformed.");
+    }
+    double sum = std::accumulate(row.regularized_q_target.begin(),
+                                 row.regularized_q_target.end(), 0.0);
+    if (std::abs(sum - 1.0) > 1e-12 || row.regularized_q_kl > 0.10 + 1e-12) {
+      return fail("valid scratch target violates normalization or KL cap.");
+    }
+  } else if (!row.regularized_q_target.empty() ||
+             row.regularized_q_error.empty() ||
+             row.policy_target_weight != 0.0) {
+    return fail("invalid scratch target is not a named zero-weight row.");
+  }
+  if (row.search_budget_class == "cheap" && row.policy_target_weight != 0.0) {
+    return fail("cheap scratch row has nonzero policy weight.");
+  }
+  if (row.search_budget_class == "full" && row.regularized_q_valid &&
+      row.policy_target_weight != 1.0) {
+    return fail("valid full scratch row lacks unit policy weight.");
   }
   return true;
 }
@@ -650,6 +787,161 @@ bool ReadSearchPiRowShard(const std::string& path,
   return true;
 }
 
+bool WriteScratchSearchPiRowShardV2(const std::string& path,
+                                    const std::vector<SearchPiRow>& rows,
+                                    std::string* error) {
+  namespace fs = std::filesystem;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    std::string why;
+    if (!ValidateScratchRowV2(rows[i], &why)) {
+      SetError(error, absl::StrCat("scratch shard row ", i,
+                                   " is invalid: ", why));
+      return false;
+    }
+  }
+
+  const fs::path target(path);
+  fs::path dir = target.parent_path();
+  if (dir.empty()) dir = fs::path(".");
+  const std::string tmp_path =
+      (dir / absl::StrCat(target.filename().string(), ".tmp.",
+                          static_cast<long long>(::getpid())))
+          .string();
+  const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    SetError(error, ErrnoText("opening scratch shard temp file", tmp_path));
+    return false;
+  }
+  auto abort_write = [&](std::string message) {
+    ::close(fd);
+    std::error_code ec;
+    fs::remove(tmp_path, ec);
+    SetError(error, std::move(message));
+    return false;
+  };
+
+  ShardWriter w(fd, tmp_path);
+  w.PutU32(kSearchPiShardMagic);
+  w.PutU32(kScratchSearchPiShardVersion);
+  w.PutU64(static_cast<uint64_t>(rows.size()));
+  for (const SearchPiRow& row : rows) SerializeScratchRowV2(&w, row);
+  w.PutU32(kSearchPiShardTrailerMagic);
+  w.PutU64(static_cast<uint64_t>(rows.size()));
+  if (!w.Flush()) return abort_write(w.error());
+  while (::fsync(fd) != 0) {
+    if (errno == EINTR) continue;
+    return abort_write(ErrnoText("fsync of scratch shard temp file", tmp_path));
+  }
+  if (::close(fd) != 0) {
+    std::error_code ec;
+    fs::remove(tmp_path, ec);
+    SetError(error, ErrnoText("closing scratch shard temp file", tmp_path));
+    return false;
+  }
+  std::error_code ec;
+  fs::rename(tmp_path, path, ec);
+  if (ec) {
+    const std::string why = ec.message();
+    std::error_code cleanup_ec;
+    fs::remove(tmp_path, cleanup_ec);
+    SetError(error, absl::StrCat("renaming '", tmp_path, "' to '", path,
+                                 "' failed: ", why, "."));
+    return false;
+  }
+  const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dir_fd >= 0) {
+    while (::fsync(dir_fd) != 0 && errno == EINTR) {
+    }
+    ::close(dir_fd);
+  }
+  return true;
+}
+
+bool ReadScratchSearchPiRowShardV2(const std::string& path,
+                                   std::vector<SearchPiRow>* rows,
+                                   std::string* error) {
+  SPIEL_CHECK_TRUE(rows != nullptr);
+  rows->clear();
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) {
+    SetError(error, absl::StrCat("cannot open scratch shard '", path,
+                                 "' for reading; it is missing or unreadable."));
+    return false;
+  }
+  const std::streamoff end = in.tellg();
+  if (end < 0) {
+    SetError(error, absl::StrCat("cannot determine the size of scratch shard '",
+                                 path, "'."));
+    return false;
+  }
+  const uint64_t size = static_cast<uint64_t>(end);
+  in.seekg(0, std::ios::beg);
+  if (!in.good()) {
+    SetError(error, absl::StrCat("cannot rewind scratch shard '", path, "'."));
+    return false;
+  }
+
+  ShardReader r(&in, size, path);
+  uint32_t magic = 0;
+  uint32_t version = 0;
+  uint64_t row_count = 0;
+  if (!r.U32(&magic, "magic") || !r.U32(&version, "version") ||
+      !r.U64(&row_count, "row_count")) {
+    SetError(error, r.error());
+    return false;
+  }
+  if (magic != kSearchPiShardMagic) {
+    r.Fail(absl::StrCat("magic is 0x", absl::Hex(magic), ", expected 0x",
+                        absl::Hex(kSearchPiShardMagic), "."));
+  } else if (version != kScratchSearchPiShardVersion) {
+    r.Fail(absl::StrCat("version is ", version,
+                        ", but scratch_q_v1 reads only version ",
+                        kScratchSearchPiShardVersion, "."));
+  } else if (row_count > r.remaining() / kMinSerializedRowBytes) {
+    r.Fail(absl::StrCat("header declares ", row_count,
+                        " rows, which cannot fit in the remaining bytes."));
+  }
+  if (r.failed()) {
+    SetError(error, r.error());
+    return false;
+  }
+
+  std::vector<SearchPiRow> parsed(static_cast<size_t>(row_count));
+  for (uint64_t i = 0; i < row_count; ++i) {
+    if (!DeserializeScratchRowV2(&r, &parsed[static_cast<size_t>(i)])) {
+      SetError(error, absl::StrCat(r.error(), " (at row index ", i, ")."));
+      return false;
+    }
+    std::string why;
+    if (!ValidateScratchRowV2(parsed[static_cast<size_t>(i)], &why)) {
+      SetError(error, absl::StrCat("scratch shard row ", i,
+                                   " failed validation: ", why));
+      return false;
+    }
+  }
+  uint32_t trailer = 0;
+  uint64_t trailer_count = 0;
+  if (!r.U32(&trailer, "trailer_magic") ||
+      !r.U64(&trailer_count, "trailer_row_count")) {
+    SetError(error, r.error());
+    return false;
+  }
+  if (trailer != kSearchPiShardTrailerMagic) {
+    r.Fail("scratch shard trailer magic is invalid or truncated.");
+  } else if (trailer_count != row_count) {
+    r.Fail("scratch shard trailer row count disagrees with its header.");
+  } else if (r.remaining() != 0) {
+    r.Fail(absl::StrCat(r.remaining(),
+                        " unexpected bytes follow the scratch trailer."));
+  }
+  if (r.failed()) {
+    SetError(error, r.error());
+    return false;
+  }
+  *rows = std::move(parsed);
+  return true;
+}
+
 // ===========================================================================
 // Public: uniform replay-window sampler
 // ===========================================================================
@@ -708,6 +1000,65 @@ std::vector<SearchPiRow> SampleUniformReplayWindow(
   return out;
 }
 
+std::vector<SearchPiRow> SampleScratchSearchPiReplayWindow(
+    const std::vector<std::vector<SearchPiRow>>& window,
+    int current_generation, size_t max_rows, uint64_t seed,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  std::vector<const SearchPiRow*> flat;
+  for (const auto& cohort : window) {
+    for (const SearchPiRow& row : cohort) {
+      if (row.row_schema_version != 2) {
+        SetError(error, "scratch replay window contains a non-v2 row.");
+        return {};
+      }
+      flat.push_back(&row);
+    }
+  }
+  const size_t target_count = std::min(max_rows, flat.size());
+  std::vector<bool> selected(flat.size(), false);
+  size_t required = 0;
+  for (size_t i = 0; i < flat.size(); ++i) {
+    const SearchPiRow& row = *flat[i];
+    if (row.generation == current_generation &&
+        row.search_budget_class == "full" &&
+        row.policy_target_weight > 0.0) {
+      selected[i] = true;
+      ++required;
+    }
+  }
+  if (required > target_count) {
+    SetError(error, absl::StrCat(
+                        "current full rows (", required,
+                        ") exceed the scratch replay cap (", target_count,
+                        ")."));
+    return {};
+  }
+
+  std::vector<size_t> remaining;
+  remaining.reserve(flat.size() - required);
+  for (size_t i = 0; i < flat.size(); ++i) {
+    if (!selected[i]) remaining.push_back(i);
+  }
+  const size_t need = target_count - required;
+  std::mt19937_64 rng = dune_seed::MakeRng64(
+      dune_seed::DeriveSeed(seed, kStreamPiScratchReplaySample,
+                            current_generation));
+  for (size_t i = 0; i < need; ++i) {
+    const size_t j = i + static_cast<size_t>(
+                             BoundedUniform(&rng, remaining.size() - i));
+    std::swap(remaining[i], remaining[j]);
+    selected[remaining[i]] = true;
+  }
+
+  std::vector<SearchPiRow> out;
+  out.reserve(target_count);
+  for (size_t i = 0; i < flat.size(); ++i) {
+    if (selected[i]) out.push_back(*flat[i]);
+  }
+  return out;
+}
+
 // ===========================================================================
 // Public: retention
 // ===========================================================================
@@ -716,6 +1067,13 @@ std::string SearchPiShardPathForGeneration(const std::string& dir,
                                            int generation) {
   return (std::filesystem::path(dir) /
           absl::StrFormat("%s%06d%s", kShardPrefix, generation, kShardSuffix))
+      .string();
+}
+
+std::string ScratchSearchPiShardPathForGeneration(const std::string& dir,
+                                                  int generation) {
+  return (std::filesystem::path(dir) /
+          absl::StrFormat("scratch_q_v1_%06d.bin", generation))
       .string();
 }
 
