@@ -29,6 +29,7 @@ inline constexpr double kOfflineChangedStateGradientClip = 0.5;
 inline constexpr double kOfflineChangedStateLogitCap = 10.0;
 inline constexpr double kOfflineChangedStateWeightDecay = 0.0;
 inline constexpr double kOfflineChangedStatePolicyWeightDecay = 0.0;
+inline constexpr double kOfflineChangedStateModerationLambda = 0.25;
 
 struct OfflineRoleSpec {
   DuneDecisionRole role;
@@ -46,6 +47,8 @@ struct OfflineRoleWeightSummary {
   int64_t parsed_total = 0;
   int64_t parsed_changed = 0;
   int64_t parsed_preserved = 0;
+  double balanced_changed_weight = 0.0;
+  double balanced_preserved_weight = 0.0;
   double changed_weight = 0.0;
   double preserved_weight = 0.0;
   double changed_loss_mass = 0.0;
@@ -54,6 +57,7 @@ struct OfflineRoleWeightSummary {
 };
 
 struct OfflineWeightPlan {
+  double treatment_lambda = 1.0;
   std::vector<double> control;
   std::vector<double> treatment;
   std::vector<OfflineRoleWeightSummary> roles;
@@ -65,7 +69,8 @@ struct OfflineWeightPlan {
 
 bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
                             const std::vector<OfflineRoleSpec>& specs,
-                            OfflineWeightPlan* out, std::string* error);
+                            OfflineWeightPlan* out, std::string* error,
+                            double treatment_lambda = 1.0);
 
 struct OfflineBatchBoundary {
   int64_t start = 0;

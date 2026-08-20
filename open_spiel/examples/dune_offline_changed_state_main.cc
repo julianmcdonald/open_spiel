@@ -54,6 +54,8 @@ ABSL_FLAG(std::string, optimizer_checkpoint, "",
 ABSL_FLAG(std::string, device, "auto", "auto, cuda, or cpu");
 ABSL_FLAG(std::string, output, "", "Preflight/result JSON path");
 ABSL_FLAG(std::string, output_dir, "", "Runtime model output directory");
+ABSL_FLAG(double, treatment_lambda, 1.0,
+          "Interpolation from uniform (0) to within-role balance (1)");
 
 // Link-only definitions required by dune_ppo_training_utils.cc.  The offline
 // lane calls only CenterAndCapLogitsTensor; none of these flags is read.
@@ -326,7 +328,10 @@ std::string PreflightJson(
   std::ostringstream out;
   out << std::setprecision(17)
       << "{\"schema_version\":1,\"mode\":" << JsonString(mode)
-      << ",\"analysis_kind\":\"FROZEN_OFFLINE_CHANGED_STATE_WEIGHTING\""
+      << ",\"analysis_kind\":"
+      << JsonString(weights.treatment_lambda == 1.0
+                        ? "FROZEN_OFFLINE_CHANGED_STATE_WEIGHTING"
+                        : "FROZEN_OFFLINE_MODERATED_CHANGED_STATE_WEIGHTING")
       << ",\"confirmatory\":false,\"termination_label\":"
       << JsonString(kTerminationLabel)
       << ",\"binary\":{\"path\":" << JsonString(binary_path)
@@ -351,6 +356,8 @@ std::string PreflightJson(
   out << "],\"corpus\":{\"rows\":" << rows
       << ",\"target_hash\":" << JsonString(target_hash)
       << ",\"extended_hash\":" << JsonString(extended_hash)
+      << ",\"treatment_lambda\":" << weights.treatment_lambda
+      << ",\"treatment_formula\":\"1 + lambda * (balanced_weight - 1)\""
       << ",\"order\":\"cohort generation ascending, then stored row "
          "order\",\"roles\":[";
   for (size_t i = 0; i < weights.roles.size(); ++i) {
@@ -360,6 +367,10 @@ std::string PreflightJson(
         << ",\"total\":" << role.parsed_total
         << ",\"changed\":" << role.parsed_changed
         << ",\"preserved\":" << role.parsed_preserved
+        << ",\"balanced_changed_weight\":"
+        << role.balanced_changed_weight
+        << ",\"balanced_preserved_weight\":"
+        << role.balanced_preserved_weight
         << ",\"changed_weight\":" << role.changed_weight
         << ",\"preserved_weight\":" << role.preserved_weight
         << ",\"changed_loss_mass\":" << role.changed_loss_mass
@@ -573,7 +584,8 @@ int main(int argc, char** argv) {
   OfflineWeightPlan weights;
   std::string weight_error;
   if (!BuildOfflineWeightPlan(rows, registered_specs, &weights,
-                              &weight_error)) {
+                              &weight_error,
+                              absl::GetFlag(FLAGS_treatment_lambda))) {
     SpielFatalError("offline weight-plan validation failed: " + weight_error);
   }
   const std::vector<OfflineBatchBoundary> boundaries =
@@ -722,7 +734,10 @@ int main(int argc, char** argv) {
   std::ostringstream result;
   result << std::setprecision(17)
          << "{\"schema_version\":1,\"analysis_kind\":"
-            "\"FROZEN_OFFLINE_CHANGED_STATE_WEIGHTING_RESULT\""
+         << JsonString(weights.treatment_lambda == 1.0
+                           ? "FROZEN_OFFLINE_CHANGED_STATE_WEIGHTING_RESULT"
+                           : "FROZEN_OFFLINE_MODERATED_CHANGED_STATE_"
+                             "WEIGHTING_RESULT")
          << ",\"confirmatory\":false,\"termination_label\":"
          << JsonString(kTerminationLabel) << ",\"preflight\":"
          << preflight_json

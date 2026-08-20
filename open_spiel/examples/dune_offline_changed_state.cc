@@ -224,7 +224,8 @@ const char* OfflineRoleName(DuneDecisionRole role) {
 
 bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
                             const std::vector<OfflineRoleSpec>& specs,
-                            OfflineWeightPlan* out, std::string* error) {
+                            OfflineWeightPlan* out, std::string* error,
+                            double treatment_lambda) {
   if (out == nullptr) {
     SetError(error, "weight plan output is null");
     return false;
@@ -234,6 +235,12 @@ bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
     SetError(error, "role specifications are empty");
     return false;
   }
+  if (!std::isfinite(treatment_lambda) || treatment_lambda < 0.0 ||
+      treatment_lambda > 1.0) {
+    SetError(error, "treatment lambda must be finite and in [0, 1]");
+    return false;
+  }
+  out->treatment_lambda = treatment_lambda;
   std::set<int> roles;
   int64_t expected_rows = 0;
   out->roles.reserve(specs.size());
@@ -251,10 +258,14 @@ bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
     expected_rows += spec.total;
     OfflineRoleWeightSummary summary;
     summary.spec = spec;
-    summary.changed_weight =
+    summary.balanced_changed_weight =
         static_cast<double>(spec.total) / (2.0 * spec.changed);
-    summary.preserved_weight =
+    summary.balanced_preserved_weight =
         static_cast<double>(spec.total) / (2.0 * spec.preserved);
+    summary.changed_weight =
+        1.0 + treatment_lambda * (summary.balanced_changed_weight - 1.0);
+    summary.preserved_weight =
+        1.0 + treatment_lambda * (summary.balanced_preserved_weight - 1.0);
     out->roles.push_back(summary);
   }
   if (expected_rows != static_cast<int64_t>(rows.size())) {
@@ -304,9 +315,14 @@ bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
         summary.preserved_weight * summary.parsed_preserved;
     summary.total_loss_mass =
         summary.changed_loss_mass + summary.preserved_loss_mass;
-    if (std::abs(summary.changed_loss_mass - summary.spec.total / 2.0) >
-            1e-8 ||
-        std::abs(summary.preserved_loss_mass - summary.spec.total / 2.0) >
+    const double expected_changed_mass =
+        (1.0 - treatment_lambda) * summary.spec.changed +
+        treatment_lambda * summary.spec.total / 2.0;
+    const double expected_preserved_mass =
+        (1.0 - treatment_lambda) * summary.spec.preserved +
+        treatment_lambda * summary.spec.total / 2.0;
+    if (std::abs(summary.changed_loss_mass - expected_changed_mass) > 1e-8 ||
+        std::abs(summary.preserved_loss_mass - expected_preserved_mass) >
             1e-8 ||
         std::abs(summary.total_loss_mass - summary.spec.total) > 1e-8) {
       SetError(error, std::string("loss-mass mismatch for ") +

@@ -103,6 +103,71 @@ void TestRegisteredCountsAndWeights() {
   SPIEL_CHECK_FALSE(BuildOfflineWeightPlan(rows, small, &plan, &error));
 }
 
+void TestModeratedFormulaAndExactMasses() {
+  const auto& registered = RegisteredOfflineRoleSpecs();
+  std::vector<SearchPiRow> rows;
+  rows.reserve(kOfflineChangedStateRows);
+  for (const OfflineRoleSpec& spec : registered) {
+    for (int64_t i = 0; i < spec.changed; ++i) {
+      SearchPiRow row;
+      row.role = spec.role;
+      row.target_argmax_differs_from_raw = true;
+      rows.push_back(std::move(row));
+    }
+    for (int64_t i = 0; i < spec.preserved; ++i) {
+      SearchPiRow row;
+      row.role = spec.role;
+      row.target_argmax_differs_from_raw = false;
+      rows.push_back(std::move(row));
+    }
+  }
+  const std::vector<OfflineRoleSpec> specs(registered.begin(),
+                                           registered.end());
+  OfflineWeightPlan plan;
+  std::string error;
+  SPIEL_CHECK_TRUE(BuildOfflineWeightPlan(
+      rows, specs, &plan, &error, kOfflineChangedStateModerationLambda));
+  SPIEL_CHECK_FLOAT_EQ(plan.treatment_lambda, 0.25);
+  SPIEL_CHECK_EQ(plan.control.size(), rows.size());
+  SPIEL_CHECK_EQ(plan.treatment.size(), rows.size());
+  SPIEL_CHECK_LT(std::abs(plan.control_mass - 92379.0), 1e-10);
+  SPIEL_CHECK_LT(std::abs(plan.treatment_mass - 92379.0), 1e-10);
+  SPIEL_CHECK_LT(
+      std::abs(plan.extended_precision_sequential_treatment_mass - 92379.0),
+      1e-10);
+
+  double corpus_changed_mass = 0.0;
+  double corpus_preserved_mass = 0.0;
+  for (const OfflineRoleWeightSummary& role : plan.roles) {
+    const double expected_changed_weight =
+        1.0 + 0.25 * (role.balanced_changed_weight - 1.0);
+    const double expected_preserved_weight =
+        1.0 + 0.25 * (role.balanced_preserved_weight - 1.0);
+    const double expected_changed_mass =
+        0.75 * role.spec.changed + 0.125 * role.spec.total;
+    const double expected_preserved_mass =
+        0.75 * role.spec.preserved + 0.125 * role.spec.total;
+    SPIEL_CHECK_LT(
+        std::abs(role.changed_weight - expected_changed_weight), 1e-12);
+    SPIEL_CHECK_LT(
+        std::abs(role.preserved_weight - expected_preserved_weight), 1e-12);
+    SPIEL_CHECK_LT(
+        std::abs(role.changed_loss_mass - expected_changed_mass), 1e-8);
+    SPIEL_CHECK_LT(
+        std::abs(role.preserved_loss_mass - expected_preserved_mass), 1e-8);
+    SPIEL_CHECK_LT(std::abs(role.total_loss_mass - role.spec.total), 1e-8);
+    corpus_changed_mass += role.changed_loss_mass;
+    corpus_preserved_mass += role.preserved_loss_mass;
+  }
+  SPIEL_CHECK_LT(std::abs(corpus_changed_mass - 18837.375), 1e-8);
+  SPIEL_CHECK_LT(std::abs(corpus_preserved_mass - 73541.625), 1e-8);
+  SPIEL_CHECK_LT(
+      std::abs(corpus_changed_mass + corpus_preserved_mass - 92379.0), 1e-8);
+
+  SPIEL_CHECK_FALSE(BuildOfflineWeightPlan(rows, specs, &plan, &error, -0.01));
+  SPIEL_CHECK_FALSE(BuildOfflineWeightPlan(rows, specs, &plan, &error, 1.01));
+}
+
 void TestOrderHashesAndLastMinibatch() {
   std::vector<SearchPiRow> rows = {
       MakeRow(8, 10, DuneDecisionRole::kAgentPrimary, true),
@@ -226,6 +291,7 @@ void TestOfflineGate() {
 
 int main() {
   open_spiel::TestRegisteredCountsAndWeights();
+  open_spiel::TestModeratedFormulaAndExactMasses();
   open_spiel::TestOrderHashesAndLastMinibatch();
   open_spiel::TestFreshOptimizerBoundaryAndTraining();
   open_spiel::TestOfflineGate();
