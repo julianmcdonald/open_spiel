@@ -239,6 +239,7 @@ void SerializeRow(ShardWriter* w, const SearchPiRow& row) {
 
 void SerializeScratchRowV2(ShardWriter* w, const SearchPiRow& row) {
   SerializeRow(w, row);
+  w->PutF64(row.local_shaping_reward);
   w->PutI32(row.row_schema_version);
   w->PutString(row.target_type);
   w->PutString(row.search_budget_class);
@@ -451,6 +452,9 @@ bool DeserializeRow(ShardReader* r, SearchPiRow* row) {
 
 bool DeserializeScratchRowV2(ShardReader* r, SearchPiRow* row) {
   if (!DeserializeRow(r, row)) return false;
+  if (!r->F64(&row->local_shaping_reward, "local_shaping_reward")) {
+    return false;
+  }
   if (!r->I32(&row->row_schema_version, "row_schema_version")) return false;
   if (!r->Str(&row->target_type, "target_type")) return false;
   if (!r->Str(&row->search_budget_class, "search_budget_class")) return false;
@@ -530,6 +534,9 @@ bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
       !std::isfinite(row.regularized_q_q_range) ||
       !std::isfinite(row.regularized_q_entropy_norm)) {
     return fail("scratch row contains a non-finite numeric field.");
+  }
+  if (!std::isfinite(row.local_shaping_reward)) {
+    return fail("scratch row contains a non-finite local shaping reward.");
   }
   if (!row.value_target_attached) {
     return fail("scratch row lacks its terminal value target.");

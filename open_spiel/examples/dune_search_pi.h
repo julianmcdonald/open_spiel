@@ -380,6 +380,11 @@ struct SearchPiRow {
   // state->Returns()[player] / utility_divisor and nothing else.
   double value_target = 0.0;
   bool value_target_attached = false;
+  // Training-only local breadcrumb reward assigned at this decision. The
+  // value target is a return-to-go that includes this reward and later rewards;
+  // retaining the local term makes the shaping contract auditable after the
+  // in-memory collector exits.
+  double local_shaping_reward = 0.0;
 
   // --- Identity ---
   int generation = -1;

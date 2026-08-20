@@ -370,12 +370,15 @@ void TestV2AndReplay() {
   const std::string path =
       ScratchSearchPiShardPathForGeneration(directory.string(), 2);
   std::vector<SearchPiRow> rows = {Row(true, 1, 1), Row(false, 2, 2)};
+  rows[0].local_shaping_reward = -0.0175;
   std::string error;
   SPIEL_CHECK_TRUE(WriteScratchSearchPiRowShardV2(path, rows, &error));
   std::vector<SearchPiRow> back;
   SPIEL_CHECK_TRUE(ReadScratchSearchPiRowShardV2(path, &back, &error));
   SPIEL_CHECK_EQ(back.size(), rows.size());
   SPIEL_CHECK_EQ(back[0].regularized_q_target, rows[0].regularized_q_target);
+  SPIEL_CHECK_FLOAT_EQ(back[0].local_shaping_reward,
+                       rows[0].local_shaping_reward);
   std::vector<SearchPiRow> legacy;
   SPIEL_CHECK_FALSE(ReadSearchPiRowShard(path, &legacy, &error));
 

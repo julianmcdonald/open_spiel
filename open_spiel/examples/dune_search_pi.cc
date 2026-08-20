@@ -1562,6 +1562,7 @@ void SearchPiGenerator::GenerateGeneration(
       SPIEL_CHECK_LT(row.player, static_cast<int>(returns.size()));
       shaping_return_to_go_by_player[row.player] +=
           shaping_reward_by_row[idx - row_base];
+      row.local_shaping_reward = shaping_reward_by_row[idx - row_base];
       row.value_target = returns[row.player] / config_.utility_divisor +
                          shaping_return_to_go_by_player[row.player] /
                              config_.utility_divisor;
@@ -2604,6 +2605,7 @@ std::string ChainSearchPiExtendedRowHash(const std::string& prev,
   // --- Value target ---
   put_i64(row.value_target_attached ? 1 : 0);
   put_f64(row.value_target);
+  put_f64(row.local_shaping_reward);
 
   // --- Search provenance: how this row was produced, not just what it says.
   // A row reached by a different budget or a re-root miss is a different row
