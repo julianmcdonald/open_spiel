@@ -89,6 +89,16 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_search_pi_replay_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_replay_test COMMAND dune_search_pi_replay_test)
 
+  # Post-termination descriptive forensic for Rung-4N. This is a separate
+  # read-only instrument: it reconstructs and hashes the exact rows presented
+  # to a completed F/W update, then brackets that update with its archived
+  # parent and child checkpoints. It is never linked into the frozen trainer.
+  add_executable(dune_target_fit_forensic
+    dune_target_fit_forensic.cc dune_search_pi_replay.cc
+    dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_target_fit_forensic dune_search ${TORCH_LIBRARIES})
+
   # The rung-3 teacher audit. Same source set as the test target above, for the
   # same reason: it CALLS SearchPiGenerator::GenerateGeneration rather than
   # re-implementing the controller, which is what makes the controller-parity
