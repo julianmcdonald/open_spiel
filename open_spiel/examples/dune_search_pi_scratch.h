@@ -14,6 +14,7 @@
 namespace open_spiel {
 
 inline constexpr char kScratchSearchPiProfile[] = "scratch_q_v1";
+inline constexpr char kScratchVisitSearchPiProfile[] = "scratch_visit_v1";
 inline constexpr char kWarmSearchPiProfile[] = "ppo_warm_q_v1";
 inline constexpr char kWarmNormalizedCmpoProfile[] = "ppo_warm_cmpo_norm_v1";
 
@@ -43,6 +44,21 @@ bool ApplyNormalizedCmpoTargets(
     std::vector<SearchPiRow>* rows, NormalizedCmpoGenerationStats* stats,
     std::string* error);
 
+struct ScratchVisitGenerationStats {
+  int64_t full_rows = 0;
+  int64_t cheap_rows = 0;
+  double target_entropy_mean = 0.0;
+  double target_kl_mean = 0.0;
+  double prior_expected_q_mean = 0.0;
+  double target_expected_q_mean = 0.0;
+  double q_range_mean = 0.0;
+  double direct_visit_count_mean = 0.0;
+};
+
+bool ApplyScratchVisitTargets(
+    std::vector<SearchPiRow>* rows, ScratchVisitGenerationStats* stats,
+    std::string* error);
+
 std::vector<std::vector<SearchPiRow>> FilterNormalizedCmpoReplayWindow(
     const std::vector<std::vector<SearchPiRow>>& replay_window);
 
@@ -69,6 +85,11 @@ struct ScratchSearchPiLearnerStats {
   double critic_pred_sd_post = 0.0;
   double critic_saturation_pre = 0.0;
   double critic_saturation_post = 0.0;
+  double learner_precap_max_legal_logit = 0.0;
+  double learner_postcap_max_legal_logit = 0.0;
+  int64_t learner_logit_cap_decisions = 0;
+  int64_t learner_logit_cap_legal_logits = 0;
+  int64_t learner_logit_cap_saturated = 0;
 };
 
 ScratchSearchPiLearnerStats RunScratchSearchPiLearner(

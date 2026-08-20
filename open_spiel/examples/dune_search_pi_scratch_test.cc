@@ -15,6 +15,7 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "dune_search_pi_concurrent.h"
 #include "dune_search_pi_replay.h"
+#include "dune_ppo_training_utils.h"
 
 ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
 ABSL_FLAG(int, ppo_update_epochs, 4, "");
@@ -215,6 +216,71 @@ void TestNormalizedCmpo() {
                  static_cast<double>(stats.advantage_count));
   SPIEL_CHECK_LE(static_cast<double>(stats.clipped_high),
                  static_cast<double>(stats.advantage_count));
+}
+
+void TestVisitPolicyTargets() {
+  SearchPiRow full = Row(true, 10, 1, {0.1, 0.9});
+  SearchPiRow cheap = Row(false, 11, 2, {0.1, 0.9});
+  std::vector<SearchPiRow> rows = {full, cheap};
+  ScratchVisitGenerationStats stats;
+  std::string error;
+  SPIEL_CHECK_TRUE(ApplyScratchVisitTargets(&rows, &stats, &error));
+  SPIEL_CHECK_TRUE(error.empty());
+  SPIEL_CHECK_EQ(stats.full_rows, 1);
+  SPIEL_CHECK_EQ(stats.cheap_rows, 1);
+  SPIEL_CHECK_EQ(rows[0].target_type, "visit_policy");
+  SPIEL_CHECK_EQ(rows[1].target_type, "visit_policy");
+  SPIEL_CHECK_EQ(rows[0].regularized_q_target, std::vector<double>({0.1, 0.9}));
+  SPIEL_CHECK_EQ(rows[1].regularized_q_target, std::vector<double>({0.1, 0.9}));
+  SPIEL_CHECK_EQ(rows[0].policy_target_weight, 1.0);
+  SPIEL_CHECK_EQ(rows[1].policy_target_weight, 0.0);
+  SPIEL_CHECK_GT(stats.target_entropy_mean, 0.0);
+
+  SearchPiLearnerConfig config;
+  config.learning_rate = 1e-3;
+  config.minibatch_size = 1;
+  config.epochs = 1;
+  config.value_coef = 0.0;
+  auto first = TinyModel(71);
+  auto second = TinyModel(72);
+  CopySearchPiModel(first, second);
+  auto first_optimizer = Optimizer(first);
+  auto second_optimizer = Optimizer(second);
+  auto first_stats = RunScratchSearchPiLearner(
+      first, *first_optimizer, {rows[0]}, 4, 4, torch::kCPU, 71, 1, config);
+  rows[0].target_visits = {1, 7};
+  rows[0].target_probs = {0.125, 0.875};
+  SPIEL_CHECK_TRUE(ApplyScratchVisitTargets(&rows, &stats, &error));
+  auto second_stats = RunScratchSearchPiLearner(
+      second, *second_optimizer, {rows[0]}, 4, 4, torch::kCPU, 72, 1, config);
+  SPIEL_CHECK_TRUE(first_stats.policy_backward_executed);
+  SPIEL_CHECK_TRUE(second_stats.policy_backward_executed);
+  SPIEL_CHECK_NE(CanonicalSearchPiModuleDigest(*first),
+                 CanonicalSearchPiModuleDigest(*second));
+}
+
+void TestVisitShapingConfiguration() {
+  SearchPiConfig config = ScratchConfig();
+  config.scratch_q_v1 = false;
+  config.scratch_visit_v1 = true;
+  config.intermediate_vp_breadcrumb_weight = 0.2;
+  config.specimen_exchange_penalty = 0.02;
+  config.shaping_start_env_steps = 0;
+  config.shaping_decay_env_steps = 10'000'000;
+  config.shaping_lambda = 1.0f;
+  SPIEL_CHECK_FLOAT_EQ(config.intermediate_vp_breadcrumb_weight, 0.2);
+  SPIEL_CHECK_FLOAT_EQ(config.specimen_exchange_penalty, 0.02);
+  SPIEL_CHECK_FLOAT_EQ(ComputeRewardLambda(0, 0, 10'000'000), 1.0f);
+  SPIEL_CHECK_FLOAT_EQ(ComputeRewardLambda(5'000'000, 0, 10'000'000), 0.5f);
+  SPIEL_CHECK_FLOAT_EQ(ComputeRewardLambda(10'000'000, 0, 10'000'000), 0.0f);
+  SPIEL_CHECK_FLOAT_EQ(ApplySpecimenExchangeShaping(1.0f, 741, 0.02, 1.0f),
+                       0.98f);
+  SPIEL_CHECK_FLOAT_EQ(ApplySpecimenExchangeShaping(1.0f, 752, 0.02, 0.5f),
+                       0.99f);
+  SPIEL_CHECK_FLOAT_EQ(ApplySpecimenExchangeShaping(1.0f, 740, 0.02, 1.0f),
+                       1.0f);
+  SPIEL_CHECK_FLOAT_EQ(ApplySpecimenExchangeShaping(1.0f, 753, 0.02, 1.0f),
+                       1.0f);
 }
 
 void TestBudgets() {
@@ -419,6 +485,78 @@ void TestScratchOneGameChunksPreserveBalancedGeneration() {
     seats[outcome.searched_seat] = true;
   }
   for (bool seen : seats) SPIEL_CHECK_TRUE(seen);
+  for (const SearchPiRow& row : result.retained_rows) {
+    for (const SearchPiGameOutcome& outcome : result.games) {
+      if (outcome.episode_id != row.episode_id) continue;
+      SPIEL_CHECK_GE(row.player, 0);
+      SPIEL_CHECK_LT(row.player, static_cast<int>(outcome.returns.size()));
+      SPIEL_CHECK_FLOAT_EQ(
+          row.value_target,
+          outcome.returns[row.player] / config.search.utility_divisor);
+      SPIEL_CHECK_TRUE(row.value_target_attached);
+      break;
+    }
+  }
+  std::filesystem::remove_all(directory);
+}
+
+void TestTrainingShapingCannotChangeSearchArtifacts() {
+  auto game = LoadGame("dune_imperium");
+  auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  auto model_b = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  CopySearchPiModel(model_a, model_b);
+  SearchPiConfig base = ScratchConfig();
+  base.scratch_q_v1 = false;
+  base.scratch_visit_v1 = true;
+  base.games_per_generation = 4;
+  base.next_episode_id = 5000;
+  base.primary_simulations = 2;
+  base.continuation_simulations = 1;
+  base.purchase_combat_budget = 1;
+  base.scratch_full_root_probability = 0.0;
+  base.scratch_cheap_primary_simulations = 2;
+  base.scratch_cheap_other_simulations = 1;
+  base.behavior_temperature = 1.0;
+  base.shaping_lambda = 1.0f;
+
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("searchpi_shaping_artifacts_" + std::to_string(::getpid()));
+  ConcurrentSearchPiCollectionConfig config_a;
+  config_a.search = base;
+  config_a.generation = 1;
+  config_a.collection_games = 4;
+  config_a.chunk_games = 1;
+  config_a.requested_workers = 4;
+  config_a.batch_target = 0;
+  config_a.retain_rows = true;
+  config_a.output_dir = (directory / "a").string();
+  ConcurrentSearchPiCollectionConfig config_b = config_a;
+  config_b.search.intermediate_vp_breadcrumb_weight = 0.2;
+  config_b.search.specimen_exchange_penalty = 0.02;
+  config_b.output_dir = (directory / "b").string();
+  const auto result_a = CollectSearchPiConcurrent(
+      config_a, game, model_a, torch::Device(torch::kCPU));
+  const auto result_b = CollectSearchPiConcurrent(
+      config_b, game, model_b, torch::Device(torch::kCPU));
+  SPIEL_CHECK_EQ(result_a.retained_rows.size(), result_b.retained_rows.size());
+  SPIEL_CHECK_EQ(result_a.games.size(), result_b.games.size());
+  for (size_t i = 0; i < result_a.retained_rows.size(); ++i) {
+    const SearchPiRow& a = result_a.retained_rows[i];
+    const SearchPiRow& b = result_b.retained_rows[i];
+    SPIEL_CHECK_EQ(a.raw_visits, b.raw_visits);
+    SPIEL_CHECK_EQ(a.target_visits, b.target_visits);
+    SPIEL_CHECK_EQ(a.target_probs, b.target_probs);
+    SPIEL_CHECK_EQ(a.q_values, b.q_values);
+    SPIEL_CHECK_FLOAT_EQ(a.root_value, b.root_value);
+  }
+  for (size_t i = 0; i < result_a.games.size(); ++i) {
+    SPIEL_CHECK_EQ(result_a.games[i].returns, result_b.games[i].returns);
+  }
   std::filesystem::remove_all(directory);
 }
 
@@ -428,11 +566,14 @@ void TestScratchOneGameChunksPreserveBalancedGeneration() {
 int main() {
   open_spiel::TestRegularizedQ();
   open_spiel::TestNormalizedCmpo();
+  open_spiel::TestVisitPolicyTargets();
+  open_spiel::TestVisitShapingConfiguration();
   open_spiel::TestBudgets();
   open_spiel::TestLearnerMaskingAndTarget();
   open_spiel::TestV2AndReplay();
   open_spiel::TestActingPlayerInformationBoundary();
   open_spiel::TestScratchOneGameChunksPreserveBalancedGeneration();
+  open_spiel::TestTrainingShapingCannotChangeSearchArtifacts();
   std::cout << "dune_search_pi_scratch_test: PASS\n";
   return 0;
 }

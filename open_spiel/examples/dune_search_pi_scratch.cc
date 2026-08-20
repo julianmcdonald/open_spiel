@@ -340,6 +340,120 @@ bool ApplyNormalizedCmpoTargets(
   return true;
 }
 
+bool ApplyScratchVisitTargets(
+    std::vector<SearchPiRow>* rows, ScratchVisitGenerationStats* stats,
+    std::string* error) {
+  if (error != nullptr) error->clear();
+  if (rows == nullptr || stats == nullptr) {
+    if (error != nullptr) *error = "null_visit_policy_output";
+    return false;
+  }
+  *stats = ScratchVisitGenerationStats();
+  double entropy_sum = 0.0;
+  double kl_sum = 0.0;
+  double prior_q_sum = 0.0;
+  double target_q_sum = 0.0;
+  double q_range_sum = 0.0;
+  double direct_visits_sum = 0.0;
+  for (SearchPiRow& row : *rows) {
+    const size_t n = row.legal_actions.size();
+    if ((row.search_budget_class != "full" &&
+         row.search_budget_class != "cheap") ||
+        n == 0 || row.raw_policy.size() != n ||
+        row.raw_visits.size() != n || row.target_visits.size() != n ||
+        row.target_probs.size() != n ||
+        row.q_values.size() != n || !std::isfinite(row.root_value)) {
+      if (error != nullptr) *error = "unaligned_visit_policy_row";
+      return false;
+    }
+
+    double target_sum = 0.0;
+    int64_t target_visit_sum = 0;
+    double prior_sum = 0.0;
+    std::vector<double> prior(n);
+    std::vector<double> completed_q(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (!std::isfinite(row.target_probs[i]) || row.target_probs[i] < 0.0 ||
+          !std::isfinite(row.raw_policy[i]) || row.raw_policy[i] < 0.0 ||
+          row.raw_visits[i] < 0 || row.target_visits[i] < 0 ||
+          !std::isfinite(row.q_values[i])) {
+        if (error != nullptr) *error = "invalid_visit_policy_inputs";
+        return false;
+      }
+      target_sum += row.target_probs[i];
+      target_visit_sum += row.target_visits[i];
+      prior[i] = std::max(1e-12, row.raw_policy[i]);
+      prior_sum += prior[i];
+      completed_q[i] = row.raw_visits[i] > 0 ? row.q_values[i]
+                                              : row.root_value;
+    }
+    if (target_visit_sum <= 0 || !std::isfinite(target_sum) ||
+        std::abs(target_sum - 1.0) > 1e-10 ||
+        !(prior_sum > 0.0) || !std::isfinite(prior_sum)) {
+      if (error != nullptr) *error = "unnormalized_visit_policy_target";
+      return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      const double expected = static_cast<double>(row.target_visits[i]) /
+                              static_cast<double>(target_visit_sum);
+      if (std::abs(row.target_probs[i] - expected) > 1e-10) {
+        if (error != nullptr) *error = "visit_policy_target_mismatch";
+        return false;
+      }
+    }
+    for (double& value : prior) value /= prior_sum;
+
+    double prior_expected_q = 0.0;
+    double target_expected_q = 0.0;
+    double q_min = completed_q.front();
+    double q_max = completed_q.front();
+    double target_kl = 0.0;
+    int direct_visits = 0;
+    for (size_t i = 0; i < n; ++i) {
+      prior_expected_q += prior[i] * completed_q[i];
+      target_expected_q += row.target_probs[i] * completed_q[i];
+      q_min = std::min(q_min, completed_q[i]);
+      q_max = std::max(q_max, completed_q[i]);
+      if (row.target_probs[i] > 0.0) {
+        target_kl += row.target_probs[i] *
+                     std::log(row.target_probs[i] / prior[i]);
+      }
+      if (row.raw_visits[i] > 0) ++direct_visits;
+    }
+    if (!std::isfinite(target_kl) || !std::isfinite(prior_expected_q) ||
+        !std::isfinite(target_expected_q)) {
+      if (error != nullptr) *error = "nonfinite_visit_policy_diagnostics";
+      return false;
+    }
+
+    row.row_schema_version = 2;
+    row.target_type = "visit_policy";
+    // Keep the Q target and its diagnostics intact. The learner branches on
+    // target_type and consumes target_probs for this profile.
+    row.policy_target_weight = row.search_budget_class == "full" ? 1.0 : 0.0;
+
+    if (row.search_budget_class == "full") {
+      ++stats->full_rows;
+      entropy_sum += NormalizedEntropy(row.target_probs);
+      kl_sum += target_kl;
+      prior_q_sum += prior_expected_q;
+      target_q_sum += target_expected_q;
+      q_range_sum += q_max - q_min;
+      direct_visits_sum += direct_visits;
+    } else {
+      ++stats->cheap_rows;
+    }
+  }
+  const double denominator = std::max<int64_t>(1, stats->full_rows);
+  stats->target_entropy_mean = entropy_sum / denominator;
+  stats->target_kl_mean = kl_sum / denominator;
+  stats->prior_expected_q_mean = prior_q_sum / denominator;
+  stats->target_expected_q_mean = target_q_sum / denominator;
+  stats->q_range_mean = q_range_sum / denominator;
+  stats->direct_visit_count_mean = direct_visits_sum / denominator;
+  return true;
+}
+
 std::vector<std::vector<SearchPiRow>> FilterNormalizedCmpoReplayWindow(
     const std::vector<std::vector<SearchPiRow>>& replay_window) {
   std::vector<std::vector<SearchPiRow>> full_only(replay_window.size());
@@ -384,14 +498,20 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
     const SearchPiRow& row = rows[i];
     SPIEL_CHECK_EQ(row.row_schema_version, 2);
     SPIEL_CHECK_TRUE(row.target_type == "regularized_q_kl" ||
-                     row.target_type == "normalized_cmpo");
+                     row.target_type == "normalized_cmpo" ||
+                     row.target_type == "visit_policy");
     SPIEL_CHECK_TRUE(row.value_target_attached);
     SPIEL_CHECK_TRUE(std::isfinite(row.value_target));
     SPIEL_CHECK_TRUE(row.policy_target_weight == 0.0 ||
                      row.policy_target_weight == 1.0);
     if (row.policy_target_weight > 0.0) {
-      SPIEL_CHECK_TRUE(row.regularized_q_valid);
-      SPIEL_CHECK_EQ(row.regularized_q_target.size(), row.legal_actions.size());
+      if (row.target_type != "visit_policy") {
+        SPIEL_CHECK_TRUE(row.regularized_q_valid);
+      }
+      const std::vector<double>& policy_target =
+          row.target_type == "visit_policy" ? row.target_probs
+                                             : row.regularized_q_target;
+      SPIEL_CHECK_EQ(policy_target.size(), row.legal_actions.size());
       ++stats.policy_weight_rows;
     }
     const int64_t copy = std::min<int64_t>(
@@ -406,7 +526,9 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
       SPIEL_CHECK_LT(action, action_dim);
       mask_data[i * action_dim + action] = true;
       if (row.policy_target_weight > 0.0) {
-        const double probability = row.regularized_q_target[j];
+        const double probability =
+            row.target_type == "visit_policy" ? row.target_probs[j]
+                                                : row.regularized_q_target[j];
         SPIEL_CHECK_TRUE(std::isfinite(probability));
         SPIEL_CHECK_GE(probability, 0.0);
         target_data[i * action_dim + action] = static_cast<float>(probability);
@@ -469,6 +591,32 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
       torch::Tensor mb_values = values.index_select(0, index);
 
       auto output = model->forward(mb_states);
+      {
+        const torch::Tensor legal = mb_masks.to(output.logits.dtype());
+        const torch::Tensor legal_count = legal.sum(1, true).clamp_min(1.0);
+        const torch::Tensor centered =
+            output.logits - (output.logits * legal).sum(1, true) / legal_count;
+        const torch::Tensor pre_max = centered.abs().masked_fill(
+            mb_masks.logical_not(), 0.0).amax(1);
+        stats.learner_precap_max_legal_logit = std::max(
+            stats.learner_precap_max_legal_logit, pre_max.max().item<double>());
+        torch::Tensor capped = centered;
+        if (cfg.logit_cap > 0.0) {
+          capped = static_cast<float>(cfg.logit_cap) *
+                   torch::tanh(centered / static_cast<float>(cfg.logit_cap));
+        }
+        const torch::Tensor post_max = capped.abs().masked_fill(
+            mb_masks.logical_not(), 0.0).amax(1);
+        stats.learner_postcap_max_legal_logit = std::max(
+            stats.learner_postcap_max_legal_logit, post_max.max().item<double>());
+        stats.learner_logit_cap_decisions += length;
+        stats.learner_logit_cap_legal_logits += legal.sum().item<int64_t>();
+        if (cfg.logit_cap > 0.0) {
+          stats.learner_logit_cap_saturated +=
+              ((capped.abs() >= 0.99 * static_cast<float>(cfg.logit_cap)) &
+               mb_masks).sum().item<int64_t>();
+        }
+      }
       torch::Tensor logits = CenterAndCapLogitsTensor(
           output.logits, mb_masks, static_cast<float>(cfg.logit_cap));
       torch::Tensor log_probability = torch::log_softmax(

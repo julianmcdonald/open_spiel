@@ -18,6 +18,8 @@
 #include "dune_search_pi_concurrent.h"
 #include "dune_search_pi_replay.h"
 #include "dune_search_pi_scratch.h"
+#include "dune_ppo_training_utils.h"
+#include "dune_evaluator.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 
@@ -33,15 +35,13 @@ ABSL_FLAG(double, entropy_coef, 0.01, "");
 ABSL_FLAG(double, value_coef, 0.5, "");
 ABSL_FLAG(double, target_kl, 0.0, "");
 ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
 
 ABSL_FLAG(std::string, profile, open_spiel::kWarmSearchPiProfile,
-          "ppo_warm_q_v1, ppo_warm_cmpo_norm_v1 or scratch_q_v1");
+          "ppo_warm_q_v1, ppo_warm_cmpo_norm_v1, scratch_q_v1 or scratch_visit_v1");
 ABSL_FLAG(std::string, output_dir, "", "Fresh runtime output directory.");
 ABSL_FLAG(std::string, init_model_checkpoint, "",
-          "Warm-start model; forbidden for scratch_q_v1.");
+          "Warm-start model; forbidden for scratch profiles.");
 ABSL_FLAG(std::string, init_model_sha256, "",
           "Required SHA-256 for the warm-start model.");
 ABSL_FLAG(std::string, resume, "", "Scratch checkpoint JSON to resume.");
@@ -72,6 +72,14 @@ ABSL_FLAG(int, minibatch_size, 256, "Search learner minibatch size.");
 ABSL_FLAG(int, epochs, 1, "Search learner epochs.");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "Gradient clip norm.");
 ABSL_FLAG(double, logit_cap, 10.0, "Legal-centered tanh logit cap.");
+ABSL_FLAG(double, intermediate_vp_breadcrumb_weight, 0.2,
+          "Training-only intermediate VP breadcrumb weight.");
+ABSL_FLAG(double, specimen_exchange_penalty, 0.02,
+          "Positive training-only anti-breadcrumb penalty.");
+ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
+          "Environment transition count at which shaping decay starts.");
+ABSL_FLAG(uint64_t, shaping_decay_env_steps, 10000000,
+          "Environment transition count over which shaping decays.");
 
 namespace open_spiel {
 namespace {
@@ -79,10 +87,12 @@ namespace {
 struct ResumeState {
   int generation = 0;
   int64_t next_episode_id = 0;
+  uint64_t total_env_steps = 0;
   std::string model_path;
   std::string optimizer_path;
   std::string model_sha256;
   std::string optimizer_sha256;
+  std::string student_digest;
   std::vector<std::string> replay_paths;
   std::vector<std::string> replay_sha256;
 };
@@ -144,8 +154,10 @@ std::string Fingerprint(const std::string& profile, const SearchPiConfig& search
                         int64_t first_episode_id) {
   std::ostringstream value;
   const bool normalized_profile = profile == kWarmNormalizedCmpoProfile;
+  const bool visit_profile = profile == kScratchVisitSearchPiProfile;
   value << (normalized_profile ? "search_pi_cmpo_norm_v2|profile="
-                                : "search_pi_q_v1|profile=")
+             : visit_profile ? "search_pi_visit_v1|profile="
+                              : "search_pi_q_v1|profile=")
         << profile
         << "|hidden=" << hidden_dim
         << "|blocks=" << blocks << "|nonlinear=" << nonlinear
@@ -163,16 +175,20 @@ std::string Fingerprint(const std::string& profile, const SearchPiConfig& search
         << "|fpu0=" << search.root_noise_fpu_zero
         << "|watchdog=" << search.relative_time_budget_ms
         << "|behavior=" << search.behavior_temperature
+        << "|vp_weight=" << search.intermediate_vp_breadcrumb_weight
+        << "|specimen_penalty=" << search.specimen_exchange_penalty
+        << "|shape_start=" << search.shaping_start_env_steps
+        << "|shape_decay=" << search.shaping_decay_env_steps
         << "|replaymax=" << replay_max
         << "|replaygens=" << replay_generations
         << "|lr=" << learner.learning_rate << "|eps=1e-5"
         << "|mb=" << learner.minibatch_size << "|epochs=" << learner.epochs
         << "|clip=" << learner.grad_clip_norm
         << "|logit=" << learner.logit_cap << "|target="
-        << (profile == kWarmNormalizedCmpoProfile ? "normalized_cmpo"
-                                                  : "regularized_q_kl")
+        << (normalized_profile ? "normalized_cmpo"
+             : visit_profile ? "visit_policy" : "regularized_q_kl")
         << "|initsha=" << init_sha;
-  if (normalized_profile) {
+  if (normalized_profile || visit_profile) {
     value << "|policy_coef=" << learner.policy_coef
           << "|value_coef=" << learner.value_coef << "|seed=" << seed
           << "|first_episode=" << first_episode_id;
@@ -196,18 +212,18 @@ ResumeState ReadResume(const std::string& path, const std::string& profile,
   ResumeState state;
   state.generation = object.at("generation").GetInt();
   state.next_episode_id = object.at("next_episode_id").GetInt();
+  state.total_env_steps = static_cast<uint64_t>(
+      object.at("total_env_steps").GetInt());
   state.model_path = object.at("model_checkpoint").GetString();
   state.optimizer_path = object.at("optimizer_checkpoint").GetString();
   state.model_sha256 = object.at("model_sha256").GetString();
   state.optimizer_sha256 = object.at("optimizer_sha256").GetString();
+  state.student_digest = object.at("student_digest").GetString();
   for (const json::Value& value : object.at("replay_paths").GetArray()) {
     state.replay_paths.push_back(value.GetString());
   }
-  const auto replay_hashes = object.find("replay_sha256");
-  if (replay_hashes != object.end()) {
-    for (const json::Value& value : replay_hashes->second.GetArray()) {
-      state.replay_sha256.push_back(value.GetString());
-    }
+  for (const json::Value& value : object.at("replay_sha256").GetArray()) {
+    state.replay_sha256.push_back(value.GetString());
   }
   return state;
 }
@@ -234,6 +250,7 @@ json::Object ResolvedConfig(const std::string& profile,
   result["games_per_generation"] = int64_t{search.games_per_generation};
   result["seed"] = int64_t{static_cast<int64_t>(seed)};
   result["first_episode_id"] = first_episode_id;
+  result["total_env_steps_start"] = int64_t{0};
   result["workers"] = int64_t{workers};
   result["batch_target"] = int64_t{batch_target};
   result["batcher_timeout_ms"] = int64_t{timeout_ms};
@@ -248,14 +265,22 @@ json::Object ResolvedConfig(const std::string& profile,
   result["cheap_other_budget"] =
       int64_t{search.scratch_cheap_other_simulations};
   result["target_type"] =
-      profile == kWarmNormalizedCmpoProfile ? "normalized_cmpo"
-                                             : "regularized_q_kl";
-  result["kl_cap"] = 0.10;
+      profile == kWarmNormalizedCmpoProfile
+          ? "normalized_cmpo"
+          : profile == kScratchVisitSearchPiProfile ? "visit_policy"
+                                                     : "regularized_q_kl";
+  result["kl_cap"] = profile == kScratchVisitSearchPiProfile ? 0.0 : 0.10;
   result["prior_floor"] =
-      profile == kWarmNormalizedCmpoProfile ? 1e-12 : 1e-8;
+      (profile == kWarmNormalizedCmpoProfile ||
+       profile == kScratchVisitSearchPiProfile) ? 1e-12 : 1e-8;
   result["advantage_clip"] =
-      profile == kWarmNormalizedCmpoProfile ? 1.0 : 0.25;
-  result["max_beta"] = profile == kWarmNormalizedCmpoProfile ? 1.0 : 4.0;
+      profile == kWarmNormalizedCmpoProfile
+          ? 1.0
+          : profile == kScratchVisitSearchPiProfile ? 0.0 : 0.25;
+  result["max_beta"] =
+      profile == kWarmNormalizedCmpoProfile
+          ? 1.0
+          : profile == kScratchVisitSearchPiProfile ? 0.0 : 4.0;
   result["normalized_sigma_floor"] =
       profile == kWarmNormalizedCmpoProfile ? 1e-6 : 0.0;
   result["policy_coef"] = learner.policy_coef;
@@ -265,6 +290,14 @@ json::Object ResolvedConfig(const std::string& profile,
   result["forced_playouts_k"] = search.forced_playouts_k;
   result["root_noise_fpu_zero"] = search.root_noise_fpu_zero;
   result["behavior_temperature"] = search.behavior_temperature;
+  result["intermediate_vp_breadcrumb_weight"] =
+      search.intermediate_vp_breadcrumb_weight;
+  result["specimen_exchange_penalty"] = search.specimen_exchange_penalty;
+  result["shaping_start_env_steps"] =
+      static_cast<int64_t>(search.shaping_start_env_steps);
+  result["shaping_decay_env_steps"] =
+      static_cast<int64_t>(search.shaping_decay_env_steps);
+  result["shaping_lambda"] = static_cast<double>(search.shaping_lambda);
   result["learning_rate"] = learner.learning_rate;
   result["adamw_epsilon"] = 1e-5;
   result["minibatch_size"] = int64_t{learner.minibatch_size};
@@ -279,6 +312,7 @@ json::Object ResolvedConfig(const std::string& profile,
 json::Object SaveCheckpoint(
     const std::string& output_dir, const std::string& profile,
     const std::string& fingerprint, int generation, int64_t next_episode_id,
+    uint64_t total_env_steps,
     const std::vector<std::string>& replay_paths,
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     torch::optim::Optimizer& optimizer) {
@@ -302,6 +336,8 @@ json::Object SaveCheckpoint(
   checkpoint["config_fingerprint"] = fingerprint;
   checkpoint["generation"] = int64_t{generation};
   checkpoint["next_episode_id"] = next_episode_id;
+  checkpoint["total_env_steps"] =
+      static_cast<int64_t>(total_env_steps);
   checkpoint["model_checkpoint"] = model_path;
   checkpoint["optimizer_checkpoint"] = optimizer_path;
   checkpoint["model_sha256"] = ComputeFileSHA256(model_path);
@@ -319,6 +355,66 @@ json::Object SaveCheckpoint(
   AtomicJson((std::filesystem::path(output_dir) / "checkpoint_latest.json").string(),
              checkpoint);
   return checkpoint;
+}
+
+void SaveInitialRandomModelIfNeeded(
+    const std::string& output_dir, const std::string& profile,
+    const std::string& fingerprint, uint64_t seed, int64_t first_episode_id,
+    bool random_init,
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  if (!random_init) return;
+  const std::filesystem::path checkpoint_dir =
+      std::filesystem::path(output_dir) / "checkpoints";
+  std::filesystem::create_directories(checkpoint_dir);
+  const std::filesystem::path model_path =
+      checkpoint_dir / "generation_0_model.pt";
+  const std::filesystem::path marker_path =
+      checkpoint_dir / "generation_0.json";
+  bool created_model = false;
+  if (!std::filesystem::exists(model_path)) {
+    const std::filesystem::path temporary = model_path.string() + ".tmp";
+    torch::save(model, temporary.string());
+    std::error_code error;
+    std::filesystem::rename(temporary, model_path, error);
+    if (error) {
+      std::filesystem::remove(temporary);
+      SpielFatalError("cannot publish generation-zero model: " +
+                      error.message());
+    }
+    created_model = true;
+  }
+  if (!std::filesystem::exists(marker_path) && !created_model) {
+    SpielFatalError("generation-zero model exists without its lineage marker.");
+  }
+  if (created_model) {
+    json::Object marker;
+    marker["schema_version"] = int64_t{1};
+    marker["profile"] = profile;
+    marker["config_fingerprint"] = fingerprint;
+    marker["seed"] = static_cast<int64_t>(seed);
+    marker["first_episode_id"] = first_episode_id;
+    marker["generation"] = int64_t{0};
+    marker["model_checkpoint"] = model_path.string();
+    marker["model_sha256"] = ComputeFileSHA256(model_path.string());
+    marker["student_digest"] = CanonicalSearchPiModuleDigest(*model);
+    AtomicJson(marker_path.string(), marker);
+  }
+  const auto parsed = json::FromString(ReadText(marker_path.string()));
+  if (!parsed.has_value() || !parsed->IsObject()) {
+    SpielFatalError("generation-zero marker is malformed.");
+  }
+  const json::Object& marker = parsed->GetObject();
+  if (marker.at("profile").GetString() != profile ||
+      marker.at("config_fingerprint").GetString() != fingerprint ||
+      marker.at("generation").GetInt() != 0 ||
+      marker.at("seed").GetInt() != static_cast<int64_t>(seed) ||
+      marker.at("first_episode_id").GetInt() != first_episode_id ||
+      marker.at("model_checkpoint").GetString() != model_path.string() ||
+      marker.at("model_sha256").GetString() !=
+          ComputeFileSHA256(model_path.string()) ||
+      marker.at("student_digest").GetString().empty()) {
+    SpielFatalError("generation-zero lineage marker validation failed.");
+  }
 }
 
 SearchPiRoleStats SumRole(const ConcurrentSearchPiCollectionResult& result,
@@ -339,8 +435,10 @@ void ValidateCollection(const ConcurrentSearchPiCollectionResult& result,
     SPIEL_CHECK_EQ(row.row_schema_version, 2);
     SPIEL_CHECK_TRUE(row.search_budget_class == "full" ||
                      row.search_budget_class == "cheap");
-    SPIEL_CHECK_TRUE(row.regularized_q_valid);
-    SPIEL_CHECK_EQ(row.regularized_q_error, "none");
+    if (row.target_type != "visit_policy") {
+      SPIEL_CHECK_TRUE(row.regularized_q_valid);
+      SPIEL_CHECK_EQ(row.regularized_q_error, "none");
+    }
     SPIEL_CHECK_EQ(row.simulations_completed, row.simulations_requested);
     const ScratchSearchBudgetAssignment expected = AssignScratchSearchBudget(
         config, row.episode_id, row.decision_id, row.player, row.role);
@@ -368,12 +466,15 @@ int main(int argc, char** argv) {
   const std::string output_dir = absl::GetFlag(FLAGS_output_dir);
   if (profile != kWarmSearchPiProfile &&
       profile != kWarmNormalizedCmpoProfile &&
-      profile != kScratchSearchPiProfile) {
+      profile != kScratchSearchPiProfile &&
+      profile != kScratchVisitSearchPiProfile) {
     SpielFatalError(
-        "profile must be ppo_warm_q_v1, ppo_warm_cmpo_norm_v1 or scratch_q_v1.");
+        "profile must be ppo_warm_q_v1, ppo_warm_cmpo_norm_v1, scratch_q_v1 "
+        "or scratch_visit_v1.");
   }
   if (output_dir.empty()) SpielFatalError("--output_dir is required.");
   const bool normalized = profile == kWarmNormalizedCmpoProfile;
+  const bool visit = profile == kScratchVisitSearchPiProfile;
   const bool warm = profile == kWarmSearchPiProfile || normalized;
   const std::string init_model = absl::GetFlag(FLAGS_init_model_checkpoint);
   std::string init_sha = absl::GetFlag(FLAGS_init_model_sha256);
@@ -381,16 +482,25 @@ int main(int argc, char** argv) {
     SpielFatalError("warm Search-PI profiles require --init_model_checkpoint.");
   }
   if (!warm && !init_model.empty()) {
-    SpielFatalError("scratch_q_v1 generation zero rejects a model checkpoint.");
+    SpielFatalError("scratch profiles generation zero rejects a model checkpoint.");
   }
   if (warm && absl::GetFlag(FLAGS_num_blocks) != 8) {
     SpielFatalError("warm Search-PI profiles retain the mature checkpoint's eight blocks.");
   }
   if (!warm && absl::GetFlag(FLAGS_num_blocks) != 4) {
-    SpielFatalError("scratch_q_v1 uses exactly four residual blocks.");
+    SpielFatalError("scratch profiles use exactly four residual blocks.");
   }
   if (absl::GetFlag(FLAGS_nonlinear_value_head)) {
     SpielFatalError("Q v1 requires nonlinear_value_head=false.");
+  }
+  if (visit && std::abs(absl::GetFlag(FLAGS_logit_cap) - 10.0) > 1e-12) {
+    SpielFatalError("scratch_visit_v1 requires mandatory logit_cap=10.");
+  }
+  if (absl::GetFlag(FLAGS_intermediate_vp_breadcrumb_weight) < 0.0) {
+    SpielFatalError("intermediate_vp_breadcrumb_weight must be nonnegative.");
+  }
+  if (absl::GetFlag(FLAGS_specimen_exchange_penalty) < 0.0) {
+    SpielFatalError("specimen_exchange_penalty must be nonnegative.");
   }
   if (warm) {
     const std::string actual = ComputeFileSHA256(init_model);
@@ -401,7 +511,8 @@ int main(int argc, char** argv) {
   }
 
   SearchPiConfig search;
-  search.scratch_q_v1 = true;
+  search.scratch_q_v1 = !normalized;
+  search.scratch_visit_v1 = visit;
   search.normalized_cmpo = normalized;
   search.games_per_generation = absl::GetFlag(FLAGS_games_per_generation);
   search.next_episode_id = absl::GetFlag(FLAGS_first_episode_id);
@@ -430,6 +541,14 @@ int main(int argc, char** argv) {
   search.non_search_temperature = 1.0;
   search.searched_seat_unsearched_temperature = 1.0;
   search.search_leader_draft = false;
+  search.intermediate_vp_breadcrumb_weight =
+      absl::GetFlag(FLAGS_intermediate_vp_breadcrumb_weight);
+  search.specimen_exchange_penalty =
+      absl::GetFlag(FLAGS_specimen_exchange_penalty);
+  search.shaping_start_env_steps =
+      absl::GetFlag(FLAGS_shaping_start_env_steps);
+  search.shaping_decay_env_steps =
+      absl::GetFlag(FLAGS_shaping_decay_env_steps);
 
   SearchPiLearnerConfig learner;
   learner.learning_rate = absl::GetFlag(FLAGS_learning_rate);
@@ -450,7 +569,11 @@ int main(int argc, char** argv) {
   const int chunk_games = absl::GetFlag(FLAGS_chunk_games);
   const size_t replay_max = absl::GetFlag(FLAGS_replay_max_rows);
   const int replay_generations = absl::GetFlag(FLAGS_replay_generations);
-  if (replay_generations != 4) SpielFatalError("Q v1 replay window is four generations.");
+  const int required_replay_generations = visit ? 8 : 4;
+  if (replay_generations != required_replay_generations) {
+    SpielFatalError(visit ? "scratch_visit_v1 replay window is eight generations."
+                          : "Q v1 replay window is four generations.");
+  }
   const std::string fingerprint = Fingerprint(
       profile, search, learner, hidden, blocks, false, workers, batch_target,
       timeout_ms, chunk_games, replay_max, replay_generations, init_sha,
@@ -479,11 +602,23 @@ int main(int argc, char** argv) {
 
   ResumeState state;
   state.next_episode_id = search.next_episode_id;
+  state.total_env_steps = 0;
   const std::string resume = absl::GetFlag(FLAGS_resume);
+  const std::filesystem::path generation_zero =
+      std::filesystem::path(output_dir) / "checkpoints/generation_0_model.pt";
+  if (!warm && !resume.empty() && !std::filesystem::exists(generation_zero)) {
+    SpielFatalError("resume is missing the immutable generation-zero model.");
+  }
+  SaveInitialRandomModelIfNeeded(
+      output_dir, profile, fingerprint, absl::GetFlag(FLAGS_seed),
+      absl::GetFlag(FLAGS_first_episode_id), !warm, student);
   if (!resume.empty()) {
     state = ReadResume(resume, profile, fingerprint);
     torch::load(student, state.model_path, device);
     torch::load(*optimizer, state.optimizer_path, device);
+    if (CanonicalSearchPiModuleDigest(*student) != state.student_digest) {
+      SpielFatalError("resume model digest validation failed.");
+    }
     search.next_episode_id = state.next_episode_id;
     for (const std::string& path : state.replay_paths) {
       std::vector<SearchPiRow> rows;
@@ -497,8 +632,13 @@ int main(int argc, char** argv) {
         ComputeFileSHA256(state.optimizer_path) != state.optimizer_sha256) {
       SpielFatalError("resume checkpoint SHA-256 validation failed.");
     }
-    if (normalized && state.replay_sha256.size() != state.replay_paths.size()) {
-      SpielFatalError("normalized CMPO resume lacks replay SHA-256 entries.");
+    if (state.replay_sha256.size() != state.replay_paths.size()) {
+      SpielFatalError("resume lacks replay SHA-256 entries.");
+    }
+    if (visit && state.replay_paths.size() !=
+                     std::min<size_t>(state.generation,
+                                      static_cast<size_t>(replay_generations))) {
+      SpielFatalError("resume replay window is incomplete for its generation.");
     }
     if (!state.replay_sha256.empty()) {
       for (size_t i = 0; i < state.replay_paths.size(); ++i) {
@@ -506,6 +646,13 @@ int main(int argc, char** argv) {
           SpielFatalError("resume replay SHA-256 validation failed.");
         }
       }
+    }
+    const int64_t expected_episode =
+        absl::GetFlag(FLAGS_first_episode_id) +
+        static_cast<int64_t>(state.generation) *
+            static_cast<int64_t>(absl::GetFlag(FLAGS_games_per_generation));
+    if (state.next_episode_id != expected_episode) {
+      SpielFatalError("resume episode cursor does not match generation geometry.");
     }
   } else if (warm) {
     torch::load(student, init_model, device);
@@ -525,6 +672,9 @@ int main(int argc, char** argv) {
   }
   for (int generation = state.generation + 1;
        generation <= target_generation; ++generation) {
+    search.shaping_lambda = ComputeRewardLambda(
+        state.total_env_steps, search.shaping_start_env_steps,
+        search.shaping_decay_env_steps);
     const std::string student_before = CanonicalSearchPiModuleDigest(*student);
     auto collector = std::make_shared<SharedDunePolicyValueNetImpl>(
         obs_size, hidden, action_dim, blocks, false);
@@ -550,15 +700,26 @@ int main(int argc, char** argv) {
     collection.logit_cap = learner.logit_cap;
     collection.output_dir =
         (std::filesystem::path(output_dir) / "collection" /
-         ("generation_" + std::to_string(generation)))
+            ("generation_" + std::to_string(generation)))
             .string();
+    DuneNNEvaluator::ResetLogitCapStats();
     const auto collect_start = std::chrono::steady_clock::now();
     ConcurrentSearchPiCollectionResult collected = CollectSearchPiConcurrent(
         collection, game, collector, device);
     const double collection_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - collect_start).count();
+    const DuneNNEvaluator::LogitCapAggregate collection_cap_stats =
+        DuneNNEvaluator::GetLogitCapStats();
     NormalizedCmpoGenerationStats normalized_stats;
-    if (normalized) {
+    ScratchVisitGenerationStats visit_stats;
+    if (visit) {
+      std::string target_error;
+      if (!ApplyScratchVisitTargets(&collected.retained_rows, &visit_stats,
+                                    &target_error)) {
+        SpielFatalError("visit-policy target construction failed: " +
+                        target_error);
+      }
+    } else if (normalized) {
       std::string target_error;
       if (!ApplyNormalizedCmpoTargets(&collected.retained_rows,
                                       &normalized_stats, &target_error)) {
@@ -624,10 +785,34 @@ int main(int argc, char** argv) {
     const std::string student_after = CanonicalSearchPiModuleDigest(*student);
     SPIEL_CHECK_NE(student_before, student_after);
 
+    int64_t generation_env_steps = 0;
+    int64_t generation_vp_breadcrumbs = 0;
+    int64_t generation_specimen_breadcrumbs = 0;
+    double generation_shaping_reward = 0.0;
+    double generation_vp_raw_reward = 0.0;
+    double generation_specimen_raw_penalty = 0.0;
+    double generation_vp_shaped_reward = 0.0;
+    double generation_specimen_shaped_reward = 0.0;
+    for (const SearchPiGameOutcome& outcome : collected.games) {
+      generation_env_steps += outcome.trajectory_transitions;
+      generation_vp_breadcrumbs += outcome.vp_breadcrumb_events;
+      generation_specimen_breadcrumbs +=
+          outcome.specimen_anti_breadcrumb_events;
+      generation_shaping_reward += outcome.shaping_reward_sum;
+      generation_vp_raw_reward += outcome.vp_breadcrumb_raw_reward_sum;
+      generation_specimen_raw_penalty +=
+          outcome.specimen_anti_breadcrumb_raw_penalty_sum;
+      generation_vp_shaped_reward +=
+          outcome.vp_breadcrumb_shaped_reward_sum;
+      generation_specimen_shaped_reward +=
+          outcome.specimen_anti_breadcrumb_shaped_reward_sum;
+    }
+    state.total_env_steps += static_cast<uint64_t>(generation_env_steps);
     state.generation = generation;
     state.next_episode_id += search.games_per_generation;
     json::Object checkpoint = SaveCheckpoint(
         output_dir, profile, fingerprint, generation, state.next_episode_id,
+        state.total_env_steps,
         state.replay_paths, student, *optimizer);
 
     int64_t full_rows = 0;
@@ -730,6 +915,20 @@ int main(int argc, char** argv) {
           normalized_stats.target_expected_q_mean;
       telemetry["normalized_cmpo_q_range_mean"] = normalized_stats.q_range_mean;
     }
+    if (visit) {
+      telemetry["visit_policy_target_rows"] = visit_stats.full_rows;
+      telemetry["visit_policy_cheap_rows"] = visit_stats.cheap_rows;
+      telemetry["visit_policy_target_entropy_mean"] =
+          visit_stats.target_entropy_mean;
+      telemetry["visit_policy_target_kl_mean"] = visit_stats.target_kl_mean;
+      telemetry["visit_policy_prior_expected_q_mean"] =
+          visit_stats.prior_expected_q_mean;
+      telemetry["visit_policy_target_expected_q_mean"] =
+          visit_stats.target_expected_q_mean;
+      telemetry["visit_policy_q_range_mean"] = visit_stats.q_range_mean;
+      telemetry["visit_policy_direct_visit_count_mean"] =
+          visit_stats.direct_visit_count_mean;
+    }
     telemetry["policy_ce"] = learner_stats.policy_ce;
     telemetry["value_mse"] = learner_stats.value_mse;
     telemetry["policy_grad_norm"] = learner_stats.policy_grad_norm;
@@ -745,6 +944,52 @@ int main(int argc, char** argv) {
     telemetry["student_before_digest"] = student_before;
     telemetry["collector_digest"] = collector_digest;
     telemetry["student_after_digest"] = student_after;
+    telemetry["shaping_lambda"] = static_cast<double>(search.shaping_lambda);
+    telemetry["total_env_steps"] =
+        static_cast<int64_t>(state.total_env_steps);
+    telemetry["generation_env_steps"] = generation_env_steps;
+    telemetry["vp_breadcrumb_events"] = generation_vp_breadcrumbs;
+    telemetry["specimen_anti_breadcrumb_events"] =
+        generation_specimen_breadcrumbs;
+    telemetry["shaping_reward_sum"] = generation_shaping_reward;
+    telemetry["vp_breadcrumb_raw_reward_sum"] = generation_vp_raw_reward;
+    telemetry["specimen_anti_breadcrumb_raw_penalty_sum"] =
+        generation_specimen_raw_penalty;
+    telemetry["vp_breadcrumb_shaped_reward_sum"] =
+        generation_vp_shaped_reward;
+    telemetry["specimen_anti_breadcrumb_shaped_reward_sum"] =
+        generation_specimen_shaped_reward;
+    telemetry["logit_cap"] = learner.logit_cap;
+    telemetry["collector_precap_max_legal_logit"] =
+        collection_cap_stats.pre_max_abs;
+    telemetry["collector_postcap_max_legal_logit"] =
+        collection_cap_stats.post_max_abs;
+    telemetry["collector_logit_cap_decisions"] =
+        static_cast<int64_t>(collection_cap_stats.decisions);
+    telemetry["collector_logit_cap_saturated"] =
+        static_cast<int64_t>(collection_cap_stats.saturated);
+    telemetry["collector_logit_cap_legal_logits"] =
+        static_cast<int64_t>(collection_cap_stats.legal_logits);
+    telemetry["collector_logit_cap_saturation_rate"] =
+        collection_cap_stats.legal_logits == 0
+            ? 0.0
+            : static_cast<double>(collection_cap_stats.saturated) /
+                  static_cast<double>(collection_cap_stats.legal_logits);
+    telemetry["learner_precap_max_legal_logit"] =
+        learner_stats.learner_precap_max_legal_logit;
+    telemetry["learner_postcap_max_legal_logit"] =
+        learner_stats.learner_postcap_max_legal_logit;
+    telemetry["learner_logit_cap_decisions"] =
+        learner_stats.learner_logit_cap_decisions;
+    telemetry["learner_logit_cap_saturated"] =
+        learner_stats.learner_logit_cap_saturated;
+    telemetry["learner_logit_cap_legal_logits"] =
+        learner_stats.learner_logit_cap_legal_logits;
+    telemetry["learner_logit_cap_saturation_rate"] =
+        learner_stats.learner_logit_cap_legal_logits == 0
+            ? 0.0
+            : static_cast<double>(learner_stats.learner_logit_cap_saturated) /
+                  static_cast<double>(learner_stats.learner_logit_cap_legal_logits);
     telemetry["checkpoint"] = checkpoint;
     AtomicJson((std::filesystem::path(output_dir) /
                 ("generation_" + std::to_string(generation) + ".json"))

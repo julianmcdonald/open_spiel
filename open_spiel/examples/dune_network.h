@@ -331,10 +331,18 @@ struct EvalResult {
     float value;
 };
 
-inline void CenterAndCapLegalLogits(std::vector<float>& logits,
-                                    const std::vector<Action>& legal_actions,
-                                    float logit_cap) {
-    if (logits.empty() || legal_actions.empty()) return;
+struct LogitCapApplicationStats {
+  double pre_max_abs = 0.0;
+  double post_max_abs = 0.0;
+  int legal_count = 0;
+  int saturated_count = 0;
+};
+
+inline LogitCapApplicationStats CenterAndCapLegalLogitsWithStats(
+    std::vector<float>& logits, const std::vector<Action>& legal_actions,
+    float logit_cap) {
+  LogitCapApplicationStats stats;
+  if (logits.empty() || legal_actions.empty()) return stats;
 
     double legal_sum = 0.0;
     int legal_count = 0;
@@ -344,19 +352,35 @@ inline void CenterAndCapLegalLogits(std::vector<float>& logits,
             ++legal_count;
         }
     }
-    if (legal_count == 0) return;
+  if (legal_count == 0) return stats;
 
     const float legal_mean = static_cast<float>(legal_sum / legal_count);
     // Only legal logits are consumed by the softmax. Transforming all 2,391
     // outputs performed thousands of unnecessary tanh calls per game.
     for (Action action : legal_actions) {
-        if (action < 0 || static_cast<size_t>(action) >= logits.size()) continue;
-        float& logit = logits[action];
-        logit -= legal_mean;
-        if (logit_cap > 0.0f) {
-            logit = logit_cap * std::tanh(logit / logit_cap);
-        }
+    if (action < 0 || static_cast<size_t>(action) >= logits.size()) continue;
+    float& logit = logits[action];
+    logit -= legal_mean;
+    stats.pre_max_abs =
+        std::max(stats.pre_max_abs, std::abs(static_cast<double>(logit)));
+    ++stats.legal_count;
+    if (logit_cap > 0.0f) {
+      logit = logit_cap * std::tanh(logit / logit_cap);
     }
+    stats.post_max_abs =
+        std::max(stats.post_max_abs, std::abs(static_cast<double>(logit)));
+    if (logit_cap > 0.0f &&
+        std::abs(static_cast<double>(logit)) >= 0.99 * logit_cap) {
+      ++stats.saturated_count;
+    }
+  }
+  return stats;
+}
+
+inline void CenterAndCapLegalLogits(std::vector<float>& logits,
+                                    const std::vector<Action>& legal_actions,
+                                    float logit_cap) {
+  CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap);
 }
 
 // Samples one legal action from `logits` (already legal-centered and capped by

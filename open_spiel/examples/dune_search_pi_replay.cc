@@ -506,8 +506,9 @@ bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
   const size_t n = row.legal_actions.size();
   if (row.row_schema_version != 2) return fail("scratch row schema is not 2.");
   if (row.target_type != "regularized_q_kl" &&
-      row.target_type != "normalized_cmpo") {
-    return fail("scratch row target_type is not a supported Q target.");
+      row.target_type != "normalized_cmpo" &&
+      row.target_type != "visit_policy") {
+    return fail("scratch row target_type is not supported.");
   }
   if (row.search_budget_class != "full" &&
       row.search_budget_class != "cheap") {
@@ -540,7 +541,41 @@ bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
   if (row.policy_target_weight != 0.0 && row.policy_target_weight != 1.0) {
     return fail("scratch row policy weight is not 0 or 1.");
   }
-  if (row.regularized_q_valid) {
+  if (row.target_type == "visit_policy") {
+    double visit_sum = std::accumulate(row.target_probs.begin(),
+                                       row.target_probs.end(), 0.0);
+    const int64_t target_visit_total = std::accumulate(
+        row.target_visits.begin(), row.target_visits.end(), int64_t{0});
+    if (target_visit_total <= 0 || std::abs(visit_sum - 1.0) > 1e-10) {
+      return fail("visit-policy target is not normalized.");
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (row.target_visits[i] < 0) {
+        return fail("visit-policy target visits contain a negative count.");
+      }
+      const double expected = static_cast<double>(row.target_visits[i]) /
+                              static_cast<double>(target_visit_total);
+      if (std::abs(row.target_probs[i] - expected) > 1e-10) {
+        return fail("visit-policy target does not match target visits.");
+      }
+    }
+    if (row.regularized_q_valid) {
+      if (row.regularized_q_error != "none" ||
+          row.regularized_q_target.size() != n ||
+          !AllFinite(row.regularized_q_target)) {
+        return fail("valid diagnostic Q target is malformed.");
+      }
+      double q_sum = std::accumulate(row.regularized_q_target.begin(),
+                                     row.regularized_q_target.end(), 0.0);
+      if (std::abs(q_sum - 1.0) > 1e-12 ||
+          row.regularized_q_kl > 0.10 + 1e-12) {
+        return fail("valid diagnostic Q target violates its contract.");
+      }
+    } else if (!row.regularized_q_target.empty() ||
+               row.regularized_q_error.empty()) {
+      return fail("invalid diagnostic Q target is not named.");
+    }
+  } else if (row.regularized_q_valid) {
     if (row.regularized_q_error != "none" ||
         row.regularized_q_target.size() != n ||
         !AllFinite(row.regularized_q_target)) {
@@ -548,7 +583,9 @@ bool ValidateScratchRowV2(const SearchPiRow& row, std::string* error) {
     }
     double sum = std::accumulate(row.regularized_q_target.begin(),
                                  row.regularized_q_target.end(), 0.0);
-    if (std::abs(sum - 1.0) > 1e-12 || row.regularized_q_kl > 0.10 + 1e-12) {
+    if (std::abs(sum - 1.0) > 1e-12 ||
+        (row.target_type != "visit_policy" &&
+         row.regularized_q_kl > 0.10 + 1e-12)) {
       return fail("valid scratch target violates normalization or KL cap.");
     }
   } else if (!row.regularized_q_target.empty() ||

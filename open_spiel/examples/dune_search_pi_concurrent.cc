@@ -121,7 +121,8 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   SPIEL_CHECK_GT(config.collection_games, 0);
   SPIEL_CHECK_EQ(config.collection_games % 4, 0);
   SPIEL_CHECK_GT(config.chunk_games, 0);
-  if (config.search.scratch_q_v1 || config.search.normalized_cmpo) {
+  if (config.search.scratch_q_v1 || config.search.scratch_visit_v1 ||
+      config.search.normalized_cmpo) {
     SPIEL_CHECK_EQ(config.chunk_games, 1);
   } else {
     SPIEL_CHECK_EQ(config.chunk_games % 4, 0);

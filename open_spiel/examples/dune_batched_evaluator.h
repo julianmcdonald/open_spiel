@@ -56,7 +56,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     }
 
     std::vector<float> logits(result.logits.begin(), result.logits.end());
-    open_spiel::CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+    const LogitCapApplicationStats cap_stats =
+        CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
+    DuneNNEvaluator::RecordLogitCapStats(cap_stats);
 
     double max_logit = -std::numeric_limits<double>::infinity();
     for (Action action : legal_actions) {
@@ -114,7 +116,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         std::vector<Action> legal_actions = state.LegalActions();
         if (!legal_actions.empty()) {
           std::vector<float> logits(result.logits.begin(), result.logits.end());
-          open_spiel::CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+          const LogitCapApplicationStats cap_stats =
+              CenterAndCapLegalLogitsWithStats(logits, legal_actions,
+                                               logit_cap_);
+          DuneNNEvaluator::RecordLogitCapStats(cap_stats);
 
           double max_logit = -std::numeric_limits<double>::infinity();
           for (Action action : legal_actions) {

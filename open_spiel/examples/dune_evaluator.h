@@ -21,6 +21,45 @@ class DuneNNEvaluator : public algorithms::Evaluator {
  public:
   inline static std::atomic<double> global_abs_leaf_value_sum{0.0};
   inline static std::atomic<uint64_t> global_num_leaf_evaluations{0};
+  inline static std::atomic<uint64_t> global_logit_cap_decisions{0};
+  inline static std::atomic<uint64_t> global_logit_cap_legal_logits{0};
+  inline static std::atomic<uint64_t> global_logit_cap_saturated{0};
+  inline static std::atomic<double> global_logit_cap_pre_max{0.0};
+  inline static std::atomic<double> global_logit_cap_post_max{0.0};
+
+  struct LogitCapAggregate {
+    uint64_t decisions = 0;
+    uint64_t legal_logits = 0;
+    uint64_t saturated = 0;
+    double pre_max_abs = 0.0;
+    double post_max_abs = 0.0;
+  };
+
+  static void ResetLogitCapStats() {
+    global_logit_cap_decisions.store(0, std::memory_order_relaxed);
+    global_logit_cap_legal_logits.store(0, std::memory_order_relaxed);
+    global_logit_cap_saturated.store(0, std::memory_order_relaxed);
+    global_logit_cap_pre_max.store(0.0, std::memory_order_relaxed);
+    global_logit_cap_post_max.store(0.0, std::memory_order_relaxed);
+  }
+
+  static LogitCapAggregate GetLogitCapStats() {
+    return {global_logit_cap_decisions.load(std::memory_order_relaxed),
+            global_logit_cap_legal_logits.load(std::memory_order_relaxed),
+            global_logit_cap_saturated.load(std::memory_order_relaxed),
+            global_logit_cap_pre_max.load(std::memory_order_relaxed),
+            global_logit_cap_post_max.load(std::memory_order_relaxed)};
+  }
+
+  static void RecordLogitCapStats(const LogitCapApplicationStats& stats) {
+    global_logit_cap_decisions.fetch_add(1, std::memory_order_relaxed);
+    global_logit_cap_legal_logits.fetch_add(stats.legal_count,
+                                            std::memory_order_relaxed);
+    global_logit_cap_saturated.fetch_add(stats.saturated_count,
+                                         std::memory_order_relaxed);
+    AtomicMax(&global_logit_cap_pre_max, stats.pre_max_abs);
+    AtomicMax(&global_logit_cap_post_max, stats.post_max_abs);
+  }
 
   static void RecordLeafValue(double val) {
     double current = global_abs_leaf_value_sum.load(std::memory_order_relaxed);
@@ -121,7 +160,9 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     int64_t action_dim = logits_tensor.size(0);
     std::vector<float> logits(logits_ptr, logits_ptr + action_dim);
 
-    CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+    const LogitCapApplicationStats cap_stats =
+        CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
+    RecordLogitCapStats(cap_stats);
 
     // CPU-based softmax over legal actions
     double max_logit = -std::numeric_limits<double>::infinity();
@@ -201,7 +242,9 @@ class DuneNNEvaluator : public algorithms::Evaluator {
         int64_t action_dim = player_logits.size(0);
         std::vector<float> logits(logits_ptr, logits_ptr + action_dim);
 
-        CenterAndCapLegalLogits(logits, legal_actions, logit_cap_);
+        const LogitCapApplicationStats cap_stats =
+            CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
+        RecordLogitCapStats(cap_stats);
 
         double max_logit = -std::numeric_limits<double>::infinity();
         for (Action action : legal_actions) {
@@ -234,6 +277,15 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   }
 
  private:
+  static void AtomicMax(std::atomic<double>* target, double value) {
+    double current = target->load(std::memory_order_relaxed);
+    while (current < value &&
+           !target->compare_exchange_weak(current, value,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
+    }
+  }
+
   void CheckObsSize(size_t size) const {
     SPIEL_CHECK_TRUE(size == static_cast<size_t>(obs_size_) || 
                      (size == 5580 && obs_size_ == 5584) ||

@@ -277,6 +277,16 @@ struct SearchPiConfig {
   // is legible from a run's own artifacts.
   bool search_leader_draft = false;
 
+  // Training-only reward shaping. These are applied after search has produced
+  // its Q values and visit targets, so they cannot alter MCTS backups or the
+  // policy target. `shaping_lambda` is supplied by the generation driver from
+  // the persisted cumulative environment-transition count.
+  double intermediate_vp_breadcrumb_weight = 0.0;
+  double specimen_exchange_penalty = 0.0;
+  uint64_t shaping_start_env_steps = 0;
+  uint64_t shaping_decay_env_steps = 0;
+  float shaping_lambda = 1.0f;
+
   // --- Seeds ---
   uint64_t seed_domain = 0;  // REQUIRED nonzero; distinct from PPO's domains
 
@@ -292,6 +302,9 @@ struct SearchPiConfig {
   // The legacy config fingerprint intentionally excludes them; scratch_q_v1
   // owns a separate profile/config fingerprint in dune_search_pi_scratch.
   bool scratch_q_v1 = false;
+  // Search-from-birth visit-policy baseline. It shares the scratch collector
+  // and row schema but replaces the clipped-Q learner target with target_probs.
+  bool scratch_visit_v1 = false;
   // The mature-safe warm-start lane shares scratch collection/replay mechanics
   // but replaces the per-row clipped-Q target with a generation-normalized
   // CMPO target. Historical profiles leave this false.
@@ -544,6 +557,13 @@ struct SearchPiGameOutcome {
   // Complete applied transitions (chance plus every player's decisions).
   // Used by scratch_q_v1 resource telemetry; legacy shard rows are unchanged.
   int64_t trajectory_transitions = 0;
+  double shaping_reward_sum = 0.0;
+  double vp_breadcrumb_raw_reward_sum = 0.0;
+  double specimen_anti_breadcrumb_raw_penalty_sum = 0.0;
+  double vp_breadcrumb_shaped_reward_sum = 0.0;
+  double specimen_anti_breadcrumb_shaped_reward_sum = 0.0;
+  int64_t vp_breadcrumb_events = 0;
+  int64_t specimen_anti_breadcrumb_events = 0;
   int64_t primary_roots = 0;
   int64_t continuation_roots = 0;
   int64_t primary_simulations = 0;

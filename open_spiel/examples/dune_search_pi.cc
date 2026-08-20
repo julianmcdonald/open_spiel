@@ -553,7 +553,8 @@ ScratchSearchBudgetAssignment AssignScratchSearchBudget(
     const SearchPiConfig& config, int64_t episode_id, int decision_id,
     Player acting_player, DuneDecisionRole role) {
   ScratchSearchBudgetAssignment out;
-  if (!config.scratch_q_v1 && !config.normalized_cmpo) return out;
+  if (!config.scratch_q_v1 && !config.scratch_visit_v1 &&
+      !config.normalized_cmpo) return out;
   SPIEL_CHECK_GE(config.scratch_full_root_probability, 0.0);
   SPIEL_CHECK_LE(config.scratch_full_root_probability, 1.0);
   uint64_t draw = DeriveStream(config.seed_domain, episode_id, decision_id,
@@ -837,7 +838,8 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   // is not a multiple of four searches some seats more than others. Scratch
   // concurrent collection enforces this over the COMPLETE generation while
   // scheduling one game per worker chunk to reach the audited G=128 geometry.
-  if (!config_.scratch_q_v1 && !config_.normalized_cmpo) {
+  if (!config_.scratch_q_v1 && !config_.scratch_visit_v1 &&
+      !config_.normalized_cmpo) {
     SPIEL_CHECK_EQ(config_.games_per_generation % 4, 0);
   }
   SPIEL_CHECK_GT(config_.primary_simulations, 0);
@@ -846,6 +848,12 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   SPIEL_CHECK_GT(config_.utility_divisor, 0.0);
   SPIEL_CHECK_GE(config_.behavior_temperature, 0.0);
   SPIEL_CHECK_GE(config_.target_sharpen_exponent, 0.0);
+  SPIEL_CHECK_GE(config_.intermediate_vp_breadcrumb_weight, 0.0);
+  if (config_.specimen_exchange_penalty < 0.0) {
+    SpielFatalError("scratch_visit_v1 specimen_exchange_penalty must be nonnegative.");
+  }
+  SPIEL_CHECK_GE(config_.shaping_lambda, 0.0f);
+  SPIEL_CHECK_LE(config_.shaping_lambda, 1.0f);
   // The Leader teacher must not leak into this lane. It is not a tunable knob
   // here: the lane's scope is agent-turn decisions.
   //
@@ -866,7 +874,8 @@ SearchPiGenerator::SearchPiGenerator(const SearchPiConfig& config)
   if (config_.dirichlet_epsilon <= 0.0) {
     SPIEL_CHECK_EQ(config_.forced_playouts_k, 0.0);
   }
-  if (config_.scratch_q_v1 || config_.normalized_cmpo) {
+  if (config_.scratch_q_v1 || config_.scratch_visit_v1 ||
+      config_.normalized_cmpo) {
     SPIEL_CHECK_GE(config_.scratch_full_root_probability, 0.0);
     SPIEL_CHECK_LE(config_.scratch_full_root_probability, 1.0);
     SPIEL_CHECK_GT(config_.scratch_full_primary_simulations, 0);
@@ -1012,14 +1021,76 @@ void SearchPiGenerator::GenerateGeneration(
     session.SetUpdateId(generation);
 
     std::unique_ptr<State> state = game->NewInitialState();
-    std::vector<size_t> emitted_indices;
-    int64_t decision_index = 0;
-    int64_t chance_index = 0;
-    int64_t transition_index = 0;
-
     SearchPiGameOutcome outcome;
     outcome.episode_id = episode_id;
     outcome.searched_seat = searched_seat;
+    std::vector<size_t> emitted_indices;
+    const size_t row_base = out->size();
+    std::vector<int> last_emitted_row_for_player(game->NumPlayers(), -1);
+    std::vector<double> shaping_reward_by_row;
+    std::vector<int> previous_conflict_vp(game->NumPlayers(), 0);
+    std::vector<int> previous_total_vp(game->NumPlayers(), 0);
+    const auto* initial_dune_state =
+        dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    if (initial_dune_state != nullptr) {
+      for (int p = 0; p < game->NumPlayers(); ++p) {
+        previous_conflict_vp[p] = initial_dune_state->ConflictVpDelta(p);
+        previous_total_vp[p] = initial_dune_state->GetPlayerVp(p);
+      }
+    }
+    auto apply_training_shaping = [&](Action action, Player acting_player) {
+      auto* dune_state =
+          dynamic_cast<dune_imperium::DuneImperiumState*>(state.get());
+      if (dune_state == nullptr) return;
+      const float lambda = config_.shaping_lambda;
+      const double vp_weight = config_.intermediate_vp_breadcrumb_weight;
+      if (vp_weight != 0.0) {
+        for (int p = 0; p < game->NumPlayers(); ++p) {
+          const int conflict_delta =
+              dune_state->ConflictVpDelta(p) - previous_conflict_vp[p];
+          const int total_delta =
+              dune_state->GetPlayerVp(p) - previous_total_vp[p];
+          previous_conflict_vp[p] = dune_state->ConflictVpDelta(p);
+          previous_total_vp[p] = dune_state->GetPlayerVp(p);
+          const int noncombat_delta = total_delta - conflict_delta;
+          const double raw =
+              (static_cast<double>(std::max(conflict_delta, 0)) +
+               static_cast<double>(noncombat_delta)) * vp_weight;
+          const int row_index = last_emitted_row_for_player[p];
+          if (row_index >= 0 && raw != 0.0) {
+            const float shaped = static_cast<float>(raw) * lambda;
+            shaping_reward_by_row[static_cast<size_t>(row_index) - row_base] +=
+                shaped;
+            ++outcome.vp_breadcrumb_events;
+            outcome.vp_breadcrumb_raw_reward_sum += raw;
+            outcome.vp_breadcrumb_shaped_reward_sum += shaped;
+          }
+        }
+      } else {
+        for (int p = 0; p < game->NumPlayers(); ++p) {
+          previous_conflict_vp[p] = dune_state->ConflictVpDelta(p);
+          previous_total_vp[p] = dune_state->GetPlayerVp(p);
+        }
+      }
+      if (acting_player >= 0 && acting_player < game->NumPlayers() &&
+          config_.specimen_exchange_penalty != 0.0 &&
+          dune_shaping::IsSpecimenConversionAction(action)) {
+        const float shaped = ApplySpecimenExchangeShaping(
+            0.0f, action, config_.specimen_exchange_penalty, lambda);
+        const int row_index = last_emitted_row_for_player[acting_player];
+        if (row_index >= 0 && shaped != 0.0f) {
+          shaping_reward_by_row[static_cast<size_t>(row_index) - row_base] +=
+              shaped;
+          ++outcome.specimen_anti_breadcrumb_events;
+          outcome.specimen_anti_breadcrumb_raw_penalty_sum +=
+              config_.specimen_exchange_penalty;
+          outcome.specimen_anti_breadcrumb_shaped_reward_sum += shaped;
+        }
+      }
+    };
+    int64_t decision_index = 0;
+    int64_t chance_index = 0;
+    int64_t transition_index = 0;
 
     while (!state->IsTerminal()) {
       if (state->IsChanceNode()) {
@@ -1031,6 +1102,7 @@ void SearchPiGenerator::GenerateGeneration(
             outcome.full_trajectory_digest, transition_index++,
             state->CurrentPlayer(), action);
         state->ApplyAction(action);
+        apply_training_shaping(action, kInvalidPlayer);
         continue;
       }
 
@@ -1052,6 +1124,7 @@ void SearchPiGenerator::GenerateGeneration(
         outcome.full_trajectory_digest = MixAppliedAction(
             outcome.full_trajectory_digest, transition_index++, cur, action);
         state->ApplyAction(action);
+        apply_training_shaping(action, cur);
         continue;
       }
 
@@ -1072,7 +1145,8 @@ void SearchPiGenerator::GenerateGeneration(
       const bool role_is_search =
           IsSearchPiSearchRole(role, config_.purchase_combat_budget);
       ScratchSearchBudgetAssignment scratch_budget;
-      if ((config_.scratch_q_v1 || config_.normalized_cmpo) && role_is_search) {
+      if ((config_.scratch_q_v1 || config_.scratch_visit_v1 ||
+           config_.normalized_cmpo) && role_is_search) {
         scratch_budget = AssignScratchSearchBudget(
             config_, episode_id, static_cast<int>(this_decision), cur, role);
         const int primary = scratch_budget.full
@@ -1252,7 +1326,8 @@ void SearchPiGenerator::GenerateGeneration(
           fallback = SearchPiFallback::kZeroVisits;
         }
         if (fallback == SearchPiFallback::kNone &&
-            (config_.scratch_q_v1 || config_.normalized_cmpo)) {
+            (config_.scratch_q_v1 || config_.scratch_visit_v1 ||
+             config_.normalized_cmpo)) {
           const std::vector<double>& raw_priors =
               res.diagnostics.raw_priors.empty() ? res.diagnostics.priors
                                                  : res.diagnostics.raw_priors;
@@ -1321,7 +1396,8 @@ void SearchPiGenerator::GenerateGeneration(
           row.root_value = res.diagnostics.root_value;
           row.q_values = res.diagnostics.q_values;
 
-          if (config_.scratch_q_v1 || config_.normalized_cmpo) {
+          if (config_.scratch_q_v1 || config_.scratch_visit_v1 ||
+              config_.normalized_cmpo) {
             row.row_schema_version = 2;
             row.target_type = "regularized_q_kl";
             row.search_budget_class = scratch_budget.full ? "full" : "cheap";
@@ -1372,6 +1448,8 @@ void SearchPiGenerator::GenerateGeneration(
           if (row.target_argmax_differs_from_raw) rs->target_argmax_overrides++;
 
           emitted_indices.push_back(out->size());
+          last_emitted_row_for_player[cur] = static_cast<int>(out->size());
+          shaping_reward_by_row.push_back(0.0);
           out->push_back(std::move(row));
           rs->rows_emitted++;
           outcome.rows_emitted++;
@@ -1469,15 +1547,24 @@ void SearchPiGenerator::GenerateGeneration(
       dec.mcts_proposed_action = res.diagnostics.selected_action;
       session.CommitAction(dec);
       state->ApplyAction(chosen);
+      apply_training_shaping(chosen, cur);
     }
 
     // Terminal value targets, from the engine's own Returns() and nothing else.
     const std::vector<double> returns = state->Returns();
-    for (size_t idx : emitted_indices) {
+    std::vector<double> shaping_return_to_go_by_player(
+        game->NumPlayers(), 0.0);
+    for (auto it = emitted_indices.rbegin(); it != emitted_indices.rend();
+         ++it) {
+      const size_t idx = *it;
       SearchPiRow& row = (*out)[idx];
       SPIEL_CHECK_GE(row.player, 0);
       SPIEL_CHECK_LT(row.player, static_cast<int>(returns.size()));
-      row.value_target = returns[row.player] / config_.utility_divisor;
+      shaping_return_to_go_by_player[row.player] +=
+          shaping_reward_by_row[idx - row_base];
+      row.value_target = returns[row.player] / config_.utility_divisor +
+                         shaping_return_to_go_by_player[row.player] /
+                             config_.utility_divisor;
       row.value_target_attached = true;
     }
 
@@ -1485,6 +1572,9 @@ void SearchPiGenerator::GenerateGeneration(
     // strength test has something to join on. Placement is read off the ladder
     // at divisor 1.0 because these are raw returns, not scaled targets.
     outcome.returns = returns;
+    outcome.shaping_reward_sum =
+        outcome.vp_breadcrumb_shaped_reward_sum +
+        outcome.specimen_anti_breadcrumb_shaped_reward_sum;
 
     // Game-shape telemetry, from GAME TRUTH rather than the convenient reads.
     // See SearchPiGameOutcome for why each of these two has a wrong derivation
