@@ -95,6 +95,8 @@ void TestRegisteredCountsAndWeights() {
   SPIEL_CHECK_FLOAT_EQ(plan.treatment[3], 1.0);
   SPIEL_CHECK_FLOAT_EQ(plan.treatment[4], 1.0);
   SPIEL_CHECK_FLOAT_EQ(plan.treatment_mass, 5.0);
+  SPIEL_CHECK_FLOAT_EQ(plan.extended_precision_sequential_treatment_mass, 5.0);
+  SPIEL_CHECK_FLOAT_EQ(plan.binary64_sequential_treatment_mass, 5.0);
   SPIEL_CHECK_FLOAT_EQ(plan.roles[0].changed_loss_mass, 1.5);
   SPIEL_CHECK_FLOAT_EQ(plan.roles[0].preserved_loss_mass, 1.5);
   rows[0].role = DuneDecisionRole::kOtherOptional;

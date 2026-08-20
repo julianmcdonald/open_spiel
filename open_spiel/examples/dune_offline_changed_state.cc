@@ -284,6 +284,7 @@ bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
   }
 
   out->control_mass = static_cast<double>(rows.size());
+  double role_mass = 0.0;
   for (OfflineRoleWeightSummary& summary : out->roles) {
     if (summary.parsed_total != summary.spec.total ||
         summary.parsed_changed != summary.spec.changed ||
@@ -312,9 +313,18 @@ bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,
                           summary.spec.name);
       return false;
     }
-    out->treatment_mass += summary.total_loss_mass;
+    role_mass += summary.total_loss_mass;
   }
-  if (std::abs(out->treatment_mass - rows.size()) > 1e-8) {
+  const long double row_mass = std::accumulate(
+      out->treatment.begin(), out->treatment.end(),
+      static_cast<long double>(0.0));
+  out->treatment_mass = role_mass;
+  out->extended_precision_sequential_treatment_mass =
+      static_cast<double>(row_mass);
+  out->binary64_sequential_treatment_mass =
+      std::accumulate(out->treatment.begin(), out->treatment.end(), 0.0);
+  if (std::abs(row_mass - static_cast<long double>(role_mass)) > 1e-10L ||
+      std::abs(row_mass - static_cast<long double>(rows.size())) > 1e-10L) {
     SetError(error, "treatment corpus mean weight is not exactly one");
     return false;
   }
@@ -558,11 +568,9 @@ OfflineTrainingStats TrainOfflineChangedStateArm(
     ++stats.minibatches;
     stats.final_minibatch_size = boundary.count;
     stats.weighted_ce_sum += numerator.item<double>();
-    for (int64_t i = boundary.start;
-         i < boundary.start + boundary.count; ++i) {
-      stats.presentation_weight_mass += weights[static_cast<size_t>(i)];
-    }
   }
+  stats.presentation_weight_mass = static_cast<double>(std::accumulate(
+      weights.begin(), weights.end(), static_cast<long double>(0.0)));
   if (stats.presentation_weight_mass > 0.0) {
     stats.mean_presented_weighted_ce =
         stats.weighted_ce_sum / stats.presentation_weight_mass;

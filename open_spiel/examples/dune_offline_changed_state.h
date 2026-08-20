@@ -59,6 +59,8 @@ struct OfflineWeightPlan {
   std::vector<OfflineRoleWeightSummary> roles;
   double control_mass = 0.0;
   double treatment_mass = 0.0;
+  double extended_precision_sequential_treatment_mass = 0.0;
+  double binary64_sequential_treatment_mass = 0.0;
 };
 
 bool BuildOfflineWeightPlan(const std::vector<SearchPiRow>& rows,

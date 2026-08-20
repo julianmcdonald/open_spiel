@@ -368,6 +368,10 @@ std::string PreflightJson(
   }
   out << "],\"control_loss_mass\":" << weights.control_mass
       << ",\"treatment_loss_mass\":" << weights.treatment_mass
+      << ",\"extended_precision_sequential_treatment_loss_mass\":"
+      << weights.extended_precision_sequential_treatment_mass
+      << ",\"binary64_sequential_treatment_loss_mass\":"
+      << weights.binary64_sequential_treatment_mass
       << ",\"treatment_mean_weight\":"
       << weights.treatment_mass / rows << '}'
       << ",\"presentation\":{\"seed\":"
@@ -696,7 +700,20 @@ int main(int argc, char** argv) {
       std::abs(treatment_training.presentation_weight_mass -
                kOfflineChangedStateRows) < 1e-8;
   if (!runtime_integrity) {
-    SpielFatalError("runtime presentation/weight integrity assertion failed");
+    std::ostringstream failure;
+    failure << std::setprecision(17)
+            << "runtime presentation/weight integrity assertion failed: "
+            << "C presentations/minibatches/final/mass="
+            << control_training.presentations << '/'
+            << control_training.minibatches << '/'
+            << control_training.final_minibatch_size << '/'
+            << control_training.presentation_weight_mass
+            << " T presentations/minibatches/final/mass="
+            << treatment_training.presentations << '/'
+            << treatment_training.minibatches << '/'
+            << treatment_training.final_minibatch_size << '/'
+            << treatment_training.presentation_weight_mass;
+    SpielFatalError(failure.str());
   }
   const OfflineGateResult gate = ApplyOfflineChangedStateGate(
       rows, parent, control_child, treatment_child,
