@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
   }
 
   SearchPiConfig search;
-  search.scratch_q_v1 = !normalized;
+  search.scratch_q_v1 = !normalized && !visit;
   search.scratch_visit_v1 = visit;
   search.normalized_cmpo = normalized;
   search.games_per_generation = absl::GetFlag(FLAGS_games_per_generation);
