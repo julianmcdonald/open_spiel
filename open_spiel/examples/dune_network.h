@@ -1,6 +1,10 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -18,6 +22,7 @@
 #include <shared_mutex>
 #include <utility>
 #include <ATen/autocast_mode.h>
+#include "open_spiel/examples/dune_hotspot_profile.h"
 
 #include "open_spiel/spiel.h"
 #include "dune_seed_utils.h"  // MakeTorchCPUGenerator, for the PWO-5 head init
@@ -331,6 +336,12 @@ struct EvalResult {
     float value;
 };
 
+struct CompactEvalResult {
+    std::vector<Action> actions;
+    std::vector<float> probabilities;
+    float value = 0.0f;
+};
+
 struct LogitCapApplicationStats {
   double pre_max_abs = 0.0;
   double post_max_abs = 0.0;
@@ -485,6 +496,7 @@ public:
         }
         return results;
     }
+
     virtual EvaluatorStats GetStats() const = 0;
 };
 
@@ -680,14 +692,17 @@ public:
                      torch::Device device,
                      std::shared_mutex* sync_mutex,
                      float logit_cap = 0.0f,
-                     bool device_synchronize = true)
+                     bool device_synchronize = true,
+                     bool high_priority_stream = false)
         : model_(model), target_batch_size_(target_batch_size),
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
+          high_priority_stream_(high_priority_stream),
           stop_(false) {
 
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
+        model_action_dim_ = model_->policy_head->weight.size(0);
 
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {
@@ -729,6 +744,7 @@ public:
             req.obs = &obs;
             req.result_dest = &result;
             req.ready_flag = &ready;
+            req.wants_logits = true;
             req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             req.group_size = 1;
             req.is_group = false;
@@ -762,6 +778,119 @@ public:
         }
 
         return result; // Move semantics
+    }
+
+    // Production leaf path: values are returned without allocating or copying
+    // the 2,391-action policy vector to host memory.
+    EvalResult EvaluateValues(const std::vector<float>& obs) {
+        CheckEvalObsSize(obs.size(), model_input_dim_);
+        EvalResult result;
+        std::atomic<bool> ready{false};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (requests_.empty()) first_request_ts_ = now;
+            Request req;
+            req.obs = &obs;
+            req.result_dest = &result;
+            req.ready_flag = &ready;
+            req.wants_logits = false;
+            req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            req.group_size = 1;
+            req.is_group = false;
+            req.enqueue_ts = now;
+            requests_.push_back(req);
+            single_row_calls_.fetch_add(1, std::memory_order_relaxed);
+            if (requests_.size() == 1 ||
+                requests_.size() >= static_cast<size_t>(target_batch_size_)) {
+                cv_.notify_one();
+            }
+        }
+        int spin_count = 0;
+        while (!ready.load(std::memory_order_acquire)) {
+            if (spin_count++ < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            } else {
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, [&] {
+                    return ready.load(std::memory_order_acquire);
+                });
+            }
+        }
+        return result;
+    }
+
+    CompactEvalResult EvaluateCompact(
+        const std::vector<float>& obs,
+        const std::vector<Action>& legal_actions) {
+        if (!device_.is_cuda() || device_synchronize_) {
+            EvalResult full = Evaluate(obs);
+            CompactEvalResult compact;
+            compact.actions = legal_actions;
+            std::vector<float> logits = full.logits;
+            CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
+            double max_logit = -std::numeric_limits<double>::infinity();
+            for (Action action : legal_actions) {
+                max_logit = std::max(max_logit,
+                                     static_cast<double>(logits[action]));
+            }
+            double total = 0.0;
+            for (Action action : legal_actions) {
+                total += std::exp(static_cast<double>(logits[action]) - max_logit);
+            }
+            compact.probabilities.reserve(legal_actions.size());
+            for (Action action : legal_actions) {
+                compact.probabilities.push_back(static_cast<float>(
+                    std::exp(static_cast<double>(logits[action]) - max_logit) /
+                    total));
+            }
+            compact.value = full.value;
+            return compact;
+        }
+        CheckEvalObsSize(obs.size(), model_input_dim_);
+        CompactEvalResult result;
+        std::atomic<bool> ready{false};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (requests_.empty()) first_request_ts_ = now;
+            Request req;
+            req.obs = &obs;
+            req.ready_flag = &ready;
+            req.compact_dest = &result;
+            req.legal_actions = legal_actions;
+            req.wants_logits = false;
+            req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            req.group_size = 1;
+            req.is_group = false;
+            req.enqueue_ts = now;
+            requests_.push_back(std::move(req));
+            single_row_calls_.fetch_add(1, std::memory_order_relaxed);
+            if (requests_.size() == 1 ||
+                requests_.size() >= static_cast<size_t>(target_batch_size_)) {
+                cv_.notify_one();
+            }
+        }
+        int spin_count = 0;
+        while (!ready.load(std::memory_order_acquire)) {
+            if (spin_count++ < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            } else {
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, [&] {
+                    return ready.load(std::memory_order_acquire);
+                });
+            }
+        }
+        return result;
     }
 
     std::vector<EvalResult> EvaluateBatch(
@@ -848,6 +977,120 @@ public:
         return s;
     }
 
+    std::vector<EvalResult> EvaluateBatchValues(
+        const std::vector<std::vector<float>>& observations) {
+        std::vector<EvalResult> results(observations.size());
+        if (observations.empty()) return results;
+        if (observations.size() > static_cast<size_t>(target_batch_size_)) {
+            SpielFatalError("BatchedEvaluator::EvaluateBatchValues group exceeds target");
+        }
+        for (const auto& obs : observations) CheckEvalObsSize(obs.size(), model_input_dim_);
+        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (requests_.empty()) first_request_ts_ = now;
+            const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t gsize = static_cast<uint32_t>(observations.size());
+            for (size_t i = 0; i < observations.size(); ++i) {
+                ready[i].store(false, std::memory_order_relaxed);
+                Request req;
+                req.obs = &observations[i];
+                req.result_dest = &results[i];
+                req.ready_flag = &ready[i];
+                req.wants_logits = false;
+                req.group_id = gid;
+                req.group_size = gsize;
+                req.is_group = true;
+                req.enqueue_ts = now;
+                requests_.push_back(req);
+            }
+            group_calls_.fetch_add(1, std::memory_order_relaxed);
+            group_rows_.fetch_add(gsize, std::memory_order_relaxed);
+            cv_.notify_one();
+        }
+        auto all_ready = [&]() {
+            for (size_t i = 0; i < observations.size(); ++i) {
+                if (!ready[i].load(std::memory_order_acquire)) return false;
+            }
+            return true;
+        };
+        int spin_count = 0;
+        while (!all_ready()) {
+            if (spin_count++ < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            } else {
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, all_ready);
+            }
+        }
+        return results;
+    }
+
+    std::pair<std::vector<EvalResult>, CompactEvalResult>
+    EvaluateBatchValuesWithCompactPrior(
+        const std::vector<std::vector<float>>& observations,
+        size_t prior_index, const std::vector<Action>& legal_actions) {
+        std::vector<EvalResult> results(observations.size());
+        CompactEvalResult compact;
+        if (observations.empty() || prior_index >= observations.size()) {
+            return {std::move(results), std::move(compact)};
+        }
+        for (const auto& obs : observations) CheckEvalObsSize(obs.size(), model_input_dim_);
+        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (requests_.empty()) first_request_ts_ = now;
+            const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            const uint32_t gsize = static_cast<uint32_t>(observations.size());
+            for (size_t i = 0; i < observations.size(); ++i) {
+                ready[i].store(false, std::memory_order_relaxed);
+                Request req;
+                req.obs = &observations[i];
+                req.result_dest = &results[i];
+                req.ready_flag = &ready[i];
+                req.wants_logits = false;
+                if (i == prior_index) {
+                    req.compact_dest = &compact;
+                    req.legal_actions = legal_actions;
+                }
+                req.group_id = gid;
+                req.group_size = gsize;
+                req.is_group = true;
+                req.enqueue_ts = now;
+                requests_.push_back(std::move(req));
+            }
+            group_calls_.fetch_add(1, std::memory_order_relaxed);
+            group_rows_.fetch_add(gsize, std::memory_order_relaxed);
+            cv_.notify_one();
+        }
+        auto all_ready = [&]() {
+            for (size_t i = 0; i < observations.size(); ++i) {
+                if (!ready[i].load(std::memory_order_acquire)) return false;
+            }
+            return true;
+        };
+        int spin_count = 0;
+        while (!all_ready()) {
+            if (spin_count++ < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            } else {
+                std::unique_lock<std::mutex> park_lock(park_mutex_);
+                park_cv_.wait(park_lock, all_ready);
+            }
+        }
+        return {std::move(results), std::move(compact)};
+    }
+
     // R2 (WO-3 review F1): arms the per-batch bookkeeping below (batch-size
     // record, per-row queue-wait accounting, split-leaf-group maps). Call it
     // BEFORE the workload starts; without it those sections are skipped and
@@ -883,6 +1126,14 @@ public:
         t.sync_ms = sync_us_.load(std::memory_order_relaxed) / 1000.0;
         t.device_timed_batches =
             device_timed_batches_.load(std::memory_order_relaxed);
+        // Lightweight production telemetry: these counters are always live,
+        // so mean batch size remains available even when detailed per-batch
+        // telemetry and CUDA event timing are disabled.
+        if (t.physical_batches > 0) {
+            t.mean_batch_size =
+                static_cast<double>(t.submitted_rows) /
+                static_cast<double>(t.physical_batches);
+        }
 
         std::vector<uint32_t> sizes;
         {
@@ -921,9 +1172,12 @@ public:
 
 private:
     struct Request {
-        const std::vector<float>* obs;
-        EvalResult* result_dest;
-        std::atomic<bool>* ready_flag;
+        const std::vector<float>* obs = nullptr;
+        EvalResult* result_dest = nullptr;
+        std::atomic<bool>* ready_flag = nullptr;
+        bool wants_logits = true;
+        CompactEvalResult* compact_dest = nullptr;
+        std::vector<Action> legal_actions;
         // WO-PERF-3 telemetry tags (no effect on dispatch). group_id is unique
         // per logical call; a one-row Evaluate() is its own group. is_group is
         // true only for EvaluateBatch() (searched-leaf) rows. enqueue_ts stamps
@@ -944,7 +1198,9 @@ private:
     std::shared_mutex* sync_mutex_;
     float logit_cap_;
     bool device_synchronize_;
+    bool high_priority_stream_;
     int64_t model_input_dim_;
+    int64_t model_action_dim_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -993,7 +1249,408 @@ private:
     std::unordered_map<uint64_t, int> group_batches_seen_;  // gid -> # batches
     std::unordered_map<uint64_t, int> group_rows_left_;     // gid -> rows undispatched
 
+    // Production CUDA path: two reusable slots let the runner assemble the
+    // next CPU batch while the previous slot is executing. Completion waits
+    // on one CUDA event for this stream, never on the whole device.
+    struct AsyncBatchSlot {
+        std::vector<Request> batch;
+        torch::Tensor host_obs;
+        torch::Tensor device_obs;
+        torch::Tensor device_logits;
+        torch::Tensor device_values;
+        torch::Tensor host_logits;
+        torch::Tensor host_values;
+        std::unique_ptr<c10::cuda::CUDAStream> stream;
+        std::unique_ptr<c10::Event> complete;
+        bool wants_logits = false;
+        int compact_max_legal = 0;
+        std::vector<size_t> compact_request_indices;
+        torch::Tensor compact_device_ids;
+        torch::Tensor compact_device_mask;
+        torch::Tensor compact_device_rows;
+        torch::Tensor compact_host_probs;
+        bool pending = false;
+    };
+
+    void RunnerAsync() {
+        torch::InferenceMode inference_guard;
+        const c10::DeviceIndex device_index =
+            device_.has_index() ? device_.index() : c10::cuda::current_device();
+        std::array<AsyncBatchSlot, 2> slots;
+        for (AsyncBatchSlot& slot : slots) {
+            slot.stream = std::make_unique<c10::cuda::CUDAStream>(
+                c10::cuda::getStreamFromPool(high_priority_stream_,
+                                             device_index));
+        }
+        int pending_slot = -1;
+        int next_slot = 0;
+
+        auto take_batch = [&](bool* timeout_flush) {
+            std::vector<Request> batch;
+            *timeout_flush = false;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !requests_.empty(); });
+                if (stop_ && requests_.empty()) return batch;
+                const auto deadline =
+                    first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
+                cv_.wait_until(lock, deadline, [this, deadline]() {
+                    return stop_ || requests_.size() >=
+                                      static_cast<size_t>(target_batch_size_) ||
+                           std::chrono::steady_clock::now() >= deadline;
+                });
+                if (stop_ && requests_.empty()) return batch;
+                *timeout_flush = !stop_ &&
+                                 requests_.size() <
+                                     static_cast<size_t>(target_batch_size_);
+                size_t actual_batch =
+                    std::min(static_cast<size_t>(target_batch_size_),
+                             requests_.size());
+                if (actual_batch > 0 && actual_batch < requests_.size() &&
+                    requests_[actual_batch - 1].is_group &&
+                    requests_[actual_batch].is_group &&
+                    requests_[actual_batch - 1].group_id ==
+                        requests_[actual_batch].group_id) {
+                    const uint64_t boundary_gid =
+                        requests_[actual_batch].group_id;
+                    size_t group_start = actual_batch;
+                    while (group_start > 0 &&
+                           requests_[group_start - 1].group_id == boundary_gid) {
+                        --group_start;
+                    }
+                    if (group_start > 0) {
+                        actual_batch = group_start;
+                    } else {
+                        while (actual_batch < requests_.size() &&
+                               requests_[actual_batch].group_id ==
+                                   boundary_gid) {
+                            ++actual_batch;
+                        }
+                    }
+                }
+                batch.reserve(actual_batch);
+                for (size_t i = 0; i < actual_batch; ++i) {
+                    batch.push_back(std::move(requests_.front()));
+                    requests_.pop_front();
+                }
+                if (!requests_.empty()) {
+                    first_request_ts_ = std::chrono::steady_clock::now();
+                }
+            }
+            return batch;
+        };
+
+        auto record_batch_telemetry = [&](const std::vector<Request>& batch,
+                                          bool timeout_flush) {
+            const size_t batch_size = batch.size();
+            total_batches_.fetch_add(1, std::memory_order_relaxed);
+            total_requests_.fetch_add(static_cast<uint64_t>(batch_size),
+                                       std::memory_order_relaxed);
+            uint64_t observed_max =
+                max_batch_size_seen_.load(std::memory_order_relaxed);
+            while (batch_size > observed_max &&
+                   !max_batch_size_seen_.compare_exchange_weak(
+                       observed_max, static_cast<uint64_t>(batch_size),
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {}
+            if (timeout_flush) {
+                timeout_flush_batches_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            }
+            if (!batcher_telemetry_enabled_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(telemetry_mutex_);
+                physical_batch_sizes_.push_back(
+                    static_cast<uint32_t>(batch_size));
+            }
+            const auto dispatch_ts = std::chrono::steady_clock::now();
+            std::unordered_map<uint64_t, std::pair<int, uint32_t>> groups_here;
+            for (const Request& request : batch) {
+                const uint64_t wait_ns = static_cast<uint64_t>(std::max<int64_t>(
+                    0, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           dispatch_ts - request.enqueue_ts)
+                           .count()));
+                if (request.is_group) {
+                    group_wait_ns_sum_.fetch_add(wait_ns,
+                                                 std::memory_order_relaxed);
+                    group_wait_n_.fetch_add(1, std::memory_order_relaxed);
+                    uint64_t max_wait =
+                        group_wait_ns_max_.load(std::memory_order_relaxed);
+                    while (wait_ns > max_wait &&
+                           !group_wait_ns_max_.compare_exchange_weak(
+                               max_wait, wait_ns, std::memory_order_relaxed,
+                               std::memory_order_relaxed)) {}
+                    auto& entry = groups_here[request.group_id];
+                    entry.first += 1;
+                    entry.second = request.group_size;
+                } else {
+                    single_wait_ns_sum_.fetch_add(wait_ns,
+                                                  std::memory_order_relaxed);
+                    single_wait_n_.fetch_add(1, std::memory_order_relaxed);
+                    uint64_t max_wait =
+                        single_wait_ns_max_.load(std::memory_order_relaxed);
+                    while (wait_ns > max_wait &&
+                           !single_wait_ns_max_.compare_exchange_weak(
+                               max_wait, wait_ns, std::memory_order_relaxed,
+                               std::memory_order_relaxed)) {}
+                }
+            }
+            for (const auto& item : groups_here) {
+                const uint64_t group_id = item.first;
+                const int rows_here = item.second.first;
+                const uint32_t group_size = item.second.second;
+                const int seen = ++group_batches_seen_[group_id];
+                if (seen == 2) {
+                    leaf_groups_split_.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
+                int& rows_left = group_rows_left_
+                    .try_emplace(group_id, static_cast<int>(group_size))
+                    .first->second;
+                rows_left -= rows_here;
+                if (rows_left <= 0) {
+                    group_batches_seen_.erase(group_id);
+                    group_rows_left_.erase(group_id);
+                }
+            }
+        };
+
+        auto finish_slot = [&](AsyncBatchSlot& slot) {
+            if (!slot.pending) return;
+            slot.complete->synchronize();
+            const float* values = slot.host_values.data_ptr<float>();
+            const size_t action_dim = static_cast<size_t>(model_action_dim_);
+            dune_hotspot::ScopedTimer hotspot_timer(
+                dune_hotspot::Kind::kBatcherResultDistribution);
+            for (size_t i = 0; i < slot.batch.size(); ++i) {
+                Request& request = slot.batch[i];
+                if (request.result_dest != nullptr) {
+                    request.result_dest->value = values[i];
+                    if (request.wants_logits) {
+                        const float* logits = slot.host_logits.data_ptr<float>();
+                        request.result_dest->logits.assign(
+                            logits + i * action_dim,
+                            logits + (i + 1) * action_dim);
+                    }
+                }
+                if (request.compact_dest != nullptr) {
+                    const auto it = std::find(slot.compact_request_indices.begin(),
+                                              slot.compact_request_indices.end(), i);
+                    const size_t compact_index = static_cast<size_t>(
+                        std::distance(slot.compact_request_indices.begin(), it));
+                    const float* probs = slot.compact_host_probs.data_ptr<float>();
+                    request.compact_dest->actions = request.legal_actions;
+                    request.compact_dest->probabilities.assign(
+                        probs + compact_index * slot.compact_max_legal,
+                        probs + compact_index * slot.compact_max_legal +
+                            request.legal_actions.size());
+                    request.compact_dest->value = values[i];
+                }
+                slot.batch[i].ready_flag->store(true,
+                                                std::memory_order_release);
+            }
+            {
+                std::lock_guard<std::mutex> park_lock(park_mutex_);
+            }
+            park_cv_.notify_all();
+            slot.batch.clear();
+            slot.pending = false;
+        };
+
+        auto launch_slot = [&](AsyncBatchSlot& slot) {
+            const size_t batch_size = slot.batch.size();
+            slot.wants_logits = false;
+            slot.compact_request_indices.clear();
+            slot.compact_max_legal = 0;
+            for (size_t i = 0; i < batch_size; ++i) {
+                if (slot.batch[i].wants_logits) slot.wants_logits = true;
+                if (slot.batch[i].compact_dest != nullptr) {
+                    slot.compact_request_indices.push_back(i);
+                    slot.compact_max_legal = std::max(
+                        slot.compact_max_legal,
+                        static_cast<int>(slot.batch[i].legal_actions.size()));
+                }
+            }
+            if (!slot.device_obs.defined()) {
+                auto host_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(torch::kCPU)
+                    .pinned_memory(true);
+                auto device_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(device_);
+                slot.host_obs = torch::empty(
+                    {target_batch_size_, model_input_dim_}, host_options);
+                slot.device_obs = torch::empty(
+                    {target_batch_size_, model_input_dim_}, device_options);
+                slot.device_values = torch::empty(
+                    {target_batch_size_}, device_options);
+                slot.host_values = torch::empty(
+                    {target_batch_size_}, host_options);
+                slot.complete = std::make_unique<c10::Event>(
+                    c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+            }
+            if (slot.wants_logits && !slot.device_logits.defined()) {
+                auto host_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(torch::kCPU)
+                    .pinned_memory(true);
+                auto device_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(device_);
+                slot.device_logits = torch::empty(
+                    {target_batch_size_, model_action_dim_}, device_options);
+                slot.host_logits = torch::empty(
+                    {target_batch_size_, model_action_dim_}, host_options);
+            }
+            {
+                c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
+                auto host_obs = slot.host_obs.narrow(0, 0, batch_size);
+                auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
+                device_obs.copy_(host_obs, /*non_blocking=*/true);
+                SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+                {
+                    std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
+                    AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                    outputs = model_->forward(device_obs);
+                }
+                auto device_values = slot.device_values.narrow(
+                    0, 0, batch_size);
+                device_values.copy_(outputs.values.reshape(
+                                        {static_cast<int64_t>(batch_size)}),
+                                    /*non_blocking=*/true);
+                if (slot.wants_logits) {
+                    auto device_logits = slot.device_logits.narrow(
+                        0, 0, batch_size);
+                    device_logits.copy_(outputs.logits,
+                                        /*non_blocking=*/true);
+                    slot.host_logits.narrow(0, 0, batch_size).copy_(
+                        device_logits, /*non_blocking=*/true);
+                }
+                if (!slot.compact_request_indices.empty()) {
+                    const int compact_count =
+                        static_cast<int>(slot.compact_request_indices.size());
+                    torch::Tensor ids_cpu = torch::zeros(
+                        {compact_count, slot.compact_max_legal},
+                        torch::TensorOptions().dtype(torch::kInt64));
+                    torch::Tensor mask_cpu = torch::zeros(
+                        {compact_count, slot.compact_max_legal},
+                        torch::TensorOptions().dtype(torch::kBool));
+                    int64_t* ids = ids_cpu.data_ptr<int64_t>();
+                    bool* mask = mask_cpu.data_ptr<bool>();
+                    for (int k = 0; k < compact_count; ++k) {
+                        const Request& request = slot.batch[
+                            slot.compact_request_indices[k]];
+                        for (size_t j = 0; j < request.legal_actions.size(); ++j) {
+                            ids[k * slot.compact_max_legal + j] =
+                                request.legal_actions[j];
+                            mask[k * slot.compact_max_legal + j] = true;
+                        }
+                    }
+                    slot.compact_device_ids = ids_cpu.to(
+                        device_, /*non_blocking=*/true);
+                    slot.compact_device_mask = mask_cpu.to(
+                        device_, /*non_blocking=*/true);
+                    std::vector<int64_t> compact_row_ids;
+                    compact_row_ids.reserve(compact_count);
+                    for (size_t row_index : slot.compact_request_indices) {
+                        compact_row_ids.push_back(static_cast<int64_t>(row_index));
+                    }
+                    slot.compact_device_rows = torch::tensor(
+                        compact_row_ids,
+                        torch::TensorOptions().dtype(torch::kInt64))
+                        .to(device_, /*non_blocking=*/true);
+                    auto compact_logits = outputs.logits.index_select(
+                        0, slot.compact_device_rows)
+                        .gather(1, slot.compact_device_ids)
+                        .to(torch::kFloat32);
+                    const torch::Tensor legal =
+                        slot.compact_device_mask.to(torch::kFloat32);
+                    const torch::Tensor legal_count =
+                        legal.sum(1, true).clamp_min(1.0);
+                    compact_logits = compact_logits -
+                        (compact_logits * legal).sum(1, true) / legal_count;
+                    if (logit_cap_ > 0.0f) {
+                        compact_logits = logit_cap_ *
+                            torch::tanh(compact_logits / logit_cap_);
+                    }
+                    auto compact_probs = torch::softmax(
+                        compact_logits.masked_fill(
+                            slot.compact_device_mask.logical_not(), -1e9f),
+                        1);
+                    slot.compact_host_probs = compact_probs.to(
+                        torch::kCPU, /*non_blocking=*/true);
+                }
+                slot.host_values.narrow(0, 0, batch_size).copy_(
+                    device_values, /*non_blocking=*/true);
+                slot.complete->record(*slot.stream);
+            }
+            slot.pending = true;
+        };
+
+        for (;;) {
+            bool timeout_flush = false;
+            std::vector<Request> batch = take_batch(&timeout_flush);
+            if (batch.empty()) break;
+            const int slot_index = next_slot;
+            AsyncBatchSlot& slot = slots[slot_index];
+            if (slot.pending) finish_slot(slot);
+            slot.batch = std::move(batch);
+            record_batch_telemetry(slot.batch, timeout_flush);
+            float* destination = slot.host_obs.defined()
+                ? slot.host_obs.data_ptr<float>()
+                : nullptr;
+            if (destination == nullptr) {
+                auto host_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(torch::kCPU)
+                    .pinned_memory(true);
+                slot.host_obs = torch::empty(
+                    {target_batch_size_, model_input_dim_}, host_options);
+                destination = slot.host_obs.data_ptr<float>();
+            }
+            for (size_t i = 0; i < slot.batch.size(); ++i) {
+                const int64_t input_size =
+                    static_cast<int64_t>(slot.batch[i].obs->size());
+                const int64_t copy_size =
+                    std::min<int64_t>(model_input_dim_, input_size);
+                std::memcpy(destination + i * model_input_dim_,
+                            slot.batch[i].obs->data(),
+                            copy_size * sizeof(float));
+                if (copy_size < model_input_dim_) {
+                    std::memset(destination + i * model_input_dim_ + copy_size,
+                                0,
+                                (model_input_dim_ - copy_size) * sizeof(float));
+                }
+            }
+            // Complete the prior stream before launching the next shared-model
+            // forward. The two slots still overlap CPU batch assembly with the
+            // prior GPU batch, while the event wait protects host outputs and
+            // avoids whole-device synchronization. Concurrent forwards on the
+            // shared LibTorch module are deliberately not enabled.
+            if (pending_slot >= 0) finish_slot(slots[pending_slot]);
+            launch_slot(slot);
+            bool queue_empty = false;
+            {
+                std::lock_guard<std::mutex> queue_lock(mutex_);
+                queue_empty = requests_.empty();
+            }
+            if (queue_empty) {
+                // Every worker may be blocked on this batch. Publish its
+                // event before returning to an empty-queue wait, otherwise
+                // the runner and all actors wait on one another forever.
+                finish_slot(slot);
+                pending_slot = -1;
+            } else {
+                pending_slot = slot_index;
+            }
+            next_slot = 1 - next_slot;
+        }
+        if (pending_slot >= 0) finish_slot(slots[pending_slot]);
+    }
+
     void Runner() {
+        if (device_.is_cuda() && !device_synchronize_) {
+            RunnerAsync();
+            return;
+        }
         torch::InferenceMode inference_guard;
         torch::Tensor pinned_stacked_obs;
         bool pinned_allocated = false;

@@ -503,6 +503,123 @@ void TestScratchOneGameChunksPreserveBalancedGeneration() {
   std::filesystem::remove_all(directory);
 }
 
+void TestPrefetchRangesAreFixedAndDisjoint() {
+  auto game = LoadGame("dune_imperium");
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  model->eval();
+  SearchPiConfig search = ScratchConfig();
+  search.games_per_generation = 4;
+  search.next_episode_id = 6000;
+  search.primary_simulations = 2;
+  search.continuation_simulations = 1;
+  search.purchase_combat_budget = 1;
+  search.scratch_full_root_probability = 0.0;
+  search.scratch_cheap_primary_simulations = 2;
+  search.scratch_cheap_other_simulations = 1;
+  search.behavior_temperature = 1.0;
+  const std::filesystem::path directory =
+      std::filesystem::temp_directory_path() /
+      ("searchpi_prefetch_ranges_" + std::to_string(::getpid()));
+  ConcurrentSearchPiCollectionConfig config;
+  config.search = search;
+  config.generation = 3;
+  config.collection_games = 4;
+  config.chunk_games = 1;
+  config.requested_workers = 4;
+  config.prefetch_games = 4;
+  config.prefetch_trigger_running = 2;
+  config.batch_target = 0;
+  config.retain_rows = true;
+  config.output_dir = directory.string();
+  const auto result = CollectSearchPiConcurrent(
+      config, game, model, torch::Device(torch::kCPU));
+  SPIEL_CHECK_EQ(result.games.size(), 4u);
+  SPIEL_CHECK_EQ(result.prefetched_games.size(), 4u);
+  bool current_seen[4] = {false, false, false, false};
+  bool prefetch_seen[4] = {false, false, false, false};
+  for (const auto& outcome : result.games) {
+    SPIEL_CHECK_GE(outcome.episode_id, int64_t{6000});
+    SPIEL_CHECK_LT(outcome.episode_id, int64_t{6004});
+    current_seen[outcome.episode_id - 6000] = true;
+  }
+  for (const auto& outcome : result.prefetched_games) {
+    SPIEL_CHECK_GE(outcome.episode_id, int64_t{6004});
+    SPIEL_CHECK_LT(outcome.episode_id, int64_t{6008});
+    prefetch_seen[outcome.episode_id - 6004] = true;
+  }
+  for (int i = 0; i < 4; ++i) {
+    SPIEL_CHECK_TRUE(current_seen[i]);
+    SPIEL_CHECK_TRUE(prefetch_seen[i]);
+  }
+  SPIEL_CHECK_EQ(result.prefetch_collector_generation, 3);
+  SPIEL_CHECK_EQ(result.prefetch_for_generation, 4);
+  SPIEL_CHECK_EQ(result.prefetched_rows.size() > 0, true);
+  std::filesystem::remove_all(directory);
+}
+
+void TestAsyncEvaluatorEmptyQueueCompletes() {
+  if (!torch::cuda::is_available()) return;
+  auto game = LoadGame("dune_imperium");
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  model->to(torch::Device(torch::kCUDA));
+  model->eval();
+  std::shared_mutex model_mutex;
+  BatchedEvaluator evaluator(
+      model, 16, 2, torch::Device(torch::kCUDA), &model_mutex, 0.0f, false);
+  const std::vector<float> observation(
+      static_cast<size_t>(game->InformationStateTensorSize()), 0.0f);
+  const EvalResult result = evaluator.Evaluate(observation);
+  SPIEL_CHECK_EQ(result.logits.size(),
+                 static_cast<size_t>(game->NumDistinctActions()));
+}
+
+void TestCompactLegalPolicyParityOnDuneState() {
+  if (!torch::cuda::is_available()) return;
+  auto game = LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  for (int i = 0; i < 32 && state->IsChanceNode(); ++i) {
+    const auto outcomes = state->ChanceOutcomes();
+    SPIEL_CHECK_FALSE(outcomes.empty());
+    state->ApplyAction(outcomes.front().first);
+  }
+  const Player player = state->CurrentPlayer();
+  SPIEL_CHECK_GE(player, 0);
+  const std::vector<Action> legal = state->LegalActions();
+  SPIEL_CHECK_FALSE(legal.empty());
+  const std::vector<float> observation =
+      state->InformationStateTensor(player);
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  model->to(torch::Device(torch::kCUDA));
+  model->eval();
+  std::shared_mutex model_mutex;
+  BatchedEvaluator evaluator(
+      model, 16, 2, torch::Device(torch::kCUDA), &model_mutex, 10.0f, false);
+  const EvalResult full = evaluator.Evaluate(observation);
+  const CompactEvalResult compact = evaluator.EvaluateCompact(
+      observation, legal);
+  SPIEL_CHECK_EQ(compact.actions, legal);
+  std::vector<float> logits = full.logits;
+  CenterAndCapLegalLogitsWithStats(logits, legal, 10.0f);
+  double normalizer = 0.0;
+  std::vector<double> expected;
+  for (Action action : legal) {
+    expected.push_back(std::exp(static_cast<double>(logits[action])));
+    normalizer += expected.back();
+  }
+  for (size_t i = 0; i < legal.size(); ++i) {
+    SPIEL_CHECK_TRUE(std::abs(
+        compact.probabilities[i] -
+        static_cast<float>(expected[i] / normalizer)) < 3e-3);
+  }
+  SPIEL_CHECK_TRUE(std::abs(compact.value - full.value) < 3e-3);
+}
+
 void TestTrainingShapingCannotChangeSearchArtifacts() {
   auto game = LoadGame("dune_imperium");
   auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(
@@ -576,6 +693,9 @@ int main() {
   open_spiel::TestV2AndReplay();
   open_spiel::TestActingPlayerInformationBoundary();
   open_spiel::TestScratchOneGameChunksPreserveBalancedGeneration();
+  open_spiel::TestPrefetchRangesAreFixedAndDisjoint();
+  open_spiel::TestAsyncEvaluatorEmptyQueueCompletes();
+  open_spiel::TestCompactLegalPolicyParityOnDuneState();
   open_spiel::TestTrainingShapingCannotChangeSearchArtifacts();
   std::cout << "dune_search_pi_scratch_test: PASS\n";
   return 0;

@@ -21,6 +21,7 @@
 #include "dune_batched_evaluator.h"
 #include "dune_evaluator.h"
 #include "dune_sha256.h"
+#include "dune_search_pi_scratch.h"
 #include "dune_split_evaluator.h"
 
 namespace open_spiel {
@@ -129,8 +130,12 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   }
   SPIEL_CHECK_EQ(config.collection_games % config.chunk_games, 0);
   SPIEL_CHECK_GT(config.requested_workers, 0);
+  SPIEL_CHECK_GE(config.inference_lanes, 1);
+  SPIEL_CHECK_EQ(config.requested_workers % config.inference_lanes, 0);
   const int num_chunks = config.collection_games / config.chunk_games;
-  SPIEL_CHECK_LE(config.requested_workers, num_chunks);
+  SPIEL_CHECK_GE(config.prefetch_games, 0);
+  SPIEL_CHECK_GT(config.prefetch_trigger_running, 0);
+  SPIEL_CHECK_EQ(config.prefetch_games % config.chunk_games, 0);
   SPIEL_CHECK_EQ(config.warmup_games % 4, 0);
   SPIEL_CHECK_TRUE(!config.output_dir.empty());
   if (config.batch_target != 0) {
@@ -169,6 +174,8 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   }
 
   const bool batched = config.batch_target > 0;
+  if (!batched) SPIEL_CHECK_EQ(config.inference_lanes, 1);
+  const int inference_lanes = batched ? config.inference_lanes : 1;
   // Declared before any batcher, so reverse destruction tears the batchers
   // down -- joining their runner threads -- while the mutex each was handed is
   // still alive. The policy batcher gets its OWN mutex: the two batchers guard
@@ -176,6 +183,16 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   // forwards behind the frozen model's for no protection.
   std::shared_mutex model_mutex;
   std::shared_mutex policy_model_mutex;
+  // These vectors are declared before the batchers so destruction joins every
+  // runner before its model or mutex is released. Lane zero aliases the
+  // caller-owned frozen model; every additional lane receives an independent
+  // parameter/buffer copy with identical weights.
+  std::vector<std::shared_ptr<SharedDunePolicyValueNetImpl>> lane_models;
+  std::vector<std::shared_ptr<std::shared_mutex>> lane_model_mutexes;
+  std::vector<std::shared_ptr<SharedDunePolicyValueNetImpl>> lane_policy_models;
+  std::vector<std::shared_ptr<std::shared_mutex>> lane_policy_mutexes;
+  std::vector<std::shared_ptr<BatchedEvaluator>> lane_batchers;
+  std::vector<std::shared_ptr<BatchedEvaluator>> lane_policy_batchers;
 
   // Provenance, taken BEFORE any batcher exists so no runner thread is reading
   // the parameters this walks. Hybrid only: on the incumbent path this would be
@@ -241,11 +258,13 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
     if (batched) {
       warm_batched = std::make_shared<BatchedEvaluator>(
           frozen_model, config.batch_target, config.batcher_timeout_ms, device,
-          &model_mutex, /*logit_cap=*/0.0f);
+          &model_mutex, /*logit_cap=*/0.0f,
+          config.device_synchronize, config.inference_high_priority);
       if (hybrid) {
         warm_policy_batched = std::make_shared<BatchedEvaluator>(
             policy_prior_model, config.batch_target, config.batcher_timeout_ms,
-            device, &policy_model_mutex, /*logit_cap=*/0.0f);
+            device, &policy_model_mutex, /*logit_cap=*/0.0f,
+            config.device_synchronize, config.inference_high_priority);
       }
     }
     // Warm-up must warm BOTH models under the hybrid arm: the point of the
@@ -271,39 +290,159 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   std::shared_ptr<BatchedEvaluator> shared_batcher;
   std::shared_ptr<BatchedEvaluator> policy_batcher;
   if (batched) {
-    shared_batcher = std::make_shared<BatchedEvaluator>(
-        frozen_model, config.batch_target, config.batcher_timeout_ms, device,
-        &model_mutex, /*logit_cap=*/0.0f);
-    shared_batcher->EnableBatcherTelemetry();
+    lane_models.reserve(inference_lanes);
+    lane_model_mutexes.reserve(inference_lanes);
+    lane_batchers.reserve(inference_lanes);
+    lane_models.push_back(frozen_model);
+    for (int lane = 1; lane < inference_lanes; ++lane) {
+      auto lane_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+          frozen_model->input_layer->weight.size(1),
+          frozen_model->input_layer->weight.size(0),
+          frozen_model->policy_head->weight.size(0),
+          static_cast<int>(frozen_model->res_blocks.size()),
+          frozen_model->use_nonlinear_value_head_,
+          frozen_model->has_aux_heads_);
+      lane_model->to(device);
+      CopySearchPiModel(frozen_model, lane_model);
+      lane_model->eval();
+      lane_models.push_back(std::move(lane_model));
+    }
+    for (int lane = 0; lane < inference_lanes; ++lane) {
+      lane_model_mutexes.push_back(std::make_shared<std::shared_mutex>());
+      lane_batchers.push_back(std::make_shared<BatchedEvaluator>(
+          lane_models[lane], config.batch_target, config.batcher_timeout_ms,
+          device, lane_model_mutexes[lane].get(), /*logit_cap=*/0.0f,
+          config.device_synchronize, config.inference_high_priority));
+      if (config.enable_batcher_telemetry) {
+        lane_batchers.back()->EnableBatcherTelemetry();
+      }
+    }
+    shared_batcher = lane_batchers.front();
     if (hybrid) {
-      // Mirrors the frozen batcher exactly -- same target, same timeout, same
-      // device, same zero logit cap (the cap is applied by BatchedNNEvaluator,
-      // not here) -- so the two telemetry records are read on one scale, and
-      // any difference between them is traffic rather than configuration.
-      policy_batcher = std::make_shared<BatchedEvaluator>(
-          policy_prior_model, config.batch_target, config.batcher_timeout_ms,
-          device, &policy_model_mutex, /*logit_cap=*/0.0f);
-      policy_batcher->EnableBatcherTelemetry();
+      lane_policy_models.reserve(inference_lanes);
+      lane_policy_mutexes.reserve(inference_lanes);
+      lane_policy_batchers.reserve(inference_lanes);
+      lane_policy_models.push_back(policy_prior_model);
+      for (int lane = 1; lane < inference_lanes; ++lane) {
+        auto lane_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+            policy_prior_model->input_layer->weight.size(1),
+            policy_prior_model->input_layer->weight.size(0),
+            policy_prior_model->policy_head->weight.size(0),
+            static_cast<int>(policy_prior_model->res_blocks.size()),
+            policy_prior_model->use_nonlinear_value_head_,
+            policy_prior_model->has_aux_heads_);
+        lane_model->to(device);
+        CopySearchPiModel(policy_prior_model, lane_model);
+        lane_model->eval();
+        lane_policy_models.push_back(std::move(lane_model));
+      }
+      for (int lane = 0; lane < inference_lanes; ++lane) {
+        lane_policy_mutexes.push_back(
+            std::make_shared<std::shared_mutex>());
+        lane_policy_batchers.push_back(std::make_shared<BatchedEvaluator>(
+            lane_policy_models[lane], config.batch_target,
+            config.batcher_timeout_ms, device, lane_policy_mutexes[lane].get(),
+            /*logit_cap=*/0.0f, config.device_synchronize,
+            config.inference_high_priority));
+        if (config.enable_batcher_telemetry) {
+          lane_policy_batchers.back()->EnableBatcherTelemetry();
+        }
+      }
+      policy_batcher = lane_policy_batchers.front();
     }
   }
 
   std::vector<SearchPiEvaluatorPair> evaluators;
   evaluators.reserve(config.requested_workers);
   for (int worker = 0; worker < config.requested_workers; ++worker) {
-    evaluators.push_back(make_evaluator_pair(shared_batcher, policy_batcher));
+    const int lane = worker % inference_lanes;
+    if (batched) {
+      evaluators.push_back(make_evaluator_pair(
+          lane_batchers[lane],
+          hybrid ? lane_policy_batchers[lane]
+                 : std::shared_ptr<BatchedEvaluator>()));
+    } else {
+      evaluators.push_back(make_evaluator_pair(shared_batcher, policy_batcher));
+    }
   }
 
   std::vector<SearchPiGenerationStats> chunk_stats(num_chunks);
   std::vector<std::vector<SearchPiRow>> chunk_rows(
       config.retain_rows ? num_chunks : 0);
+  const int prefetch_chunks = config.prefetch_games / config.chunk_games;
+  std::vector<SearchPiGenerationStats> prefetch_stats(prefetch_chunks);
+  std::vector<std::vector<SearchPiRow>> prefetch_rows(
+      config.retain_rows ? prefetch_chunks : 0);
   std::atomic<int> next_chunk{0};
+  std::atomic<int> current_running{0};
+  std::atomic<int> prefetch_next{0};
+  std::mutex prefetch_mutex;
+  std::condition_variable prefetch_cv;
+  std::mutex timing_mutex;
+  bool tail_triggered = false;
+  bool main_completed = false;
+  std::chrono::steady_clock::time_point tail_start;
+  std::chrono::steady_clock::time_point main_end;
+  int games_completed_before_tail = 0;
   std::mutex output_mutex;
+  auto emit_outcomes = [&](const std::vector<SearchPiGameOutcome>& outcomes) {
+    std::lock_guard<std::mutex> lock(output_mutex);
+    for (const SearchPiGameOutcome& outcome : outcomes) {
+      if (outcome.searches_short_of_budget > 0) {
+        short_stream << "{\"episode_id\":" << outcome.episode_id
+                     << ",\"root_fires\":"
+                     << outcome.searches_short_of_budget << "}\n";
+      }
+    }
+    short_stream.flush();
+    if (!short_stream) {
+      SpielFatalError(absl::StrCat(
+          "write failed for short-episode stream: ", short_path));
+    }
+  };
   auto worker_fn = [&](int slot) {
     torch::InferenceMode inference_guard;
     const SearchPiEvaluatorPair evaluator = evaluators[slot];
     for (;;) {
       const int chunk_index = next_chunk.fetch_add(1);
-      if (chunk_index >= num_chunks) break;
+      if (chunk_index >= num_chunks) {
+        if (prefetch_chunks == 0) break;
+        std::unique_lock<std::mutex> prefetch_lock(prefetch_mutex);
+        prefetch_cv.wait(prefetch_lock, [&]() {
+          return prefetch_next.load(std::memory_order_relaxed) >=
+                     prefetch_chunks ||
+                 current_running.load(std::memory_order_relaxed) <
+                     config.prefetch_trigger_running;
+        });
+        const int prefetch_index = prefetch_next.fetch_add(1);
+        if (prefetch_index >= prefetch_chunks) break;
+        prefetch_lock.unlock();
+        SearchPiConfig prefetch_config = config.search;
+        prefetch_config.games_per_generation = config.chunk_games;
+        prefetch_config.next_episode_id =
+            config.search.next_episode_id + config.collection_games +
+            static_cast<int64_t>(prefetch_index) * config.chunk_games;
+        std::vector<SearchPiRow> rows;
+        SearchPiGenerator(prefetch_config).GenerateGeneration(
+            config.generation, game, evaluator.behavior, evaluator.search,
+            &rows, &prefetch_stats[prefetch_index], config.arm);
+        if (config.retain_rows) {
+          prefetch_rows[prefetch_index] = std::move(rows);
+        }
+        emit_outcomes(prefetch_stats[prefetch_index].games_played);
+        {
+          std::lock_guard<std::mutex> lock(output_mutex);
+          std::cout << "[search-PI concurrent] " << SearchPiArmName(config.arm)
+                    << " prefetch " << (prefetch_index + 1) << "/"
+                    << prefetch_chunks << " episodes ["
+                    << prefetch_stats[prefetch_index].first_episode_id << ".."
+                    << prefetch_stats[prefetch_index].next_episode_id
+                    << ") rows=" << prefetch_stats[prefetch_index].rows_total
+                    << " collector_generation=" << config.generation << "\n";
+        }
+        continue;
+      }
+      current_running.fetch_add(1, std::memory_order_relaxed);
       SearchPiConfig chunk_config = config.search;
       chunk_config.games_per_generation = config.chunk_games;
       chunk_config.next_episode_id =
@@ -318,21 +457,29 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
           config.generation, game, evaluator.behavior, evaluator.search, &rows,
           &chunk_stats[chunk_index], config.arm);
       if (config.retain_rows) chunk_rows[chunk_index] = std::move(rows);
+      emit_outcomes(chunk_stats[chunk_index].games_played);
+      const int running_after =
+          current_running.fetch_sub(1, std::memory_order_relaxed) - 1;
+      if (next_chunk.load(std::memory_order_relaxed) >= num_chunks &&
+          running_after < config.prefetch_trigger_running) {
+        std::lock_guard<std::mutex> timing_lock(timing_mutex);
+        if (!tail_triggered) {
+          tail_triggered = true;
+          tail_start = std::chrono::steady_clock::now();
+          games_completed_before_tail = config.collection_games - running_after;
+        }
+      }
+      if (running_after == 0 &&
+          next_chunk.load(std::memory_order_relaxed) >= num_chunks) {
+        std::lock_guard<std::mutex> timing_lock(timing_mutex);
+        if (!main_completed) {
+          main_completed = true;
+          main_end = std::chrono::steady_clock::now();
+        }
+      }
+      prefetch_cv.notify_all();
       {
         std::lock_guard<std::mutex> lock(output_mutex);
-        for (const SearchPiGameOutcome& outcome :
-             chunk_stats[chunk_index].games_played) {
-          if (outcome.searches_short_of_budget > 0) {
-            short_stream << "{\"episode_id\":" << outcome.episode_id
-                         << ",\"root_fires\":"
-                         << outcome.searches_short_of_budget << "}\n";
-          }
-        }
-        short_stream.flush();
-        if (!short_stream) {
-          SpielFatalError(absl::StrCat(
-              "write failed for short-episode stream: ", short_path));
-        }
         std::cout << "[search-PI concurrent] " << SearchPiArmName(config.arm)
                   << " chunk " << (chunk_index + 1) << "/" << num_chunks
                   << " episodes [" << chunk_stats[chunk_index].first_episode_id
@@ -355,6 +502,7 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   result.actual_workers = config.requested_workers;
   result.configured_batch_target = config.batch_target;
   result.configured_batcher_timeout_ms = config.batcher_timeout_ms;
+  result.configured_inference_lanes = inference_lanes;
   // Unchanged in BOTH modes, and correct in both. A worker thread blocks on one
   // evaluator request at a time, and the largest request it can make of the
   // frozen batcher is still the four-row leaf group -- hybrid moves priors out,
@@ -393,17 +541,91 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
   if (config.retain_rows) {
     for (int chunk_index = 0; chunk_index < num_chunks; ++chunk_index) {
       for (const SearchPiRow& row : chunk_rows[chunk_index]) {
-        result.target_hash_chain =
-            ChainSearchPiTargetHash(result.target_hash_chain, row);
-        result.extended_hash_chain =
-            ChainSearchPiExtendedRowHash(result.extended_hash_chain, row);
+        if (!config.search.scratch_visit_v1) {
+          result.target_hash_chain =
+              ChainSearchPiTargetHash(result.target_hash_chain, row);
+          result.extended_hash_chain =
+              ChainSearchPiExtendedRowHash(result.extended_hash_chain, row);
+        }
         result.retained_rows.push_back(row);
       }
     }
   }
+  if (config.retain_rows) {
+    result.prefetch_collector_generation = config.generation;
+    result.prefetch_for_generation = config.generation + 1;
+    for (int prefetch_index = 0; prefetch_index < prefetch_chunks;
+         ++prefetch_index) {
+      result.prefetched_rows.insert(
+          result.prefetched_rows.end(), prefetch_rows[prefetch_index].begin(),
+          prefetch_rows[prefetch_index].end());
+      result.prefetched_games.insert(
+          result.prefetched_games.end(),
+          prefetch_stats[prefetch_index].games_played.begin(),
+          prefetch_stats[prefetch_index].games_played.end());
+    }
+  }
   if (batched) {
-    result.telemetry = shared_batcher->GetBatcherTelemetry();
-    result.telemetry_valid = true;
+    auto add_telemetry = [](BatcherTelemetry* dst,
+                            const BatcherTelemetry& src) {
+      const uint64_t prior_physical = dst->physical_batches;
+      const uint64_t prior_single_wait = dst->single_wait_n;
+      const uint64_t prior_group_wait = dst->group_wait_n;
+      dst->submitted_rows += src.submitted_rows;
+      dst->physical_batches += src.physical_batches;
+      dst->max_batch_size = std::max(dst->max_batch_size, src.max_batch_size);
+      dst->timeout_flush_batches += src.timeout_flush_batches;
+      dst->single_row_calls += src.single_row_calls;
+      dst->group_calls += src.group_calls;
+      dst->group_rows += src.group_rows;
+      dst->leaf_groups_split += src.leaf_groups_split;
+      dst->single_wait_ms_max =
+          std::max(dst->single_wait_ms_max, src.single_wait_ms_max);
+      dst->group_wait_ms_max =
+          std::max(dst->group_wait_ms_max, src.group_wait_ms_max);
+      dst->single_wait_ms_mean =
+          prior_single_wait + src.single_wait_n > 0
+              ? (dst->single_wait_ms_mean * prior_single_wait +
+                 src.single_wait_ms_mean * src.single_wait_n) /
+                    (prior_single_wait + src.single_wait_n)
+              : 0.0;
+      dst->group_wait_ms_mean =
+          prior_group_wait + src.group_wait_n > 0
+              ? (dst->group_wait_ms_mean * prior_group_wait +
+                 src.group_wait_ms_mean * src.group_wait_n) /
+                    (prior_group_wait + src.group_wait_n)
+              : 0.0;
+      dst->single_wait_n += src.single_wait_n;
+      dst->group_wait_n += src.group_wait_n;
+      dst->h2d_ms += src.h2d_ms;
+      dst->forward_ms += src.forward_ms;
+      dst->output_cast_ms += src.output_cast_ms;
+      dst->d2h_ms += src.d2h_ms;
+      dst->sync_ms += src.sync_ms;
+      dst->device_timed_batches += src.device_timed_batches;
+      if (dst->target_batch_size == 0) {
+        dst->target_batch_size = src.target_batch_size;
+        dst->timeout_ms = src.timeout_ms;
+      }
+      if (dst->physical_batches > 0) {
+        dst->mean_batch_size =
+            static_cast<double>(dst->submitted_rows) /
+            static_cast<double>(dst->physical_batches);
+        dst->target_occupancy = dst->target_batch_size > 0
+            ? dst->mean_batch_size / dst->target_batch_size
+            : 0.0;
+      }
+      (void)prior_physical;
+    };
+    result.lane_telemetry.reserve(inference_lanes);
+    result.lane_worker_counts.reserve(inference_lanes);
+    for (int lane = 0; lane < inference_lanes; ++lane) {
+      result.lane_telemetry.push_back(lane_batchers[lane]->GetBatcherTelemetry());
+      result.lane_worker_counts.push_back(config.requested_workers /
+                                          inference_lanes);
+      add_telemetry(&result.telemetry, result.lane_telemetry.back());
+    }
+    result.telemetry_valid = config.enable_batcher_telemetry;
     result.telemetry_device_applicable = device.is_cuda();
     if (hybrid) {
       // Surfaced, not discarded. Half a hybrid run's inference traffic goes
@@ -411,12 +633,65 @@ ConcurrentSearchPiCollectionResult CollectSearchPiConcurrent(
       // occupancy unmeasurable -- and, more importantly, would leave the
       // validator unable to prove from telemetry that no leaf group ever
       // reached the candidate model.
-      result.policy_telemetry = policy_batcher->GetBatcherTelemetry();
-      result.policy_telemetry_valid = true;
+      for (int lane = 0; lane < inference_lanes; ++lane) {
+        const BatcherTelemetry policy_lane =
+            lane_policy_batchers[lane]->GetBatcherTelemetry();
+        // The policy telemetry is descriptive for the hybrid arm and retains
+        // one aggregate record for compatibility with existing validators.
+        result.policy_telemetry.submitted_rows += policy_lane.submitted_rows;
+        result.policy_telemetry.physical_batches += policy_lane.physical_batches;
+        result.policy_telemetry.max_batch_size = std::max(
+            result.policy_telemetry.max_batch_size, policy_lane.max_batch_size);
+        result.policy_telemetry.timeout_flush_batches +=
+            policy_lane.timeout_flush_batches;
+        result.policy_telemetry.single_row_calls += policy_lane.single_row_calls;
+        result.policy_telemetry.group_calls += policy_lane.group_calls;
+        result.policy_telemetry.group_rows += policy_lane.group_rows;
+        result.policy_telemetry.leaf_groups_split +=
+            policy_lane.leaf_groups_split;
+        result.policy_telemetry.h2d_ms += policy_lane.h2d_ms;
+        result.policy_telemetry.forward_ms += policy_lane.forward_ms;
+        result.policy_telemetry.output_cast_ms += policy_lane.output_cast_ms;
+        result.policy_telemetry.d2h_ms += policy_lane.d2h_ms;
+        result.policy_telemetry.sync_ms += policy_lane.sync_ms;
+        result.policy_telemetry.device_timed_batches +=
+            policy_lane.device_timed_batches;
+        result.policy_telemetry.target_batch_size =
+            policy_lane.target_batch_size;
+        result.policy_telemetry.timeout_ms = policy_lane.timeout_ms;
+      }
+      if (result.policy_telemetry.physical_batches > 0) {
+        result.policy_telemetry.mean_batch_size =
+            static_cast<double>(result.policy_telemetry.submitted_rows) /
+            result.policy_telemetry.physical_batches;
+        result.policy_telemetry.target_occupancy =
+            result.policy_telemetry.target_batch_size > 0
+                ? result.policy_telemetry.mean_batch_size /
+                      result.policy_telemetry.target_batch_size
+                : 0.0;
+      }
+      result.policy_telemetry_valid = config.enable_batcher_telemetry;
     }
   }
   result.wall_time_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - wall_start).count();
+  {
+    std::lock_guard<std::mutex> timing_lock(timing_mutex);
+    const auto wall_end = std::chrono::steady_clock::now();
+    result.prefetch_triggered = tail_triggered && prefetch_chunks > 0;
+    result.main_games_completed_before_tail = games_completed_before_tail;
+    if (main_completed) {
+      result.main_collection_wall_time_s = std::chrono::duration<double>(
+          main_end - wall_start).count();
+    } else {
+      result.main_collection_wall_time_s = result.wall_time_s;
+    }
+    if (tail_triggered && main_completed) {
+      result.tail_wall_time_s = std::chrono::duration<double>(
+          main_end - tail_start).count();
+    }
+    (void)wall_end;
+  }
   return result;
 }
 

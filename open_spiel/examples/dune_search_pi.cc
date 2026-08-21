@@ -1,4 +1,5 @@
 #include "dune_search_pi.h"
+#include "open_spiel/examples/dune_hotspot_profile.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1158,6 +1159,8 @@ void SearchPiGenerator::GenerateGeneration(
         session.SetTrainingPolicyIterationBudgets(primary, other, other);
       }
 
+      dune_hotspot::ScopedTimer hotspot_timer(
+          dune_hotspot::Kind::kMctsSearch);
       DuneSearchResult res = session.Search(*state);
       stats->simulations_by_role[role_idx] += res.simulations_completed;
       if (!IsSearchPiSearchRole(role, config_.purchase_combat_budget)) {
@@ -1382,7 +1385,9 @@ void SearchPiGenerator::GenerateGeneration(
           // representation for this explicit-chance, sequential game. Hash it
           // before applying the selected action so retained Gate 3/4 rows can
           // be joined only when they describe the same game state.
-          row.state_fingerprint = ComputeStringSHA256(state->Serialize());
+          row.state_fingerprint = config_.scratch_visit_v1
+                                      ? std::string()
+                                      : ComputeStringSHA256(state->Serialize());
           row.simulations_completed = res.simulations_completed;
           row.simulations_requested = requested;
           row.early_exit = early_exit;
@@ -1618,9 +1623,11 @@ void SearchPiGenerator::GenerateGeneration(
   // extended one is the only one that can carry a cross-arm row-identity claim.
   std::string chain;
   std::string ext_chain;
-  for (size_t i = out_base; i < out->size(); ++i) {
-    chain = ChainSearchPiTargetHash(chain, (*out)[i]);
-    ext_chain = ChainSearchPiExtendedRowHash(ext_chain, (*out)[i]);
+  if (!config_.scratch_visit_v1) {
+    for (size_t i = out_base; i < out->size(); ++i) {
+      chain = ChainSearchPiTargetHash(chain, (*out)[i]);
+      ext_chain = ChainSearchPiExtendedRowHash(ext_chain, (*out)[i]);
+    }
   }
   stats->target_hash_chain = chain;
   stats->extended_hash_chain = ext_chain;

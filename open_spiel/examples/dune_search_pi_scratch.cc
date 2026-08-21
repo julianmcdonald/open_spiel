@@ -37,6 +37,23 @@ double SaturationRate(const torch::Tensor& values) {
   return values.detach().abs().ge(0.99).to(torch::kDouble).mean().item<double>();
 }
 
+torch::Tensor PredictValuesInMinibatches(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const torch::Tensor& states_cpu, torch::Device device,
+    int64_t minibatch_size) {
+  const int64_t n = states_cpu.size(0);
+  torch::Tensor prediction_cpu = torch::empty(
+      {n}, torch::TensorOptions().dtype(torch::kFloat32));
+  for (int64_t start = 0; start < n; start += minibatch_size) {
+    const int64_t length = std::min<int64_t>(minibatch_size, n - start);
+    torch::Tensor mb_states = states_cpu.narrow(0, start, length).to(device);
+    torch::Tensor mb_values = model->forward(mb_states).values.squeeze(1)
+                                  .to(torch::kCPU);
+    prediction_cpu.narrow(0, start, length).copy_(mb_values);
+  }
+  return prediction_cpu;
+}
+
 double GradNorm(const std::vector<torch::Tensor>& grads) {
   double sum_sq = 0.0;
   for (const torch::Tensor& grad : grads) {
@@ -538,16 +555,12 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
     value_data[i] = static_cast<float>(row.value_target);
   }
 
-  states = states.to(device);
-  masks = masks.to(device);
-  targets = targets.to(device);
-  weights = weights.to(device);
-  values = values.to(device);
   MeanSd(values, &stats.value_target_mean, &stats.value_target_sd);
 
   {
     torch::NoGradGuard guard;
-    torch::Tensor prediction = model->forward(states).values.squeeze(1);
+    torch::Tensor prediction = PredictValuesInMinibatches(
+        model, states, device, cfg.minibatch_size);
     MeanSd(prediction, &stats.critic_pred_mean_pre,
            &stats.critic_pred_sd_pre);
     stats.critic_saturation_pre = SaturationRate(prediction);
@@ -578,17 +591,16 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
                               generation, epoch, uint64_t{0x5009}));
     torch::Tensor permutation =
         torch::randperm(n, generator,
-                        torch::TensorOptions().dtype(torch::kInt64))
-            .to(device);
+                        torch::TensorOptions().dtype(torch::kInt64));
     for (int64_t start = 0; start < n; start += cfg.minibatch_size) {
       const int64_t length =
           std::min<int64_t>(cfg.minibatch_size, n - start);
       torch::Tensor index = permutation.narrow(0, start, length);
-      torch::Tensor mb_states = states.index_select(0, index);
-      torch::Tensor mb_masks = masks.index_select(0, index);
-      torch::Tensor mb_targets = targets.index_select(0, index);
-      torch::Tensor mb_weights = weights.index_select(0, index);
-      torch::Tensor mb_values = values.index_select(0, index);
+      torch::Tensor mb_states = states.index_select(0, index).to(device);
+      torch::Tensor mb_masks = masks.index_select(0, index).to(device);
+      torch::Tensor mb_targets = targets.index_select(0, index).to(device);
+      torch::Tensor mb_weights = weights.index_select(0, index).to(device);
+      torch::Tensor mb_values = values.index_select(0, index).to(device);
 
       auto output = model->forward(mb_states);
       {
@@ -722,7 +734,8 @@ ScratchSearchPiLearnerStats RunScratchSearchPiLearner(
   model->eval();
   {
     torch::NoGradGuard guard;
-    torch::Tensor prediction = model->forward(states).values.squeeze(1);
+    torch::Tensor prediction = PredictValuesInMinibatches(
+        model, states, device, cfg.minibatch_size);
     MeanSd(prediction, &stats.critic_pred_mean_post,
            &stats.critic_pred_sd_post);
     stats.critic_saturation_post = SaturationRate(prediction);

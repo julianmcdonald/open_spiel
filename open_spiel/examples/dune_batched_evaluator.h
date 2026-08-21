@@ -30,7 +30,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     for (int p = 0; p < num_players; ++p) {
       observations.push_back(state.InformationStateTensor(p));
     }
-    auto results = batched_eval_->EvaluateBatch(observations);
+    auto results = batched_eval_->EvaluateBatchValues(observations);
     for (int p = 0; p < num_players; ++p) {
       double val = results[p].value;
       values[p] = val;
@@ -47,45 +47,19 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     if (current_player < 0 || current_player >= state.NumPlayers()) {
       return {};
     }
-    std::vector<float> obs = state.InformationStateTensor(current_player);
-    open_spiel::EvalResult result = batched_eval_->Evaluate(obs);
-
     std::vector<Action> legal_actions = state.LegalActions();
     if (legal_actions.empty()) {
       return {};
     }
-
-    std::vector<float> logits(result.logits.begin(), result.logits.end());
-    const LogitCapApplicationStats cap_stats =
-        CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
-    DuneNNEvaluator::RecordLogitCapStats(cap_stats);
-
-    double max_logit = -std::numeric_limits<double>::infinity();
-    for (Action action : legal_actions) {
-      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
-        max_logit = std::max(max_logit, static_cast<double>(logits[action]));
-      }
-    }
-
-    double sum_exp = 0.0;
-    std::vector<double> exps(legal_actions.size());
-    for (size_t i = 0; i < legal_actions.size(); ++i) {
-      Action action = legal_actions[i];
-      if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
-        exps[i] = std::exp(logits[action] - max_logit);
-        sum_exp += exps[i];
-      } else {
-        exps[i] = 0.0;
-      }
-    }
+    std::vector<float> obs = state.InformationStateTensor(current_player);
+    open_spiel::CompactEvalResult result =
+        batched_eval_->EvaluateCompact(obs, legal_actions);
 
     ActionsAndProbs policy;
-    policy.reserve(legal_actions.size());
-    for (size_t i = 0; i < legal_actions.size(); ++i) {
-      double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
-      policy.push_back({legal_actions[i], prob});
+    policy.reserve(result.actions.size());
+    for (size_t i = 0; i < result.actions.size(); ++i) {
+      policy.push_back({result.actions[i], result.probabilities[i]});
     }
-
     return policy;
   }
 
@@ -98,13 +72,24 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       return {policy, values};
     }
     Player current_player = state.CurrentPlayer();
+    if (current_player < 0 || current_player >= num_players) {
+      return {policy, values};
+    }
 
     std::vector<std::vector<float>> observations;
     observations.reserve(num_players);
     for (int p = 0; p < num_players; ++p) {
       observations.push_back(state.InformationStateTensor(p));
     }
-    auto results = batched_eval_->EvaluateBatch(observations);
+    std::vector<Action> legal_actions;
+    if (current_player >= 0 && current_player < num_players) {
+      legal_actions = state.LegalActions();
+    }
+    auto value_and_prior = batched_eval_->EvaluateBatchValuesWithCompactPrior(
+        observations, static_cast<size_t>(current_player),
+        legal_actions);
+    auto& results = value_and_prior.first;
+    const auto& compact_prior = value_and_prior.second;
 
     for (int p = 0; p < num_players; ++p) {
       const open_spiel::EvalResult& result = results[p];
@@ -112,41 +97,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       values[p] = val;
       DuneNNEvaluator::RecordLeafValue(val);
 
-      if (p == current_player) {
-        std::vector<Action> legal_actions = state.LegalActions();
-        if (!legal_actions.empty()) {
-          std::vector<float> logits(result.logits.begin(), result.logits.end());
-          const LogitCapApplicationStats cap_stats =
-              CenterAndCapLegalLogitsWithStats(logits, legal_actions,
-                                               logit_cap_);
-          DuneNNEvaluator::RecordLogitCapStats(cap_stats);
-
-          double max_logit = -std::numeric_limits<double>::infinity();
-          for (Action action : legal_actions) {
-            if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
-              max_logit = std::max(max_logit, static_cast<double>(logits[action]));
-            }
-          }
-
-          double sum_exp = 0.0;
-          std::vector<double> exps(legal_actions.size());
-          for (size_t i = 0; i < legal_actions.size(); ++i) {
-            Action action = legal_actions[i];
-            if (action >= 0 && static_cast<size_t>(action) < logits.size()) {
-              exps[i] = std::exp(logits[action] - max_logit);
-              sum_exp += exps[i];
-            } else {
-              exps[i] = 0.0;
-            }
-          }
-
-          policy.reserve(legal_actions.size());
-          for (size_t i = 0; i < legal_actions.size(); ++i) {
-            double prob = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
-            policy.push_back({legal_actions[i], prob});
-          }
-        }
-      }
+    }
+    policy.reserve(compact_prior.actions.size());
+    for (size_t i = 0; i < compact_prior.actions.size(); ++i) {
+      policy.push_back({compact_prior.actions[i], compact_prior.probabilities[i]});
     }
     return {policy, values};
   }

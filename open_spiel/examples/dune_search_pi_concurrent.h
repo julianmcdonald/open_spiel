@@ -28,6 +28,24 @@ struct ConcurrentSearchPiCollectionConfig {
   int requested_workers = 1;
   int batch_target = 0;       // zero preserves the historical reference path
   int batcher_timeout_ms = 2;
+  // Detailed per-row/device telemetry is useful for benchmark runs but adds
+  // bookkeeping to every physical batch. Production can disable it while
+  // retaining the always-on health counters.
+  bool enable_batcher_telemetry = true;
+  // The production fast path may use blocking D2H copies, which synchronize
+  // only the work needed for that result instead of the whole CUDA device.
+  bool device_synchronize = true;
+  bool inference_high_priority = false;
+  // Number of independent immutable collector-model/batcher lanes. Each lane
+  // owns its queue, runner stream(s), staging buffers, and model mutex. The
+  // historical path remains one lane; throughput probes may partition workers
+  // evenly across multiple lanes.
+  int inference_lanes = 1;
+  // Optional bounded look-ahead. These games use the current frozen collector
+  // but are returned separately so the caller cannot train on them in this
+  // generation's update.
+  int prefetch_games = 0;
+  int prefetch_trigger_running = 32;
   int warmup_games = 0;
   bool retain_rows = true;
   float logit_cap = 10.0f;
@@ -41,6 +59,7 @@ struct ConcurrentSearchPiCollectionResult {
   int actual_workers = 0;
   int configured_batch_target = 0;
   int configured_batcher_timeout_ms = 0;
+  int configured_inference_lanes = 1;
   // Capacity of the FROZEN batcher, in rows: four leaf-group rows per worker,
   // because a worker thread blocks on exactly one evaluator request at a time
   // and its largest request is the four-player leaf group. Unchanged by the
@@ -79,10 +98,20 @@ struct ConcurrentSearchPiCollectionResult {
   std::string target_hash_chain;
   std::string extended_hash_chain;
   std::vector<SearchPiRow> retained_rows;
+  std::vector<SearchPiRow> prefetched_rows;
+  std::vector<SearchPiGameOutcome> prefetched_games;
+  int prefetch_collector_generation = -1;
+  int prefetch_for_generation = -1;
   double wall_time_s = 0.0;
+  double main_collection_wall_time_s = 0.0;
+  double tail_wall_time_s = 0.0;
+  int main_games_completed_before_tail = 0;
+  bool prefetch_triggered = false;
   bool telemetry_valid = false;
   bool telemetry_device_applicable = false;
   BatcherTelemetry telemetry;
+  std::vector<BatcherTelemetry> lane_telemetry;
+  std::vector<int> lane_worker_counts;
 };
 
 bool SearchPiBatcherRowsIdentityOk(const BatcherTelemetry& telemetry);
