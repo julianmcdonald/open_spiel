@@ -73,9 +73,15 @@ ABSL_FLAG(bool, crash_after_update, false,
           "Stop cleanly after update one to exercise resume.");
 ABSL_FLAG(bool, verify_production_manifest_only, false,
           "Load and validate a production manifest, then exit without games.");
+ABSL_FLAG(bool, checkpoint_every_update, false,
+          "Test-only: publish a standard checkpoint after every update.");
+ABSL_FLAG(bool, force_health_failure_for_test, false,
+          "Test-only: make manifest verification fail closed.");
 ABSL_FLAG(std::string, resume, "", "Async smoke state JSON.");
 ABSL_FLAG(std::string, production_checkpoint_manifest, "",
           "Production checkpoint manifest used to seed a faithful comparison.");
+ABSL_FLAG(std::string, production_run_dir, "",
+          "Standard production run root for checkpoints and telemetry.");
 ABSL_FLAG(size_t, replay_max_rows, 200000, "Maximum replay rows sampled per update.");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
           "Environment step at which shaping decay starts.");
@@ -129,6 +135,9 @@ struct LedgerEntry {
 
 struct SmokeState {
   int next_update = 0;
+  int initial_generation = 0;
+  int64_t run_first_episode_id = 0;
+  int64_t target_episode_end = 0;
   int64_t first_episode_id = 0;
   int64_t next_episode_id = 0;
   int published_generation = 0;
@@ -165,6 +174,10 @@ json::Object ToJson(const SmokeState& state) {
   json::Object object;
   object["schema_version"] = int64_t{1};
   object["next_update"] = static_cast<int64_t>(state.next_update);
+  object["initial_generation"] =
+      static_cast<int64_t>(state.initial_generation);
+  object["run_first_episode_id"] = state.run_first_episode_id;
+  object["target_episode_end"] = state.target_episode_end;
   object["first_episode_id"] = state.first_episode_id;
   object["next_episode_id"] = state.next_episode_id;
   object["published_generation"] =
@@ -220,6 +233,19 @@ SmokeState ReadState(const std::string& path) {
   state.first_episode_id = first_episode == object.end()
                                ? state.next_episode_id
                                : first_episode->second.GetInt();
+  const auto initial_generation = object.find("initial_generation");
+  state.initial_generation =
+      initial_generation == object.end()
+          ? state.published_generation
+          : static_cast<int>(initial_generation->second.GetInt());
+  const auto run_first_episode = object.find("run_first_episode_id");
+  state.run_first_episode_id =
+      run_first_episode == object.end()
+          ? state.first_episode_id
+          : run_first_episode->second.GetInt();
+  const auto target_episode_end = object.find("target_episode_end");
+  state.target_episode_end =
+      target_episode_end == object.end() ? 0 : target_episode_end->second.GetInt();
   state.next_episode_id = object.at("next_episode_id").GetInt();
   state.published_generation =
       static_cast<int>(object.at("published_generation").GetInt());
@@ -298,23 +324,9 @@ ProductionResumeState ReadProductionResumeState(const std::string& path) {
       object.at("total_env_steps").GetInt());
   state.model_checkpoint = object.at("model_checkpoint").GetString();
   state.optimizer_checkpoint = object.at("optimizer_checkpoint").GetString();
+  // This is the continuation's first new episode, not the generation-zero
+  // origin recorded in resolved_config.json.
   state.first_episode_id = state.next_episode_id;
-  const std::filesystem::path resolved_path =
-      std::filesystem::path(path).parent_path().parent_path() /
-      "resolved_config.json";
-  if (std::filesystem::exists(resolved_path)) {
-    std::ifstream resolved_input(resolved_path);
-    const std::string resolved_content(
-        (std::istreambuf_iterator<char>(resolved_input)),
-        std::istreambuf_iterator<char>());
-    auto resolved = json::FromString(resolved_content);
-    if (resolved.has_value() && resolved->IsObject()) {
-      const auto first_episode = resolved->GetObject().find("first_episode_id");
-      if (first_episode != resolved->GetObject().end()) {
-        state.first_episode_id = first_episode->second.GetInt();
-      }
-    }
-  }
   for (const json::Value& value : object.at("replay_paths").GetArray()) {
     state.replay_paths.push_back(value.GetString());
   }
@@ -335,10 +347,11 @@ ProductionResumeState ReadProductionResumeState(const std::string& path) {
   }
   const size_t expected_replay_paths =
       static_cast<size_t>(std::min(state.generation, 8));
-  if (state.replay_paths.size() != expected_replay_paths) {
-    SpielFatalError("production comparison replay horizon mismatch: expected " +
-                    std::to_string(expected_replay_paths) + ", got " +
-                    std::to_string(state.replay_paths.size()));
+  const size_t logical_replay_cohorts = state.replay_cohort_groups.size();
+  if (logical_replay_cohorts != expected_replay_paths) {
+    SpielFatalError("production comparison logical replay horizon mismatch: " +
+                    std::to_string(expected_replay_paths) + " expected, got " +
+                    std::to_string(logical_replay_cohorts));
   }
   return state;
 }
@@ -608,9 +621,12 @@ int main(int argc, char** argv) {
   const std::string production_manifest =
       ::absl::GetFlag(FLAGS_production_checkpoint_manifest);
   const std::filesystem::path production_run_dir =
-      production_manifest.empty()
-          ? std::filesystem::path()
-          : std::filesystem::path(production_manifest).parent_path().parent_path();
+      !::absl::GetFlag(FLAGS_production_run_dir).empty()
+          ? std::filesystem::path(::absl::GetFlag(FLAGS_production_run_dir))
+          : production_manifest.empty()
+                ? std::filesystem::path()
+                : std::filesystem::path(production_manifest)
+                      .parent_path().parent_path();
   const uint64_t shaping_start_env_steps =
       ::absl::GetFlag(FLAGS_shaping_start_env_steps);
   const uint64_t shaping_decay_env_steps =
@@ -637,14 +653,18 @@ int main(int argc, char** argv) {
     torch::load(student, production_state.model_checkpoint, device);
     torch::load(*optimizer, production_state.optimizer_checkpoint, device);
     state.first_episode_id = production_state.first_episode_id;
+    state.run_first_episode_id = production_state.first_episode_id;
     state.next_episode_id = production_state.next_episode_id;
     state.published_generation = production_state.generation;
+    state.initial_generation = production_state.generation;
     state.total_env_steps = production_state.total_env_steps;
     state.replay_paths = production_state.replay_paths;
     state.replay_cohort_groups = production_state.replay_cohort_groups;
   } else {
     state.first_episode_id = ::absl::GetFlag(FLAGS_first_episode_id);
+    state.run_first_episode_id = state.first_episode_id;
     state.next_episode_id = ::absl::GetFlag(FLAGS_first_episode_id);
+    state.initial_generation = state.published_generation;
     AtomicJson(state_path.string(), ToJson(state));
   }
 
@@ -700,6 +720,9 @@ int main(int argc, char** argv) {
         static_cast<int64_t>(state.total_env_steps);
     verification["replay_cohorts"] =
         static_cast<int64_t>(replay_window.size());
+    if (::absl::GetFlag(FLAGS_force_health_failure_for_test)) {
+      return 2;
+    }
     std::cout << json::ToString(verification, true) << "\n";
     return 0;
   }
@@ -725,10 +748,22 @@ int main(int argc, char** argv) {
                                     ? requested_target_generation
                                     : state.published_generation + updates;
   SPIEL_CHECK_GT(target_generation, state.published_generation);
-  const int target_updates = target_generation - state.published_generation;
-  const int total_games = target_updates * games_per_update;
-  const int64_t target_end =
-      state.first_episode_id + static_cast<int64_t>(total_games);
+  if (state.initial_generation == 0 && state.published_generation != 0) {
+    state.initial_generation = state.published_generation;
+  }
+  if (state.run_first_episode_id == 0) {
+    state.run_first_episode_id = state.first_episode_id;
+  }
+  if (state.target_episode_end == 0) {
+    state.target_episode_end =
+        state.run_first_episode_id +
+        static_cast<int64_t>(target_generation - state.initial_generation) *
+            games_per_update;
+  }
+  const int64_t target_end = state.target_episode_end;
+  const int total_games = static_cast<int>(
+      target_end - state.run_first_episode_id);
+  SPIEL_CHECK_GT(total_games, 0);
   const auto started = std::chrono::steady_clock::now();
   const std::set<int64_t> completed_at_resume = [&]() {
     std::set<int64_t> ids;
@@ -1083,7 +1118,8 @@ int main(int argc, char** argv) {
                    std::to_string(state.published_generation) + ".json"))
                      .string(),
                  generation_telemetry);
-      if (state.published_generation % 5 == 0) {
+      if (::absl::GetFlag(FLAGS_checkpoint_every_update) ||
+          state.published_generation % 5 == 0) {
         SaveProductionCheckpoint(production_run_dir,
                                  state.published_generation, state, student,
                                  *optimizer);
