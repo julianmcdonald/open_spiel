@@ -117,6 +117,18 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_search_pi_async_smoke
     dune_search ${TORCH_LIBRARIES})
 
+  # Production actor-learner entry point. It shares the persistent queue and
+  # immutable two-lane implementation with the smoke harness, but the real
+  # launcher invokes this distinct target with a production checkpoint
+  # manifest and target generation.
+  add_executable(dune_search_pi_async_train
+    dune_search_pi_async_smoke_main.cc dune_search_pi_scratch.cc
+    dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_async_train
+    dune_search ${TORCH_LIBRARIES})
+
   # Post-termination descriptive forensic for Rung-4N. This is a separate
   # read-only instrument: it reconstructs and hashes the exact rows presented
   # to a completed F/W update, then brackets that update with its archived
