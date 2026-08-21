@@ -668,7 +668,6 @@ int main(int argc, char** argv) {
     AtomicJson(state_path.string(), ToJson(state));
   }
 
-  std::vector<SearchPiRow> replay_rows;
   std::vector<std::vector<SearchPiRow>> replay_window;
   std::map<int64_t, LedgerEntry> ledger;
   if (state.replay_cohort_groups.empty()) {
@@ -684,27 +683,14 @@ int main(int argc, char** argv) {
       if (!ReadScratchSearchPiRowShardV2(replay_path, &rows, &error)) {
         SpielFatalError("async production replay load failed: " + error);
       }
-      replay_rows.insert(replay_rows.end(), rows.begin(), rows.end());
       cohort_rows.insert(cohort_rows.end(), rows.begin(), rows.end());
     }
     replay_window.push_back(std::move(cohort_rows));
   }
-  std::vector<SearchPiRow> resumed_rows;
   for (const LedgerEntry& entry : state.completed) {
     if (!ledger.emplace(entry.episode_id, entry).second) {
       SpielFatalError("duplicate completed episode in ledger");
     }
-    std::vector<SearchPiRow> rows;
-    std::string error;
-    if (!ReadScratchSearchPiRowShardV2(entry.shard_path, &rows, &error)) {
-      SpielFatalError("async smoke replay load failed: " + error);
-    }
-    replay_rows.insert(replay_rows.end(), rows.begin(), rows.end());
-    resumed_rows.insert(resumed_rows.end(), rows.begin(), rows.end());
-  }
-  if (!resumed_rows.empty()) {
-    replay_window.push_back(std::move(resumed_rows));
-    while (replay_window.size() > 8) replay_window.erase(replay_window.begin());
   }
   if (::absl::GetFlag(FLAGS_verify_production_manifest_only)) {
     if (production_manifest.empty()) {
@@ -931,8 +917,6 @@ int main(int argc, char** argv) {
     entry.non_timeout_early_exits = completion.outcome.non_timeout_early_exits;
     ledger.emplace(entry.episode_id, entry);
     state.completed.push_back(entry);
-    replay_rows.insert(replay_rows.end(), completion.rows.begin(),
-                       completion.rows.end());
     current_update_rows.insert(current_update_rows.end(),
                                completion.rows.begin(), completion.rows.end());
     current_update_paths.push_back(shard_path.string());
@@ -1052,11 +1036,8 @@ int main(int argc, char** argv) {
       max_staleness = std::max(max_staleness, staleness);
     }
     update["completed_simulations"] = total_simulations;
-    for (const SearchPiRow& row : replay_rows) {
-      if (row.search_budget_class == "full" &&
-          row.policy_target_weight > 0.0) {
-        ++full_policy_target_rows;
-      }
+    for (const LedgerEntry& entry : state.completed) {
+      full_policy_target_rows += entry.full_policy_target_rows;
     }
     update["full_policy_target_rows"] = full_policy_target_rows;
     update["staleness_mean"] = state.completed.empty()
