@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -92,6 +93,12 @@ namespace open_spiel {
 namespace {
 
 struct CollectorSnapshot {
+  struct CapBaseline {
+    uint64_t decisions = 0;
+    uint64_t legal_logits = 0;
+    uint64_t saturated = 0;
+  };
+
   int generation = 0;
   int inference_lanes = 0;
   uint64_t total_env_steps = 0;
@@ -102,6 +109,30 @@ struct CollectorSnapshot {
   std::vector<std::shared_ptr<std::shared_mutex>> model_mutexes;
   std::vector<std::shared_ptr<BatchedEvaluator>> batchers;
   std::vector<std::shared_ptr<algorithms::Evaluator>> evaluators;
+  std::vector<CapBaseline> cap_baselines;
+
+  BatchedLogitCapAggregate ConsumeCapTelemetry() {
+    BatchedLogitCapAggregate interval;
+    if (cap_baselines.size() != batchers.size()) {
+      cap_baselines.resize(batchers.size());
+    }
+    for (size_t lane = 0; lane < batchers.size(); ++lane) {
+      const BatchedLogitCapAggregate current =
+          batchers[lane]->GetLogitCapStats();
+      CapBaseline& baseline = cap_baselines[lane];
+      interval.decisions += current.decisions - baseline.decisions;
+      interval.legal_logits += current.legal_logits - baseline.legal_logits;
+      interval.saturated += current.saturated - baseline.saturated;
+      interval.pre_max_abs = std::max(interval.pre_max_abs,
+                                      current.pre_max_abs);
+      interval.post_max_abs = std::max(interval.post_max_abs,
+                                       current.post_max_abs);
+      baseline.decisions = current.decisions;
+      baseline.legal_logits = current.legal_logits;
+      baseline.saturated = current.saturated;
+    }
+    return interval;
+  }
 };
 
 struct Task {
@@ -115,6 +146,7 @@ struct Completion {
   int start_staleness = 0;
   double actor_completion_wall_seconds = 0.0;
   std::vector<SearchPiRow> rows;
+  ScratchVisitGenerationStats visit_stats;
   SearchPiGameOutcome outcome;
 };
 
@@ -131,6 +163,70 @@ struct LedgerEntry {
   int64_t fallbacks = 0;
   int64_t watchdog_timeouts = 0;
   int64_t non_timeout_early_exits = 0;
+};
+
+struct UpdateCollectionTelemetry {
+  int64_t requested_simulations = 0;
+  int64_t completed_simulations = 0;
+  int64_t full_policy_target_rows = 0;
+  int64_t trajectory_transitions = 0;
+  int64_t fallbacks = 0;
+  int64_t watchdog_timeouts = 0;
+  int64_t non_timeout_early_exits = 0;
+  int64_t vp_breadcrumb_events = 0;
+  int64_t specimen_anti_breadcrumb_events = 0;
+  double vp_breadcrumb_raw_reward_sum = 0.0;
+  double specimen_anti_breadcrumb_raw_penalty_sum = 0.0;
+  double vp_breadcrumb_shaped_reward_sum = 0.0;
+  double specimen_anti_breadcrumb_shaped_reward_sum = 0.0;
+  double collector_generation_sum = 0.0;
+  int collector_generation_min = std::numeric_limits<int>::max();
+  int collector_generation_max = std::numeric_limits<int>::min();
+  double collector_start_staleness_sum = 0.0;
+  int collector_start_staleness_max = 0;
+  double collector_staleness_sum = 0.0;
+  int collector_staleness_max = 0;
+  int64_t visit_full_rows = 0;
+  int64_t visit_cheap_rows = 0;
+  double visit_entropy_sum = 0.0;
+  double visit_kl_sum = 0.0;
+  int64_t visit_stat_games = 0;
+
+  void Add(const Completion& completion, const ScratchVisitGenerationStats& visit,
+           const LedgerEntry& entry, int learner_generation) {
+    const SearchPiGameOutcome& outcome = completion.outcome;
+    requested_simulations += entry.requested_simulations;
+    completed_simulations += entry.completed_simulations;
+    full_policy_target_rows += visit.full_rows;
+    trajectory_transitions += outcome.trajectory_transitions;
+    fallbacks += outcome.fallbacks;
+    watchdog_timeouts += outcome.watchdog_timeouts;
+    non_timeout_early_exits += outcome.non_timeout_early_exits;
+    vp_breadcrumb_events += outcome.vp_breadcrumb_events;
+    specimen_anti_breadcrumb_events += outcome.specimen_anti_breadcrumb_events;
+    vp_breadcrumb_raw_reward_sum += outcome.vp_breadcrumb_raw_reward_sum;
+    specimen_anti_breadcrumb_raw_penalty_sum +=
+        outcome.specimen_anti_breadcrumb_raw_penalty_sum;
+    vp_breadcrumb_shaped_reward_sum +=
+        outcome.vp_breadcrumb_shaped_reward_sum;
+    specimen_anti_breadcrumb_shaped_reward_sum +=
+        outcome.specimen_anti_breadcrumb_shaped_reward_sum;
+    collector_generation_sum += completion.collector_generation;
+    collector_generation_min =
+        std::min(collector_generation_min, completion.collector_generation);
+    collector_generation_max =
+        std::max(collector_generation_max, completion.collector_generation);
+    collector_start_staleness_sum += completion.start_staleness;
+    collector_start_staleness_max =
+        std::max(collector_start_staleness_max, completion.start_staleness);
+    const int staleness = std::max(
+        0, learner_generation - completion.collector_generation);
+    collector_staleness_sum += staleness;
+    collector_staleness_max = std::max(collector_staleness_max, staleness);
+    visit_entropy_sum += visit.target_entropy_mean * visit.full_rows;
+    visit_kl_sum += visit.target_kl_mean * visit.full_rows;
+    visit_stat_games += visit.full_rows > 0 ? 1 : 0;
+  }
 };
 
 struct SmokeState {
@@ -391,6 +487,7 @@ std::shared_ptr<CollectorSnapshot> MakeSnapshot(
     snapshot->evaluators.push_back(std::make_shared<BatchedNNEvaluator>(
         snapshot->batchers.back(), 10.0f));
   }
+  snapshot->cap_baselines.resize(snapshot->batchers.size());
   return snapshot;
 }
 
@@ -719,6 +816,8 @@ int main(int argc, char** argv) {
       ::absl::GetFlag(FLAGS_batcher_timeout_ms), inference_lanes,
       state.total_env_steps, shaping_start_env_steps,
       shaping_decay_env_steps);
+  std::vector<std::shared_ptr<CollectorSnapshot>> collector_snapshots = {
+      latest_snapshot};
   std::mutex snapshot_mutex;
   TaskQueue tasks;
   std::mutex completions_mutex;
@@ -830,6 +929,7 @@ int main(int argc, char** argv) {
                                         started)
               .count();
       completion.rows = std::move(rows);
+      completion.visit_stats = visit_stats;
       completion.outcome = stats.games_played.front();
       CheckCompletedGame(completion);
       const int64_t completion_ns =
@@ -875,6 +975,7 @@ int main(int argc, char** argv) {
   std::vector<int64_t> update_new_ids;
   std::vector<SearchPiRow> current_update_rows;
   std::vector<std::string> current_update_paths;
+  UpdateCollectionTelemetry current_update_collection;
   int64_t current_update_env_steps = 0;
   int64_t total_learner_minibatches = 0;
   bool simulated_crash = false;
@@ -915,6 +1016,9 @@ int main(int argc, char** argv) {
     entry.fallbacks = completion.outcome.fallbacks;
     entry.watchdog_timeouts = completion.outcome.watchdog_timeouts;
     entry.non_timeout_early_exits = completion.outcome.non_timeout_early_exits;
+    current_update_collection.Add(
+        completion, completion.visit_stats, entry,
+        state.published_generation + 1);
     ledger.emplace(entry.episode_id, entry);
     state.completed.push_back(entry);
     current_update_rows.insert(current_update_rows.end(),
@@ -994,6 +1098,19 @@ int main(int argc, char** argv) {
           ::absl::GetFlag(FLAGS_batcher_timeout_ms), inference_lanes,
           state.total_env_steps, shaping_start_env_steps,
           shaping_decay_env_steps);
+      collector_snapshots.push_back(latest_snapshot);
+    }
+    BatchedLogitCapAggregate collector_cap_interval;
+    for (const auto& snapshot : collector_snapshots) {
+      const BatchedLogitCapAggregate interval =
+          snapshot->ConsumeCapTelemetry();
+      collector_cap_interval.decisions += interval.decisions;
+      collector_cap_interval.legal_logits += interval.legal_logits;
+      collector_cap_interval.saturated += interval.saturated;
+      collector_cap_interval.pre_max_abs =
+          std::max(collector_cap_interval.pre_max_abs, interval.pre_max_abs);
+      collector_cap_interval.post_max_abs =
+          std::max(collector_cap_interval.post_max_abs, interval.post_max_abs);
     }
     SaveStudentCheckpoint(output_dir, state.next_update + 1, student,
                           *optimizer);
@@ -1024,26 +1141,153 @@ int main(int argc, char** argv) {
         learner_stats.critic_pred_mean_pre;
     update["learner_value_prediction_mean_post"] =
         learner_stats.critic_pred_mean_post;
+    update["requested_simulations"] =
+        current_update_collection.requested_simulations;
+    update["completed_simulations"] =
+        current_update_collection.completed_simulations;
+    update["fallbacks"] = current_update_collection.fallbacks;
+    update["watchdog_timeouts"] = current_update_collection.watchdog_timeouts;
+    update["non_timeout_early_exits"] =
+        current_update_collection.non_timeout_early_exits;
+    update["generation_env_steps"] =
+        current_update_collection.trajectory_transitions;
+    update["total_env_steps"] = static_cast<int64_t>(state.total_env_steps);
+    update["shaping_lambda"] =
+        static_cast<double>(latest_snapshot->shaping_lambda);
+    update["vp_breadcrumb_events"] =
+        current_update_collection.vp_breadcrumb_events;
+    update["specimen_anti_breadcrumb_events"] =
+        current_update_collection.specimen_anti_breadcrumb_events;
+    update["vp_breadcrumb_raw_reward_sum"] =
+        current_update_collection.vp_breadcrumb_raw_reward_sum;
+    update["specimen_anti_breadcrumb_raw_penalty_sum"] =
+        current_update_collection.specimen_anti_breadcrumb_raw_penalty_sum;
+    update["vp_breadcrumb_shaped_reward_sum"] =
+        current_update_collection.vp_breadcrumb_shaped_reward_sum;
+    update["specimen_anti_breadcrumb_shaped_reward_sum"] =
+        current_update_collection.specimen_anti_breadcrumb_shaped_reward_sum;
+    update["collector_generation_min"] =
+        static_cast<int64_t>(current_update_collection.collector_generation_min);
+    update["collector_generation_max"] =
+        static_cast<int64_t>(current_update_collection.collector_generation_max);
+    update["collector_generation_mean"] =
+        current_update_collection.collector_generation_sum /
+        std::max<size_t>(1, update_new_ids.size());
+    update["collector_start_staleness_mean"] =
+        current_update_collection.collector_start_staleness_sum /
+        std::max<size_t>(1, update_new_ids.size());
+    update["collector_start_staleness_max"] =
+        static_cast<int64_t>(current_update_collection.collector_start_staleness_max);
+    update["collector_staleness_mean"] =
+        current_update_collection.collector_staleness_sum /
+        std::max<size_t>(1, update_new_ids.size());
+    update["collector_staleness_max"] =
+        static_cast<int64_t>(current_update_collection.collector_staleness_max);
+    update["collector_staleness_definition"] =
+        "learner_generation_minus_collector_generation_for_this_update_games";
+    update["collector_logit_cap_scope"] =
+        "counter_delta_since_previous_generation_telemetry;maxima_lifetime_per_snapshot";
+    update["collector_precap_max_legal_logit"] =
+        collector_cap_interval.pre_max_abs;
+    update["collector_postcap_max_legal_logit"] =
+        collector_cap_interval.post_max_abs;
+    update["collector_logit_cap_decisions"] =
+        static_cast<int64_t>(collector_cap_interval.decisions);
+    update["collector_logit_cap_legal_logits"] =
+        static_cast<int64_t>(collector_cap_interval.legal_logits);
+    update["collector_logit_cap_saturated"] =
+        static_cast<int64_t>(collector_cap_interval.saturated);
+    update["collector_logit_cap_saturation_rate"] =
+        collector_cap_interval.legal_logits == 0
+            ? 0.0
+            : static_cast<double>(collector_cap_interval.saturated) /
+                  static_cast<double>(collector_cap_interval.legal_logits);
+    update["learner_precap_max_legal_logit"] =
+        learner_stats.learner_precap_max_legal_logit;
+    update["learner_postcap_max_legal_logit"] =
+        learner_stats.learner_postcap_max_legal_logit;
+    update["learner_logit_cap_decisions"] =
+        learner_stats.learner_logit_cap_decisions;
+    update["learner_logit_cap_legal_logits"] =
+        learner_stats.learner_logit_cap_legal_logits;
+    update["learner_logit_cap_saturated"] =
+        learner_stats.learner_logit_cap_saturated;
+    update["learner_logit_cap_saturation_rate"] =
+        learner_stats.learner_logit_cap_legal_logits == 0
+            ? 0.0
+            : static_cast<double>(learner_stats.learner_logit_cap_saturated) /
+                  static_cast<double>(learner_stats.learner_logit_cap_legal_logits);
+    const std::set<int64_t> unique_update_ids(update_new_ids.begin(),
+                                               update_new_ids.end());
+    // Actors continuously issue the next available IDs while the learner is
+    // processing a boundary. Consequently, the 512 completions in one
+    // learner update are not required to form a contiguous episode interval:
+    // a later-issued game may finish before an earlier-issued game. The global
+    // summary checks the complete run range; this update-level contract counts
+    // completion slots and separately records the observed ID span.
+    const int64_t expected_update_games =
+        static_cast<int64_t>(update_new_ids.size());
+    const int64_t missing_update_ids = std::max<int64_t>(
+        0, expected_update_games -
+               static_cast<int64_t>(unique_update_ids.size()));
+    const int64_t observed_first_episode_id =
+        unique_update_ids.empty()
+            ? -1
+            : *unique_update_ids.begin();
+    const int64_t observed_episode_end =
+        unique_update_ids.empty() ? -1 : *unique_update_ids.rbegin() + 1;
+    update["episode_accounting_scope"] =
+        "completed_update_slots;continuous_issue_order_is_not_contiguous";
+    update["observed_first_episode_id"] = observed_first_episode_id;
+    update["observed_episode_end"] = observed_episode_end;
+    update["expected_games_this_update"] = expected_update_games;
+    update["nominal_games_per_update"] =
+        static_cast<int64_t>(games_per_update);
+    update["unique_episode_ids"] =
+        static_cast<int64_t>(unique_update_ids.size());
+    update["missing_episode_ids"] = missing_update_ids;
+    update["duplicate_episode_ids"] =
+        static_cast<int64_t>(update_new_ids.size() - unique_update_ids.size());
+    update["episode_accounting_complete"] =
+        unique_update_ids.size() == static_cast<size_t>(expected_update_games) &&
+        missing_update_ids == 0 &&
+        update_new_ids.size() == unique_update_ids.size();
     int64_t total_simulations = 0;
+    int64_t cumulative_requested = 0;
     int64_t full_policy_target_rows = 0;
+    int64_t cumulative_fallbacks = 0;
+    int64_t cumulative_timeouts = 0;
+    int64_t cumulative_early_exits = 0;
     double staleness_sum = 0.0;
     int max_staleness = 0;
     for (const LedgerEntry& item : state.completed) {
+      cumulative_requested += item.requested_simulations;
       total_simulations += item.completed_simulations;
+      cumulative_fallbacks += item.fallbacks;
+      cumulative_timeouts += item.watchdog_timeouts;
+      cumulative_early_exits += item.non_timeout_early_exits;
       const int staleness =
           state.published_generation - item.collector_generation;
       staleness_sum += staleness;
       max_staleness = std::max(max_staleness, staleness);
     }
-    update["completed_simulations"] = total_simulations;
     for (const LedgerEntry& entry : state.completed) {
       full_policy_target_rows += entry.full_policy_target_rows;
     }
-    update["full_policy_target_rows"] = full_policy_target_rows;
-    update["staleness_mean"] = state.completed.empty()
-                                    ? 0.0
-                                    : staleness_sum / state.completed.size();
-    update["staleness_max"] = static_cast<int64_t>(max_staleness);
+    update["full_policy_target_rows"] =
+        current_update_collection.full_policy_target_rows;
+    update["cumulative_requested_simulations"] = cumulative_requested;
+    update["cumulative_completed_simulations"] = total_simulations;
+    update["cumulative_full_policy_target_rows"] = full_policy_target_rows;
+    update["cumulative_fallbacks"] = cumulative_fallbacks;
+    update["cumulative_watchdog_timeouts"] = cumulative_timeouts;
+    update["cumulative_non_timeout_early_exits"] = cumulative_early_exits;
+    update["cumulative_collector_staleness_mean"] = state.completed.empty()
+                                                         ? 0.0
+                                                         : staleness_sum /
+                                                               state.completed.size();
+    update["cumulative_collector_staleness_max"] =
+        static_cast<int64_t>(max_staleness);
     update_records.push_back(update);
     AtomicJson((output_dir / ("update_" +
                               std::to_string(state.next_update + 1) +
@@ -1051,28 +1295,11 @@ int main(int argc, char** argv) {
                    .string(),
                update);
     if (!production_run_dir.empty()) {
-      int64_t cumulative_requested = 0;
-      int64_t cumulative_fallbacks = 0;
-      int64_t cumulative_timeouts = 0;
-      int64_t cumulative_early_exits = 0;
-      for (const LedgerEntry& entry : state.completed) {
-        cumulative_requested += entry.requested_simulations;
-        cumulative_fallbacks += entry.fallbacks;
-        cumulative_timeouts += entry.watchdog_timeouts;
-        cumulative_early_exits += entry.non_timeout_early_exits;
-      }
       json::Object generation_telemetry = update;
       generation_telemetry["generation"] =
           static_cast<int64_t>(state.published_generation);
       generation_telemetry["games"] =
-          static_cast<int64_t>(state.completed.size());
-      generation_telemetry["requested_simulations"] =
-          cumulative_requested;
-      generation_telemetry["completed_simulations"] = total_simulations;
-      generation_telemetry["fallbacks"] = cumulative_fallbacks;
-      generation_telemetry["watchdog_timeouts"] = cumulative_timeouts;
-      generation_telemetry["non_timeout_early_exits"] =
-          cumulative_early_exits;
+          static_cast<int64_t>(update_new_ids.size());
       generation_telemetry["policy_ce"] = learner_stats.policy_ce;
       generation_telemetry["value_mse"] = learner_stats.value_mse;
       generation_telemetry["policy_grad_norm"] =
@@ -1108,6 +1335,7 @@ int main(int argc, char** argv) {
     }
     update_new_ids.clear();
     current_update_paths.clear();
+    current_update_collection = UpdateCollectionTelemetry();
     current_update_env_steps = 0;
     ++state.next_update;
     state.next_episode_id =

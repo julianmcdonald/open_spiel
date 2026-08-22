@@ -349,6 +349,17 @@ struct LogitCapApplicationStats {
   int saturated_count = 0;
 };
 
+// Lifetime counters for one BatchedEvaluator. Async telemetry records the
+// delta since the prior generation publication, so the scope of a reported
+// cap statistic is explicit and never confused with a cumulative total.
+struct BatchedLogitCapAggregate {
+  uint64_t decisions = 0;
+  uint64_t legal_logits = 0;
+  uint64_t saturated = 0;
+  double pre_max_abs = 0.0;
+  double post_max_abs = 0.0;
+};
+
 inline LogitCapApplicationStats CenterAndCapLegalLogitsWithStats(
     std::vector<float>& logits, const std::vector<Action>& legal_actions,
     float logit_cap) {
@@ -832,7 +843,10 @@ public:
             CompactEvalResult compact;
             compact.actions = legal_actions;
             std::vector<float> logits = full.logits;
-            CenterAndCapLegalLogitsWithStats(logits, legal_actions, logit_cap_);
+            const LogitCapApplicationStats cap_stats =
+                CenterAndCapLegalLogitsWithStats(logits, legal_actions,
+                                                 logit_cap_);
+            RecordLogitCapStats(cap_stats);
             double max_logit = -std::numeric_limits<double>::infinity();
             for (Action action : legal_actions) {
                 max_logit = std::max(max_logit,
@@ -1170,6 +1184,14 @@ public:
         return t;
     }
 
+    BatchedLogitCapAggregate GetLogitCapStats() const {
+        return {logit_cap_decisions_.load(std::memory_order_relaxed),
+                logit_cap_legal_logits_.load(std::memory_order_relaxed),
+                logit_cap_saturated_.load(std::memory_order_relaxed),
+                logit_cap_pre_max_.load(std::memory_order_relaxed),
+                logit_cap_post_max_.load(std::memory_order_relaxed)};
+    }
+
 private:
     struct Request {
         const std::vector<float>* obs = nullptr;
@@ -1243,11 +1265,43 @@ private:
     std::atomic<uint64_t> d2h_us_{0};
     std::atomic<uint64_t> sync_us_{0};
     std::atomic<uint64_t> device_timed_batches_{0};
+    std::atomic<uint64_t> logit_cap_decisions_{0};
+    std::atomic<uint64_t> logit_cap_legal_logits_{0};
+    std::atomic<uint64_t> logit_cap_saturated_{0};
+    std::atomic<double> logit_cap_pre_max_{0.0};
+    std::atomic<double> logit_cap_post_max_{0.0};
     // Runner-thread-only maps for split-leaf-group detection. A leaf group's
     // rows are contiguous in the deque, so within one physical batch a group is
     // a single run; a group counted in a second physical batch is a split.
     std::unordered_map<uint64_t, int> group_batches_seen_;  // gid -> # batches
     std::unordered_map<uint64_t, int> group_rows_left_;     // gid -> rows undispatched
+
+    static void AtomicMax(std::atomic<double>* target, double value) {
+        double current = target->load(std::memory_order_relaxed);
+        while (value > current &&
+               !target->compare_exchange_weak(
+                   current, value, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    void RecordLogitCapStats(const LogitCapApplicationStats& stats) {
+        RecordLogitCapStats(stats.pre_max_abs, stats.post_max_abs,
+                            stats.legal_count, stats.saturated_count);
+    }
+
+    void RecordLogitCapStats(double pre_max_abs, double post_max_abs,
+                             int64_t legal_count, int64_t saturated_count) {
+        logit_cap_decisions_.fetch_add(1, std::memory_order_relaxed);
+        logit_cap_legal_logits_.fetch_add(
+            static_cast<uint64_t>(std::max<int64_t>(0, legal_count)),
+            std::memory_order_relaxed);
+        logit_cap_saturated_.fetch_add(
+            static_cast<uint64_t>(std::max<int64_t>(0, saturated_count)),
+            std::memory_order_relaxed);
+        AtomicMax(&logit_cap_pre_max_, pre_max_abs);
+        AtomicMax(&logit_cap_post_max_, post_max_abs);
+    }
 
     // Production CUDA path: two reusable slots let the runner assemble the
     // next CPU batch while the previous slot is executing. Completion waits
@@ -1568,10 +1622,20 @@ private:
                         legal.sum(1, true).clamp_min(1.0);
                     compact_logits = compact_logits -
                         (compact_logits * legal).sum(1, true) / legal_count;
+                    const torch::Tensor pre_max = compact_logits.abs().masked_fill(
+                        slot.compact_device_mask.logical_not(), 0.0).amax(1);
                     if (logit_cap_ > 0.0f) {
                         compact_logits = logit_cap_ *
                             torch::tanh(compact_logits / logit_cap_);
                     }
+                    const torch::Tensor post_max = compact_logits.abs().masked_fill(
+                        slot.compact_device_mask.logical_not(), 0.0).amax(1);
+                    RecordLogitCapStats(
+                        pre_max.max().item<double>(), post_max.max().item<double>(),
+                        legal.sum().item<int64_t>(),
+                        ((compact_logits.abs() >=
+                          0.99 * static_cast<float>(logit_cap_)) &
+                         slot.compact_device_mask).sum().item<int64_t>());
                     auto compact_probs = torch::softmax(
                         compact_logits.masked_fill(
                             slot.compact_device_mask.logical_not(), -1e9f),
