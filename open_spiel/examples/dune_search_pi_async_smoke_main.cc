@@ -70,6 +70,8 @@ ABSL_FLAG(double, relative_time_budget_ms, 600000.0,
 ABSL_FLAG(int, minibatch_size, 256, "Learner minibatch size.");
 ABSL_FLAG(double, logit_cap, 10.0, "Learner logit cap.");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "Learner gradient clip.");
+ABSL_FLAG(bool, reset_replay_buffer_on_resume, false,
+          "Whether to reset the replay window on resume from production manifest.");
 ABSL_FLAG(bool, crash_after_update, false,
           "Stop cleanly after update one to exercise resume.");
 ABSL_FLAG(bool, verify_production_manifest_only, false,
@@ -757,8 +759,13 @@ int main(int argc, char** argv) {
     state.published_generation = production_state.generation;
     state.initial_generation = production_state.generation;
     state.total_env_steps = production_state.total_env_steps;
-    state.replay_paths = production_state.replay_paths;
-    state.replay_cohort_groups = production_state.replay_cohort_groups;
+    if (::absl::GetFlag(FLAGS_reset_replay_buffer_on_resume)) {
+      state.replay_paths.clear();
+      state.replay_cohort_groups.clear();
+    } else {
+      state.replay_paths = production_state.replay_paths;
+      state.replay_cohort_groups = production_state.replay_cohort_groups;
+    }
   } else {
     state.first_episode_id = ::absl::GetFlag(FLAGS_first_episode_id);
     state.run_first_episode_id = state.first_episode_id;
@@ -1187,6 +1194,8 @@ int main(int argc, char** argv) {
         static_cast<int64_t>(current_update_collection.collector_staleness_max);
     update["collector_staleness_definition"] =
         "learner_generation_minus_collector_generation_for_this_update_games";
+    update["configured_logit_cap"] =
+        ::absl::GetFlag(FLAGS_logit_cap);
     update["collector_logit_cap_scope"] =
         "counter_delta_since_previous_generation_telemetry;maxima_lifetime_per_snapshot";
     update["collector_precap_max_legal_logit"] =
