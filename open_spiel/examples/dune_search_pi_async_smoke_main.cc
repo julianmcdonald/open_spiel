@@ -477,6 +477,7 @@ std::shared_ptr<CollectorSnapshot> MakeSnapshot(
     model->to(device);
     CopySearchPiModel(source, model);
     model->eval();
+    auto model_mutex = std::make_shared<std::shared_mutex>();
     const float configured_cap =
         static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
     auto batcher = std::make_shared<BatchedEvaluator>(
