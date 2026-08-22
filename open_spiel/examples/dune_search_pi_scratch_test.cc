@@ -13,6 +13,7 @@
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/spiel_utils.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
+#include "dune_evaluator.h"
 #include "dune_search_pi_concurrent.h"
 #include "dune_search_pi_replay.h"
 #include "dune_ppo_training_utils.h"
@@ -620,6 +621,48 @@ void TestCompactLegalPolicyParityOnDuneState() {
   SPIEL_CHECK_TRUE(std::abs(compact.value - full.value) < 3e-3);
 }
 
+void TestLogitCapCollectorAndLearnerParity() {
+  if (!torch::cuda::is_available()) return;
+  auto game = LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  for (int i = 0; i < 32 && state->IsChanceNode(); ++i) {
+    const auto outcomes = state->ChanceOutcomes();
+    SPIEL_CHECK_FALSE(outcomes.empty());
+    state->ApplyAction(outcomes.front().first);
+  }
+  const Player player = state->CurrentPlayer();
+  SPIEL_CHECK_GE(player, 0);
+  const std::vector<Action> legal = state->LegalActions();
+  SPIEL_CHECK_FALSE(legal.empty());
+
+  // 1. Verify CenterAndCapLegalLogitsWithStats clamps extreme logits to cap and records saturation
+  std::vector<float> extreme_logits(static_cast<size_t>(game->NumDistinctActions()), 0.0f);
+  extreme_logits[legal.front()] = 50.0f;
+  extreme_logits[legal.back()] = -50.0f;
+  const float cap = 10.0f;
+  const auto stats = CenterAndCapLegalLogitsWithStats(extreme_logits, legal, cap);
+  SPIEL_CHECK_LE(stats.post_max_abs, static_cast<double>(cap) + 1e-5);
+  SPIEL_CHECK_GT(stats.pre_max_abs, 20.0);
+  SPIEL_CHECK_GE(stats.saturated_count, 1);
+  SPIEL_CHECK_EQ(stats.legal_count, static_cast<int64_t>(legal.size()));
+
+  // 2. Verify BatchedEvaluator records post_max <= cap
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1,
+      false);
+  model->to(torch::Device(torch::kCUDA));
+  model->eval();
+  std::shared_mutex model_mutex;
+  BatchedEvaluator evaluator(
+      model, 16, 2, torch::Device(torch::kCUDA), &model_mutex, cap, false);
+  const std::vector<float> observation = state->InformationStateTensor(player);
+  const CompactEvalResult compact = evaluator.EvaluateCompact(observation, legal);
+  SPIEL_CHECK_EQ(compact.actions, legal);
+  const auto batcher_stats = evaluator.GetLogitCapStats();
+  SPIEL_CHECK_LE(batcher_stats.post_max_abs, static_cast<double>(cap) + 1e-5);
+  SPIEL_CHECK_GE(batcher_stats.legal_logits, static_cast<uint64_t>(legal.size()));
+}
+
 void TestTrainingShapingCannotChangeSearchArtifacts() {
   auto game = LoadGame("dune_imperium");
   auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(
@@ -696,6 +739,7 @@ int main() {
   open_spiel::TestPrefetchRangesAreFixedAndDisjoint();
   open_spiel::TestAsyncEvaluatorEmptyQueueCompletes();
   open_spiel::TestCompactLegalPolicyParityOnDuneState();
+  open_spiel::TestLogitCapCollectorAndLearnerParity();
   open_spiel::TestTrainingShapingCannotChangeSearchArtifacts();
   std::cout << "dune_search_pi_scratch_test: PASS\n";
   return 0;

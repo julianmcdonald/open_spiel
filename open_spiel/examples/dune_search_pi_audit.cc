@@ -180,6 +180,7 @@ ABSL_FLAG(int, warmup_games, 0,
 ABSL_FLAG(std::string, batcher_telemetry_json_path, "",
           "Where to write batcher telemetry. Its ABSENCE on a batched arm is a "
           "STOP (Phase-2 S2), so a batched run should always set it.");
+ABSL_FLAG(int, inference_lanes, 4, "Number of GPU inference lanes.");
 
 ABSL_FLAG(int, search_pi_purchase_combat_budget, 0,
           "NEW simulations at kPurchase / kCombatIntrigue / kOtherOptional -- "
@@ -480,6 +481,7 @@ ArmResult RunArm(SearchPiArm arm, const std::shared_ptr<const Game>& game,
   config.chunk_games = absl::GetFlag(FLAGS_chunk_games);
   config.requested_workers = absl::GetFlag(FLAGS_threads);
   config.batch_target = absl::GetFlag(FLAGS_batch_target);
+  config.inference_lanes = absl::GetFlag(FLAGS_inference_lanes);
   config.batcher_timeout_ms = absl::GetFlag(FLAGS_batcher_timeout_ms);
   config.warmup_games = absl::GetFlag(FLAGS_warmup_games);
   config.retain_rows = absl::GetFlag(FLAGS_retain_rows);

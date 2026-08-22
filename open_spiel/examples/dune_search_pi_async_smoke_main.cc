@@ -477,15 +477,16 @@ std::shared_ptr<CollectorSnapshot> MakeSnapshot(
     model->to(device);
     CopySearchPiModel(source, model);
     model->eval();
-    auto model_mutex = std::make_shared<std::shared_mutex>();
+    const float configured_cap =
+        static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
     auto batcher = std::make_shared<BatchedEvaluator>(
-        model, batch_target, timeout_ms, device, model_mutex.get(), 0.0f,
-        false, true);
+        model, batch_target, timeout_ms, device, model_mutex.get(),
+        configured_cap, false, true);
     snapshot->models.push_back(std::move(model));
     snapshot->model_mutexes.push_back(std::move(model_mutex));
     snapshot->batchers.push_back(std::move(batcher));
     snapshot->evaluators.push_back(std::make_shared<BatchedNNEvaluator>(
-        snapshot->batchers.back(), 10.0f));
+        snapshot->batchers.back(), configured_cap));
   }
   snapshot->cap_baselines.resize(snapshot->batchers.size());
   return snapshot;
@@ -708,7 +709,7 @@ int main(int argc, char** argv) {
   learner_config.minibatch_size = ::absl::GetFlag(FLAGS_minibatch_size);
   learner_config.epochs = 1;
   learner_config.grad_clip_norm = 0.5;
-  learner_config.logit_cap = 10.0;
+  learner_config.logit_cap = absl::GetFlag(FLAGS_logit_cap);
   learner_config.policy_coef = 1.0;
   learner_config.value_coef = 1.0;
   auto optimizer = MakeSmokeOptimizer(student);
