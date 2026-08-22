@@ -1299,6 +1299,24 @@ int main(int argc, char** argv) {
                                                                state.completed.size();
     update["cumulative_collector_staleness_max"] =
         static_cast<int64_t>(max_staleness);
+    json::Array replay_paths_json;
+    for (const std::string& path : state.replay_paths) {
+      replay_paths_json.push_back(path);
+    }
+    json::Array replay_groups_json;
+    for (const auto& group : state.replay_cohort_groups) {
+      json::Array group_json;
+      for (const std::string& path : group) {
+        group_json.push_back(path);
+      }
+      replay_groups_json.push_back(std::move(group_json));
+    }
+    update["replay_cohorts"] =
+        static_cast<int64_t>(state.replay_cohort_groups.size());
+    update["replay_paths_count"] =
+        static_cast<int64_t>(state.replay_paths.size());
+    update["replay_paths"] = std::move(replay_paths_json);
+    update["replay_cohort_groups"] = std::move(replay_groups_json);
     update_records.push_back(update);
     AtomicJson((output_dir / ("update_" +
                               std::to_string(state.next_update + 1) +
