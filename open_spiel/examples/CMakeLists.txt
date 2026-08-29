@@ -110,7 +110,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # Bounded persistent actor-learner smoke. This is an experimental target,
   # separate from the production generation-barrier trainer.
   add_executable(dune_search_pi_async_smoke
-    dune_search_pi_async_smoke_main.cc dune_search_pi_scratch.cc
+    dune_search_pi_async_smoke_main.cc dune_search_pi_async_resume.cc
+    dune_search_pi_scratch.cc
     dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc
     dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
@@ -122,12 +123,21 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # launcher invokes this distinct target with a production checkpoint
   # manifest and target generation.
   add_executable(dune_search_pi_async_train
-    dune_search_pi_async_smoke_main.cc dune_search_pi_scratch.cc
+    dune_search_pi_async_smoke_main.cc dune_search_pi_async_resume.cc
+    dune_search_pi_scratch.cc
     dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc
     dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_async_train
     dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_search_pi_async_resume_test
+    dune_search_pi_async_resume_test.cc dune_search_pi_async_resume.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_pi_async_resume_test
+    dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_search_pi_async_resume_test
+    COMMAND dune_search_pi_async_resume_test)
 
   # Post-termination descriptive forensic for Rung-4N. This is a separate
   # read-only instrument: it reconstructs and hashes the exact rows presented

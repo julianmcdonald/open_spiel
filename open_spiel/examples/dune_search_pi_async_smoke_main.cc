@@ -32,6 +32,7 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_seed_utils.h"
 #include "dune_search_pi.h"
+#include "dune_search_pi_async_resume.h"
 #include "dune_search_pi_replay.h"
 #include "dune_search_pi_scratch.h"
 #include "dune_split_evaluator.h"
@@ -152,21 +153,6 @@ struct Completion {
   SearchPiGameOutcome outcome;
 };
 
-struct LedgerEntry {
-  int64_t episode_id = -1;
-  int collector_generation = -1;
-  std::string shard_path;
-  int64_t rows = 0;
-  int64_t requested_simulations = 0;
-  int64_t completed_simulations = 0;
-  int64_t full_policy_target_rows = 0;
-  int64_t trajectory_transitions = 0;
-  int start_staleness = 0;
-  int64_t fallbacks = 0;
-  int64_t watchdog_timeouts = 0;
-  int64_t non_timeout_early_exits = 0;
-};
-
 struct UpdateCollectionTelemetry {
   int64_t requested_simulations = 0;
   int64_t completed_simulations = 0;
@@ -228,6 +214,30 @@ struct UpdateCollectionTelemetry {
     visit_entropy_sum += visit.target_entropy_mean * visit.full_rows;
     visit_kl_sum += visit.target_kl_mean * visit.full_rows;
     visit_stat_games += visit.full_rows > 0 ? 1 : 0;
+  }
+
+  void AddResumed(const AsyncResumePendingUpdate& pending) {
+    requested_simulations += pending.requested_simulations;
+    completed_simulations += pending.completed_simulations;
+    full_policy_target_rows += pending.full_policy_target_rows;
+    trajectory_transitions += pending.trajectory_transitions;
+    fallbacks += pending.fallbacks;
+    watchdog_timeouts += pending.watchdog_timeouts;
+    non_timeout_early_exits += pending.non_timeout_early_exits;
+    collector_generation_sum += pending.collector_generation_sum;
+    if (pending.resumed_prefetch_games > 0) {
+      collector_generation_min =
+          std::min(collector_generation_min, pending.collector_generation_min);
+      collector_generation_max =
+          std::max(collector_generation_max, pending.collector_generation_max);
+    }
+    collector_start_staleness_sum += pending.collector_start_staleness_sum;
+    collector_start_staleness_max = std::max(
+        collector_start_staleness_max,
+        pending.collector_start_staleness_max);
+    collector_staleness_sum += pending.collector_staleness_sum;
+    collector_staleness_max =
+        std::max(collector_staleness_max, pending.collector_staleness_max);
   }
 };
 
@@ -327,15 +337,33 @@ SmokeState ReadState(const std::string& path) {
   const json::Object& object = parsed->GetObject();
   SmokeState state;
   state.next_update = static_cast<int>(object.at("next_update").GetInt());
+  state.published_generation =
+      static_cast<int>(object.at("published_generation").GetInt());
+  state.next_episode_id = object.at("next_episode_id").GetInt();
   const auto first_episode = object.find("first_episode_id");
-  state.first_episode_id = first_episode == object.end()
-                               ? state.next_episode_id
-                               : first_episode->second.GetInt();
+  const std::optional<int64_t> persisted_first_episode_id =
+      first_episode == object.end()
+          ? std::nullopt
+          : std::optional<int64_t>(first_episode->second.GetInt());
+  std::string first_episode_error;
+  if (!ResolveAsyncFirstEpisodeId(
+          persisted_first_episode_id, state.next_episode_id,
+          &state.first_episode_id, &first_episode_error)) {
+    SpielFatalError("async smoke state first episode id is invalid: " +
+                    first_episode_error);
+  }
   const auto initial_generation = object.find("initial_generation");
-  state.initial_generation =
+  std::string initial_generation_error;
+  const std::optional<int64_t> persisted_initial_generation =
       initial_generation == object.end()
-          ? state.published_generation
-          : static_cast<int>(initial_generation->second.GetInt());
+          ? std::nullopt
+          : std::optional<int64_t>(initial_generation->second.GetInt());
+  if (!ResolveAsyncInitialGeneration(
+          persisted_initial_generation, state.published_generation,
+          &state.initial_generation, &initial_generation_error)) {
+    SpielFatalError("async smoke state initial generation is invalid: " +
+                    initial_generation_error);
+  }
   const auto run_first_episode = object.find("run_first_episode_id");
   state.run_first_episode_id =
       run_first_episode == object.end()
@@ -344,9 +372,6 @@ SmokeState ReadState(const std::string& path) {
   const auto target_episode_end = object.find("target_episode_end");
   state.target_episode_end =
       target_episode_end == object.end() ? 0 : target_episode_end->second.GetInt();
-  state.next_episode_id = object.at("next_episode_id").GetInt();
-  state.published_generation =
-      static_cast<int>(object.at("published_generation").GetInt());
   const auto total_env_steps = object.find("total_env_steps");
   state.total_env_steps = total_env_steps == object.end()
                               ? 0
@@ -798,6 +823,19 @@ int main(int argc, char** argv) {
       SpielFatalError("duplicate completed episode in ledger");
     }
   }
+  AsyncResumePendingUpdate resume_pending;
+  std::string resume_pending_error;
+  if (!ReconstructAsyncResumePendingUpdate(
+          state.completed, state.next_update, games_per_update,
+          state.published_generation + 1,
+          [](const std::string& path, std::vector<SearchPiRow>* rows,
+             std::string* error) {
+            return ReadScratchSearchPiRowShardV2(path, rows, error);
+          },
+          &resume_pending, &resume_pending_error)) {
+    SpielFatalError("async resume pending update reconstruction failed: " +
+                    resume_pending_error);
+  }
   if (::absl::GetFlag(FLAGS_verify_production_manifest_only)) {
     if (production_manifest.empty()) {
       SpielFatalError("verify_production_manifest_only requires a manifest.");
@@ -842,9 +880,6 @@ int main(int argc, char** argv) {
                                     ? requested_target_generation
                                     : state.published_generation + updates;
   SPIEL_CHECK_GT(target_generation, state.published_generation);
-  if (state.initial_generation == 0 && state.published_generation != 0) {
-    state.initial_generation = state.published_generation;
-  }
   if (state.run_first_episode_id == 0) {
     state.run_first_episode_id = state.first_episode_id;
   }
@@ -981,11 +1016,19 @@ int main(int argc, char** argv) {
   };
   std::vector<LearnerInterval> learner_intervals;
   std::vector<json::Object> update_records;
-  std::vector<int64_t> update_new_ids;
-  std::vector<SearchPiRow> current_update_rows;
-  std::vector<std::string> current_update_paths;
+  std::vector<int64_t> update_new_ids =
+      std::move(resume_pending.episode_ids);
+  std::vector<SearchPiRow> current_update_rows =
+      std::move(resume_pending.rows);
+  std::vector<std::string> current_update_paths =
+      std::move(resume_pending.shard_paths);
   UpdateCollectionTelemetry current_update_collection;
-  int64_t current_update_env_steps = 0;
+  current_update_collection.AddResumed(resume_pending);
+  int64_t current_update_env_steps = resume_pending.trajectory_transitions;
+  int64_t resumed_prefetch_games = resume_pending.resumed_prefetch_games;
+  int64_t resumed_prefetch_rows =
+      static_cast<int64_t>(current_update_rows.size());
+  int64_t collected_games_after_resume = 0;
   int64_t total_learner_minibatches = 0;
   bool simulated_crash = false;
   while (state.published_generation < target_generation) {
@@ -1025,6 +1068,7 @@ int main(int argc, char** argv) {
     entry.fallbacks = completion.outcome.fallbacks;
     entry.watchdog_timeouts = completion.outcome.watchdog_timeouts;
     entry.non_timeout_early_exits = completion.outcome.non_timeout_early_exits;
+    entry.trajectory_transitions = completion.outcome.trajectory_transitions;
     current_update_collection.Add(
         completion, completion.visit_stats, entry,
         state.published_generation + 1);
@@ -1035,12 +1079,18 @@ int main(int argc, char** argv) {
     current_update_paths.push_back(shard_path.string());
     current_update_env_steps += completion.outcome.trajectory_transitions;
     update_new_ids.push_back(completion.episode_id);
+    ++collected_games_after_resume;
     state.next_episode_id =
         next_episode_to_issue.load(std::memory_order_relaxed);
     publish_state();
 
     const int update_target = (state.next_update + 1) * games_per_update;
     if (static_cast<int>(state.completed.size()) < update_target) continue;
+    if (static_cast<int>(state.completed.size()) != update_target ||
+        update_new_ids.size() != static_cast<size_t>(games_per_update) ||
+        current_update_paths.size() != static_cast<size_t>(games_per_update)) {
+      SpielFatalError("async learner boundary is not one exact game cohort");
+    }
     const double boundary_wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       started)
@@ -1054,6 +1104,7 @@ int main(int argc, char** argv) {
       learner_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(
           *learner_stream);
     }
+    const size_t replay_paths_before_update = state.replay_paths.size();
     replay_window.push_back(std::move(current_update_rows));
     while (replay_window.size() > 8) replay_window.erase(replay_window.begin());
     state.replay_cohort_groups.push_back(std::move(current_update_paths));
@@ -1064,6 +1115,10 @@ int main(int argc, char** argv) {
     for (const auto& group : state.replay_cohort_groups) {
       state.replay_paths.insert(state.replay_paths.end(), group.begin(),
                                 group.end());
+    }
+    if (resumed_prefetch_games > 0 &&
+        state.replay_paths.size() < replay_paths_before_update) {
+      SpielFatalError("async resume unexpectedly shrank the replay path window");
     }
     std::string replay_error;
     const int learner_generation = state.published_generation + 1;
@@ -1129,6 +1184,14 @@ int main(int argc, char** argv) {
         static_cast<int64_t>(state.completed.size());
     update["new_games_this_update"] =
         static_cast<int64_t>(update_new_ids.size());
+    update["resumed_prefetch_games"] = resumed_prefetch_games;
+    update["resumed_prefetch_rows"] = resumed_prefetch_rows;
+    update["collected_games_after_resume"] = collected_games_after_resume;
+    // Existing ledgers persist all health and dose counters, but do not persist
+    // per-game breadcrumb sums. Name that limitation instead of presenting a
+    // partial behavioral aggregate as complete after a mid-update resume.
+    update["resumed_prefetch_behavior_telemetry_complete"] =
+        resumed_prefetch_games == 0;
     update["replay_rows"] = static_cast<int64_t>(learner_rows.size());
     update["learner_seconds"] = learner_seconds;
     update["boundary_wall_seconds"] = boundary_wall_seconds;
@@ -1236,8 +1299,7 @@ int main(int argc, char** argv) {
     // a later-issued game may finish before an earlier-issued game. The global
     // summary checks the complete run range; this update-level contract counts
     // completion slots and separately records the observed ID span.
-    const int64_t expected_update_games =
-        static_cast<int64_t>(update_new_ids.size());
+    const int64_t expected_update_games = games_per_update;
     const int64_t missing_update_ids = std::max<int64_t>(
         0, expected_update_games -
                static_cast<int64_t>(unique_update_ids.size()));
@@ -1366,6 +1428,9 @@ int main(int argc, char** argv) {
     current_update_paths.clear();
     current_update_collection = UpdateCollectionTelemetry();
     current_update_env_steps = 0;
+    resumed_prefetch_games = 0;
+    resumed_prefetch_rows = 0;
+    collected_games_after_resume = 0;
     ++state.next_update;
     state.next_episode_id =
         next_episode_to_issue.load(std::memory_order_relaxed);
@@ -1424,17 +1489,34 @@ int main(int argc, char** argv) {
     start_staleness_sum += entry.start_staleness;
     start_staleness_max = std::max(start_staleness_max, entry.start_staleness);
   }
+  const int64_t persisted_total_games =
+      state.target_episode_end - state.run_first_episode_id;
+  SPIEL_CHECK_GE(persisted_total_games, 0);
+  SPIEL_CHECK_EQ(persisted_total_games % games_per_update, 0);
+  const int persisted_target_generation =
+      state.initial_generation + persisted_total_games / games_per_update;
+  const bool persisted_endpoint_reached =
+      state.published_generation == persisted_target_generation;
+  const int64_t expected_completed_slots =
+      static_cast<int64_t>(state.published_generation -
+                           state.initial_generation) *
+      games_per_update;
   int64_t missing_episode_ids = 0;
   const int64_t expected_first_episode_id = state.first_episode_id;
-  for (int64_t episode_id = expected_first_episode_id;
-       episode_id < expected_first_episode_id + total_games; ++episode_id) {
-    if (!ledger.contains(episode_id)) ++missing_episode_ids;
+  if (persisted_endpoint_reached) {
+    for (int64_t episode_id = state.run_first_episode_id;
+         episode_id < state.target_episode_end; ++episode_id) {
+      if (!ledger.contains(episode_id)) ++missing_episode_ids;
+    }
   }
   const bool duplicate_free = ledger.size() == state.completed.size();
+  const bool completed_slot_accounting =
+      static_cast<int64_t>(state.completed.size()) == expected_completed_slots;
   const bool complete_health =
       total_requested_simulations == total_completed_simulations &&
       total_fallbacks == 0 && total_watchdog_timeouts == 0 &&
-      total_non_timeout_early_exits == 0 && missing_episode_ids == 0 &&
+      total_non_timeout_early_exits == 0 && completed_slot_accounting &&
+      (!persisted_endpoint_reached || missing_episode_ids == 0) &&
       duplicate_free;
   constexpr double kSyncCollectionSeconds = 305.277009;
   constexpr double kSyncLearnerSeconds = 14.955119;
@@ -1467,8 +1549,15 @@ int main(int argc, char** argv) {
   summary["completed_ids_unique"] = duplicate_free;
   summary["duplicate_episode_ids"] = duplicate_free ? 0 : 1;
   summary["missing_episode_ids"] = missing_episode_ids;
+  summary["episode_accounting_scope"] =
+      persisted_endpoint_reached
+          ? "persisted_full_episode_range"
+          : "completed_update_slots_intermediate_target";
+  summary["completed_slot_accounting"] = completed_slot_accounting;
+  summary["expected_completed_slots"] = expected_completed_slots;
+  summary["persisted_endpoint_reached"] = persisted_endpoint_reached;
   summary["expected_first_episode_id"] = expected_first_episode_id;
-  summary["expected_episode_end"] = expected_first_episode_id + total_games;
+  summary["expected_episode_end"] = state.target_episode_end;
   summary["fallbacks"] = total_fallbacks;
   summary["watchdog_timeouts"] = total_watchdog_timeouts;
   summary["non_timeout_early_exits"] = total_non_timeout_early_exits;
