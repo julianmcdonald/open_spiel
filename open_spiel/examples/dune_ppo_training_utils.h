@@ -41,6 +41,10 @@ struct PpoTransition {
   // rollout rows leave the vector empty and the role at -1, so the training
   // path pays no per-row distribution storage cost.
   std::vector<float> behavior_legal_log_probs;
+  // V3 hard-validity input: evaluator logits for legal actions only, in exact
+  // state.LegalActions() order, captured BEFORE CPU centering/capping. Empty on
+  // every normal PPO path and every pre-v3 transition.
+  std::vector<float> behavior_raw_legal_logits;
   int decision_role = -1;
 };
 

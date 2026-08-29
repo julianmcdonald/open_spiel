@@ -4,10 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <c10/util/BFloat16.h>
 
 namespace open_spiel {
 
@@ -104,7 +108,200 @@ struct PpoNumericalParityRow {
   int64_t new_probability_underflows = 0;
   int64_t nonfinite_values = 0;
   int64_t schema_errors = 0;
+  std::string row_identity_sha256;
 };
+
+inline uint32_t PpoParityFloatBits(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+inline bool PpoParityBf16RoundTripsBitExactly(float value) {
+  const float roundtrip = static_cast<float>(c10::BFloat16(value));
+  return PpoParityFloatBits(value) == PpoParityFloatBits(roundtrip);
+}
+
+// Exact CPU postprocessing used by rollout after the evaluator returns its
+// full FP32 container of BF16-grid logits. The input is legal-only and already
+// ordered like state.LegalActions(); subtracting one shared legal mean means no
+// illegal value is needed.
+inline bool RecomputePpoBehaviorLegalLogProbs(
+    const std::vector<float>& raw_legal_logits, float logit_cap,
+    std::vector<float>* out, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (out == nullptr) return fail("null behavior recompute output");
+  if (raw_legal_logits.empty()) return fail("empty raw legal-logit vector");
+  double sum = 0.0;
+  for (float value : raw_legal_logits) {
+    if (!std::isfinite(value)) return fail("nonfinite raw legal logit");
+    sum += value;
+  }
+  const float mean = static_cast<float>(
+      sum / static_cast<double>(raw_legal_logits.size()));
+  std::vector<float> logits = raw_legal_logits;
+  for (float& value : logits) {
+    value -= mean;
+    if (logit_cap > 0.0f) {
+      value = logit_cap * std::tanh(value / logit_cap);
+    }
+  }
+  float maximum = -std::numeric_limits<float>::infinity();
+  for (float value : logits) maximum = std::max(maximum, value);
+  std::vector<double> weights(logits.size(), 0.0);
+  double total = 0.0;
+  for (size_t i = 0; i < logits.size(); ++i) {
+    weights[i] = std::exp(static_cast<double>(logits[i] - maximum));
+    if (!std::isfinite(weights[i]) || weights[i] < 0.0) weights[i] = 0.0;
+    total += weights[i];
+  }
+  if (!(total > 0.0) || !std::isfinite(total)) {
+    weights.assign(logits.size(), 1.0);
+    total = static_cast<double>(logits.size());
+  }
+  std::vector<float> result;
+  result.reserve(logits.size());
+  for (double weight : weights) {
+    result.push_back(weight > 0.0
+                         ? static_cast<float>(std::log(weight / total))
+                         : -std::numeric_limits<float>::infinity());
+  }
+  *out = std::move(result);
+  return true;
+}
+
+struct PpoParityPrecapCaptureValidation {
+  bool full_width_ok = false;
+  bool full_finite_ok = false;
+  bool legal_ids_unique_in_range = false;
+};
+
+inline PpoParityPrecapCaptureValidation ValidateAndCapturePpoParityPrecap(
+    const std::vector<float>& full_logits, int64_t action_dim,
+    const std::vector<int64_t>& legal_actions,
+    std::vector<float>* raw_legal_logits, std::string* error) {
+  PpoParityPrecapCaptureValidation out;
+  if (raw_legal_logits == nullptr) {
+    if (error != nullptr) *error = "null raw legal-logit output";
+    return out;
+  }
+  out.full_width_ok =
+      static_cast<int64_t>(full_logits.size()) == action_dim;
+  out.full_finite_ok = std::all_of(
+      full_logits.begin(), full_logits.end(),
+      [](float value) { return std::isfinite(value); });
+  std::set<int64_t> unique;
+  out.legal_ids_unique_in_range = !legal_actions.empty();
+  raw_legal_logits->clear();
+  raw_legal_logits->reserve(legal_actions.size());
+  for (int64_t action : legal_actions) {
+    const bool in_range = action >= 0 && action < action_dim &&
+                          action < static_cast<int64_t>(full_logits.size());
+    if (!in_range || !unique.insert(action).second) {
+      out.legal_ids_unique_in_range = false;
+    }
+    raw_legal_logits->push_back(
+        in_range ? full_logits[action]
+                 : std::numeric_limits<float>::quiet_NaN());
+  }
+  if (error != nullptr) {
+    std::string message;
+    if (!out.full_width_ok) message += "full_width;";
+    if (!out.full_finite_ok) message += "full_nonfinite;";
+    if (!out.legal_ids_unique_in_range) message += "legal_ids;";
+    *error = message;
+  }
+  return out;
+}
+
+inline bool ValidatePpoParityBehaviorCaptureWidthsAndChoice(
+    const std::vector<int64_t>& legal_actions, int64_t chosen_action,
+    const std::vector<float>& raw_legal_logits,
+    const std::vector<float>& behavior_log_probs, std::string* error) {
+  if (legal_actions.empty() || raw_legal_logits.size() != legal_actions.size() ||
+      behavior_log_probs.size() != legal_actions.size()) {
+    if (error != nullptr) *error = "legal/raw/behavior vector width mismatch";
+    return false;
+  }
+  const int count = static_cast<int>(std::count(
+      legal_actions.begin(), legal_actions.end(), chosen_action));
+  if (count != 1) {
+    if (error != nullptr) *error = "chosen action does not occur exactly once";
+    return false;
+  }
+  return true;
+}
+
+enum class PpoParityV3Classification {
+  kInvalid,
+  kPostprocessSufficient,
+  kForwardBatchComponentNecessary,
+  kInconclusive,
+};
+
+inline PpoParityV3Classification ClassifyPpoParityV3(
+    bool instrument_valid, bool learner_bf16_pass,
+    bool captured_logits_postprocess_pass) {
+  if (!instrument_valid) return PpoParityV3Classification::kInvalid;
+  if (learner_bf16_pass) return PpoParityV3Classification::kInconclusive;
+  return captured_logits_postprocess_pass
+             ? PpoParityV3Classification::kForwardBatchComponentNecessary
+             : PpoParityV3Classification::kPostprocessSufficient;
+}
+
+inline std::string PpoParityV3ClassificationName(
+    PpoParityV3Classification classification) {
+  switch (classification) {
+    case PpoParityV3Classification::kInvalid: return "INVALID";
+    case PpoParityV3Classification::kPostprocessSufficient:
+      return "POSTPROCESS_SUFFICIENT";
+    case PpoParityV3Classification::kForwardBatchComponentNecessary:
+      return "FORWARD_BATCH_COMPONENT_NECESSARY";
+    case PpoParityV3Classification::kInconclusive: return "INCONCLUSIVE";
+  }
+  return "INVALID";
+}
+
+inline std::vector<std::string> IntersectPpoParityViolationIdentities(
+    const std::vector<std::string>& first,
+    const std::vector<std::string>& second) {
+  const std::set<std::string> second_set(second.begin(), second.end());
+  std::vector<std::string> out;
+  for (const std::string& identity : first) {
+    if (second_set.find(identity) != second_set.end()) out.push_back(identity);
+  }
+  return out;
+}
+
+inline bool CanonicalPpoParityViolationIdentityPayload(
+    const std::vector<std::string>& identities, std::string* payload,
+    std::string* error) {
+  auto valid_sha256 = [](const std::string& digest) {
+    if (digest.size() != 64) return false;
+    for (char c : digest) {
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+  };
+  if (payload == nullptr) {
+    if (error != nullptr) *error = "null violation payload output";
+    return false;
+  }
+  std::string out;
+  for (const std::string& identity : identities) {
+    if (!valid_sha256(identity)) {
+      if (error != nullptr) *error = "invalid row-identity SHA-256";
+      return false;
+    }
+    out.append(identity);
+    out.push_back('\n');
+  }
+  *payload = std::move(out);
+  return true;
+}
 
 inline std::string PpoNumericalParityOldProbabilityBucket(
     const PpoNumericalParityRow& row) {

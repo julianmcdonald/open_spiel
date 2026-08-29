@@ -1342,6 +1342,7 @@ void TestRawPpoNumericalParityMathAndDefaultInertness() {
   TEST_BEGIN("Raw-PPO parity v2: normalized KL, raw-mass gate, underflow, default inertness") {
     PpoTransition default_transition;
     UTILS_CHECK(default_transition.behavior_legal_log_probs.empty());
+    UTILS_CHECK(default_transition.behavior_raw_legal_logits.empty());
     CHECK_EQ(default_transition.decision_role, -1);
 
     PpoNumericalParityInput equal;
@@ -1482,6 +1483,99 @@ void TestRawPpoNumericalParityMathAndDefaultInertness() {
   } TEST_END();
 }
 
+void TestRawPpoNumericalParityV3CaptureAndClassification() {
+  TEST_BEGIN("Raw-PPO parity v3: CPU recompute, capture validity, classification, violation sets") {
+    const std::vector<float> raw = {1.0f, -2.0f, 0.5f, 3.25f};
+    std::vector<float> recomputed;
+    std::string error;
+    UTILS_CHECK(RecomputePpoBehaviorLegalLogProbs(
+        raw, 10.0f, &recomputed, &error));
+    CHECK_EQ(recomputed.size(), raw.size());
+    // Independent literal transcription of rollout CPU arithmetic.
+    double sum = 0.0;
+    for (float x : raw) sum += x;
+    const float mean = static_cast<float>(sum / raw.size());
+    std::vector<float> capped = raw;
+    for (float& x : capped) {
+      x -= mean;
+      x = 10.0f * std::tanh(x / 10.0f);
+    }
+    const float maximum = *std::max_element(capped.begin(), capped.end());
+    std::vector<double> weights;
+    double total = 0.0;
+    for (float x : capped) {
+      weights.push_back(std::exp(static_cast<double>(x - maximum)));
+      total += weights.back();
+    }
+    for (size_t i = 0; i < raw.size(); ++i) {
+      const float expected = static_cast<float>(std::log(weights[i] / total));
+      CHECK_EQ(PpoParityFloatBits(recomputed[i]),
+               PpoParityFloatBits(expected));
+    }
+    std::vector<float> unused;
+    UTILS_CHECK(!RecomputePpoBehaviorLegalLogProbs(
+        {}, 10.0f, &unused, &error));
+    UTILS_CHECK(!RecomputePpoBehaviorLegalLogProbs(
+        {0.0f, std::numeric_limits<float>::quiet_NaN()}, 10.0f, &unused,
+        &error));
+
+    std::vector<float> captured;
+    PpoParityPrecapCaptureValidation capture =
+        ValidateAndCapturePpoParityPrecap(
+            {0.0f, 1.0f}, /*action_dim=*/3, {0, 1}, &captured, &error);
+    UTILS_CHECK(!capture.full_width_ok);
+    UTILS_CHECK(capture.full_finite_ok);
+    UTILS_CHECK(capture.legal_ids_unique_in_range);
+    capture = ValidateAndCapturePpoParityPrecap(
+        {0.0f, std::numeric_limits<float>::infinity(), 2.0f},
+        /*action_dim=*/3, {0, 0, 4}, &captured, &error);
+    UTILS_CHECK(capture.full_width_ok);
+    UTILS_CHECK(!capture.full_finite_ok);
+    UTILS_CHECK(!capture.legal_ids_unique_in_range);
+    CHECK_EQ(captured.size(), static_cast<size_t>(3));
+    UTILS_CHECK(!ValidatePpoParityBehaviorCaptureWidthsAndChoice(
+        {0, 1}, /*chosen=*/0, {1.0f}, {-0.5f, -1.0f}, &error));
+    UTILS_CHECK(!ValidatePpoParityBehaviorCaptureWidthsAndChoice(
+        {0, 0}, /*chosen=*/0, {1.0f, 2.0f}, {-0.5f, -1.0f}, &error));
+    UTILS_CHECK(ValidatePpoParityBehaviorCaptureWidthsAndChoice(
+        {0, 1}, /*chosen=*/1, {1.0f, 2.0f}, {-0.5f, -1.0f}, &error));
+
+    const float bf16_grid = static_cast<float>(c10::BFloat16(1.2345f));
+    UTILS_CHECK(PpoParityBf16RoundTripsBitExactly(bf16_grid));
+    UTILS_CHECK(!PpoParityBf16RoundTripsBitExactly(1.2345f));
+
+    CHECK_EQ(PpoParityV3ClassificationName(
+                 ClassifyPpoParityV3(false, false, false)),
+             std::string("INVALID"));
+    CHECK_EQ(PpoParityV3ClassificationName(
+                 ClassifyPpoParityV3(true, false, false)),
+             std::string("POSTPROCESS_SUFFICIENT"));
+    CHECK_EQ(PpoParityV3ClassificationName(
+                 ClassifyPpoParityV3(true, false, true)),
+             std::string("FORWARD_BATCH_COMPONENT_NECESSARY"));
+    CHECK_EQ(PpoParityV3ClassificationName(
+                 ClassifyPpoParityV3(true, true, false)),
+             std::string("INCONCLUSIVE"));
+    CHECK_EQ(PpoParityV3ClassificationName(
+                 ClassifyPpoParityV3(true, true, true)),
+             std::string("INCONCLUSIVE"));
+
+    const std::string a(64, 'a'), b(64, 'b'), c(64, 'c');
+    const std::vector<std::string> intersection =
+        IntersectPpoParityViolationIdentities({a, b}, {b, c});
+    CHECK_EQ(intersection.size(), static_cast<size_t>(1));
+    UTILS_CHECK(intersection[0] == b);
+    std::string payload;
+    UTILS_CHECK(CanonicalPpoParityViolationIdentityPayload(
+        intersection, &payload, &error));
+    UTILS_CHECK(payload == b + "\n");
+    UTILS_CHECK(ComputeStringSHA256(payload) ==
+                ComputeStringSHA256(b + "\n"));
+    UTILS_CHECK(!CanonicalPpoParityViolationIdentityPayload(
+        {"not-a-sha"}, &payload, &error));
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1553,6 +1647,7 @@ int main() {
   TestDiagPrepassCadenced();
   TestGradTelemetryAccumulatedParity();
   TestRawPpoNumericalParityMathAndDefaultInertness();
+  TestRawPpoNumericalParityV3CaptureAndClassification();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 
