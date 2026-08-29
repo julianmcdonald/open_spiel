@@ -1736,6 +1736,47 @@ void TestRawPpoNumericalParityV5SharedRowsFailClosed() {
   } TEST_END();
 }
 
+void TestRawPpoNumericalParityRawLogitPrecisionGate() {
+  TEST_BEGIN("Raw-PPO parity: BF16-grid validity follows rollout precision") {
+    const float non_grid = 0.1f;
+    UTILS_CHECK(!PpoParityBf16RoundTripsBitExactly(non_grid));
+    int64_t total = 0;
+    int64_t exact = 0;
+    UTILS_CHECK(PpoParityCapturedRawLogitsValid(
+        {non_grid}, /*require_bf16_grid=*/false, &total, &exact));
+    CHECK_EQ(total, int64_t{1});
+    CHECK_EQ(exact, int64_t{0});
+
+    total = 0;
+    exact = 0;
+    UTILS_CHECK(!PpoParityCapturedRawLogitsValid(
+        {non_grid}, /*require_bf16_grid=*/true, &total, &exact));
+    CHECK_EQ(total, int64_t{1});
+    CHECK_EQ(exact, int64_t{0});
+
+    const float bf16_grid = static_cast<float>(c10::BFloat16(non_grid));
+    UTILS_CHECK(PpoParityBf16RoundTripsBitExactly(bf16_grid));
+    for (bool require_bf16_grid : {false, true}) {
+      total = 0;
+      exact = 0;
+      UTILS_CHECK(PpoParityCapturedRawLogitsValid(
+          {bf16_grid}, require_bf16_grid, &total, &exact));
+      CHECK_EQ(total, int64_t{1});
+      CHECK_EQ(exact, int64_t{1});
+    }
+
+    const float nonfinite = std::numeric_limits<float>::quiet_NaN();
+    for (bool require_bf16_grid : {false, true}) {
+      total = 0;
+      exact = 0;
+      UTILS_CHECK(!PpoParityCapturedRawLogitsValid(
+          {nonfinite}, require_bf16_grid, &total, &exact));
+      CHECK_EQ(total, int64_t{1});
+      CHECK_EQ(exact, int64_t{0});
+    }
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1811,6 +1852,7 @@ int main() {
   TestRawPpoNumericalParityV4BatchMetadataAndClassification();
   TestRawPpoNumericalParityV5PrecisionAndClassification();
   TestRawPpoNumericalParityV5SharedRowsFailClosed();
+  TestRawPpoNumericalParityRawLogitPrecisionGate();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 

@@ -157,10 +157,31 @@ inline bool PpoParityBf16RoundTripsBitExactly(float value) {
   return PpoParityFloatBits(value) == PpoParityFloatBits(roundtrip);
 }
 
+// All parity captures require finite raw logits. BF16-grid membership is a
+// hard validity gate only when the rollout itself used BF16 autocast; FP32
+// rollouts still report the exact-grid count descriptively.
+inline bool PpoParityCapturedRawLogitsValid(
+    const std::vector<float>& raw_legal_logits, bool require_bf16_grid,
+    int64_t* raw_values_total, int64_t* raw_values_bf16_exact) {
+  bool all_finite = true;
+  bool all_bf16_exact = true;
+  for (float raw : raw_legal_logits) {
+    if (raw_values_total != nullptr) ++*raw_values_total;
+    if (std::isfinite(raw) && PpoParityBf16RoundTripsBitExactly(raw)) {
+      if (raw_values_bf16_exact != nullptr) ++*raw_values_bf16_exact;
+    } else {
+      if (!std::isfinite(raw)) all_finite = false;
+      all_bf16_exact = false;
+    }
+  }
+  return all_finite && (!require_bf16_grid || all_bf16_exact);
+}
+
 // Exact CPU postprocessing used by rollout after the evaluator returns its
-// full FP32 container of BF16-grid logits. The input is legal-only and already
-// ordered like state.LegalActions(); subtracting one shared legal mean means no
-// illegal value is needed.
+// full FP32 logit container. BF16 rollouts lie on the BF16 grid; FP32 rollouts
+// need not. The input is legal-only and already ordered like
+// state.LegalActions(); subtracting one shared legal mean means no illegal
+// value is needed.
 inline bool RecomputePpoBehaviorLegalLogProbs(
     const std::vector<float>& raw_legal_logits, float logit_cap,
     std::vector<float>* out, std::string* error) {

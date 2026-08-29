@@ -2593,6 +2593,7 @@ std::string PpoParityCapturedPolicySha256(
 
 std::vector<PpoNumericalParityRow> ReplayPpoCpuIntegrityCell(
     const std::vector<PpoTransition>& batch, float logit_cap,
+    bool require_bf16_grid,
     std::vector<std::string>* schema_errors,
     std::string* row_evidence_sha256, int64_t* raw_values_total,
     int64_t* raw_values_bf16_exact, int64_t* vector_width_rows_ok,
@@ -2629,17 +2630,12 @@ std::vector<PpoNumericalParityRow> ReplayPpoCpuIntegrityCell(
     } else if (vector_width_rows_ok != nullptr) {
       ++*vector_width_rows_ok;
     }
-    bool bf16_exact = true;
-    for (float raw : transition.behavior_raw_legal_logits) {
-      if (raw_values_total != nullptr) ++*raw_values_total;
-      if (std::isfinite(raw) && PpoParityBf16RoundTripsBitExactly(raw)) {
-        if (raw_values_bf16_exact != nullptr) ++*raw_values_bf16_exact;
-      } else {
-        bf16_exact = false;
-      }
-    }
-    if (!bf16_exact) {
-      error("captured raw legal logits are not finite BF16-grid values");
+    if (!PpoParityCapturedRawLogitsValid(
+            transition.behavior_raw_legal_logits, require_bf16_grid,
+            raw_values_total, raw_values_bf16_exact)) {
+      error(require_bf16_grid
+                ? "captured raw legal logits are not finite BF16-grid values"
+                : "captured raw legal logits are not finite");
     }
 
     std::vector<float> recomputed;
@@ -7481,6 +7477,7 @@ int main(int argc, char** argv) {
     integrity_cell.rows = open_spiel::ReplayPpoCpuIntegrityCell(
         current_collect.rollout,
         static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+        absl::GetFlag(FLAGS_rollout_amp),
         &integrity_cell.schema_errors, &integrity_cell.row_evidence_sha256,
         &integrity_stats.raw_values_total,
         &integrity_stats.raw_values_bf16_exact,
