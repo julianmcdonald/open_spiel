@@ -1692,6 +1692,50 @@ void TestRawPpoNumericalParityV5PrecisionAndClassification() {
   } TEST_END();
 }
 
+void TestRawPpoNumericalParityV5SharedRowsFailClosed() {
+  TEST_BEGIN("Raw-PPO parity v5: incomplete shared rows fail closed without indexing") {
+    auto row = [](char digit) {
+      PpoNumericalParityRow value;
+      value.row_identity_sha256 = std::string(64, digit);
+      return value;
+    };
+    const PpoNumericalParityRow row_a = row('a');
+    const PpoNumericalParityRow row_b = row('b');
+    const std::vector<PpoNumericalParityRow> complete = {row_a, row_b};
+    const std::vector<PpoNumericalParityRow> short_rows = {row_a};
+    const std::vector<PpoNumericalParityRow> empty;
+
+    auto require_invalid = [&](const std::vector<PpoNumericalParityRow>& a,
+                               const std::vector<PpoNumericalParityRow>& r,
+                               const std::vector<PpoNumericalParityRow>& b,
+                               const std::vector<PpoNumericalParityRow>& d,
+                               int64_t expected_rows) {
+      const bool shared = PpoParityV5RowsShareIdentities(
+          a, r, b, d, expected_rows);
+      UTILS_CHECK(!shared);
+      CHECK_EQ(PpoParityV5ClassificationName(
+                   ClassifyPpoParityV5(shared, true, true)),
+               std::string("INVALID"));
+    };
+
+    require_invalid(empty, empty, empty, empty, 1);
+    require_invalid(complete, empty, complete, complete, 2);
+    require_invalid(complete, short_rows, complete, complete, 2);
+    require_invalid(complete, complete, complete,
+                    {row_a, row_b, row_a}, 2);
+    auto mismatched = complete;
+    mismatched[1].row_identity_sha256 = std::string(64, 'c');
+    require_invalid(complete, complete, mismatched, complete, 2);
+    require_invalid(empty, empty, empty, empty, -1);
+
+    UTILS_CHECK(PpoParityV5RowsShareIdentities(
+        complete, complete, complete, complete, 2));
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(true, true, true)),
+             std::string("FP32_TF32_ALLOWED_CANDIDATE_ADMITTED"));
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1766,6 +1810,7 @@ int main() {
   TestRawPpoNumericalParityV3CaptureAndClassification();
   TestRawPpoNumericalParityV4BatchMetadataAndClassification();
   TestRawPpoNumericalParityV5PrecisionAndClassification();
+  TestRawPpoNumericalParityV5SharedRowsFailClosed();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 

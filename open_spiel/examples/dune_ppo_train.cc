@@ -4436,16 +4436,8 @@ bool WritePpoNumericalParityArtifactV5(
   }
   require(cell_hashes_valid && evidence_hashes.size() == cell_list.size(),
           "cell raw/policy/evidence hashes malformed or evidence not distinct");
-  bool shared_rows = true;
-  for (int64_t i = 0; i < transitions; ++i) {
-    const std::string& identity = cell_a.rows[i].row_identity_sha256;
-    if (!hex64(identity) || cell_r.rows[i].row_identity_sha256 != identity ||
-        cell_b.rows[i].row_identity_sha256 != identity ||
-        cell_d.rows[i].row_identity_sha256 != identity) {
-      shared_rows = false;
-      break;
-    }
-  }
+  const bool shared_rows = PpoParityV5RowsShareIdentities(
+      cell_a.rows, cell_r.rows, cell_b.rows, cell_d.rows, transitions);
   require(shared_rows, "A/R/B/D row identities differ");
   require(model_hash_before == model_hash_after &&
               inference_hash_before == inference_hash_after &&

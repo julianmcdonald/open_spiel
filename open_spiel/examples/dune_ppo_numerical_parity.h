@@ -112,6 +112,40 @@ struct PpoNumericalParityRow {
   std::string row_identity_sha256;
 };
 
+// V5 may deliberately leave a replay cell empty after an earlier hard gate
+// fails. Validate every width before indexing so the artifact can report
+// INVALID instead of dereferencing a skipped cell. Identity syntax remains a
+// hard part of the same gate.
+inline bool PpoParityV5RowsShareIdentities(
+    const std::vector<PpoNumericalParityRow>& cell_a,
+    const std::vector<PpoNumericalParityRow>& cell_r,
+    const std::vector<PpoNumericalParityRow>& cell_b,
+    const std::vector<PpoNumericalParityRow>& cell_d,
+    int64_t expected_rows) {
+  if (expected_rows < 0) return false;
+  const size_t rows = static_cast<size_t>(expected_rows);
+  if (cell_a.size() != rows || cell_r.size() != rows ||
+      cell_b.size() != rows || cell_d.size() != rows) {
+    return false;
+  }
+  auto valid_sha256 = [](const std::string& digest) {
+    if (digest.size() != 64) return false;
+    return std::all_of(digest.begin(), digest.end(), [](char c) {
+      return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+  };
+  for (size_t i = 0; i < rows; ++i) {
+    const std::string& identity = cell_a[i].row_identity_sha256;
+    if (!valid_sha256(identity) ||
+        cell_r[i].row_identity_sha256 != identity ||
+        cell_b[i].row_identity_sha256 != identity ||
+        cell_d[i].row_identity_sha256 != identity) {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline uint32_t PpoParityFloatBits(float value) {
   uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
