@@ -334,6 +334,12 @@ struct AutocastGuard {
 struct EvalResult {
     std::vector<float> logits;
     float value;
+    // Opt-in physical-batch membership for read-only numerical diagnostics.
+    // Default sentinels preserve every existing evaluator consumer and make an
+    // uninstrumented result mechanically distinguishable from batch 0/row 0.
+    int64_t physical_batch_id = -1;
+    int32_t physical_batch_size = -1;
+    int32_t physical_batch_row = -1;
 };
 
 struct CompactEvalResult {
@@ -704,11 +710,13 @@ public:
                      std::shared_mutex* sync_mutex,
                      float logit_cap = 0.0f,
                      bool device_synchronize = true,
-                     bool high_priority_stream = false)
+                     bool high_priority_stream = false,
+                     bool emit_batch_membership = false)
         : model_(model), target_batch_size_(target_batch_size),
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
           high_priority_stream_(high_priority_stream),
+          emit_batch_membership_(emit_batch_membership),
           stop_(false) {
 
         // Dynamically get the input layer dimension from the model's weights
@@ -1221,6 +1229,7 @@ private:
     float logit_cap_;
     bool device_synchronize_;
     bool high_priority_stream_;
+    bool emit_batch_membership_;
     int64_t model_input_dim_;
     int64_t model_action_dim_;
 
@@ -1234,6 +1243,7 @@ private:
     std::atomic<uint64_t> total_batches_{0};
     std::atomic<uint64_t> total_requests_{0};
     std::atomic<uint64_t> max_batch_size_seen_{0};
+    std::atomic<int64_t> next_membership_batch_id_{0};
 
     // --- WO-PERF-3 telemetry (additive; does not influence dispatch) ---------
     std::atomic<uint64_t> next_group_id_{1};
@@ -1324,6 +1334,7 @@ private:
         torch::Tensor compact_device_rows;
         torch::Tensor compact_host_probs;
         bool pending = false;
+        int64_t membership_batch_id = -1;
     };
 
     void RunnerAsync() {
@@ -1502,6 +1513,14 @@ private:
                             request.legal_actions.size());
                     request.compact_dest->value = values[i];
                 }
+                if (emit_batch_membership_ && request.result_dest != nullptr) {
+                    request.result_dest->physical_batch_id =
+                        slot.membership_batch_id;
+                    request.result_dest->physical_batch_size =
+                        static_cast<int32_t>(slot.batch.size());
+                    request.result_dest->physical_batch_row =
+                        static_cast<int32_t>(i);
+                }
                 slot.batch[i].ready_flag->store(true,
                                                 std::memory_order_release);
             }
@@ -1511,6 +1530,7 @@ private:
             park_cv_.notify_all();
             slot.batch.clear();
             slot.pending = false;
+            slot.membership_batch_id = -1;
         };
 
         auto launch_slot = [&](AsyncBatchSlot& slot) {
@@ -1658,6 +1678,11 @@ private:
             AsyncBatchSlot& slot = slots[slot_index];
             if (slot.pending) finish_slot(slot);
             slot.batch = std::move(batch);
+            if (emit_batch_membership_) {
+                slot.membership_batch_id =
+                    next_membership_batch_id_.fetch_add(
+                        1, std::memory_order_relaxed);
+            }
             record_batch_telemetry(slot.batch, timeout_flush);
             float* destination = slot.host_obs.defined()
                 ? slot.host_obs.data_ptr<float>()
@@ -1792,6 +1817,10 @@ private:
             if (batch.empty()) continue;
 
             size_t batch_size = batch.size();
+            const int64_t membership_batch_id = emit_batch_membership_
+                ? next_membership_batch_id_.fetch_add(
+                      1, std::memory_order_relaxed)
+                : -1;
             total_batches_.fetch_add(1, std::memory_order_relaxed);
             total_requests_.fetch_add(static_cast<uint64_t>(batch_size), std::memory_order_relaxed);
             uint64_t observed_max = max_batch_size_seen_.load(std::memory_order_relaxed);
@@ -2006,6 +2035,15 @@ private:
             for (size_t i = 0; i < batch_size; ++i) {
                 batch[i].result_dest->logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
                 batch[i].result_dest->value = values_ptr[i];
+
+                if (emit_batch_membership_) {
+                    batch[i].result_dest->physical_batch_id =
+                        membership_batch_id;
+                    batch[i].result_dest->physical_batch_size =
+                        static_cast<int32_t>(batch_size);
+                    batch[i].result_dest->physical_batch_row =
+                        static_cast<int32_t>(i);
+                }
 
                 // Set the atomic flag (fast spinning threads will catch this instantly)
                 batch[i].ready_flag->store(true, std::memory_order_release);

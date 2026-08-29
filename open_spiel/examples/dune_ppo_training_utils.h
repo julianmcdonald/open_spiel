@@ -46,6 +46,9 @@ struct PpoTransition {
   // every normal PPO path and every pre-v3 transition.
   std::vector<float> behavior_raw_legal_logits;
   int decision_role = -1;
+  int64_t behavior_physical_batch_id = -1;
+  int32_t behavior_physical_batch_size = -1;
+  int32_t behavior_physical_batch_row = -1;
 };
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH

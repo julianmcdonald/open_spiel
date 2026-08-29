@@ -2067,6 +2067,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       transition.behavior_raw_legal_logits =
           std::move(parity_raw_legal_logits);
       transition.decision_role = parity_decision_role;
+      transition.behavior_physical_batch_id = result.physical_batch_id;
+      transition.behavior_physical_batch_size = result.physical_batch_size;
+      transition.behavior_physical_batch_row = result.physical_batch_row;
       trajectory->push_back(std::move(transition));
 
       if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -2560,6 +2563,28 @@ std::string PpoParitySharedIdentitySha256(
   return ComputeStringSHA256(payload);
 }
 
+std::string PpoParityCapturedRawSha256(
+    const std::vector<PpoTransition>& batch) {
+  std::stringstream bytes;
+  for (const auto& transition : batch) {
+    for (float value : transition.behavior_raw_legal_logits) {
+      bytes.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+  }
+  return ComputeStringSHA256(bytes.str());
+}
+
+std::string PpoParityCapturedPolicySha256(
+    const std::vector<PpoTransition>& batch) {
+  std::stringstream bytes;
+  for (const auto& transition : batch) {
+    for (float value : transition.behavior_legal_log_probs) {
+      bytes.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+  }
+  return ComputeStringSHA256(bytes.str());
+}
+
 std::vector<PpoNumericalParityRow> ReplayPpoCpuIntegrityCell(
     const std::vector<PpoTransition>& batch, float logit_cap,
     std::vector<std::string>* schema_errors,
@@ -2697,10 +2722,12 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
     const std::string& cell_label,
     std::vector<std::string>* schema_errors,
     std::string* row_evidence_sha256, int64_t* model_forward_calls,
-    int64_t* dense_mask_rows_ok) {
+    int64_t* dense_mask_rows_ok, std::string* raw_logit_sha256,
+    std::string* policy_sha256) {
   std::vector<PpoNumericalParityRow> rows;
   rows.reserve(batch.size());
   std::stringstream evidence;
+  std::stringstream raw_bytes, policy_bytes;
   evidence << "dune_raw_ppo_numerical_parity_v3";
   evidence.put('\0');
   evidence << cell_label;
@@ -2770,12 +2797,13 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
 
     const torch::Tensor states = states_cpu.to(device);
     const torch::Tensor masks = masks_cpu.to(device);
-    torch::Tensor replay_log_probs;
+    torch::Tensor replay_raw_logits, replay_log_probs;
     auto replay_policy_path = [&]() {
       if (model_forward_calls != nullptr) ++*model_forward_calls;
       const auto outputs = model->forward(states);
+      replay_raw_logits = outputs.logits;
       const torch::Tensor centered =
-          CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
+          CenterAndCapLogitsTensor(replay_raw_logits, masks, logit_cap);
       const torch::Tensor masked_logits =
           centered.masked_fill(masks.logical_not(), -1e9f);
       replay_log_probs = torch::log_softmax(masked_logits, -1);
@@ -2792,7 +2820,10 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
     }
     const torch::Tensor log_probs_cpu =
         replay_log_probs.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    const torch::Tensor raw_logits_cpu =
+        replay_raw_logits.to(torch::kCPU).to(torch::kFloat32).contiguous();
     const float* new_log_probs = log_probs_cpu.data_ptr<float>();
+    const float* raw_logits = raw_logits_cpu.data_ptr<float>();
 
     for (int64_t i = 0; i < count; ++i) {
       const int64_t row_index = start + i;
@@ -2817,6 +2848,16 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
                 ? new_log_probs[i * action_dim + action]
                 : std::numeric_limits<double>::quiet_NaN());
         if (action == transition.action) input.chosen_index = j;
+        const float replay_raw =
+            (action >= 0 && action < action_dim)
+                ? raw_logits[i * action_dim + action]
+                : std::numeric_limits<float>::quiet_NaN();
+        raw_bytes.write(reinterpret_cast<const char*>(&replay_raw),
+                        sizeof(replay_raw));
+        const float replay_policy = static_cast<float>(
+            input.new_log_probs.back());
+        policy_bytes.write(reinterpret_cast<const char*>(&replay_policy),
+                           sizeof(replay_policy));
       }
       // Hash the exact row identity and BOTH aligned legal distributions. The
       // artifact's summaries can therefore be tied back to the measured row
@@ -2879,6 +2920,12 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
   }
   if (row_evidence_sha256 != nullptr) {
     *row_evidence_sha256 = ComputeStringSHA256(evidence.str());
+  }
+  if (raw_logit_sha256 != nullptr) {
+    *raw_logit_sha256 = ComputeStringSHA256(raw_bytes.str());
+  }
+  if (policy_sha256 != nullptr) {
+    *policy_sha256 = ComputeStringSHA256(policy_bytes.str());
   }
   return rows;
 }
@@ -3237,6 +3284,8 @@ struct PpoParityCellResult {
   std::vector<PpoNumericalParityRow> rows;
   std::vector<std::string> schema_errors;
   std::string row_evidence_sha256;
+  std::string raw_logit_sha256;
+  std::string policy_sha256;
   int64_t model_forward_calls = 0;
   int64_t dense_mask_rows_ok = 0;
 };
@@ -3247,6 +3296,22 @@ struct PpoParityIntegrityStats {
   int64_t vector_width_rows_ok = 0;
   int64_t behavior_vector_exact_rows = 0;
   int64_t chosen_scalar_exact_rows = 0;
+};
+
+struct PpoParityReplayGeometryStats {
+  EvaluatorStats before;
+  EvaluatorStats after;
+  int64_t returned_metadata_exact_rows = 0;
+  int64_t raw_legal_exact_rows = 0;
+  int64_t cpu_policy_exact_rows = 0;
+  int64_t model_forward_calls = 0;
+  std::string captured_raw_sha256;
+  std::string replay_raw_sha256;
+};
+
+struct PpoParityOriginalGeometryModelStats {
+  int64_t raw_legal_exact_rows = 0;
+  double raw_legal_max_abs_delta = 0.0;
 };
 
 PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
@@ -3294,6 +3359,312 @@ PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
         registered_sha256 + " computed " + out.combined_sha256);
   }
   return out;
+}
+
+PpoParityCellResult ReplayPpoInferenceExactGeometry(
+    BatchedEvaluator* evaluator, const std::vector<PpoTransition>& batch,
+    const PpoParityBatchGeometry& geometry, int64_t action_dim,
+    float logit_cap, const EvaluatorStats& before,
+    PpoParityReplayGeometryStats* stats) {
+  PpoParityCellResult cell;
+  cell.name = "live_inference_exact_original_batches";
+  cell.rows.resize(batch.size());
+  stats->before = before;
+  std::stringstream evidence, captured_raw, replay_raw, replay_policy_bytes;
+  evidence << "dune_raw_ppo_numerical_parity_v4";
+  evidence.put('\0');
+  evidence << cell.name;
+  evidence.put('\0');
+  for (size_t group_index = 0;
+       group_index < geometry.row_indices_by_group.size(); ++group_index) {
+    const auto& indices = geometry.row_indices_by_group[group_index];
+    std::vector<std::vector<float>> observations;
+    observations.reserve(indices.size());
+    for (size_t index : indices) observations.push_back(batch[index].state);
+    const std::vector<EvalResult> replay = evaluator->EvaluateBatch(observations);
+    ++stats->model_forward_calls;
+    if (replay.size() != indices.size()) {
+      cell.schema_errors.push_back("R returned row count differs from group");
+      continue;
+    }
+    for (size_t position = 0; position < indices.size(); ++position) {
+      const size_t index = indices[position];
+      const PpoTransition& transition = batch[index];
+      const EvalResult& result = replay[position];
+      const std::string identity =
+          PpoParityRowIdentitySha256(static_cast<int64_t>(index), transition);
+      bool valid = true;
+      auto error = [&](const std::string& message) {
+        cell.schema_errors.push_back("row " + std::to_string(index) +
+                                     ": " + message);
+        valid = false;
+      };
+      const int64_t expected_replay_batch_id =
+          static_cast<int64_t>(before.batches + group_index);
+      if (result.physical_batch_id == expected_replay_batch_id &&
+          result.physical_batch_size == static_cast<int32_t>(indices.size()) &&
+          result.physical_batch_row == static_cast<int32_t>(position)) {
+        ++stats->returned_metadata_exact_rows;
+      } else {
+        error("returned replay batch metadata differs from exact group");
+      }
+      if (static_cast<int64_t>(result.logits.size()) != action_dim ||
+          !std::all_of(result.logits.begin(), result.logits.end(),
+                       [](float value) { return std::isfinite(value); })) {
+        error("returned full logits have wrong width or nonfinite value");
+      }
+      std::vector<float> replay_raw_legal;
+      replay_raw_legal.reserve(transition.legal_actions.size());
+      for (Action action : transition.legal_actions) {
+        replay_raw_legal.push_back(
+            action >= 0 && action < action_dim &&
+                    action < static_cast<Action>(result.logits.size())
+                ? result.logits[action]
+                : std::numeric_limits<float>::quiet_NaN());
+      }
+      bool raw_exact = replay_raw_legal.size() ==
+                       transition.behavior_raw_legal_logits.size();
+      if (raw_exact) {
+        for (size_t j = 0; j < replay_raw_legal.size(); ++j) {
+          if (PpoParityFloatBits(replay_raw_legal[j]) != PpoParityFloatBits(
+                  transition.behavior_raw_legal_logits[j])) {
+            raw_exact = false;
+            break;
+          }
+        }
+      }
+      if (raw_exact) ++stats->raw_legal_exact_rows;
+      else error("returned raw legal logits are not bit-exact captured logits");
+      std::vector<float> replay_policy;
+      std::string recompute_error;
+      if (!RecomputePpoBehaviorLegalLogProbs(
+              replay_raw_legal, logit_cap, &replay_policy,
+              &recompute_error)) {
+        error("returned-logit CPU policy recompute failed: " + recompute_error);
+      }
+      bool policy_exact = replay_policy.size() ==
+                          transition.behavior_legal_log_probs.size();
+      if (policy_exact) {
+        for (size_t j = 0; j < replay_policy.size(); ++j) {
+          if (PpoParityFloatBits(replay_policy[j]) != PpoParityFloatBits(
+                  transition.behavior_legal_log_probs[j])) {
+            policy_exact = false;
+            break;
+          }
+        }
+      }
+      if (policy_exact) ++stats->cpu_policy_exact_rows;
+      else error("returned-logit CPU policy is not bit-exact captured policy");
+
+      PpoNumericalParityInput input;
+      input.legal_count = static_cast<int>(transition.legal_actions.size());
+      input.decision_role = transition.decision_role;
+      input.advantage = transition.advantage;
+      input.stored_chosen_log_prob = transition.old_log_prob;
+      for (size_t j = 0; j < transition.legal_actions.size(); ++j) {
+        input.old_log_probs.push_back(
+            j < transition.behavior_legal_log_probs.size()
+                ? transition.behavior_legal_log_probs[j]
+                : std::numeric_limits<double>::quiet_NaN());
+        input.new_log_probs.push_back(
+            j < replay_policy.size()
+                ? replay_policy[j]
+                : std::numeric_limits<double>::quiet_NaN());
+        if (transition.legal_actions[j] == transition.action) {
+          input.chosen_index = static_cast<int>(j);
+        }
+        const float captured =
+            j < transition.behavior_raw_legal_logits.size()
+                ? transition.behavior_raw_legal_logits[j]
+                : std::numeric_limits<float>::quiet_NaN();
+        const float returned =
+            j < replay_raw_legal.size()
+                ? replay_raw_legal[j]
+                : std::numeric_limits<float>::quiet_NaN();
+        captured_raw.write(reinterpret_cast<const char*>(&captured),
+                           sizeof(captured));
+        replay_raw.write(reinterpret_cast<const char*>(&returned),
+                         sizeof(returned));
+        const float replay_policy_value =
+            j < replay_policy.size()
+                ? replay_policy[j]
+                : std::numeric_limits<float>::quiet_NaN();
+        replay_policy_bytes.write(
+            reinterpret_cast<const char*>(&replay_policy_value),
+            sizeof(replay_policy_value));
+      }
+      PpoNumericalParityRow row;
+      std::string row_error;
+      if (!ComputePpoNumericalParityRow(input, &row, &row_error)) {
+        error("R parity row failed: " + row_error);
+      }
+      if (!valid) {
+        row.schema_errors = std::max<int64_t>(1, row.schema_errors);
+        row.nonfinite_values = std::max<int64_t>(1, row.nonfinite_values);
+      }
+      row.row_identity_sha256 = identity;
+      cell.rows[index] = row;
+      evidence << identity;
+      evidence.put('\0');
+      for (float value : replay_raw_legal) {
+        evidence.write(reinterpret_cast<const char*>(&value), sizeof(value));
+      }
+    }
+  }
+  stats->after = evaluator->GetStats();
+  stats->captured_raw_sha256 = ComputeStringSHA256(captured_raw.str());
+  stats->replay_raw_sha256 = ComputeStringSHA256(replay_raw.str());
+  cell.model_forward_calls = stats->model_forward_calls;
+  cell.row_evidence_sha256 = ComputeStringSHA256(evidence.str());
+  cell.raw_logit_sha256 = stats->replay_raw_sha256;
+  cell.policy_sha256 = ComputeStringSHA256(replay_policy_bytes.str());
+  return cell;
+}
+
+PpoParityCellResult ReplayPpoTrainingModelOriginalGeometry(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const std::vector<PpoTransition>& batch,
+    const PpoParityBatchGeometry& geometry, int64_t obs_size,
+    int64_t action_dim, torch::Device device, float logit_cap,
+    PpoParityOriginalGeometryModelStats* stats) {
+  PpoParityCellResult cell;
+  cell.name = "training_model_exact_original_batches";
+  cell.rows.resize(batch.size());
+  std::stringstream evidence, raw_bytes, policy_bytes;
+  evidence << "dune_raw_ppo_numerical_parity_v4";
+  evidence.put('\0');
+  evidence << cell.name;
+  evidence.put('\0');
+  const bool was_training = model->is_training();
+  model->train();
+  torch::NoGradGuard no_grad;
+  for (const auto& indices : geometry.row_indices_by_group) {
+    const int64_t count = static_cast<int64_t>(indices.size());
+    torch::Tensor states_cpu = torch::zeros(
+        {count, obs_size}, torch::TensorOptions().dtype(torch::kFloat32));
+    torch::Tensor masks_cpu = torch::zeros(
+        {count, action_dim}, torch::TensorOptions().dtype(torch::kBool));
+    float* state_data = states_cpu.data_ptr<float>();
+    bool* mask_data = masks_cpu.data_ptr<bool>();
+    std::vector<bool> valid(count, true);
+    for (int64_t i = 0; i < count; ++i) {
+      const PpoTransition& transition = batch[indices[i]];
+      if (static_cast<int64_t>(transition.state.size()) != obs_size) {
+        valid[i] = false;
+        cell.schema_errors.push_back("D observation width mismatch");
+      } else {
+        std::memcpy(state_data + i * obs_size, transition.state.data(),
+                    obs_size * sizeof(float));
+      }
+      for (Action action : transition.legal_actions) {
+        if (action >= 0 && action < action_dim) {
+          mask_data[i * action_dim + action] = true;
+        }
+      }
+    }
+    const torch::Tensor popcounts =
+        masks_cpu.sum(1).to(torch::kCPU).to(torch::kInt64).contiguous();
+    const int64_t* popcount = popcounts.data_ptr<int64_t>();
+    for (int64_t i = 0; i < count; ++i) {
+      if (popcount[i] == static_cast<int64_t>(
+                             batch[indices[i]].legal_actions.size())) {
+        ++cell.dense_mask_rows_ok;
+      } else {
+        valid[i] = false;
+        cell.schema_errors.push_back("D dense-mask popcount mismatch");
+      }
+    }
+    const torch::Tensor states = states_cpu.to(device);
+    const torch::Tensor masks = masks_cpu.to(device);
+    torch::Tensor raw_logits, replay_log_probs;
+    {
+      AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+      const auto outputs = model->forward(states);
+      raw_logits = outputs.logits;
+      const torch::Tensor centered =
+          CenterAndCapLogitsTensor(raw_logits, masks, logit_cap);
+      replay_log_probs = torch::log_softmax(
+          centered.masked_fill(masks.logical_not(), -1e9f), -1);
+    }
+    ++cell.model_forward_calls;
+    const torch::Tensor raw_cpu =
+        raw_logits.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    const torch::Tensor log_probs_cpu =
+        replay_log_probs.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    const float* raw_data = raw_cpu.data_ptr<float>();
+    const float* logprob_data = log_probs_cpu.data_ptr<float>();
+    for (int64_t i = 0; i < count; ++i) {
+      const size_t index = indices[i];
+      const PpoTransition& transition = batch[index];
+      const std::string identity =
+          PpoParityRowIdentitySha256(static_cast<int64_t>(index), transition);
+      bool raw_exact = transition.behavior_raw_legal_logits.size() ==
+                       transition.legal_actions.size();
+      PpoNumericalParityInput input;
+      input.legal_count = static_cast<int>(transition.legal_actions.size());
+      input.decision_role = transition.decision_role;
+      input.advantage = transition.advantage;
+      input.stored_chosen_log_prob = transition.old_log_prob;
+      for (size_t j = 0; j < transition.legal_actions.size(); ++j) {
+        const Action action = transition.legal_actions[j];
+        const float replay_raw =
+            action >= 0 && action < action_dim
+                ? raw_data[i * action_dim + action]
+                : std::numeric_limits<float>::quiet_NaN();
+        const float captured_raw =
+            j < transition.behavior_raw_legal_logits.size()
+                ? transition.behavior_raw_legal_logits[j]
+                : std::numeric_limits<float>::quiet_NaN();
+        if (PpoParityFloatBits(replay_raw) !=
+            PpoParityFloatBits(captured_raw)) {
+          raw_exact = false;
+        }
+        if (std::isfinite(replay_raw) && std::isfinite(captured_raw)) {
+          stats->raw_legal_max_abs_delta = std::max(
+              stats->raw_legal_max_abs_delta,
+              std::abs(static_cast<double>(replay_raw) - captured_raw));
+        }
+        input.old_log_probs.push_back(
+            j < transition.behavior_legal_log_probs.size()
+                ? transition.behavior_legal_log_probs[j]
+                : std::numeric_limits<double>::quiet_NaN());
+        input.new_log_probs.push_back(
+            action >= 0 && action < action_dim
+                ? logprob_data[i * action_dim + action]
+                : std::numeric_limits<double>::quiet_NaN());
+        if (action == transition.action) input.chosen_index = j;
+        evidence.write(reinterpret_cast<const char*>(&replay_raw),
+                       sizeof(replay_raw));
+        raw_bytes.write(reinterpret_cast<const char*>(&replay_raw),
+                        sizeof(replay_raw));
+        const float replay_policy = static_cast<float>(
+            input.new_log_probs.back());
+        policy_bytes.write(reinterpret_cast<const char*>(&replay_policy),
+                           sizeof(replay_policy));
+      }
+      if (raw_exact) ++stats->raw_legal_exact_rows;
+      PpoNumericalParityRow row;
+      std::string error;
+      if (!ComputePpoNumericalParityRow(input, &row, &error)) {
+        cell.schema_errors.push_back("row " + std::to_string(index) +
+                                     ": " + error);
+        valid[i] = false;
+      }
+      if (!valid[i]) {
+        row.schema_errors = std::max<int64_t>(1, row.schema_errors);
+        row.nonfinite_values = std::max<int64_t>(1, row.nonfinite_values);
+      }
+      row.row_identity_sha256 = identity;
+      cell.rows[index] = row;
+      evidence << identity;
+      evidence.put('\0');
+    }
+  }
+  if (was_training) model->train(); else model->eval();
+  cell.row_evidence_sha256 = ComputeStringSHA256(evidence.str());
+  cell.raw_logit_sha256 = ComputeStringSHA256(raw_bytes.str());
+  cell.policy_sha256 = ComputeStringSHA256(policy_bytes.str());
+  return cell;
 }
 
 bool WritePpoNumericalParityArtifact(
@@ -3890,6 +4261,328 @@ bool WritePpoNumericalParityArtifactV3(
   return root["status"] == "VALID";
 }
 
+bool WritePpoNumericalParityArtifactV4(
+    const std::string& output_path, const PpoParityCellResult& cell_a,
+    const PpoParityIntegrityStats& a_stats,
+    const PpoParityCellResult& cell_r,
+    const PpoParityReplayGeometryStats& r_stats,
+    const PpoParityCellResult& cell_b,
+    const PpoParityCellResult& cell_d,
+    const PpoParityOriginalGeometryModelStats& d_stats,
+    const PpoParityBatchGeometry& geometry,
+    const std::string& geometry_sha256, const CollectResult& collect,
+    const std::string& shared_identity_sha256,
+    const std::string& model_hash_before,
+    const std::string& model_hash_after,
+    const std::string& inference_hash_before,
+    const std::string& inference_hash_after,
+    const std::string& source_manifest,
+    const std::string& source_manifest_sha256, int64_t source_global_update,
+    const std::string& source_checkpoint_uuid,
+    const std::string& config_fingerprint, torch::Device device,
+    int64_t obs_size, int64_t action_size, const std::string& command_line,
+    const PpoNumericalParitySourceProvenance& source_provenance) {
+  const int64_t transitions = static_cast<int64_t>(collect.rollout.size());
+  const auto sa = SummarizePpoNumericalParityRows(cell_a.rows);
+  const auto sr = SummarizePpoNumericalParityRows(cell_r.rows);
+  const auto sb = SummarizePpoNumericalParityRows(cell_b.rows);
+  const auto sd = SummarizePpoNumericalParityRows(cell_d.rows);
+  auto hex64 = [](const std::string& value) {
+    if (value.size() != 64) return false;
+    return std::all_of(value.begin(), value.end(), [](char c) {
+      return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+  };
+  std::vector<std::string> validity_errors = collect.parity_capture_errors;
+  validity_errors.insert(validity_errors.end(), geometry.errors.begin(),
+                         geometry.errors.end());
+  auto require = [&](bool ok, const std::string& error) {
+    if (!ok) validity_errors.push_back(error);
+  };
+  require(collect.episode_ids_unique, "episode IDs are not unique");
+  require(static_cast<int64_t>(collect.games) ==
+              absl::GetFlag(FLAGS_rollout_games),
+          "exact game count mismatch");
+  require(transitions >= absl::GetFlag(FLAGS_numerical_parity_min_rows),
+          "row floor not met");
+  int64_t nontrivial_rows = 0;
+  for (const auto& row : cell_a.rows) if (row.legal_count > 1) ++nontrivial_rows;
+  require(nontrivial_rows >=
+              absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows),
+          "nontrivial row floor not met");
+  require(collect.parity_decisions == transitions &&
+              collect.parity_full_width_ok == transitions &&
+              collect.parity_full_finite_ok == transitions &&
+              collect.parity_legal_ids_unique_in_range == transitions &&
+              collect.parity_chosen_once == transitions,
+          "capture counters do not cover every transition");
+  require(geometry.valid && geometry.rows == transitions &&
+              geometry.groups > 0 && geometry.max_batch_size <=
+                  absl::GetFlag(FLAGS_eval_batch_size),
+          "physical-batch geometry is invalid");
+  require(r_stats.before.requests == static_cast<uint64_t>(transitions) &&
+              r_stats.before.batches == static_cast<uint64_t>(geometry.groups) &&
+              r_stats.before.max_batch_size ==
+                  static_cast<uint64_t>(geometry.max_batch_size) &&
+              std::abs(r_stats.before.avg_batch_size -
+                       static_cast<double>(transitions) / geometry.groups) <
+                  1e-12,
+          "pre-R evaluator stats do not match captured geometry");
+  require(r_stats.after.requests - r_stats.before.requests ==
+                  static_cast<uint64_t>(transitions) &&
+              r_stats.after.batches - r_stats.before.batches ==
+                  static_cast<uint64_t>(geometry.groups) &&
+              r_stats.after.max_batch_size == r_stats.before.max_batch_size,
+          "post-R evaluator stats deltas do not match exact replay");
+  require(r_stats.returned_metadata_exact_rows == transitions &&
+              r_stats.raw_legal_exact_rows == transitions &&
+              r_stats.cpu_policy_exact_rows == transitions &&
+              r_stats.model_forward_calls == geometry.groups &&
+              r_stats.captured_raw_sha256 == r_stats.replay_raw_sha256,
+          "R exact metadata/raw/policy/hash replay failed");
+  require(sa.rows == transitions && sr.rows == transitions &&
+              sb.rows == transitions && sd.rows == transitions,
+          "A/R/B/D row counts differ");
+  require(cell_a.schema_errors.empty() && cell_r.schema_errors.empty() &&
+              cell_b.schema_errors.empty() && cell_d.schema_errors.empty(),
+          "one or more cells have schema errors");
+  require(sa.finite_rows == transitions && sr.finite_rows == transitions &&
+              sb.finite_rows == transitions && sd.finite_rows == transitions,
+          "one or more cells have incomplete finite rows");
+  require(sa.max_abs_chosen_log_prob_delta == 0.0 &&
+              sa.max_kl_old_new == 0.0 && sa.max_kl_new_old == 0.0 &&
+              sa.ratio_min == 1.0 && sa.ratio_max == 1.0,
+          "A is not exact identity");
+  require(cell_a.model_forward_calls == 0 && cell_b.model_forward_calls > 0 &&
+              cell_d.model_forward_calls == geometry.groups,
+          "model-forward call counts are invalid");
+  require(cell_b.dense_mask_rows_ok == transitions &&
+              cell_d.dense_mask_rows_ok == transitions,
+          "B/D dense-mask coverage incomplete");
+  require(a_stats.raw_values_total == sa.legal_logits &&
+              a_stats.raw_values_total == a_stats.raw_values_bf16_exact &&
+              a_stats.vector_width_rows_ok == transitions &&
+              a_stats.behavior_vector_exact_rows == transitions &&
+              a_stats.chosen_scalar_exact_rows == transitions,
+          "A raw/vector/BF16-grid proof incomplete");
+  require(hex64(geometry_sha256) && hex64(shared_identity_sha256),
+          "geometry/shared hash malformed");
+  const std::vector<const PpoParityCellResult*> cell_list =
+      {&cell_a, &cell_r, &cell_b, &cell_d};
+  std::set<std::string> evidence_hashes;
+  bool cell_hashes_valid = true;
+  for (const auto* cell : cell_list) {
+    cell_hashes_valid = cell_hashes_valid &&
+        hex64(cell->row_evidence_sha256) && hex64(cell->raw_logit_sha256) &&
+        hex64(cell->policy_sha256);
+    evidence_hashes.insert(cell->row_evidence_sha256);
+  }
+  require(cell_hashes_valid && evidence_hashes.size() == cell_list.size(),
+          "cell raw/policy/evidence hashes malformed or evidence not distinct");
+  bool shared_rows = true;
+  for (int64_t i = 0; i < transitions; ++i) {
+    const std::string& identity = cell_a.rows[i].row_identity_sha256;
+    if (!hex64(identity) || cell_r.rows[i].row_identity_sha256 != identity ||
+        cell_b.rows[i].row_identity_sha256 != identity ||
+        cell_d.rows[i].row_identity_sha256 != identity) {
+      shared_rows = false;
+      break;
+    }
+  }
+  require(shared_rows, "A/R/B/D row identities differ");
+  require(model_hash_before == model_hash_after &&
+              inference_hash_before == inference_hash_after &&
+              model_hash_before == inference_hash_before,
+          "model immutability/equality failure");
+
+  const bool instrument_valid = validity_errors.empty();
+  const auto b_violations = BuildPpoParityViolationMap(cell_b.rows);
+  const auto d_violations = BuildPpoParityViolationMap(cell_d.rows);
+  const bool b_pass = instrument_valid &&
+                      PpoParityViolationMapPasses(b_violations);
+  const bool d_pass = instrument_valid &&
+                      PpoParityViolationMapPasses(d_violations);
+  const auto classification = ClassifyPpoParityV4(
+      instrument_valid, b_pass, d_pass);
+
+  json::Object root;
+  root["schema"] = "dune_raw_ppo_numerical_parity_v4";
+  root["status"] = instrument_valid ? "VALID" : "INVALID";
+  root["classification"] = PpoParityV4ClassificationName(classification);
+  root["training_authorized"] = false;
+  root["registration_id"] =
+      absl::GetFlag(FLAGS_numerical_parity_registration_id);
+  root["scope"] = "raw_ppo_only";
+  root["epistemic_label"] =
+      "no_training_exact_physical_batch_replay_causal_diagnostic";
+  root["optimizer_steps"] = int64_t{0};
+  root["optimizer_checkpoint_loaded"] = false;
+  root["backward_calls"] = int64_t{0};
+  root["training_updates"] = int64_t{0};
+  root["command_line"] = command_line;
+  root["config_fingerprint"] = config_fingerprint;
+  root["device"] = device.str();
+  root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["ppo_minibatch_size"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_ppo_minibatch_size));
+  root["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
+  root["seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+  root["threads"] = static_cast<int64_t>(absl::GetFlag(FLAGS_threads));
+  root["eval_batch_size"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_eval_batch_size));
+  root["eval_timeout_ms"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_eval_timeout_ms));
+  root["rollout_games"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_rollout_games));
+  root["hard_transition_ceiling"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_rollout_games)) * 5000;
+  root["games_collected"] = static_cast<int64_t>(collect.games);
+  root["transitions_collected"] = transitions;
+  root["nontrivial_rows"] = nontrivial_rows;
+  root["observation_size"] = obs_size;
+  root["action_size"] = action_size;
+  root["rollout_hash"] = ComputeRolloutHash(collect.rollout);
+  root["shared_row_identity_sha256"] = shared_identity_sha256;
+  root["physical_batch_geometry_sha256"] = geometry_sha256;
+  root["model_state_sha256_before"] = model_hash_before;
+  root["model_state_sha256_after"] = model_hash_after;
+  root["inference_state_sha256_before"] = inference_hash_before;
+  root["inference_state_sha256_after"] = inference_hash_after;
+  json::Object thresholds;
+  thresholds["min_rows"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_numerical_parity_min_rows));
+  thresholds["min_nontrivial_rows"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows));
+  thresholds["max_abs_chosen_logprob_delta"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta);
+  thresholds["max_full_legal_kl_each_direction"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_full_kl);
+  thresholds["max_raw_mass_residual"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_raw_mass_residual);
+  thresholds["min_ratio"] =
+      absl::GetFlag(FLAGS_numerical_parity_min_ratio);
+  thresholds["max_ratio"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_ratio);
+  root["thresholds"] = json::Value(thresholds);
+
+  auto stats_json = [](const EvaluatorStats& stats) {
+    json::Object out;
+    out["requests"] = static_cast<int64_t>(stats.requests);
+    out["batches"] = static_cast<int64_t>(stats.batches);
+    out["max_batch_size"] = static_cast<int64_t>(stats.max_batch_size);
+    out["mean_batch_size"] = stats.avg_batch_size;
+    return out;
+  };
+  json::Object metadata;
+  metadata["groups"] = geometry.groups;
+  metadata["rows"] = geometry.rows;
+  metadata["max_batch_size"] = geometry.max_batch_size;
+  metadata["pre_R_stats"] = json::Value(stats_json(r_stats.before));
+  metadata["post_R_stats"] = json::Value(stats_json(r_stats.after));
+  metadata["returned_metadata_exact_rows"] =
+      r_stats.returned_metadata_exact_rows;
+  metadata["R_captured_raw_sha256"] = r_stats.captured_raw_sha256;
+  metadata["R_replay_raw_sha256"] = r_stats.replay_raw_sha256;
+  json::Array geometry_errors;
+  for (const auto& error : validity_errors) geometry_errors.emplace_back(error);
+  metadata["validity_errors"] = json::Value(geometry_errors);
+  root["physical_batch_metadata"] = json::Value(metadata);
+
+  auto cell_json = [&](const PpoParityCellResult& cell,
+                       const std::string& role,
+                       const PpoNumericalParitySummary& summary,
+                       const PpoParityViolationMap* violations) {
+    json::Object out;
+    out["name"] = cell.name;
+    out["role"] = role;
+    out["model_forward_calls"] = cell.model_forward_calls;
+    out["dense_mask_rows_ok"] = cell.dense_mask_rows_ok;
+    out["row_evidence_sha256"] = cell.row_evidence_sha256;
+    out["raw_logit_sha256"] = cell.raw_logit_sha256;
+    out["policy_sha256"] = cell.policy_sha256;
+    out["overall"] = json::Value(PpoNumericalParitySummaryJson(summary));
+    out["splits"] = json::Value(PpoNumericalParitySplitsJson(cell.rows));
+    json::Array errors;
+    for (const auto& error : cell.schema_errors) errors.emplace_back(error);
+    out["schema_errors"] = json::Value(errors);
+    if (violations != nullptr) {
+      out["threshold_pass"] = PpoParityViolationMapPasses(*violations);
+      out["violations"] = json::Value(PpoParityViolationMapJson(*violations));
+    }
+    return out;
+  };
+  json::Object cells;
+  cells["A"] = json::Value(cell_json(cell_a, "hard_validity", sa, nullptr));
+  cells["R"] = json::Value(cell_json(
+      cell_r, "live_inference_exact_batch_replay", sr, nullptr));
+  cells["B"] = json::Value(cell_json(
+      cell_b, "full_bf16_2048_phenotype", sb, &b_violations));
+  json::Object d_json = cell_json(
+      cell_d, "training_model_original_batch_geometry", sd, &d_violations);
+  d_json["raw_legal_bit_exact_rows"] = d_stats.raw_legal_exact_rows;
+  d_json["raw_legal_max_abs_delta"] = d_stats.raw_legal_max_abs_delta;
+  cells["D"] = json::Value(d_json);
+  root["cells"] = json::Value(cells);
+  root["B_D_violation_intersections"] = json::Value(
+      PpoParityViolationIntersectionsJson(b_violations, d_violations));
+
+  size_t model_size = 0;
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  json::Object source;
+  source["model_path"] = std::filesystem::absolute(model_path).string();
+  source["model_sha256"] = ComputeFileSHA256(model_path, &model_size);
+  source["model_size"] = static_cast<int64_t>(model_size);
+  source["manifest_path"] = std::filesystem::absolute(source_manifest).string();
+  source["manifest_sha256"] = source_manifest_sha256;
+  source["global_update"] = source_global_update;
+  source["checkpoint_uuid"] = source_checkpoint_uuid;
+  size_t binary_size = 0;
+  std::error_code ec;
+  const auto binary_path = std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (ec || binary_path.empty()) {
+    root["status"] = "INVALID";
+    root["classification"] = "INVALID";
+  } else {
+    source["binary_path"] = binary_path.string();
+    source["binary_sha256"] =
+        ComputeFileSHA256(binary_path.string(), &binary_size);
+    source["binary_size"] = static_cast<int64_t>(binary_size);
+  }
+  root["source"] = json::Value(source);
+  json::Object source_code;
+  source_code["root"] = source_provenance.root;
+  source_code["combined_sha256"] = source_provenance.combined_sha256;
+  json::Array source_files;
+  for (const auto& file : source_provenance.files) {
+    json::Object record;
+    record["relative_path"] = file.relative_path;
+    record["absolute_path"] = file.absolute_path;
+    record["size"] = file.size;
+    record["sha256"] = file.sha256;
+    source_files.emplace_back(json::Value(record));
+  }
+  source_code["files"] = json::Value(source_files);
+  root["source_code"] = json::Value(source_code);
+  const std::filesystem::path output(output_path);
+  const std::filesystem::path tmp = output_path + ".tmp";
+  if (std::filesystem::exists(output) || std::filesystem::exists(tmp)) {
+    SpielFatalError("Numerical parity output already exists; refusing overwrite: " +
+                    output_path);
+  }
+  if (!output.parent_path().empty()) {
+    std::filesystem::create_directories(output.parent_path());
+  }
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) SpielFatalError("Cannot create numerical parity temp artifact");
+    out << json::ToString(root, true) << "\n";
+    out.flush();
+    if (!out) SpielFatalError("Numerical parity artifact write failed");
+  }
+  std::filesystem::rename(tmp, output);
+  return root["status"] == "VALID";
+}
+
 
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -3944,12 +4637,18 @@ int main(int argc, char** argv) {
     }
     if (!absl::GetFlag(FLAGS_train_amp)) {
       parity_stop(
-          "v2 requires --train_amp=true because the gate cell is the actual "
-          "production CUDA BF16 learner policy path");
+          "v4 requires --train_amp=true because B/D reproduce the production "
+          "CUDA BF16 learner policy path");
     }
     if (absl::GetFlag(FLAGS_ppo_minibatch_size) != 2048) {
       parity_stop(
-          "v2 requires --ppo_minibatch_size=2048 to reproduce historical u15828");
+          "v4 requires --ppo_minibatch_size=2048 to reproduce historical u15828");
+    }
+    if (absl::GetFlag(FLAGS_deterministic_rollout_eval) ||
+        !absl::GetFlag(FLAGS_evaluator_device_synchronize)) {
+      parity_stop(
+          "v4 requires BatchedEvaluator with deterministic_rollout_eval=false "
+          "and evaluator_device_synchronize=true");
     }
     if (absl::GetFlag(FLAGS_pipeline) ||
         absl::GetFlag(FLAGS_online_search_collection) ||
@@ -5073,7 +5772,9 @@ int main(int argc, char** argv) {
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
         inference_model, absl::GetFlag(FLAGS_eval_batch_size),
         absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
-        absl::GetFlag(FLAGS_evaluator_device_synchronize));
+        absl::GetFlag(FLAGS_evaluator_device_synchronize),
+        /*high_priority_stream=*/false,
+        /*emit_batch_membership=*/numerical_parity);
   }
 
   // =========================================================================
@@ -6655,6 +7356,26 @@ int main(int argc, char** argv) {
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda);
   if (numerical_parity) {
+    const auto batch_evaluator =
+        std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator);
+    if (batch_evaluator == nullptr) {
+      SpielFatalError("v4 numerical parity requires BatchedEvaluator");
+    }
+    const open_spiel::EvaluatorStats evaluator_before_r =
+        batch_evaluator->GetStats();
+    std::vector<open_spiel::PpoParityBatchMembership> membership;
+    membership.reserve(current_collect.rollout.size());
+    for (const auto& transition : current_collect.rollout) {
+      membership.push_back({transition.behavior_physical_batch_id,
+                            transition.behavior_physical_batch_size,
+                            transition.behavior_physical_batch_row});
+    }
+    const open_spiel::PpoParityBatchGeometry geometry =
+        open_spiel::ReconstructPpoParityBatchGeometry(
+            membership, absl::GetFlag(FLAGS_eval_batch_size));
+    const std::string geometry_sha256 =
+        open_spiel::ComputeStringSHA256(geometry.canonical_payload);
+
     open_spiel::PpoParityCellResult integrity_cell;
     integrity_cell.name = "rollout_cpu_recompute_integrity";
     open_spiel::PpoParityIntegrityStats integrity_stats;
@@ -6667,6 +7388,10 @@ int main(int argc, char** argv) {
         &integrity_stats.vector_width_rows_ok,
         &integrity_stats.behavior_vector_exact_rows,
         &integrity_stats.chosen_scalar_exact_rows);
+    integrity_cell.raw_logit_sha256 =
+        open_spiel::PpoParityCapturedRawSha256(current_collect.rollout);
+    integrity_cell.policy_sha256 =
+        open_spiel::PpoParityCapturedPolicySha256(current_collect.rollout);
     const int64_t transitions =
         static_cast<int64_t>(current_collect.rollout.size());
     const bool hard_capture_valid =
@@ -6682,43 +7407,75 @@ int main(int argc, char** argv) {
         integrity_stats.behavior_vector_exact_rows == transitions &&
         integrity_stats.chosen_scalar_exact_rows == transitions &&
         integrity_stats.raw_values_bf16_exact ==
-            integrity_stats.raw_values_total;
+            integrity_stats.raw_values_total && geometry.valid &&
+        evaluator_before_r.requests == static_cast<uint64_t>(transitions) &&
+        evaluator_before_r.batches ==
+            static_cast<uint64_t>(geometry.groups) &&
+        evaluator_before_r.max_batch_size ==
+            static_cast<uint64_t>(geometry.max_batch_size);
 
+    open_spiel::PpoParityCellResult replay_cell;
+    open_spiel::PpoParityReplayGeometryStats replay_stats;
     open_spiel::PpoParityCellResult learner_cell;
     learner_cell.name = "actual_learner_full_bf16_2048";
-    open_spiel::PpoParityCellResult postprocess_cell;
-    postprocess_cell.name =
-        "captured_logits_dense_cuda_bf16_postprocess";
+    open_spiel::PpoParityCellResult geometry_model_cell;
+    open_spiel::PpoParityOriginalGeometryModelStats geometry_model_stats;
     if (hard_capture_valid) {
-      learner_cell.rows = open_spiel::ReplayPpoNumericalParityCell(
-          training_model, current_collect.rollout, obs_size, action_size,
-          device, /*learner_autocast=*/true, learner_cell.name,
-          &learner_cell.schema_errors, &learner_cell.row_evidence_sha256,
-          &learner_cell.model_forward_calls,
-          &learner_cell.dense_mask_rows_ok);
-      // Cell C is reached only after EVERY captured raw legal float proved an
-      // exact FP32 -> BF16 -> FP32 round-trip. It executes no model forward.
-      postprocess_cell.rows =
-          open_spiel::ReplayPpoCapturedLogitsBf16Cell(
-              current_collect.rollout, action_size, device,
-              static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
-              &postprocess_cell.schema_errors,
-              &postprocess_cell.row_evidence_sha256,
-              &postprocess_cell.model_forward_calls,
-              &postprocess_cell.dense_mask_rows_ok);
+      replay_cell = open_spiel::ReplayPpoInferenceExactGeometry(
+          batch_evaluator.get(), current_collect.rollout, geometry,
+          action_size, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+          evaluator_before_r, &replay_stats);
+      const bool r_valid = replay_cell.schema_errors.empty() &&
+          replay_stats.returned_metadata_exact_rows == transitions &&
+          replay_stats.raw_legal_exact_rows == transitions &&
+          replay_stats.cpu_policy_exact_rows == transitions &&
+          replay_stats.captured_raw_sha256 == replay_stats.replay_raw_sha256 &&
+          replay_stats.after.requests - replay_stats.before.requests ==
+              static_cast<uint64_t>(transitions) &&
+          replay_stats.after.batches - replay_stats.before.batches ==
+              static_cast<uint64_t>(geometry.groups) &&
+          replay_stats.after.max_batch_size ==
+              replay_stats.before.max_batch_size;
+      if (r_valid) {
+        learner_cell.rows = open_spiel::ReplayPpoNumericalParityCell(
+            training_model, current_collect.rollout, obs_size, action_size,
+            device, /*learner_autocast=*/true, learner_cell.name,
+            &learner_cell.schema_errors, &learner_cell.row_evidence_sha256,
+            &learner_cell.model_forward_calls,
+            &learner_cell.dense_mask_rows_ok,
+            &learner_cell.raw_logit_sha256,
+            &learner_cell.policy_sha256);
+        geometry_model_cell =
+            open_spiel::ReplayPpoTrainingModelOriginalGeometry(
+                training_model, current_collect.rollout, geometry, obs_size,
+                action_size, device,
+                static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+                &geometry_model_stats);
+      } else {
+        learner_cell.schema_errors.push_back(
+            "skipped because R exact replay validity failed");
+        geometry_model_cell.schema_errors.push_back(
+            "skipped because R exact replay validity failed");
+      }
     } else {
+      replay_cell.name = "live_inference_exact_original_batches";
+      replay_cell.schema_errors.push_back(
+          "skipped because A/capture/geometry validity failed");
       learner_cell.schema_errors.push_back(
-          "skipped because cell A/capture hard validity failed");
-      postprocess_cell.schema_errors.push_back(
-          "skipped because cell A/capture hard validity failed");
+          "skipped because A/capture/geometry validity failed");
+      geometry_model_cell.name = "training_model_exact_original_batches";
+      geometry_model_cell.schema_errors.push_back(
+          "skipped because A/capture/geometry validity failed");
     }
     const std::string parity_model_hash_after =
         open_spiel::HashAllModelState(training_model);
     const std::string parity_inference_hash_after =
         open_spiel::HashAllModelState(inference_model);
-    const bool valid = open_spiel::WritePpoNumericalParityArtifactV3(
+    const bool valid = open_spiel::WritePpoNumericalParityArtifactV4(
         absl::GetFlag(FLAGS_numerical_parity_output), integrity_cell,
-        integrity_stats, learner_cell, postprocess_cell, current_collect,
+        integrity_stats, replay_cell, replay_stats, learner_cell,
+        geometry_model_cell, geometry_model_stats, geometry, geometry_sha256,
+        current_collect,
         open_spiel::PpoParitySharedIdentitySha256(current_collect.rollout),
         parity_model_hash_before,
         parity_model_hash_after, parity_inference_hash_before,
@@ -6726,7 +7483,7 @@ int main(int argc, char** argv) {
         parity_source_manifest_sha256, parity_source_global_update,
         parity_source_checkpoint_uuid, config_fingerprint, device, obs_size,
         action_size, parity_command_line, parity_source_provenance);
-    std::cout << "Raw-PPO numerical parity v3 "
+    std::cout << "Raw-PPO numerical parity v4 "
               << (valid ? "VALID classification" : "INVALID instrument")
               << ": "
               << absl::GetFlag(FLAGS_numerical_parity_output) << "\n"

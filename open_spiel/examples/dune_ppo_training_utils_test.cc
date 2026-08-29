@@ -1576,6 +1576,66 @@ void TestRawPpoNumericalParityV3CaptureAndClassification() {
   } TEST_END();
 }
 
+void TestRawPpoNumericalParityV4BatchMetadataAndClassification() {
+  TEST_BEGIN("Raw-PPO parity v4: sentinels, exact batch geometry, malformed metadata, classification") {
+    EvalResult default_result;
+    CHECK_EQ(default_result.physical_batch_id, int64_t{-1});
+    CHECK_EQ(default_result.physical_batch_size, int32_t{-1});
+    CHECK_EQ(default_result.physical_batch_row, int32_t{-1});
+    PpoTransition default_transition;
+    CHECK_EQ(default_transition.behavior_physical_batch_id, int64_t{-1});
+    CHECK_EQ(default_transition.behavior_physical_batch_size, int32_t{-1});
+    CHECK_EQ(default_transition.behavior_physical_batch_row, int32_t{-1});
+
+    // Global transition order is deliberately different from physical batch
+    // row order. Reconstruction must return groups by ID and members by row.
+    const std::vector<PpoParityBatchMembership> membership = {
+        {1, 2, 1}, {0, 2, 0}, {1, 2, 0}, {0, 2, 1}};
+    const PpoParityBatchGeometry geometry =
+        ReconstructPpoParityBatchGeometry(membership, /*max=*/64);
+    UTILS_CHECK(geometry.valid);
+    CHECK_EQ(geometry.groups, int64_t{2});
+    CHECK_EQ(geometry.rows, int64_t{4});
+    CHECK_EQ(geometry.max_batch_size, int64_t{2});
+    CHECK_EQ(geometry.row_indices_by_group.size(), static_cast<size_t>(2));
+    UTILS_CHECK(geometry.row_indices_by_group[0] ==
+                std::vector<size_t>({1, 3}));
+    UTILS_CHECK(geometry.row_indices_by_group[1] ==
+                std::vector<size_t>({2, 0}));
+    const std::string geometry_hash =
+        ComputeStringSHA256(geometry.canonical_payload);
+    UTILS_CHECK(geometry_hash ==
+                ComputeStringSHA256(geometry.canonical_payload));
+
+    UTILS_CHECK(!ReconstructPpoParityBatchGeometry(
+        {{-1, -1, -1}}, 64).valid);
+    UTILS_CHECK(!ReconstructPpoParityBatchGeometry(
+        {{0, 2, 0}, {0, 2, 0}}, 64).valid);  // duplicate position
+    UTILS_CHECK(!ReconstructPpoParityBatchGeometry(
+        {{0, 1, 0}, {2, 1, 0}}, 64).valid);  // non-contiguous IDs
+    UTILS_CHECK(!ReconstructPpoParityBatchGeometry(
+        {{0, 65, 0}}, 64).valid);             // exceeds target
+    UTILS_CHECK(!ReconstructPpoParityBatchGeometry(
+        {{0, 1, 0}, {0, 2, 1}}, 64).valid);  // inconsistent size
+
+    CHECK_EQ(PpoParityV4ClassificationName(
+                 ClassifyPpoParityV4(false, false, false)),
+             std::string("INVALID"));
+    CHECK_EQ(PpoParityV4ClassificationName(
+                 ClassifyPpoParityV4(true, true, false)),
+             std::string("INCONCLUSIVE_PHENOTYPE_NOT_REPRODUCED"));
+    CHECK_EQ(PpoParityV4ClassificationName(
+                 ClassifyPpoParityV4(true, true, true)),
+             std::string("INCONCLUSIVE_PHENOTYPE_NOT_REPRODUCED"));
+    CHECK_EQ(PpoParityV4ClassificationName(
+                 ClassifyPpoParityV4(true, false, true)),
+             std::string("BATCH_GEOMETRY_SUFFICIENT"));
+    CHECK_EQ(PpoParityV4ClassificationName(
+                 ClassifyPpoParityV4(true, false, false)),
+             std::string("BATCH_GEOMETRY_INSUFFICIENT"));
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1648,6 +1708,7 @@ int main() {
   TestGradTelemetryAccumulatedParity();
   TestRawPpoNumericalParityMathAndDefaultInertness();
   TestRawPpoNumericalParityV3CaptureAndClassification();
+  TestRawPpoNumericalParityV4BatchMetadataAndClassification();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 

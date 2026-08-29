@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -265,6 +266,39 @@ inline std::string PpoParityV3ClassificationName(
   return "INVALID";
 }
 
+enum class PpoParityV4Classification {
+  kInvalid,
+  kInconclusivePhenotypeNotReproduced,
+  kBatchGeometrySufficient,
+  kBatchGeometryInsufficient,
+};
+
+inline PpoParityV4Classification ClassifyPpoParityV4(
+    bool instrument_valid, bool learner_bf16_pass,
+    bool original_geometry_replay_pass) {
+  if (!instrument_valid) return PpoParityV4Classification::kInvalid;
+  if (learner_bf16_pass) {
+    return PpoParityV4Classification::kInconclusivePhenotypeNotReproduced;
+  }
+  return original_geometry_replay_pass
+             ? PpoParityV4Classification::kBatchGeometrySufficient
+             : PpoParityV4Classification::kBatchGeometryInsufficient;
+}
+
+inline std::string PpoParityV4ClassificationName(
+    PpoParityV4Classification classification) {
+  switch (classification) {
+    case PpoParityV4Classification::kInvalid: return "INVALID";
+    case PpoParityV4Classification::kInconclusivePhenotypeNotReproduced:
+      return "INCONCLUSIVE_PHENOTYPE_NOT_REPRODUCED";
+    case PpoParityV4Classification::kBatchGeometrySufficient:
+      return "BATCH_GEOMETRY_SUFFICIENT";
+    case PpoParityV4Classification::kBatchGeometryInsufficient:
+      return "BATCH_GEOMETRY_INSUFFICIENT";
+  }
+  return "INVALID";
+}
+
 inline std::vector<std::string> IntersectPpoParityViolationIdentities(
     const std::vector<std::string>& first,
     const std::vector<std::string>& second) {
@@ -301,6 +335,94 @@ inline bool CanonicalPpoParityViolationIdentityPayload(
   }
   *payload = std::move(out);
   return true;
+}
+
+struct PpoParityBatchMembership {
+  int64_t batch_id = -1;
+  int32_t batch_size = -1;
+  int32_t batch_row = -1;
+};
+
+struct PpoParityBatchGeometry {
+  bool valid = false;
+  int64_t groups = 0;
+  int64_t rows = 0;
+  int64_t max_batch_size = 0;
+  std::vector<std::vector<size_t>> row_indices_by_group;
+  std::string canonical_payload;
+  std::vector<std::string> errors;
+};
+
+inline PpoParityBatchGeometry ReconstructPpoParityBatchGeometry(
+    const std::vector<PpoParityBatchMembership>& membership,
+    int64_t configured_max_batch_size) {
+  PpoParityBatchGeometry out;
+  out.rows = static_cast<int64_t>(membership.size());
+  std::map<int64_t, std::vector<std::pair<int32_t, size_t>>> groups;
+  std::map<int64_t, int32_t> sizes;
+  for (size_t i = 0; i < membership.size(); ++i) {
+    const auto& item = membership[i];
+    if (item.batch_id < 0 || item.batch_size < 1 ||
+        item.batch_size > configured_max_batch_size || item.batch_row < 0 ||
+        item.batch_row >= item.batch_size) {
+      out.errors.push_back("row " + std::to_string(i) +
+                           " has invalid membership sentinel/range");
+      continue;
+    }
+    auto found = sizes.find(item.batch_id);
+    if (found == sizes.end()) {
+      sizes[item.batch_id] = item.batch_size;
+    } else if (found->second != item.batch_size) {
+      out.errors.push_back("batch " + std::to_string(item.batch_id) +
+                           " carries inconsistent sizes");
+    }
+    groups[item.batch_id].push_back({item.batch_row, i});
+    out.max_batch_size = std::max<int64_t>(out.max_batch_size,
+                                           item.batch_size);
+  }
+  if (groups.empty() && !membership.empty()) {
+    out.errors.push_back("no valid batch groups reconstructed");
+  }
+  int64_t expected_id = 0;
+  int64_t member_sum = 0;
+  for (auto& item : groups) {
+    const int64_t id = item.first;
+    if (id != expected_id) {
+      out.errors.push_back("batch IDs are not contiguous from zero");
+    }
+    ++expected_id;
+    auto& members = item.second;
+    std::sort(members.begin(), members.end());
+    const int32_t expected_size = sizes[id];
+    if (static_cast<int32_t>(members.size()) != expected_size) {
+      out.errors.push_back("batch " + std::to_string(id) +
+                           " member count differs from declared size");
+    }
+    std::vector<size_t> row_indices;
+    for (size_t position = 0; position < members.size(); ++position) {
+      if (members[position].first != static_cast<int32_t>(position)) {
+        out.errors.push_back("batch " + std::to_string(id) +
+                             " has duplicate/missing row positions");
+      }
+      row_indices.push_back(members[position].second);
+      out.canonical_payload.append(std::to_string(id));
+      out.canonical_payload.push_back(':');
+      out.canonical_payload.append(std::to_string(expected_size));
+      out.canonical_payload.push_back(':');
+      out.canonical_payload.append(std::to_string(position));
+      out.canonical_payload.push_back(':');
+      out.canonical_payload.append(std::to_string(members[position].second));
+      out.canonical_payload.push_back('\n');
+      ++member_sum;
+    }
+    out.row_indices_by_group.push_back(std::move(row_indices));
+  }
+  out.groups = static_cast<int64_t>(groups.size());
+  if (member_sum != out.rows) {
+    out.errors.push_back("sum of reconstructed members differs from rows");
+  }
+  out.valid = out.errors.empty();
+  return out;
 }
 
 inline std::string PpoNumericalParityOldProbabilityBucket(
