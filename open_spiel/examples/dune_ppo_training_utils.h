@@ -37,6 +37,11 @@ struct PpoTransition {
   float return_value;
   int player_id;
   uint64_t episode_id;
+  // Populated ONLY by the opt-in numerical-parity diagnostic. Normal PPO
+  // rollout rows leave the vector empty and the role at -1, so the training
+  // path pays no per-row distribution storage cost.
+  std::vector<float> behavior_legal_log_probs;
+  int decision_role = -1;
 };
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH

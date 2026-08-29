@@ -9,7 +9,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # trainer both WRITES a cohort shard after collection and READS a replay window
   # back in its train-only invocation, so the row codec has to live in the same
   # binary as the learner that consumes the rows.
-  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc dune_search_pi_replay.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc dune_search_pi_scratch.cc dune_search_pi_replay.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})

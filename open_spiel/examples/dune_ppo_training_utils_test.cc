@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_numerical_parity.h"
 #include "dune_sha256.h"
 #include <chrono>
 #include "open_spiel/spiel.h"
@@ -1336,6 +1337,112 @@ void TestGradTelemetryAccumulatedParity() {
     UTILS_CHECK(per_param_stats.TrunkGradNormMean() > 0.0);
   } TEST_END();
 }
+
+void TestRawPpoNumericalParityMathAndDefaultInertness() {
+  TEST_BEGIN("Raw-PPO parity: full categorical math, underflow, and default-inert transition") {
+    PpoTransition default_transition;
+    UTILS_CHECK(default_transition.behavior_legal_log_probs.empty());
+    CHECK_EQ(default_transition.decision_role, -1);
+
+    PpoNumericalParityInput equal;
+    equal.legal_count = 3;
+    equal.decision_role = 2;
+    equal.advantage = 0.25;
+    equal.chosen_index = 1;
+    equal.old_log_probs = {std::log(0.2), std::log(0.3), std::log(0.5)};
+    equal.new_log_probs = equal.old_log_probs;
+    equal.stored_chosen_log_prob = std::log(0.3);
+    PpoNumericalParityRow equal_row;
+    std::string error;
+    UTILS_CHECK(ComputePpoNumericalParityRow(equal, &equal_row, &error));
+    CHECK_NEAR(equal_row.ratio, 1.0, 1e-12);
+    CHECK_NEAR(equal_row.kl_old_new, 0.0, 1e-12);
+    CHECK_NEAR(equal_row.kl_new_old, 0.0, 1e-12);
+
+    PpoNumericalParityInput shifted = equal;
+    shifted.new_log_probs = {std::log(0.25), std::log(0.25), std::log(0.5)};
+    PpoNumericalParityRow shifted_row;
+    UTILS_CHECK(ComputePpoNumericalParityRow(shifted, &shifted_row, &error));
+    CHECK_NEAR(shifted_row.ratio, 0.25 / 0.3, 1e-12);
+    const double expected_forward =
+        0.2 * std::log(0.2 / 0.25) + 0.3 * std::log(0.3 / 0.25);
+    const double expected_reverse =
+        0.25 * std::log(0.25 / 0.2) + 0.25 * std::log(0.25 / 0.3);
+    CHECK_NEAR(shifted_row.kl_old_new, expected_forward, 1e-12);
+    CHECK_NEAR(shifted_row.kl_new_old, expected_reverse, 1e-12);
+
+    PpoNumericalParityInput underflow = equal;
+    underflow.old_log_probs = {
+        -std::numeric_limits<double>::infinity(), std::log(0.4), std::log(0.6)};
+    underflow.new_log_probs = {std::log(0.1), std::log(0.36), std::log(0.54)};
+    underflow.stored_chosen_log_prob = std::log(0.4);
+    PpoNumericalParityRow underflow_row;
+    UTILS_CHECK(ComputePpoNumericalParityRow(
+        underflow, &underflow_row, &error));
+    CHECK_EQ(underflow_row.old_probability_underflows, int64_t{1});
+    CHECK_EQ(underflow_row.nonfinite_values, int64_t{1});
+
+    PpoNumericalParityInput malformed = equal;
+    malformed.stored_chosen_log_prob += 0.01;
+    PpoNumericalParityRow malformed_row;
+    UTILS_CHECK(!ComputePpoNumericalParityRow(
+        malformed, &malformed_row, &error));
+    UTILS_CHECK(error.find("disagrees") != std::string::npos);
+
+    const PpoNumericalParitySummary summary =
+        SummarizePpoNumericalParityRows({equal_row, shifted_row, underflow_row});
+    CHECK_EQ(summary.rows, int64_t{3});
+    CHECK_EQ(summary.finite_rows, int64_t{2});
+    CHECK_EQ(summary.old_probability_underflows, int64_t{1});
+    CHECK_EQ(summary.nonfinite_values, int64_t{1});
+    CHECK_NEAR(summary.ratio_min, shifted_row.ratio, 1e-12);
+    CHECK_NEAR(summary.ratio_max, 1.0, 1e-12);
+  } TEST_END();
+}
+
+void TestRawPpoNumericalParitySourceCanonicalization() {
+  TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
+    const std::vector<std::string> paths =
+        PpoNumericalParitySourceRelativePaths();
+    CHECK_EQ(paths.size(), static_cast<size_t>(7));
+    UTILS_CHECK(paths.front() ==
+                "open_spiel/examples/dune_ppo_train.cc");
+    UTILS_CHECK(paths.back() ==
+                "open_spiel/examples/dune_search_routing.h");
+
+    std::vector<std::pair<std::string, std::string>> records;
+    for (size_t i = 0; i < paths.size(); ++i) {
+      records.push_back({paths[i], std::string(64, static_cast<char>('0' + i))});
+    }
+    std::string payload_a, payload_b, error;
+    UTILS_CHECK(CanonicalPpoNumericalParitySourcePayload(
+        records, &payload_a, &error));
+    UTILS_CHECK(CanonicalPpoNumericalParitySourcePayload(
+        records, &payload_b, &error));
+    UTILS_CHECK(payload_a == payload_b);
+    const std::string digest_a = ComputeStringSHA256(payload_a);
+
+    auto changed = records;
+    changed[3].second = std::string(64, 'f');
+    std::string changed_payload;
+    UTILS_CHECK(CanonicalPpoNumericalParitySourcePayload(
+        changed, &changed_payload, &error));
+    UTILS_CHECK(ComputeStringSHA256(changed_payload) != digest_a);
+
+    auto reordered = records;
+    std::swap(reordered[0], reordered[1]);
+    std::string rejected_payload;
+    UTILS_CHECK(!CanonicalPpoNumericalParitySourcePayload(
+        reordered, &rejected_payload, &error));
+    UTILS_CHECK(error.find("path/order") != std::string::npos);
+
+    auto uppercase = records;
+    uppercase[0].second = std::string(64, 'A');
+    UTILS_CHECK(!CanonicalPpoNumericalParitySourcePayload(
+        uppercase, &rejected_payload, &error));
+    UTILS_CHECK(error.find("lowercase SHA-256") != std::string::npos);
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -1363,6 +1470,8 @@ int main() {
   TestDiagnosticsCsvSchemaGate();
   TestDiagPrepassCadenced();
   TestGradTelemetryAccumulatedParity();
+  TestRawPpoNumericalParityMathAndDefaultInertness();
+  TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 
   // -----------------------------------------------------------------------

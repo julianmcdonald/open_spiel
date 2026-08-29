@@ -20,9 +20,11 @@
 #include <iomanip>
 
 #include <random>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
@@ -41,6 +43,7 @@
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_numerical_parity.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
@@ -90,6 +93,29 @@ ABSL_FLAG(bool, evaluator_device_synchronize, true,
 ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
 ABSL_FLAG(bool, deterministic_rollout_eval, false, "Use deterministic batch-1 rollout evaluation.");
 ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
+ABSL_FLAG(std::string, numerical_parity_output, "",
+          "Fresh output JSON for the read-only rollout-BF16 versus learner-FP32 "
+          "parity gate. Requires --diagnostics_only and --init_mode=diagnostic; "
+          "the path must not already exist.");
+ABSL_FLAG(std::string, numerical_parity_registration_id, "",
+          "Required immutable registration identifier recorded in the parity artifact.");
+ABSL_FLAG(std::string, numerical_parity_source_root, "",
+          "Required OpenSpiel source root containing the fixed parity source "
+          "provenance list (normally third_party/open_spiel).");
+ABSL_FLAG(std::string, numerical_parity_source_sha256, "",
+          "Required registered SHA-256 of the canonical fixed parity source list.");
+ABSL_FLAG(int, numerical_parity_min_rows, -1,
+          "Required minimum total transition rows for a parity PASS.");
+ABSL_FLAG(int, numerical_parity_min_nontrivial_rows, -1,
+          "Required minimum rows with at least two legal actions for a parity PASS.");
+ABSL_FLAG(double, numerical_parity_max_abs_logprob_delta, -1.0,
+          "Required maximum absolute chosen-action log-probability drift.");
+ABSL_FLAG(double, numerical_parity_max_full_kl, -1.0,
+          "Required maximum for each direction of full legal categorical KL.");
+ABSL_FLAG(double, numerical_parity_min_ratio, -1.0,
+          "Required minimum unchanged-weight chosen-action probability ratio.");
+ABSL_FLAG(double, numerical_parity_max_ratio, -1.0,
+          "Required maximum unchanged-weight chosen-action probability ratio.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -718,6 +744,31 @@ std::string HashNonValueParameters(const std::shared_ptr<SharedDunePolicyValueNe
     }
   }
   return open_spiel::ComputeStringSHA256(ss.str());
+}
+
+// Canonical in-memory identity for the read-only parity gate. Parameter and
+// buffer names, shapes and FP32 bytes are included so equality before/after the
+// diagnostic proves that neither collection nor replay mutated the model.
+std::string HashAllModelState(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  std::stringstream ss;
+  torch::NoGradGuard no_grad;
+  auto append = [&](const std::string& name, const torch::Tensor& source) {
+    const torch::Tensor tensor =
+        source.detach().contiguous().cpu().to(torch::kFloat32);
+    ss << name << ':';
+    for (int64_t dim : tensor.sizes()) ss << dim << ',';
+    ss << ';';
+    ss.write(reinterpret_cast<const char*>(tensor.data_ptr<float>()),
+             tensor.numel() * sizeof(float));
+  };
+  for (const auto& item : model->named_parameters()) {
+    append("P/" + item.key(), item.value());
+  }
+  for (const auto& item : model->named_buffers()) {
+    append("B/" + item.key(), item.value());
+  }
+  return ComputeStringSHA256(ss.str());
 }
 
 // PWO-5 section 7.2 — THE ARCHITECTURE-VERSIONED CHECKPOINT MIGRATION.
@@ -1678,6 +1729,49 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
       CenterAndCapLegalLogits(logits, actions, logit_cap);
 
+      // The ordinary PPO transition stores only the sampled action's scalar
+      // log-probability. The numerical-parity gate needs the whole behavior
+      // categorical to measure full legal KL, but retaining 2--50 floats per
+      // decision is deliberately opt-in so normal training has no memory or
+      // serialization change.
+      std::vector<float> parity_behavior_log_probs;
+      int parity_decision_role = -1;
+      if (!absl::GetFlag(FLAGS_numerical_parity_output).empty()) {
+        parity_decision_role = static_cast<int>(ClassifyDuneDecisionRole(
+            *state, current_player, /*has_active_session=*/false));
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (Action a : actions) {
+          if (a >= 0 && static_cast<size_t>(a) < logits.size()) {
+            max_logit = std::max(max_logit, logits[a]);
+          }
+        }
+        std::vector<double> weights(actions.size(), 0.0);
+        double total_weight = 0.0;
+        for (size_t i = 0; i < actions.size(); ++i) {
+          const Action a = actions[i];
+          if (a >= 0 && static_cast<size_t>(a) < logits.size() &&
+              std::isfinite(max_logit)) {
+            weights[i] = std::exp(
+                static_cast<double>(logits[a] - max_logit));
+            if (!std::isfinite(weights[i]) || weights[i] < 0.0) {
+              weights[i] = 0.0;
+            }
+          }
+          total_weight += weights[i];
+        }
+        if (!(total_weight > 0.0) || !std::isfinite(total_weight)) {
+          weights.assign(actions.size(), 1.0);
+          total_weight = static_cast<double>(actions.size());
+        }
+        parity_behavior_log_probs.reserve(actions.size());
+        for (double weight : weights) {
+          parity_behavior_log_probs.push_back(
+              weight > 0.0
+                  ? static_cast<float>(std::log(weight / total_weight))
+                  : -std::numeric_limits<float>::infinity());
+        }
+      }
+
       // --- PWO-5 section 14.1b: NE and max_action_prob, the POST-cap half. --
       //
       // Taken from the distribution the behaviour policy ACTUALLY SAMPLES FROM
@@ -1904,6 +1998,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       transition.return_value = 0.0f;
       transition.player_id = current_player;
       transition.episode_id = episode_id;
+      transition.behavior_legal_log_probs =
+          std::move(parity_behavior_log_probs);
+      transition.decision_role = parity_decision_role;
       trajectory->push_back(std::move(transition));
 
       if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -2335,6 +2432,502 @@ CollectResult CollectRollout(const Game* game,
   return result;
 }
 
+std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityFp32(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const std::vector<PpoTransition>& batch, int64_t obs_size,
+    int64_t action_dim, torch::Device device,
+    std::vector<std::string>* schema_errors,
+    std::string* row_evidence_sha256) {
+  std::vector<PpoNumericalParityRow> rows;
+  rows.reserve(batch.size());
+  std::stringstream evidence;
+  const int64_t chunk_size = std::max<int64_t>(
+      1, std::min<int64_t>(absl::GetFlag(FLAGS_ppo_minibatch_size),
+                           static_cast<int64_t>(batch.size())));
+  const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+  const bool was_training = model->is_training();
+  model->eval();
+  torch::NoGradGuard no_grad;
+
+  for (int64_t start = 0; start < static_cast<int64_t>(batch.size());
+       start += chunk_size) {
+    const int64_t count = std::min<int64_t>(
+        chunk_size, static_cast<int64_t>(batch.size()) - start);
+    torch::Tensor states_cpu = torch::empty(
+        {count, obs_size}, torch::TensorOptions().dtype(torch::kFloat32));
+    torch::Tensor masks_cpu = torch::zeros(
+        {count, action_dim}, torch::TensorOptions().dtype(torch::kBool));
+    float* state_ptr = states_cpu.data_ptr<float>();
+    bool* mask_ptr = masks_cpu.data_ptr<bool>();
+    for (int64_t i = 0; i < count; ++i) {
+      const PpoTransition& transition = batch[start + i];
+      if (static_cast<int64_t>(transition.state.size()) != obs_size) {
+        schema_errors->push_back(absl::StrFormat(
+            "row %lld: observation width %lld != %lld",
+            static_cast<long long>(start + i),
+            static_cast<long long>(transition.state.size()),
+            static_cast<long long>(obs_size)));
+        continue;
+      }
+      std::memcpy(state_ptr + i * obs_size, transition.state.data(),
+                  obs_size * sizeof(float));
+      for (Action action : transition.legal_actions) {
+        if (action >= 0 && action < action_dim) {
+          mask_ptr[i * action_dim + action] = true;
+        }
+      }
+    }
+
+    const torch::Tensor states = states_cpu.to(device);
+    const torch::Tensor masks = masks_cpu.to(device);
+    // Deliberately NO AutocastGuard: this is the learner-FP32 side of the
+    // registered comparison, at unchanged weights.
+    const auto outputs = model->forward(states);
+    const torch::Tensor centered =
+        CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
+    const torch::Tensor log_probs_cpu =
+        torch::log_softmax(
+            centered.masked_fill(masks.logical_not(), -1e9f), -1)
+            .to(torch::kCPU)
+            .to(torch::kFloat32)
+            .contiguous();
+    const float* new_log_probs = log_probs_cpu.data_ptr<float>();
+
+    for (int64_t i = 0; i < count; ++i) {
+      const int64_t row_index = start + i;
+      const PpoTransition& transition = batch[row_index];
+      PpoNumericalParityInput input;
+      input.legal_count = static_cast<int>(transition.legal_actions.size());
+      input.decision_role = transition.decision_role;
+      input.advantage = transition.advantage;
+      input.stored_chosen_log_prob = transition.old_log_prob;
+      input.old_log_probs.reserve(input.legal_count);
+      input.new_log_probs.reserve(input.legal_count);
+      for (int j = 0; j < input.legal_count; ++j) {
+        const Action action = transition.legal_actions[j];
+        input.old_log_probs.push_back(
+            j < static_cast<int>(transition.behavior_legal_log_probs.size())
+                ? transition.behavior_legal_log_probs[j]
+                : std::numeric_limits<double>::quiet_NaN());
+        input.new_log_probs.push_back(
+            (action >= 0 && action < action_dim)
+                ? new_log_probs[i * action_dim + action]
+                : std::numeric_limits<double>::quiet_NaN());
+        if (action == transition.action) input.chosen_index = j;
+      }
+      // Hash the exact row identity and BOTH aligned legal distributions. The
+      // artifact's summaries can therefore be tied back to the measured row
+      // evidence without embedding a many-megabyte raw dump in JSON.
+      evidence.write(reinterpret_cast<const char*>(&row_index),
+                     sizeof(row_index));
+      evidence.write(reinterpret_cast<const char*>(&transition.episode_id),
+                     sizeof(transition.episode_id));
+      evidence.write(reinterpret_cast<const char*>(&transition.player_id),
+                     sizeof(transition.player_id));
+      evidence.write(reinterpret_cast<const char*>(&transition.action),
+                     sizeof(transition.action));
+      evidence.write(reinterpret_cast<const char*>(&transition.decision_role),
+                     sizeof(transition.decision_role));
+      evidence.write(reinterpret_cast<const char*>(&transition.advantage),
+                     sizeof(transition.advantage));
+      evidence.write(reinterpret_cast<const char*>(&transition.old_log_prob),
+                     sizeof(transition.old_log_prob));
+      for (int j = 0; j < input.legal_count; ++j) {
+        evidence.write(
+            reinterpret_cast<const char*>(&transition.legal_actions[j]),
+            sizeof(transition.legal_actions[j]));
+        evidence.write(reinterpret_cast<const char*>(&input.old_log_probs[j]),
+                       sizeof(input.old_log_probs[j]));
+        evidence.write(reinterpret_cast<const char*>(&input.new_log_probs[j]),
+                       sizeof(input.new_log_probs[j]));
+      }
+      PpoNumericalParityRow row;
+      std::string error;
+      if (!ComputePpoNumericalParityRow(input, &row, &error)) {
+        schema_errors->push_back(absl::StrFormat(
+            "row %lld: %s", static_cast<long long>(row_index), error));
+        continue;
+      }
+      rows.push_back(row);
+    }
+  }
+  if (was_training) model->train();
+  if (row_evidence_sha256 != nullptr) {
+    *row_evidence_sha256 = ComputeStringSHA256(evidence.str());
+  }
+  return rows;
+}
+
+json::Object PpoNumericalParitySummaryJson(
+    const PpoNumericalParitySummary& s) {
+  json::Object out;
+  out["rows"] = s.rows;
+  out["finite_rows"] = s.finite_rows;
+  out["legal_logits"] = s.legal_logits;
+  out["old_probability_underflows"] = s.old_probability_underflows;
+  out["new_probability_underflows"] = s.new_probability_underflows;
+  out["nonfinite_values"] = s.nonfinite_values;
+  out["mean_abs_chosen_log_prob_delta"] =
+      s.mean_abs_chosen_log_prob_delta;
+  out["max_abs_chosen_log_prob_delta"] =
+      s.max_abs_chosen_log_prob_delta;
+  out["mean_full_kl_old_new"] = s.mean_kl_old_new;
+  out["max_full_kl_old_new"] = s.max_kl_old_new;
+  out["mean_full_kl_new_old"] = s.mean_kl_new_old;
+  out["max_full_kl_new_old"] = s.max_kl_new_old;
+  out["ratio_min"] = s.ratio_min;
+  out["ratio_p01"] = s.ratio_p01;
+  out["ratio_p50"] = s.ratio_p50;
+  out["ratio_p99"] = s.ratio_p99;
+  out["ratio_max"] = s.ratio_max;
+  out["ratio_lt_0_8"] = s.ratio_lt_0_8;
+  out["ratio_gt_1_2"] = s.ratio_gt_1_2;
+  return out;
+}
+
+template <typename Predicate>
+json::Object PpoNumericalParitySubsetJson(
+    const std::vector<PpoNumericalParityRow>& rows, Predicate predicate) {
+  std::vector<PpoNumericalParityRow> subset;
+  for (const auto& row : rows) {
+    if (predicate(row)) subset.push_back(row);
+  }
+  return PpoNumericalParitySummaryJson(
+      SummarizePpoNumericalParityRows(subset));
+}
+
+std::string PpoDecisionRoleName(int role) {
+  switch (static_cast<DuneDecisionRole>(role)) {
+    case DuneDecisionRole::kForcedOrBookkeeping: return "forced_or_bookkeeping";
+    case DuneDecisionRole::kLeaderSelection: return "leader_selection";
+    case DuneDecisionRole::kAgentPrimary: return "agent_primary";
+    case DuneDecisionRole::kAgentContinuation: return "agent_continuation";
+    case DuneDecisionRole::kPurchase: return "purchase";
+    case DuneDecisionRole::kCombatIntrigue: return "combat_intrigue";
+    case DuneDecisionRole::kOtherOptional: return "other_optional";
+  }
+  return "invalid_role_" + std::to_string(role);
+}
+
+struct PpoNumericalParitySourceRecord {
+  std::string relative_path;
+  std::string absolute_path;
+  int64_t size = 0;
+  std::string sha256;
+};
+
+struct PpoNumericalParitySourceProvenance {
+  std::string root;
+  std::string combined_sha256;
+  std::vector<PpoNumericalParitySourceRecord> files;
+};
+
+PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
+    const std::string& source_root, const std::string& registered_sha256) {
+  std::error_code ec;
+  const std::filesystem::path canonical_root =
+      std::filesystem::canonical(source_root, ec);
+  if (ec || !std::filesystem::is_directory(canonical_root)) {
+    SpielFatalError(
+        "Numerical parity source root is not a readable directory: " +
+        source_root);
+  }
+  PpoNumericalParitySourceProvenance out;
+  out.root = canonical_root.string();
+  std::vector<std::pair<std::string, std::string>> digest_records;
+  for (const std::string& relative :
+       PpoNumericalParitySourceRelativePaths()) {
+    const std::filesystem::path path = canonical_root / relative;
+    if (!std::filesystem::is_regular_file(path)) {
+      SpielFatalError(
+          "Numerical parity required source is not a regular file: " +
+          path.string());
+    }
+    size_t size = 0;
+    const std::string digest = ComputeFileSHA256(path.string(), &size);
+    if (digest.empty()) {
+      SpielFatalError("Numerical parity could not hash required source: " +
+                      path.string());
+    }
+    out.files.push_back({relative, path.string(),
+                         static_cast<int64_t>(size), digest});
+    digest_records.push_back({relative, digest});
+  }
+  std::string payload;
+  std::string payload_error;
+  if (!CanonicalPpoNumericalParitySourcePayload(
+          digest_records, &payload, &payload_error)) {
+    SpielFatalError("Numerical parity source canonicalization failed: " +
+                    payload_error);
+  }
+  out.combined_sha256 = ComputeStringSHA256(payload);
+  if (out.combined_sha256 != registered_sha256) {
+    SpielFatalError(
+        "Numerical parity registered source SHA-256 mismatch: expected " +
+        registered_sha256 + " computed " + out.combined_sha256);
+  }
+  return out;
+}
+
+bool WritePpoNumericalParityArtifact(
+    const std::string& output_path,
+    const std::vector<PpoNumericalParityRow>& rows,
+    const std::vector<std::string>& schema_errors, const CollectResult& collect,
+    const std::string& model_hash_before,
+    const std::string& model_hash_after,
+    const std::string& inference_hash_before,
+    const std::string& inference_hash_after,
+    const std::string& source_manifest,
+    const std::string& source_manifest_sha256, int64_t source_global_update,
+    const std::string& source_checkpoint_uuid,
+    const std::string& config_fingerprint, torch::Device device,
+    int64_t obs_size, int64_t action_size, const std::string& command_line,
+    const std::string& row_evidence_sha256,
+    const PpoNumericalParitySourceProvenance& source_provenance) {
+  const PpoNumericalParitySummary overall =
+      SummarizePpoNumericalParityRows(rows);
+  int64_t nontrivial_rows = 0;
+  for (const auto& row : rows) {
+    if (row.legal_count > 1) ++nontrivial_rows;
+  }
+
+  json::Array failures;
+  auto reject = [&](const std::string& reason) { failures.emplace_back(reason); };
+  if (!schema_errors.empty()) {
+    reject(absl::StrFormat("%d malformed parity rows",
+                           static_cast<int>(schema_errors.size())));
+  }
+  if (!collect.episode_ids_unique) reject("episode IDs are not unique");
+  if (overall.rows < absl::GetFlag(FLAGS_numerical_parity_min_rows)) {
+    reject("total row floor not met");
+  }
+  if (nontrivial_rows <
+      absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows)) {
+    reject("nontrivial row floor not met");
+  }
+  if (overall.nonfinite_values != 0) reject("nonfinite parity values observed");
+  if (overall.old_probability_underflows != 0) {
+    reject("rollout behavior probability underflow observed");
+  }
+  if (overall.new_probability_underflows != 0) {
+    reject("learner FP32 probability underflow observed");
+  }
+  if (overall.max_abs_chosen_log_prob_delta >
+      absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta)) {
+    reject("chosen-action log-probability delta exceeds bound");
+  }
+  if (overall.max_kl_old_new >
+          absl::GetFlag(FLAGS_numerical_parity_max_full_kl) ||
+      overall.max_kl_new_old >
+          absl::GetFlag(FLAGS_numerical_parity_max_full_kl)) {
+    reject("full legal categorical KL exceeds bound");
+  }
+  if (overall.ratio_min <
+      absl::GetFlag(FLAGS_numerical_parity_min_ratio)) {
+    reject("chosen-action ratio minimum is below bound");
+  }
+  if (overall.ratio_max >
+      absl::GetFlag(FLAGS_numerical_parity_max_ratio)) {
+    reject("chosen-action ratio maximum is above bound");
+  }
+  if (model_hash_before != model_hash_after) {
+    reject("model state changed during read-only diagnostic");
+  }
+  if (inference_hash_before != inference_hash_after) {
+    reject("rollout inference model changed during read-only diagnostic");
+  }
+  if (model_hash_before != inference_hash_before) {
+    reject("learner and rollout inference models differed before collection");
+  }
+
+  json::Object root;
+  root["schema"] = "dune_raw_ppo_numerical_parity_v1";
+  root["registration_id"] =
+      absl::GetFlag(FLAGS_numerical_parity_registration_id);
+  root["scope"] = "raw_ppo_only";
+  root["optimizer_steps"] = int64_t{0};
+  root["optimizer_checkpoint_loaded"] = false;
+  root["command_line"] = command_line;
+  root["config_fingerprint"] = config_fingerprint;
+  root["device"] = device.str();
+  root["rollout_precision"] =
+      device.is_cuda() ? "cuda_bf16_autocast" : "cpu_fp32";
+  root["replay_precision"] =
+      device.is_cuda() ? "cuda_fp32_no_autocast_tf32_allowed" : "cpu_fp32";
+  root["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
+  root["seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+  root["threads"] = static_cast<int64_t>(absl::GetFlag(FLAGS_threads));
+  root["eval_batch_size"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_eval_batch_size));
+  root["eval_timeout_ms"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_eval_timeout_ms));
+  root["rollout_games"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
+  root["hard_transition_ceiling"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_rollout_games)) * 5000;
+  root["games_collected"] = static_cast<int64_t>(collect.games);
+  root["transitions_collected"] =
+      static_cast<int64_t>(collect.rollout.size());
+  root["nontrivial_rows"] = nontrivial_rows;
+  root["observation_size"] = obs_size;
+  root["action_size"] = action_size;
+  root["rollout_hash"] = ComputeRolloutHash(collect.rollout);
+  root["row_evidence_sha256"] = row_evidence_sha256;
+  root["row_evidence_contract"] =
+      "ordered row_index,episode_id,player_id,chosen_action,decision_role,"
+      "advantage,stored_chosen_logprob,then each aligned "
+      "(legal_action,rollout_logprob,learner_fp32_logprob),native fixed-width bytes";
+  root["model_state_sha256_before"] = model_hash_before;
+  root["model_state_sha256_after"] = model_hash_after;
+  root["inference_state_sha256_before"] = inference_hash_before;
+  root["inference_state_sha256_after"] = inference_hash_after;
+
+  size_t model_file_size = 0;
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  json::Object source;
+  source["model_path"] = std::filesystem::absolute(model_path).string();
+  source["model_size"] = static_cast<int64_t>(model_file_size);
+  source["model_sha256"] =
+      ComputeFileSHA256(model_path, &model_file_size);
+  source["model_size"] = static_cast<int64_t>(model_file_size);
+  source["manifest_path"] = std::filesystem::absolute(source_manifest).string();
+  source["manifest_sha256"] = source_manifest_sha256;
+  source["global_update"] = source_global_update;
+  source["checkpoint_uuid"] = source_checkpoint_uuid;
+  size_t binary_size = 0;
+  std::error_code ec;
+  const std::filesystem::path binary_path =
+      std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (ec || binary_path.empty()) {
+    reject("could not resolve executed binary path");
+  } else {
+    source["binary_path"] = binary_path.string();
+    source["binary_sha256"] =
+        ComputeFileSHA256(binary_path.string(), &binary_size);
+    source["binary_size"] = static_cast<int64_t>(binary_size);
+  }
+  root["source"] = json::Value(source);
+
+  json::Object source_code;
+  source_code["root"] = source_provenance.root;
+  source_code["combined_sha256"] = source_provenance.combined_sha256;
+  source_code["canonical_contract"] =
+      "fixed ordered relative_path + NUL + lowercase file_sha256 + newline";
+  json::Array source_files;
+  for (const auto& file : source_provenance.files) {
+    json::Object record;
+    record["relative_path"] = file.relative_path;
+    record["absolute_path"] = file.absolute_path;
+    record["size"] = file.size;
+    record["sha256"] = file.sha256;
+    source_files.emplace_back(json::Value(record));
+  }
+  source_code["files"] = json::Value(source_files);
+  root["source_code"] = json::Value(source_code);
+
+  json::Object thresholds;
+  thresholds["min_rows"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_numerical_parity_min_rows));
+  thresholds["min_nontrivial_rows"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows));
+  thresholds["max_abs_chosen_logprob_delta"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta);
+  thresholds["max_full_legal_kl_each_direction"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_full_kl);
+  thresholds["min_ratio"] =
+      absl::GetFlag(FLAGS_numerical_parity_min_ratio);
+  thresholds["max_ratio"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_ratio);
+  thresholds["require_zero_underflows"] = true;
+  thresholds["require_zero_nonfinite"] = true;
+  thresholds["require_unchanged_model_hash"] = true;
+  root["thresholds"] = json::Value(thresholds);
+  root["overall"] = json::Value(PpoNumericalParitySummaryJson(overall));
+
+  json::Object legal_splits;
+  std::set<int> legal_counts;
+  for (const auto& row : rows) legal_counts.insert(row.legal_count);
+  for (int legal_count : legal_counts) {
+    legal_splits[std::to_string(legal_count)] = json::Value(
+        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
+          return row.legal_count == legal_count;
+        }));
+  }
+  json::Object probability_splits;
+  probability_splits["p_lt_1e-6"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.old_chosen_probability < 1e-6; }));
+  probability_splits["p_1e-6_to_1e-4"] = json::Value(
+      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
+        return r.old_chosen_probability >= 1e-6 &&
+               r.old_chosen_probability < 1e-4;
+      }));
+  probability_splits["p_1e-4_to_1e-2"] = json::Value(
+      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
+        return r.old_chosen_probability >= 1e-4 &&
+               r.old_chosen_probability < 1e-2;
+      }));
+  probability_splits["p_1e-2_to_0_1"] = json::Value(
+      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
+        return r.old_chosen_probability >= 1e-2 &&
+               r.old_chosen_probability < 0.1;
+      }));
+  probability_splits["p_0_1_to_0_5"] = json::Value(
+      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
+        return r.old_chosen_probability >= 0.1 &&
+               r.old_chosen_probability < 0.5;
+      }));
+  probability_splits["p_ge_0_5"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.old_chosen_probability >= 0.5; }));
+  json::Object advantage_splits;
+  advantage_splits["negative"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage < 0.0; }));
+  advantage_splits["zero"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage == 0.0; }));
+  advantage_splits["positive"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage > 0.0; }));
+  json::Object role_splits;
+  for (int role = 0; role < 7; ++role) {
+    role_splits[PpoDecisionRoleName(role)] = json::Value(
+        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
+          return row.decision_role == role;
+        }));
+  }
+  json::Object splits;
+  splits["legal_count_exact"] = json::Value(legal_splits);
+  splits["old_chosen_probability"] = json::Value(probability_splits);
+  splits["advantage_sign"] = json::Value(advantage_splits);
+  splits["decision_role"] = json::Value(role_splits);
+  root["splits"] = json::Value(splits);
+
+  json::Array schema_error_json;
+  for (const std::string& error : schema_errors) {
+    schema_error_json.emplace_back(error);
+  }
+  root["schema_errors"] = json::Value(schema_error_json);
+  root["failure_reasons"] = json::Value(failures);
+  // Status is assigned LAST: every provenance check above is allowed to reject.
+  root["status"] = failures.empty() ? "PASS" : "REJECT";
+
+  const std::filesystem::path output(output_path);
+  const std::filesystem::path tmp = output_path + ".tmp";
+  if (std::filesystem::exists(output) || std::filesystem::exists(tmp)) {
+    SpielFatalError("Numerical parity output already exists; refusing overwrite: " +
+                    output_path);
+  }
+  if (!output.parent_path().empty()) {
+    std::filesystem::create_directories(output.parent_path());
+  }
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) SpielFatalError("Cannot create numerical parity temp artifact");
+    out << json::ToString(root, true) << "\n";
+    out.flush();
+    if (!out) SpielFatalError("Numerical parity artifact write failed");
+  }
+  std::filesystem::rename(tmp, output);
+  return failures.empty();
+}
+
 
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -2343,7 +2936,86 @@ CollectResult CollectRollout(const Game* game,
 
 int main(int argc, char** argv) {
   setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
+  std::ostringstream parity_command_line_stream;
+  for (int i = 0; i < argc; ++i) {
+    if (i) parity_command_line_stream << ' ';
+    parity_command_line_stream << std::quoted(std::string(argv[i]));
+  }
+  const std::string parity_command_line = parity_command_line_stream.str();
   absl::ParseCommandLine(argc, argv);
+  const bool numerical_parity =
+      !absl::GetFlag(FLAGS_numerical_parity_output).empty();
+  if (numerical_parity) {
+    auto parity_stop = [](const std::string& message) {
+      open_spiel::SpielFatalError(
+          "Raw-PPO numerical parity configuration rejected: " + message);
+    };
+    if (!absl::GetFlag(FLAGS_diagnostics_only)) {
+      parity_stop("--diagnostics_only must be true");
+    }
+    if (absl::GetFlag(FLAGS_init_mode) != "diagnostic") {
+      parity_stop("--init_mode must be diagnostic");
+    }
+    if (absl::GetFlag(FLAGS_artifact_manifest).empty()) {
+      parity_stop("--artifact_manifest is required");
+    }
+    if (absl::GetFlag(FLAGS_numerical_parity_registration_id).empty()) {
+      parity_stop("--numerical_parity_registration_id is required");
+    }
+    if (absl::GetFlag(FLAGS_numerical_parity_source_root).empty()) {
+      parity_stop("--numerical_parity_source_root is required");
+    }
+    const std::string registered_source_sha =
+        absl::GetFlag(FLAGS_numerical_parity_source_sha256);
+    if (registered_source_sha.size() != 64 ||
+        !std::all_of(registered_source_sha.begin(), registered_source_sha.end(),
+                     [](char c) {
+                       return (c >= '0' && c <= '9') ||
+                              (c >= 'a' && c <= 'f');
+                     })) {
+      parity_stop(
+          "--numerical_parity_source_sha256 must be an explicit lowercase SHA-256");
+    }
+    const int games = absl::GetFlag(FLAGS_rollout_games);
+    if (games <= 0 || games > 64) {
+      parity_stop("--rollout_games must be in [1,64] (hard ceiling 320000 transitions)");
+    }
+    if (absl::GetFlag(FLAGS_pipeline) ||
+        absl::GetFlag(FLAGS_online_search_collection) ||
+        absl::GetFlag(FLAGS_search_pi_mode) ||
+        !absl::GetFlag(FLAGS_search_label_dir).empty() ||
+        absl::GetFlag(FLAGS_train_value_only) ||
+        absl::GetFlag(FLAGS_sample_counterfactual_states)) {
+      parity_stop("pipeline, search, distillation, value-only, and counterfactual paths must all be disabled");
+    }
+    const double max_logprob_delta =
+        absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta);
+    const double max_full_kl =
+        absl::GetFlag(FLAGS_numerical_parity_max_full_kl);
+    const double min_ratio =
+        absl::GetFlag(FLAGS_numerical_parity_min_ratio);
+    const double max_ratio =
+        absl::GetFlag(FLAGS_numerical_parity_max_ratio);
+    if (absl::GetFlag(FLAGS_numerical_parity_min_rows) <= 0 ||
+        absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows) <= 0 ||
+        !std::isfinite(max_logprob_delta) || max_logprob_delta <= 0.0 ||
+        !std::isfinite(max_full_kl) || max_full_kl <= 0.0 ||
+        !std::isfinite(min_ratio) || !(min_ratio > 0.0 && min_ratio <= 1.0) ||
+        !std::isfinite(max_ratio) || max_ratio < 1.0) {
+      parity_stop("all sample floors and numerical bounds must be stated explicitly and be valid");
+    }
+    if (absl::GetFlag(FLAGS_numerical_parity_min_rows) > games * 5000 ||
+        absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows) >
+            games * 5000) {
+      parity_stop("a sample floor exceeds the hard transition ceiling");
+    }
+    if (std::filesystem::exists(
+            absl::GetFlag(FLAGS_numerical_parity_output)) ||
+        std::filesystem::exists(
+            absl::GetFlag(FLAGS_numerical_parity_output) + ".tmp")) {
+      parity_stop("output or temp path already exists (fresh output required)");
+    }
+  }
   // PWO-5 section 10.2: the reserved final-gate base-seed range, enforced at
   // the launcher so the exclusion is mechanical rather than a matter of
   // operator care. Checked before ANY other work.
@@ -2416,6 +3088,22 @@ int main(int argc, char** argv) {
     at::globalContext().setAllowTF32CuDNN(true);
     at::autocast::set_autocast_dtype(at::kCUDA, at::ScalarType::BFloat16);
     std::cout << "CUDA available. PPO training on GPU.\n";
+  }
+  if (numerical_parity && !device.is_cuda()) {
+    SpielFatalError(
+        "Raw-PPO numerical parity requires CUDA: without it the rollout side "
+        "does not execute BF16 autocast and cannot test the registered gate.");
+  }
+  open_spiel::PpoNumericalParitySourceProvenance
+      parity_source_provenance;
+  if (numerical_parity) {
+    // Source identity is verified before model load and, critically, before a
+    // rollout worker can be created. A mismatch cannot produce a partial
+    // collection that looks like evidence from the registered implementation.
+    parity_source_provenance =
+        open_spiel::LoadPpoNumericalParitySourceProvenance(
+            absl::GetFlag(FLAGS_numerical_parity_source_root),
+            absl::GetFlag(FLAGS_numerical_parity_source_sha256));
   }
 
   // PWO-5 section 7.2 / Appendix A.1.
@@ -2783,8 +3471,78 @@ int main(int argc, char** argv) {
   bool search_pi_resume_present = false;
   int start_update = 1;
   int target_end_update = absl::GetFlag(FLAGS_target_end_update);
+  std::string parity_source_manifest;
+  std::string parity_source_manifest_sha256;
+  int64_t parity_source_global_update = -1;
+  std::string parity_source_checkpoint_uuid;
 
-  if (init_mode == "random") {
+  if (init_mode == "diagnostic") {
+    // A model-only, read-only load path. It exists specifically so a completed
+    // checkpoint can be audited without pretending to resume it, loading Adam
+    // moments, synthesizing a bootstrap manifest, or making any checkpoint
+    // path writable.
+    if (!numerical_parity) {
+      SpielFatalError(
+          "init_mode=diagnostic is reserved for --numerical_parity_output");
+    }
+    const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    parity_source_manifest = absl::GetFlag(FLAGS_artifact_manifest);
+    if (!std::filesystem::is_regular_file(model_path) ||
+        !std::filesystem::is_regular_file(parity_source_manifest)) {
+      SpielFatalError(
+          "Diagnostic model checkpoint and provenance manifest must both be regular files");
+    }
+    size_t manifest_size = 0;
+    parity_source_manifest_sha256 = ComputeFileSHA256(
+        parity_source_manifest, &manifest_size);
+    std::ifstream source_stream(parity_source_manifest);
+    const std::string source_text((std::istreambuf_iterator<char>(source_stream)),
+                                  std::istreambuf_iterator<char>());
+    auto parsed = json::FromString(source_text);
+    if (!parsed.has_value() || !parsed->IsObject()) {
+      SpielFatalError("Numerical parity provenance manifest is malformed JSON");
+    }
+    const json::Object& source = parsed->GetObject();
+    auto required_string = [&](const char* key) -> std::string {
+      auto it = source.find(key);
+      if (it == source.end() || !it->second.IsString()) {
+        SpielFatalError(std::string("Numerical parity manifest missing string '") +
+                        key + "'");
+      }
+      return it->second.GetString();
+    };
+    auto required_int = [&](const char* key) -> int64_t {
+      auto it = source.find(key);
+      if (it == source.end() || !it->second.IsInt()) {
+        SpielFatalError(std::string("Numerical parity manifest missing integer '") +
+                        key + "'");
+      }
+      return it->second.GetInt();
+    };
+    size_t model_size = 0;
+    const std::string model_sha256 = ComputeFileSHA256(model_path, &model_size);
+    if (model_sha256 != required_string("model_sha256") ||
+        static_cast<int64_t>(model_size) != required_int("model_file_size")) {
+      SpielFatalError(
+          "Numerical parity model bytes do not match the provenance manifest");
+    }
+    if (absl::GetFlag(FLAGS_hidden_dim) != required_int("hidden_dim") ||
+        absl::GetFlag(FLAGS_num_blocks) != required_int("num_blocks")) {
+      SpielFatalError(
+          "Numerical parity architecture flags do not match the provenance manifest");
+    }
+    parity_source_global_update = required_int("global_update");
+    parity_source_checkpoint_uuid = required_string("checkpoint_uuid");
+    LoadModelCheckpoint(training_model, model_path, device);
+    start_update = static_cast<int>(parity_source_global_update + 1);
+    next_episode_id.store(
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_start_episode_id)));
+    total_env_steps.store(
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_start_env_steps)));
+    std::cout << "Loaded read-only numerical-parity source model "
+              << model_path << " sha256=" << model_sha256
+              << "; optimizer checkpoint was not loaded.\n";
+  } else if (init_mode == "random") {
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
     std::filesystem::path m_path = model_path;
@@ -3323,7 +4081,9 @@ int main(int argc, char** argv) {
                                  "  Optimizer size and hash match Phase 1 manifest.\n", actual_param_count);
     exit(0);
   } else {
-    SpielFatalError("Unsupported init_mode: " + init_mode);
+    SpielFatalError("Unsupported init_mode: " + init_mode +
+                    " (expected random, checkpoint, bootstrap, "
+                    "validate_legacy, or diagnostic)");
   }
 
   std::shared_mutex sync_mutex;
@@ -4909,12 +5669,43 @@ int main(int argc, char** argv) {
   }
 
   // Collect first rollout synchronously.
+  const std::string parity_model_hash_before =
+      numerical_parity ? open_spiel::HashAllModelState(training_model) : "";
+  const std::string parity_inference_hash_before =
+      numerical_parity ? open_spiel::HashAllModelState(inference_model) : "";
   float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda);
+  if (numerical_parity) {
+    std::vector<std::string> schema_errors;
+    std::string row_evidence_sha256;
+    const std::vector<open_spiel::PpoNumericalParityRow> parity_rows =
+        open_spiel::ReplayPpoNumericalParityFp32(
+            training_model, current_collect.rollout, obs_size, action_size,
+            device, &schema_errors, &row_evidence_sha256);
+    const std::string parity_model_hash_after =
+        open_spiel::HashAllModelState(training_model);
+    const std::string parity_inference_hash_after =
+        open_spiel::HashAllModelState(inference_model);
+    const bool pass = open_spiel::WritePpoNumericalParityArtifact(
+        absl::GetFlag(FLAGS_numerical_parity_output), parity_rows,
+        schema_errors, current_collect, parity_model_hash_before,
+        parity_model_hash_after, parity_inference_hash_before,
+        parity_inference_hash_after, parity_source_manifest,
+        parity_source_manifest_sha256, parity_source_global_update,
+        parity_source_checkpoint_uuid, config_fingerprint, device, obs_size,
+        action_size, parity_command_line, row_evidence_sha256,
+        parity_source_provenance);
+    std::cout << "Raw-PPO numerical parity "
+              << (pass ? "PASS" : "REJECT") << ": "
+              << absl::GetFlag(FLAGS_numerical_parity_output) << "\n"
+              << "No optimizer checkpoint was loaded and optimizer.step was "
+                 "not called.\n";
+    return pass ? 0 : 2;
+  }
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
     open_spiel::PpoUpdateStats stats =
         open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
