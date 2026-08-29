@@ -89,6 +89,12 @@ ABSL_FLAG(int, num_blocks, 8, "Network residual block count.");
 ABSL_FLAG(double, logit_cap, 10.0,
           "Smooth tanh cap on legal-centered policy logits. <=0 disables.");
 ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
+ABSL_FLAG(bool, rollout_amp, true,
+          "Use CUDA BF16 autocast for BatchedEvaluator rollout inference. "
+          "Default true preserves the historical rollout path.");
+ABSL_FLAG(bool, allow_tf32, true,
+          "Allow TF32 for CUDA CuBLAS/CuDNN. Default true preserves the "
+          "historical runtime policy.");
 ABSL_FLAG(bool, evaluator_device_synchronize, true,
           "Use whole-device CUDA synchronize after evaluator D2H copies.");
 ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
@@ -2718,7 +2724,8 @@ std::vector<PpoNumericalParityRow> ReplayPpoCpuIntegrityCell(
 std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     const std::vector<PpoTransition>& batch, int64_t obs_size,
-    int64_t action_dim, torch::Device device, bool learner_autocast,
+    int64_t action_dim, torch::Device device, bool model_train_mode,
+    bool learner_autocast,
     const std::string& cell_label,
     std::vector<std::string>* schema_errors,
     std::string* row_evidence_sha256, int64_t* model_forward_calls,
@@ -2739,7 +2746,7 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
                            static_cast<int64_t>(batch.size())));
   const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
   const bool was_training = model->is_training();
-  if (learner_autocast) {
+  if (model_train_mode) {
     model->train();  // exact TrainPpoUpdate module mode
   } else {
     model->eval();   // v1 descriptive-control convention
@@ -2797,6 +2804,10 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
 
     const torch::Tensor states = states_cpu.to(device);
     const torch::Tensor masks = masks_cpu.to(device);
+    if (states_cpu.scalar_type() != torch::kFloat32 ||
+        states.scalar_type() != torch::kFloat32) {
+      schema_errors->push_back("cell input/pre-forward dtype is not Float32");
+    }
     torch::Tensor replay_raw_logits, replay_log_probs;
     auto replay_policy_path = [&]() {
       if (model_forward_calls != nullptr) ++*model_forward_calls;
@@ -3288,6 +3299,12 @@ struct PpoParityCellResult {
   std::string policy_sha256;
   int64_t model_forward_calls = 0;
   int64_t dense_mask_rows_ok = 0;
+  bool module_train_mode = false;
+  bool autocast_enabled = false;
+  std::string input_dtype = "Float32";
+  std::string pre_forward_dtype = "Float32";
+  double wall_time_s = 0.0;
+  double device_time_s = -1.0;
 };
 
 struct PpoParityIntegrityStats {
@@ -3368,6 +3385,8 @@ PpoParityCellResult ReplayPpoInferenceExactGeometry(
     PpoParityReplayGeometryStats* stats) {
   PpoParityCellResult cell;
   cell.name = "live_inference_exact_original_batches";
+  cell.module_train_mode = false;
+  cell.autocast_enabled = false;
   cell.rows.resize(batch.size());
   stats->before = before;
   std::stringstream evidence, captured_raw, replay_raw, replay_policy_bytes;
@@ -3526,9 +3545,12 @@ PpoParityCellResult ReplayPpoTrainingModelOriginalGeometry(
     const std::vector<PpoTransition>& batch,
     const PpoParityBatchGeometry& geometry, int64_t obs_size,
     int64_t action_dim, torch::Device device, float logit_cap,
+    bool learner_autocast,
     PpoParityOriginalGeometryModelStats* stats) {
   PpoParityCellResult cell;
   cell.name = "training_model_exact_original_batches";
+  cell.module_train_mode = true;
+  cell.autocast_enabled = learner_autocast;
   cell.rows.resize(batch.size());
   std::stringstream evidence, raw_bytes, policy_bytes;
   evidence << "dune_raw_ppo_numerical_parity_v4";
@@ -3576,15 +3598,25 @@ PpoParityCellResult ReplayPpoTrainingModelOriginalGeometry(
     }
     const torch::Tensor states = states_cpu.to(device);
     const torch::Tensor masks = masks_cpu.to(device);
+    if (states_cpu.scalar_type() != torch::kFloat32 ||
+        states.scalar_type() != torch::kFloat32) {
+      cell.schema_errors.push_back(
+          "D input/pre-forward dtype is not Float32");
+    }
     torch::Tensor raw_logits, replay_log_probs;
-    {
-      AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+    auto compute = [&]() {
       const auto outputs = model->forward(states);
       raw_logits = outputs.logits;
       const torch::Tensor centered =
           CenterAndCapLogitsTensor(raw_logits, masks, logit_cap);
       replay_log_probs = torch::log_softmax(
           centered.masked_fill(masks.logical_not(), -1e9f), -1);
+    };
+    if (learner_autocast) {
+      AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+      compute();
+    } else {
+      compute();
     }
     ++cell.model_forward_calls;
     const torch::Tensor raw_cpu =
@@ -4089,7 +4121,9 @@ bool WritePpoNumericalParityArtifactV3(
   root["command_line"] = command_line;
   root["config_fingerprint"] = config_fingerprint;
   root["device"] = device.str();
+  root["rollout_amp"] = absl::GetFlag(FLAGS_rollout_amp);
   root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["allow_tf32"] = absl::GetFlag(FLAGS_allow_tf32);
   root["ppo_minibatch_size"] = static_cast<int64_t>(
       absl::GetFlag(FLAGS_ppo_minibatch_size));
   root["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
@@ -4192,7 +4226,6 @@ bool WritePpoNumericalParityArtifactV3(
   thresholds["max_ratio"] =
       absl::GetFlag(FLAGS_numerical_parity_max_ratio);
   root["thresholds"] = json::Value(thresholds);
-
   size_t model_file_size = 0;
   const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
   json::Object source;
@@ -4261,7 +4294,7 @@ bool WritePpoNumericalParityArtifactV3(
   return root["status"] == "VALID";
 }
 
-bool WritePpoNumericalParityArtifactV4(
+bool WritePpoNumericalParityArtifactV5(
     const std::string& output_path, const PpoParityCellResult& cell_a,
     const PpoParityIntegrityStats& a_stats,
     const PpoParityCellResult& cell_r,
@@ -4281,7 +4314,9 @@ bool WritePpoNumericalParityArtifactV4(
     const std::string& source_checkpoint_uuid,
     const std::string& config_fingerprint, torch::Device device,
     int64_t obs_size, int64_t action_size, const std::string& command_line,
-    const PpoNumericalParitySourceProvenance& source_provenance) {
+    const PpoNumericalParitySourceProvenance& source_provenance,
+    bool tf32_cublas_before, bool tf32_cudnn_before,
+    bool tf32_cublas_after, bool tf32_cudnn_after) {
   const int64_t transitions = static_cast<int64_t>(collect.rollout.size());
   const auto sa = SummarizePpoNumericalParityRows(cell_a.rows);
   const auto sr = SummarizePpoNumericalParityRows(cell_r.rows);
@@ -4360,11 +4395,33 @@ bool WritePpoNumericalParityArtifactV4(
               cell_d.dense_mask_rows_ok == transitions,
           "B/D dense-mask coverage incomplete");
   require(a_stats.raw_values_total == sa.legal_logits &&
-              a_stats.raw_values_total == a_stats.raw_values_bf16_exact &&
               a_stats.vector_width_rows_ok == transitions &&
               a_stats.behavior_vector_exact_rows == transitions &&
               a_stats.chosen_scalar_exact_rows == transitions,
-          "A raw/vector/BF16-grid proof incomplete");
+          "A raw/vector proof incomplete");
+  PpoParityV5PrecisionConfig precision_config;
+  precision_config.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+  precision_config.train_amp = absl::GetFlag(FLAGS_train_amp);
+  precision_config.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+  precision_config.tf32_cublas_before = tf32_cublas_before;
+  precision_config.tf32_cudnn_before = tf32_cudnn_before;
+  precision_config.tf32_cublas_after = tf32_cublas_after;
+  precision_config.tf32_cudnn_after = tf32_cudnn_after;
+  std::string precision_error;
+  require(ValidatePpoParityV5PrecisionConfig(
+              precision_config, &precision_error),
+          precision_error.empty() ? "v5 precision runtime contract failed"
+                                  : precision_error);
+  require(!cell_a.module_train_mode && !cell_a.autocast_enabled &&
+              !cell_r.module_train_mode && !cell_r.autocast_enabled &&
+              cell_b.module_train_mode && !cell_b.autocast_enabled &&
+              cell_d.module_train_mode && !cell_d.autocast_enabled,
+          "A/R/B/D module-mode or autocast configuration mismatch");
+  for (const auto* cell : {&cell_a, &cell_r, &cell_b, &cell_d}) {
+    require(cell->input_dtype == "Float32" &&
+                cell->pre_forward_dtype == "Float32",
+            "cell input/pre-forward dtype is not Float32");
+  }
   require(hex64(geometry_sha256) && hex64(shared_identity_sha256),
           "geometry/shared hash malformed");
   const std::vector<const PpoParityCellResult*> cell_list =
@@ -4402,19 +4459,23 @@ bool WritePpoNumericalParityArtifactV4(
                       PpoParityViolationMapPasses(b_violations);
   const bool d_pass = instrument_valid &&
                       PpoParityViolationMapPasses(d_violations);
-  const auto classification = ClassifyPpoParityV4(
+  const auto classification = ClassifyPpoParityV5(
       instrument_valid, b_pass, d_pass);
 
   json::Object root;
-  root["schema"] = "dune_raw_ppo_numerical_parity_v4";
+  root["schema"] = "dune_raw_ppo_numerical_parity_v5a";
   root["status"] = instrument_valid ? "VALID" : "INVALID";
-  root["classification"] = PpoParityV4ClassificationName(classification);
+  root["classification"] = PpoParityV5ClassificationName(classification);
   root["training_authorized"] = false;
+  root["matched_2x2_preflight_admitted"] =
+      instrument_valid &&
+      classification ==
+          PpoParityV5Classification::kFp32Tf32AllowedCandidateAdmitted;
   root["registration_id"] =
       absl::GetFlag(FLAGS_numerical_parity_registration_id);
   root["scope"] = "raw_ppo_only";
   root["epistemic_label"] =
-      "no_training_exact_physical_batch_replay_causal_diagnostic";
+      "no_training_fp32_tf32_allowed_candidate_screen";
   root["optimizer_steps"] = int64_t{0};
   root["optimizer_checkpoint_loaded"] = false;
   root["backward_calls"] = int64_t{0};
@@ -4422,7 +4483,9 @@ bool WritePpoNumericalParityArtifactV4(
   root["command_line"] = command_line;
   root["config_fingerprint"] = config_fingerprint;
   root["device"] = device.str();
+  root["rollout_amp"] = absl::GetFlag(FLAGS_rollout_amp);
   root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["allow_tf32"] = absl::GetFlag(FLAGS_allow_tf32);
   root["ppo_minibatch_size"] = static_cast<int64_t>(
       absl::GetFlag(FLAGS_ppo_minibatch_size));
   root["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
@@ -4464,6 +4527,30 @@ bool WritePpoNumericalParityArtifactV4(
   thresholds["max_ratio"] =
       absl::GetFlag(FLAGS_numerical_parity_max_ratio);
   root["thresholds"] = json::Value(thresholds);
+  json::Object precision;
+  precision["input_dtype"] = "Float32";
+  precision["pre_forward_dtype"] = "Float32";
+  precision["rollout_autocast"] = absl::GetFlag(FLAGS_rollout_amp);
+  precision["learner_autocast"] = absl::GetFlag(FLAGS_train_amp);
+  precision["tf32_cublas_before"] = tf32_cublas_before;
+  precision["tf32_cudnn_before"] = tf32_cudnn_before;
+  precision["tf32_cublas_after"] = tf32_cublas_after;
+  precision["tf32_cudnn_after"] = tf32_cudnn_after;
+  precision["runtime_state_unchanged"] =
+      tf32_cublas_before == tf32_cublas_after &&
+      tf32_cudnn_before == tf32_cudnn_after;
+  root["precision_runtime"] = json::Value(precision);
+  json::Object capture;
+  capture["decisions"] = collect.parity_decisions;
+  capture["full_width_ok"] = collect.parity_full_width_ok;
+  capture["full_finite_ok"] = collect.parity_full_finite_ok;
+  capture["legal_ids_unique_in_range"] =
+      collect.parity_legal_ids_unique_in_range;
+  capture["chosen_once"] = collect.parity_chosen_once;
+  capture["raw_values_total"] = a_stats.raw_values_total;
+  capture["raw_values_bf16_exact_descriptive"] =
+      a_stats.raw_values_bf16_exact;
+  root["hard_capture"] = json::Value(capture);
 
   auto stats_json = [](const EvaluatorStats& stats) {
     json::Object out;
@@ -4497,6 +4584,13 @@ bool WritePpoNumericalParityArtifactV4(
     out["role"] = role;
     out["model_forward_calls"] = cell.model_forward_calls;
     out["dense_mask_rows_ok"] = cell.dense_mask_rows_ok;
+    out["module_mode"] = cell.module_train_mode ? "train" : "eval";
+    out["autocast_enabled"] = cell.autocast_enabled;
+    out["input_dtype"] = cell.input_dtype;
+    out["pre_forward_dtype"] = cell.pre_forward_dtype;
+    out["wall_time_s"] = cell.wall_time_s;
+    out["device_time_s"] = cell.device_time_s;
+    out["device_timing_available"] = cell.device_time_s >= 0.0;
     out["row_evidence_sha256"] = cell.row_evidence_sha256;
     out["raw_logit_sha256"] = cell.raw_logit_sha256;
     out["policy_sha256"] = cell.policy_sha256;
@@ -4516,9 +4610,9 @@ bool WritePpoNumericalParityArtifactV4(
   cells["R"] = json::Value(cell_json(
       cell_r, "live_inference_exact_batch_replay", sr, nullptr));
   cells["B"] = json::Value(cell_json(
-      cell_b, "full_bf16_2048_phenotype", sb, &b_violations));
+      cell_b, "full_fp32_tf32_2048_candidate", sb, &b_violations));
   json::Object d_json = cell_json(
-      cell_d, "training_model_original_batch_geometry", sd, &d_violations);
+      cell_d, "fp32_tf32_original_batch_geometry", sd, &d_violations);
   d_json["raw_legal_bit_exact_rows"] = d_stats.raw_legal_exact_rows;
   d_json["raw_legal_max_abs_delta"] = d_stats.raw_legal_max_abs_delta;
   cells["D"] = json::Value(d_json);
@@ -4635,14 +4729,16 @@ int main(int argc, char** argv) {
     if (games <= 0 || games > 64) {
       parity_stop("--rollout_games must be in [1,64] (hard ceiling 320000 transitions)");
     }
-    if (!absl::GetFlag(FLAGS_train_amp)) {
+    if (absl::GetFlag(FLAGS_rollout_amp) ||
+        absl::GetFlag(FLAGS_train_amp) ||
+        !absl::GetFlag(FLAGS_allow_tf32)) {
       parity_stop(
-          "v4 requires --train_amp=true because B/D reproduce the production "
-          "CUDA BF16 learner policy path");
+          "v5-A requires rollout_amp=false, train_amp=false, and "
+          "allow_tf32=true");
     }
     if (absl::GetFlag(FLAGS_ppo_minibatch_size) != 2048) {
       parity_stop(
-          "v4 requires --ppo_minibatch_size=2048 to reproduce historical u15828");
+          "v5-A requires --ppo_minibatch_size=2048");
     }
     if (absl::GetFlag(FLAGS_deterministic_rollout_eval) ||
         !absl::GetFlag(FLAGS_evaluator_device_synchronize)) {
@@ -4758,8 +4854,10 @@ int main(int argc, char** argv) {
   torch::Device device(torch::kCPU);
   if (torch::cuda::is_available()) {
     device = torch::Device(torch::kCUDA);
-    at::globalContext().setAllowTF32CuBLAS(true);
-    at::globalContext().setAllowTF32CuDNN(true);
+    at::globalContext().setAllowTF32CuBLAS(
+        absl::GetFlag(FLAGS_allow_tf32));
+    at::globalContext().setAllowTF32CuDNN(
+        absl::GetFlag(FLAGS_allow_tf32));
     at::autocast::set_autocast_dtype(at::kCUDA, at::ScalarType::BFloat16);
     std::cout << "CUDA available. PPO training on GPU.\n";
   }
@@ -5774,7 +5872,9 @@ int main(int argc, char** argv) {
         absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
         absl::GetFlag(FLAGS_evaluator_device_synchronize),
         /*high_priority_stream=*/false,
-        /*emit_batch_membership=*/numerical_parity);
+        /*emit_batch_membership=*/numerical_parity,
+        absl::GetFlag(FLAGS_rollout_amp),
+        absl::GetFlag(FLAGS_allow_tf32));
   }
 
   // =========================================================================
@@ -7349,6 +7449,10 @@ int main(int argc, char** argv) {
       numerical_parity ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
       numerical_parity ? open_spiel::HashAllModelState(inference_model) : "";
+  const bool parity_tf32_cublas_before =
+      numerical_parity && at::globalContext().allowTF32CuBLAS();
+  const bool parity_tf32_cudnn_before =
+      numerical_parity && at::globalContext().allowTF32CuDNN();
   float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
@@ -7378,7 +7482,10 @@ int main(int argc, char** argv) {
 
     open_spiel::PpoParityCellResult integrity_cell;
     integrity_cell.name = "rollout_cpu_recompute_integrity";
+    integrity_cell.module_train_mode = false;
+    integrity_cell.autocast_enabled = false;
     open_spiel::PpoParityIntegrityStats integrity_stats;
+    const auto a_start = std::chrono::steady_clock::now();
     integrity_cell.rows = open_spiel::ReplayPpoCpuIntegrityCell(
         current_collect.rollout,
         static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
@@ -7388,6 +7495,8 @@ int main(int argc, char** argv) {
         &integrity_stats.vector_width_rows_ok,
         &integrity_stats.behavior_vector_exact_rows,
         &integrity_stats.chosen_scalar_exact_rows);
+    integrity_cell.wall_time_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - a_start).count();
     integrity_cell.raw_logit_sha256 =
         open_spiel::PpoParityCapturedRawSha256(current_collect.rollout);
     integrity_cell.policy_sha256 =
@@ -7406,8 +7515,8 @@ int main(int argc, char** argv) {
         integrity_stats.vector_width_rows_ok == transitions &&
         integrity_stats.behavior_vector_exact_rows == transitions &&
         integrity_stats.chosen_scalar_exact_rows == transitions &&
-        integrity_stats.raw_values_bf16_exact ==
-            integrity_stats.raw_values_total && geometry.valid &&
+        geometry.valid && parity_tf32_cublas_before &&
+        parity_tf32_cudnn_before &&
         evaluator_before_r.requests == static_cast<uint64_t>(transitions) &&
         evaluator_before_r.batches ==
             static_cast<uint64_t>(geometry.groups) &&
@@ -7417,14 +7526,19 @@ int main(int argc, char** argv) {
     open_spiel::PpoParityCellResult replay_cell;
     open_spiel::PpoParityReplayGeometryStats replay_stats;
     open_spiel::PpoParityCellResult learner_cell;
-    learner_cell.name = "actual_learner_full_bf16_2048";
+    learner_cell.name = "actual_learner_full_fp32_tf32_2048";
+    learner_cell.module_train_mode = true;
+    learner_cell.autocast_enabled = false;
     open_spiel::PpoParityCellResult geometry_model_cell;
     open_spiel::PpoParityOriginalGeometryModelStats geometry_model_stats;
     if (hard_capture_valid) {
+      const auto r_start = std::chrono::steady_clock::now();
       replay_cell = open_spiel::ReplayPpoInferenceExactGeometry(
           batch_evaluator.get(), current_collect.rollout, geometry,
           action_size, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
           evaluator_before_r, &replay_stats);
+      replay_cell.wall_time_s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - r_start).count();
       const bool r_valid = replay_cell.schema_errors.empty() &&
           replay_stats.returned_metadata_exact_rows == transitions &&
           replay_stats.raw_legal_exact_rows == transitions &&
@@ -7437,20 +7551,28 @@ int main(int argc, char** argv) {
           replay_stats.after.max_batch_size ==
               replay_stats.before.max_batch_size;
       if (r_valid) {
+        const auto b_start = std::chrono::steady_clock::now();
         learner_cell.rows = open_spiel::ReplayPpoNumericalParityCell(
             training_model, current_collect.rollout, obs_size, action_size,
-            device, /*learner_autocast=*/true, learner_cell.name,
+            device, /*model_train_mode=*/true,
+            /*learner_autocast=*/false, learner_cell.name,
             &learner_cell.schema_errors, &learner_cell.row_evidence_sha256,
             &learner_cell.model_forward_calls,
             &learner_cell.dense_mask_rows_ok,
             &learner_cell.raw_logit_sha256,
             &learner_cell.policy_sha256);
+        learner_cell.wall_time_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - b_start).count();
+        const auto d_start = std::chrono::steady_clock::now();
         geometry_model_cell =
             open_spiel::ReplayPpoTrainingModelOriginalGeometry(
                 training_model, current_collect.rollout, geometry, obs_size,
                 action_size, device,
                 static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+                /*learner_autocast=*/false,
                 &geometry_model_stats);
+        geometry_model_cell.wall_time_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - d_start).count();
       } else {
         learner_cell.schema_errors.push_back(
             "skipped because R exact replay validity failed");
@@ -7471,7 +7593,11 @@ int main(int argc, char** argv) {
         open_spiel::HashAllModelState(training_model);
     const std::string parity_inference_hash_after =
         open_spiel::HashAllModelState(inference_model);
-    const bool valid = open_spiel::WritePpoNumericalParityArtifactV4(
+    const bool parity_tf32_cublas_after =
+        at::globalContext().allowTF32CuBLAS();
+    const bool parity_tf32_cudnn_after =
+        at::globalContext().allowTF32CuDNN();
+    const bool valid = open_spiel::WritePpoNumericalParityArtifactV5(
         absl::GetFlag(FLAGS_numerical_parity_output), integrity_cell,
         integrity_stats, replay_cell, replay_stats, learner_cell,
         geometry_model_cell, geometry_model_stats, geometry, geometry_sha256,
@@ -7482,8 +7608,10 @@ int main(int argc, char** argv) {
         parity_inference_hash_after, parity_source_manifest,
         parity_source_manifest_sha256, parity_source_global_update,
         parity_source_checkpoint_uuid, config_fingerprint, device, obs_size,
-        action_size, parity_command_line, parity_source_provenance);
-    std::cout << "Raw-PPO numerical parity v4 "
+        action_size, parity_command_line, parity_source_provenance,
+        parity_tf32_cublas_before, parity_tf32_cudnn_before,
+        parity_tf32_cublas_after, parity_tf32_cudnn_after);
+    std::cout << "Raw-PPO numerical parity v5-A "
               << (valid ? "VALID classification" : "INVALID instrument")
               << ": "
               << absl::GetFlag(FLAGS_numerical_parity_output) << "\n"

@@ -72,6 +72,8 @@ ABSL_FLAG(double, value_coef, 0.5, "");
 ABSL_FLAG(double, logit_cap, 10.0, "");
 ABSL_FLAG(double, target_kl, 0.0, "");
 ABSL_FLAG(bool, train_amp, true, "");
+ABSL_FLAG(bool, rollout_amp, true, "");
+ABSL_FLAG(bool, allow_tf32, true, "");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
@@ -1636,6 +1638,60 @@ void TestRawPpoNumericalParityV4BatchMetadataAndClassification() {
   } TEST_END();
 }
 
+void TestRawPpoNumericalParityV5PrecisionAndClassification() {
+  TEST_BEGIN("Raw-PPO parity v5: default evaluator controls, FP32 precision contract, classification") {
+    UTILS_CHECK(absl::GetFlag(FLAGS_rollout_amp));
+    UTILS_CHECK(absl::GetFlag(FLAGS_allow_tf32));
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(8, 16, 4, 1);
+    std::shared_mutex sync;
+    {
+      BatchedEvaluator evaluator(model, /*target_batch_size=*/4,
+                                 /*timeout_ms=*/1, torch::kCPU, &sync);
+      UTILS_CHECK(!evaluator.EmitsBatchMembershipForTesting());
+      UTILS_CHECK(evaluator.RolloutAmpForTesting());
+      UTILS_CHECK(evaluator.AllowTf32ForTesting());
+    }
+
+    PpoParityV5PrecisionConfig precision;
+    precision.rollout_amp = false;
+    precision.train_amp = false;
+    precision.allow_tf32 = true;
+    std::string error;
+    UTILS_CHECK(ValidatePpoParityV5PrecisionConfig(precision, &error));
+    auto malformed = precision;
+    malformed.rollout_amp = true;
+    UTILS_CHECK(!ValidatePpoParityV5PrecisionConfig(malformed, &error));
+    malformed = precision;
+    malformed.train_amp = true;
+    UTILS_CHECK(!ValidatePpoParityV5PrecisionConfig(malformed, &error));
+    malformed = precision;
+    malformed.allow_tf32 = false;
+    UTILS_CHECK(!ValidatePpoParityV5PrecisionConfig(malformed, &error));
+    malformed = precision;
+    malformed.tf32_cublas_after = false;
+    UTILS_CHECK(!ValidatePpoParityV5PrecisionConfig(malformed, &error));
+    malformed = precision;
+    malformed.input_dtype = "BFloat16";
+    UTILS_CHECK(!ValidatePpoParityV5PrecisionConfig(malformed, &error));
+
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(false, false, false)),
+             std::string("INVALID"));
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(true, true, true)),
+             std::string("FP32_TF32_ALLOWED_CANDIDATE_ADMITTED"));
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(true, false, true)),
+             std::string("FP32_TF32_ALLOWED_BATCH_GEOMETRY_REJECT"));
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(true, false, false)),
+             std::string("INCONCLUSIVE_COMMON_OR_INTERACTION"));
+    CHECK_EQ(PpoParityV5ClassificationName(
+                 ClassifyPpoParityV5(true, true, false)),
+             std::string("INCONCLUSIVE_COMMON_OR_INTERACTION"));
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1709,6 +1765,7 @@ int main() {
   TestRawPpoNumericalParityMathAndDefaultInertness();
   TestRawPpoNumericalParityV3CaptureAndClassification();
   TestRawPpoNumericalParityV4BatchMetadataAndClassification();
+  TestRawPpoNumericalParityV5PrecisionAndClassification();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 

@@ -299,6 +299,65 @@ inline std::string PpoParityV4ClassificationName(
   return "INVALID";
 }
 
+enum class PpoParityV5Classification {
+  kInvalid,
+  kFp32Tf32AllowedCandidateAdmitted,
+  kFp32Tf32AllowedBatchGeometryReject,
+  kInconclusiveCommonOrInteraction,
+};
+
+inline PpoParityV5Classification ClassifyPpoParityV5(
+    bool instrument_valid, bool learner_2048_pass,
+    bool original_geometry_pass) {
+  if (!instrument_valid) return PpoParityV5Classification::kInvalid;
+  if (learner_2048_pass && original_geometry_pass) {
+    return PpoParityV5Classification::kFp32Tf32AllowedCandidateAdmitted;
+  }
+  if (!learner_2048_pass && original_geometry_pass) {
+    return PpoParityV5Classification::kFp32Tf32AllowedBatchGeometryReject;
+  }
+  return PpoParityV5Classification::kInconclusiveCommonOrInteraction;
+}
+
+inline std::string PpoParityV5ClassificationName(
+    PpoParityV5Classification classification) {
+  switch (classification) {
+    case PpoParityV5Classification::kInvalid: return "INVALID";
+    case PpoParityV5Classification::kFp32Tf32AllowedCandidateAdmitted:
+      return "FP32_TF32_ALLOWED_CANDIDATE_ADMITTED";
+    case PpoParityV5Classification::kFp32Tf32AllowedBatchGeometryReject:
+      return "FP32_TF32_ALLOWED_BATCH_GEOMETRY_REJECT";
+    case PpoParityV5Classification::kInconclusiveCommonOrInteraction:
+      return "INCONCLUSIVE_COMMON_OR_INTERACTION";
+  }
+  return "INVALID";
+}
+
+struct PpoParityV5PrecisionConfig {
+  bool rollout_amp = true;
+  bool train_amp = true;
+  bool allow_tf32 = true;
+  bool tf32_cublas_before = true;
+  bool tf32_cudnn_before = true;
+  bool tf32_cublas_after = true;
+  bool tf32_cudnn_after = true;
+  std::string input_dtype = "Float32";
+  std::string pre_forward_dtype = "Float32";
+};
+
+inline bool ValidatePpoParityV5PrecisionConfig(
+    const PpoParityV5PrecisionConfig& config, std::string* error) {
+  const bool valid = !config.rollout_amp && !config.train_amp &&
+      config.allow_tf32 && config.tf32_cublas_before &&
+      config.tf32_cudnn_before && config.tf32_cublas_after &&
+      config.tf32_cudnn_after && config.input_dtype == "Float32" &&
+      config.pre_forward_dtype == "Float32";
+  if (!valid && error != nullptr) {
+    *error = "v5 requires Float32 input/pre-forward, autocast off, TF32 on and unchanged";
+  }
+  return valid;
+}
+
 inline std::vector<std::string> IntersectPpoParityViolationIdentities(
     const std::vector<std::string>& first,
     const std::vector<std::string>& second) {

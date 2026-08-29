@@ -711,12 +711,15 @@ public:
                      float logit_cap = 0.0f,
                      bool device_synchronize = true,
                      bool high_priority_stream = false,
-                     bool emit_batch_membership = false)
+                     bool emit_batch_membership = false,
+                     bool rollout_amp = true,
+                     bool allow_tf32 = true)
         : model_(model), target_batch_size_(target_batch_size),
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
           high_priority_stream_(high_priority_stream),
           emit_batch_membership_(emit_batch_membership),
+          rollout_amp_(rollout_amp), allow_tf32_(allow_tf32),
           stop_(false) {
 
         // Dynamically get the input layer dimension from the model's weights
@@ -725,8 +728,8 @@ public:
 
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {
-            at::globalContext().setAllowTF32CuBLAS(true);
-            at::globalContext().setAllowTF32CuDNN(true);
+            at::globalContext().setAllowTF32CuBLAS(allow_tf32_);
+            at::globalContext().setAllowTF32CuDNN(allow_tf32_);
         }
 
         model_->eval(); // Defensive hygiene: ResBlocks use LayerNorm so this is a no-op, but protects future Dropout additions.
@@ -741,6 +744,12 @@ public:
         cv_.notify_all();
         if (runner_thread_.joinable()) runner_thread_.join();
     }
+
+    bool EmitsBatchMembershipForTesting() const {
+        return emit_batch_membership_;
+    }
+    bool RolloutAmpForTesting() const { return rollout_amp_; }
+    bool AllowTf32ForTesting() const { return allow_tf32_; }
 
     // Called by the actor threads
     EvalResult Evaluate(const std::vector<float>& obs) override {
@@ -1230,6 +1239,8 @@ private:
     bool device_synchronize_;
     bool high_priority_stream_;
     bool emit_batch_membership_;
+    bool rollout_amp_;
+    bool allow_tf32_;
     int64_t model_input_dim_;
     int64_t model_action_dim_;
 
@@ -1583,7 +1594,8 @@ private:
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 {
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
-                    AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                    AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                 rollout_amp_);
                     outputs = model_->forward(device_obs);
                 }
                 auto device_values = slot.device_values.narrow(
@@ -1959,7 +1971,8 @@ private:
             {
                 std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                 if (device_.is_cuda()) {
-                    AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                    AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                 rollout_amp_);
                     auto outputs = model_->forward(device_obs);
                     pred_logits = outputs.logits;
                     pred_values = outputs.values;
