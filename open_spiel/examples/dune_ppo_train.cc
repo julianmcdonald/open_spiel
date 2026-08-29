@@ -112,6 +112,9 @@ ABSL_FLAG(double, numerical_parity_max_abs_logprob_delta, -1.0,
           "Required maximum absolute chosen-action log-probability drift.");
 ABSL_FLAG(double, numerical_parity_max_full_kl, -1.0,
           "Required maximum for each direction of full legal categorical KL.");
+ABSL_FLAG(double, numerical_parity_max_raw_mass_residual, -1.0,
+          "Required maximum absolute raw legal-probability mass residual "
+          "before v2 double-logsumexp KL normalization.");
 ABSL_FLAG(double, numerical_parity_min_ratio, -1.0,
           "Required minimum unchanged-weight chosen-action probability ratio.");
 ABSL_FLAG(double, numerical_parity_max_ratio, -1.0,
@@ -2432,33 +2435,43 @@ CollectResult CollectRollout(const Game* game,
   return result;
 }
 
-std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityFp32(
+std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     const std::vector<PpoTransition>& batch, int64_t obs_size,
-    int64_t action_dim, torch::Device device,
+    int64_t action_dim, torch::Device device, bool learner_autocast,
+    const std::string& cell_label,
     std::vector<std::string>* schema_errors,
     std::string* row_evidence_sha256) {
   std::vector<PpoNumericalParityRow> rows;
   rows.reserve(batch.size());
   std::stringstream evidence;
+  evidence << "dune_raw_ppo_numerical_parity_v2";
+  evidence.put('\0');
+  evidence << cell_label;
+  evidence.put('\0');
   const int64_t chunk_size = std::max<int64_t>(
       1, std::min<int64_t>(absl::GetFlag(FLAGS_ppo_minibatch_size),
                            static_cast<int64_t>(batch.size())));
   const float logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
   const bool was_training = model->is_training();
-  model->eval();
+  if (learner_autocast) {
+    model->train();  // exact TrainPpoUpdate module mode
+  } else {
+    model->eval();   // v1 descriptive-control convention
+  }
   torch::NoGradGuard no_grad;
 
   for (int64_t start = 0; start < static_cast<int64_t>(batch.size());
        start += chunk_size) {
     const int64_t count = std::min<int64_t>(
         chunk_size, static_cast<int64_t>(batch.size()) - start);
-    torch::Tensor states_cpu = torch::empty(
+    torch::Tensor states_cpu = torch::zeros(
         {count, obs_size}, torch::TensorOptions().dtype(torch::kFloat32));
     torch::Tensor masks_cpu = torch::zeros(
         {count, action_dim}, torch::TensorOptions().dtype(torch::kBool));
     float* state_ptr = states_cpu.data_ptr<float>();
     bool* mask_ptr = masks_cpu.data_ptr<bool>();
+    std::vector<bool> packed_row_valid(count, true);
     for (int64_t i = 0; i < count; ++i) {
       const PpoTransition& transition = batch[start + i];
       if (static_cast<int64_t>(transition.state.size()) != obs_size) {
@@ -2467,6 +2480,7 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityFp32(
             static_cast<long long>(start + i),
             static_cast<long long>(transition.state.size()),
             static_cast<long long>(obs_size)));
+        packed_row_valid[i] = false;
         continue;
       }
       std::memcpy(state_ptr + i * obs_size, transition.state.data(),
@@ -2480,17 +2494,27 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityFp32(
 
     const torch::Tensor states = states_cpu.to(device);
     const torch::Tensor masks = masks_cpu.to(device);
-    // Deliberately NO AutocastGuard: this is the learner-FP32 side of the
-    // registered comparison, at unchanged weights.
-    const auto outputs = model->forward(states);
-    const torch::Tensor centered =
-        CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
+    torch::Tensor replay_log_probs;
+    auto replay_policy_path = [&]() {
+      const auto outputs = model->forward(states);
+      const torch::Tensor centered =
+          CenterAndCapLogitsTensor(outputs.logits, masks, logit_cap);
+      const torch::Tensor masked_logits =
+          centered.masked_fill(masks.logical_not(), -1e9f);
+      replay_log_probs = torch::log_softmax(masked_logits, -1);
+    };
+    if (learner_autocast) {
+      // Exact production PPO policy path: TrainPpoUpdate wraps compute_loss --
+      // including forward, CenterAndCapLogitsTensor, masking and log_softmax --
+      // in this CUDA BF16 AutocastGuard when --train_amp=true.
+      AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+      replay_policy_path();
+    } else {
+      // Descriptive cross-precision control retained from v1.
+      replay_policy_path();
+    }
     const torch::Tensor log_probs_cpu =
-        torch::log_softmax(
-            centered.masked_fill(masks.logical_not(), -1e9f), -1)
-            .to(torch::kCPU)
-            .to(torch::kFloat32)
-            .contiguous();
+        replay_log_probs.to(torch::kCPU).to(torch::kFloat32).contiguous();
     const float* new_log_probs = log_probs_cpu.data_ptr<float>();
 
     for (int64_t i = 0; i < count; ++i) {
@@ -2541,17 +2565,32 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityFp32(
         evidence.write(reinterpret_cast<const char*>(&input.new_log_probs[j]),
                        sizeof(input.new_log_probs[j]));
       }
+      if (!packed_row_valid[i]) {
+        PpoNumericalParityRow bad;
+        bad.legal_count = static_cast<int>(transition.legal_actions.size());
+        bad.decision_role = transition.decision_role;
+        bad.advantage = transition.advantage;
+        bad.schema_errors = 1;
+        bad.nonfinite_values = 1;
+        rows.push_back(bad);
+        continue;
+      }
       PpoNumericalParityRow row;
       std::string error;
       if (!ComputePpoNumericalParityRow(input, &row, &error)) {
         schema_errors->push_back(absl::StrFormat(
             "row %lld: %s", static_cast<long long>(row_index), error));
-        continue;
       }
+      // V2 never drops a bad row. Schema-error rows remain in every partition
+      // and are excluded only from finite metric denominators.
       rows.push_back(row);
     }
   }
-  if (was_training) model->train();
+  if (was_training) {
+    model->train();
+  } else {
+    model->eval();
+  }
   if (row_evidence_sha256 != nullptr) {
     *row_evidence_sha256 = ComputeStringSHA256(evidence.str());
   }
@@ -2567,6 +2606,12 @@ json::Object PpoNumericalParitySummaryJson(
   out["old_probability_underflows"] = s.old_probability_underflows;
   out["new_probability_underflows"] = s.new_probability_underflows;
   out["nonfinite_values"] = s.nonfinite_values;
+  out["schema_error_rows"] = s.schema_error_rows;
+  out["mass_residual_rows"] = s.mass_residual_rows;
+  out["mean_old_raw_mass_residual"] = s.mean_old_raw_mass_residual;
+  out["max_old_raw_mass_residual"] = s.max_old_raw_mass_residual;
+  out["mean_new_raw_mass_residual"] = s.mean_new_raw_mass_residual;
+  out["max_new_raw_mass_residual"] = s.max_new_raw_mass_residual;
   out["mean_abs_chosen_log_prob_delta"] =
       s.mean_abs_chosen_log_prob_delta;
   out["max_abs_chosen_log_prob_delta"] =
@@ -2607,6 +2652,54 @@ std::string PpoDecisionRoleName(int role) {
     case DuneDecisionRole::kOtherOptional: return "other_optional";
   }
   return "invalid_role_" + std::to_string(role);
+}
+
+json::Object PpoNumericalParitySplitsJson(
+    const std::vector<PpoNumericalParityRow>& rows) {
+  json::Object legal_splits;
+  std::set<int> legal_counts;
+  for (const auto& row : rows) legal_counts.insert(row.legal_count);
+  for (int legal_count : legal_counts) {
+    legal_splits[std::to_string(legal_count)] = json::Value(
+        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
+          return row.legal_count == legal_count;
+        }));
+  }
+  json::Object probability_splits;
+  for (const std::string& bucket : {
+           "p_lt_1e-6", "p_1e-6_to_1e-4", "p_1e-4_to_1e-2",
+           "p_1e-2_to_0_1", "p_0_1_to_0_5", "p_ge_0_5", "invalid"}) {
+    probability_splits[bucket] = json::Value(PpoNumericalParitySubsetJson(
+        rows, [&](const auto& row) {
+          return PpoNumericalParityOldProbabilityBucket(row) == bucket;
+        }));
+  }
+  json::Object advantage_splits;
+  advantage_splits["negative"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage < 0.0; }));
+  advantage_splits["zero"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage == 0.0; }));
+  advantage_splits["positive"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return r.advantage > 0.0; }));
+  advantage_splits["nonfinite"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& r) { return !std::isfinite(r.advantage); }));
+  json::Object role_splits;
+  for (int role = 0; role < 7; ++role) {
+    role_splits[PpoDecisionRoleName(role)] = json::Value(
+        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
+          return row.decision_role == role;
+        }));
+  }
+  role_splits["invalid"] = json::Value(PpoNumericalParitySubsetJson(
+      rows, [](const auto& row) {
+        return row.decision_role < 0 || row.decision_role >= 7;
+      }));
+  json::Object splits;
+  splits["legal_count_exact"] = json::Value(legal_splits);
+  splits["old_chosen_probability"] = json::Value(probability_splits);
+  splits["advantage_sign"] = json::Value(advantage_splits);
+  splits["decision_role"] = json::Value(role_splits);
+  return splits;
 }
 
 struct PpoNumericalParitySourceRecord {
@@ -2671,8 +2764,13 @@ PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
 
 bool WritePpoNumericalParityArtifact(
     const std::string& output_path,
-    const std::vector<PpoNumericalParityRow>& rows,
-    const std::vector<std::string>& schema_errors, const CollectResult& collect,
+    const std::vector<PpoNumericalParityRow>& primary_rows,
+    const std::vector<std::string>& primary_schema_errors,
+    const std::string& primary_row_evidence_sha256,
+    const std::vector<PpoNumericalParityRow>& control_rows,
+    const std::vector<std::string>& control_schema_errors,
+    const std::string& control_row_evidence_sha256,
+    const CollectResult& collect,
     const std::string& model_hash_before,
     const std::string& model_hash_after,
     const std::string& inference_hash_before,
@@ -2682,51 +2780,65 @@ bool WritePpoNumericalParityArtifact(
     const std::string& source_checkpoint_uuid,
     const std::string& config_fingerprint, torch::Device device,
     int64_t obs_size, int64_t action_size, const std::string& command_line,
-    const std::string& row_evidence_sha256,
     const PpoNumericalParitySourceProvenance& source_provenance) {
-  const PpoNumericalParitySummary overall =
-      SummarizePpoNumericalParityRows(rows);
+  const PpoNumericalParitySummary primary =
+      SummarizePpoNumericalParityRows(primary_rows);
+  const PpoNumericalParitySummary control =
+      SummarizePpoNumericalParityRows(control_rows);
   int64_t nontrivial_rows = 0;
-  for (const auto& row : rows) {
+  for (const auto& row : primary_rows) {
     if (row.legal_count > 1) ++nontrivial_rows;
   }
 
   json::Array failures;
   auto reject = [&](const std::string& reason) { failures.emplace_back(reason); };
-  if (!schema_errors.empty()) {
+  if (!primary_schema_errors.empty()) {
     reject(absl::StrFormat("%d malformed parity rows",
-                           static_cast<int>(schema_errors.size())));
+                           static_cast<int>(primary_schema_errors.size())));
+  }
+  if (primary.rows != static_cast<int64_t>(collect.rollout.size())) {
+    reject("primary replay row count does not match collected transitions");
+  }
+  if (primary.mass_residual_rows != primary.rows) {
+    reject("primary raw mass residual coverage is incomplete");
   }
   if (!collect.episode_ids_unique) reject("episode IDs are not unique");
-  if (overall.rows < absl::GetFlag(FLAGS_numerical_parity_min_rows)) {
+  if (primary.rows < absl::GetFlag(FLAGS_numerical_parity_min_rows)) {
     reject("total row floor not met");
   }
   if (nontrivial_rows <
       absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows)) {
     reject("nontrivial row floor not met");
   }
-  if (overall.nonfinite_values != 0) reject("nonfinite parity values observed");
-  if (overall.old_probability_underflows != 0) {
+  if (primary.nonfinite_values != 0) reject("nonfinite parity values observed");
+  if (primary.old_probability_underflows != 0) {
     reject("rollout behavior probability underflow observed");
   }
-  if (overall.new_probability_underflows != 0) {
-    reject("learner FP32 probability underflow observed");
+  if (primary.new_probability_underflows != 0) {
+    reject("learner autocast probability underflow observed");
   }
-  if (overall.max_abs_chosen_log_prob_delta >
+  const double max_raw_mass_residual =
+      absl::GetFlag(FLAGS_numerical_parity_max_raw_mass_residual);
+  if (primary.mass_residual_rows == primary.rows &&
+      !PpoNumericalParityRawMassWithinBound(primary,
+                                             max_raw_mass_residual)) {
+    reject("raw legal probability mass residual exceeds bound");
+  }
+  if (primary.max_abs_chosen_log_prob_delta >
       absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta)) {
     reject("chosen-action log-probability delta exceeds bound");
   }
-  if (overall.max_kl_old_new >
+  if (primary.max_kl_old_new >
           absl::GetFlag(FLAGS_numerical_parity_max_full_kl) ||
-      overall.max_kl_new_old >
+      primary.max_kl_new_old >
           absl::GetFlag(FLAGS_numerical_parity_max_full_kl)) {
     reject("full legal categorical KL exceeds bound");
   }
-  if (overall.ratio_min <
+  if (primary.ratio_min <
       absl::GetFlag(FLAGS_numerical_parity_min_ratio)) {
     reject("chosen-action ratio minimum is below bound");
   }
-  if (overall.ratio_max >
+  if (primary.ratio_max >
       absl::GetFlag(FLAGS_numerical_parity_max_ratio)) {
     reject("chosen-action ratio maximum is above bound");
   }
@@ -2741,7 +2853,19 @@ bool WritePpoNumericalParityArtifact(
   }
 
   json::Object root;
-  root["schema"] = "dune_raw_ppo_numerical_parity_v1";
+  root["schema"] = "dune_raw_ppo_numerical_parity_v2";
+  root["epistemic_label"] =
+      "no_training_actual_learner_autocast_parity_gate_with_fp32_control";
+  root["measurement_intent"] =
+      "Gate unchanged-weight parity on the historical production learner "
+      "CUDA BF16 autocast policy path; retain CUDA FP32 replay as a "
+      "descriptive cross-precision control only.";
+  root["prior_v1_disposition"] =
+      "The prior v1 cross-precision REJECT is a separate valid artifact; v2 "
+      "does not overwrite or reinterpret it.";
+  root["gate_cell"] = "actual_learner_cuda_bf16_autocast";
+  root["control_cell"] = "descriptive_cuda_fp32_no_autocast";
+  root["control_can_affect_status"] = false;
   root["registration_id"] =
       absl::GetFlag(FLAGS_numerical_parity_registration_id);
   root["scope"] = "raw_ppo_only";
@@ -2752,8 +2876,12 @@ bool WritePpoNumericalParityArtifact(
   root["device"] = device.str();
   root["rollout_precision"] =
       device.is_cuda() ? "cuda_bf16_autocast" : "cpu_fp32";
-  root["replay_precision"] =
-      device.is_cuda() ? "cuda_fp32_no_autocast_tf32_allowed" : "cpu_fp32";
+  root["primary_replay_precision"] = "cuda_bf16_autocast";
+  root["descriptive_control_replay_precision"] =
+      "cuda_fp32_no_autocast_tf32_allowed";
+  root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["ppo_minibatch_size"] = static_cast<int64_t>(
+      absl::GetFlag(FLAGS_ppo_minibatch_size));
   root["logit_cap"] = absl::GetFlag(FLAGS_logit_cap);
   root["seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
   root["threads"] = static_cast<int64_t>(absl::GetFlag(FLAGS_threads));
@@ -2772,11 +2900,6 @@ bool WritePpoNumericalParityArtifact(
   root["observation_size"] = obs_size;
   root["action_size"] = action_size;
   root["rollout_hash"] = ComputeRolloutHash(collect.rollout);
-  root["row_evidence_sha256"] = row_evidence_sha256;
-  root["row_evidence_contract"] =
-      "ordered row_index,episode_id,player_id,chosen_action,decision_role,"
-      "advantage,stored_chosen_logprob,then each aligned "
-      "(legal_action,rollout_logprob,learner_fp32_logprob),native fixed-width bytes";
   root["model_state_sha256_before"] = model_hash_before;
   root["model_state_sha256_after"] = model_hash_after;
   root["inference_state_sha256_before"] = inference_hash_before;
@@ -2834,6 +2957,8 @@ bool WritePpoNumericalParityArtifact(
       absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta);
   thresholds["max_full_legal_kl_each_direction"] =
       absl::GetFlag(FLAGS_numerical_parity_max_full_kl);
+  thresholds["max_raw_mass_residual"] =
+      absl::GetFlag(FLAGS_numerical_parity_max_raw_mass_residual);
   thresholds["min_ratio"] =
       absl::GetFlag(FLAGS_numerical_parity_min_ratio);
   thresholds["max_ratio"] =
@@ -2842,68 +2967,43 @@ bool WritePpoNumericalParityArtifact(
   thresholds["require_zero_nonfinite"] = true;
   thresholds["require_unchanged_model_hash"] = true;
   root["thresholds"] = json::Value(thresholds);
-  root["overall"] = json::Value(PpoNumericalParitySummaryJson(overall));
 
-  json::Object legal_splits;
-  std::set<int> legal_counts;
-  for (const auto& row : rows) legal_counts.insert(row.legal_count);
-  for (int legal_count : legal_counts) {
-    legal_splits[std::to_string(legal_count)] = json::Value(
-        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
-          return row.legal_count == legal_count;
-        }));
-  }
-  json::Object probability_splits;
-  probability_splits["p_lt_1e-6"] = json::Value(PpoNumericalParitySubsetJson(
-      rows, [](const auto& r) { return r.old_chosen_probability < 1e-6; }));
-  probability_splits["p_1e-6_to_1e-4"] = json::Value(
-      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
-        return r.old_chosen_probability >= 1e-6 &&
-               r.old_chosen_probability < 1e-4;
-      }));
-  probability_splits["p_1e-4_to_1e-2"] = json::Value(
-      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
-        return r.old_chosen_probability >= 1e-4 &&
-               r.old_chosen_probability < 1e-2;
-      }));
-  probability_splits["p_1e-2_to_0_1"] = json::Value(
-      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
-        return r.old_chosen_probability >= 1e-2 &&
-               r.old_chosen_probability < 0.1;
-      }));
-  probability_splits["p_0_1_to_0_5"] = json::Value(
-      PpoNumericalParitySubsetJson(rows, [](const auto& r) {
-        return r.old_chosen_probability >= 0.1 &&
-               r.old_chosen_probability < 0.5;
-      }));
-  probability_splits["p_ge_0_5"] = json::Value(PpoNumericalParitySubsetJson(
-      rows, [](const auto& r) { return r.old_chosen_probability >= 0.5; }));
-  json::Object advantage_splits;
-  advantage_splits["negative"] = json::Value(PpoNumericalParitySubsetJson(
-      rows, [](const auto& r) { return r.advantage < 0.0; }));
-  advantage_splits["zero"] = json::Value(PpoNumericalParitySubsetJson(
-      rows, [](const auto& r) { return r.advantage == 0.0; }));
-  advantage_splits["positive"] = json::Value(PpoNumericalParitySubsetJson(
-      rows, [](const auto& r) { return r.advantage > 0.0; }));
-  json::Object role_splits;
-  for (int role = 0; role < 7; ++role) {
-    role_splits[PpoDecisionRoleName(role)] = json::Value(
-        PpoNumericalParitySubsetJson(rows, [=](const auto& row) {
-          return row.decision_role == role;
-        }));
-  }
-  json::Object splits;
-  splits["legal_count_exact"] = json::Value(legal_splits);
-  splits["old_chosen_probability"] = json::Value(probability_splits);
-  splits["advantage_sign"] = json::Value(advantage_splits);
-  splits["decision_role"] = json::Value(role_splits);
-  root["splits"] = json::Value(splits);
-
-  json::Array schema_error_json;
-  for (const std::string& error : schema_errors) {
-    schema_error_json.emplace_back(error);
-  }
-  root["schema_errors"] = json::Value(schema_error_json);
+  auto cell_json = [&](const std::string& label, bool gate_eligible,
+                       const std::string& precision,
+                       const std::vector<PpoNumericalParityRow>& cell_rows,
+                       const PpoNumericalParitySummary& summary,
+                       const std::vector<std::string>& cell_errors,
+                       const std::string& evidence_sha256) {
+    json::Object cell;
+    cell["label"] = label;
+    cell["gate_eligible"] = gate_eligible;
+    cell["precision"] = precision;
+    cell["train_amp"] = gate_eligible;
+    cell["ppo_minibatch_size"] = static_cast<int64_t>(
+        absl::GetFlag(FLAGS_ppo_minibatch_size));
+    cell["row_evidence_sha256"] = evidence_sha256;
+    cell["row_evidence_contract"] =
+        "v2 cell label then ordered row_index,episode_id,player_id,"
+        "chosen_action,decision_role,advantage,stored_chosen_logprob,then "
+        "each aligned (legal_action,rollout_raw_logprob,replay_raw_logprob),"
+        "native fixed-width bytes";
+    cell["overall"] = json::Value(PpoNumericalParitySummaryJson(summary));
+    cell["splits"] = json::Value(PpoNumericalParitySplitsJson(cell_rows));
+    json::Array errors;
+    for (const std::string& error : cell_errors) errors.emplace_back(error);
+    cell["schema_errors"] = json::Value(errors);
+    return cell;
+  };
+  json::Object cells;
+  cells["actual_learner_cuda_bf16_autocast"] = json::Value(cell_json(
+      "actual_learner_cuda_bf16_autocast", true, "cuda_bf16_autocast",
+      primary_rows, primary, primary_schema_errors,
+      primary_row_evidence_sha256));
+  cells["descriptive_cuda_fp32_no_autocast"] = json::Value(cell_json(
+      "descriptive_cuda_fp32_no_autocast", false,
+      "cuda_fp32_no_autocast_tf32_allowed", control_rows, control,
+      control_schema_errors, control_row_evidence_sha256));
+  root["cells"] = json::Value(cells);
   root["failure_reasons"] = json::Value(failures);
   // Status is assigned LAST: every provenance check above is allowed to reject.
   root["status"] = failures.empty() ? "PASS" : "REJECT";
@@ -2980,6 +3080,15 @@ int main(int argc, char** argv) {
     if (games <= 0 || games > 64) {
       parity_stop("--rollout_games must be in [1,64] (hard ceiling 320000 transitions)");
     }
+    if (!absl::GetFlag(FLAGS_train_amp)) {
+      parity_stop(
+          "v2 requires --train_amp=true because the gate cell is the actual "
+          "production CUDA BF16 learner policy path");
+    }
+    if (absl::GetFlag(FLAGS_ppo_minibatch_size) != 2048) {
+      parity_stop(
+          "v2 requires --ppo_minibatch_size=2048 to reproduce historical u15828");
+    }
     if (absl::GetFlag(FLAGS_pipeline) ||
         absl::GetFlag(FLAGS_online_search_collection) ||
         absl::GetFlag(FLAGS_search_pi_mode) ||
@@ -2992,6 +3101,8 @@ int main(int argc, char** argv) {
         absl::GetFlag(FLAGS_numerical_parity_max_abs_logprob_delta);
     const double max_full_kl =
         absl::GetFlag(FLAGS_numerical_parity_max_full_kl);
+    const double max_raw_mass_residual =
+        absl::GetFlag(FLAGS_numerical_parity_max_raw_mass_residual);
     const double min_ratio =
         absl::GetFlag(FLAGS_numerical_parity_min_ratio);
     const double max_ratio =
@@ -3000,6 +3111,8 @@ int main(int argc, char** argv) {
         absl::GetFlag(FLAGS_numerical_parity_min_nontrivial_rows) <= 0 ||
         !std::isfinite(max_logprob_delta) || max_logprob_delta <= 0.0 ||
         !std::isfinite(max_full_kl) || max_full_kl <= 0.0 ||
+        !std::isfinite(max_raw_mass_residual) ||
+        max_raw_mass_residual != 1e-5 ||
         !std::isfinite(min_ratio) || !(min_ratio > 0.0 && min_ratio <= 1.0) ||
         !std::isfinite(max_ratio) || max_ratio < 1.0) {
       parity_stop("all sample floors and numerical bounds must be stated explicitly and be valid");
@@ -5680,25 +5793,36 @@ int main(int argc, char** argv) {
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda);
   if (numerical_parity) {
-    std::vector<std::string> schema_errors;
-    std::string row_evidence_sha256;
-    const std::vector<open_spiel::PpoNumericalParityRow> parity_rows =
-        open_spiel::ReplayPpoNumericalParityFp32(
+    std::vector<std::string> primary_schema_errors;
+    std::string primary_row_evidence_sha256;
+    const std::vector<open_spiel::PpoNumericalParityRow> primary_rows =
+        open_spiel::ReplayPpoNumericalParityCell(
             training_model, current_collect.rollout, obs_size, action_size,
-            device, &schema_errors, &row_evidence_sha256);
+            device, /*learner_autocast=*/true,
+            "actual_learner_cuda_bf16_autocast", &primary_schema_errors,
+            &primary_row_evidence_sha256);
+    std::vector<std::string> control_schema_errors;
+    std::string control_row_evidence_sha256;
+    const std::vector<open_spiel::PpoNumericalParityRow> control_rows =
+        open_spiel::ReplayPpoNumericalParityCell(
+            training_model, current_collect.rollout, obs_size, action_size,
+            device, /*learner_autocast=*/false,
+            "descriptive_cuda_fp32_no_autocast", &control_schema_errors,
+            &control_row_evidence_sha256);
     const std::string parity_model_hash_after =
         open_spiel::HashAllModelState(training_model);
     const std::string parity_inference_hash_after =
         open_spiel::HashAllModelState(inference_model);
     const bool pass = open_spiel::WritePpoNumericalParityArtifact(
-        absl::GetFlag(FLAGS_numerical_parity_output), parity_rows,
-        schema_errors, current_collect, parity_model_hash_before,
+        absl::GetFlag(FLAGS_numerical_parity_output), primary_rows,
+        primary_schema_errors, primary_row_evidence_sha256, control_rows,
+        control_schema_errors, control_row_evidence_sha256, current_collect,
+        parity_model_hash_before,
         parity_model_hash_after, parity_inference_hash_before,
         parity_inference_hash_after, parity_source_manifest,
         parity_source_manifest_sha256, parity_source_global_update,
         parity_source_checkpoint_uuid, config_fingerprint, device, obs_size,
-        action_size, parity_command_line, row_evidence_sha256,
-        parity_source_provenance);
+        action_size, parity_command_line, parity_source_provenance);
     std::cout << "Raw-PPO numerical parity "
               << (pass ? "PASS" : "REJECT") << ": "
               << absl::GetFlag(FLAGS_numerical_parity_output) << "\n"

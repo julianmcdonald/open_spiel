@@ -1339,7 +1339,7 @@ void TestGradTelemetryAccumulatedParity() {
 }
 
 void TestRawPpoNumericalParityMathAndDefaultInertness() {
-  TEST_BEGIN("Raw-PPO parity: full categorical math, underflow, and default-inert transition") {
+  TEST_BEGIN("Raw-PPO parity v2: normalized KL, raw-mass gate, underflow, default inertness") {
     PpoTransition default_transition;
     UTILS_CHECK(default_transition.behavior_legal_log_probs.empty());
     CHECK_EQ(default_transition.decision_role, -1);
@@ -1388,15 +1388,97 @@ void TestRawPpoNumericalParityMathAndDefaultInertness() {
     UTILS_CHECK(!ComputePpoNumericalParityRow(
         malformed, &malformed_row, &error));
     UTILS_CHECK(error.find("disagrees") != std::string::npos);
+    CHECK_EQ(malformed_row.schema_errors, int64_t{1});
+
+    // Float-stored log-probabilities need not sum to exactly one in double.
+    // V2 reports that tiny raw residual but normalizes both distributions with
+    // double logsumexp before KL, so identical categoricals have nonnegative
+    // zero KL instead of a spurious negative value.
+    PpoNumericalParityInput float_stored = equal;
+    float_stored.old_log_probs = {
+        static_cast<float>(std::log(0.2)),
+        static_cast<float>(std::log(0.3)),
+        static_cast<float>(std::log(0.5))};
+    float_stored.new_log_probs = float_stored.old_log_probs;
+    float_stored.stored_chosen_log_prob = float_stored.old_log_probs[1];
+    PpoNumericalParityRow float_stored_row;
+    UTILS_CHECK(ComputePpoNumericalParityRow(
+        float_stored, &float_stored_row, &error));
+    UTILS_CHECK(float_stored_row.old_raw_mass_residual >= 0.0);
+    UTILS_CHECK(float_stored_row.old_raw_mass_residual < 1e-5);
+    CHECK_NEAR(float_stored_row.kl_old_new, 0.0, 1e-15);
+    CHECK_NEAR(float_stored_row.kl_new_old, 0.0, 1e-15);
+    UTILS_CHECK(PpoNumericalParityRawMassWithinBound(
+        SummarizePpoNumericalParityRows({float_stored_row}), 1e-5));
+
+    // A true mass defect is not rejected inside the KL calculation and is not
+    // hidden by normalization: KL still measures shape (zero here), while the
+    // independently emitted residual is large enough for the registered v2
+    // 1e-5 mass gate to reject.
+    PpoNumericalParityInput mass_violation = equal;
+    const double log_two = std::log(2.0);
+    for (double& x : mass_violation.old_log_probs) x += log_two;
+    for (double& x : mass_violation.new_log_probs) x += log_two;
+    mass_violation.stored_chosen_log_prob =
+        mass_violation.old_log_probs[mass_violation.chosen_index];
+    PpoNumericalParityRow mass_violation_row;
+    UTILS_CHECK(ComputePpoNumericalParityRow(
+        mass_violation, &mass_violation_row, &error));
+    CHECK_NEAR(mass_violation_row.old_raw_mass_residual, 1.0, 1e-12);
+    CHECK_NEAR(mass_violation_row.new_raw_mass_residual, 1.0, 1e-12);
+    CHECK_NEAR(mass_violation_row.kl_old_new, 0.0, 1e-12);
+    CHECK_NEAR(mass_violation_row.kl_new_old, 0.0, 1e-12);
+    UTILS_CHECK(!PpoNumericalParityRawMassWithinBound(
+        SummarizePpoNumericalParityRows({mass_violation_row}), 1e-5));
 
     const PpoNumericalParitySummary summary =
-        SummarizePpoNumericalParityRows({equal_row, shifted_row, underflow_row});
-    CHECK_EQ(summary.rows, int64_t{3});
-    CHECK_EQ(summary.finite_rows, int64_t{2});
+        SummarizePpoNumericalParityRows(
+            {equal_row, shifted_row, underflow_row, malformed_row,
+             float_stored_row, mass_violation_row});
+    CHECK_EQ(summary.rows, int64_t{6});
+    CHECK_EQ(summary.schema_error_rows, int64_t{1});
+    CHECK_EQ(summary.mass_residual_rows, int64_t{5});
+    CHECK_EQ(summary.finite_rows, int64_t{4});
     CHECK_EQ(summary.old_probability_underflows, int64_t{1});
-    CHECK_EQ(summary.nonfinite_values, int64_t{1});
+    CHECK_EQ(summary.nonfinite_values, int64_t{2});
+    CHECK_NEAR(summary.max_old_raw_mass_residual, 1.0, 1e-12);
+    CHECK_NEAR(summary.max_new_raw_mass_residual, 1.0, 1e-12);
     CHECK_NEAR(summary.ratio_min, shifted_row.ratio, 1e-12);
     CHECK_NEAR(summary.ratio_max, 1.0, 1e-12);
+
+    // Every row belongs to exactly one old-probability bucket. In particular,
+    // a malformed row's default numeric value (0.0) must never masquerade as a
+    // genuine p<1e-6 action, and nonfinite rows are invalid regardless of the
+    // probability value they happened to carry before failing.
+    std::vector<PpoNumericalParityRow> bucket_rows;
+    for (double probability :
+         {5e-7, 5e-5, 5e-3, 5e-2, 0.2, 0.7}) {
+      PpoNumericalParityRow row;
+      row.old_chosen_probability = probability;
+      bucket_rows.push_back(row);
+    }
+    PpoNumericalParityRow malformed_bucket_row;
+    malformed_bucket_row.old_chosen_probability = 0.0;
+    malformed_bucket_row.schema_errors = 1;
+    bucket_rows.push_back(malformed_bucket_row);
+    PpoNumericalParityRow nonfinite_bucket_row;
+    nonfinite_bucket_row.old_chosen_probability = 0.2;
+    nonfinite_bucket_row.nonfinite_values = 1;
+    bucket_rows.push_back(nonfinite_bucket_row);
+    const std::vector<std::string> bucket_names = {
+        "p_lt_1e-6", "p_1e-6_to_1e-4", "p_1e-4_to_1e-2",
+        "p_1e-2_to_0_1", "p_0_1_to_0_5", "p_ge_0_5", "invalid"};
+    int partition_sum = 0;
+    for (const std::string& name : bucket_names) {
+      int count = 0;
+      for (const auto& row : bucket_rows) {
+        if (PpoNumericalParityOldProbabilityBucket(row) == name) ++count;
+      }
+      partition_sum += count;
+      if (name == "invalid") CHECK_EQ(count, 2);
+      if (name == "p_lt_1e-6") CHECK_EQ(count, 1);
+    }
+    CHECK_EQ(partition_sum, static_cast<int>(bucket_rows.size()));
   } TEST_END();
 }
 
