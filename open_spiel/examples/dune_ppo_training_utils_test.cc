@@ -3651,7 +3651,344 @@ void TestVrpoPhase4bExpandedCheckpointRoundtrip() {
     std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
     std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
                                std::istreambuf_iterator<char>());
-    UTILS_CHECK(trainer_source.find("dune_vrpo_checkpoint.h") ==
+    UTILS_CHECK(trainer_source.find("dune_vrpo_checkpoint.h") !=
+                std::string::npos);
+    UTILS_CHECK(trainer_source.find("WriteVrpoBootstrapRootAtomic") !=
+                std::string::npos);
+    UTILS_CHECK(trainer_source.find("SaveVrpoExpandedCheckpointAtomic") ==
+                std::string::npos);
+  } TEST_END();
+}
+
+void TestVrpoPhase4cBootstrapOnlyIntegration() {
+  TEST_BEGIN("VRPO phase 4c: bootstrap-only four-arm root and cleanup") {
+    const std::filesystem::path parent =
+        std::filesystem::temp_directory_path() /
+        ("dune_vrpo_phase4c_test_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(parent, ec);
+    std::filesystem::create_directories(parent);
+    const auto arms = CanonicalVrpoPhase4Arms();
+    VrpoBootstrapStartupConfig startup;
+    startup.game = "dune_imperium";
+    startup.root = (parent / "bootstrap").string();
+    startup.registration_id = "VRPO_PHASE4C_TEST";
+    startup.source_root = "/source";
+    startup.source_code_sha256 = std::string(64, '1');
+    startup.source_actor_model_sha256 = std::string(64, '3');
+    startup.source_actor_model_size = 12345;
+    startup.source_manifest_sha256 = std::string(64, '2');
+    startup.source_manifest_size = 2345;
+    startup.executed_binary_sha256 = std::string(64, '6');
+    startup.executed_binary_size = 34567;
+    startup.experiment_uuid =
+        "77777777-7777-4777-8777-777777777777";
+    startup.diagnostics_only = true;
+    startup.init_mode = "bootstrap";
+    startup.q_init_seed = 20260831;
+    startup.base_seed = 8303000;
+    startup.rollout_amp = false;
+    startup.train_amp = false;
+    startup.allow_tf32 = true;
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      startup.ranges[arm] = {
+          arms[arm].arm_id, 1000030000 + arm * 100,
+          1000030039 + arm * 100};
+    }
+    std::string error;
+    UTILS_CHECK(ValidateVrpoBootstrapStartupConfig(startup, &error));
+    auto reject_startup = [&](VrpoBootstrapStartupConfig invalid,
+                              const std::string& needle) {
+      UTILS_CHECK(!ValidateVrpoBootstrapStartupConfig(invalid, &error));
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    auto invalid_startup = startup;
+    invalid_startup.diagnostics_only = false;
+    reject_startup(invalid_startup, "diagnostics-only");
+    invalid_startup = startup;
+    invalid_startup.init_mode = "checkpoint";
+    reject_startup(invalid_startup, "bootstrap init");
+    invalid_startup = startup;
+    invalid_startup.rollout_amp = true;
+    reject_startup(invalid_startup, "FP32");
+    invalid_startup = startup;
+    invalid_startup.shaped_reward_weight = 0.1;
+    reject_startup(invalid_startup, "shaping");
+    invalid_startup = startup;
+    invalid_startup.source_code_sha256 = "bad";
+    reject_startup(invalid_startup, "identity");
+    invalid_startup = startup;
+    invalid_startup.ranges[1].start_episode_id =
+        invalid_startup.ranges[0].start_episode_id;
+    reject_startup(invalid_startup, "overlap");
+    UTILS_CHECK(ValidateVrpoBootstrapObservedFileIdentities(
+        startup, startup.source_actor_model_sha256,
+        startup.source_actor_model_size, startup.source_manifest_sha256,
+        startup.source_manifest_size, startup.executed_binary_sha256,
+        startup.executed_binary_size, &error));
+    auto require_identity_drift = [&](std::string model_sha,
+                                      int64_t model_size,
+                                      std::string manifest_sha,
+                                      int64_t manifest_size,
+                                      std::string binary_sha,
+                                      int64_t binary_size) {
+      UTILS_CHECK(!ValidateVrpoBootstrapObservedFileIdentities(
+          startup, model_sha, model_size, manifest_sha, manifest_size,
+          binary_sha, binary_size, &error));
+      UTILS_CHECK(error.find("identity mismatch") != std::string::npos);
+    };
+    require_identity_drift(std::string(64, 'a'),
+                           startup.source_actor_model_size,
+                           startup.source_manifest_sha256,
+                           startup.source_manifest_size,
+                           startup.executed_binary_sha256,
+                           startup.executed_binary_size);
+    require_identity_drift(startup.source_actor_model_sha256,
+                           startup.source_actor_model_size + 1,
+                           startup.source_manifest_sha256,
+                           startup.source_manifest_size,
+                           startup.executed_binary_sha256,
+                           startup.executed_binary_size);
+    require_identity_drift(startup.source_actor_model_sha256,
+                           startup.source_actor_model_size,
+                           std::string(64, 'b'),
+                           startup.source_manifest_size,
+                           startup.executed_binary_sha256,
+                           startup.executed_binary_size);
+    require_identity_drift(startup.source_actor_model_sha256,
+                           startup.source_actor_model_size,
+                           startup.source_manifest_sha256,
+                           startup.source_manifest_size + 1,
+                           startup.executed_binary_sha256,
+                           startup.executed_binary_size);
+    require_identity_drift(startup.source_actor_model_sha256,
+                           startup.source_actor_model_size,
+                           startup.source_manifest_sha256,
+                           startup.source_manifest_size,
+                           std::string(64, 'c'),
+                           startup.executed_binary_size);
+    require_identity_drift(startup.source_actor_model_sha256,
+                           startup.source_actor_model_size,
+                           startup.source_manifest_sha256,
+                           startup.source_manifest_size,
+                           startup.executed_binary_sha256,
+                           startup.executed_binary_size + 1);
+    invalid_startup = startup;
+    invalid_startup.experiment_uuid.clear();
+    reject_startup(invalid_startup, "experiment UUID");
+
+    torch::manual_seed(2222);
+    auto source_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        8, 16, 7, 1, false);
+    std::set<std::string> actor_names;
+    for (const auto& item : source_actor->named_parameters()) {
+      actor_names.insert(item.key());
+    }
+    std::vector<VrpoNamedParameterIdentity> source_identity;
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *source_actor, &actor_names, &source_identity, &error));
+    const std::string source_actor_hash =
+        VrpoNamedParameterIdentitySha256(source_identity, true);
+    std::array<VrpoBootstrapArmInput, 4> inputs;
+    std::array<VrpoFreshOptimizers, 4> optimizer_storage;
+    const std::string experiment_uuid = startup.experiment_uuid;
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          8, 16, 7, 1, false);
+      std::vector<VrpoNamedParameterIdentity> copied;
+      UTILS_CHECK(CopyVrpoActorSubsetByName(
+          *source_actor, *actor, actor_names, &copied, &error));
+      CHECK_EQ(VrpoNamedParameterIdentitySha256(copied, true),
+               source_actor_hash);
+      torch::manual_seed(startup.q_init_seed);
+      auto q = std::make_shared<TinyVrpoQCheckpointModule>();
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *actor, *q, &optimizer_storage[arm], &error));
+      std::vector<VrpoNamedParameterIdentity> actor_layout_id;
+      std::vector<VrpoNamedParameterIdentity> q_layout_id;
+      UTILS_CHECK(VrpoNamedParameterIdentities(
+          *actor, nullptr, &actor_layout_id, &error));
+      UTILS_CHECK(VrpoNamedParameterIdentities(
+          *q, nullptr, &q_layout_id, &error));
+      VrpoExpandedExpectedLayout layout;
+      layout.label = "tiny_test_fixture_v1";
+      layout.test_fixture = true;
+      layout.actor_observation_dim = 8;
+      layout.actor_hidden_dim = 16;
+      layout.actor_action_dim = 7;
+      layout.actor_residual_blocks = 1;
+      layout.actor_names_shapes_sha256 =
+          VrpoNamedParameterIdentitySha256(actor_layout_id, false);
+      layout.q_names_shapes_sha256 =
+          VrpoNamedParameterIdentitySha256(q_layout_id, false);
+      VrpoPhase4ManifestBinding base;
+      base.source_actor_model_sha256 = std::string(64, '3');
+      base.source_actor_manifest_sha256 = startup.source_manifest_sha256;
+      base.source_code_sha256 = startup.source_code_sha256;
+      base.q_init_seed = startup.q_init_seed;
+      base.experiment_uuid = experiment_uuid;
+      base.base_seed = startup.base_seed;
+      base.start_episode_id = startup.ranges[arm].start_episode_id;
+      base.end_episode_id_inclusive =
+          startup.ranges[arm].end_episode_id_inclusive;
+      VrpoPhase4ManifestBinding binding;
+      UTILS_CHECK(DeriveVrpoPhase4ManifestBinding(
+          *actor, *q, optimizer_storage[arm], base, layout,
+          &binding, &error));
+      CHECK_EQ(binding.actor_subset_sha256, source_actor_hash);
+      if (arm > 0) {
+        CHECK_EQ(binding.actor_subset_sha256,
+                 inputs[0].binding.actor_subset_sha256);
+        CHECK_EQ(binding.q_init_sha256, inputs[0].binding.q_init_sha256);
+        CHECK_EQ(binding.module_layout_sha256,
+                 inputs[0].binding.module_layout_sha256);
+        CHECK_EQ(binding.optimizer_zero_state_sha256,
+                 inputs[0].binding.optimizer_zero_state_sha256);
+      }
+      inputs[arm].arm = arms[arm];
+      inputs[arm].binding = binding;
+      inputs[arm].layout = layout;
+      inputs[arm].checkpoint_uuid =
+          "88888888-8888-4888-8888-88888888888" +
+          std::to_string(arm);
+      inputs[arm].actor = actor;
+      inputs[arm].q = q;
+      inputs[arm].optimizers = &optimizer_storage[arm];
+    }
+    json::Object result;
+    const auto root = std::filesystem::path(startup.root);
+    UTILS_CHECK(WriteVrpoBootstrapRootAtomic(
+        root, startup, inputs, VrpoBootstrapFailurePoint::kNone,
+        &result, &error));
+    CHECK_EQ(result.at("status").GetString(), std::string("VALID"));
+    UTILS_CHECK(result.at("optimizer_constructed").GetBool());
+    CHECK_EQ(result.at("optimizer_steps").GetInt(), int64_t{0});
+    CHECK_EQ(result.at("backward_calls").GetInt(), int64_t{0});
+    CHECK_EQ(result.at("training_updates").GetInt(), int64_t{0});
+    UTILS_CHECK(!result.at("evaluator_constructed").GetBool());
+    CHECK_EQ(result.at("rollout_games").GetInt(), int64_t{0});
+    UTILS_CHECK(!result.at("source_optimizer_loaded").GetBool());
+    UTILS_CHECK(!result.at("training_authorized").GetBool());
+    CHECK_EQ(result.at("source_actor_model_sha256").GetString(),
+             startup.source_actor_model_sha256);
+    CHECK_EQ(result.at("source_actor_model_size").GetInt(),
+             startup.source_actor_model_size);
+    CHECK_EQ(result.at("source_manifest_sha256").GetString(),
+             startup.source_manifest_sha256);
+    CHECK_EQ(result.at("source_manifest_size").GetInt(),
+             startup.source_manifest_size);
+    CHECK_EQ(result.at("executed_binary_sha256").GetString(),
+             startup.executed_binary_sha256);
+    CHECK_EQ(result.at("executed_binary_size").GetInt(),
+             startup.executed_binary_size);
+    CHECK_EQ(result.at("experiment_uuid").GetString(),
+             startup.experiment_uuid);
+    UTILS_CHECK(std::filesystem::is_regular_file(
+        root / "BOOTSTRAP_RESULT.json"));
+    for (const auto& arm : arms) {
+      UTILS_CHECK(std::filesystem::is_regular_file(
+          VrpoExpandedPaths(root / arm.arm_id).manifest));
+    }
+    auto matching = result.at("matching_matrix").GetObject();
+    for (const auto& field : matching) UTILS_CHECK(field.second.GetBool());
+
+    const auto preexisting = parent / "preexisting";
+    std::filesystem::create_directories(preexisting);
+    std::ofstream(preexisting / "sentinel") << "keep";
+    auto preexisting_startup = startup;
+    preexisting_startup.root = preexisting.string();
+    json::Object rejected_result;
+    UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
+        preexisting, preexisting_startup, inputs,
+        VrpoBootstrapFailurePoint::kNone, &rejected_result, &error));
+    UTILS_CHECK(std::filesystem::is_regular_file(preexisting / "sentinel"));
+
+    const std::array<VrpoBootstrapFailurePoint, 5> failures = {
+        VrpoBootstrapFailurePoint::kAfterArm0,
+        VrpoBootstrapFailurePoint::kAfterArm1,
+        VrpoBootstrapFailurePoint::kAfterArm2,
+        VrpoBootstrapFailurePoint::kAfterArm3,
+        VrpoBootstrapFailurePoint::kAfterGlobalManifestTemp};
+    for (size_t index = 0; index < failures.size(); ++index) {
+      auto failed_startup = startup;
+      const auto failed_root = parent / ("failed_" + std::to_string(index));
+      failed_startup.root = failed_root.string();
+      UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
+          failed_root, failed_startup, inputs, failures[index],
+          &rejected_result, &error));
+      UTILS_CHECK(!std::filesystem::exists(failed_root));
+    }
+    auto require_arm_startup_mismatch = [&](std::array<VrpoBootstrapArmInput, 4> bad,
+                                            const std::string& label) {
+      auto mismatch_startup = startup;
+      const auto mismatch_root = parent / ("mismatch_" + label);
+      mismatch_startup.root = mismatch_root.string();
+      UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
+          mismatch_root, mismatch_startup, bad,
+          VrpoBootstrapFailurePoint::kNone, &rejected_result, &error));
+      UTILS_CHECK(!std::filesystem::exists(mismatch_root));
+    };
+    auto mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.source_code_sha256 = std::string(64, 'a');
+    require_arm_startup_mismatch(mismatch_inputs, "source_code");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.source_actor_model_sha256 =
+        std::string(64, 'b');
+    require_arm_startup_mismatch(mismatch_inputs, "source_model");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.source_actor_manifest_sha256 =
+        std::string(64, 'c');
+    require_arm_startup_mismatch(mismatch_inputs, "source_manifest");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.q_init_seed++;
+    require_arm_startup_mismatch(mismatch_inputs, "q_seed");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.base_seed++;
+    require_arm_startup_mismatch(mismatch_inputs, "base_seed");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.experiment_uuid =
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    require_arm_startup_mismatch(mismatch_inputs, "uuid_drift");
+    mismatch_inputs = inputs;
+    mismatch_inputs[0].binding.experiment_uuid.clear();
+    require_arm_startup_mismatch(mismatch_inputs, "uuid_missing");
+    auto wrong_inputs = inputs;
+    wrong_inputs[1].binding.start_episode_id =
+        wrong_inputs[0].binding.start_episode_id;
+    auto wrong_startup = startup;
+    const auto wrong_root = parent / "wrong_range";
+    wrong_startup.root = wrong_root.string();
+    UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
+        wrong_root, wrong_startup, wrong_inputs,
+        VrpoBootstrapFailurePoint::kNone, &rejected_result, &error));
+    UTILS_CHECK(!std::filesystem::exists(wrong_root));
+    wrong_inputs = inputs;
+    wrong_inputs[0].layout.label = "production_dune_vrpo_layout_v1";
+    wrong_inputs[0].layout.test_fixture = false;
+    const auto wrong_layout_root = parent / "wrong_layout";
+    wrong_startup.root = wrong_layout_root.string();
+    UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
+        wrong_layout_root, wrong_startup, wrong_inputs,
+        VrpoBootstrapFailurePoint::kNone, &rejected_result, &error));
+    UTILS_CHECK(!std::filesystem::exists(wrong_layout_root));
+
+    CleanupVrpoBootstrapRoot(root);
+    std::filesystem::remove_all(parent, ec);
+    UTILS_CHECK(!std::filesystem::exists(parent));
+
+    std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
+    std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
+                               std::istreambuf_iterator<char>());
+    const size_t bootstrap_branch =
+        trainer_source.find("if (vrpo_bootstrap) {");
+    const size_t device_branch =
+        trainer_source.find("torch::Device device", bootstrap_branch);
+    UTILS_CHECK(bootstrap_branch != std::string::npos &&
+                device_branch != std::string::npos &&
+                bootstrap_branch < device_branch);
+    UTILS_CHECK(trainer_source.find("tiny_test_fixture_v1") ==
+                std::string::npos);
+    UTILS_CHECK(trainer_source.find("static_cast<int>(vrpo_bootstrap)") !=
                 std::string::npos);
   } TEST_END();
 }
@@ -3970,6 +4307,7 @@ int main() {
   TestVrpoQReferencePreflightContracts();
   TestVrpoPhase4aSchemaAndBootstrapContracts();
   TestVrpoPhase4bExpandedCheckpointRoundtrip();
+  TestVrpoPhase4cBootstrapOnlyIntegration();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

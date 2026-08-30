@@ -47,6 +47,7 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_ppo_numerical_parity.h"
 #include "dune_vrpo.h"
+#include "dune_vrpo_checkpoint.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
@@ -150,6 +151,40 @@ ABSL_FLAG(double, vrpo_q_agreement_rel_tolerance, 1e-10,
           "Relative scalar/tensor recurrence agreement tolerance.");
 ABSL_FLAG(int64_t, vrpo_q_gpu_peak_increment_limit_bytes, 268435456,
           "Hard incremental GPU allocator peak ceiling for Q preflight.");
+ABSL_FLAG(std::string, vrpo_bootstrap_root, "",
+          "Fresh root for terminal VRPO four-arm expanded bootstrap.");
+ABSL_FLAG(std::string, vrpo_bootstrap_registration_id, "",
+          "Required immutable VRPO bootstrap registration identifier.");
+ABSL_FLAG(std::string, vrpo_bootstrap_source_root, "",
+          "Required source root for VRPO bootstrap code provenance.");
+ABSL_FLAG(std::string, vrpo_bootstrap_source_sha256, "",
+          "Required canonical VRPO bootstrap source digest.");
+ABSL_FLAG(std::string, vrpo_bootstrap_source_manifest_sha256, "",
+          "Required exact u15828 source manifest digest.");
+ABSL_FLAG(int64_t, vrpo_bootstrap_source_manifest_size, 0,
+          "Required exact u15828 source manifest size.");
+ABSL_FLAG(std::string, vrpo_bootstrap_source_model_sha256, "",
+          "Required exact u15828 actor model digest.");
+ABSL_FLAG(int64_t, vrpo_bootstrap_source_model_size, 0,
+          "Required exact u15828 actor model size.");
+ABSL_FLAG(std::string, vrpo_bootstrap_binary_sha256, "",
+          "Required exact executed trainer binary digest.");
+ABSL_FLAG(int64_t, vrpo_bootstrap_binary_size, 0,
+          "Required exact executed trainer binary size.");
+ABSL_FLAG(std::string, vrpo_bootstrap_experiment_uuid, "",
+          "Required registered four-arm experiment UUID.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_q_seed, 0,
+          "Required shared deterministic Q initialization seed.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_base_seed, 0,
+          "Required shared four-arm training base seed.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_start, 0, "PPO cap10 episode start.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_end, 0, "PPO cap10 episode end inclusive.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_start, 0, "PPO uncapped episode start.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_end, 0, "PPO uncapped episode end inclusive.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_start, 0, "VRPO cap10 episode start.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_end, 0, "VRPO cap10 episode end inclusive.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_start, 0, "VRPO uncapped episode start.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_end, 0, "VRPO uncapped episode end inclusive.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5679,12 +5714,15 @@ int main(int argc, char** argv) {
       !absl::GetFlag(FLAGS_vrpo_capture_output).empty();
   const bool vrpo_q_preflight =
       !absl::GetFlag(FLAGS_vrpo_q_preflight_output).empty();
+  const bool vrpo_bootstrap =
+      !absl::GetFlag(FLAGS_vrpo_bootstrap_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
-          static_cast<int>(vrpo_q_preflight) >
+          static_cast<int>(vrpo_q_preflight) +
+          static_cast<int>(vrpo_bootstrap) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, and VRPO Q preflight modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, and VRPO bootstrap modes are mutually exclusive");
   }
   if (numerical_parity) {
     auto parity_stop = [](const std::string& message) {
@@ -5850,6 +5888,95 @@ int main(int argc, char** argv) {
           "VRPO capture output or temp already exists");
     }
   }
+  open_spiel::VrpoBootstrapStartupConfig vrpo_bootstrap_config;
+  if (vrpo_bootstrap) {
+    vrpo_bootstrap_config.game = absl::GetFlag(FLAGS_game);
+    vrpo_bootstrap_config.root = absl::GetFlag(FLAGS_vrpo_bootstrap_root);
+    vrpo_bootstrap_config.registration_id =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_registration_id);
+    vrpo_bootstrap_config.source_root =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_root);
+    vrpo_bootstrap_config.source_code_sha256 =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_sha256);
+    vrpo_bootstrap_config.source_actor_model_sha256 =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_model_sha256);
+    vrpo_bootstrap_config.source_actor_model_size =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_model_size);
+    vrpo_bootstrap_config.source_manifest_sha256 =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_manifest_sha256);
+    vrpo_bootstrap_config.source_manifest_size =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_source_manifest_size);
+    vrpo_bootstrap_config.executed_binary_sha256 =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_binary_sha256);
+    vrpo_bootstrap_config.executed_binary_size =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_binary_size);
+    vrpo_bootstrap_config.experiment_uuid =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_experiment_uuid);
+    vrpo_bootstrap_config.diagnostics_only =
+        absl::GetFlag(FLAGS_diagnostics_only);
+    vrpo_bootstrap_config.init_mode = absl::GetFlag(FLAGS_init_mode);
+    vrpo_bootstrap_config.q_init_seed =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_q_seed);
+    vrpo_bootstrap_config.base_seed =
+        absl::GetFlag(FLAGS_vrpo_bootstrap_base_seed);
+    vrpo_bootstrap_config.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+    vrpo_bootstrap_config.train_amp = absl::GetFlag(FLAGS_train_amp);
+    vrpo_bootstrap_config.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    vrpo_bootstrap_config.pipeline = absl::GetFlag(FLAGS_pipeline);
+    vrpo_bootstrap_config.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    vrpo_bootstrap_config.search_pi_mode =
+        absl::GetFlag(FLAGS_search_pi_mode);
+    vrpo_bootstrap_config.train_value_only =
+        absl::GetFlag(FLAGS_train_value_only);
+    vrpo_bootstrap_config.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    vrpo_bootstrap_config.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    vrpo_bootstrap_config.checkpoint_writes_enabled =
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    vrpo_bootstrap_config.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    vrpo_bootstrap_config.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    vrpo_bootstrap_config.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    vrpo_bootstrap_config.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    vrpo_bootstrap_config.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    vrpo_bootstrap_config.gamma = absl::GetFlag(FLAGS_gamma);
+    vrpo_bootstrap_config.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    const auto canonical_arms = open_spiel::CanonicalVrpoPhase4Arms();
+    vrpo_bootstrap_config.ranges = {{
+        {canonical_arms[0].arm_id,
+         absl::GetFlag(FLAGS_vrpo_bootstrap_ppo_cap10_start),
+         absl::GetFlag(FLAGS_vrpo_bootstrap_ppo_cap10_end)},
+        {canonical_arms[1].arm_id,
+         absl::GetFlag(FLAGS_vrpo_bootstrap_ppo_uncapped_start),
+         absl::GetFlag(FLAGS_vrpo_bootstrap_ppo_uncapped_end)},
+        {canonical_arms[2].arm_id,
+         absl::GetFlag(FLAGS_vrpo_bootstrap_vrpo_cap10_start),
+         absl::GetFlag(FLAGS_vrpo_bootstrap_vrpo_cap10_end)},
+        {canonical_arms[3].arm_id,
+         absl::GetFlag(FLAGS_vrpo_bootstrap_vrpo_uncapped_start),
+         absl::GetFlag(FLAGS_vrpo_bootstrap_vrpo_uncapped_end)}}};
+    std::string bootstrap_error;
+    if (!open_spiel::ValidateVrpoBootstrapStartupConfig(
+            vrpo_bootstrap_config, &bootstrap_error)) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap configuration rejected: " + bootstrap_error);
+    }
+    if (absl::GetFlag(FLAGS_artifact_manifest).empty() ||
+        absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        std::filesystem::exists(absl::GetFlag(FLAGS_vrpo_bootstrap_root))) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap requires source manifest, production actor layout, no auxiliary layout, and fresh absent root");
+    }
+  }
   // PWO-5 section 10.2: the reserved final-gate base-seed range, enforced at
   // the launcher so the exclusion is mechanical rather than a matter of
   // operator care. Checked before ANY other work.
@@ -5914,6 +6041,215 @@ int main(int argc, char** argv) {
                          ? game->InformationStateTensorSize()
                          : game->ObservationTensorSize();
   int64_t action_size = game->NumDistinctActions();
+
+  if (vrpo_bootstrap) {
+    std::error_code binary_ec;
+    const auto executed_binary =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    if (binary_ec || executed_binary.empty()) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap cannot resolve executed binary");
+    }
+    size_t executed_binary_size = 0;
+    const std::string executed_binary_sha256 =
+        open_spiel::ComputeFileSHA256(
+            executed_binary.string(), &executed_binary_size);
+    if (executed_binary_sha256 !=
+            vrpo_bootstrap_config.executed_binary_sha256 ||
+        static_cast<int64_t>(executed_binary_size) !=
+            vrpo_bootstrap_config.executed_binary_size) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap executed binary identity mismatch");
+    }
+    const auto source_provenance =
+        open_spiel::LoadVrpoCaptureSourceProvenance(
+            absl::GetFlag(FLAGS_vrpo_bootstrap_source_root),
+            absl::GetFlag(FLAGS_vrpo_bootstrap_source_sha256),
+            open_spiel::VrpoBootstrapSourceRelativePaths());
+    const std::string source_manifest_path =
+        absl::GetFlag(FLAGS_artifact_manifest);
+    size_t source_manifest_size = 0;
+    const std::string source_manifest_sha256 =
+        open_spiel::ComputeFileSHA256(source_manifest_path,
+                                     &source_manifest_size);
+    if (source_manifest_sha256 !=
+            vrpo_bootstrap_config.source_manifest_sha256 ||
+        static_cast<int64_t>(source_manifest_size) !=
+            vrpo_bootstrap_config.source_manifest_size) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap source manifest digest mismatch");
+    }
+    std::ifstream manifest_stream(source_manifest_path);
+    const std::string manifest_text(
+        (std::istreambuf_iterator<char>(manifest_stream)),
+        std::istreambuf_iterator<char>());
+    const auto parsed_manifest = open_spiel::json::FromString(manifest_text);
+    if (!parsed_manifest.has_value() || !parsed_manifest->IsObject()) {
+      open_spiel::SpielFatalError("VRPO bootstrap source manifest is malformed");
+    }
+    const auto& manifest = parsed_manifest->GetObject();
+    auto manifest_string = [&](const char* key) -> std::string {
+      const auto it = manifest.find(key);
+      if (it == manifest.end() || !it->second.IsString()) {
+        open_spiel::SpielFatalError(
+            std::string("VRPO bootstrap source manifest missing ") + key);
+      }
+      return it->second.GetString();
+    };
+    auto manifest_int = [&](const char* key) -> int64_t {
+      const auto it = manifest.find(key);
+      if (it == manifest.end() || !it->second.IsInt()) {
+        open_spiel::SpielFatalError(
+            std::string("VRPO bootstrap source manifest missing ") + key);
+      }
+      return it->second.GetInt();
+    };
+    const std::string source_model_path =
+        absl::GetFlag(FLAGS_model_checkpoint);
+    size_t source_model_size = 0;
+    const std::string source_model_sha256 =
+        open_spiel::ComputeFileSHA256(source_model_path, &source_model_size);
+    std::string observed_identity_error;
+    if (!open_spiel::ValidateVrpoBootstrapObservedFileIdentities(
+            vrpo_bootstrap_config, source_model_sha256,
+            static_cast<int64_t>(source_model_size),
+            source_manifest_sha256,
+            static_cast<int64_t>(source_manifest_size),
+            executed_binary_sha256,
+            static_cast<int64_t>(executed_binary_size),
+            &observed_identity_error)) {
+      open_spiel::SpielFatalError(observed_identity_error);
+    }
+    if (source_model_sha256 !=
+            vrpo_bootstrap_config.source_actor_model_sha256 ||
+        static_cast<int64_t>(source_model_size) !=
+            vrpo_bootstrap_config.source_actor_model_size ||
+        source_model_sha256 != manifest_string("model_sha256") ||
+        static_cast<int64_t>(source_model_size) !=
+            manifest_int("model_file_size") ||
+        manifest_int("hidden_dim") != 2048 ||
+        manifest_int("num_blocks") != 8 || obs_size != 5580 ||
+        action_size != 2391) {
+      open_spiel::SpielFatalError(
+          "VRPO bootstrap source actor bytes/architecture mismatch");
+    }
+    auto source_actor =
+        std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, 2048, action_size, 8, false);
+    open_spiel::LoadModelCheckpoint(
+        source_actor, source_model_path, torch::Device(torch::kCPU));
+    std::set<std::string> actor_names;
+    for (const auto& item : source_actor->named_parameters()) {
+      actor_names.insert(item.key());
+    }
+    std::vector<open_spiel::VrpoNamedParameterIdentity> source_actor_identity;
+    std::string bootstrap_error;
+    if (!open_spiel::VrpoNamedParameterIdentities(
+            *source_actor, &actor_names, &source_actor_identity,
+            &bootstrap_error)) {
+      open_spiel::SpielFatalError(bootstrap_error);
+    }
+    const std::string source_actor_subset_sha =
+        open_spiel::VrpoNamedParameterIdentitySha256(
+            source_actor_identity, true);
+    const auto arms = open_spiel::CanonicalVrpoPhase4Arms();
+    std::array<open_spiel::VrpoBootstrapArmInput, 4> inputs;
+    std::array<open_spiel::VrpoFreshOptimizers, 4> optimizer_storage;
+    const std::string experiment_uuid =
+        vrpo_bootstrap_config.experiment_uuid;
+    std::string common_q_hash;
+    std::string common_layout_hash;
+    std::string common_zero_hash;
+    for (size_t arm = 0; arm < inputs.size(); ++arm) {
+      auto actor =
+          std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+              obs_size, 2048, action_size, 8, false);
+      std::vector<open_spiel::VrpoNamedParameterIdentity> copied;
+      if (!open_spiel::CopyVrpoActorSubsetByName(
+              *source_actor, *actor, actor_names, &copied,
+              &bootstrap_error) ||
+          open_spiel::VrpoNamedParameterIdentitySha256(copied, true) !=
+              source_actor_subset_sha) {
+        open_spiel::SpielFatalError(
+            "VRPO bootstrap actor subset copy identity mismatch");
+      }
+      auto q = std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+          absl::GetFlag(FLAGS_vrpo_bootstrap_q_seed));
+      if (!open_spiel::MakeVrpoFreshOptimizers(
+              *actor, *q, &optimizer_storage[arm], &bootstrap_error)) {
+        open_spiel::SpielFatalError(bootstrap_error);
+      }
+      open_spiel::VrpoPhase4ManifestBinding binding_base;
+      binding_base.source_actor_model_sha256 = source_model_sha256;
+      binding_base.source_actor_manifest_sha256 = source_manifest_sha256;
+      binding_base.source_code_sha256 = source_provenance.combined_sha256;
+      binding_base.q_init_seed =
+          absl::GetFlag(FLAGS_vrpo_bootstrap_q_seed);
+      binding_base.experiment_uuid = experiment_uuid;
+      binding_base.base_seed =
+          absl::GetFlag(FLAGS_vrpo_bootstrap_base_seed);
+      binding_base.start_episode_id =
+          vrpo_bootstrap_config.ranges[arm].start_episode_id;
+      binding_base.end_episode_id_inclusive =
+          vrpo_bootstrap_config.ranges[arm].end_episode_id_inclusive;
+      std::vector<open_spiel::VrpoNamedParameterIdentity> actor_layout_records;
+      std::vector<open_spiel::VrpoNamedParameterIdentity> q_layout_records;
+      open_spiel::VrpoNamedParameterIdentities(
+          *actor, nullptr, &actor_layout_records, &bootstrap_error);
+      open_spiel::VrpoNamedParameterIdentities(
+          *q, nullptr, &q_layout_records, &bootstrap_error);
+      open_spiel::VrpoExpandedExpectedLayout layout;
+      layout.label = "production_dune_vrpo_layout_v1";
+      layout.test_fixture = false;
+      layout.actor_observation_dim = 5580;
+      layout.actor_hidden_dim = 2048;
+      layout.actor_action_dim = 2391;
+      layout.actor_residual_blocks = 8;
+      layout.actor_names_shapes_sha256 =
+          open_spiel::VrpoNamedParameterIdentitySha256(
+              actor_layout_records, false);
+      layout.q_names_shapes_sha256 =
+          open_spiel::VrpoNamedParameterIdentitySha256(
+              q_layout_records, false);
+      open_spiel::VrpoPhase4ManifestBinding binding;
+      if (!open_spiel::DeriveVrpoPhase4ManifestBinding(
+              *actor, *q, optimizer_storage[arm], binding_base,
+              layout, &binding, &bootstrap_error)) {
+        open_spiel::SpielFatalError(bootstrap_error);
+      }
+      if (binding.actor_subset_sha256 != source_actor_subset_sha ||
+          (arm > 0 &&
+           (binding.q_init_sha256 != common_q_hash ||
+            binding.module_layout_sha256 != common_layout_hash ||
+            binding.optimizer_zero_state_sha256 != common_zero_hash))) {
+        open_spiel::SpielFatalError(
+            "VRPO bootstrap four-arm actor/Q/layout/zero identity mismatch");
+      }
+      if (arm == 0) {
+        common_q_hash = binding.q_init_sha256;
+        common_layout_hash = binding.module_layout_sha256;
+        common_zero_hash = binding.optimizer_zero_state_sha256;
+      }
+      inputs[arm].arm = arms[arm];
+      inputs[arm].binding = std::move(binding);
+      inputs[arm].layout = std::move(layout);
+      inputs[arm].checkpoint_uuid = open_spiel::GenerateUUID();
+      inputs[arm].actor = actor;
+      inputs[arm].q = q;
+      inputs[arm].optimizers = &optimizer_storage[arm];
+    }
+    open_spiel::json::Object bootstrap_result;
+    if (!open_spiel::WriteVrpoBootstrapRootAtomic(
+            absl::GetFlag(FLAGS_vrpo_bootstrap_root),
+            vrpo_bootstrap_config, inputs,
+            open_spiel::VrpoBootstrapFailurePoint::kNone,
+            &bootstrap_result, &bootstrap_error)) {
+      open_spiel::SpielFatalError(bootstrap_error);
+    }
+    std::cout << "VRPO four-arm expanded bootstrap VALID: "
+              << absl::GetFlag(FLAGS_vrpo_bootstrap_root) << "\n";
+    return 0;
+  }
 
   torch::Device device(torch::kCPU);
   if (torch::cuda::is_available()) {

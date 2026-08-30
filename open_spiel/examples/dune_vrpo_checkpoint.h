@@ -24,6 +24,12 @@ namespace open_spiel {
 inline constexpr char kVrpoExpandedCheckpointSchema[] =
     "dune_vrpo_phase4b_expanded_checkpoint_v1";
 
+inline std::vector<std::string> VrpoBootstrapSourceRelativePaths() {
+  std::vector<std::string> paths = VrpoQPreflightSourceRelativePaths();
+  paths.push_back("open_spiel/examples/dune_vrpo_checkpoint.h");
+  return paths;
+}
+
 struct VrpoExpandedCheckpointPaths {
   std::filesystem::path directory;
   std::filesystem::path actor_model;
@@ -453,6 +459,9 @@ inline json::Object BuildVrpoExpandedManifest(
       serialized_layout.actor_names_shapes_sha256;
   out["serialized_q_names_shapes_sha256"] =
       serialized_layout.q_names_shapes_sha256;
+  out["serialized_q_value_hash_schema"] = serialized_layout.test_fixture
+      ? "generic_named_parameter_values_v1"
+      : "canonical_dune_vrpo_q_module_v1";
   const std::array<std::pair<std::string, VrpoExpandedFileIdentity>, 4> files = {{
       {"actor_model", actor_model}, {"q_model", q_model},
       {"actor_optimizer", actor_optimizer}, {"q_optimizer", q_optimizer}}};
@@ -547,6 +556,32 @@ inline bool ValidateVrpoExpandedLiveLayout(
   if (expected.test_fixture && expected.label != "tiny_test_fixture_v1") {
     return fail("test fixture layout label is invalid");
   }
+  return true;
+}
+
+inline bool VrpoExpandedQValueIdentitySha256(
+    torch::nn::Module& q_model,
+    const VrpoExpandedExpectedLayout& expected_layout,
+    std::string* output, std::string* error) {
+  if (output == nullptr) {
+    if (error != nullptr) *error = "null serialized Q identity output";
+    return false;
+  }
+  output->clear();
+  if (!expected_layout.test_fixture) {
+    auto* canonical = dynamic_cast<DuneVrpoQNetImpl*>(&q_model);
+    if (canonical == nullptr) {
+      if (error != nullptr) *error = "production Q module is not canonical";
+      return false;
+    }
+    return VrpoQModuleParameterSha256(*canonical, output, error);
+  }
+  std::vector<VrpoNamedParameterIdentity> identities;
+  if (!VrpoNamedParameterIdentities(
+          q_model, nullptr, &identities, error)) {
+    return false;
+  }
+  *output = VrpoNamedParameterIdentitySha256(identities, true);
   return true;
 }
 
@@ -649,8 +684,11 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
       return fail(error == nullptr ? "parameter identity failed" : *error,
                   paths);
     }
-    const std::string q_parameter_hash =
-        VrpoNamedParameterIdentitySha256(q_identities, true);
+    std::string q_parameter_hash;
+    if (!VrpoExpandedQValueIdentitySha256(
+            *q_model, expected_layout, &q_parameter_hash, error)) {
+      return fail(error == nullptr ? "Q identity failed" : *error, paths);
+    }
     std::string zero_state_hash;
     if (!ValidateVrpoOptimizerGroupsAndZeroState(
             optimizers, *actor_model, *q_model, &zero_state_hash, error)) {
@@ -919,8 +957,11 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
           *q_model, nullptr, &q_identities, error)) {
     return fail(error == nullptr ? "expanded parameter identity failed" : *error);
   }
-  const std::string q_values_hash =
-      VrpoNamedParameterIdentitySha256(q_identities, true);
+  std::string q_values_hash;
+  if (!VrpoExpandedQValueIdentitySha256(
+          *q_model, expected_layout, &q_values_hash, error)) {
+    return fail(error == nullptr ? "expanded Q identity failed" : *error);
+  }
   const std::string actor_values_hash =
       VrpoNamedParameterIdentitySha256(actor_identities, true);
   std::string zero_state_hash;
@@ -975,6 +1016,465 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
   }
   return true;
 }
+
+inline bool DeriveVrpoPhase4ManifestBinding(
+    SharedDunePolicyValueNetImpl& actor_model, torch::nn::Module& q_model,
+    const VrpoFreshOptimizers& optimizers,
+    VrpoPhase4ManifestBinding binding_base,
+    const VrpoExpandedExpectedLayout& expected_layout,
+    VrpoPhase4ManifestBinding* output, std::string* error) {
+  if (output == nullptr) {
+    if (error != nullptr) *error = "null derived phase4 binding output";
+    return false;
+  }
+  *output = VrpoPhase4ManifestBinding{};
+  std::vector<VrpoNamedParameterIdentity> actor_identities;
+  std::vector<VrpoNamedParameterIdentity> q_identities;
+  if (!VrpoNamedParameterIdentities(
+          actor_model, nullptr, &actor_identities, error) ||
+      !VrpoNamedParameterIdentities(
+          q_model, nullptr, &q_identities, error)) {
+    return false;
+  }
+  std::string zero_state;
+  if (!ValidateVrpoOptimizerGroupsAndZeroState(
+          optimizers, actor_model, q_model, &zero_state, error)) {
+    return false;
+  }
+  binding_base.actor_subset_sha256 =
+      VrpoNamedParameterIdentitySha256(actor_identities, true);
+  binding_base.actor_names_shapes_sha256 =
+      VrpoNamedParameterIdentitySha256(actor_identities, false);
+  if (!VrpoExpandedQValueIdentitySha256(
+          q_model, expected_layout, &binding_base.q_init_sha256, error)) {
+    return false;
+  }
+  binding_base.q_names_shapes_sha256 =
+      VrpoNamedParameterIdentitySha256(q_identities, false);
+  std::string layout_payload = "dune_vrpo_phase4_module_layout_v1";
+  layout_payload.push_back('\0');
+  layout_payload += binding_base.actor_names_shapes_sha256;
+  layout_payload += binding_base.q_names_shapes_sha256;
+  binding_base.module_layout_sha256 = ComputeStringSHA256(layout_payload);
+  binding_base.optimizer_groups_sha256 = VrpoOptimizerGroupSpecSha256(
+      CanonicalVrpoPhase4OptimizerGroups());
+  binding_base.optimizer_zero_state_sha256 = zero_state;
+  if (!ValidateVrpoPhase4ManifestBinding(binding_base, error) ||
+      !ValidateVrpoExpandedLiveLayout(
+          actor_model, q_model, expected_layout, binding_base, error)) {
+    return false;
+  }
+  *output = std::move(binding_base);
+  return true;
+}
+
+struct VrpoBootstrapArmRange {
+  std::string arm_id;
+  uint64_t start_episode_id = 0;
+  uint64_t end_episode_id_inclusive = 0;
+};
+
+struct VrpoBootstrapStartupConfig {
+  std::string game;
+  std::string root;
+  std::string registration_id;
+  std::string source_root;
+  std::string source_code_sha256;
+  std::string source_actor_model_sha256;
+  int64_t source_actor_model_size = 0;
+  std::string source_manifest_sha256;
+  int64_t source_manifest_size = 0;
+  std::string executed_binary_sha256;
+  int64_t executed_binary_size = 0;
+  std::string experiment_uuid;
+  bool diagnostics_only = false;
+  std::string init_mode;
+  uint64_t q_init_seed = 0;
+  uint64_t base_seed = 0;
+  bool rollout_amp = true;
+  bool train_amp = true;
+  bool allow_tf32 = true;
+  bool pipeline = false;
+  bool online_search_collection = false;
+  bool search_pi_mode = false;
+  bool train_value_only = false;
+  bool sample_counterfactual_states = false;
+  bool has_search_label_dir = false;
+  bool checkpoint_writes_enabled = false;
+  double shaped_reward_weight = 0.0;
+  double tleilaxu_breadcrumb_weight = 0.0;
+  double tleilaxu_level7_breadcrumb_weight = 0.0;
+  double specimen_exchange_penalty = 0.0;
+  double reward_scale = 4.0;
+  double gamma = 1.0;
+  double lambda = 1.0;
+  std::array<VrpoBootstrapArmRange, 4> ranges;
+};
+
+inline bool ValidateVrpoBootstrapStartupConfig(
+    const VrpoBootstrapStartupConfig& config, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  auto lower_hex64 = [](const std::string& value) {
+    return value.size() == 64 &&
+        std::all_of(value.begin(), value.end(), [](char c) {
+          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+  };
+  if (config.game != "dune_imperium" || config.root.empty() ||
+      config.registration_id.empty() || config.source_root.empty() ||
+      !lower_hex64(config.source_code_sha256) ||
+      !lower_hex64(config.source_actor_model_sha256) ||
+      config.source_actor_model_size <= 0 ||
+      !lower_hex64(config.source_manifest_sha256) ||
+      config.source_manifest_size <= 0 ||
+      !lower_hex64(config.executed_binary_sha256) ||
+      config.executed_binary_size <= 0) {
+    return fail("VRPO bootstrap identity/game/root contract is invalid");
+  }
+  auto uuid_valid = [](const std::string& uuid) {
+    if (uuid.size() != 36) return false;
+    for (size_t i = 0; i < uuid.size(); ++i) {
+      if (i == 8 || i == 13 || i == 18 || i == 23) {
+        if (uuid[i] != '-') return false;
+      } else if (!((uuid[i] >= '0' && uuid[i] <= '9') ||
+                   (uuid[i] >= 'a' && uuid[i] <= 'f'))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!uuid_valid(config.experiment_uuid)) {
+    return fail("VRPO bootstrap experiment UUID is invalid");
+  }
+  if (!config.diagnostics_only || config.init_mode != "bootstrap") {
+    return fail("VRPO bootstrap requires diagnostics-only bootstrap init");
+  }
+  if (config.q_init_seed == 0 || config.base_seed == 0 ||
+      config.rollout_amp || config.train_amp || !config.allow_tf32) {
+    return fail("VRPO bootstrap seed/FP32/TF32 contract is invalid");
+  }
+  if (config.pipeline || config.online_search_collection ||
+      config.search_pi_mode || config.train_value_only ||
+      config.sample_counterfactual_states || config.has_search_label_dir ||
+      config.checkpoint_writes_enabled) {
+    return fail("VRPO bootstrap forbids rollout/search/training checkpoint paths");
+  }
+  for (double coefficient :
+       {config.shaped_reward_weight, config.tleilaxu_breadcrumb_weight,
+        config.tleilaxu_level7_breadcrumb_weight,
+        config.specimen_exchange_penalty}) {
+    if (!std::isfinite(coefficient) || coefficient != 0.0) {
+      return fail("VRPO bootstrap shaping must be exactly zero");
+    }
+  }
+  if (config.reward_scale != 4.0 || config.gamma != 1.0 ||
+      config.lambda != 1.0) {
+    return fail("VRPO bootstrap reward/gamma/lambda contract is invalid");
+  }
+  const auto arms = CanonicalVrpoPhase4Arms();
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  for (size_t i = 0; i < config.ranges.size(); ++i) {
+    const auto& range = config.ranges[i];
+    if (range.arm_id != arms[i].arm_id || range.start_episode_id == 0 ||
+        range.end_episode_id_inclusive < range.start_episode_id ||
+        range.end_episode_id_inclusive > static_cast<uint64_t>(
+            std::numeric_limits<int64_t>::max())) {
+      return fail("VRPO bootstrap arm episode range is invalid");
+    }
+    ranges.push_back({range.start_episode_id, range.end_episode_id_inclusive});
+  }
+  std::sort(ranges.begin(), ranges.end());
+  for (size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].first <= ranges[i - 1].second) {
+      return fail("VRPO bootstrap arm episode ranges overlap");
+    }
+  }
+  return true;
+}
+
+inline bool ValidateVrpoBootstrapObservedFileIdentities(
+    const VrpoBootstrapStartupConfig& config,
+    const std::string& observed_model_sha256, int64_t observed_model_size,
+    const std::string& observed_manifest_sha256,
+    int64_t observed_manifest_size,
+    const std::string& observed_binary_sha256, int64_t observed_binary_size,
+    std::string* error) {
+  const bool valid =
+      observed_model_sha256 == config.source_actor_model_sha256 &&
+      observed_model_size == config.source_actor_model_size &&
+      observed_manifest_sha256 == config.source_manifest_sha256 &&
+      observed_manifest_size == config.source_manifest_size &&
+      observed_binary_sha256 == config.executed_binary_sha256 &&
+      observed_binary_size == config.executed_binary_size;
+  if (!valid && error != nullptr) {
+    *error = "VRPO bootstrap observed model/manifest/binary identity mismatch";
+  }
+  return valid;
+}
+
+enum class VrpoBootstrapFailurePoint {
+  kNone,
+  kAfterArm0,
+  kAfterArm1,
+  kAfterArm2,
+  kAfterArm3,
+  kAfterGlobalManifestTemp,
+};
+
+struct VrpoBootstrapArmInput {
+  VrpoPhase4ArmConfig arm;
+  VrpoPhase4ManifestBinding binding;
+  VrpoExpandedExpectedLayout layout;
+  std::string checkpoint_uuid;
+  std::shared_ptr<SharedDunePolicyValueNetImpl> actor;
+  std::shared_ptr<torch::nn::Module> q;
+  VrpoFreshOptimizers* optimizers = nullptr;
+};
+
+inline void CleanupVrpoBootstrapRoot(const std::filesystem::path& root) {
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  const auto parent = root.parent_path();
+  if (!parent.empty() && std::filesystem::is_directory(parent)) {
+    std::string ignored;
+    VrpoFsyncDirectory(parent, &ignored);
+  }
+}
+
+inline bool ValidateVrpoBootstrapManifestSet(
+    const std::array<json::Object, 4>& expanded,
+    const std::array<VrpoPhase4ArmConfig, 4>& arms,
+    const std::array<VrpoPhase4ManifestBinding, 4>& bindings,
+    std::string* error) {
+  std::array<json::Object, 4> phase4;
+  for (size_t i = 0; i < expanded.size(); ++i) {
+    const auto contract = expanded[i].find("phase4_contract");
+    if (contract == expanded[i].end() || !contract->second.IsObject() ||
+        !ValidateVrpoPhase4ManifestStrict(
+            contract->second.GetObject(), arms[i], bindings[i], error)) {
+      return false;
+    }
+    phase4[i] = contract->second.GetObject();
+  }
+  const std::set<std::string> allowed = {
+      "arm_id", "algorithm", "logit_cap", "config_fingerprint",
+      "start_episode_id", "end_episode_id_inclusive"};
+  for (size_t i = 1; i < phase4.size(); ++i) {
+    for (const auto& field : phase4[0]) {
+      if (allowed.count(field.first)) continue;
+      const auto it = phase4[i].find(field.first);
+      if (it == phase4[i].end() ||
+          !VrpoJsonValuesExactlyEqual(field.second, it->second)) {
+        if (error != nullptr) {
+          *error = "VRPO bootstrap matched field differs: " + field.first;
+        }
+        return false;
+      }
+    }
+  }
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  for (const auto& binding : bindings) {
+    ranges.push_back({binding.start_episode_id,
+                      binding.end_episode_id_inclusive});
+  }
+  std::sort(ranges.begin(), ranges.end());
+  for (size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].first <= ranges[i - 1].second) {
+      if (error != nullptr) *error = "VRPO bootstrap manifest ranges overlap";
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool WriteVrpoBootstrapRootAtomic(
+    const std::filesystem::path& root,
+    const VrpoBootstrapStartupConfig& startup,
+    std::array<VrpoBootstrapArmInput, 4>& inputs,
+    VrpoBootstrapFailurePoint failure_point, json::Object* result_manifest,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (result_manifest != nullptr) result_manifest->clear();
+    CleanupVrpoBootstrapRoot(root);
+    return false;
+  };
+  if (result_manifest == nullptr) {
+    if (error != nullptr) *error = "null VRPO bootstrap result output";
+    return false;
+  }
+  result_manifest->clear();
+  std::string startup_error;
+  if (!ValidateVrpoBootstrapStartupConfig(startup, &startup_error)) {
+    if (error != nullptr) *error = startup_error;
+    return false;
+  }
+  if (std::filesystem::path(startup.root) != root) {
+    if (error != nullptr) *error = "VRPO bootstrap root argument differs from startup";
+    return false;
+  }
+  if (std::filesystem::exists(root)) {
+    if (error != nullptr) *error = "VRPO bootstrap root already exists";
+    return false;
+  }
+  std::error_code ec;
+  if (!std::filesystem::create_directories(root, ec) || ec) {
+    if (error != nullptr) *error = "cannot create VRPO bootstrap root";
+    return false;
+  }
+  if (!root.parent_path().empty() &&
+      !VrpoFsyncDirectory(root.parent_path(), error)) {
+    return fail("VRPO bootstrap parent fsync failed");
+  }
+  const auto canonical_arms = CanonicalVrpoPhase4Arms();
+  std::array<json::Object, 4> expanded;
+  std::array<VrpoPhase4ManifestBinding, 4> bindings;
+  std::array<VrpoExpandedArchiveIdentity, 4> archives;
+  for (size_t arm = 0; arm < inputs.size(); ++arm) {
+    const auto& range = startup.ranges[arm];
+    if (inputs[arm].optimizers == nullptr ||
+        inputs[arm].actor == nullptr || inputs[arm].q == nullptr ||
+        inputs[arm].arm.arm_id != canonical_arms[arm].arm_id ||
+        inputs[arm].binding.source_code_sha256 !=
+            startup.source_code_sha256 ||
+        inputs[arm].binding.source_actor_model_sha256 !=
+            startup.source_actor_model_sha256 ||
+        inputs[arm].binding.source_actor_manifest_sha256 !=
+            startup.source_manifest_sha256 ||
+        inputs[arm].binding.q_init_seed != startup.q_init_seed ||
+        inputs[arm].binding.base_seed != startup.base_seed ||
+        inputs[arm].binding.experiment_uuid != startup.experiment_uuid ||
+        inputs[arm].binding.start_episode_id != range.start_episode_id ||
+        inputs[arm].binding.end_episode_id_inclusive !=
+            range.end_episode_id_inclusive) {
+      return fail("VRPO bootstrap arm input/range is invalid");
+    }
+    const auto arm_directory = root / inputs[arm].arm.arm_id;
+    if (!SaveVrpoExpandedCheckpointAtomic(
+            arm_directory, inputs[arm].arm, inputs[arm].binding,
+            inputs[arm].layout, inputs[arm].checkpoint_uuid, 0,
+            inputs[arm].binding.start_episode_id, inputs[arm].actor,
+            inputs[arm].q, *inputs[arm].optimizers,
+            VrpoCheckpointFailurePoint::kNone, error, &archives[arm])) {
+      return fail(error != nullptr ? *error : "VRPO arm save failed");
+    }
+    if (!ReadVrpoExpandedManifest(arm_directory, &expanded[arm], error)) {
+      return fail(error != nullptr ? *error : "VRPO arm manifest read failed");
+    }
+    bindings[arm] = inputs[arm].binding;
+    if ((arm == 0 && failure_point == VrpoBootstrapFailurePoint::kAfterArm0) ||
+        (arm == 1 && failure_point == VrpoBootstrapFailurePoint::kAfterArm1) ||
+        (arm == 2 && failure_point == VrpoBootstrapFailurePoint::kAfterArm2) ||
+        (arm == 3 && failure_point == VrpoBootstrapFailurePoint::kAfterArm3)) {
+      return fail("injected VRPO bootstrap arm-stage failure");
+    }
+  }
+  if (!ValidateVrpoBootstrapManifestSet(
+          expanded, canonical_arms, bindings, error)) {
+    return fail(error != nullptr ? *error : "VRPO bootstrap set mismatch");
+  }
+  json::Object root_manifest;
+  root_manifest["schema"] = "dune_vrpo_phase4c_bootstrap_root_v1";
+  root_manifest["registration_id"] = startup.registration_id;
+  root_manifest["source_code_sha256"] = startup.source_code_sha256;
+  root_manifest["source_actor_model_sha256"] =
+      startup.source_actor_model_sha256;
+  root_manifest["source_actor_model_size"] =
+      startup.source_actor_model_size;
+  root_manifest["source_manifest_sha256"] = startup.source_manifest_sha256;
+  root_manifest["source_manifest_size"] = startup.source_manifest_size;
+  root_manifest["executed_binary_sha256"] =
+      startup.executed_binary_sha256;
+  root_manifest["executed_binary_size"] = startup.executed_binary_size;
+  root_manifest["experiment_uuid"] = startup.experiment_uuid;
+  root_manifest["q_init_seed"] = static_cast<int64_t>(startup.q_init_seed);
+  root_manifest["base_seed"] = static_cast<int64_t>(startup.base_seed);
+  root_manifest["optimizer_constructed"] = true;
+  root_manifest["optimizer_steps"] = int64_t{0};
+  root_manifest["backward_calls"] = int64_t{0};
+  root_manifest["training_updates"] = int64_t{0};
+  root_manifest["evaluator_constructed"] = false;
+  root_manifest["rollout_games"] = int64_t{0};
+  root_manifest["source_optimizer_loaded"] = false;
+  root_manifest["training_authorized"] = false;
+  json::Array arm_records;
+  for (size_t arm = 0; arm < inputs.size(); ++arm) {
+    json::Object record;
+    record["arm_id"] = inputs[arm].arm.arm_id;
+    record["algorithm"] = VrpoPhase4AlgorithmName(inputs[arm].arm.algorithm);
+    record["logit_cap"] = inputs[arm].arm.logit_cap;
+    record["start_episode_id"] =
+        static_cast<int64_t>(bindings[arm].start_episode_id);
+    record["end_episode_id_inclusive"] =
+        static_cast<int64_t>(bindings[arm].end_episode_id_inclusive);
+    record["archive_sha256"] = archives[arm].combined_sha256;
+    record["archive_file_count"] = int64_t{5};
+    record["expanded_manifest_sha256"] = archives[arm].files[4].sha256;
+    record["expanded_manifest_size"] = archives[arm].files[4].size;
+    record["actor_subset_sha256"] = bindings[arm].actor_subset_sha256;
+    record["q_init_sha256"] = bindings[arm].q_init_sha256;
+    record["module_layout_sha256"] = bindings[arm].module_layout_sha256;
+    record["optimizer_groups_sha256"] =
+        bindings[arm].optimizer_groups_sha256;
+    record["optimizer_zero_state_sha256"] =
+        bindings[arm].optimizer_zero_state_sha256;
+    arm_records.emplace_back(std::move(record));
+  }
+  root_manifest["arms"] = std::move(arm_records);
+  json::Object matching;
+  matching["actor_subset_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.actor_subset_sha256 == bindings[0].actor_subset_sha256;
+      });
+  matching["q_init_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.q_init_sha256 == bindings[0].q_init_sha256;
+      });
+  matching["module_layout_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.module_layout_sha256 == bindings[0].module_layout_sha256;
+      });
+  matching["optimizer_groups_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.optimizer_groups_sha256 ==
+            bindings[0].optimizer_groups_sha256;
+      });
+  matching["optimizer_zero_state_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.optimizer_zero_state_sha256 ==
+            bindings[0].optimizer_zero_state_sha256;
+      });
+  root_manifest["matching_matrix"] = std::move(matching);
+  root_manifest["classification"] = "VALID_BOOTSTRAP";
+  root_manifest["status"] = "VALID";
+  const auto result_path = root / "BOOTSTRAP_RESULT.json";
+  const auto result_tmp = root / ".BOOTSTRAP_RESULT.json.tmp";
+  {
+    std::ofstream stream(result_tmp, std::ios::trunc);
+    if (!stream) return fail("cannot write VRPO bootstrap result temp");
+    stream << json::ToString(root_manifest, true) << "\n";
+    stream.flush();
+    if (!stream) return fail("VRPO bootstrap result flush failed");
+  }
+  if (!VrpoFsyncFile(result_tmp, error)) {
+    return fail(error != nullptr ? *error : "VRPO root result fsync failed");
+  }
+  if (failure_point == VrpoBootstrapFailurePoint::kAfterGlobalManifestTemp) {
+    return fail("injected VRPO bootstrap global-manifest failure");
+  }
+  std::filesystem::rename(result_tmp, result_path);
+  if (!VrpoFsyncDirectory(root, error) ||
+      (!root.parent_path().empty() &&
+       !VrpoFsyncDirectory(root.parent_path(), error))) {
+    return fail(error != nullptr ? *error : "VRPO root commit fsync failed");
+  }
+  *result_manifest = std::move(root_manifest);
+  return true;
+}
+
 
 }  // namespace open_spiel
 
