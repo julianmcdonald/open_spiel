@@ -2278,6 +2278,227 @@ void TestVrpoDeterministicQModule() {
   } TEST_END();
 }
 
+void TestVrpoCapturedEpisodeAndZeroShapingRewards() {
+  TEST_BEGIN("VRPO phase 2b: sealed global capture, zero-shaping rewards, and reference conversion") {
+    CHECK_EQ(ComputeStringSHA256(std::string(kVrpoCaptureSchemaLabel)),
+             std::string(kVrpoCaptureSchemaSha256));
+    CHECK_EQ(ComputeStringSHA256(
+                 std::string(kVrpoZeroShapingRewardConventionLabel)),
+             std::string(kVrpoZeroShapingRewardConventionSha256));
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+    dune_state->SetPlayerHandForTesting(1, {3});
+
+    auto make_episode = [&]() {
+      VrpoCapturedEpisode episode;
+      episode.episode_id = 101;
+      for (int64_t t = 0; t < 4; ++t) {
+        VrpoCapturedRow row;
+        row.episode_id = episode.episode_id;
+        row.global_row_index = t;
+        row.actor = static_cast<Player>(t);
+        row.actor_observation = state->InformationStateTensor(row.actor);
+        row.central_tensor = dune_state->VrpoCentralCriticTensor(row.actor);
+        row.central_schema_sha256 =
+            kVrpoCentralCriticTensorSchemaSha256;
+        row.legal_actions = {static_cast<Action>(10 + 2 * t),
+                             static_cast<Action>(11 + 2 * t)};
+        row.chosen_index = static_cast<int>(t % 2);
+        row.chosen_action = row.legal_actions[row.chosen_index];
+        row.legal_behavior_probabilities = {0.25, 0.75};
+        episode.rows.push_back(std::move(row));
+      }
+      return episode;
+    };
+
+    VrpoZeroShapingRewardConfig config;
+    config.reward_scale = 4.0;
+    config.gamma = 0.9;
+    config.lambda = 0.8;
+    const VrpoSeatValues terminal_returns = {-8.0, -2.0, 6.0, 12.0};
+    VrpoCapturedEpisode episode = make_episode();
+    std::string error;
+    UTILS_CHECK(FinalizeVrpoZeroShapingEpisode(
+        &episode, terminal_returns, config, &error));
+    UTILS_CHECK(ValidateVrpoCapturedEpisode(episode, &error));
+    CHECK_EQ(episode.capture_schema_sha256,
+             std::string(kVrpoCaptureSchemaSha256));
+    CHECK_EQ(episode.reward_convention_sha256,
+             std::string(kVrpoZeroShapingRewardConventionSha256));
+    CHECK_EQ(episode.reward_scale, 4.0);
+    CHECK_EQ(episode.gamma, 0.9);
+    CHECK_EQ(episode.lambda, 0.8);
+    for (size_t t = 0; t + 1 < episode.rows.size(); ++t) {
+      UTILS_CHECK(episode.rows[t].rewards ==
+                  VrpoSeatValues({0.0, 0.0, 0.0, 0.0}));
+      UTILS_CHECK(!episode.rows[t].terminal_after);
+    }
+    UTILS_CHECK(episode.rows.back().rewards ==
+                VrpoSeatValues({-1.0, -0.5, 1.0, 1.0}));
+    UTILS_CHECK(episode.rows.back().terminal_after);
+    VrpoSeatValues reward_sums = {0.0, 0.0, 0.0, 0.0};
+    for (const auto& row : episode.rows) {
+      for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+        reward_sums[seat] += row.rewards[seat];
+      }
+      UTILS_CHECK(row.row_sha256.size() == 64);
+    }
+    UTILS_CHECK(reward_sums == VrpoSeatValues({-1.0, -0.5, 1.0, 1.0}));
+    UTILS_CHECK(episode.capture_sha256.size() == 64);
+
+    VrpoCapturedEpisode repeated = make_episode();
+    UTILS_CHECK(FinalizeVrpoZeroShapingEpisode(
+        &repeated, terminal_returns, config, &error));
+    CHECK_EQ(repeated.capture_sha256, episode.capture_sha256);
+    for (size_t t = 0; t < episode.rows.size(); ++t) {
+      CHECK_EQ(repeated.rows[t].row_sha256, episode.rows[t].row_sha256);
+    }
+
+    std::vector<std::vector<VrpoActorRelativeSeatValues>> relative_q;
+    for (size_t t = 0; t < episode.rows.size(); ++t) {
+      std::vector<VrpoActorRelativeSeatValues> legal;
+      for (size_t a = 0; a < episode.rows[t].legal_actions.size(); ++a) {
+        const double base = 100.0 * t + 10.0 * a;
+        VrpoActorRelativeSeatValues q;
+        q.slots = {base + 0.0, base + 1.0, base + 2.0, base + 3.0};
+        legal.push_back(q);
+      }
+      relative_q.push_back(std::move(legal));
+    }
+    std::vector<VrpoTimelineRow> timeline;
+    UTILS_CHECK(VrpoCapturedEpisodeToTimeline(
+        episode, relative_q, &timeline, &error));
+    CHECK_EQ(timeline.size(), episode.rows.size());
+    // Row 3 actor wraparound: relative slots [actor3,seat0,seat1,seat2].
+    CHECK_EQ(timeline[3].legal_q_values[0][3], 300.0);
+    CHECK_EQ(timeline[3].legal_q_values[0][0], 301.0);
+    CHECK_EQ(timeline[3].legal_q_values[0][1], 302.0);
+    CHECK_EQ(timeline[3].legal_q_values[0][2], 303.0);
+    VrpoReferenceTrace from_capture, direct;
+    UTILS_CHECK(ComputeVrpoCapturedEpisodeReference(
+        episode, relative_q, &from_capture, &error));
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        timeline, episode.gamma, episode.lambda, &direct, &error,
+        episode.probability_tolerance));
+    CHECK_EQ(from_capture.canonical_sha256, direct.canonical_sha256);
+
+    auto expect_invalid = [&](VrpoCapturedEpisode malformed,
+                              const std::string& needle) {
+      UTILS_CHECK(!ValidateVrpoCapturedEpisode(malformed, &error));
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    auto malformed = episode;
+    std::swap(malformed.rows[0], malformed.rows[1]);
+    expect_invalid(malformed, "global row order");
+    malformed = episode;
+    malformed.rows[2].global_row_index = 3;
+    expect_invalid(malformed, "global row order");
+    malformed = episode;
+    malformed.rows[1].episode_id = 102;
+    expect_invalid(malformed, "episode boundary");
+    malformed = episode;
+    malformed.rows[0].actor = 4;
+    expect_invalid(malformed, "actor is out of range");
+    malformed = episode;
+    malformed.rows[0].terminal_after = true;
+    expect_invalid(malformed, "terminal boundary");
+    malformed = episode;
+    malformed.rows.back().terminal_after = false;
+    expect_invalid(malformed, "terminal boundary");
+    malformed = episode;
+    malformed.rows[0].central_tensor[0] += 1.0f;
+    expect_invalid(malformed, "central prefix");
+    malformed = episode;
+    malformed.rows[0].actor_observation.pop_back();
+    expect_invalid(malformed, "dimensions are invalid");
+    malformed = episode;
+    malformed.rows[0].central_tensor.pop_back();
+    expect_invalid(malformed, "dimensions are invalid");
+    malformed = episode;
+    malformed.rows[0].central_tensor[100] =
+        std::numeric_limits<float>::quiet_NaN();
+    expect_invalid(malformed, "tensor is nonfinite");
+    malformed = episode;
+    malformed.rows[0].central_schema_sha256 = std::string(64, '0');
+    expect_invalid(malformed, "central tensor schema");
+    malformed = episode;
+    malformed.rows[0].row_sha256 = std::string(64, '0');
+    expect_invalid(malformed, "row hash mismatch");
+    malformed = episode;
+    malformed.capture_schema_sha256 = std::string(64, '0');
+    expect_invalid(malformed, "episode schema");
+    malformed = episode;
+    malformed.reward_convention_sha256 = std::string(64, '0');
+    expect_invalid(malformed, "reward convention");
+    malformed = episode;
+    malformed.capture_sha256 = std::string(64, '0');
+    expect_invalid(malformed, "episode hash mismatch");
+    malformed = episode;
+    malformed.rows[0].legal_actions[1] = malformed.rows[0].legal_actions[0];
+    expect_invalid(malformed, "duplicated");
+    malformed = episode;
+    malformed.rows[0].legal_actions[1] = kVrpoDuneActionDim;
+    expect_invalid(malformed, "out of range");
+    malformed = episode;
+    malformed.rows[0].legal_behavior_probabilities = {0.4, 0.4};
+    expect_invalid(malformed, "sum to one");
+    malformed = episode;
+    malformed.rows[0].legal_behavior_probabilities[0] =
+        std::numeric_limits<double>::infinity();
+    expect_invalid(malformed, "probability is invalid");
+    malformed = episode;
+    malformed.rows[0].legal_behavior_probabilities.pop_back();
+    expect_invalid(malformed, "widths differ");
+    malformed = episode;
+    malformed.rows[0].chosen_action = malformed.rows[0].legal_actions[1];
+    expect_invalid(malformed, "chosen index/action");
+    malformed = episode;
+    malformed.rows[0].is_counterfactual = true;
+    expect_invalid(malformed, "invalid or counterfactual");
+    malformed = episode;
+    malformed.rows[0].chosen_action = kInvalidAction;
+    expect_invalid(malformed, "invalid or counterfactual");
+
+    for (int shaping_field = 0; shaping_field < 4; ++shaping_field) {
+      VrpoCapturedEpisode refused = make_episode();
+      VrpoZeroShapingRewardConfig nonzero = config;
+      if (shaping_field == 0) nonzero.shaped_reward_weight = 0.1;
+      if (shaping_field == 1) nonzero.tleilaxu_breadcrumb_weight = 0.1;
+      if (shaping_field == 2) {
+        nonzero.tleilaxu_level7_breadcrumb_weight = 0.1;
+      }
+      if (shaping_field == 3) nonzero.specimen_exchange_penalty = 0.1;
+      UTILS_CHECK(!FinalizeVrpoZeroShapingEpisode(
+          &refused, terminal_returns, nonzero, &error));
+      UTILS_CHECK(!refused.rewards_finalized);
+      UTILS_CHECK(refused.capture_sha256.empty());
+      UTILS_CHECK(error.find("shaping coefficients") != std::string::npos);
+    }
+    VrpoCapturedEpisode refused = make_episode();
+    VrpoSeatValues bad_returns = terminal_returns;
+    bad_returns[0] = std::numeric_limits<double>::quiet_NaN();
+    UTILS_CHECK(!FinalizeVrpoZeroShapingEpisode(
+        &refused, bad_returns, config, &error));
+    UTILS_CHECK(!refused.rewards_finalized);
+
+    std::vector<std::vector<VrpoActorRelativeSeatValues>> wrong_q = relative_q;
+    wrong_q.pop_back();
+    UTILS_CHECK(!VrpoCapturedEpisodeToTimeline(
+        episode, wrong_q, &timeline, &error));
+    wrong_q = relative_q;
+    wrong_q[0].pop_back();
+    UTILS_CHECK(!VrpoCapturedEpisodeToTimeline(
+        episode, wrong_q, &timeline, &error));
+    wrong_q = relative_q;
+    wrong_q[0][0].slots[0] =
+        std::numeric_limits<double>::infinity();
+    UTILS_CHECK(!VrpoCapturedEpisodeToTimeline(
+        episode, wrong_q, &timeline, &error));
+  } TEST_END();
+}
+
 void TestVrpoGlobalExpectedSarsaLambdaReference() {
   TEST_BEGIN("VRPO phase 1: global Expected-SARSA(lambda) reference and strict timeline validation") {
     auto make_row = [](uint64_t episode, Player actor,
@@ -2586,6 +2807,7 @@ int main() {
   TestVrpoActorRelativeJointInformationTensor();
   TestVrpoCentralCriticTensor();
   TestVrpoDeterministicQModule();
+  TestVrpoCapturedEpisodeAndZeroShapingRewards();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

@@ -617,6 +617,398 @@ inline bool ComputeVrpoExpectedSarsaLambdaReference(
   return true;
 }
 
+inline constexpr char kVrpoCaptureSchemaLabel[] =
+    "dune_vrpo_capture_v1|episode_id:uint64|global_row_index:int64_contiguous_zero_based|actor:absolute_0_3|actor_obs:float32x5580|central:float32x9012|central_schema_sha256|legal_ids:ordered_unique_in_range|chosen_index_action|legal_behavior_probabilities:float64|rewards:absolute_float64x4|terminal_after|counterfactual=false|row_sha256";
+inline constexpr char kVrpoCaptureSchemaSha256[] =
+    "372e366961abf192da908041488a4f081cd01e7f34b301867c54f0cc838c6d19";
+inline constexpr char kVrpoZeroShapingRewardConventionLabel[] =
+    "dune_vrpo_reward_v1|zero_shaping_only|reward_scale=4|intermediate_rewards=absolute_zero_x4|final_reward=clamp(terminal_return_per_absolute_seat/4,-1,1)|gamma_lambda_registered|per_seat_conservation";
+inline constexpr char kVrpoZeroShapingRewardConventionSha256[] =
+    "b63478ccd2c7bc85028b6659a75c290df8f284a4a45a0fb2bd92abc477d89a9f";
+
+struct VrpoCapturedRow {
+  uint64_t episode_id = 0;
+  int64_t global_row_index = -1;
+  Player actor = kInvalidPlayer;  // absolute seat
+  std::vector<float> actor_observation;  // exactly 5580
+  std::vector<float> central_tensor;     // exactly 9012
+  std::string central_schema_sha256;
+  std::vector<Action> legal_actions;
+  int chosen_index = -1;
+  Action chosen_action = kInvalidAction;
+  std::vector<double> legal_behavior_probabilities;
+  VrpoSeatValues rewards = {0.0, 0.0, 0.0, 0.0};  // absolute seats
+  bool terminal_after = false;
+  bool is_counterfactual = false;
+  std::string row_sha256;
+};
+
+struct VrpoCapturedEpisode {
+  uint64_t episode_id = 0;
+  std::vector<VrpoCapturedRow> rows;
+  std::string capture_schema_sha256;
+  std::string reward_convention_sha256;
+  double reward_scale = 4.0;
+  double gamma = 1.0;
+  double lambda = 1.0;
+  double probability_tolerance = 1e-9;
+  VrpoSeatValues terminal_returns = {0.0, 0.0, 0.0, 0.0};
+  bool rewards_finalized = false;
+  std::string capture_sha256;
+};
+
+struct VrpoZeroShapingRewardConfig {
+  double reward_scale = 4.0;
+  double gamma = 1.0;
+  double lambda = 1.0;
+  double probability_tolerance = 1e-9;
+  double shaped_reward_weight = 0.0;
+  double tleilaxu_breadcrumb_weight = 0.0;
+  double tleilaxu_level7_breadcrumb_weight = 0.0;
+  double specimen_exchange_penalty = 0.0;
+};
+
+namespace vrpo_capture_internal {
+
+template <typename T>
+inline void AppendPod(std::string* payload, const T& value) {
+  payload->append(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+inline bool ValidateRowCore(const VrpoCapturedEpisode& episode,
+                            const VrpoCapturedRow& row, size_t expected_index,
+                            std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (row.episode_id != episode.episode_id) {
+    return fail("captured row crosses an episode boundary");
+  }
+  if (row.global_row_index != static_cast<int64_t>(expected_index)) {
+    return fail("captured global row order is not contiguous zero-based");
+  }
+  if (row.actor < 0 || row.actor >= kVrpoNumSeats) {
+    return fail("captured row actor is out of range");
+  }
+  if (row.is_counterfactual || row.chosen_action == kInvalidAction) {
+    return fail("captured row is invalid or counterfactual");
+  }
+  if (row.actor_observation.size() !=
+          static_cast<size_t>(kVrpoDuneInformationStateSize) ||
+      row.central_tensor.size() != static_cast<size_t>(
+          dune_imperium::kVrpoCentralCriticTensorSize)) {
+    return fail("captured actor/central tensor dimensions are invalid");
+  }
+  if (row.central_schema_sha256 !=
+      dune_imperium::kVrpoCentralCriticTensorSchemaSha256) {
+    return fail("captured central tensor schema hash is wrong");
+  }
+  const auto finite_float = [](float value) { return std::isfinite(value); };
+  if (!std::all_of(row.actor_observation.begin(),
+                   row.actor_observation.end(), finite_float) ||
+      !std::all_of(row.central_tensor.begin(), row.central_tensor.end(),
+                   finite_float)) {
+    return fail("captured actor/central tensor is nonfinite");
+  }
+  if (std::memcmp(row.actor_observation.data(), row.central_tensor.data(),
+                  kVrpoDuneInformationStateSize * sizeof(float)) != 0) {
+    return fail("captured central prefix does not bit-match actor observation");
+  }
+  const size_t legal_count = row.legal_actions.size();
+  if (legal_count == 0 ||
+      row.legal_behavior_probabilities.size() != legal_count) {
+    return fail("captured legal/probability widths differ or are empty");
+  }
+  if (row.chosen_index < 0 ||
+      row.chosen_index >= static_cast<int>(legal_count) ||
+      row.legal_actions[row.chosen_index] != row.chosen_action) {
+    return fail("captured chosen index/action is not aligned to legal order");
+  }
+  std::set<Action> seen;
+  double probability_sum = 0.0;
+  for (size_t a = 0; a < legal_count; ++a) {
+    const Action action = row.legal_actions[a];
+    if (action < 0 || action >= kVrpoDuneActionDim) {
+      return fail("captured legal action is out of range");
+    }
+    if (!seen.insert(action).second) {
+      return fail("captured legal action is duplicated");
+    }
+    const double probability = row.legal_behavior_probabilities[a];
+    if (!std::isfinite(probability) || probability < 0.0 ||
+        probability > 1.0 + episode.probability_tolerance) {
+      return fail("captured legal probability is invalid");
+    }
+    probability_sum += probability;
+  }
+  if (!std::isfinite(probability_sum) ||
+      std::abs(probability_sum - 1.0) > episode.probability_tolerance) {
+    return fail("captured legal probabilities do not sum to one");
+  }
+  if (!std::all_of(row.rewards.begin(), row.rewards.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    return fail("captured absolute reward is nonfinite");
+  }
+  return true;
+}
+
+inline std::string RowSha256(const VrpoCapturedRow& row) {
+  std::string payload = kVrpoCaptureSchemaSha256;
+  AppendPod(&payload, row.episode_id);
+  AppendPod(&payload, row.global_row_index);
+  AppendPod(&payload, row.actor);
+  payload.append(reinterpret_cast<const char*>(row.actor_observation.data()),
+                 row.actor_observation.size() * sizeof(float));
+  payload.append(reinterpret_cast<const char*>(row.central_tensor.data()),
+                 row.central_tensor.size() * sizeof(float));
+  payload.append(row.central_schema_sha256);
+  const uint64_t legal_count = row.legal_actions.size();
+  AppendPod(&payload, legal_count);
+  for (size_t a = 0; a < row.legal_actions.size(); ++a) {
+    AppendPod(&payload, row.legal_actions[a]);
+    AppendPod(&payload, row.legal_behavior_probabilities[a]);
+  }
+  AppendPod(&payload, row.chosen_index);
+  AppendPod(&payload, row.chosen_action);
+  for (double reward : row.rewards) AppendPod(&payload, reward);
+  AppendPod(&payload, row.terminal_after);
+  AppendPod(&payload, row.is_counterfactual);
+  return ComputeStringSHA256(payload);
+}
+
+inline std::string EpisodeSha256(const VrpoCapturedEpisode& episode) {
+  std::string payload = kVrpoCaptureSchemaSha256;
+  payload.append(episode.reward_convention_sha256);
+  AppendPod(&payload, episode.episode_id);
+  AppendPod(&payload, episode.reward_scale);
+  AppendPod(&payload, episode.gamma);
+  AppendPod(&payload, episode.lambda);
+  AppendPod(&payload, episode.probability_tolerance);
+  for (double value : episode.terminal_returns) AppendPod(&payload, value);
+  AppendPod(&payload, episode.rewards_finalized);
+  const uint64_t rows = episode.rows.size();
+  AppendPod(&payload, rows);
+  for (const auto& row : episode.rows) payload.append(row.row_sha256);
+  return ComputeStringSHA256(payload);
+}
+
+inline void RefreshHashes(VrpoCapturedEpisode* episode) {
+  for (auto& row : episode->rows) row.row_sha256 = RowSha256(row);
+  episode->capture_sha256 = EpisodeSha256(*episode);
+}
+
+}  // namespace vrpo_capture_internal
+
+inline bool ValidateVrpoCapturedEpisode(const VrpoCapturedEpisode& episode,
+                                        std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (episode.capture_schema_sha256 != kVrpoCaptureSchemaSha256) {
+    return fail("captured episode schema hash is wrong");
+  }
+  if (episode.reward_convention_sha256 !=
+      kVrpoZeroShapingRewardConventionSha256) {
+    return fail("captured reward convention hash is wrong");
+  }
+  if (!episode.rewards_finalized) {
+    return fail("captured episode rewards are not finalized");
+  }
+  if (episode.rows.empty()) return fail("captured episode has no rows");
+  if (episode.reward_scale != 4.0 || !std::isfinite(episode.gamma) ||
+      episode.gamma < 0.0 || episode.gamma > 1.0 ||
+      !std::isfinite(episode.lambda) || episode.lambda < 0.0 ||
+      episode.lambda > 1.0 ||
+      !std::isfinite(episode.probability_tolerance) ||
+      episode.probability_tolerance < 0.0 ||
+      episode.probability_tolerance > kVrpoMaxProbabilityTolerance) {
+    return fail("captured reward scale/gamma/lambda/tolerance is invalid");
+  }
+  for (double value : episode.terminal_returns) {
+    if (!std::isfinite(value)) return fail("terminal return is nonfinite");
+  }
+  VrpoSeatValues reward_sums = {0.0, 0.0, 0.0, 0.0};
+  for (size_t t = 0; t < episode.rows.size(); ++t) {
+    const VrpoCapturedRow& row = episode.rows[t];
+    std::string row_error;
+    if (!vrpo_capture_internal::ValidateRowCore(
+            episode, row, t, &row_error)) {
+      return fail(row_error);
+    }
+    if (row.terminal_after != (t + 1 == episode.rows.size())) {
+      return fail("captured terminal boundary is not exactly the final row");
+    }
+    if (row.row_sha256 != vrpo_capture_internal::RowSha256(row)) {
+      return fail("captured row hash mismatch");
+    }
+    for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+      const double expected =
+          (t + 1 == episode.rows.size())
+              ? std::clamp(episode.terminal_returns[seat] / 4.0, -1.0, 1.0)
+              : 0.0;
+      if (row.rewards[seat] != expected) {
+        return fail("captured zero-shaping reward placement is wrong");
+      }
+      reward_sums[seat] += row.rewards[seat];
+    }
+  }
+  for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+    const double expected =
+        std::clamp(episode.terminal_returns[seat] / 4.0, -1.0, 1.0);
+    if (reward_sums[seat] != expected) {
+      return fail("captured per-seat reward conservation failed");
+    }
+  }
+  if (episode.capture_sha256 !=
+      vrpo_capture_internal::EpisodeSha256(episode)) {
+    return fail("captured episode hash mismatch");
+  }
+  return true;
+}
+
+inline bool FinalizeVrpoZeroShapingEpisode(
+    VrpoCapturedEpisode* episode, const VrpoSeatValues& terminal_returns,
+    const VrpoZeroShapingRewardConfig& config, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (episode == nullptr) return fail("null captured episode");
+  if (episode->rows.empty()) return fail("captured episode has no rows");
+  if (config.reward_scale != 4.0 || !std::isfinite(config.gamma) ||
+      config.gamma < 0.0 || config.gamma > 1.0 ||
+      !std::isfinite(config.lambda) || config.lambda < 0.0 ||
+      config.lambda > 1.0 ||
+      !std::isfinite(config.probability_tolerance) ||
+      config.probability_tolerance < 0.0 ||
+      config.probability_tolerance > kVrpoMaxProbabilityTolerance) {
+    return fail("zero-shaping reward config is invalid");
+  }
+  for (double coefficient :
+       {config.shaped_reward_weight, config.tleilaxu_breadcrumb_weight,
+        config.tleilaxu_level7_breadcrumb_weight,
+        config.specimen_exchange_penalty}) {
+    if (!std::isfinite(coefficient) || coefficient != 0.0) {
+      return fail("all shaping coefficients must be exactly zero");
+    }
+  }
+  for (double value : terminal_returns) {
+    if (!std::isfinite(value)) return fail("terminal return is nonfinite");
+  }
+
+  VrpoCapturedEpisode candidate = *episode;
+  candidate.capture_schema_sha256 = kVrpoCaptureSchemaSha256;
+  candidate.reward_convention_sha256 =
+      kVrpoZeroShapingRewardConventionSha256;
+  candidate.reward_scale = config.reward_scale;
+  candidate.gamma = config.gamma;
+  candidate.lambda = config.lambda;
+  candidate.probability_tolerance = config.probability_tolerance;
+  candidate.terminal_returns = terminal_returns;
+  candidate.rewards_finalized = true;
+  for (size_t t = 0; t < candidate.rows.size(); ++t) {
+    std::string row_error;
+    if (!vrpo_capture_internal::ValidateRowCore(
+            candidate, candidate.rows[t], t, &row_error)) {
+      return fail(row_error);
+    }
+    candidate.rows[t].rewards = {0.0, 0.0, 0.0, 0.0};
+    candidate.rows[t].terminal_after = false;
+  }
+  candidate.rows.back().terminal_after = true;
+  for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+    candidate.rows.back().rewards[seat] =
+        std::clamp(terminal_returns[seat] / 4.0, -1.0, 1.0);
+  }
+  vrpo_capture_internal::RefreshHashes(&candidate);
+  std::string validation_error;
+  if (!ValidateVrpoCapturedEpisode(candidate, &validation_error)) {
+    return fail("finalized capture validation failed: " + validation_error);
+  }
+  *episode = std::move(candidate);
+  return true;
+}
+
+inline bool VrpoCapturedEpisodeToTimeline(
+    const VrpoCapturedEpisode& episode,
+    const std::vector<std::vector<VrpoActorRelativeSeatValues>>&
+        relative_legal_q_by_row,
+    std::vector<VrpoTimelineRow>* timeline, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (timeline != nullptr) timeline->clear();
+    return false;
+  };
+  if (timeline == nullptr) return fail("null timeline output");
+  timeline->clear();
+  std::string validation_error;
+  if (!ValidateVrpoCapturedEpisode(episode, &validation_error)) {
+    return fail("captured episode is invalid: " + validation_error);
+  }
+  if (relative_legal_q_by_row.size() != episode.rows.size()) {
+    return fail("relative Q outer row count differs from capture");
+  }
+  std::vector<VrpoTimelineRow> converted;
+  converted.reserve(episode.rows.size());
+  for (size_t t = 0; t < episode.rows.size(); ++t) {
+    const VrpoCapturedRow& captured = episode.rows[t];
+    if (relative_legal_q_by_row[t].size() !=
+        captured.legal_actions.size()) {
+      return fail("relative Q legal width differs from capture");
+    }
+    std::vector<VrpoSeatValues> absolute_q;
+    std::string adapter_error;
+    if (!VrpoActorRelativeQToAbsolute(
+            captured.actor, relative_legal_q_by_row[t], &absolute_q,
+            &adapter_error)) {
+      return fail("relative Q conversion failed: " + adapter_error);
+    }
+    VrpoTimelineRow row;
+    row.episode_id = captured.episode_id;
+    row.actor = captured.actor;
+    row.legal_actions = captured.legal_actions;
+    row.chosen_index = captured.chosen_index;
+    row.chosen_action = captured.chosen_action;
+    row.legal_probabilities = captured.legal_behavior_probabilities;
+    row.legal_q_values = std::move(absolute_q);
+    row.rewards = captured.rewards;
+    row.terminal_after = captured.terminal_after;
+    converted.push_back(std::move(row));
+  }
+  *timeline = std::move(converted);
+  return true;
+}
+
+inline bool ComputeVrpoCapturedEpisodeReference(
+    const VrpoCapturedEpisode& episode,
+    const std::vector<std::vector<VrpoActorRelativeSeatValues>>&
+        relative_legal_q_by_row,
+    VrpoReferenceTrace* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = VrpoReferenceTrace{};
+    return false;
+  };
+  if (output == nullptr) return fail("null captured-reference output");
+  *output = VrpoReferenceTrace{};
+  std::vector<VrpoTimelineRow> timeline;
+  std::string conversion_error;
+  if (!VrpoCapturedEpisodeToTimeline(
+          episode, relative_legal_q_by_row, &timeline,
+          &conversion_error)) {
+    return fail(conversion_error);
+  }
+  std::string reference_error;
+  if (!ComputeVrpoExpectedSarsaLambdaReference(
+          timeline, episode.gamma, episode.lambda, output,
+          &reference_error, episode.probability_tolerance)) {
+    return fail("reference trace failed: " + reference_error);
+  }
+  return true;
+}
+
 }  // namespace open_spiel
 
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_VRPO_H_
