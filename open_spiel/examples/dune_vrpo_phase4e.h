@@ -746,6 +746,13 @@ inline bool WriteVrpoPhase4eOneUpdate(
     return fail("injected phase4e preflight failure");
   }
 
+  vrpo_training_internal::ModuleRuntimePlacement actor_placement;
+  vrpo_training_internal::ModuleRuntimePlacement q_placement;
+  if (!vrpo_training_internal::CapturePhase4dRuntimePlacements(
+          *actor, *q, &actor_placement, &q_placement, error)) {
+    return fail(error != nullptr ? *error
+                                 : "phase4e module placement is invalid");
+  }
   vrpo_training_internal::TrainingTransaction transaction;
   if (!transaction.Capture(*actor, *q, *optimizers->actor,
                            *optimizers->q, error)) {
@@ -762,15 +769,48 @@ inline bool WriteVrpoPhase4eOneUpdate(
   }
 
   VrpoPhase4eCanary canary = MakeVrpoPhase4eCanary(layout);
-  const torch::Device actor_device = actor->input_layer->weight.device();
-  const torch::Device q_device = q->parameters().front().device();
+  torch::Tensor actor_canary_input;
+  torch::Tensor q_canary_input;
+  if (!vrpo_training_internal::MoveTensorToPlacement(
+          canary.actor_input, actor_placement, "phase4e actor canary",
+          &actor_canary_input, error) ||
+      !vrpo_training_internal::MoveTensorToPlacement(
+          canary.q_input, q_placement, "phase4e Q canary",
+          &q_canary_input, error)) {
+    return fail(error != nullptr ? *error
+                                 : "phase4e canary placement failed");
+  }
   torch::Tensor actor_logits_before;
   torch::Tensor q_values_before;
-  {
-    torch::NoGradGuard no_grad;
-    actor_logits_before = actor_forward(
-        canary.actor_input.to(actor_device)).logits.detach().cpu();
-    q_values_before = q_forward(canary.q_input.to(q_device)).detach().cpu();
+  auto evaluate_canary = [&](torch::Tensor* actor_logits,
+                             torch::Tensor* q_values) {
+    try {
+      torch::NoGradGuard no_grad;
+      const VrpoActorTrainingOutput actor_output =
+          actor_forward(actor_canary_input);
+      const torch::Tensor q_output = q_forward(q_canary_input);
+      if (!vrpo_training_internal::ValidateActorOutput(
+              actor_output, actor_canary_input.size(0), actor_placement,
+              error) ||
+          !vrpo_training_internal::ValidateQOutput(
+              q_output, q_canary_input.size(0), q_placement, error)) {
+        return false;
+      }
+      *actor_logits = actor_output.logits.detach().contiguous().cpu();
+      *q_values = q_output.detach().contiguous().cpu();
+      return vrpo_training_internal::FiniteTensor(*actor_logits) &&
+          vrpo_training_internal::FiniteTensor(*q_values);
+    } catch (const std::exception& exception) {
+      if (error != nullptr) {
+        *error = std::string("phase4e canary forward failed: ") +
+            exception.what();
+      }
+      return false;
+    }
+  };
+  if (!evaluate_canary(&actor_logits_before, &q_values_before)) {
+    return fail(error != nullptr && !error->empty()
+                    ? *error : "phase4e pre-save canary failed");
   }
   const std::string actor_canary_before =
       VrpoPhase4eTensorSha256(actor_logits_before, "actor_logits");
@@ -827,11 +867,9 @@ inline bool WriteVrpoPhase4eOneUpdate(
   }
   torch::Tensor actor_logits_after;
   torch::Tensor q_values_after;
-  {
-    torch::NoGradGuard no_grad;
-    actor_logits_after = actor_forward(
-        canary.actor_input.to(actor_device)).logits.detach().cpu();
-    q_values_after = q_forward(canary.q_input.to(q_device)).detach().cpu();
+  if (!evaluate_canary(&actor_logits_after, &q_values_after)) {
+    return fail(error != nullptr && !error->empty()
+                    ? *error : "phase4e post-reload canary failed");
   }
   const std::string actor_canary_after =
       VrpoPhase4eTensorSha256(actor_logits_after, "actor_logits");

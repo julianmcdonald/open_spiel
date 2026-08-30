@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -97,6 +98,18 @@ struct VrpoTrainingTargetBundle {
   std::string canonical_sha256;
 };
 
+struct VrpoFixedLegalQRow {
+  uint64_t row_id = 0;
+  std::vector<Action> legal_actions;
+  std::vector<VrpoActorRelativeSeatValues> legal_q_actor_relative;
+};
+
+struct VrpoFixedLegalQTable {
+  std::vector<VrpoFixedLegalQRow> rows;
+  std::string q_values_sha256;
+  std::string canonical_sha256;
+};
+
 struct VrpoTrainingUpdateStats {
   bool success = false;
   int64_t actor_optimizer_steps = 0;
@@ -158,6 +171,70 @@ struct ModuleRuntimePlacement {
   torch::Dtype dtype = torch::kFloat32;
 };
 
+struct BatchPlacementCounters {
+  int64_t actor_batches = 0;
+  int64_t q_batches = 0;
+  int64_t source_rows = 0;
+  int64_t placement_calls = 0;
+  int64_t destination_finite_checks = 0;
+  int64_t legal_index_placement_calls = 0;
+  int64_t legal_probability_host_copies = 0;
+  int64_t legal_probability_finite_checks = 0;
+  int64_t actor_diagnostic_host_copies = 0;
+  int64_t actor_old_probability_placement_calls = 0;
+  int64_t gradient_summary_host_copies = 0;
+  int64_t q_target_placement_calls = 0;
+  int64_t fixed_q_index_placement_calls = 0;
+  int64_t fixed_q_host_copies = 0;
+};
+
+inline std::atomic<int64_t> g_phase4d_actor_batches{0};
+inline std::atomic<int64_t> g_phase4d_q_batches{0};
+inline std::atomic<int64_t> g_phase4d_source_rows{0};
+inline std::atomic<int64_t> g_phase4d_placement_calls{0};
+inline std::atomic<int64_t> g_phase4d_destination_finite_checks{0};
+inline std::atomic<int64_t> g_phase4d_legal_index_placement_calls{0};
+inline std::atomic<int64_t> g_phase4d_legal_probability_host_copies{0};
+inline std::atomic<int64_t> g_phase4d_legal_probability_finite_checks{0};
+inline std::atomic<int64_t> g_phase4d_actor_diagnostic_host_copies{0};
+inline std::atomic<int64_t> g_phase4d_actor_old_probability_placement_calls{0};
+inline std::atomic<int64_t> g_phase4d_gradient_summary_host_copies{0};
+inline std::atomic<int64_t> g_phase4d_q_target_placement_calls{0};
+inline std::atomic<int64_t> g_phase4d_fixed_q_index_placement_calls{0};
+inline std::atomic<int64_t> g_phase4d_fixed_q_host_copies{0};
+
+inline void ResetBatchPlacementCounters() {
+  g_phase4d_actor_batches.store(0);
+  g_phase4d_q_batches.store(0);
+  g_phase4d_source_rows.store(0);
+  g_phase4d_placement_calls.store(0);
+  g_phase4d_destination_finite_checks.store(0);
+  g_phase4d_legal_index_placement_calls.store(0);
+  g_phase4d_legal_probability_host_copies.store(0);
+  g_phase4d_legal_probability_finite_checks.store(0);
+  g_phase4d_actor_diagnostic_host_copies.store(0);
+  g_phase4d_actor_old_probability_placement_calls.store(0);
+  g_phase4d_gradient_summary_host_copies.store(0);
+  g_phase4d_q_target_placement_calls.store(0);
+  g_phase4d_fixed_q_index_placement_calls.store(0);
+  g_phase4d_fixed_q_host_copies.store(0);
+}
+
+inline BatchPlacementCounters ReadBatchPlacementCounters() {
+  return {g_phase4d_actor_batches.load(), g_phase4d_q_batches.load(),
+          g_phase4d_source_rows.load(), g_phase4d_placement_calls.load(),
+          g_phase4d_destination_finite_checks.load(),
+          g_phase4d_legal_index_placement_calls.load(),
+          g_phase4d_legal_probability_host_copies.load(),
+          g_phase4d_legal_probability_finite_checks.load(),
+          g_phase4d_actor_diagnostic_host_copies.load(),
+          g_phase4d_actor_old_probability_placement_calls.load(),
+          g_phase4d_gradient_summary_host_copies.load(),
+          g_phase4d_q_target_placement_calls.load(),
+          g_phase4d_fixed_q_index_placement_calls.load(),
+          g_phase4d_fixed_q_host_copies.load()};
+}
+
 // Expanded archives are deliberately CPU-portable. LibTorch restores archive
 // tensors on CPU, so every load/rollback must explicitly put the live module
 // back on the device and dtype that owned the transaction before serialization.
@@ -188,6 +265,53 @@ inline bool CaptureUniformModuleRuntimePlacement(
   if (first) {
     if (error != nullptr) *error = "module has no parameters";
     return false;
+  }
+  return true;
+}
+
+inline bool CapturePhase4dRuntimePlacements(
+    torch::nn::Module& actor_model, torch::nn::Module& q_model,
+    ModuleRuntimePlacement* actor, ModuleRuntimePlacement* q,
+    std::string* error) {
+  if (actor == nullptr || q == nullptr ||
+      !CaptureUniformModuleRuntimePlacement(actor_model, actor, error) ||
+      !CaptureUniformModuleRuntimePlacement(q_model, q, error)) {
+    return false;
+  }
+  if (actor->dtype != torch::kFloat32 || q->dtype != torch::kFloat32) {
+    if (error != nullptr) *error = "phase4d modules must use Float32 parameters";
+    return false;
+  }
+  if (actor->device != q->device || actor->dtype != q->dtype) {
+    if (error != nullptr) {
+      *error = "phase4d actor and Q modules do not share device/dtype";
+    }
+    return false;
+  }
+  return true;
+}
+
+inline bool MoveTensorToPlacement(
+    const torch::Tensor& input, const ModuleRuntimePlacement& placement,
+    const std::string& label, torch::Tensor* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = label + ": " + message;
+    if (output != nullptr) *output = torch::Tensor();
+    return false;
+  };
+  if (output == nullptr || !input.defined() || !input.is_floating_point() ||
+      input.numel() <= 0 || !FiniteTensor(input)) {
+    return fail("input tensor is empty, nonfloating, or nonfinite");
+  }
+  try {
+    *output = input.to(placement.device, placement.dtype).contiguous();
+  } catch (const std::exception& exception) {
+    return fail(std::string("device/dtype transfer failed: ") +
+                exception.what());
+  }
+  if (output->device() != placement.device ||
+      output->scalar_type() != placement.dtype || !FiniteTensor(*output)) {
+    return fail("transferred tensor has wrong placement or is nonfinite");
   }
   return true;
 }
@@ -308,33 +432,53 @@ inline bool GradientNorm(torch::nn::Module& module,
   }
   *norm = 0.0;
   *any_gradient = false;
-  long double sum_squares = 0.0;
   bool selected = false;
+  torch::Tensor sum_squares;
+  torch::Tensor gradients_finite;
+  torch::Device gradient_device = torch::kCPU;
   for (const auto& item : module.named_parameters()) {
     if (!prefix.empty() && item.key().rfind(prefix, 0) != 0) continue;
     selected = true;
     const torch::Tensor gradient = item.value().grad();
     if (!gradient.defined()) continue;
     *any_gradient = true;
-    if (!FiniteTensor(gradient)) {
-      if (error != nullptr) *error = "parameter gradient is nonfinite";
+    if (gradient.device() != item.value().device() ||
+        gradient.scalar_type() != item.value().scalar_type() ||
+        gradient.sizes() != item.value().sizes()) {
+      if (error != nullptr) *error = "parameter gradient placement is invalid";
       return false;
     }
-    const double squared = gradient.detach().to(torch::kFloat64)
-                               .pow(2)
-                               .sum()
-                               .item<double>();
-    if (!std::isfinite(squared)) {
-      if (error != nullptr) *error = "gradient norm is nonfinite";
+    if (!sum_squares.defined()) {
+      gradient_device = gradient.device();
+      sum_squares = torch::zeros(
+          {}, torch::TensorOptions().dtype(torch::kFloat64)
+                  .device(gradient_device));
+      gradients_finite = torch::ones(
+          {}, torch::TensorOptions().dtype(torch::kBool)
+                  .device(gradient_device));
+    } else if (gradient.device() != gradient_device) {
+      if (error != nullptr) *error = "selected gradients span devices";
       return false;
     }
-    sum_squares += squared;
+    gradients_finite = gradients_finite.logical_and(
+        torch::isfinite(gradient).all());
+    sum_squares = sum_squares +
+        gradient.detach().to(torch::kFloat64).pow(2).sum();
   }
   if (!selected) {
     if (error != nullptr) *error = "gradient prefix selected no parameters";
     return false;
   }
-  *norm = std::sqrt(static_cast<double>(sum_squares));
+  if (!*any_gradient) return true;
+  g_phase4d_gradient_summary_host_copies.fetch_add(1);
+  torch::Tensor summary = torch::stack(
+      {gradients_finite.to(torch::kFloat64), sum_squares}).cpu();
+  const double* values = summary.data_ptr<double>();
+  if (values[0] != 1.0 || !std::isfinite(values[1]) || values[1] < 0.0) {
+    if (error != nullptr) *error = "gradient norm is nonfinite";
+    return false;
+  }
+  *norm = std::sqrt(values[1]);
   if (!std::isfinite(*norm)) {
     if (error != nullptr) *error = "gradient norm is nonfinite";
     return false;
@@ -380,21 +524,59 @@ inline bool ValidateOptimizerCoverage(torch::optim::Optimizer& optimizer,
 
 inline bool OptimizerStateIsFresh(torch::optim::Optimizer& optimizer,
                                   std::string* error) {
-  for (const auto& entry : optimizer.state()) {
-    const auto* state = dynamic_cast<const torch::optim::AdamWParamState*>(
-        entry.second.get());
-    if (state == nullptr || state->step() != 0) {
-      if (error != nullptr) *error = "optimizer state is not fresh step zero";
-      return false;
+  std::set<c10::TensorImpl*> parameters;
+  for (const auto& group : optimizer.param_groups()) {
+    for (const torch::Tensor& parameter : group.params()) {
+      if (!parameters.insert(parameter.unsafeGetTensorImpl()).second) {
+        if (error != nullptr) *error = "optimizer repeats a parameter";
+        return false;
+      }
     }
-    if ((state->exp_avg().defined() &&
-         (!FiniteTensor(state->exp_avg()) ||
-          state->exp_avg().abs().max().item<double>() != 0.0)) ||
-        (state->exp_avg_sq().defined() &&
-         (!FiniteTensor(state->exp_avg_sq()) ||
-          state->exp_avg_sq().abs().max().item<double>() != 0.0))) {
-      if (error != nullptr) *error = "optimizer moments are not exactly zero";
-      return false;
+  }
+  if (!optimizer.state().empty() &&
+      optimizer.state().size() != parameters.size()) {
+    if (error != nullptr) *error = "optimizer fresh state is partial or extra";
+    return false;
+  }
+  for (const auto& group : optimizer.param_groups()) {
+    for (const torch::Tensor& parameter : group.params()) {
+      const auto found = optimizer.state().find(
+          parameter.unsafeGetTensorImpl());
+      if (found == optimizer.state().end()) {
+        if (optimizer.state().empty()) continue;
+        if (error != nullptr) *error = "optimizer fresh state omits a parameter";
+        return false;
+      }
+      const auto* state = dynamic_cast<const torch::optim::AdamWParamState*>(
+          found->second.get());
+      if (state == nullptr || state->step() != 0 ||
+          !state->exp_avg().defined() || !state->exp_avg_sq().defined()) {
+        if (error != nullptr) *error = "optimizer state is not fresh step zero";
+        return false;
+      }
+      for (const torch::Tensor& moment :
+           {state->exp_avg(), state->exp_avg_sq()}) {
+        if (moment.device() != parameter.device() ||
+            moment.scalar_type() != parameter.scalar_type() ||
+            moment.sizes() != parameter.sizes() || !FiniteTensor(moment) ||
+            moment.abs().max().item<double>() != 0.0) {
+          if (error != nullptr) {
+            *error = "optimizer fresh moment placement/value is invalid";
+          }
+          return false;
+        }
+      }
+      if (state->max_exp_avg_sq().defined() &&
+          (state->max_exp_avg_sq().device() != parameter.device() ||
+           state->max_exp_avg_sq().scalar_type() != parameter.scalar_type() ||
+           state->max_exp_avg_sq().sizes() != parameter.sizes() ||
+           !FiniteTensor(state->max_exp_avg_sq()) ||
+           state->max_exp_avg_sq().abs().max().item<double>() != 0.0)) {
+        if (error != nullptr) {
+          *error = "optimizer fresh AMSGrad moment placement/value is invalid";
+        }
+        return false;
+      }
     }
   }
   return true;
@@ -503,6 +685,8 @@ class TrainingTransaction {
     q_model_ = &q_model;
     actor_optimizer_ = &actor_optimizer;
     q_optimizer_ = &q_optimizer;
+    actor_optimizer_state_was_empty_ = actor_optimizer.state().empty();
+    q_optimizer_state_was_empty_ = q_optimizer.state().empty();
     actor_training_ = actor_model.is_training();
     q_training_ = q_model.is_training();
     for (const auto& item : actor_model.named_parameters()) {
@@ -538,6 +722,13 @@ class TrainingTransaction {
   bool Rollback(std::string* error) noexcept {
     if (!active_) return true;
     active_ = false;
+    bool restored = true;
+    std::string failure;
+    auto record_failure = [&](const std::string& message) {
+      restored = false;
+      if (!failure.empty()) failure += "; ";
+      failure += message;
+    };
     try {
       LoadModule(*actor_model_, actor_module_bytes_);
       LoadModule(*q_model_, q_module_bytes_);
@@ -553,28 +744,60 @@ class TrainingTransaction {
       LoadOptimizer(*actor_optimizer_, actor_optimizer_bytes_);
       LoadOptimizer(*q_optimizer_, q_optimizer_bytes_);
       std::string migration_error;
-      if (!MigrateAdamWOptimizerStateToParameterDevices(
-              *actor_optimizer_, &migration_error) ||
-          !MigrateAdamWOptimizerStateToParameterDevices(
-              *q_optimizer_, &migration_error)) {
-        throw std::runtime_error(migration_error);
+      const bool actor_state_ok = actor_optimizer_state_was_empty_
+          ? actor_optimizer_->state().empty()
+          : MigrateAdamWOptimizerStateToParameterDevices(
+                *actor_optimizer_, &migration_error);
+      if (!actor_state_ok) {
+        throw std::runtime_error(
+            actor_optimizer_state_was_empty_
+                ? "empty actor optimizer capture reloaded nonempty state"
+                : migration_error);
       }
-      actor_optimizer_->zero_grad();
-      q_optimizer_->zero_grad();
-      RestoreRequiresGrad(*actor_model_, actor_requires_grad_);
-      RestoreRequiresGrad(*q_model_, q_requires_grad_);
-      actor_model_->train(actor_training_);
-      q_model_->train(q_training_);
-      Clear();
-      return true;
+      const bool q_state_ok = q_optimizer_state_was_empty_
+          ? q_optimizer_->state().empty()
+          : MigrateAdamWOptimizerStateToParameterDevices(
+                *q_optimizer_, &migration_error);
+      if (!q_state_ok) {
+        throw std::runtime_error(
+            q_optimizer_state_was_empty_
+                ? "empty Q optimizer capture reloaded nonempty state"
+                : migration_error);
+      }
     } catch (const std::exception& exception) {
-      if (error != nullptr) {
-        *error = std::string("training transaction rollback failed: ") +
-                 exception.what();
-      }
-      Clear();
-      return false;
+      record_failure(std::string("training state restore failed: ") +
+                     exception.what());
     }
+    // Modes, requires-grad flags, and live gradients are runtime state rather
+    // than archive payload. Restore them even if archive or optimizer-state
+    // restoration failed, and report both failures when necessary.
+    auto restore_runtime_piece = [&](const std::string& label,
+                                     const auto& operation) {
+      try {
+        operation();
+      } catch (const std::exception& exception) {
+        record_failure(label + ": " + exception.what());
+      }
+    };
+    restore_runtime_piece("actor gradient clear",
+                          [&]() { actor_optimizer_->zero_grad(); });
+    restore_runtime_piece("Q gradient clear",
+                          [&]() { q_optimizer_->zero_grad(); });
+    restore_runtime_piece(
+        "actor requires-grad restore",
+        [&]() { RestoreRequiresGrad(*actor_model_, actor_requires_grad_); });
+    restore_runtime_piece(
+        "Q requires-grad restore",
+        [&]() { RestoreRequiresGrad(*q_model_, q_requires_grad_); });
+    restore_runtime_piece("actor training-mode restore",
+                          [&]() { actor_model_->train(actor_training_); });
+    restore_runtime_piece("Q training-mode restore",
+                          [&]() { q_model_->train(q_training_); });
+    Clear();
+    if (!restored && error != nullptr) {
+      *error = "training transaction rollback failed: " + failure;
+    }
+    return restored;
   }
 
   void Commit() {
@@ -643,6 +866,8 @@ class TrainingTransaction {
     q_requires_grad_.clear();
     actor_placement_ = ModuleRuntimePlacement{};
     q_placement_ = ModuleRuntimePlacement{};
+    actor_optimizer_state_was_empty_ = false;
+    q_optimizer_state_was_empty_ = false;
     actor_module_bytes_.clear();
     q_module_bytes_.clear();
     actor_optimizer_bytes_.clear();
@@ -660,6 +885,8 @@ class TrainingTransaction {
   std::vector<bool> q_requires_grad_;
   ModuleRuntimePlacement actor_placement_;
   ModuleRuntimePlacement q_placement_;
+  bool actor_optimizer_state_was_empty_ = false;
+  bool q_optimizer_state_was_empty_ = false;
   std::string actor_module_bytes_;
   std::string q_module_bytes_;
   std::string actor_optimizer_bytes_;
@@ -727,18 +954,79 @@ inline FlatBatch FlattenEpisodes(const std::vector<VrpoTrainingEpisode>& episode
   return flat;
 }
 
-inline torch::Tensor StackInputs(const std::vector<const VrpoTrainingRow*>& rows,
-                                 bool actor_input) {
+inline bool StackInputs(const std::vector<const VrpoTrainingRow*>& rows,
+                        bool actor_input,
+                        const ModuleRuntimePlacement& placement,
+                        torch::Tensor* output, std::string* error) {
+  if (output == nullptr || rows.empty()) {
+    if (error != nullptr) *error = "cannot stack an empty phase4d input batch";
+    return false;
+  }
+  *output = torch::Tensor();
   std::vector<torch::Tensor> tensors;
   tensors.reserve(rows.size());
+  torch::Device source_device = torch::kCPU;
+  torch::Dtype source_dtype = torch::kFloat32;
+  int64_t source_width = -1;
+  bool first = true;
   for (const VrpoTrainingRow* row : rows) {
-    tensors.push_back(actor_input ? row->actor_input : row->q_input);
+    if (row == nullptr) {
+      if (error != nullptr) *error = "phase4d input row is null";
+      return false;
+    }
+    const torch::Tensor& tensor =
+        actor_input ? row->actor_input : row->q_input;
+    if (!tensor.defined() || !tensor.is_floating_point() ||
+        tensor.dim() != 1 || tensor.numel() <= 0) {
+      if (error != nullptr) {
+        *error = "phase4d source input is empty, nonfloating, or not rank one";
+      }
+      return false;
+    }
+    if (first) {
+      source_device = tensor.device();
+      source_dtype = tensor.scalar_type();
+      source_width = tensor.size(0);
+      first = false;
+    } else if (tensor.device() != source_device ||
+               tensor.scalar_type() != source_dtype ||
+               tensor.size(0) != source_width) {
+      if (error != nullptr) {
+        *error = "phase4d source inputs have mixed shape/device/dtype";
+      }
+      return false;
+    }
+    tensors.push_back(tensor);
   }
-  return torch::stack(tensors);
+  (actor_input ? g_phase4d_actor_batches : g_phase4d_q_batches)
+      .fetch_add(1);
+  g_phase4d_source_rows.fetch_add(static_cast<int64_t>(rows.size()));
+  try {
+    torch::Tensor source_batch = torch::stack(tensors).contiguous();
+    g_phase4d_placement_calls.fetch_add(1);
+    *output = source_batch.to(placement.device, placement.dtype).contiguous();
+  } catch (const std::exception& exception) {
+    if (error != nullptr) {
+      *error = std::string("phase4d input stack failed: ") + exception.what();
+    }
+    return false;
+  }
+  g_phase4d_destination_finite_checks.fetch_add(1);
+  if (output->device() != placement.device ||
+      output->scalar_type() != placement.dtype || !FiniteTensor(*output)) {
+    if (error != nullptr) {
+      *error = "phase4d stacked input has wrong placement or is nonfinite";
+    }
+    *output = torch::Tensor();
+    return false;
+  }
+  return true;
 }
 
 inline bool ValidateActorOutput(const VrpoActorTrainingOutput& output,
-                                int64_t rows, std::string* error) {
+                                int64_t rows,
+                                const ModuleRuntimePlacement& placement,
+                                std::string* error) {
   const bool values_shape = output.values.defined() &&
       ((output.values.dim() == 1 && output.values.size(0) == rows) ||
        (output.values.dim() == 2 && output.values.size(0) == rows &&
@@ -747,6 +1035,8 @@ inline bool ValidateActorOutput(const VrpoActorTrainingOutput& output,
       output.logits.size(0) != rows || output.logits.size(1) <= 0 ||
       output.logits.scalar_type() != torch::kFloat32 || !values_shape ||
       output.values.scalar_type() != torch::kFloat32 ||
+      output.logits.device() != placement.device ||
+      output.values.device() != placement.device ||
       !FiniteTensor(output.logits) || !FiniteTensor(output.values)) {
     if (error != nullptr) *error = "actor output shape/dtype/finiteness invalid";
     return false;
@@ -755,10 +1045,12 @@ inline bool ValidateActorOutput(const VrpoActorTrainingOutput& output,
 }
 
 inline bool ValidateQOutput(const torch::Tensor& output, int64_t rows,
+                            const ModuleRuntimePlacement& placement,
                             std::string* error) {
   if (!output.defined() || output.dim() != 3 || output.size(0) != rows ||
       output.size(1) <= 0 || output.size(2) != kVrpoNumSeats ||
-      output.scalar_type() != torch::kFloat32 || !FiniteTensor(output)) {
+      output.scalar_type() != torch::kFloat32 ||
+      output.device() != placement.device || !FiniteTensor(output)) {
     if (error != nullptr) *error = "Q output must be finite Float32 [rows,A,4]";
     return false;
   }
@@ -850,6 +1142,226 @@ inline bool BuildReferences(
   return true;
 }
 
+inline std::string FixedLegalQTableSha256(
+    const VrpoFixedLegalQTable& table) {
+  std::string payload = "dune_vrpo_phase4d_fixed_legal_q_v1";
+  payload.append(table.q_values_sha256);
+  AppendPod(&payload, static_cast<uint64_t>(table.rows.size()));
+  for (const auto& row : table.rows) {
+    AppendPod(&payload, row.row_id);
+    AppendPod(&payload, static_cast<uint64_t>(row.legal_actions.size()));
+    for (size_t index = 0; index < row.legal_actions.size(); ++index) {
+      AppendPod(&payload, row.legal_actions[index]);
+      if (index < row.legal_q_actor_relative.size()) {
+        for (double value : row.legal_q_actor_relative[index].slots) {
+          AppendPod(&payload, value);
+        }
+      }
+    }
+  }
+  return ComputeStringSHA256(payload);
+}
+
+inline bool BuildFixedLegalQTable(
+    const FlatBatch& flat, const torch::Tensor& q_output,
+    torch::nn::Module& q_model, VrpoFixedLegalQTable* output,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = VrpoFixedLegalQTable{};
+    return false;
+  };
+  if (output == nullptr || flat.rows.empty() || !q_output.defined() ||
+      q_output.dim() != 3 ||
+      q_output.size(0) != static_cast<int64_t>(flat.rows.size()) ||
+      q_output.size(2) != kVrpoNumSeats ||
+      q_output.scalar_type() != torch::kFloat32) {
+    return fail("fixed legal-Q table input shape/dtype is invalid");
+  }
+  size_t total_legal = 0;
+  for (const VrpoTrainingRow* row : flat.rows) {
+    if (row == nullptr || row->legal_actions.empty()) {
+      return fail("fixed legal-Q table has a null/empty row");
+    }
+    total_legal += row->legal_actions.size();
+  }
+  std::vector<int64_t> packed_indices(2 * total_legal);
+  size_t offset = 0;
+  for (size_t row_index = 0; row_index < flat.rows.size(); ++row_index) {
+    for (Action action : flat.rows[row_index]->legal_actions) {
+      if (action < 0 || action >= q_output.size(1)) {
+        return fail("fixed legal-Q action exceeds Q width");
+      }
+      packed_indices[offset] = static_cast<int64_t>(row_index);
+      packed_indices[total_legal + offset] = action;
+      ++offset;
+    }
+  }
+  torch::Tensor legal_q_cpu;
+  try {
+    torch::Tensor indices = torch::from_blob(
+        packed_indices.data(), {2, static_cast<int64_t>(total_legal)},
+        torch::TensorOptions().dtype(torch::kInt64)).clone();
+    g_phase4d_fixed_q_index_placement_calls.fetch_add(1);
+    indices = indices.to(q_output.device());
+    torch::Tensor legal_q = q_output.index({indices[0], indices[1]});
+    g_phase4d_fixed_q_host_copies.fetch_add(1);
+    legal_q_cpu = legal_q.detach().contiguous().cpu();
+  } catch (const std::exception& exception) {
+    return fail(std::string("fixed legal-Q gather/copy failed: ") +
+                exception.what());
+  }
+  if (!FiniteTensor(legal_q_cpu)) {
+    return fail("fixed legal-Q values are nonfinite");
+  }
+  std::string q_hash;
+  if (!ModuleValueSha256(q_model, "", &q_hash, error)) return false;
+  const auto values = legal_q_cpu.accessor<float, 2>();
+  VrpoFixedLegalQTable table;
+  table.q_values_sha256 = q_hash;
+  table.rows.reserve(flat.rows.size());
+  offset = 0;
+  for (const VrpoTrainingRow* source : flat.rows) {
+    VrpoFixedLegalQRow row;
+    row.row_id = source->row_id;
+    row.legal_actions = source->legal_actions;
+    row.legal_q_actor_relative.reserve(source->legal_actions.size());
+    for (size_t action = 0; action < source->legal_actions.size(); ++action) {
+      VrpoActorRelativeSeatValues q;
+      for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+        q.slots[slot] = values[offset][slot];
+      }
+      row.legal_q_actor_relative.push_back(q);
+      ++offset;
+    }
+    table.rows.push_back(std::move(row));
+  }
+  table.canonical_sha256 = FixedLegalQTableSha256(table);
+  *output = std::move(table);
+  return true;
+}
+
+inline bool ValidateFixedLegalQTable(
+    const VrpoFixedLegalQTable& table, const FlatBatch& flat,
+    torch::nn::Module& q_model, std::string* error) {
+  if (table.rows.size() != flat.rows.size() ||
+      table.q_values_sha256.empty() || table.canonical_sha256.empty()) {
+    if (error != nullptr) *error = "fixed legal-Q table width/identity is invalid";
+    return false;
+  }
+  std::string q_hash;
+  if (!ModuleValueSha256(q_model, "", &q_hash, error)) return false;
+  if (q_hash != table.q_values_sha256 ||
+      FixedLegalQTableSha256(table) != table.canonical_sha256) {
+    if (error != nullptr) *error = "fixed legal-Q table is stale or corrupted";
+    return false;
+  }
+  for (size_t index = 0; index < flat.rows.size(); ++index) {
+    const auto& fixed = table.rows[index];
+    const VrpoTrainingRow* source = flat.rows[index];
+    if (source == nullptr || fixed.row_id != source->row_id ||
+        fixed.legal_actions != source->legal_actions ||
+        fixed.legal_q_actor_relative.size() != source->legal_actions.size()) {
+      if (error != nullptr) {
+        *error = "fixed legal-Q row/order/legal binding differs";
+      }
+      return false;
+    }
+    for (const auto& q : fixed.legal_q_actor_relative) {
+      for (double value : q.slots) {
+        if (!std::isfinite(value)) {
+          if (error != nullptr) *error = "fixed legal-Q table is nonfinite";
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+inline bool BuildReferencesFromFixedLegalQ(
+    const VrpoPhase4ArmConfig& config, const FlatBatch& flat,
+    const std::vector<std::vector<double>>& probabilities,
+    const VrpoFixedLegalQTable& table, std::vector<double>* advantages,
+    std::vector<VrpoTrainingTargetRow>* targets, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (advantages != nullptr) advantages->clear();
+    if (targets != nullptr) targets->clear();
+    return false;
+  };
+  if (advantages == nullptr || targets == nullptr ||
+      probabilities.size() != flat.rows.size()) {
+    return fail("fixed reference builder input widths differ");
+  }
+  std::map<uint64_t, const VrpoFixedLegalQRow*> fixed_by_row;
+  for (const auto& row : table.rows) {
+    if (!fixed_by_row.emplace(row.row_id, &row).second) {
+      return fail("fixed legal-Q table repeats a row ID");
+    }
+  }
+  advantages->assign(flat.rows.size(), 0.0);
+  targets->assign(flat.rows.size(), VrpoTrainingTargetRow{});
+  for (const auto& range : flat.episode_ranges) {
+    std::vector<VrpoTimelineRow> timeline;
+    timeline.reserve(range.second - range.first);
+    for (size_t flat_index = range.first; flat_index < range.second;
+         ++flat_index) {
+      const VrpoTrainingRow& source = *flat.rows[flat_index];
+      const auto found = fixed_by_row.find(source.row_id);
+      if (found == fixed_by_row.end() ||
+          found->second->legal_actions != source.legal_actions ||
+          found->second->legal_q_actor_relative.size() !=
+              source.legal_actions.size()) {
+        return fail("fixed legal-Q lookup/order/legal binding differs");
+      }
+      VrpoTimelineRow row;
+      row.episode_id = source.episode_id;
+      row.actor = source.actor;
+      row.legal_actions = source.legal_actions;
+      row.chosen_index = source.chosen_index;
+      row.chosen_action = source.chosen_action;
+      row.legal_probabilities = probabilities[flat_index];
+      row.rewards = source.rewards;
+      row.terminal_after = source.terminal_after;
+      std::string adapter_error;
+      if (!VrpoActorRelativeQToAbsolute(
+              source.actor, found->second->legal_q_actor_relative,
+              &row.legal_q_values, &adapter_error)) {
+        return fail("fixed legal-Q seat conversion failed: " + adapter_error);
+      }
+      timeline.push_back(std::move(row));
+    }
+    VrpoReferenceTrace trace;
+    std::string reference_error;
+    if (!ComputeVrpoExpectedSarsaLambdaReference(
+            timeline, config.gamma, config.lambda, &trace,
+            &reference_error, kVrpoMaxProbabilityTolerance)) {
+      return fail("fixed global Expected-SARSA reference failed: " +
+                  reference_error);
+    }
+    for (size_t local = 0; local < trace.rows.size(); ++local) {
+      const size_t flat_index = range.first + local;
+      const VrpoTrainingRow& source = *flat.rows[flat_index];
+      const VrpoReferenceRow& reference = trace.rows[local];
+      (*advantages)[flat_index] = reference.actor_advantage;
+      VrpoTrainingTargetRow target;
+      target.row_id = source.row_id;
+      target.episode_id = source.episode_id;
+      target.step_index = source.step_index;
+      target.actor = source.actor;
+      target.actor_advantage = reference.actor_advantage;
+      target.q_target_absolute = reference.q_target;
+      for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+        target.q_target_actor_relative[slot] =
+            reference.q_target[(source.actor + slot) % kVrpoNumSeats];
+      }
+      (*targets)[flat_index] = target;
+    }
+  }
+  return true;
+}
+
 inline std::string TargetValuesSha256(
     const std::vector<VrpoTrainingTargetRow>& rows) {
   std::string payload = "dune_vrpo_phase4d_target_values_v1";
@@ -873,23 +1385,89 @@ inline bool BuildLegalPolicies(
     std::vector<torch::Tensor>* probabilities,
     std::vector<std::vector<double>>* detached_probabilities,
     std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (log_probabilities != nullptr) log_probabilities->clear();
+    if (probabilities != nullptr) probabilities->clear();
+    if (detached_probabilities != nullptr) detached_probabilities->clear();
+    return false;
+  };
+  if (log_probabilities == nullptr || probabilities == nullptr ||
+      detached_probabilities == nullptr ||
+      flat.rows.size() != static_cast<size_t>(actor_output.logits.size(0))) {
+    return fail("legal-policy batch inputs/outputs are incomplete");
+  }
   log_probabilities->clear();
   probabilities->clear();
   detached_probabilities->clear();
-  for (size_t index = 0; index < flat.rows.size(); ++index) {
-    torch::Tensor log_probs;
-    torch::Tensor probs;
-    if (!LegalPolicy(actor_output.logits[index], *flat.rows[index], logit_cap,
-                     &log_probs, &probs, error)) {
-      return false;
+  size_t total_legal = 0;
+  for (const VrpoTrainingRow* row : flat.rows) {
+    if (row == nullptr || row->legal_actions.empty()) {
+      return fail("legal-policy batch has a null/empty row");
     }
+    total_legal += row->legal_actions.size();
+  }
+  std::vector<int64_t> packed_indices(2 * total_legal);
+  size_t offset = 0;
+  for (size_t index = 0; index < flat.rows.size(); ++index) {
+    for (Action action : flat.rows[index]->legal_actions) {
+      if (action < 0 || action >= actor_output.logits.size(1)) {
+        return fail("legal action exceeds actor output width");
+      }
+      packed_indices[offset] = static_cast<int64_t>(index);
+      packed_indices[total_legal + offset] = action;
+      ++offset;
+    }
+  }
+  torch::Tensor device_indices;
+  try {
+    torch::Tensor cpu_indices = torch::from_blob(
+        packed_indices.data(), {2, static_cast<int64_t>(total_legal)},
+        torch::TensorOptions().dtype(torch::kInt64)).clone();
+    g_phase4d_legal_index_placement_calls.fetch_add(1);
+    device_indices = cpu_indices.to(actor_output.logits.device());
+  } catch (const std::exception& exception) {
+    return fail(std::string("legal index placement failed: ") +
+                exception.what());
+  }
+  torch::Tensor gathered;
+  try {
+    gathered = actor_output.logits.index(
+        {device_indices[0], device_indices[1]});
+  } catch (const std::exception& exception) {
+    return fail(std::string("batched legal-logit gather failed: ") +
+                exception.what());
+  }
+  offset = 0;
+  for (const VrpoTrainingRow* row : flat.rows) {
+    const int64_t length = row->legal_actions.size();
+    torch::Tensor legal_logits = gathered.narrow(0, offset, length);
+    torch::Tensor transformed = CenterAndCapLegalLogits(legal_logits,
+                                                        logit_cap);
+    torch::Tensor log_probs = torch::log_softmax(transformed, 0);
+    torch::Tensor probs = torch::softmax(transformed, 0);
     log_probabilities->push_back(log_probs);
     probabilities->push_back(probs);
-    torch::Tensor cpu = probs.detach().contiguous().cpu().to(torch::kFloat64);
-    std::vector<double> values(cpu.numel());
-    std::memcpy(values.data(), cpu.data_ptr<double>(),
-                values.size() * sizeof(double));
-    detached_probabilities->push_back(std::move(values));
+    offset += length;
+  }
+  torch::Tensor all_log_probabilities = torch::cat(*log_probabilities);
+  torch::Tensor all_probabilities = torch::cat(*probabilities);
+  g_phase4d_legal_probability_finite_checks.fetch_add(1);
+  const bool finite = torch::stack(
+      {torch::isfinite(all_log_probabilities).all(),
+       torch::isfinite(all_probabilities).all()}).all().item<bool>();
+  if (!finite) return fail("derived legal policy batch is nonfinite");
+  g_phase4d_legal_probability_host_copies.fetch_add(1);
+  torch::Tensor probability_cpu = all_probabilities.detach()
+      .to(torch::kFloat64).contiguous().cpu();
+  const double* probability_values = probability_cpu.data_ptr<double>();
+  offset = 0;
+  detached_probabilities->reserve(flat.rows.size());
+  for (const VrpoTrainingRow* row : flat.rows) {
+    const size_t length = row->legal_actions.size();
+    detached_probabilities->emplace_back(
+        probability_values + offset, probability_values + offset + length);
+    offset += length;
   }
   return true;
 }
@@ -927,11 +1505,9 @@ inline bool ValidateAllData(const std::vector<VrpoTrainingEpisode>& episodes,
       }
       if (!row.actor_input.defined() || row.actor_input.dim() != 1 ||
           row.actor_input.scalar_type() != torch::kFloat32 ||
-          !FiniteTensor(row.actor_input) || !row.q_input.defined() ||
-          row.q_input.dim() != 1 ||
-          row.q_input.scalar_type() != torch::kFloat32 ||
-          !FiniteTensor(row.q_input)) {
-        return fail("training input is empty, malformed, or nonfinite");
+          !row.q_input.defined() || row.q_input.dim() != 1 ||
+          row.q_input.scalar_type() != torch::kFloat32) {
+        return fail("training input is empty or malformed");
       }
       if (actor_width < 0) actor_width = row.actor_input.size(0);
       if (q_width < 0) q_width = row.q_input.size(0);
@@ -1130,7 +1706,9 @@ inline bool ComputeVrpoTrainingTargets(
     const std::vector<VrpoTrainingEpisode>& episodes,
     torch::nn::Module& actor_model, torch::nn::Module& q_model,
     const VrpoActorForward& actor_forward, const VrpoQForward& q_forward,
-    VrpoTrainingTargetBundle* output, std::string* error) {
+    VrpoTrainingTargetBundle* output, std::string* error,
+    const VrpoFixedLegalQTable* fixed_q_table = nullptr,
+    VrpoFixedLegalQTable* built_fixed_q_table = nullptr) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     if (output != nullptr) *output = VrpoTrainingTargetBundle{};
@@ -1144,24 +1722,60 @@ inline bool ComputeVrpoTrainingTargets(
   if (!ValidateVrpoPhase4ArmConfig(config, &contract_error)) {
     return fail(contract_error);
   }
+  vrpo_training_internal::ModuleRuntimePlacement actor_placement;
+  vrpo_training_internal::ModuleRuntimePlacement q_placement;
+  if (!vrpo_training_internal::CapturePhase4dRuntimePlacements(
+          actor_model, q_model, &actor_placement, &q_placement, error)) {
+    return false;
+  }
   if (!vrpo_training_internal::ValidateAllData(episodes, error)) return false;
   std::vector<size_t> all(episodes.size());
   for (size_t index = 0; index < all.size(); ++index) all[index] = index;
   const auto flat = vrpo_training_internal::FlattenEpisodes(episodes, all);
   torch::NoGradGuard no_grad;
   VrpoActorTrainingOutput actor_output;
-  torch::Tensor q_output;
+  torch::Tensor actor_inputs;
+  if (!vrpo_training_internal::StackInputs(
+          flat.rows, true, actor_placement, &actor_inputs, error)) {
+    return false;
+  }
   try {
-    actor_output = actor_forward(
-        vrpo_training_internal::StackInputs(flat.rows, true));
-    q_output = q_forward(vrpo_training_internal::StackInputs(flat.rows, false));
+    actor_output = actor_forward(actor_inputs);
   } catch (const std::exception& exception) {
-    return fail(std::string("target forward failed: ") + exception.what());
+    return fail(std::string("target actor forward failed: ") +
+                exception.what());
   }
   if (!vrpo_training_internal::ValidateActorOutput(
-          actor_output, flat.rows.size(), error) ||
-      !vrpo_training_internal::ValidateQOutput(
-          q_output, flat.rows.size(), error)) {
+          actor_output, flat.rows.size(), actor_placement, error)) {
+    return false;
+  }
+  VrpoFixedLegalQTable owned_fixed_q_table;
+  const VrpoFixedLegalQTable* effective_fixed_q_table = fixed_q_table;
+  if (effective_fixed_q_table == nullptr) {
+    torch::Tensor q_inputs;
+    if (!vrpo_training_internal::StackInputs(
+            flat.rows, false, q_placement, &q_inputs, error)) {
+      return false;
+    }
+    torch::Tensor q_output;
+    try {
+      q_output = q_forward(q_inputs);
+    } catch (const std::exception& exception) {
+      return fail(std::string("target Q forward failed: ") +
+                  exception.what());
+    }
+    if (!vrpo_training_internal::ValidateQOutput(
+            q_output, flat.rows.size(), q_placement, error) ||
+        !vrpo_training_internal::BuildFixedLegalQTable(
+            flat, q_output, q_model, &owned_fixed_q_table, error)) {
+      return false;
+    }
+    effective_fixed_q_table = &owned_fixed_q_table;
+    if (built_fixed_q_table != nullptr) {
+      *built_fixed_q_table = owned_fixed_q_table;
+    }
+  } else if (!vrpo_training_internal::ValidateFixedLegalQTable(
+                 *effective_fixed_q_table, flat, q_model, error)) {
     return false;
   }
   std::vector<torch::Tensor> log_probabilities;
@@ -1174,9 +1788,9 @@ inline bool ComputeVrpoTrainingTargets(
   }
   std::vector<double> advantages;
   std::vector<VrpoTrainingTargetRow> targets;
-  if (!vrpo_training_internal::BuildReferences(
-          config, flat, detached_probabilities, q_output, &advantages,
-          &targets, error)) {
+  if (!vrpo_training_internal::BuildReferencesFromFixedLegalQ(
+          config, flat, detached_probabilities, *effective_fixed_q_table,
+          &advantages, &targets, error)) {
     return false;
   }
   VrpoTrainingTargetBundle bundle;
@@ -1247,6 +1861,12 @@ inline bool RunVrpoPhase4dOneUpdate(
       config.critic_replay_rollouts != 1 || !config.complete_game_batches) {
     return fail("phase4d update config violates the registered mechanics");
   }
+  vrpo_training_internal::ModuleRuntimePlacement actor_placement;
+  vrpo_training_internal::ModuleRuntimePlacement q_placement;
+  if (!vrpo_training_internal::CapturePhase4dRuntimePlacements(
+          actor_model, q_model, &actor_placement, &q_placement, error)) {
+    return false;
+  }
   if (!vrpo_training_internal::ValidateAllData(episodes, error) ||
       !vrpo_training_internal::ValidateOptimizerCoverage(
           actor_optimizer, actor_model, q_model, error) ||
@@ -1297,9 +1917,10 @@ inline bool RunVrpoPhase4dOneUpdate(
   // optimizer step. It catches malformed output shapes, NaNs, bad legal-action
   // widths, or reference failures without partially mutating either module.
   VrpoTrainingTargetBundle pre_actor_targets;
+  VrpoFixedLegalQTable fixed_q_table;
   if (!ComputeVrpoTrainingTargets(
           config, episodes, actor_model, q_model, actor_forward, q_forward,
-          &pre_actor_targets, error)) {
+          &pre_actor_targets, error, nullptr, &fixed_q_table)) {
     return false;
   }
   if (!vrpo_training_internal::ValidateTargetBundleFloat32Domain(
@@ -1347,24 +1968,21 @@ inline bool RunVrpoPhase4dOneUpdate(
       actor_optimizer.zero_grad();
       q_optimizer.zero_grad();
       VrpoActorTrainingOutput actor_output;
-      torch::Tensor q_output;
+      torch::Tensor actor_inputs;
+      if (!vrpo_training_internal::StackInputs(
+              flat.rows, true, actor_placement, &actor_inputs, error)) {
+        restore_q();
+        return false;
+      }
       try {
-        actor_output = actor_forward(
-            vrpo_training_internal::StackInputs(flat.rows, true));
-        {
-          torch::NoGradGuard no_grad;
-          q_output = q_forward(
-              vrpo_training_internal::StackInputs(flat.rows, false));
-        }
+        actor_output = actor_forward(actor_inputs);
       } catch (const std::exception& exception) {
         restore_q();
         return fail(std::string("actor-phase forward failed: ") +
                     exception.what());
       }
       if (!vrpo_training_internal::ValidateActorOutput(
-              actor_output, flat.rows.size(), error) ||
-          !vrpo_training_internal::ValidateQOutput(
-              q_output, flat.rows.size(), error)) {
+              actor_output, flat.rows.size(), actor_placement, error)) {
         restore_q();
         return false;
       }
@@ -1385,9 +2003,9 @@ inline bool RunVrpoPhase4dOneUpdate(
         }
       } else {
         std::vector<VrpoTrainingTargetRow> ignored_targets;
-        if (!vrpo_training_internal::BuildReferences(
-                config, flat, detached_probabilities, q_output, &advantages,
-                &ignored_targets, error)) {
+        if (!vrpo_training_internal::BuildReferencesFromFixedLegalQ(
+                config, flat, detached_probabilities, fixed_q_table,
+                &advantages, &ignored_targets, error)) {
           restore_q();
           return false;
         }
@@ -1419,6 +2037,29 @@ inline bool RunVrpoPhase4dOneUpdate(
       std::vector<torch::Tensor> policy_terms;
       std::vector<torch::Tensor> entropy_terms;
       std::vector<torch::Tensor> value_losses;
+      std::vector<torch::Tensor> ratio_diagnostics;
+      std::vector<torch::Tensor> kl_diagnostics;
+      std::vector<float> old_probability_values;
+      for (const VrpoTrainingRow* row : flat.rows) {
+        for (double probability : row->old_legal_probabilities) {
+          old_probability_values.push_back(static_cast<float>(probability));
+        }
+      }
+      torch::Tensor old_probability_batch;
+      try {
+        torch::Tensor old_probability_cpu = torch::from_blob(
+            old_probability_values.data(),
+            {static_cast<int64_t>(old_probability_values.size())},
+            torch::TensorOptions().dtype(torch::kFloat32)).clone();
+        vrpo_training_internal::g_phase4d_actor_old_probability_placement_calls
+            .fetch_add(1);
+        old_probability_batch = old_probability_cpu.to(actor_placement.device);
+      } catch (const std::exception& exception) {
+        restore_q();
+        return fail(std::string("actor old-probability placement failed: ") +
+                    exception.what());
+      }
+      int64_t old_probability_offset = 0;
       for (size_t index = 0; index < flat.rows.size(); ++index) {
         const VrpoTrainingRow& row = *flat.rows[index];
         const torch::Tensor& log_probs = legal_log_probabilities[index];
@@ -1426,12 +2067,12 @@ inline bool RunVrpoPhase4dOneUpdate(
         torch::Tensor chosen_log_probability = log_probs[row.chosen_index];
         torch::Tensor ratio = torch::exp(
             chosen_log_probability - row.old_chosen_log_probability);
-        const double ratio_value = ratio.detach().item<double>();
         const double advantage = advantages[index];
-        if (!std::isfinite(ratio_value) || !std::isfinite(advantage)) {
+        if (!std::isfinite(advantage)) {
           restore_q();
-          return fail("actor ratio or advantage is nonfinite before step");
+          return fail("actor advantage is nonfinite before step");
         }
+        ratio_diagnostics.push_back(ratio.detach());
         const double loss_advantage = loss_advantages[index];
         if (row.legal_actions.size() > 1) {
           torch::Tensor first = ratio * loss_advantage;
@@ -1454,25 +2095,36 @@ inline bool RunVrpoPhase4dOneUpdate(
           value_losses.push_back(0.5 * torch::maximum(unclipped, clipped));
         }
 
-        torch::Tensor old = torch::tensor(
-            row.old_legal_probabilities,
-            torch::TensorOptions().dtype(torch::kFloat32).device(
-                log_probs.device()));
+        const int64_t legal_count = row.old_legal_probabilities.size();
+        torch::Tensor old = old_probability_batch.narrow(
+            0, old_probability_offset, legal_count);
+        old_probability_offset += legal_count;
         torch::Tensor positive = old > 0.0;
         torch::Tensor safe_old = torch::clamp_min(old, 1e-30);
-        const double full_kl = torch::where(
+        kl_diagnostics.push_back(torch::where(
             positive, old * (torch::log(safe_old) - log_probs),
-            torch::zeros_like(old)).sum().detach().item<double>();
-        if (!std::isfinite(full_kl) || full_kl < -1e-5) {
+            torch::zeros_like(old)).sum().detach());
+        stats.max_abs_advantage =
+            std::max(stats.max_abs_advantage, std::abs(advantage));
+      }
+      vrpo_training_internal::g_phase4d_actor_diagnostic_host_copies
+          .fetch_add(1);
+      torch::Tensor diagnostics_cpu = torch::cat(
+          {torch::stack(ratio_diagnostics), torch::stack(kl_diagnostics)})
+          .to(torch::kFloat64).contiguous().cpu();
+      const double* diagnostic_values = diagnostics_cpu.data_ptr<double>();
+      for (size_t index = 0; index < flat.rows.size(); ++index) {
+        const double ratio_value = diagnostic_values[index];
+        const double full_kl = diagnostic_values[flat.rows.size() + index];
+        if (!std::isfinite(ratio_value) || !std::isfinite(full_kl) ||
+            full_kl < -1e-5) {
           restore_q();
-          return fail("full legal-distribution KL is invalid before step");
+          return fail("actor ratio or legal-distribution KL is invalid before step");
         }
         stats.min_ratio = std::min(stats.min_ratio, ratio_value);
         stats.max_ratio = std::max(stats.max_ratio, ratio_value);
-        stats.max_full_legal_kl =
-            std::max(stats.max_full_legal_kl, std::max(0.0, full_kl));
-        stats.max_abs_advantage =
-            std::max(stats.max_abs_advantage, std::abs(advantage));
+        stats.max_full_legal_kl = std::max(
+            stats.max_full_legal_kl, std::max(0.0, full_kl));
       }
       if (policy_terms.empty()) {
         restore_q();
@@ -1536,7 +2188,7 @@ inline bool RunVrpoPhase4dOneUpdate(
   VrpoTrainingTargetBundle post_actor_targets;
   if (!ComputeVrpoTrainingTargets(
           config, episodes, actor_model, q_model, actor_forward, q_forward,
-          &post_actor_targets, error)) {
+          &post_actor_targets, error, &fixed_q_table)) {
     return false;
   }
   if (!vrpo_training_internal::ValidateTargetBundleFloat32Domain(
@@ -1574,21 +2226,25 @@ inline bool RunVrpoPhase4dOneUpdate(
         actor_optimizer.zero_grad();
         q_optimizer.zero_grad();
         torch::Tensor q_output;
+        torch::Tensor q_inputs;
+        if (!vrpo_training_internal::StackInputs(
+                flat.rows, false, q_placement, &q_inputs, error)) {
+          actor_model.train(actor_was_training);
+          return false;
+        }
         try {
-          q_output = q_forward(
-              vrpo_training_internal::StackInputs(flat.rows, false));
+          q_output = q_forward(q_inputs);
         } catch (const std::exception& exception) {
           actor_model.train(actor_was_training);
           return fail(std::string("Q-phase forward failed: ") +
                       exception.what());
         }
         if (!vrpo_training_internal::ValidateQOutput(
-                q_output, flat.rows.size(), error)) {
+                q_output, flat.rows.size(), q_placement, error)) {
           actor_model.train(actor_was_training);
           return false;
         }
-        std::vector<torch::Tensor> predicted;
-        std::vector<torch::Tensor> targets;
+        std::vector<float> packed_target_values(flat.rows.size() * 5);
         for (size_t index = 0; index < flat.rows.size(); ++index) {
           const VrpoTrainingRow& row = *flat.rows[index];
           const auto found = target_by_row.find(row.row_id);
@@ -1597,16 +2253,34 @@ inline bool RunVrpoPhase4dOneUpdate(
             actor_model.train(actor_was_training);
             return fail("Q regression target/action lookup failed");
           }
-          predicted.push_back(q_output[index][row.chosen_action]);
-          targets.push_back(torch::tensor(
-              std::vector<double>(
-                  found->second.q_target_actor_relative.begin(),
-                  found->second.q_target_actor_relative.end()),
-              torch::TensorOptions().dtype(torch::kFloat32).device(
-                  q_output.device())));
+          packed_target_values[5 * index] =
+              static_cast<float>(row.chosen_action);
+          for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+            packed_target_values[5 * index + 1 + slot] = static_cast<float>(
+                found->second.q_target_actor_relative[slot]);
+          }
         }
+        torch::Tensor packed_targets;
+        try {
+          torch::Tensor packed_cpu = torch::from_blob(
+              packed_target_values.data(),
+              {static_cast<int64_t>(flat.rows.size()), 5},
+              torch::TensorOptions().dtype(torch::kFloat32)).clone();
+          vrpo_training_internal::g_phase4d_q_target_placement_calls
+              .fetch_add(1);
+          packed_targets = packed_cpu.to(q_placement.device);
+        } catch (const std::exception& exception) {
+          actor_model.train(actor_was_training);
+          return fail(std::string("Q target placement failed: ") +
+                      exception.what());
+        }
+        torch::Tensor chosen_actions = packed_targets.select(1, 0)
+            .to(torch::kInt64).reshape({-1, 1, 1})
+            .expand({-1, 1, kVrpoNumSeats});
+        torch::Tensor predicted = q_output.gather(1, chosen_actions).squeeze(1);
+        torch::Tensor targets = packed_targets.slice(1, 1, 5);
         torch::Tensor q_loss = 0.5 * torch::mse_loss(
-            torch::stack(predicted), torch::stack(targets));
+            predicted, targets);
         if (!vrpo_training_internal::FiniteTensor(q_loss)) {
           actor_model.train(actor_was_training);
           return fail("Q loss is nonfinite before step");

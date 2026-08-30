@@ -4418,6 +4418,9 @@ struct TinyVrpoArmRun {
   std::string q_initial;
   size_t actor_initial_optimizer_states = 0;
   size_t q_initial_optimizer_states = 0;
+  int64_t actor_forward_calls = 0;
+  int64_t q_forward_calls = 0;
+  vrpo_training_internal::BatchPlacementCounters placement_counters;
 };
 
 TinyVrpoArmRun RunTinyVrpoArm(const VrpoPhase4ArmConfig& arm) {
@@ -4431,11 +4434,24 @@ TinyVrpoArmRun RunTinyVrpoArm(const VrpoPhase4ArmConfig& arm) {
   result.q_initial_optimizer_states = fixture.q_optimizer->state().size();
   auto episodes = MakeTinyVrpoTrainingEpisodes(
       *fixture.actor, arm.logit_cap);
+  VrpoActorForward counted_actor_forward =
+      [forward = fixture.actor_forward, &result](const torch::Tensor& input) {
+        ++result.actor_forward_calls;
+        return forward(input);
+      };
+  VrpoQForward counted_q_forward =
+      [forward = fixture.q_forward, &result](const torch::Tensor& input) {
+        ++result.q_forward_calls;
+        return forward(input);
+      };
   std::string error;
+  vrpo_training_internal::ResetBatchPlacementCounters();
   const bool update_ok = RunVrpoPhase4dOneUpdate(
       arm, episodes, 99887766, *fixture.actor, *fixture.q,
       *fixture.actor_optimizer, *fixture.q_optimizer,
-      fixture.actor_forward, fixture.q_forward, &result.stats, &error);
+      counted_actor_forward, counted_q_forward, &result.stats, &error);
+  result.placement_counters =
+      vrpo_training_internal::ReadBatchPlacementCounters();
   if (!update_ok) std::cerr << "\n  phase4d error: " << error << "\n";
   UTILS_CHECK(update_ok);
   return result;
@@ -4453,6 +4469,29 @@ void TestVrpoPhase4dFourArmUpdateMechanics() {
       CHECK_EQ(runs[arm].stats.actor_optimizer_steps, int64_t{64});
       CHECK_EQ(runs[arm].stats.actor_backward_calls, int64_t{64});
       CHECK_EQ(runs[arm].stats.actor_rows_seen, int64_t{256});
+      CHECK_EQ(runs[arm].actor_forward_calls, int64_t{66});
+      CHECK_EQ(runs[arm].placement_counters.actor_batches, int64_t{66});
+      CHECK_EQ(runs[arm].placement_counters.placement_calls,
+               runs[arm].placement_counters.actor_batches +
+                   runs[arm].placement_counters.q_batches);
+      CHECK_EQ(runs[arm].placement_counters.destination_finite_checks,
+               runs[arm].placement_counters.placement_calls);
+      CHECK_EQ(runs[arm].placement_counters.legal_index_placement_calls,
+               int64_t{66});
+      CHECK_EQ(runs[arm].placement_counters.legal_probability_host_copies,
+               int64_t{66});
+      CHECK_EQ(runs[arm].placement_counters.legal_probability_finite_checks,
+               int64_t{66});
+      CHECK_EQ(runs[arm].placement_counters.actor_diagnostic_host_copies,
+               int64_t{64});
+      CHECK_EQ(
+          runs[arm].placement_counters.actor_old_probability_placement_calls,
+          int64_t{64});
+      CHECK_EQ(runs[arm].placement_counters.gradient_summary_host_copies,
+               int64_t{128});
+      CHECK_EQ(runs[arm].placement_counters.fixed_q_index_placement_calls,
+               int64_t{1});
+      CHECK_EQ(runs[arm].placement_counters.fixed_q_host_copies, int64_t{1});
       CHECK_EQ(runs[arm].stats.target_recomputations_after_actor, int64_t{1});
       UTILS_CHECK(runs[arm].stats.complete_episode_partitions);
       UTILS_CHECK(runs[arm].stats.advantages_detached);
@@ -4471,6 +4510,10 @@ void TestVrpoPhase4dFourArmUpdateMechanics() {
                     64);
       }
       if (arms[arm].algorithm == VrpoPhase4Algorithm::kPpo) {
+        CHECK_EQ(runs[arm].q_forward_calls, int64_t{1});
+        CHECK_EQ(runs[arm].placement_counters.q_batches, int64_t{1});
+        CHECK_EQ(runs[arm].placement_counters.q_target_placement_calls,
+                 int64_t{0});
         CHECK_EQ(runs[arm].stats.q_optimizer_steps, int64_t{0});
         CHECK_EQ(runs[arm].stats.q_backward_calls, int64_t{0});
         CHECK_EQ(runs[arm].stats.q_rows_seen, int64_t{0});
@@ -4480,6 +4523,10 @@ void TestVrpoPhase4dFourArmUpdateMechanics() {
                     runs[arm].stats.value_head_after_sha256);
         UTILS_CHECK(runs[arm].stats.max_value_head_grad_norm > 0.0);
       } else {
+        CHECK_EQ(runs[arm].q_forward_calls, int64_t{65});
+        CHECK_EQ(runs[arm].placement_counters.q_batches, int64_t{65});
+        CHECK_EQ(runs[arm].placement_counters.q_target_placement_calls,
+                 int64_t{64});
         CHECK_EQ(runs[arm].stats.q_optimizer_steps, int64_t{64});
         CHECK_EQ(runs[arm].stats.q_backward_calls, int64_t{64});
         CHECK_EQ(runs[arm].stats.q_rows_seen, int64_t{256});
@@ -4508,6 +4555,37 @@ void TestVrpoPhase4dFourArmUpdateMechanics() {
                 runs[1].stats.actor_values_after_sha256);
     UTILS_CHECK(runs[2].stats.actor_values_after_sha256 !=
                 runs[3].stats.actor_values_after_sha256);
+
+    // PPO's Q is provenance-only: one whole-rollout preflight forward. A Q
+    // callback that rejects any second call must produce the exact same actor
+    // and value update as the ordinary callback.
+    {
+      auto fixture = MakeTinyVrpoTrainingFixture();
+      auto episodes = MakeTinyVrpoTrainingEpisodes(
+          *fixture.actor, arms[0].logit_cap);
+      int64_t q_forward_calls = 0;
+      VrpoQForward one_q_forward =
+          [q = fixture.q, &q_forward_calls](const torch::Tensor& input) {
+            ++q_forward_calls;
+            if (q_forward_calls > 1) {
+              throw std::runtime_error("PPO actor phase unexpectedly used Q");
+            }
+            return q->Forward(input);
+          };
+      VrpoTrainingUpdateStats stats;
+      std::string error;
+      UTILS_CHECK(RunVrpoPhase4dOneUpdate(
+          arms[0], episodes, 99887766, *fixture.actor, *fixture.q,
+          *fixture.actor_optimizer, *fixture.q_optimizer,
+          fixture.actor_forward, one_q_forward, &stats, &error));
+      CHECK_EQ(q_forward_calls, int64_t{1});
+      CHECK_EQ(stats.actor_values_after_sha256,
+               runs[0].stats.actor_values_after_sha256);
+      CHECK_EQ(stats.value_head_after_sha256,
+               runs[0].stats.value_head_after_sha256);
+      CHECK_EQ(stats.q_values_after_sha256,
+               runs[0].stats.q_values_after_sha256);
+    }
 
     const TinyVrpoArmRun repeat = RunTinyVrpoArm(arms[2]);
     CHECK_EQ(repeat.stats.actor_values_after_sha256,
@@ -4564,6 +4642,364 @@ void TestVrpoPhase4dFourArmUpdateMechanics() {
   } TEST_END();
 }
 
+void AssertTinyVrpoOptimizerMomentsOn(
+    torch::optim::Optimizer& optimizer, const torch::Device& device,
+    torch::Dtype dtype, bool require_nonempty) {
+  if (require_nonempty) UTILS_CHECK(!optimizer.state().empty());
+  for (const auto& group : optimizer.param_groups()) {
+    for (const torch::Tensor& parameter : group.params()) {
+      CHECK_EQ(parameter.device(), device);
+      CHECK_EQ(parameter.scalar_type(), dtype);
+      const auto found = optimizer.state().find(
+          parameter.unsafeGetTensorImpl());
+      if (found == optimizer.state().end()) continue;
+      const auto* state = dynamic_cast<const torch::optim::AdamWParamState*>(
+          found->second.get());
+      UTILS_CHECK(state != nullptr);
+      for (const torch::Tensor& moment :
+           {state->exp_avg(), state->exp_avg_sq()}) {
+        UTILS_CHECK(moment.defined());
+        CHECK_EQ(moment.device(), device);
+        CHECK_EQ(moment.scalar_type(), dtype);
+        CHECK_EQ(moment.sizes(), parameter.sizes());
+        UTILS_CHECK(torch::isfinite(moment).all().item<bool>());
+      }
+    }
+  }
+}
+
+void TestVrpoPhase4dCudaCpuInputPlacementAndRollback() {
+  TEST_BEGIN("VRPO phase 4d: CPU captures run all CUDA arms and late failure rolls back") {
+    if (!torch::cuda::is_available()) {
+      std::cout << "SKIPPED (CUDA unavailable) ";
+    } else {
+      const torch::Device device(torch::kCUDA, 0);
+      const auto arms = CanonicalVrpoPhase4Arms();
+
+      // Thousands of CPU rows: validation is timed separately, then actor/Q
+      // placement, variable-length legal policies (including forced rows), and
+      // fixed legal-Q extraction must each use bounded batch transfers/copies.
+      {
+        constexpr int kSyntheticEpisodes = 1024;
+        constexpr int kSyntheticRows = kSyntheticEpisodes * 4;
+        auto fixture = MakeTinyVrpoTrainingFixture();
+        auto episodes = MakeTinyVrpoTrainingEpisodes(
+            *fixture.actor, 10.0, kSyntheticEpisodes, false);
+        int row_index = 0;
+        for (auto& episode : episodes) {
+          for (auto& row : episode.rows) {
+            if (row_index % 7 == 0) {
+              row.legal_actions = {row.chosen_action};
+              row.chosen_index = 0;
+              row.old_legal_probabilities = {1.0};
+              row.old_chosen_log_probability = 0.0;
+            }
+            ++row_index;
+          }
+        }
+        std::string error;
+        const auto validation_start = std::chrono::steady_clock::now();
+        UTILS_CHECK(vrpo_training_internal::ValidateAllData(episodes, &error));
+        const auto validation_millis =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - validation_start).count();
+        std::vector<size_t> all(episodes.size());
+        for (size_t index = 0; index < all.size(); ++index) all[index] = index;
+        const auto flat = vrpo_training_internal::FlattenEpisodes(episodes, all);
+        CHECK_EQ(flat.rows.size(), static_cast<size_t>(kSyntheticRows));
+        fixture.actor->to(device, torch::kFloat32);
+        fixture.q->to(device, torch::kFloat32);
+        vrpo_training_internal::ModuleRuntimePlacement actor_placement;
+        vrpo_training_internal::ModuleRuntimePlacement q_placement;
+        UTILS_CHECK(vrpo_training_internal::CapturePhase4dRuntimePlacements(
+            *fixture.actor, *fixture.q, &actor_placement, &q_placement,
+            &error));
+        vrpo_training_internal::ResetBatchPlacementCounters();
+        const auto batched_start = std::chrono::steady_clock::now();
+        torch::Tensor actor_batch;
+        torch::Tensor q_batch;
+        UTILS_CHECK(vrpo_training_internal::StackInputs(
+            flat.rows, true, actor_placement, &actor_batch, &error));
+        UTILS_CHECK(vrpo_training_internal::StackInputs(
+            flat.rows, false, q_placement, &q_batch, &error));
+        const VrpoActorTrainingOutput actor_output =
+            fixture.actor->Forward(actor_batch);
+        const torch::Tensor q_output = fixture.q->Forward(q_batch);
+        std::vector<torch::Tensor> capped_log_probabilities;
+        std::vector<torch::Tensor> capped_probabilities;
+        std::vector<std::vector<double>> capped_values;
+        UTILS_CHECK(vrpo_training_internal::BuildLegalPolicies(
+            actor_output, flat, 10.0, &capped_log_probabilities,
+            &capped_probabilities, &capped_values, &error));
+        std::vector<torch::Tensor> uncapped_log_probabilities;
+        std::vector<torch::Tensor> uncapped_probabilities;
+        std::vector<std::vector<double>> uncapped_values;
+        UTILS_CHECK(vrpo_training_internal::BuildLegalPolicies(
+            actor_output, flat, 0.0, &uncapped_log_probabilities,
+            &uncapped_probabilities, &uncapped_values, &error));
+        VrpoFixedLegalQTable fixed_q_table;
+        UTILS_CHECK(vrpo_training_internal::BuildFixedLegalQTable(
+            flat, q_output, *fixture.q, &fixed_q_table, &error));
+        CHECK_EQ(actor_batch.numel(), int64_t{kSyntheticRows * 5});
+        CHECK_EQ(q_batch.numel(), int64_t{kSyntheticRows * 4});
+        size_t cached_legal_rows = 0;
+        for (const auto& row : fixed_q_table.rows) {
+          cached_legal_rows += row.legal_q_actor_relative.size();
+        }
+        UTILS_CHECK(cached_legal_rows <= static_cast<size_t>(
+            kSyntheticRows * 3));
+        const auto batched_millis =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - batched_start).count();
+        const auto counters =
+            vrpo_training_internal::ReadBatchPlacementCounters();
+        CHECK_EQ(counters.actor_batches, int64_t{1});
+        CHECK_EQ(counters.q_batches, int64_t{1});
+        CHECK_EQ(counters.source_rows, int64_t{2 * kSyntheticRows});
+        CHECK_EQ(counters.placement_calls, int64_t{2});
+        CHECK_EQ(counters.destination_finite_checks, int64_t{2});
+        CHECK_EQ(counters.legal_index_placement_calls, int64_t{2});
+        CHECK_EQ(counters.legal_probability_host_copies, int64_t{2});
+        CHECK_EQ(counters.legal_probability_finite_checks, int64_t{2});
+        CHECK_EQ(counters.fixed_q_index_placement_calls, int64_t{1});
+        CHECK_EQ(counters.fixed_q_host_copies, int64_t{1});
+        UTILS_CHECK(validation_millis < 5000);
+        UTILS_CHECK(batched_millis < 5000);
+        for (size_t index = 0; index < 32; ++index) {
+          std::vector<double> scalar_capped;
+          std::vector<double> scalar_uncapped;
+          UTILS_CHECK(VrpoTrainingLegalProbabilities(
+              actor_output.logits[index], *flat.rows[index], 10.0,
+              &scalar_capped, &error));
+          UTILS_CHECK(VrpoTrainingLegalProbabilities(
+              actor_output.logits[index], *flat.rows[index], 0.0,
+              &scalar_uncapped, &error));
+          CHECK_EQ(capped_values[index].size(), scalar_capped.size());
+          CHECK_EQ(uncapped_values[index].size(), scalar_uncapped.size());
+          for (size_t legal = 0; legal < scalar_capped.size(); ++legal) {
+            CHECK_EQ(capped_values[index][legal], scalar_capped[legal]);
+            CHECK_EQ(uncapped_values[index][legal], scalar_uncapped[legal]);
+          }
+        }
+        auto expect_source_mismatch = [&](torch::Tensor replacement) {
+          VrpoTrainingRow changed = *flat.rows[1];
+          changed.actor_input = std::move(replacement);
+          std::vector<const VrpoTrainingRow*> mismatched = {
+              flat.rows[0], &changed};
+          torch::Tensor rejected;
+          UTILS_CHECK(!vrpo_training_internal::StackInputs(
+              mismatched, true, actor_placement, &rejected, &error));
+          UTILS_CHECK(error.find("mixed shape/device/dtype") !=
+                      std::string::npos);
+        };
+        expect_source_mismatch(flat.rows[1]->actor_input.to(device));
+        expect_source_mismatch(flat.rows[1]->actor_input.to(torch::kFloat64));
+        expect_source_mismatch(flat.rows[1]->actor_input.narrow(0, 0, 4));
+      }
+
+      for (size_t arm_index = 0; arm_index < arms.size(); ++arm_index) {
+        auto fixture = MakeTinyVrpoTrainingFixture();
+        auto episodes = MakeTinyVrpoTrainingEpisodes(
+            *fixture.actor, arms[arm_index].logit_cap);
+        for (const auto& episode : episodes) {
+          for (const auto& row : episode.rows) {
+            UTILS_CHECK(row.actor_input.device().is_cpu());
+            UTILS_CHECK(row.q_input.device().is_cpu());
+          }
+        }
+        fixture.actor->to(device, torch::kFloat32);
+        fixture.q->to(device, torch::kFloat32);
+        const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+        const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+        const std::string value_before =
+            TinyVrpoModuleHash(*fixture.actor, "value_head");
+        VrpoTrainingUpdateStats stats;
+        std::string error;
+        const bool update_ok = RunVrpoPhase4dOneUpdate(
+            arms[arm_index], episodes, 0x4d000000 + arm_index,
+            *fixture.actor, *fixture.q, *fixture.actor_optimizer,
+            *fixture.q_optimizer, fixture.actor_forward, fixture.q_forward,
+            &stats, &error);
+        if (!update_ok) {
+          std::cerr << "\n  CUDA phase4d arm " << arms[arm_index].arm_id
+                    << " failed: " << error << "\n";
+        }
+        UTILS_CHECK(update_ok);
+        CHECK_EQ(stats.actor_optimizer_steps, int64_t{64});
+        CHECK_EQ(stats.actor_rows_seen, int64_t{256});
+        UTILS_CHECK(TinyVrpoModuleHash(*fixture.actor) != actor_before);
+        AssertTinyVrpoOptimizerMomentsOn(
+            *fixture.actor_optimizer, device, torch::kFloat32, true);
+        if (arms[arm_index].algorithm == VrpoPhase4Algorithm::kPpo) {
+          CHECK_EQ(stats.q_optimizer_steps, int64_t{0});
+          CHECK_EQ(stats.q_rows_seen, int64_t{0});
+          CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+          UTILS_CHECK(TinyVrpoModuleHash(*fixture.actor, "value_head") !=
+                      value_before);
+          UTILS_CHECK(fixture.q_optimizer->state().empty());
+        } else {
+          CHECK_EQ(stats.q_optimizer_steps, int64_t{64});
+          CHECK_EQ(stats.q_rows_seen, int64_t{256});
+          UTILS_CHECK(TinyVrpoModuleHash(*fixture.q) != q_before);
+          CHECK_EQ(TinyVrpoModuleHash(*fixture.actor, "value_head"),
+                   value_before);
+          AssertTinyVrpoOptimizerMomentsOn(
+              *fixture.q_optimizer, device, torch::kFloat32, true);
+        }
+      }
+
+      // A partially moved module must fail before preflight or any optimizer
+      // state creation; silently repairing mixed module placement would hide a
+      // broken production load.
+      {
+        const auto arm = arms[0];
+        auto fixture = MakeTinyVrpoTrainingFixture();
+        auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor,
+                                                     arm.logit_cap);
+        fixture.actor->to(device, torch::kFloat32);
+        fixture.q->to(device, torch::kFloat32);
+        fixture.actor->policy_head->to(torch::kCPU, torch::kFloat32);
+        const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+        const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+        VrpoTrainingUpdateStats rejected;
+        std::string error;
+        UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+            arm, episodes, 0x4dfffffe, *fixture.actor, *fixture.q,
+            *fixture.actor_optimizer, *fixture.q_optimizer,
+            fixture.actor_forward, fixture.q_forward, &rejected, &error));
+        CHECK_EQ(rejected.actor_optimizer_steps, int64_t{0});
+        CHECK_EQ(rejected.q_optimizer_steps, int64_t{0});
+        CHECK_EQ(TinyVrpoModuleHash(*fixture.actor), actor_before);
+        CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+        UTILS_CHECK(fixture.actor_optimizer->state().empty());
+        UTILS_CHECK(fixture.q_optimizer->state().empty());
+        UTILS_CHECK(error.find("device/dtype") != std::string::npos);
+      }
+
+      // The production transaction also supports truly empty fresh AdamW
+      // state. Prove that a CUDA step materializes moments and rollback removes
+      // them again while retaining device, modes, requires-grad, and no grads.
+      {
+        const auto arm = arms[2];
+        auto fixture = MakeTinyVrpoTrainingFixture();
+        auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor,
+                                                     arm.logit_cap);
+        fixture.actor->to(device, torch::kFloat32);
+        fixture.q->to(device, torch::kFloat32);
+        fixture.actor->eval();
+        fixture.q->train();
+        fixture.actor->value_head->bias.set_requires_grad(false);
+        UTILS_CHECK(fixture.actor_optimizer->state().empty());
+        UTILS_CHECK(fixture.q_optimizer->state().empty());
+        const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+        const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+        int actor_forward_calls = 0;
+        bool saw_stepped_actor_state = false;
+        VrpoActorForward late_empty_failure =
+            [actor = fixture.actor,
+             optimizer = fixture.actor_optimizer.get(),
+             &actor_forward_calls, &saw_stepped_actor_state](
+                const torch::Tensor& input) {
+              VrpoActorTrainingOutput result = actor->Forward(input);
+              ++actor_forward_calls;
+              if (actor_forward_calls == 3) {
+                for (const auto& item : optimizer->state()) {
+                  const auto* state =
+                      dynamic_cast<const torch::optim::AdamWParamState*>(
+                          item.second.get());
+                  if (state != nullptr && state->step() > 0) {
+                    saw_stepped_actor_state = true;
+                  }
+                }
+                result.logits = torch::full_like(
+                    result.logits,
+                    std::numeric_limits<float>::quiet_NaN());
+              }
+              return result;
+            };
+        VrpoTrainingUpdateStats rejected;
+        std::string error;
+        UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+            arm, episodes, 0x4dfffffd, *fixture.actor, *fixture.q,
+            *fixture.actor_optimizer, *fixture.q_optimizer,
+            late_empty_failure, fixture.q_forward, &rejected, &error));
+        UTILS_CHECK(actor_forward_calls >= 3);
+        UTILS_CHECK(saw_stepped_actor_state);
+        CHECK_EQ(rejected.actor_optimizer_steps, int64_t{0});
+        CHECK_EQ(rejected.q_optimizer_steps, int64_t{0});
+        CHECK_EQ(TinyVrpoModuleHash(*fixture.actor), actor_before);
+        CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+        UTILS_CHECK(fixture.actor_optimizer->state().empty());
+        UTILS_CHECK(fixture.q_optimizer->state().empty());
+        UTILS_CHECK(!fixture.actor->is_training());
+        UTILS_CHECK(fixture.q->is_training());
+        UTILS_CHECK(!fixture.actor->value_head->bias.requires_grad());
+        for (const auto& item : fixture.actor->named_parameters()) {
+          CHECK_EQ(item.value().device(), device);
+          UTILS_CHECK(!item.value().grad().defined() ||
+                      item.value().grad().abs().max().item<double>() == 0.0);
+        }
+        for (const auto& item : fixture.q->named_parameters()) {
+          CHECK_EQ(item.value().device(), device);
+          UTILS_CHECK(!item.value().grad().defined() ||
+                      item.value().grad().abs().max().item<double>() == 0.0);
+        }
+        UTILS_CHECK(!error.empty());
+      }
+
+      // Fail after one actor minibatch has stepped. The transaction must put
+      // both modules and every materialized AdamW moment back on CUDA exactly.
+      const auto arm = arms[2];
+      auto fixture = MakeTinyVrpoTrainingFixture();
+      auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor,
+                                                   arm.logit_cap);
+      fixture.actor->to(device, torch::kFloat32);
+      fixture.q->to(device, torch::kFloat32);
+      MaterializeVrpoZeroAdamWState(*fixture.actor_optimizer);
+      MaterializeVrpoZeroAdamWState(*fixture.q_optimizer);
+      const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+      const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+      const std::string actor_optimizer_before =
+          TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer);
+      const std::string q_optimizer_before =
+          TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer);
+      int actor_forward_calls = 0;
+      VrpoActorForward late_nonfinite =
+          [actor = fixture.actor, &actor_forward_calls](
+              const torch::Tensor& input) {
+            VrpoActorTrainingOutput result = actor->Forward(input);
+            ++actor_forward_calls;
+            if (actor_forward_calls == 3) {
+              result.logits = torch::full_like(
+                  result.logits,
+                  std::numeric_limits<float>::quiet_NaN());
+            }
+            return result;
+          };
+      VrpoTrainingUpdateStats rejected;
+      std::string error;
+      UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+          arm, episodes, 0x4dffffff, *fixture.actor, *fixture.q,
+          *fixture.actor_optimizer, *fixture.q_optimizer, late_nonfinite,
+          fixture.q_forward, &rejected, &error));
+      UTILS_CHECK(actor_forward_calls >= 3);
+      CHECK_EQ(rejected.actor_optimizer_steps, int64_t{0});
+      CHECK_EQ(rejected.q_optimizer_steps, int64_t{0});
+      CHECK_EQ(TinyVrpoModuleHash(*fixture.actor), actor_before);
+      CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+      CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer),
+               actor_optimizer_before);
+      CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer),
+               q_optimizer_before);
+      AssertTinyVrpoOptimizerMomentsOn(
+          *fixture.actor_optimizer, device, torch::kFloat32, true);
+      AssertTinyVrpoOptimizerMomentsOn(
+          *fixture.q_optimizer, device, torch::kFloat32, true);
+      UTILS_CHECK(!error.empty());
+    }
+  } TEST_END();
+}
+
 void TestVrpoPhase4dFreshTargetsAndGlobalTrace() {
   TEST_BEGIN("VRPO phase 4d: post-actor target freshness, opponent influence, and episode isolation") {
     const auto config = CanonicalVrpoPhase4Arms()[2];
@@ -4571,11 +5007,81 @@ void TestVrpoPhase4dFreshTargetsAndGlobalTrace() {
     auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, config.logit_cap);
     std::string error;
     VrpoTrainingTargetBundle baseline;
+    VrpoFixedLegalQTable fixed_q_table;
     UTILS_CHECK(ComputeVrpoTrainingTargets(
         config, episodes, *fixture.actor, *fixture.q,
-        fixture.actor_forward, fixture.q_forward, &baseline, &error));
+        fixture.actor_forward, fixture.q_forward, &baseline, &error,
+        nullptr, &fixed_q_table));
     UTILS_CHECK(ValidateVrpoTrainingTargetsFresh(
         baseline, *fixture.actor, *fixture.q, &error));
+
+    std::vector<size_t> all_episode_indices(episodes.size());
+    for (size_t index = 0; index < episodes.size(); ++index) {
+      all_episode_indices[index] = index;
+    }
+    const auto full_flat = vrpo_training_internal::FlattenEpisodes(
+        episodes, all_episode_indices);
+    UTILS_CHECK(vrpo_training_internal::ValidateFixedLegalQTable(
+        fixed_q_table, full_flat, *fixture.q, &error));
+
+    // Compare the legal-only cache path to the original dense-Q scalar
+    // reference adapter on the exact same actor probabilities and Q output.
+    std::vector<torch::Tensor> actor_inputs;
+    std::vector<torch::Tensor> q_inputs;
+    for (const VrpoTrainingRow* row : full_flat.rows) {
+      actor_inputs.push_back(row->actor_input);
+      q_inputs.push_back(row->q_input);
+    }
+    const VrpoActorTrainingOutput dense_actor =
+        fixture.actor->Forward(torch::stack(actor_inputs));
+    const torch::Tensor dense_q = fixture.q->Forward(torch::stack(q_inputs));
+    std::vector<torch::Tensor> direct_log_probabilities;
+    std::vector<torch::Tensor> direct_probabilities;
+    std::vector<std::vector<double>> direct_probability_values;
+    UTILS_CHECK(vrpo_training_internal::BuildLegalPolicies(
+        dense_actor, full_flat, config.logit_cap, &direct_log_probabilities,
+        &direct_probabilities, &direct_probability_values, &error));
+    std::vector<double> direct_advantages;
+    std::vector<VrpoTrainingTargetRow> direct_targets;
+    UTILS_CHECK(vrpo_training_internal::BuildReferences(
+        config, full_flat, direct_probability_values, dense_q,
+        &direct_advantages, &direct_targets, &error));
+    CHECK_EQ(vrpo_training_internal::TargetValuesSha256(direct_targets),
+             baseline.target_values_sha256);
+    CHECK_EQ(direct_targets.size(), baseline.rows.size());
+    for (size_t index = 0; index < direct_targets.size(); ++index) {
+      CHECK_EQ(direct_targets[index].row_id, baseline.rows[index].row_id);
+      CHECK_EQ(direct_targets[index].actor_advantage,
+               baseline.rows[index].actor_advantage);
+      CHECK_EQ(direct_targets[index].q_target_absolute,
+               baseline.rows[index].q_target_absolute);
+      CHECK_EQ(direct_targets[index].q_target_actor_relative,
+               baseline.rows[index].q_target_actor_relative);
+    }
+
+    auto reordered_flat = full_flat;
+    std::swap(reordered_flat.rows[0], reordered_flat.rows[1]);
+    UTILS_CHECK(!vrpo_training_internal::ValidateFixedLegalQTable(
+        fixed_q_table, reordered_flat, *fixture.q, &error));
+    VrpoTrainingRow legal_changed = *full_flat.rows[0];
+    std::swap(legal_changed.legal_actions[0], legal_changed.legal_actions[1]);
+    auto legal_mismatch_flat = full_flat;
+    legal_mismatch_flat.rows[0] = &legal_changed;
+    UTILS_CHECK(!vrpo_training_internal::ValidateFixedLegalQTable(
+        fixed_q_table, legal_mismatch_flat, *fixture.q, &error));
+    const torch::Tensor q_bias_before = fixture.q->q_head->bias.detach().clone();
+    {
+      torch::NoGradGuard no_grad;
+      fixture.q->q_head->bias.add_(0.125);
+    }
+    UTILS_CHECK(!vrpo_training_internal::ValidateFixedLegalQTable(
+        fixed_q_table, full_flat, *fixture.q, &error));
+    {
+      torch::NoGradGuard no_grad;
+      fixture.q->q_head->bias.copy_(q_bias_before);
+    }
+    UTILS_CHECK(vrpo_training_internal::ValidateFixedLegalQTable(
+        fixed_q_table, full_flat, *fixture.q, &error));
 
     {
       torch::NoGradGuard no_grad;
@@ -4696,6 +5202,109 @@ void TestVrpoPhase4dFailClosedBeforeStep() {
     require_reject_without_movement(2);
     require_reject_without_movement(3);
     require_reject_without_movement(4);
+
+    // A partially materialized optimizer is neither a supported empty state
+    // nor a complete registered state and must fail before any forward/step.
+    {
+      auto partial = MakeTinyVrpoTrainingFixture();
+      auto partial_episodes = MakeTinyVrpoTrainingEpisodes(
+          *partial.actor, config.logit_cap);
+      MaterializeVrpoZeroAdamWState(*partial.actor_optimizer);
+      const auto first_parameter =
+          partial.actor_optimizer->param_groups()[0].params().front();
+      partial.actor_optimizer->state().erase(
+          first_parameter.unsafeGetTensorImpl());
+      const std::string actor_before = TinyVrpoModuleHash(*partial.actor);
+      const std::string q_before = TinyVrpoModuleHash(*partial.q);
+      const std::string actor_optimizer_before =
+          TinyVrpoOptimizerNumericalHash(*partial.actor_optimizer);
+      int actor_forward_calls = 0;
+      VrpoActorForward counted_forward =
+          [actor = partial.actor, &actor_forward_calls](
+              const torch::Tensor& input) {
+            ++actor_forward_calls;
+            return actor->Forward(input);
+          };
+      VrpoTrainingUpdateStats rejected;
+      std::string partial_error;
+      UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+          config, partial_episodes, 414141, *partial.actor, *partial.q,
+          *partial.actor_optimizer, *partial.q_optimizer, counted_forward,
+          partial.q_forward, &rejected, &partial_error));
+      CHECK_EQ(actor_forward_calls, 0);
+      CHECK_EQ(rejected.actor_optimizer_steps, int64_t{0});
+      CHECK_EQ(rejected.q_optimizer_steps, int64_t{0});
+      CHECK_EQ(TinyVrpoModuleHash(*partial.actor), actor_before);
+      CHECK_EQ(TinyVrpoModuleHash(*partial.q), q_before);
+      CHECK_EQ(TinyVrpoOptimizerNumericalHash(*partial.actor_optimizer),
+               actor_optimizer_before);
+      UTILS_CHECK(partial_error.find("partial or extra") !=
+                  std::string::npos);
+    }
+
+    // Empty AdamW state is a supported fresh state. After one real actor step,
+    // a late failure must restore exact empty state plus runtime flags/grads.
+    {
+      auto empty = MakeTinyVrpoTrainingFixture();
+      auto empty_episodes = MakeTinyVrpoTrainingEpisodes(
+          *empty.actor, config.logit_cap);
+      empty.actor->eval();
+      empty.q->train();
+      empty.actor->value_head->bias.set_requires_grad(false);
+      UTILS_CHECK(empty.actor_optimizer->state().empty());
+      UTILS_CHECK(empty.q_optimizer->state().empty());
+      const std::string actor_before = TinyVrpoModuleHash(*empty.actor);
+      const std::string q_before = TinyVrpoModuleHash(*empty.q);
+      int actor_forward_calls = 0;
+      bool saw_stepped_actor_state = false;
+      VrpoActorForward late_empty_failure =
+          [actor = empty.actor, optimizer = empty.actor_optimizer.get(),
+           &actor_forward_calls, &saw_stepped_actor_state](
+              const torch::Tensor& input) {
+            VrpoActorTrainingOutput result = actor->Forward(input);
+            ++actor_forward_calls;
+            if (actor_forward_calls == 3) {
+              for (const auto& item : optimizer->state()) {
+                const auto* state =
+                    dynamic_cast<const torch::optim::AdamWParamState*>(
+                        item.second.get());
+                if (state != nullptr && state->step() > 0) {
+                  saw_stepped_actor_state = true;
+                }
+              }
+              result.logits = torch::full_like(
+                  result.logits,
+                  std::numeric_limits<float>::quiet_NaN());
+            }
+            return result;
+          };
+      VrpoTrainingUpdateStats rejected;
+      std::string empty_error;
+      UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+          config, empty_episodes, 424241, *empty.actor, *empty.q,
+          *empty.actor_optimizer, *empty.q_optimizer, late_empty_failure,
+          empty.q_forward, &rejected, &empty_error));
+      UTILS_CHECK(actor_forward_calls >= 3);
+      UTILS_CHECK(saw_stepped_actor_state);
+      CHECK_EQ(rejected.actor_optimizer_steps, int64_t{0});
+      CHECK_EQ(rejected.q_optimizer_steps, int64_t{0});
+      CHECK_EQ(TinyVrpoModuleHash(*empty.actor), actor_before);
+      CHECK_EQ(TinyVrpoModuleHash(*empty.q), q_before);
+      UTILS_CHECK(empty.actor_optimizer->state().empty());
+      UTILS_CHECK(empty.q_optimizer->state().empty());
+      UTILS_CHECK(!empty.actor->is_training());
+      UTILS_CHECK(empty.q->is_training());
+      UTILS_CHECK(!empty.actor->value_head->bias.requires_grad());
+      for (const auto& item : empty.actor->named_parameters()) {
+        UTILS_CHECK(!item.value().grad().defined() ||
+                    item.value().grad().abs().max().item<double>() == 0.0);
+      }
+      for (const auto& item : empty.q->named_parameters()) {
+        UTILS_CHECK(!item.value().grad().defined() ||
+                    item.value().grad().abs().max().item<double>() == 0.0);
+      }
+      UTILS_CHECK(!empty_error.empty());
+    }
 
     // A forward failure that appears only after the first actor optimizer step
     // is not structurally preflightable. The transaction must restore modules
@@ -4933,11 +5542,15 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
         return q->Forward(input);
       };
       json::Object result;
-      UTILS_CHECK(WriteVrpoPhase4eOneUpdate(
+      const bool write_ok = WriteVrpoPhase4eOneUpdate(
           startup, arms[arm_index], fixture.binding, fixture.layout,
           input_identity, episodes, pairing, actor, q, &optimizers,
           actor_forward, q_forward, VrpoPhase4eFailurePoint::kNone, &result,
-          &error));
+          &error);
+      if (!write_ok) {
+        std::cerr << "\n  phase4e one-update error: " << error << "\n";
+      }
+      UTILS_CHECK(write_ok);
       CHECK_EQ(result.at("status").GetString(), std::string("PASS"));
       CHECK_EQ(result.at("startup_logit_cap").GetDouble(),
                arms[arm_index].logit_cap);
@@ -5778,6 +6391,7 @@ int main() {
   TestVrpoPhase4cBootstrapOnlyIntegration();
   TestVrpoPhase4dWholeEpisodePartitioner();
   TestVrpoPhase4dFourArmUpdateMechanics();
+  TestVrpoPhase4dCudaCpuInputPlacementAndRollback();
   TestVrpoPhase4dFreshTargetsAndGlobalTrace();
   TestVrpoPhase4dFailClosedBeforeStep();
   TestVrpoPhase4eOneUpdateArchiveAndRollback();
