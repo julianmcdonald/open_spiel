@@ -6836,7 +6836,15 @@ int main(int argc, char** argv) {
     vrpo_one_update_startup.reward_scale = absl::GetFlag(FLAGS_reward_scale);
     vrpo_one_update_startup.gamma = absl::GetFlag(FLAGS_gamma);
     vrpo_one_update_startup.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    // Bind the actual policy transform before strict archive loading. The
+    // startup contract below rejects NaN and every non-exact arm/cap pairing.
+    vrpo_one_update_startup.logit_cap = absl::GetFlag(FLAGS_logit_cap);
     std::string vrpo_one_update_error;
+    if (!open_spiel::ValidateVrpoPhase4eSelectedArmLogitCap(
+            vrpo_one_update_startup, &vrpo_one_update_error)) {
+      SpielFatalError("VRPO one-update startup rejected: " +
+                      vrpo_one_update_error);
+    }
     json::Object input_manifest;
     if (!open_spiel::ReadVrpoPhase4eExternalBinding(
             vrpo_one_update_startup.input_archive, vrpo_one_update_arm,

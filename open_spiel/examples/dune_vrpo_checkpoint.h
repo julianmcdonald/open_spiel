@@ -6,8 +6,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -50,6 +52,30 @@ struct VrpoExpandedExpectedLayout {
   std::string actor_names_shapes_sha256;
   std::string q_names_shapes_sha256;
 };
+
+// Bootstrap and phase-4d archives intentionally retain their original strict
+// schema. Phase 4e provides this optional binding only on its update-1 output,
+// so the command-line policy transform is independently auditable.
+struct VrpoPhase4eLogitCapBinding {
+  double startup_logit_cap = std::numeric_limits<double>::quiet_NaN();
+  double arm_logit_cap = std::numeric_limits<double>::quiet_NaN();
+  bool matched = false;
+};
+
+inline bool ValidateVrpoPhase4eLogitCapBinding(
+    const VrpoPhase4eLogitCapBinding& binding,
+    const VrpoPhase4ArmConfig& arm, std::string* error) {
+  if (!std::isfinite(binding.startup_logit_cap) ||
+      !std::isfinite(binding.arm_logit_cap) || !binding.matched ||
+      binding.startup_logit_cap != binding.arm_logit_cap ||
+      binding.arm_logit_cap != arm.logit_cap) {
+    if (error != nullptr) {
+      *error = "phase4e logit-cap binding is not finite, exact, and matched";
+    }
+    return false;
+  }
+  return true;
+}
 
 inline VrpoExpandedCheckpointPaths VrpoExpandedPaths(
     const std::filesystem::path& directory) {
@@ -591,7 +617,9 @@ inline json::Object BuildVrpoExpandedManifest(
     const std::string& q_values_sha256,
     const std::string& optimizer_zero_state_sha256,
     const std::string& actor_optimizer_state_sha256,
-    const std::string& q_optimizer_state_sha256) {
+    const std::string& q_optimizer_state_sha256,
+    const std::optional<VrpoPhase4eLogitCapBinding>& phase4e_cap_binding =
+        std::nullopt) {
   json::Object out;
   out["schema"] = kVrpoExpandedCheckpointSchema;
   out["phase4_contract"] = json::Value(BuildVrpoPhase4Manifest(arm, binding));
@@ -619,6 +647,14 @@ inline json::Object BuildVrpoExpandedManifest(
   out["serialized_q_value_hash_schema"] = serialized_layout.test_fixture
       ? "generic_named_parameter_values_v1"
       : "canonical_dune_vrpo_q_module_v1";
+  if (phase4e_cap_binding.has_value()) {
+    json::Object cap_binding;
+    cap_binding["startup_logit_cap"] =
+        phase4e_cap_binding->startup_logit_cap;
+    cap_binding["arm_logit_cap"] = phase4e_cap_binding->arm_logit_cap;
+    cap_binding["matched"] = phase4e_cap_binding->matched;
+    out["phase4e_logit_cap_binding"] = std::move(cap_binding);
+  }
   const std::array<std::pair<std::string, VrpoExpandedFileIdentity>, 4> files = {{
       {"actor_model", actor_model}, {"q_model", q_model},
       {"actor_optimizer", actor_optimizer}, {"q_optimizer", q_optimizer}}};
@@ -753,7 +789,9 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
     std::shared_ptr<torch::nn::Module> q_model,
     VrpoFreshOptimizers& optimizers,
     VrpoCheckpointFailurePoint failure_point, std::string* error,
-    VrpoExpandedArchiveIdentity* archive_identity = nullptr) {
+    VrpoExpandedArchiveIdentity* archive_identity = nullptr,
+    const std::optional<VrpoPhase4eLogitCapBinding>& phase4e_cap_binding =
+        std::nullopt) {
   auto fail = [&](const std::string& message,
                   const VrpoExpandedCheckpointPaths& paths) {
     if (error != nullptr) *error = message;
@@ -785,6 +823,12 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
       !ValidateVrpoExpandedLiveLayout(
           *actor_model, *q_model, expected_layout, binding,
           &contract_error)) {
+    if (error != nullptr) *error = contract_error;
+    return false;
+  }
+  if (phase4e_cap_binding.has_value() &&
+      !ValidateVrpoPhase4eLogitCapBinding(
+          *phase4e_cap_binding, arm, &contract_error)) {
     if (error != nullptr) *error = contract_error;
     return false;
   }
@@ -917,7 +961,8 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
         next_episode_id,
         actor_file, q_file, actor_optimizer_file, q_optimizer_file,
         actor_value_hash, q_parameter_hash, zero_state_hash,
-        actor_optimizer_state_hash, q_optimizer_state_hash);
+        actor_optimizer_state_hash, q_optimizer_state_hash,
+        phase4e_cap_binding);
     {
       std::ofstream stream(manifest_tmp, std::ios::trunc);
       if (!stream) return fail("cannot write expanded manifest temp", paths);
@@ -1036,7 +1081,9 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
     std::string* error,
     VrpoExpandedArchiveIdentity* archive_identity = nullptr,
     int64_t expected_global_update = 0,
-    std::optional<uint64_t> expected_next_episode_id = std::nullopt) {
+    std::optional<uint64_t> expected_next_episode_id = std::nullopt,
+    const std::optional<VrpoPhase4eLogitCapBinding>&
+        expected_phase4e_cap_binding = std::nullopt) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     if (loaded_manifest != nullptr) loaded_manifest->clear();
@@ -1212,7 +1259,8 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
       static_cast<uint64_t>(next_it->second.GetInt()),
       actor_file, q_file, actor_optimizer_file, q_optimizer_file,
       actor_values_hash, q_values_hash, zero_state_hash,
-      actor_optimizer_state_hash, q_optimizer_state_hash);
+      actor_optimizer_state_hash, q_optimizer_state_hash,
+      expected_phase4e_cap_binding);
   if (!VrpoExpandedManifestStrictEqual(manifest, expected, error)) {
     return false;
   }

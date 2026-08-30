@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <random>
@@ -185,8 +186,35 @@ struct VrpoPhase4eStartupConfig {
   double reward_scale = 4.0;
   double gamma = 1.0;
   double lambda = 1.0;
+  // The actual runtime transform, supplied from FLAGS_logit_cap. It must be
+  // exactly the registered selected-arm value before Phase 4e can load,
+  // collect, or step.
+  double logit_cap = std::numeric_limits<double>::quiet_NaN();
   double probability_tolerance = kVrpoRegisteredProbabilityTolerance;
 };
+
+inline const VrpoPhase4ArmConfig* FindCanonicalVrpoPhase4Arm(
+    const std::string& arm_id) {
+  static const auto arms = CanonicalVrpoPhase4Arms();
+  for (const auto& arm : arms) {
+    if (arm.arm_id == arm_id) return &arm;
+  }
+  return nullptr;
+}
+
+inline bool ValidateVrpoPhase4eSelectedArmLogitCap(
+    const VrpoPhase4eStartupConfig& config, std::string* error) {
+  const VrpoPhase4ArmConfig* selected_arm =
+      FindCanonicalVrpoPhase4Arm(config.selected_arm_id);
+  if (selected_arm == nullptr || !std::isfinite(config.logit_cap) ||
+      config.logit_cap != selected_arm->logit_cap) {
+    if (error != nullptr) {
+      *error = "phase4e runtime logit cap does not exactly match selected arm";
+    }
+    return false;
+  }
+  return true;
+}
 
 inline bool VrpoPhase4eLowerHex64(const std::string& value) {
   return value.size() == 64 &&
@@ -251,19 +279,19 @@ inline bool ValidateVrpoPhase4eStartupConfig(
     if (error != nullptr) *error = message;
     return false;
   };
-  const auto arms = CanonicalVrpoPhase4Arms();
-  const bool arm_valid = std::any_of(
-      arms.begin(), arms.end(), [&](const auto& arm) {
-        return arm.arm_id == config.selected_arm_id;
-      });
+  const VrpoPhase4ArmConfig* selected_arm =
+      FindCanonicalVrpoPhase4Arm(config.selected_arm_id);
   if (config.game != "dune_imperium" || config.registration_id.empty() ||
-      !arm_valid || config.input_archive.empty() ||
+      selected_arm == nullptr || config.input_archive.empty() ||
       config.output_root.empty() || config.source_root.empty() ||
       !VrpoPhase4eLowerHex64(config.source_code_sha256) ||
       !VrpoPhase4eLowerHex64(config.executed_binary_sha256) ||
       config.executed_binary_size <= 0 ||
       !VrpoPhase4eLowerHex64(config.input_archive_sha256)) {
     return fail("phase4e identity/game/path/arm contract is invalid");
+  }
+  if (!ValidateVrpoPhase4eSelectedArmLogitCap(config, error)) {
+    return false;
   }
   VrpoPhase4eResolvedPaths resolved;
   if (!ResolveVrpoPhase4ePaths(config.input_archive, config.output_root,
@@ -301,15 +329,6 @@ inline bool ValidateVrpoPhase4eStartupConfig(
     return fail("phase4e output root must be fresh and absent");
   }
   return true;
-}
-
-inline const VrpoPhase4ArmConfig* FindCanonicalVrpoPhase4Arm(
-    const std::string& arm_id) {
-  static const auto arms = CanonicalVrpoPhase4Arms();
-  for (const auto& arm : arms) {
-    if (arm.arm_id == arm_id) return &arm;
-  }
-  return nullptr;
 }
 
 inline bool ReadVrpoPhase4eExternalBinding(
@@ -701,6 +720,15 @@ inline bool WriteVrpoPhase4eOneUpdate(
   if (!ValidateVrpoPhase4eStartupConfig(effective_startup, &startup_error)) {
     return fail(startup_error);
   }
+  // This redundant writer-local check is intentionally before transaction
+  // capture and RunVrpoPhase4dOneUpdate: a caller cannot bypass the startup
+  // gate and collect/step under a cap other than its registered arm.
+  if (!std::isfinite(effective_startup.logit_cap) ||
+      effective_startup.logit_cap != arm.logit_cap) {
+    return fail("phase4e runtime logit cap differs from selected arm before update");
+  }
+  const VrpoPhase4eLogitCapBinding cap_binding{
+      effective_startup.logit_cap, arm.logit_cap, true};
   if (arm.arm_id != effective_startup.selected_arm_id ||
       input_identity.combined_sha256 != effective_startup.input_archive_sha256 ||
       binding.start_episode_id + kVrpoPhase4eGames - 1 >
@@ -783,7 +811,7 @@ inline bool WriteVrpoPhase4eOneUpdate(
           archive_path, arm, binding, layout,
           GenerateVrpoPhase4eCheckpointUuid(), 1,
           next_episode_id, actor, q, *optimizers, save_failure, error,
-          &output_identity)) {
+          &output_identity, cap_binding)) {
     return fail(error != nullptr ? *error : "phase4e update archive save failed");
   }
   if (failure_point == VrpoPhase4eFailurePoint::kReload) {
@@ -794,7 +822,7 @@ inline bool WriteVrpoPhase4eOneUpdate(
   if (!LoadAndValidateVrpoExpandedCheckpoint(
           archive_path, arm, binding, layout, actor, q, *optimizers,
           &reloaded_manifest, error, &reloaded_identity, 1,
-          next_episode_id)) {
+          next_episode_id, cap_binding)) {
     return fail(error != nullptr ? *error : "phase4e strict reload failed");
   }
   torch::Tensor actor_logits_after;
@@ -836,6 +864,9 @@ inline bool WriteVrpoPhase4eOneUpdate(
   root["selected_arm_id"] = arm.arm_id;
   root["algorithm"] = VrpoPhase4AlgorithmName(arm.algorithm);
   root["logit_cap"] = arm.logit_cap;
+  root["startup_logit_cap"] = effective_startup.logit_cap;
+  root["arm_logit_cap"] = arm.logit_cap;
+  root["logit_cap_matched"] = true;
   root["profile"] = effective_startup.profile;
   root["source_code_sha256"] = effective_startup.source_code_sha256;
   root["executed_binary_sha256"] = effective_startup.executed_binary_sha256;

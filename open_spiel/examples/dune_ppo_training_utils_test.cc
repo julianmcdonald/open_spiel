@@ -4913,6 +4913,7 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       startup.rollout_amp = false;
       startup.train_amp = false;
       startup.allow_tf32 = true;
+      startup.logit_cap = arms[arm_index].logit_cap;
       const auto episodes = MakeTinyVrpoPhase4eEpisodes(
           *actor, arms[arm_index].logit_cap, first_episode_id);
       VrpoPhase4ePairingStats pairing;
@@ -4938,6 +4939,11 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
           actor_forward, q_forward, VrpoPhase4eFailurePoint::kNone, &result,
           &error));
       CHECK_EQ(result.at("status").GetString(), std::string("PASS"));
+      CHECK_EQ(result.at("startup_logit_cap").GetDouble(),
+               arms[arm_index].logit_cap);
+      CHECK_EQ(result.at("arm_logit_cap").GetDouble(),
+               arms[arm_index].logit_cap);
+      UTILS_CHECK(result.at("logit_cap_matched").GetBool());
       CHECK_EQ(result.at("global_update").GetInt(), int64_t{1});
       CHECK_EQ(result.at("next_episode_id").GetInt(),
                static_cast<int64_t>(first_episode_id + kVrpoPhase4eGames));
@@ -4952,8 +4958,111 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       UTILS_CHECK(LoadAndValidateVrpoExpandedCheckpoint(
           startup.output_root / "archive", arms[arm_index], fixture.binding,
           fixture.layout, actor, q, optimizers, &output_manifest, &error,
-          &output_identity, 1, first_episode_id + kVrpoPhase4eGames));
+          &output_identity, 1, first_episode_id + kVrpoPhase4eGames,
+          VrpoPhase4eLogitCapBinding{arms[arm_index].logit_cap,
+                                     arms[arm_index].logit_cap, true}));
       UTILS_CHECK(output_identity.combined_sha256.size() == 64);
+      const auto cap_binding = output_manifest.find("phase4e_logit_cap_binding");
+      UTILS_CHECK(cap_binding != output_manifest.end() &&
+                  cap_binding->second.IsObject());
+      const auto& cap_object = cap_binding->second.GetObject();
+      CHECK_EQ(cap_object.at("startup_logit_cap").GetDouble(),
+               arms[arm_index].logit_cap);
+      CHECK_EQ(cap_object.at("arm_logit_cap").GetDouble(),
+               arms[arm_index].logit_cap);
+      UTILS_CHECK(cap_object.at("matched").GetBool());
+    }
+
+    // Every registered arm must reject both its opposite finite treatment and
+    // NaN before transaction capture. The unchanged model/optimizer identities
+    // are the fail-closed proof that this path takes zero learner steps.
+    for (size_t arm_index = 0; arm_index < arms.size(); ++arm_index) {
+      for (const double wrong_cap :
+           {arms[arm_index].logit_cap == 10.0 ? 0.0 : 10.0,
+            std::numeric_limits<double>::quiet_NaN()}) {
+        const uint64_t first_episode_id = 1000040500 + 100 * arm_index;
+        auto fixture = MakeTinyVrpoPhase4eFixture(first_episode_id);
+        std::string error;
+        const std::string case_name =
+            std::isnan(wrong_cap) ? "nan" : "swapped";
+        const auto input = root / ("cap_reject_input_" +
+                                   std::to_string(arm_index) + "_" + case_name);
+        VrpoExpandedArchiveIdentity input_identity;
+        UTILS_CHECK(SaveVrpoExpandedCheckpointAtomic(
+            input, arms[arm_index], fixture.binding, fixture.layout,
+            "33333333-3333-4333-8333-333333333333", 0, first_episode_id,
+            fixture.actor, fixture.q, fixture.optimizers,
+            VrpoCheckpointFailurePoint::kNone, &error, &input_identity));
+        auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(5, 8, 6, 1,
+                                                                      false);
+        auto q = std::make_shared<TinyVrpoPhase4eQ>();
+        VrpoFreshOptimizers optimizers;
+        UTILS_CHECK(MakeVrpoFreshOptimizers(*actor, *q, &optimizers, &error));
+        json::Object loaded;
+        UTILS_CHECK(LoadAndValidateVrpoExpandedCheckpoint(
+            input, arms[arm_index], fixture.binding, fixture.layout, actor, q,
+            optimizers, &loaded, &error, nullptr, 0, first_episode_id));
+        const std::string actor_before = TinyVrpoModuleHash(*actor);
+        const std::string q_before = TinyVrpoModuleHash(*q);
+        std::string actor_optimizer_before, q_optimizer_before;
+        UTILS_CHECK(ValidateVrpoOptimizerGroupsAndFiniteState(
+            optimizers, *actor, *q, &actor_optimizer_before,
+            &q_optimizer_before, &error));
+
+        VrpoPhase4eStartupConfig startup;
+        startup.game = "dune_imperium";
+        startup.registration_id = "VRPO_PHASE4E_CAP_REJECT_TEST";
+        startup.selected_arm_id = arms[arm_index].arm_id;
+        startup.input_archive = input;
+        startup.output_root = root / ("cap_reject_output_" +
+                                      std::to_string(arm_index) + "_" + case_name);
+        startup.source_root = "/source";
+        startup.source_code_sha256 = std::string(64, '4');
+        startup.executed_binary_sha256 = std::string(64, '5');
+        startup.executed_binary_size = 1;
+        startup.input_archive_sha256 = input_identity.combined_sha256;
+        startup.profile = "smoke16";
+        startup.rollout_games = kVrpoPhase4eGames;
+        startup.threads = 1;
+        startup.init_mode = "vrpo_one_update";
+        startup.rollout_amp = false;
+        startup.train_amp = false;
+        startup.allow_tf32 = true;
+        startup.logit_cap = wrong_cap;
+        const auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, arms[arm_index].logit_cap, first_episode_id);
+        VrpoPhase4ePairingStats pairing;
+        pairing.episodes = kVrpoPhase4eGames;
+        pairing.capture_rows = pairing.rollout_rows = pairing.paired_rows = 64;
+        pairing.canonical_sha256 = std::string(64, '6');
+        for (const auto& episode : episodes) {
+          for (const auto& row : episode.rows) ++pairing.actor_rows[row.actor];
+        }
+        VrpoActorForward actor_forward = [actor](const torch::Tensor& input) {
+          const auto output = actor->forward(input);
+          return VrpoActorTrainingOutput{output.logits, output.values};
+        };
+        VrpoQForward q_forward = [q](const torch::Tensor& input) {
+          return q->Forward(input);
+        };
+        json::Object result;
+        UTILS_CHECK(!WriteVrpoPhase4eOneUpdate(
+            startup, arms[arm_index], fixture.binding, fixture.layout,
+            input_identity, episodes, pairing, actor, q, &optimizers,
+            actor_forward, q_forward, VrpoPhase4eFailurePoint::kNone, &result,
+            &error));
+        UTILS_CHECK(error.find("logit cap") != std::string::npos);
+        UTILS_CHECK(result.empty());
+        UTILS_CHECK(!std::filesystem::exists(startup.output_root));
+        CHECK_EQ(TinyVrpoModuleHash(*actor), actor_before);
+        CHECK_EQ(TinyVrpoModuleHash(*q), q_before);
+        std::string actor_optimizer_after, q_optimizer_after;
+        UTILS_CHECK(ValidateVrpoOptimizerGroupsAndFiniteState(
+            optimizers, *actor, *q, &actor_optimizer_after,
+            &q_optimizer_after, &error));
+        CHECK_EQ(actor_optimizer_after, actor_optimizer_before);
+        CHECK_EQ(q_optimizer_after, q_optimizer_before);
+      }
     }
 
     for (const VrpoPhase4eFailurePoint failure :
@@ -5007,6 +5116,7 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       startup.rollout_amp = false;
       startup.train_amp = false;
       startup.allow_tf32 = true;
+      startup.logit_cap = arms[2].logit_cap;
       const auto episodes = MakeTinyVrpoPhase4eEpisodes(
           *actor, arms[2].logit_cap, first_episode_id);
       VrpoPhase4ePairingStats pairing;
@@ -5094,6 +5204,19 @@ void TestVrpoPhase4ePathAndSourceContracts() {
     for (const std::string& relative : paths) {
       UTILS_CHECK(std::filesystem::is_regular_file(source_root / relative));
     }
+    std::ifstream trainer(source_root / "open_spiel/examples/dune_ppo_train.cc");
+    std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
+                               std::istreambuf_iterator<char>());
+    const size_t startup_cap = trainer_source.find(
+        "vrpo_one_update_startup.logit_cap = absl::GetFlag(FLAGS_logit_cap)");
+    const size_t startup_cap_gate = trainer_source.find(
+        "ValidateVrpoPhase4eSelectedArmLogitCap", startup_cap);
+    const size_t strict_load = trainer_source.find(
+        "LoadAndValidateVrpoExpandedCheckpoint", startup_cap_gate);
+    UTILS_CHECK(startup_cap != std::string::npos);
+    UTILS_CHECK(startup_cap_gate != std::string::npos);
+    UTILS_CHECK(strict_load != std::string::npos && startup_cap < startup_cap_gate &&
+                startup_cap_gate < strict_load);
 
     const std::filesystem::path root = std::filesystem::temp_directory_path() /
         ("dune_vrpo_phase4e_path_source_" + std::to_string(::getpid()));
@@ -5307,6 +5430,7 @@ void TestVrpoPhase4eCudaArchiveRestore() {
       startup.rollout_amp = false;
       startup.train_amp = false;
       startup.allow_tf32 = true;
+      startup.logit_cap = arm.logit_cap;
       VrpoActorForward actor_forward =
           [rollback_actor](const torch::Tensor& input_tensor) {
             const auto out = rollback_actor->forward(input_tensor);
