@@ -1264,7 +1264,7 @@ std::string ComputeLegacyConfigFingerprint() {
   return open_spiel::ComputeStringSHA256(json_str);
 }
 
-std::string ComputeConfigFingerprint() {
+json::Object BuildPrePrecisionConfigFingerprintObject() {
   open_spiel::json::Object config_obj;
   config_obj["game"] = absl::GetFlag(FLAGS_game);
   config_obj["ppo_minibatch_size"] = absl::GetFlag(FLAGS_ppo_minibatch_size);
@@ -1356,8 +1356,19 @@ std::string ComputeConfigFingerprint() {
   config_obj["policy_kl_anchor_coeff"] =
       absl::GetFlag(FLAGS_policy_kl_anchor_coeff);
 
-  std::string json_str = open_spiel::json::ToString(config_obj);
-  return open_spiel::ComputeStringSHA256(json_str);
+  return config_obj;
+}
+
+std::string ComputeCurrentPrePrecisionConfigFingerprint() {
+  return open_spiel::ComputePrePrecisionConfigFingerprint(
+      BuildPrePrecisionConfigFingerprintObject());
+}
+
+std::string ComputeConfigFingerprint() {
+  return open_spiel::ComputePrecisionConfigFingerprint(
+      BuildPrePrecisionConfigFingerprintObject(),
+      absl::GetFlag(FLAGS_rollout_amp),
+      absl::GetFlag(FLAGS_allow_tf32));
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,6 +1504,9 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["base_seed"] = static_cast<int64_t>(base_seed);
     manifest_obj["seed_scheme_version"] = static_cast<int64_t>(seed_scheme_version);
     manifest_obj["config_fingerprint"] = config_fingerprint;
+    WritePpoPrecisionManifestFields(
+        manifest_obj, absl::GetFlag(FLAGS_rollout_amp),
+        absl::GetFlag(FLAGS_allow_tf32));
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = run_uuid;
     manifest_obj["model_filename"] = std::filesystem::path(model_path).filename().string();
@@ -5159,6 +5173,8 @@ int main(int argc, char** argv) {
   }
 
   std::string config_fingerprint = open_spiel::ComputeConfigFingerprint();
+  const std::string pre_precision_config_fingerprint =
+      open_spiel::ComputeCurrentPrePrecisionConfigFingerprint();
   std::string search_label_fingerprint = open_spiel::GetSearchLabelFingerprint(absl::GetFlag(FLAGS_search_label_dir));
   std::string run_uuid = open_spiel::GenerateUUID();
 
@@ -5381,7 +5397,11 @@ int main(int argc, char** argv) {
     if (!ParseAndValidateManifest(manifest_path, model_path, optim_path,
                                   master, target_end_update,
                                   absl::GetFlag(FLAGS_seed_scheme_version),
-                                  config_fingerprint, search_label_fingerprint,
+                                  config_fingerprint,
+                                  pre_precision_config_fingerprint,
+                                  absl::GetFlag(FLAGS_rollout_amp),
+                                  absl::GetFlag(FLAGS_allow_tf32),
+                                  search_label_fingerprint,
                                   absl::GetFlag(FLAGS_hidden_dim),
                                   absl::GetFlag(FLAGS_num_blocks),
                                   manifest, err, legacy_fingerprint)) {
@@ -5680,6 +5700,9 @@ int main(int argc, char** argv) {
     manifest_obj["base_seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
     manifest_obj["seed_scheme_version"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed_scheme_version));
     manifest_obj["config_fingerprint"] = config_fingerprint;
+    WritePpoPrecisionManifestFields(
+        manifest_obj, absl::GetFlag(FLAGS_rollout_amp),
+        absl::GetFlag(FLAGS_allow_tf32));
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = open_spiel::GenerateUUID();
     manifest_obj["checkpoint_uuid"] = open_spiel::GenerateUUID();

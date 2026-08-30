@@ -1777,6 +1777,135 @@ void TestRawPpoNumericalParityRawLogitPrecisionGate() {
   } TEST_END();
 }
 
+void TestPpoPrecisionFingerprintAndManifestMigration() {
+  TEST_BEGIN("PPO precision fingerprint and manifest migration fail closed") {
+    json::Object pre_precision;
+    pre_precision["game"] = "dune_imperium";
+    pre_precision["train_amp"] = true;
+    pre_precision["collector_acceptance_prior"] = "raw_network_prior";
+    const std::string pre_payload = json::ToString(pre_precision);
+    const std::string pre_fingerprint =
+        ComputePrePrecisionConfigFingerprint(pre_precision);
+    CHECK_EQ(pre_fingerprint,
+             std::string(
+                 "91796725a86d03a83ee03962589e57d23d9cc7792daccb9b20c3ebfe36310b9a"));
+    const std::string default_fingerprint =
+        ComputePrecisionConfigFingerprint(pre_precision, true, true);
+    const std::string fp32_fingerprint =
+        ComputePrecisionConfigFingerprint(pre_precision, false, true);
+    const std::string no_tf32_fingerprint =
+        ComputePrecisionConfigFingerprint(pre_precision, true, false);
+    UTILS_CHECK(default_fingerprint != pre_fingerprint);
+    UTILS_CHECK(fp32_fingerprint != default_fingerprint);
+    UTILS_CHECK(no_tf32_fingerprint != default_fingerprint);
+    UTILS_CHECK(fp32_fingerprint != no_tf32_fingerprint);
+    UTILS_CHECK(json::ToString(pre_precision) == pre_payload);
+
+    json::Object fresh;
+    fresh["config_fingerprint"] = default_fingerprint;
+    WritePpoPrecisionManifestFields(fresh, true, true);
+    UTILS_CHECK(fresh.at("rollout_amp").IsBool());
+    UTILS_CHECK(fresh.at("rollout_amp").GetBool());
+    UTILS_CHECK(fresh.at("allow_tf32").IsBool());
+    UTILS_CHECK(fresh.at("allow_tf32").GetBool());
+
+    auto validate = [&](const json::Object& manifest,
+                        const std::string& stored,
+                        const std::string& current,
+                        const std::string& pre,
+                        const std::string& legacy,
+                        bool rollout_amp, bool allow_tf32,
+                        PpoPrecisionManifestCompatibility* compatibility,
+                        std::string* error) {
+      return ValidatePpoPrecisionManifestCompatibility(
+          manifest, stored, current, pre, legacy, rollout_amp, allow_tf32,
+          compatibility, error);
+    };
+
+    PpoPrecisionManifestCompatibility compatibility;
+    std::string error;
+    UTILS_CHECK(validate(fresh, default_fingerprint, default_fingerprint,
+                         pre_fingerprint, "", true, true,
+                         &compatibility, &error));
+    UTILS_CHECK(compatibility.fields_present);
+    UTILS_CHECK(!compatibility.legacy_precision_migration);
+
+    json::Object fresh_fp32;
+    WritePpoPrecisionManifestFields(fresh_fp32, false, true);
+    UTILS_CHECK(validate(fresh_fp32, fp32_fingerprint, fp32_fingerprint,
+                         pre_fingerprint, "", false, true,
+                         &compatibility, &error));
+    UTILS_CHECK(compatibility.fields_present);
+    UTILS_CHECK(!compatibility.rollout_amp);
+    UTILS_CHECK(compatibility.allow_tf32);
+
+    auto mismatched = fresh;
+    mismatched["rollout_amp"] = false;
+    UTILS_CHECK(!validate(mismatched, default_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error));
+    UTILS_CHECK(error.find("rollout_amp mismatch") != std::string::npos);
+    mismatched = fresh;
+    mismatched["allow_tf32"] = false;
+    UTILS_CHECK(!validate(mismatched, default_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error));
+    UTILS_CHECK(error.find("allow_tf32 mismatch") != std::string::npos);
+    mismatched = fresh;
+    mismatched["rollout_amp"] = "true";
+    UTILS_CHECK(!validate(mismatched, default_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error));
+    UTILS_CHECK(error.find("must both be booleans") != std::string::npos);
+    mismatched = fresh;
+    mismatched.erase("allow_tf32");
+    UTILS_CHECK(!validate(mismatched, default_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error));
+    UTILS_CHECK(error.find("fields are partial") != std::string::npos);
+    UTILS_CHECK(!validate(fresh, "wrong", default_fingerprint,
+                          pre_fingerprint, "", true, true, &compatibility,
+                          &error));
+    UTILS_CHECK(error.find("precision-aware manifest") != std::string::npos);
+
+    json::Object absent;
+    UTILS_CHECK(validate(absent, pre_fingerprint, default_fingerprint,
+                         pre_fingerprint, "", true, true,
+                         &compatibility, &error));
+    UTILS_CHECK(!compatibility.fields_present);
+    UTILS_CHECK(compatibility.legacy_precision_migration);
+    CHECK_EQ(compatibility.migration_source,
+             std::string("pre_precision_fingerprint"));
+    UTILS_CHECK(!validate(absent, pre_fingerprint, fp32_fingerprint,
+                          pre_fingerprint, "", false, true,
+                          &compatibility, &error));
+    UTILS_CHECK(error.find("permitted only with default") !=
+                std::string::npos);
+    UTILS_CHECK(!validate(absent, "wrong", default_fingerprint,
+                          pre_fingerprint, "", true, true, &compatibility,
+                          &error));
+    UTILS_CHECK(error.find("field-absent precision manifest") !=
+                std::string::npos);
+    const std::string older_legacy = "older-legacy-fingerprint";
+    UTILS_CHECK(validate(absent, older_legacy, default_fingerprint,
+                         pre_fingerprint, older_legacy, true, true,
+                         &compatibility, &error));
+    CHECK_EQ(compatibility.migration_source,
+             std::string("older_legacy_fingerprint"));
+
+    // A migrated manifest's next-write contract: current fingerprint plus
+    // both typed fields validates as current, never as another migration.
+    json::Object rewritten;
+    rewritten["config_fingerprint"] = default_fingerprint;
+    WritePpoPrecisionManifestFields(rewritten, true, true);
+    UTILS_CHECK(validate(rewritten, default_fingerprint,
+                         default_fingerprint, pre_fingerprint, older_legacy,
+                         true, true, &compatibility, &error));
+    UTILS_CHECK(compatibility.fields_present);
+    UTILS_CHECK(!compatibility.legacy_precision_migration);
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1853,6 +1982,7 @@ int main() {
   TestRawPpoNumericalParityV5PrecisionAndClassification();
   TestRawPpoNumericalParityV5SharedRowsFailClosed();
   TestRawPpoNumericalParityRawLogitPrecisionGate();
+  TestPpoPrecisionFingerprintAndManifestMigration();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 
@@ -2184,8 +2314,10 @@ int main() {
   TEST_BEGIN("Checkpoint corruption / invalid manifest path") {
     CheckpointManifest manifest;
     std::string err;
-    bool success = ParseAndValidateManifest("nonexistent_manifest.json", model_file, optim_file,
-                                            42, 100, 2, "conf123", "label456", 2048, 8, manifest, err);
+    bool success = ParseAndValidateManifest(
+        "nonexistent_manifest.json", model_file, optim_file, 42, 100, 2,
+        "current-conf", "conf123", true, true, "label456", 2048, 8,
+        manifest, err);
     CHECK_EQ(success, false);
     UTILS_CHECK(err.find("manifest file not found") != std::string::npos);
   } TEST_END();
@@ -2196,8 +2328,10 @@ int main() {
   TEST_BEGIN("Missing manifest check") {
     CheckpointManifest manifest;
     std::string err;
-    bool success = ParseAndValidateManifest("missing.json", model_file, optim_file,
-                                            42, 100, 2, "conf123", "label456", 2048, 8, manifest, err);
+    bool success = ParseAndValidateManifest(
+        "missing.json", model_file, optim_file, 42, 100, 2,
+        "current-conf", "conf123", true, true, "label456", 2048, 8,
+        manifest, err);
     CHECK_EQ(success, false);
   } TEST_END();
 
@@ -2208,8 +2342,10 @@ int main() {
     CheckpointManifest manifest;
     std::string err;
     // We pass model path to optim and vice versa, which should fail filename verification.
-    bool success = ParseAndValidateManifest(manifest_file, optim_file, model_file,
-                                            42, 100, 2, "conf123", "label456", 2048, 8, manifest, err);
+    bool success = ParseAndValidateManifest(
+        manifest_file, optim_file, model_file, 42, 100, 2,
+        "current-conf", "conf123", true, true, "label456", 2048, 8,
+        manifest, err);
     CHECK_EQ(success, false);
     if (err.find("filename mismatch") == std::string::npos) {
       std::cout << "ACTUAL ERROR: " << err << "\n";
@@ -2224,8 +2360,10 @@ int main() {
     CheckpointManifest manifest;
     std::string err;
     // Passing wrong config fingerprint
-    bool success = ParseAndValidateManifest(manifest_file, model_file, optim_file,
-                                            42, 100, 2, "wrong_config", "label456", 2048, 8, manifest, err);
+    bool success = ParseAndValidateManifest(
+        manifest_file, model_file, optim_file, 42, 100, 2,
+        "wrong_config", "wrong_pre_precision", true, true, "label456",
+        2048, 8, manifest, err);
     CHECK_EQ(success, false);
     UTILS_CHECK(err.find("Configuration fingerprint mismatch") != std::string::npos);
   } TEST_END();
@@ -2237,8 +2375,10 @@ int main() {
     CheckpointManifest manifest;
     std::string err;
     // Swapping dim parameters
-    bool success = ParseAndValidateManifest(manifest_file, model_file, optim_file,
-                                            42, 100, 2, "conf123", "label456", 512, 8, manifest, err);
+    bool success = ParseAndValidateManifest(
+        manifest_file, model_file, optim_file, 42, 100, 2,
+        "current-conf", "conf123", true, true, "label456", 512, 8,
+        manifest, err);
     CHECK_EQ(success, false);
     UTILS_CHECK(err.find("hidden_dim mismatch") != std::string::npos);
   } TEST_END();

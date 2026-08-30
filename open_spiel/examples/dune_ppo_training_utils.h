@@ -705,7 +705,45 @@ struct CheckpointManifest {
   std::string optimizer_sha256;
   int hidden_dim;
   int num_blocks;
+  bool precision_fields_present = false;
+  bool rollout_amp = true;
+  bool allow_tf32 = true;
+  bool legacy_precision_migration = false;
+  std::string precision_migration_source;
 };
+
+// Fingerprint the exact pre-precision JSON object, or a copy extended with the
+// two precision controls. Keeping the former explicit prevents compatibility
+// migration from depending on a mutable "legacy" approximation.
+std::string ComputePrePrecisionConfigFingerprint(
+    const json::Object& pre_precision_config);
+std::string ComputePrecisionConfigFingerprint(
+    const json::Object& pre_precision_config, bool rollout_amp,
+    bool allow_tf32);
+
+// Every newly written checkpoint/bootstrap manifest carries these fields.
+void WritePpoPrecisionManifestFields(json::Object& manifest_obj,
+                                     bool rollout_amp, bool allow_tf32);
+
+struct PpoPrecisionManifestCompatibility {
+  bool fields_present = false;
+  bool rollout_amp = true;
+  bool allow_tf32 = true;
+  bool legacy_precision_migration = false;
+  std::string migration_source;
+};
+
+// Fail-closed precision/fingerprint compatibility gate. A field-absent
+// manifest may migrate only under default true/true precision and an exact
+// pre-precision (or explicitly enabled older-legacy) fingerprint.
+bool ValidatePpoPrecisionManifestCompatibility(
+    const json::Object& manifest_obj,
+    const std::string& stored_config_fingerprint,
+    const std::string& current_config_fingerprint,
+    const std::string& current_pre_precision_config_fingerprint,
+    const std::string& current_legacy_config_fingerprint,
+    bool current_rollout_amp, bool current_allow_tf32,
+    PpoPrecisionManifestCompatibility* out, std::string* error);
 
 // Deterministic contiguous partition of `num_examples` aux examples across
 // `num_minibatches` PPO minibatch steps in one epoch: base each, remainder to
@@ -771,6 +809,9 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               int current_target_end_update,
                               int current_seed_scheme_version,
                               const std::string& current_config_fingerprint,
+                              const std::string& current_pre_precision_config_fingerprint,
+                              bool current_rollout_amp,
+                              bool current_allow_tf32,
                               const std::string& current_search_label_fingerprint,
                               int current_hidden_dim,
                               int current_num_blocks,

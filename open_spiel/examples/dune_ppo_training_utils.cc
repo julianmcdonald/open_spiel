@@ -113,6 +113,104 @@ std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch) {
   return open_spiel::ComputeStringSHA256(data);
 }
 
+std::string ComputePrePrecisionConfigFingerprint(
+    const json::Object& pre_precision_config) {
+  return ComputeStringSHA256(json::ToString(pre_precision_config));
+}
+
+std::string ComputePrecisionConfigFingerprint(
+    const json::Object& pre_precision_config, bool rollout_amp,
+    bool allow_tf32) {
+  json::Object current = pre_precision_config;
+  current["rollout_amp"] = rollout_amp;
+  current["allow_tf32"] = allow_tf32;
+  return ComputeStringSHA256(json::ToString(current));
+}
+
+void WritePpoPrecisionManifestFields(json::Object& manifest_obj,
+                                     bool rollout_amp, bool allow_tf32) {
+  manifest_obj["rollout_amp"] = rollout_amp;
+  manifest_obj["allow_tf32"] = allow_tf32;
+}
+
+bool ValidatePpoPrecisionManifestCompatibility(
+    const json::Object& manifest_obj,
+    const std::string& stored_config_fingerprint,
+    const std::string& current_config_fingerprint,
+    const std::string& current_pre_precision_config_fingerprint,
+    const std::string& current_legacy_config_fingerprint,
+    bool current_rollout_amp, bool current_allow_tf32,
+    PpoPrecisionManifestCompatibility* out, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (out == nullptr) return fail("null precision compatibility output");
+  *out = PpoPrecisionManifestCompatibility{};
+  const auto rollout_it = manifest_obj.find("rollout_amp");
+  const auto tf32_it = manifest_obj.find("allow_tf32");
+  const bool rollout_present = rollout_it != manifest_obj.end();
+  const bool tf32_present = tf32_it != manifest_obj.end();
+  if (rollout_present != tf32_present) {
+    return fail(
+        "Precision manifest fields are partial: rollout_amp and allow_tf32 "
+        "must either both be present or both be absent");
+  }
+  if (rollout_present) {
+    if (!rollout_it->second.IsBool() || !tf32_it->second.IsBool()) {
+      return fail(
+          "Precision manifest fields rollout_amp and allow_tf32 must both be booleans");
+    }
+    out->fields_present = true;
+    out->rollout_amp = rollout_it->second.GetBool();
+    out->allow_tf32 = tf32_it->second.GetBool();
+    if (out->rollout_amp != current_rollout_amp) {
+      return fail(absl::StrFormat(
+          "rollout_amp mismatch. Current: %s, Manifest: %s",
+          current_rollout_amp ? "true" : "false",
+          out->rollout_amp ? "true" : "false"));
+    }
+    if (out->allow_tf32 != current_allow_tf32) {
+      return fail(absl::StrFormat(
+          "allow_tf32 mismatch. Current: %s, Manifest: %s",
+          current_allow_tf32 ? "true" : "false",
+          out->allow_tf32 ? "true" : "false"));
+    }
+    if (stored_config_fingerprint != current_config_fingerprint) {
+      return fail(
+          "Configuration fingerprint mismatch for precision-aware manifest.\n  Expected: " +
+          stored_config_fingerprint + "\n  Got:      " +
+          current_config_fingerprint);
+    }
+    return true;
+  }
+
+  if (!current_rollout_amp || !current_allow_tf32) {
+    return fail(
+        "Precision fields are absent, but migration is permitted only with "
+        "default rollout_amp=true and allow_tf32=true");
+  }
+  out->legacy_precision_migration = true;
+  if (!current_pre_precision_config_fingerprint.empty() &&
+      stored_config_fingerprint == current_pre_precision_config_fingerprint) {
+    out->migration_source = "pre_precision_fingerprint";
+    return true;
+  }
+  if (!current_legacy_config_fingerprint.empty() &&
+      stored_config_fingerprint == current_legacy_config_fingerprint) {
+    out->migration_source = "older_legacy_fingerprint";
+    return true;
+  }
+  return fail(
+      "Configuration fingerprint mismatch for field-absent precision manifest.\n"
+      "  Stored:        " + stored_config_fingerprint +
+      "\n  Pre-precision: " + current_pre_precision_config_fingerprint +
+      (current_legacy_config_fingerprint.empty()
+           ? std::string("\n  Older legacy:  disabled")
+           : std::string("\n  Older legacy:  ") +
+                 current_legacy_config_fingerprint));
+}
+
 bool ParseAndValidateManifest(const std::string& manifest_path,
                               const std::string& model_path,
                               const std::string& optim_path,
@@ -120,6 +218,9 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               int current_target_end_update,
                               int current_seed_scheme_version,
                               const std::string& current_config_fingerprint,
+                              const std::string& current_pre_precision_config_fingerprint,
+                              bool current_rollout_amp,
+                              bool current_allow_tf32,
                               const std::string& current_search_label_fingerprint,
                               int current_hidden_dim,
                               int current_num_blocks,
@@ -287,12 +388,28 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
     return false;
   }
 
-  if (current_config_fingerprint != out_manifest.config_fingerprint) {
-    if (current_legacy_config_fingerprint.empty() || current_legacy_config_fingerprint != out_manifest.config_fingerprint) {
-      error_msg = "Configuration fingerprint mismatch. Effective hyperparameters changed.\n  Expected: " + out_manifest.config_fingerprint + "\n  Got:      " + current_config_fingerprint;
-      return false;
-    }
-    std::cout << "Resuming checkpoint with legacy config fingerprint format.\n";
+  PpoPrecisionManifestCompatibility precision;
+  if (!ValidatePpoPrecisionManifestCompatibility(
+          manifest_obj, out_manifest.config_fingerprint,
+          current_config_fingerprint,
+          current_pre_precision_config_fingerprint,
+          current_legacy_config_fingerprint, current_rollout_amp,
+          current_allow_tf32, &precision, &error_msg)) {
+    return false;
+  }
+  out_manifest.precision_fields_present = precision.fields_present;
+  out_manifest.rollout_amp = precision.rollout_amp;
+  out_manifest.allow_tf32 = precision.allow_tf32;
+  out_manifest.legacy_precision_migration =
+      precision.legacy_precision_migration;
+  out_manifest.precision_migration_source = precision.migration_source;
+  if (precision.legacy_precision_migration) {
+    std::cout
+        << "[precision-manifest] Accepted legacy-precision migration from "
+        << precision.migration_source
+        << " under required defaults rollout_amp=true allow_tf32=true. "
+           "The next checkpoint will write both precision fields and the "
+           "current fingerprint.\n";
   }
   if (current_search_label_fingerprint != out_manifest.search_label_fingerprint) {
     error_msg = "Search label fingerprint mismatch.\n  Expected: " + out_manifest.search_label_fingerprint + "\n  Got:      " + current_search_label_fingerprint;
