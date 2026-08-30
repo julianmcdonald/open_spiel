@@ -12,7 +12,14 @@
 #include <vector>
 
 #include "dune_sha256.h"
+#include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include <torch/torch.h>
+
+#include "dune_seed_utils.h"
+#endif
 
 namespace open_spiel {
 
@@ -26,6 +33,8 @@ inline constexpr char kVrpoJointInformationEncodingLabel[] =
     "actor_relative_joint_information_proxy_not_full_markov_state_v1";
 inline constexpr bool kVrpoJointInformationIsFullMarkovState = false;
 inline constexpr bool kVrpoJointInformationMayFeedActorInference = false;
+static_assert(kVrpoDuneInformationStateSize ==
+              dune_imperium::kVrpoCentralActorPrefixSize);
 
 // Privileged training-only proxy. Segment slot s contains the information-state
 // tensor for absolute seat (actor+s)%4. It intentionally is NOT called a full
@@ -96,6 +105,36 @@ inline std::string VrpoJointInformationSha256(
   return ComputeStringSHA256(payload);
 }
 
+inline bool VrpoCentralCriticTensorSha256(
+    Player actor, const std::vector<float>& central_tensor,
+    std::string* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) output->clear();
+    return false;
+  };
+  if (output == nullptr) return fail("null central-tensor hash output");
+  output->clear();
+  if (actor < 0 || actor >= kVrpoNumSeats) {
+    return fail("central-tensor hash actor is out of range");
+  }
+  if (central_tensor.size() !=
+      static_cast<size_t>(dune_imperium::kVrpoCentralCriticTensorSize)) {
+    return fail("central-tensor hash input width is not 9012");
+  }
+  if (!std::all_of(central_tensor.begin(), central_tensor.end(),
+                   [](float value) { return std::isfinite(value); })) {
+    return fail("central-tensor hash input is nonfinite");
+  }
+  std::string payload(dune_imperium::kVrpoCentralCriticTensorSchemaSha256);
+  payload.push_back('\0');
+  payload.append(reinterpret_cast<const char*>(&actor), sizeof(actor));
+  payload.append(reinterpret_cast<const char*>(central_tensor.data()),
+                 central_tensor.size() * sizeof(float));
+  *output = ComputeStringSHA256(payload);
+  return true;
+}
+
 // Every value indexed by seat in the reference arithmetic is in ABSOLUTE seat
 // order [seat0, seat1, seat2, seat3]. Actor-relative arrays are a distinct type
 // and must pass through the checked adapter below before entering a timeline.
@@ -128,6 +167,186 @@ inline bool VrpoActorRelativeToAbsoluteSeatValues(
   }
   return true;
 }
+
+// Checked Q boundary: the canonical Q module emits relative slots because its
+// input is actor-relative; paper-reference rows accept absolute seat order
+// only. Phase-2 callers must convert every legal action through this adapter.
+inline bool VrpoActorRelativeQToAbsolute(
+    Player actor,
+    const std::vector<VrpoActorRelativeSeatValues>& relative_legal_q,
+    std::vector<VrpoSeatValues>* absolute_legal_q, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (absolute_legal_q != nullptr) absolute_legal_q->clear();
+    return false;
+  };
+  if (absolute_legal_q == nullptr) return fail("null absolute legal-Q output");
+  absolute_legal_q->clear();
+  if (relative_legal_q.empty()) return fail("relative legal-Q input is empty");
+  std::vector<VrpoSeatValues> converted;
+  converted.reserve(relative_legal_q.size());
+  for (const auto& relative : relative_legal_q) {
+    VrpoSeatValues absolute;
+    std::string adapter_error;
+    if (!VrpoActorRelativeToAbsoluteSeatValues(
+            actor, relative, &absolute, &adapter_error)) {
+      return fail("relative legal-Q conversion failed: " + adapter_error);
+    }
+    converted.push_back(absolute);
+  }
+  *absolute_legal_q = std::move(converted);
+  return true;
+}
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
+inline constexpr int kVrpoQHiddenDim = 512;
+inline constexpr int kVrpoQNumResBlocks = 2;
+inline constexpr double kVrpoQFinalInitScale = 0.01;
+
+struct DuneVrpoQResBlockImpl : torch::nn::Module {
+  torch::nn::Linear fc1{nullptr};
+  torch::nn::Linear fc2{nullptr};
+  torch::nn::LayerNorm ln1{nullptr};
+  torch::nn::LayerNorm ln2{nullptr};
+
+  DuneVrpoQResBlockImpl() {
+    fc1 = register_module(
+        "fc1", torch::nn::Linear(kVrpoQHiddenDim, kVrpoQHiddenDim));
+    fc2 = register_module(
+        "fc2", torch::nn::Linear(kVrpoQHiddenDim, kVrpoQHiddenDim));
+    ln1 = register_module(
+        "ln1", torch::nn::LayerNorm(
+                   torch::nn::LayerNormOptions({kVrpoQHiddenDim})));
+    ln2 = register_module(
+        "ln2", torch::nn::LayerNorm(
+                   torch::nn::LayerNormOptions({kVrpoQHiddenDim})));
+  }
+
+  torch::Tensor forward(torch::Tensor x) {
+    torch::Tensor residual = x;
+    x = torch::relu(ln1->forward(fc1->forward(x)));
+    x = ln2->forward(fc2->forward(x));
+    return torch::relu(x + residual);
+  }
+};
+TORCH_MODULE(DuneVrpoQResBlock);
+
+// Canonical matched Q module for every future 2x2 arm. The final dimension is
+// ACTOR-RELATIVE slot order; callers must use VrpoActorRelativeQToAbsolute
+// before constructing reference rows. No tanh, dropout, or batch norm.
+struct DuneVrpoQNetImpl : torch::nn::Module {
+  torch::nn::Linear input_layer{nullptr};
+  DuneVrpoQResBlock res1{nullptr};
+  DuneVrpoQResBlock res2{nullptr};
+  torch::nn::Linear q_head{nullptr};
+  uint64_t init_seed = 0;
+
+  explicit DuneVrpoQNetImpl(uint64_t registered_init_seed)
+      : init_seed(registered_init_seed) {
+    input_layer = register_module(
+        "input_layer",
+        torch::nn::Linear(dune_imperium::kVrpoCentralCriticTensorSize,
+                          kVrpoQHiddenDim));
+    res1 = register_module("res1", DuneVrpoQResBlock());
+    res2 = register_module("res2", DuneVrpoQResBlock());
+    q_head = register_module(
+        "q_head",
+        torch::nn::Linear(kVrpoQHiddenDim,
+                          kVrpoDuneActionDim * kVrpoNumSeats));
+
+    torch::NoGradGuard no_grad;
+    at::Generator generator =
+        dune_seed::MakeTorchCPUGenerator(registered_init_seed);
+    auto initialize_linear = [&](torch::nn::Linear& layer, double scale) {
+      const double bound = 1.0 / std::sqrt(layer->weight.size(1));
+      layer->weight.uniform_(-bound, bound, generator);
+      layer->weight.mul_(scale);
+      if (layer->bias.defined()) layer->bias.zero_();
+    };
+    initialize_linear(input_layer, 1.0);
+    for (DuneVrpoQResBlock block : {res1, res2}) {
+      initialize_linear(block->fc1, 1.0);
+      initialize_linear(block->fc2, 1.0);
+      block->ln1->weight.fill_(1.0);
+      block->ln1->bias.zero_();
+      block->ln2->weight.fill_(1.0);
+      block->ln2->bias.zero_();
+    }
+    initialize_linear(q_head, kVrpoQFinalInitScale);
+  }
+
+  bool ForwardChecked(const torch::Tensor& input, torch::Tensor* output,
+                      std::string* error) {
+    auto fail = [&](const std::string& message) {
+      if (error != nullptr) *error = message;
+      if (output != nullptr) *output = torch::Tensor();
+      return false;
+    };
+    if (output == nullptr) return fail("null Q output");
+    *output = torch::Tensor();
+    if (!input.defined() || input.dim() != 2 || input.size(0) <= 0 ||
+        input.size(1) != dune_imperium::kVrpoCentralCriticTensorSize) {
+      return fail("Q input must have shape [positive_batch,9012]");
+    }
+    if (input.scalar_type() != torch::kFloat32) {
+      return fail("Q input dtype must be Float32");
+    }
+    if (input.device() != input_layer->weight.device()) {
+      return fail("Q input and module devices differ");
+    }
+    if (!torch::isfinite(input).all().item<bool>()) {
+      return fail("Q input contains a nonfinite value");
+    }
+    torch::Tensor hidden = torch::relu(input_layer->forward(input));
+    hidden = res1->forward(hidden);
+    hidden = res2->forward(hidden);
+    torch::Tensor values = q_head->forward(hidden).reshape(
+        {input.size(0), kVrpoDuneActionDim, kVrpoNumSeats});
+    if (values.dim() != 3 || values.size(0) != input.size(0) ||
+        values.size(1) != kVrpoDuneActionDim ||
+        values.size(2) != kVrpoNumSeats) {
+      return fail("Q output shape is not [batch,2391,4]");
+    }
+    if (!torch::isfinite(values).all().item<bool>()) {
+      return fail("Q output contains a nonfinite value");
+    }
+    *output = values;
+    return true;
+  }
+};
+TORCH_MODULE(DuneVrpoQNet);
+
+inline bool VrpoQModuleParameterSha256(
+    DuneVrpoQNetImpl& model, std::string* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) output->clear();
+    return false;
+  };
+  if (output == nullptr) return fail("null Q parameter-hash output");
+  output->clear();
+  std::string payload = "dune_vrpo_q_module_v1";
+  for (const auto& item : model.named_parameters()) {
+    torch::Tensor tensor =
+        item.value().detach().contiguous().cpu().to(torch::kFloat32);
+    if (!torch::isfinite(tensor).all().item<bool>()) {
+      return fail("Q module parameter is nonfinite: " + item.key());
+    }
+    payload.append(item.key());
+    payload.push_back('\0');
+    for (int64_t dim : tensor.sizes()) {
+      payload.append(reinterpret_cast<const char*>(&dim), sizeof(dim));
+    }
+    payload.push_back('\0');
+    payload.append(reinterpret_cast<const char*>(tensor.data_ptr<float>()),
+                   tensor.numel() * sizeof(float));
+  }
+  *output = ComputeStringSHA256(payload);
+  return true;
+}
+
+#endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
 // One row in one complete episode's GLOBAL player-decision timeline. Q is
 // legal-only and aligned to ordered legal_actions: legal_q_values[a][i] is the

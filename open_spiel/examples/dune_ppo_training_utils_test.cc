@@ -2007,6 +2007,277 @@ void TestVrpoActorRelativeJointInformationTensor() {
   } TEST_END();
 }
 
+void TestVrpoCentralCriticTensor() {
+  TEST_BEGIN("VRPO phase 2a: compact central tensor schema, rotation, sensitivity, and exclusions") {
+    using namespace dune_imperium;
+    CHECK_EQ(kVrpoCentralCriticTensorSize, 9012);
+    CHECK_EQ(kVrpoCentralPrivateAppendixSize, 1144);
+    CHECK_EQ(kVrpoAppendixEnd, kVrpoCentralPrivateAppendixSize);
+    CHECK_EQ(ComputeStringSHA256(
+                 std::string(kVrpoCentralCriticTensorSchemaLabel)),
+             std::string(kVrpoCentralCriticTensorSchemaSha256));
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+    dune_state->SetPlayerHandForTesting(1, {0, 0});
+    dune_state->SetPlayerDeckForTesting(1, {1, 1, 1});
+    dune_state->SetPlayerDiscardForTesting(1, {2});
+    dune_state->SetPlayedAgentCardsForTesting(1, {3});
+    dune_state->SetRevealedCardsForTesting(1, {4});
+    dune_state->SetPlayerIntrigueHandForTesting(1, {0, 0});
+    dune_state->SetVladimirSecretFactionsForTesting(1, 1, 2);
+    dune_state->SetIlesaSetAsideCardForTesting(1, 3);
+    dune_state->SetIlesaBonusCardForTesting(1, 4);
+    dune_state->SetHundroKnownDrawnIntrigueForTesting(1, 5);
+    dune_state->SetPaulKnownTopCardForTesting(1, 6);
+
+    const std::vector<float> central =
+        dune_state->VrpoCentralCriticTensor(/*actor=*/0);
+    CHECK_EQ(central.size(), static_cast<size_t>(9012));
+    UTILS_CHECK(std::all_of(central.begin(), central.end(),
+                            [](float value) { return std::isfinite(value); }));
+    const std::vector<float> actor_prefix =
+        state->InformationStateTensor(/*player=*/0);
+    UTILS_CHECK(std::equal(actor_prefix.begin(), actor_prefix.end(),
+                            central.begin()));
+    const int appendix = kVrpoCentralActorPrefixSize;
+    UTILS_CHECK(std::abs(central[appendix + kVrpoAppendixHandOffset + 0] -
+                         0.25f) < 1e-7f);
+    UTILS_CHECK(std::abs(central[appendix + kVrpoAppendixDrawOffset + 1] -
+                         0.375f) < 1e-7f);
+    UTILS_CHECK(std::abs(
+        central[appendix + kVrpoAppendixDiscardOffset + 2] - 0.125f) <
+        1e-7f);
+    UTILS_CHECK(std::abs(
+        central[appendix + kVrpoAppendixPlayedAgentOffset + 3] - 0.125f) <
+        1e-7f);
+    UTILS_CHECK(std::abs(
+        central[appendix + kVrpoAppendixRevealedOffset + 4] - 0.125f) <
+        1e-7f);
+    UTILS_CHECK(std::abs(
+        central[appendix + kVrpoAppendixIntrigueHandOffset + 0] - 0.2f) <
+        1e-7f);
+    CHECK_EQ(central[appendix + kVrpoAppendixVladimirFirstOffset + 1],
+             1.0f);
+    CHECK_EQ(central[appendix + kVrpoAppendixVladimirSecondOffset + 2],
+             1.0f);
+    CHECK_EQ(central[appendix + kVrpoAppendixIlesaSetAsideOffset + 3],
+             1.0f);
+    CHECK_EQ(central[appendix + kVrpoAppendixIlesaBonusOffset + 4], 1.0f);
+    CHECK_EQ(central[appendix + kVrpoAppendixHundroKnownDrawnOffset + 5],
+             1.0f);
+    CHECK_EQ(central[appendix + kVrpoAppendixPaulKnownTopOffset + 6], 1.0f);
+    std::string central_hash, error;
+    UTILS_CHECK(VrpoCentralCriticTensorSha256(
+        0, central, &central_hash, &error));
+    std::string repeated_hash;
+    UTILS_CHECK(VrpoCentralCriticTensorSha256(
+        0, central, &repeated_hash, &error));
+    CHECK_EQ(central_hash, repeated_hash);
+
+    // Actor 3 wraps opponent slot 1 to absolute seat 0.
+    dune_state->SetPlayerHandForTesting(0, {7});
+    const std::vector<float> actor3 =
+        dune_state->VrpoCentralCriticTensor(/*actor=*/3);
+    const int actor3_slot1 = kVrpoCentralActorPrefixSize;
+    UTILS_CHECK(std::abs(
+        actor3[actor3_slot1 + kVrpoAppendixHandOffset + 7] - 0.125f) <
+        1e-7f);
+    const std::vector<float> actor3_prefix =
+        state->InformationStateTensor(3);
+    UTILS_CHECK(std::equal(actor3_prefix.begin(), actor3_prefix.end(),
+                            actor3.begin()));
+
+    // Equal-size private identity changes move the privileged appendix.
+    const std::vector<float> private_before =
+        dune_state->VrpoCentralCriticTensor(0);
+    dune_state->SetPlayerHandForTesting(1, {8, 8});
+    const std::vector<float> hand_changed =
+        dune_state->VrpoCentralCriticTensor(0);
+    UTILS_CHECK(hand_changed != private_before);
+    dune_state->SetPlayerIntrigueHandForTesting(1, {9, 9});
+    const std::vector<float> intrigue_changed =
+        dune_state->VrpoCentralCriticTensor(0);
+    UTILS_CHECK(intrigue_changed != hand_changed);
+    dune_state->SetPaulKnownTopCardForTesting(1, 10);
+    const std::vector<float> special_changed =
+        dune_state->VrpoCentralCriticTensor(0);
+    UTILS_CHECK(special_changed != intrigue_changed);
+
+    // Public actor-prefix state remains sensitive.
+    const std::vector<float> public_before =
+        dune_state->VrpoCentralCriticTensor(0);
+    dune_state->SetPlayerSpiceForTesting(2, 7);
+    const std::vector<float> public_changed =
+        dune_state->VrpoCentralCriticTensor(0);
+    UTILS_CHECK(public_changed != public_before);
+
+    // Future deck ORDER is explicitly excluded. Frequencies/current contents
+    // stay identical, so reversing player and shared intrigue decks is inert.
+    dune_state->SetPlayerDeckForTesting(2, {11, 12, 13});
+    dune_state->SetIntrigueDrawDeckForTesting({14, 15, 16});
+    const std::vector<float> order_a =
+        dune_state->VrpoCentralCriticTensor(0);
+    dune_state->SetPlayerDeckForTesting(2, {13, 12, 11});
+    dune_state->SetIntrigueDrawDeckForTesting({16, 15, 14});
+    const std::vector<float> order_b =
+        dune_state->VrpoCentralCriticTensor(0);
+    UTILS_CHECK(order_a == order_b);
+
+    std::vector<float> malformed = central;
+    malformed.pop_back();
+    UTILS_CHECK(!VrpoCentralCriticTensorSha256(
+        0, malformed, &repeated_hash, &error));
+    malformed = central;
+    malformed[0] = std::numeric_limits<float>::quiet_NaN();
+    UTILS_CHECK(!VrpoCentralCriticTensorSha256(
+        0, malformed, &repeated_hash, &error));
+
+    // Actor model remains structurally 5580-wide and cannot consume 9012.
+    auto actor_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        game->InformationStateTensorSize(), 16, game->NumDistinctActions(), 1);
+    CHECK_EQ(actor_model->input_layer->weight.size(1), int64_t{5580});
+    UTILS_CHECK(actor_model->input_layer->weight.size(1) !=
+                kVrpoCentralCriticTensorSize);
+  } TEST_END();
+}
+
+void TestVrpoDeterministicQModule() {
+  TEST_BEGIN("VRPO phase 2a: deterministic matched Q module and checked perspective boundary") {
+    constexpr uint64_t kSeed = 20260831;
+    std::vector<std::shared_ptr<DuneVrpoQNetImpl>> arms;
+    for (int arm = 0; arm < 4; ++arm) {
+      arms.push_back(std::make_shared<DuneVrpoQNetImpl>(kSeed));
+    }
+    std::vector<std::string> hashes;
+    std::vector<std::string> names;
+    std::vector<std::vector<int64_t>> shapes;
+    std::string error;
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      std::string hash;
+      UTILS_CHECK(VrpoQModuleParameterSha256(*arms[arm], &hash, &error));
+      hashes.push_back(hash);
+      std::vector<std::string> arm_names;
+      std::vector<std::vector<int64_t>> arm_shapes;
+      for (const auto& item : arms[arm]->named_parameters()) {
+        arm_names.push_back(item.key());
+        arm_shapes.emplace_back(item.value().sizes().begin(),
+                                item.value().sizes().end());
+      }
+      if (arm == 0) {
+        names = arm_names;
+        shapes = arm_shapes;
+      } else {
+        UTILS_CHECK(arm_names == names);
+        UTILS_CHECK(arm_shapes == shapes);
+      }
+    }
+    UTILS_CHECK(std::all_of(hashes.begin(), hashes.end(),
+                            [&](const std::string& hash) {
+                              return hash == hashes.front();
+                            }));
+    CHECK_EQ(names.front(), std::string("input_layer.weight"));
+    CHECK_EQ(names.back(), std::string("q_head.bias"));
+    CHECK_EQ(names.size(), static_cast<size_t>(20));
+    auto different = std::make_shared<DuneVrpoQNetImpl>(kSeed + 1);
+    std::string different_hash;
+    UTILS_CHECK(VrpoQModuleParameterSha256(
+        *different, &different_hash, &error));
+    UTILS_CHECK(different_hash != hashes.front());
+    UTILS_CHECK(different->named_buffers().size() == 0);  // no BatchNorm state
+    {
+      torch::NoGradGuard no_grad;
+      different->q_head->weight.zero_();
+      different->q_head->bias.fill_(2.0f);
+    }
+    different->train();
+    torch::Tensor linear_probe_a, linear_probe_b;
+    {
+      torch::NoGradGuard no_grad;
+      torch::Tensor probe = torch::zeros({1, kVrpoCentralCriticTensorSize});
+      UTILS_CHECK(different->ForwardChecked(
+          probe, &linear_probe_a, &error));
+      UTILS_CHECK(different->ForwardChecked(
+          probe, &linear_probe_b, &error));
+    }
+    UTILS_CHECK(torch::equal(linear_probe_a, linear_probe_b));  // no Dropout
+    CHECK_EQ(linear_probe_a.min().item<float>(), 2.0f);
+    CHECK_EQ(linear_probe_a.max().item<float>(), 2.0f);  // no tanh/clamp
+
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+    const std::vector<float> central =
+        dune_state->VrpoCentralCriticTensor(3);
+    torch::Tensor input = torch::zeros(
+        {2, kVrpoCentralCriticTensorSize},
+        torch::TensorOptions().dtype(torch::kFloat32));
+    CHECK_EQ(input.size(1), int64_t{9012});
+    std::memcpy(input[1].data_ptr<float>(), central.data(),
+                central.size() * sizeof(float));
+    torch::Tensor q;
+    {
+      torch::NoGradGuard no_grad;
+      UTILS_CHECK(arms[0]->ForwardChecked(input, &q, &error));
+    }
+    UTILS_CHECK(q.sizes() ==
+                torch::IntArrayRef({2, kVrpoDuneActionDim, kVrpoNumSeats}));
+    UTILS_CHECK(torch::isfinite(q).all().item<bool>());
+    UTILS_CHECK(q.abs().max().item<float>() < 0.5f);
+
+    const int action = 17;
+    const torch::Tensor relative_tensor =
+        q[1][action].detach().contiguous().cpu();
+    VrpoActorRelativeSeatValues relative;
+    for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+      relative.slots[slot] = relative_tensor[slot].item<double>();
+    }
+    std::vector<VrpoSeatValues> absolute;
+    UTILS_CHECK(VrpoActorRelativeQToAbsolute(
+        /*actor=*/3, {relative}, &absolute, &error));
+    CHECK_EQ(absolute.size(), static_cast<size_t>(1));
+    UTILS_CHECK(std::abs(absolute[0][3] - relative.slots[0]) < 1e-12);
+    UTILS_CHECK(std::abs(absolute[0][0] - relative.slots[1]) < 1e-12);
+    UTILS_CHECK(std::abs(absolute[0][1] - relative.slots[2]) < 1e-12);
+    UTILS_CHECK(std::abs(absolute[0][2] - relative.slots[3]) < 1e-12);
+
+    auto expect_bad_input = [&](torch::Tensor bad,
+                                const std::string& needle) {
+      torch::Tensor rejected = torch::ones({1});
+      UTILS_CHECK(!arms[0]->ForwardChecked(bad, &rejected, &error));
+      UTILS_CHECK(!rejected.defined());
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    expect_bad_input(torch::zeros({9012}), "shape");
+    expect_bad_input(torch::zeros({1, 9011}), "shape");
+    expect_bad_input(torch::zeros({0, 9012}), "shape");
+    expect_bad_input(torch::zeros(
+                         {1, 9012},
+                         torch::TensorOptions().dtype(torch::kFloat64)),
+                     "dtype");
+    torch::Tensor nonfinite = torch::zeros({1, 9012});
+    nonfinite[0][0] = std::numeric_limits<float>::infinity();
+    expect_bad_input(nonfinite, "nonfinite");
+    UTILS_CHECK(!arms[0]->ForwardChecked(input, nullptr, &error));
+    UTILS_CHECK(!VrpoActorRelativeQToAbsolute(
+        0, {}, &absolute, &error));
+    relative.slots[0] = std::numeric_limits<double>::quiet_NaN();
+    UTILS_CHECK(!VrpoActorRelativeQToAbsolute(
+        0, {relative}, &absolute, &error));
+
+    {
+      torch::NoGradGuard no_grad;
+      different->q_head->weight[0][0].fill_(
+          std::numeric_limits<float>::quiet_NaN());
+    }
+    UTILS_CHECK(!VrpoQModuleParameterSha256(
+        *different, &different_hash, &error));
+    UTILS_CHECK(different_hash.empty());
+  } TEST_END();
+}
+
 void TestVrpoGlobalExpectedSarsaLambdaReference() {
   TEST_BEGIN("VRPO phase 1: global Expected-SARSA(lambda) reference and strict timeline validation") {
     auto make_row = [](uint64_t episode, Player actor,
@@ -2313,6 +2584,8 @@ int main() {
   TestRawPpoNumericalParityRawLogitPrecisionGate();
   TestPpoPrecisionFingerprintAndManifestMigration();
   TestVrpoActorRelativeJointInformationTensor();
+  TestVrpoCentralCriticTensor();
+  TestVrpoDeterministicQModule();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
