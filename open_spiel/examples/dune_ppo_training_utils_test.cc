@@ -52,6 +52,7 @@
 #include "dune_sha256.h"
 #include "dune_vrpo.h"
 #include "dune_vrpo_checkpoint.h"
+#include "dune_vrpo_training.h"
 #include <chrono>
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -2712,6 +2713,9 @@ void TestVrpoCaptureStartupAndLazyOptimizerContracts() {
     malformed = config;
     malformed.lambda = -0.1;
     reject(malformed, "lambda");
+    malformed = config;
+    malformed.probability_tolerance = 1e-8;
+    reject(malformed, "probability tolerance");
     UTILS_CHECK(!VrpoCaptureShouldConstructOptimizer(true));
     UTILS_CHECK(VrpoCaptureShouldConstructOptimizer(false));
 
@@ -2732,6 +2736,136 @@ void TestVrpoCaptureStartupAndLazyOptimizerContracts() {
     UTILS_CHECK(body.find("std::filesystem::exists(tmp)") !=
                 std::string::npos);
   } TEST_END();
+}
+
+void CheckVrpoExactNumericArtifactProvenance() {
+  {
+    const double reward_scale = 4.0;
+    const double gamma = 1.0;
+    const double lambda = 0.95;
+    const VrpoExactNumericStrings registered =
+        MakeVrpoRegisteredExactNumericStrings(
+            reward_scale, gamma, lambda);
+    CHECK_EQ(registered.probability_tolerance,
+             std::string("1.0000000000000001e-09"));
+    CHECK_EQ(registered.agreement_abs_tolerance, std::string("1e-10"));
+    CHECK_EQ(registered.agreement_rel_tolerance, std::string("1e-10"));
+
+    auto emit_and_parse = [&](const VrpoExactNumericStrings& exact,
+                              double runtime_probability_tolerance,
+                              bool include_q_tolerances,
+                              double runtime_abs_tolerance,
+                              double runtime_rel_tolerance) {
+      json::Object artifact;
+      std::string numeric_error;
+      const bool valid = PopulateVrpoExactNumericProvenance(
+          &artifact, exact, reward_scale, gamma, lambda,
+          runtime_probability_tolerance, include_q_tolerances,
+          runtime_abs_tolerance, runtime_rel_tolerance, &numeric_error);
+      json::Array validation_errors;
+      if (!valid) validation_errors.emplace_back(numeric_error);
+      artifact["validation_errors"] = std::move(validation_errors);
+      // Mirrors both production writers: status is assigned only after the
+      // exact/runtime gate has had its opportunity to reject.
+      artifact["status"] = valid ? "VALID" : "INVALID";
+      const std::string emitted = json::ToString(artifact, true);
+      auto parsed = json::FromString(emitted);
+      UTILS_CHECK(parsed.has_value() && parsed->IsObject());
+      return parsed->GetObject();
+    };
+
+    const json::Object capture = emit_and_parse(
+        registered, kVrpoRegisteredProbabilityTolerance,
+        /*include_q_tolerances=*/false,
+        kVrpoRegisteredQAgreementAbsTolerance,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(capture.at("status"), std::string("VALID"));
+    CHECK_EQ(capture.at("numeric_exact_encoding"),
+             std::string(kVrpoExactNumericEncoding));
+    CHECK_EQ(capture.at("probability_tolerance_exact"),
+             std::string("1.0000000000000001e-09"));
+    CHECK_EQ(capture.at("reward_scale_exact"), std::string("4"));
+    CHECK_EQ(capture.at("gamma_exact"), std::string("1"));
+    CHECK_EQ(capture.at("lambda_exact"),
+             std::string("0.94999999999999996"));
+    UTILS_CHECK(capture.at("probability_tolerance").IsDouble());
+    UTILS_CHECK(capture.find("agreement_abs_tolerance_exact") ==
+                capture.end());
+
+    const json::Object q = emit_and_parse(
+        registered, kVrpoRegisteredProbabilityTolerance,
+        /*include_q_tolerances=*/true,
+        kVrpoRegisteredQAgreementAbsTolerance,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(q.at("status"), std::string("VALID"));
+    CHECK_EQ(q.at("probability_tolerance_exact"),
+             std::string("1.0000000000000001e-09"));
+    CHECK_EQ(q.at("agreement_abs_tolerance_exact"),
+             std::string("1e-10"));
+    CHECK_EQ(q.at("agreement_rel_tolerance_exact"),
+             std::string("1e-10"));
+    UTILS_CHECK(q.at("agreement_abs_tolerance").IsDouble());
+    UTILS_CHECK(q.at("agreement_rel_tolerance").IsDouble());
+
+    const json::Object altered_runtime = emit_and_parse(
+        registered, 1e-8, /*include_q_tolerances=*/false,
+        kVrpoRegisteredQAgreementAbsTolerance,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(altered_runtime.at("status"), std::string("INVALID"));
+    UTILS_CHECK(!altered_runtime.at("validation_errors").GetArray().empty());
+
+    VrpoExactNumericStrings altered_string = registered;
+    altered_string.probability_tolerance = "1e-08";
+    const json::Object rejected_string = emit_and_parse(
+        altered_string, kVrpoRegisteredProbabilityTolerance,
+        /*include_q_tolerances=*/false,
+        kVrpoRegisteredQAgreementAbsTolerance,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(rejected_string.at("status"), std::string("INVALID"));
+
+    const json::Object altered_q_runtime = emit_and_parse(
+        registered, kVrpoRegisteredProbabilityTolerance,
+        /*include_q_tolerances=*/true, 1e-11,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(altered_q_runtime.at("status"), std::string("INVALID"));
+
+    altered_string = registered;
+    altered_string.agreement_rel_tolerance = "1e-11";
+    const json::Object rejected_q_string = emit_and_parse(
+        altered_string, kVrpoRegisteredProbabilityTolerance,
+        /*include_q_tolerances=*/true,
+        kVrpoRegisteredQAgreementAbsTolerance,
+        kVrpoRegisteredQAgreementRelTolerance);
+    CHECK_EQ(rejected_q_string.at("status"), std::string("INVALID"));
+
+    // Registered defaults remain diagnostic-only and default-inert: ordinary
+    // paths do not construct an optimizer or artifact through this pure helper.
+    VrpoCaptureStartupConfig capture_defaults;
+    VrpoQPreflightStartupConfig q_defaults;
+    CHECK_EQ(capture_defaults.probability_tolerance,
+             kVrpoRegisteredProbabilityTolerance);
+    CHECK_EQ(q_defaults.agreement_abs_tolerance,
+             kVrpoRegisteredQAgreementAbsTolerance);
+    CHECK_EQ(q_defaults.agreement_rel_tolerance,
+             kVrpoRegisteredQAgreementRelTolerance);
+
+    std::ifstream source("open_spiel/examples/dune_ppo_train.cc");
+    UTILS_CHECK(source.good());
+    const std::string text((std::istreambuf_iterator<char>(source)),
+                           std::istreambuf_iterator<char>());
+    for (const std::string signature : {"bool WriteVrpoCaptureArtifact(",
+                                        "bool WriteVrpoQPreflightArtifact("}) {
+      const size_t writer = text.find(signature);
+      const size_t writer_end = text.find("\n}\n", writer);
+      UTILS_CHECK(writer != std::string::npos &&
+                  writer_end != std::string::npos);
+      const std::string body = text.substr(writer, writer_end - writer);
+      UTILS_CHECK(body.find("PopulateVrpoExactNumericProvenance(") !=
+                  std::string::npos);
+      UTILS_CHECK(body.rfind("root[\"status\"]") >
+                  body.rfind("require("));
+    }
+  }
 }
 
 void TestVrpoQReferencePreflightContracts() {
@@ -2767,6 +2901,10 @@ void TestVrpoQReferencePreflightContracts() {
         invalid_startup, &error));
     invalid_startup = startup;
     invalid_startup.agreement_abs_tolerance = 1e-5;
+    UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
+        invalid_startup, &error));
+    invalid_startup = startup;
+    invalid_startup.agreement_rel_tolerance = 1e-11;
     UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
         invalid_startup, &error));
     const auto q_sources = VrpoQPreflightSourceRelativePaths();
@@ -4020,6 +4158,593 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
   } TEST_END();
 }
 
+struct TinyVrpoTrainingActor : torch::nn::Module {
+  torch::nn::Linear input_layer{nullptr};
+  torch::nn::Linear policy_head{nullptr};
+  torch::nn::Linear value_head{nullptr};
+
+  TinyVrpoTrainingActor() {
+    input_layer = register_module("input_layer", torch::nn::Linear(5, 8));
+    policy_head = register_module("policy_head", torch::nn::Linear(8, 6));
+    value_head = register_module("value_head", torch::nn::Linear(8, 1));
+  }
+
+  VrpoActorTrainingOutput Forward(torch::Tensor input) {
+    torch::Tensor hidden = torch::tanh(input_layer->forward(input));
+    return {policy_head->forward(hidden), value_head->forward(hidden)};
+  }
+};
+
+struct TinyVrpoTrainingQ : torch::nn::Module {
+  torch::nn::Linear input_layer{nullptr};
+  torch::nn::Linear q_head{nullptr};
+
+  TinyVrpoTrainingQ() {
+    input_layer = register_module("input_layer", torch::nn::Linear(4, 8));
+    q_head = register_module("q_head", torch::nn::Linear(8, 6 * 4));
+  }
+
+  torch::Tensor Forward(torch::Tensor input) {
+    torch::Tensor hidden = torch::relu(input_layer->forward(input));
+    return q_head->forward(hidden).reshape({input.size(0), 6, 4});
+  }
+};
+
+struct TinyVrpoTrainingFixture {
+  std::shared_ptr<TinyVrpoTrainingActor> actor;
+  std::shared_ptr<TinyVrpoTrainingQ> q;
+  std::unique_ptr<torch::optim::AdamW> actor_optimizer;
+  std::unique_ptr<torch::optim::AdamW> q_optimizer;
+  VrpoActorForward actor_forward;
+  VrpoQForward q_forward;
+};
+
+TinyVrpoTrainingFixture MakeTinyVrpoTrainingFixture() {
+  torch::manual_seed(48151623);
+  TinyVrpoTrainingFixture fixture;
+  fixture.actor = std::make_shared<TinyVrpoTrainingActor>();
+  fixture.q = std::make_shared<TinyVrpoTrainingQ>();
+  fixture.actor_optimizer = std::make_unique<torch::optim::AdamW>(
+      fixture.actor->parameters(),
+      torch::optim::AdamWOptions(2.5e-3).betas({0.9, 0.999})
+          .eps(1e-5).weight_decay(0.0));
+  fixture.q_optimizer = std::make_unique<torch::optim::AdamW>(
+      fixture.q->parameters(),
+      torch::optim::AdamWOptions(2.5e-3).betas({0.9, 0.999})
+          .eps(1e-5).weight_decay(0.0));
+  fixture.actor_forward = [actor = fixture.actor](const torch::Tensor& input) {
+    return actor->Forward(input);
+  };
+  fixture.q_forward = [q = fixture.q](const torch::Tensor& input) {
+    return q->Forward(input);
+  };
+  return fixture;
+}
+
+std::vector<VrpoTrainingEpisode> MakeTinyVrpoTrainingEpisodes(
+    TinyVrpoTrainingActor& behavior_actor, double logit_cap,
+    int episode_count = 16, bool varied_lengths = false) {
+  std::vector<VrpoTrainingEpisode> episodes;
+  episodes.reserve(episode_count);
+  torch::NoGradGuard no_grad;
+  for (int episode_index = 0; episode_index < episode_count;
+       ++episode_index) {
+    VrpoTrainingEpisode episode;
+    episode.episode_id = 700000 + episode_index;
+    const int row_count = varied_lengths ? 1 + (episode_index % 5) : 4;
+    for (int step = 0; step < row_count; ++step) {
+      VrpoTrainingRow row;
+      row.row_id = 900000 + episode_index * 10 + step;
+      row.episode_id = episode.episode_id;
+      row.step_index = step;
+      row.actor = (episode_index + step) % 4;
+      row.actor_input = torch::tensor(
+          {1.0f,
+           static_cast<float>(episode_index) / 16.0f,
+           static_cast<float>(step) / 4.0f,
+           static_cast<float>(row.actor) / 3.0f,
+           static_cast<float>((episode_index + 2 * step) % 7) / 7.0f},
+          torch::kFloat32);
+      row.q_input = torch::tensor(
+          {static_cast<float>(episode_index + 1) / 17.0f,
+           static_cast<float>(step + 1) / 5.0f,
+           static_cast<float>(row.actor + 1) / 4.0f,
+           static_cast<float>((episode_index * 3 + step) % 11) / 11.0f},
+          torch::kFloat32);
+      row.legal_actions = (step % 2 == 0)
+          ? std::vector<Action>{0, 2, 5}
+          : std::vector<Action>{1, 3, 4};
+      row.chosen_index = (episode_index + step) % 3;
+      row.chosen_action = row.legal_actions[row.chosen_index];
+      const auto actor_output = behavior_actor.Forward(row.actor_input.unsqueeze(0));
+      std::string error;
+      UTILS_CHECK(VrpoTrainingLegalProbabilities(
+          actor_output.logits[0], row, logit_cap,
+          &row.old_legal_probabilities, &error));
+      row.old_chosen_log_probability =
+          std::log(row.old_legal_probabilities[row.chosen_index]);
+      row.ppo_old_value = actor_output.values[0][0].item<double>();
+      row.ppo_advantage = ((episode_index + step) % 2 == 0 ? 0.75 : -0.45) +
+                          0.01 * episode_index;
+      row.ppo_return = 0.35 + 0.03 * step - 0.01 * episode_index;
+      row.rewards = {
+          0.02 * (step + 1), -0.01 * (episode_index % 3),
+          0.015 * ((episode_index + step) % 4),
+          -0.005 * (step + 2)};
+      if (step + 1 == row_count) {
+        row.rewards[row.actor] += 0.5 + 0.01 * episode_index;
+      }
+      row.terminal_after = step + 1 == row_count;
+      episode.rows.push_back(std::move(row));
+    }
+    episodes.push_back(std::move(episode));
+  }
+  return episodes;
+}
+
+std::string TinyVrpoModuleHash(torch::nn::Module& module,
+                               const std::string& prefix = "") {
+  std::string hash;
+  std::string error;
+  UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+      module, prefix, &hash, &error));
+  return hash;
+}
+
+std::string TinyVrpoLayoutHash(torch::nn::Module& module) {
+  std::vector<VrpoNamedParameterIdentity> identities;
+  std::string error;
+  UTILS_CHECK(VrpoNamedParameterIdentities(
+      module, nullptr, &identities, &error));
+  return VrpoNamedParameterIdentitySha256(identities, false);
+}
+
+std::string TinyVrpoOptimizerNumericalHash(
+    torch::optim::Optimizer& optimizer) {
+  std::string payload = "tiny_vrpo_optimizer_numerical_state_v1";
+  const uint64_t group_count = optimizer.param_groups().size();
+  vrpo_training_internal::AppendPod(&payload, group_count);
+  for (const auto& group : optimizer.param_groups()) {
+    const uint64_t parameter_count = group.params().size();
+    vrpo_training_internal::AppendPod(&payload, parameter_count);
+    for (const auto& parameter : group.params()) {
+      const auto found = optimizer.state().find(
+          parameter.unsafeGetTensorImpl());
+      const bool present = found != optimizer.state().end();
+      vrpo_training_internal::AppendPod(&payload, present);
+      if (!present) continue;
+      const auto* state = dynamic_cast<const torch::optim::AdamWParamState*>(
+          found->second.get());
+      UTILS_CHECK(state != nullptr);
+      vrpo_training_internal::AppendPod(&payload, state->step());
+      for (const torch::Tensor& tensor :
+           {state->exp_avg(), state->exp_avg_sq(),
+            state->max_exp_avg_sq()}) {
+        const bool defined = tensor.defined();
+        vrpo_training_internal::AppendPod(&payload, defined);
+        if (!defined) continue;
+        torch::Tensor value =
+            tensor.detach().contiguous().cpu().to(torch::kFloat32);
+        UTILS_CHECK(torch::isfinite(value).all().item<bool>());
+        const int64_t count = value.numel();
+        vrpo_training_internal::AppendPod(&payload, count);
+        payload.append(
+            reinterpret_cast<const char*>(value.data_ptr<float>()),
+            value.numel() * sizeof(float));
+      }
+    }
+  }
+  return ComputeStringSHA256(payload);
+}
+
+size_t CountNonoverlappingOccurrences(const std::string& text,
+                                      const std::string& needle) {
+  size_t count = 0;
+  size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos) {
+    ++count;
+    position += needle.size();
+  }
+  return count;
+}
+
+void TestVrpoPhase4dWholeEpisodePartitioner() {
+  TEST_BEGIN("VRPO phase 4d: deterministic row-balanced whole-episode partitions") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(
+        *fixture.actor, 10.0, 23, true);
+    std::string error;
+    VrpoEpisodePartitionPlan first;
+    VrpoEpisodePartitionPlan repeat;
+    VrpoEpisodePartitionPlan different;
+    UTILS_CHECK(BuildVrpoEpisodePartitionPlan(
+        episodes, 1234567, &first, &error));
+    UTILS_CHECK(BuildVrpoEpisodePartitionPlan(
+        episodes, 1234567, &repeat, &error));
+    UTILS_CHECK(BuildVrpoEpisodePartitionPlan(
+        episodes, 1234568, &different, &error));
+    CHECK_EQ(first.canonical_sha256, repeat.canonical_sha256);
+    UTILS_CHECK(first.canonical_sha256 != different.canonical_sha256);
+
+    std::set<size_t> episode_indices;
+    std::set<uint64_t> row_ids;
+    int64_t total_rows = 0;
+    int64_t min_rows = std::numeric_limits<int64_t>::max();
+    int64_t max_rows = 0;
+    for (const auto& minibatch : first.minibatches) {
+      UTILS_CHECK(!minibatch.episode_indices.empty());
+      int64_t observed_rows = 0;
+      for (size_t episode_index : minibatch.episode_indices) {
+        UTILS_CHECK(episode_indices.insert(episode_index).second);
+        observed_rows += episodes[episode_index].rows.size();
+        for (const auto& row : episodes[episode_index].rows) {
+          UTILS_CHECK(row_ids.insert(row.row_id).second);
+        }
+      }
+      CHECK_EQ(observed_rows, minibatch.row_count);
+      total_rows += observed_rows;
+      min_rows = std::min(min_rows, observed_rows);
+      max_rows = std::max(max_rows, observed_rows);
+    }
+    CHECK_EQ(episode_indices.size(), episodes.size());
+    CHECK_EQ(row_ids.size(), static_cast<size_t>(total_rows));
+    UTILS_CHECK(max_rows - min_rows <= 5);
+
+    auto duplicate_episode = episodes;
+    duplicate_episode[1].episode_id = duplicate_episode[0].episode_id;
+    UTILS_CHECK(!BuildVrpoEpisodePartitionPlan(
+        duplicate_episode, 1, &repeat, &error));
+    auto duplicate_row = episodes;
+    duplicate_row[1].rows[0].row_id = duplicate_row[0].rows[0].row_id;
+    UTILS_CHECK(!BuildVrpoEpisodePartitionPlan(
+        duplicate_row, 1, &repeat, &error));
+    auto empty_episode = episodes;
+    empty_episode[0].rows.clear();
+    UTILS_CHECK(!BuildVrpoEpisodePartitionPlan(
+        empty_episode, 1, &repeat, &error));
+    auto too_few = episodes;
+    too_few.resize(15);
+    UTILS_CHECK(!BuildVrpoEpisodePartitionPlan(
+        too_few, 1, &repeat, &error));
+  } TEST_END();
+}
+
+struct TinyVrpoArmRun {
+  VrpoTrainingUpdateStats stats;
+  std::string actor_layout;
+  std::string q_layout;
+  std::string actor_initial;
+  std::string q_initial;
+  size_t actor_initial_optimizer_states = 0;
+  size_t q_initial_optimizer_states = 0;
+};
+
+TinyVrpoArmRun RunTinyVrpoArm(const VrpoPhase4ArmConfig& arm) {
+  auto fixture = MakeTinyVrpoTrainingFixture();
+  TinyVrpoArmRun result;
+  result.actor_layout = TinyVrpoLayoutHash(*fixture.actor);
+  result.q_layout = TinyVrpoLayoutHash(*fixture.q);
+  result.actor_initial = TinyVrpoModuleHash(*fixture.actor);
+  result.q_initial = TinyVrpoModuleHash(*fixture.q);
+  result.actor_initial_optimizer_states = fixture.actor_optimizer->state().size();
+  result.q_initial_optimizer_states = fixture.q_optimizer->state().size();
+  auto episodes = MakeTinyVrpoTrainingEpisodes(
+      *fixture.actor, arm.logit_cap);
+  std::string error;
+  const bool update_ok = RunVrpoPhase4dOneUpdate(
+      arm, episodes, 99887766, *fixture.actor, *fixture.q,
+      *fixture.actor_optimizer, *fixture.q_optimizer,
+      fixture.actor_forward, fixture.q_forward, &result.stats, &error);
+  if (!update_ok) std::cerr << "\n  phase4d error: " << error << "\n";
+  UTILS_CHECK(update_ok);
+  return result;
+}
+
+void TestVrpoPhase4dFourArmUpdateMechanics() {
+  TEST_BEGIN("VRPO phase 4d: four-arm no-shortcut update mechanics and module gates") {
+    const auto arms = CanonicalVrpoPhase4Arms();
+    std::array<TinyVrpoArmRun, 4> runs;
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      runs[arm] = RunTinyVrpoArm(arms[arm]);
+      UTILS_CHECK(runs[arm].stats.success);
+      CHECK_EQ(runs[arm].actor_initial_optimizer_states, size_t{0});
+      CHECK_EQ(runs[arm].q_initial_optimizer_states, size_t{0});
+      CHECK_EQ(runs[arm].stats.actor_optimizer_steps, int64_t{64});
+      CHECK_EQ(runs[arm].stats.actor_backward_calls, int64_t{64});
+      CHECK_EQ(runs[arm].stats.actor_rows_seen, int64_t{256});
+      CHECK_EQ(runs[arm].stats.target_recomputations_after_actor, int64_t{1});
+      UTILS_CHECK(runs[arm].stats.complete_episode_partitions);
+      UTILS_CHECK(runs[arm].stats.advantages_detached);
+      UTILS_CHECK(runs[arm].stats.targets_recomputed_after_actor);
+      UTILS_CHECK(runs[arm].stats.current_rollout_only);
+      UTILS_CHECK(runs[arm].stats.actor_values_before_sha256 !=
+                  runs[arm].stats.actor_values_after_sha256);
+      UTILS_CHECK(std::isfinite(runs[arm].stats.actor_loss_mean));
+      UTILS_CHECK(std::isfinite(runs[arm].stats.max_abs_advantage));
+      UTILS_CHECK(std::isfinite(runs[arm].stats.min_ratio));
+      UTILS_CHECK(std::isfinite(runs[arm].stats.max_ratio));
+      UTILS_CHECK(std::isfinite(runs[arm].stats.max_full_legal_kl));
+      UTILS_CHECK(runs[arm].stats.max_actor_grad_norm > 0.0);
+      for (int epoch = 0; epoch < 4; ++epoch) {
+        UTILS_CHECK(runs[arm].stats.actor_epoch_partition_sha256[epoch].size() ==
+                    64);
+      }
+      if (arms[arm].algorithm == VrpoPhase4Algorithm::kPpo) {
+        CHECK_EQ(runs[arm].stats.q_optimizer_steps, int64_t{0});
+        CHECK_EQ(runs[arm].stats.q_backward_calls, int64_t{0});
+        CHECK_EQ(runs[arm].stats.q_rows_seen, int64_t{0});
+        CHECK_EQ(runs[arm].stats.q_values_before_sha256,
+                 runs[arm].stats.q_values_after_sha256);
+        UTILS_CHECK(runs[arm].stats.value_head_before_sha256 !=
+                    runs[arm].stats.value_head_after_sha256);
+        UTILS_CHECK(runs[arm].stats.max_value_head_grad_norm > 0.0);
+      } else {
+        CHECK_EQ(runs[arm].stats.q_optimizer_steps, int64_t{64});
+        CHECK_EQ(runs[arm].stats.q_backward_calls, int64_t{64});
+        CHECK_EQ(runs[arm].stats.q_rows_seen, int64_t{256});
+        UTILS_CHECK(runs[arm].stats.q_frozen_during_actor);
+        UTILS_CHECK(runs[arm].stats.q_values_before_sha256 !=
+                    runs[arm].stats.q_values_after_sha256);
+        CHECK_EQ(runs[arm].stats.value_head_before_sha256,
+                 runs[arm].stats.value_head_after_sha256);
+        CHECK_EQ(runs[arm].stats.max_value_head_grad_norm, 0.0);
+        UTILS_CHECK(runs[arm].stats.max_q_grad_norm > 0.0);
+        for (int epoch = 0; epoch < 4; ++epoch) {
+          UTILS_CHECK(runs[arm].stats.q_epoch_partition_sha256[epoch].size() ==
+                      64);
+        }
+      }
+    }
+    for (size_t arm = 1; arm < runs.size(); ++arm) {
+      CHECK_EQ(runs[arm].actor_layout, runs[0].actor_layout);
+      CHECK_EQ(runs[arm].q_layout, runs[0].q_layout);
+      CHECK_EQ(runs[arm].actor_initial, runs[0].actor_initial);
+      CHECK_EQ(runs[arm].q_initial, runs[0].q_initial);
+      CHECK_EQ(runs[arm].stats.actor_epoch_partition_sha256,
+               runs[0].stats.actor_epoch_partition_sha256);
+    }
+    UTILS_CHECK(runs[0].stats.actor_values_after_sha256 !=
+                runs[1].stats.actor_values_after_sha256);
+    UTILS_CHECK(runs[2].stats.actor_values_after_sha256 !=
+                runs[3].stats.actor_values_after_sha256);
+
+    const TinyVrpoArmRun repeat = RunTinyVrpoArm(arms[2]);
+    CHECK_EQ(repeat.stats.actor_values_after_sha256,
+             runs[2].stats.actor_values_after_sha256);
+    CHECK_EQ(repeat.stats.q_values_after_sha256,
+             runs[2].stats.q_values_after_sha256);
+    CHECK_EQ(repeat.stats.deterministic_summary_sha256,
+             runs[2].stats.deterministic_summary_sha256);
+
+    VrpoTrainingUpdateStats hash_probe = runs[2].stats;
+    hash_probe.post_actor_target_values_sha256 = std::string(64, 'a');
+    hash_probe.post_actor_target_bundle_sha256 = std::string(64, 'b');
+    const std::string payload =
+        vrpo_training_internal::StatsCanonicalPayload(hash_probe);
+    CHECK_EQ(CountNonoverlappingOccurrences(
+                 payload, hash_probe.post_actor_target_values_sha256),
+             size_t{1});
+    CHECK_EQ(CountNonoverlappingOccurrences(
+                 payload, hash_probe.post_actor_target_bundle_sha256),
+             size_t{1});
+    const std::string original_stats_hash =
+        vrpo_training_internal::StatsSha256(hash_probe);
+    auto changed_values = hash_probe;
+    changed_values.post_actor_target_values_sha256[0] = 'c';
+    UTILS_CHECK(vrpo_training_internal::StatsSha256(changed_values) !=
+                original_stats_hash);
+    auto changed_bundle = hash_probe;
+    changed_bundle.post_actor_target_bundle_sha256[0] = 'd';
+    UTILS_CHECK(vrpo_training_internal::StatsSha256(changed_bundle) !=
+                original_stats_hash);
+
+    torch::Tensor probe = torch::tensor(
+        {30.0f, -10.0f, 5.0f, 2.0f, -3.0f, 8.0f}, torch::kFloat32);
+    VrpoTrainingRow probe_row;
+    probe_row.legal_actions = {0, 1, 2};
+    std::vector<double> capped;
+    std::vector<double> uncapped;
+    std::string error;
+    UTILS_CHECK(VrpoTrainingLegalProbabilities(
+        probe, probe_row, 10.0, &capped, &error));
+    UTILS_CHECK(VrpoTrainingLegalProbabilities(
+        probe, probe_row, 0.0, &uncapped, &error));
+    UTILS_CHECK(capped != uncapped);
+    const double legal_mean = (30.0 - 10.0 + 5.0) / 3.0;
+    std::vector<double> expected_weights;
+    for (double value : {30.0, -10.0, 5.0}) {
+      expected_weights.push_back(std::exp(value - legal_mean));
+    }
+    const double expected_sum = expected_weights[0] + expected_weights[1] +
+                                expected_weights[2];
+    for (size_t index = 0; index < uncapped.size(); ++index) {
+      CHECK_NEAR(uncapped[index], expected_weights[index] / expected_sum, 1e-6);
+    }
+  } TEST_END();
+}
+
+void TestVrpoPhase4dFreshTargetsAndGlobalTrace() {
+  TEST_BEGIN("VRPO phase 4d: post-actor target freshness, opponent influence, and episode isolation") {
+    const auto config = CanonicalVrpoPhase4Arms()[2];
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, config.logit_cap);
+    std::string error;
+    VrpoTrainingTargetBundle baseline;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        config, episodes, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &baseline, &error));
+    UTILS_CHECK(ValidateVrpoTrainingTargetsFresh(
+        baseline, *fixture.actor, *fixture.q, &error));
+
+    {
+      torch::NoGradGuard no_grad;
+      fixture.actor->policy_head->bias.add_(0.2 * torch::tensor(
+          {1.0f, -1.0f, 0.5f, 0.0f, 0.25f, -0.5f}));
+    }
+    UTILS_CHECK(!ValidateVrpoTrainingTargetsFresh(
+        baseline, *fixture.actor, *fixture.q, &error));
+    VrpoTrainingTargetBundle fresh;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        config, episodes, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &fresh, &error));
+    UTILS_CHECK(ValidateVrpoTrainingTargetsFresh(
+        fresh, *fixture.actor, *fixture.q, &error));
+    UTILS_CHECK(fresh.target_values_sha256 != baseline.target_values_sha256);
+
+    auto opponent_changed = episodes;
+    const Player first_actor = opponent_changed[0].rows[0].actor;
+    opponent_changed[0].rows[1].rewards[first_actor] += 3.0;
+    VrpoTrainingTargetBundle opponent_targets;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        config, opponent_changed, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &opponent_targets, &error));
+    CHECK_EQ(opponent_targets.rows[0].row_id, fresh.rows[0].row_id);
+    UTILS_CHECK(std::abs(opponent_targets.rows[0].actor_advantage -
+                         fresh.rows[0].actor_advantage) > 1e-6);
+
+    auto other_episode_changed = episodes;
+    other_episode_changed[1].rows.back().rewards[first_actor] += 7.0;
+    VrpoTrainingTargetBundle isolated_targets;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        config, other_episode_changed, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &isolated_targets, &error));
+    for (size_t row = 0; row < episodes[0].rows.size(); ++row) {
+      CHECK_EQ(isolated_targets.rows[row].row_id, fresh.rows[row].row_id);
+      CHECK_NEAR(isolated_targets.rows[row].actor_advantage,
+                 fresh.rows[row].actor_advantage, 1e-12);
+      for (int seat = 0; seat < 4; ++seat) {
+        CHECK_NEAR(isolated_targets.rows[row].q_target_absolute[seat],
+                   fresh.rows[row].q_target_absolute[seat], 1e-12);
+      }
+    }
+  } TEST_END();
+}
+
+void TestVrpoPhase4dFailClosedBeforeStep() {
+  TEST_BEGIN("VRPO phase 4d: late-bin invalid data and runtime failure are atomic") {
+    const auto config = CanonicalVrpoPhase4Arms()[2];
+    auto require_reject_without_movement = [&](int failure_kind) {
+      auto fixture = MakeTinyVrpoTrainingFixture();
+      auto episodes = MakeTinyVrpoTrainingEpisodes(
+          *fixture.actor, config.logit_cap);
+      VrpoEpisodePartitionPlan first_epoch_plan;
+      std::string error;
+      UTILS_CHECK(BuildVrpoEpisodePartitionPlan(
+          episodes, vrpo_training_internal::SplitMix64(31337 + 1),
+          &first_epoch_plan, &error));
+      UTILS_CHECK(!first_epoch_plan.minibatches[0].episode_indices.empty());
+      UTILS_CHECK(!first_epoch_plan.minibatches[1].episode_indices.empty());
+      if (failure_kind == 0) {
+        episodes[1].episode_id = episodes[0].episode_id;
+      } else if (failure_kind == 1) {
+        episodes[1].rows[0].row_id = episodes[0].rows[0].row_id;
+      } else if (failure_kind == 2) {
+        episodes[2].rows[1].actor_input[0] =
+            std::numeric_limits<float>::quiet_NaN();
+      } else if (failure_kind == 3) {
+        const size_t late_episode =
+            first_epoch_plan.minibatches[1].episode_indices.front();
+        episodes[late_episode].rows[0].ppo_return =
+            std::numeric_limits<double>::max();
+      } else {
+        for (size_t episode_index :
+             first_epoch_plan.minibatches[1].episode_indices) {
+          for (auto& row : episodes[episode_index].rows) {
+            row.legal_actions = {0};
+            row.chosen_index = 0;
+            row.chosen_action = 0;
+            row.old_legal_probabilities = {1.0};
+            row.old_chosen_log_probability = 0.0;
+          }
+        }
+      }
+      if (failure_kind >= 3) {
+        MaterializeVrpoZeroAdamWState(*fixture.actor_optimizer);
+        MaterializeVrpoZeroAdamWState(*fixture.q_optimizer);
+      }
+      const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+      const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+      const std::string value_before =
+          TinyVrpoModuleHash(*fixture.actor, "value_head");
+      const std::string actor_optimizer_before =
+          TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer);
+      const std::string q_optimizer_before =
+          TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer);
+      const size_t actor_state_count = fixture.actor_optimizer->state().size();
+      const size_t q_state_count = fixture.q_optimizer->state().size();
+      VrpoTrainingUpdateStats stats;
+      UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+          config, episodes, 31337, *fixture.actor, *fixture.q,
+          *fixture.actor_optimizer, *fixture.q_optimizer,
+          fixture.actor_forward, fixture.q_forward, &stats, &error));
+      CHECK_EQ(stats.actor_optimizer_steps, int64_t{0});
+      CHECK_EQ(stats.q_optimizer_steps, int64_t{0});
+      CHECK_EQ(fixture.actor_optimizer->state().size(), actor_state_count);
+      CHECK_EQ(fixture.q_optimizer->state().size(), q_state_count);
+      CHECK_EQ(TinyVrpoModuleHash(*fixture.actor), actor_before);
+      CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+      CHECK_EQ(TinyVrpoModuleHash(*fixture.actor, "value_head"), value_before);
+      CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer),
+               actor_optimizer_before);
+      CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer),
+               q_optimizer_before);
+      UTILS_CHECK(!error.empty());
+    };
+    require_reject_without_movement(0);
+    require_reject_without_movement(1);
+    require_reject_without_movement(2);
+    require_reject_without_movement(3);
+    require_reject_without_movement(4);
+
+    // A forward failure that appears only after the first actor optimizer step
+    // is not structurally preflightable. The transaction must restore modules
+    // and materialized AdamW numerical state exactly.
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(
+        *fixture.actor, config.logit_cap);
+    MaterializeVrpoZeroAdamWState(*fixture.actor_optimizer);
+    MaterializeVrpoZeroAdamWState(*fixture.q_optimizer);
+    const std::string actor_before = TinyVrpoModuleHash(*fixture.actor);
+    const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+    const std::string value_before =
+        TinyVrpoModuleHash(*fixture.actor, "value_head");
+    const std::string actor_optimizer_before =
+        TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer);
+    const std::string q_optimizer_before =
+        TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer);
+    int actor_forward_calls = 0;
+    VrpoActorForward late_nonfinite =
+        [actor = fixture.actor, &actor_forward_calls](
+            const torch::Tensor& input) {
+          VrpoActorTrainingOutput result = actor->Forward(input);
+          ++actor_forward_calls;
+          if (actor_forward_calls == 3) {
+            result.logits = torch::full_like(
+                result.logits,
+                std::numeric_limits<float>::quiet_NaN());
+          }
+          return result;
+        };
+    VrpoTrainingUpdateStats stats;
+    std::string error;
+    UTILS_CHECK(!RunVrpoPhase4dOneUpdate(
+        config, episodes, 424242, *fixture.actor, *fixture.q,
+        *fixture.actor_optimizer, *fixture.q_optimizer,
+        late_nonfinite, fixture.q_forward, &stats, &error));
+    UTILS_CHECK(actor_forward_calls >= 3);
+    CHECK_EQ(stats.actor_optimizer_steps, int64_t{0});
+    CHECK_EQ(stats.q_optimizer_steps, int64_t{0});
+    CHECK_EQ(TinyVrpoModuleHash(*fixture.actor), actor_before);
+    CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_before);
+    CHECK_EQ(TinyVrpoModuleHash(*fixture.actor, "value_head"), value_before);
+    CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.actor_optimizer),
+             actor_optimizer_before);
+    CHECK_EQ(TinyVrpoOptimizerNumericalHash(*fixture.q_optimizer),
+             q_optimizer_before);
+    UTILS_CHECK(!error.empty());
+  } TEST_END();
+}
+
 void TestVrpoGlobalExpectedSarsaLambdaReference() {
   TEST_BEGIN("VRPO phase 1: global Expected-SARSA(lambda) reference and strict timeline validation") {
     auto make_row = [](uint64_t episode, Player actor,
@@ -4331,10 +5056,15 @@ int main() {
   TestVrpoDeterministicQModule();
   TestVrpoCapturedEpisodeAndZeroShapingRewards();
   TestVrpoCaptureStartupAndLazyOptimizerContracts();
+  CheckVrpoExactNumericArtifactProvenance();
   TestVrpoQReferencePreflightContracts();
   TestVrpoPhase4aSchemaAndBootstrapContracts();
   TestVrpoPhase4bExpandedCheckpointRoundtrip();
   TestVrpoPhase4cBootstrapOnlyIntegration();
+  TestVrpoPhase4dWholeEpisodePartitioner();
+  TestVrpoPhase4dFourArmUpdateMechanics();
+  TestVrpoPhase4dFreshTargetsAndGlobalTrace();
+  TestVrpoPhase4dFailClosedBeforeStep();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

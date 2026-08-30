@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -35,14 +36,126 @@ inline constexpr int kVrpoJointInformationSize =
     kVrpoNumSeats * kVrpoDuneInformationStateSize;
 inline constexpr int kVrpoDuneActionDim = 2391;
 inline constexpr double kVrpoMaxProbabilityTolerance = 1e-6;
+inline constexpr double kVrpoRegisteredProbabilityTolerance = 1e-9;
 inline constexpr int kVrpoQPreflightMaxChunkRows = 256;
 inline constexpr double kVrpoQPreflightMaxAgreementTolerance = 1e-6;
+inline constexpr double kVrpoRegisteredQAgreementAbsTolerance = 1e-10;
+inline constexpr double kVrpoRegisteredQAgreementRelTolerance = 1e-10;
+inline constexpr char kVrpoRegisteredProbabilityToleranceExact[] =
+    "1.0000000000000001e-09";
+inline constexpr char kVrpoRegisteredQAgreementAbsToleranceExact[] = "1e-10";
+inline constexpr char kVrpoRegisteredQAgreementRelToleranceExact[] = "1e-10";
+inline constexpr char kVrpoExactNumericEncoding[] =
+    "cxx_max_digits10_general_round_trip_v1";
 inline constexpr char kVrpoJointInformationEncodingLabel[] =
     "actor_relative_joint_information_proxy_not_full_markov_state_v1";
 inline constexpr bool kVrpoJointInformationIsFullMarkovState = false;
 inline constexpr bool kVrpoJointInformationMayFeedActorInference = false;
 static_assert(kVrpoDuneInformationStateSize ==
               dune_imperium::kVrpoCentralActorPrefixSize);
+
+// OpenSpiel's legacy JSON writer formats doubles with six decimal places, so
+// diagnostic thresholds such as 1e-9 and 1e-10 become a descriptive numeric
+// 0.000000 on disk. Keep those numeric fields for backwards compatibility, but
+// make every decision-bearing value recoverable through a canonical string.
+// This is deliberately local to VRPO artifacts; changing the global JSON
+// serializer would rewrite unrelated manifests and fingerprints.
+inline std::string VrpoCanonicalExactDouble(double value) {
+  if (!std::isfinite(value)) return {};
+  char buffer[64];
+  const auto result = std::to_chars(
+      buffer, buffer + sizeof(buffer), value, std::chars_format::general,
+      std::numeric_limits<double>::max_digits10);
+  if (result.ec != std::errc()) return {};
+  return std::string(buffer, result.ptr);
+}
+
+struct VrpoExactNumericStrings {
+  std::string reward_scale;
+  std::string gamma;
+  std::string lambda;
+  std::string probability_tolerance =
+      kVrpoRegisteredProbabilityToleranceExact;
+  std::string agreement_abs_tolerance =
+      kVrpoRegisteredQAgreementAbsToleranceExact;
+  std::string agreement_rel_tolerance =
+      kVrpoRegisteredQAgreementRelToleranceExact;
+};
+
+inline VrpoExactNumericStrings MakeVrpoRegisteredExactNumericStrings(
+    double reward_scale, double gamma, double lambda) {
+  VrpoExactNumericStrings exact;
+  exact.reward_scale = VrpoCanonicalExactDouble(reward_scale);
+  exact.gamma = VrpoCanonicalExactDouble(gamma);
+  exact.lambda = VrpoCanonicalExactDouble(lambda);
+  return exact;
+}
+
+// Populates the exact/numeric fields used by both phase-3 artifacts and gates
+// the registered strings against the values actually used at runtime. Fields
+// are populated even on rejection so an INVALID artifact remains auditable.
+inline bool PopulateVrpoExactNumericProvenance(
+    json::Object* root, const VrpoExactNumericStrings& exact,
+    double reward_scale, double gamma, double lambda,
+    double probability_tolerance, bool include_q_tolerances,
+    double agreement_abs_tolerance, double agreement_rel_tolerance,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (root == nullptr) return fail("null VRPO numeric-provenance artifact");
+
+  (*root)["numeric_exact_encoding"] = kVrpoExactNumericEncoding;
+  (*root)["reward_scale"] = reward_scale;
+  (*root)["reward_scale_exact"] = exact.reward_scale;
+  (*root)["gamma"] = gamma;
+  (*root)["gamma_exact"] = exact.gamma;
+  (*root)["lambda"] = lambda;
+  (*root)["lambda_exact"] = exact.lambda;
+  (*root)["probability_tolerance"] = probability_tolerance;
+  (*root)["probability_tolerance_exact"] =
+      exact.probability_tolerance;
+  if (include_q_tolerances) {
+    (*root)["agreement_abs_tolerance"] = agreement_abs_tolerance;
+    (*root)["agreement_abs_tolerance_exact"] =
+        exact.agreement_abs_tolerance;
+    (*root)["agreement_rel_tolerance"] = agreement_rel_tolerance;
+    (*root)["agreement_rel_tolerance_exact"] =
+        exact.agreement_rel_tolerance;
+  }
+
+  if (exact.reward_scale != VrpoCanonicalExactDouble(reward_scale) ||
+      exact.gamma != VrpoCanonicalExactDouble(gamma) ||
+      exact.lambda != VrpoCanonicalExactDouble(lambda)) {
+    return fail("VRPO reward/gamma/lambda exact string differs from runtime");
+  }
+  if (probability_tolerance != kVrpoRegisteredProbabilityTolerance ||
+      exact.probability_tolerance !=
+          kVrpoRegisteredProbabilityToleranceExact ||
+      exact.probability_tolerance !=
+          VrpoCanonicalExactDouble(probability_tolerance)) {
+    return fail(
+        "VRPO probability tolerance exact string/runtime registration mismatch");
+  }
+  if (include_q_tolerances &&
+      (agreement_abs_tolerance !=
+           kVrpoRegisteredQAgreementAbsTolerance ||
+       agreement_rel_tolerance !=
+           kVrpoRegisteredQAgreementRelTolerance ||
+       exact.agreement_abs_tolerance !=
+           kVrpoRegisteredQAgreementAbsToleranceExact ||
+       exact.agreement_rel_tolerance !=
+           kVrpoRegisteredQAgreementRelToleranceExact ||
+       exact.agreement_abs_tolerance !=
+           VrpoCanonicalExactDouble(agreement_abs_tolerance) ||
+       exact.agreement_rel_tolerance !=
+           VrpoCanonicalExactDouble(agreement_rel_tolerance))) {
+    return fail(
+        "VRPO Q agreement tolerance exact string/runtime registration mismatch");
+  }
+  return true;
+}
 
 // Privileged training-only proxy. Segment slot s contains the information-state
 // tensor for absolute seat (actor+s)%4. It intentionally is NOT called a full
@@ -908,7 +1021,7 @@ struct VrpoCapturedEpisode {
   double reward_scale = 4.0;
   double gamma = 1.0;
   double lambda = 1.0;
-  double probability_tolerance = 1e-9;
+  double probability_tolerance = kVrpoRegisteredProbabilityTolerance;
   VrpoSeatValues terminal_returns = {0.0, 0.0, 0.0, 0.0};
   bool rewards_finalized = false;
   std::string capture_sha256;
@@ -985,6 +1098,7 @@ struct VrpoCaptureStartupConfig {
   double reward_scale = 4.0;
   double gamma = 1.0;
   double lambda = 1.0;
+  double probability_tolerance = kVrpoRegisteredProbabilityTolerance;
 };
 
 inline bool ValidateVrpoCaptureStartupConfig(
@@ -1030,8 +1144,11 @@ inline bool ValidateVrpoCaptureStartupConfig(
   if (config.reward_scale != 4.0 || !std::isfinite(config.gamma) ||
       config.gamma < 0.0 || config.gamma > 1.0 ||
       !std::isfinite(config.lambda) || config.lambda < 0.0 ||
-      config.lambda > 1.0) {
-    return fail("VRPO capture reward scale/gamma/lambda is invalid");
+      config.lambda > 1.0 ||
+      config.probability_tolerance !=
+          kVrpoRegisteredProbabilityTolerance) {
+    return fail(
+        "VRPO capture reward scale/gamma/lambda/probability tolerance is invalid");
   }
   return true;
 }
@@ -1044,8 +1161,8 @@ struct VrpoQPreflightStartupConfig {
   VrpoCaptureStartupConfig capture;
   uint64_t q_init_seed = 0;
   int q_chunk_rows = 0;
-  double agreement_abs_tolerance = 1e-10;
-  double agreement_rel_tolerance = 1e-10;
+  double agreement_abs_tolerance = kVrpoRegisteredQAgreementAbsTolerance;
+  double agreement_rel_tolerance = kVrpoRegisteredQAgreementRelTolerance;
   int64_t gpu_peak_increment_limit_bytes = 0;
 };
 
@@ -1066,12 +1183,11 @@ inline bool ValidateVrpoQPreflightStartupConfig(
       config.q_chunk_rows > kVrpoQPreflightMaxChunkRows) {
     return fail("Q preflight seed/chunk contract is invalid");
   }
-  for (double tolerance : {config.agreement_abs_tolerance,
-                           config.agreement_rel_tolerance}) {
-    if (!std::isfinite(tolerance) || tolerance < 0.0 ||
-        tolerance > kVrpoQPreflightMaxAgreementTolerance) {
-      return fail("Q preflight agreement tolerance is invalid");
-    }
+  if (config.agreement_abs_tolerance !=
+          kVrpoRegisteredQAgreementAbsTolerance ||
+      config.agreement_rel_tolerance !=
+          kVrpoRegisteredQAgreementRelTolerance) {
+    return fail("Q preflight agreement tolerance differs from registration");
   }
   if (config.gpu_peak_increment_limit_bytes <= 0) {
     return fail("Q preflight GPU memory ceiling must be positive");
@@ -1271,7 +1387,7 @@ struct VrpoZeroShapingRewardConfig {
   double reward_scale = 4.0;
   double gamma = 1.0;
   double lambda = 1.0;
-  double probability_tolerance = 1e-9;
+  double probability_tolerance = kVrpoRegisteredProbabilityTolerance;
   double shaped_reward_weight = 0.0;
   double tleilaxu_breadcrumb_weight = 0.0;
   double tleilaxu_level7_breadcrumb_weight = 0.0;

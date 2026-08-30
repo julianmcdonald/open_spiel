@@ -137,6 +137,10 @@ ABSL_FLAG(std::string, vrpo_capture_source_root, "",
           "Required source root for the fixed VRPO capture source list.");
 ABSL_FLAG(std::string, vrpo_capture_source_sha256, "",
           "Required canonical VRPO capture source digest.");
+ABSL_FLAG(double, vrpo_probability_tolerance,
+          open_spiel::kVrpoRegisteredProbabilityTolerance,
+          "Registered legal-probability validation tolerance for VRPO "
+          "diagnostics; must remain exactly 1e-9.");
 ABSL_FLAG(std::string, vrpo_q_preflight_output, "",
           "Fresh atomic JSON output for the no-training VRPO Q/reference preflight.");
 ABSL_FLAG(std::string, vrpo_q_preflight_registration_id, "",
@@ -2312,6 +2316,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       config.reward_scale = absl::GetFlag(FLAGS_reward_scale);
       config.gamma = absl::GetFlag(FLAGS_gamma);
       config.lambda = absl::GetFlag(FLAGS_gae_lambda);
+      config.probability_tolerance =
+          absl::GetFlag(FLAGS_vrpo_probability_tolerance);
       config.shaped_reward_weight =
           absl::GetFlag(FLAGS_shaped_reward_weight);
       config.tleilaxu_breadcrumb_weight =
@@ -4912,7 +4918,7 @@ bool WriteVrpoCaptureArtifact(
     const bool metadata_valid = ValidateVrpoCaptureRewardMetadata(
         episode, absl::GetFlag(FLAGS_reward_scale),
         absl::GetFlag(FLAGS_gamma), absl::GetFlag(FLAGS_gae_lambda),
-        1e-9, &metadata_error);
+        absl::GetFlag(FLAGS_vrpo_probability_tolerance), &metadata_error);
     require(metadata_valid, metadata_error);
     require(episode_ids.insert(episode.episode_id).second,
             "duplicate captured episode ID");
@@ -5004,10 +5010,21 @@ bool WriteVrpoCaptureArtifact(
   root["captured_episodes"] = static_cast<int64_t>(episodes.size());
   root["captured_rows"] = total_rows;
   root["sampler_exact_rows"] = sampler_exact_rows;
-  root["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
-  root["gamma"] = absl::GetFlag(FLAGS_gamma);
-  root["lambda"] = absl::GetFlag(FLAGS_gae_lambda);
-  root["probability_tolerance"] = 1e-9;
+  const VrpoExactNumericStrings exact_numeric =
+      MakeVrpoRegisteredExactNumericStrings(
+          absl::GetFlag(FLAGS_reward_scale), absl::GetFlag(FLAGS_gamma),
+          absl::GetFlag(FLAGS_gae_lambda));
+  std::string exact_numeric_error;
+  require(PopulateVrpoExactNumericProvenance(
+              &root, exact_numeric, absl::GetFlag(FLAGS_reward_scale),
+              absl::GetFlag(FLAGS_gamma),
+              absl::GetFlag(FLAGS_gae_lambda),
+              absl::GetFlag(FLAGS_vrpo_probability_tolerance),
+              /*include_q_tolerances=*/false,
+              kVrpoRegisteredQAgreementAbsTolerance,
+              kVrpoRegisteredQAgreementRelTolerance,
+              &exact_numeric_error),
+          exact_numeric_error);
   root["episodes"] = std::move(episode_json);
   root["capture_schema_label"] = kVrpoCaptureSchemaLabel;
   root["capture_schema_sha256"] = kVrpoCaptureSchemaSha256;
@@ -5571,14 +5588,21 @@ bool WriteVrpoQPreflightArtifact(
   root["capture_schema_sha256"] = kVrpoCaptureSchemaSha256;
   root["reward_convention_sha256"] =
       kVrpoZeroShapingRewardConventionSha256;
-  root["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
-  root["gamma"] = absl::GetFlag(FLAGS_gamma);
-  root["lambda"] = absl::GetFlag(FLAGS_gae_lambda);
-  root["probability_tolerance"] = 1e-9;
-  root["agreement_abs_tolerance"] =
-      absl::GetFlag(FLAGS_vrpo_q_agreement_abs_tolerance);
-  root["agreement_rel_tolerance"] =
-      absl::GetFlag(FLAGS_vrpo_q_agreement_rel_tolerance);
+  const VrpoExactNumericStrings exact_numeric =
+      MakeVrpoRegisteredExactNumericStrings(
+          absl::GetFlag(FLAGS_reward_scale), absl::GetFlag(FLAGS_gamma),
+          absl::GetFlag(FLAGS_gae_lambda));
+  std::string exact_numeric_error;
+  require(PopulateVrpoExactNumericProvenance(
+              &root, exact_numeric, absl::GetFlag(FLAGS_reward_scale),
+              absl::GetFlag(FLAGS_gamma),
+              absl::GetFlag(FLAGS_gae_lambda),
+              absl::GetFlag(FLAGS_vrpo_probability_tolerance),
+              /*include_q_tolerances=*/true,
+              absl::GetFlag(FLAGS_vrpo_q_agreement_abs_tolerance),
+              absl::GetFlag(FLAGS_vrpo_q_agreement_rel_tolerance),
+              &exact_numeric_error),
+          exact_numeric_error);
   json::Object agreement;
   agreement["compared_values"] = result.agreement.compared_values;
   agreement["mismatch_count"] = result.agreement.mismatch_count;
@@ -5861,6 +5885,8 @@ int main(int argc, char** argv) {
     config.reward_scale = absl::GetFlag(FLAGS_reward_scale);
     config.gamma = absl::GetFlag(FLAGS_gamma);
     config.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    config.probability_tolerance =
+        absl::GetFlag(FLAGS_vrpo_probability_tolerance);
     std::string gate_error;
     const bool gate_valid = vrpo_q_preflight
         ? open_spiel::ValidateVrpoQPreflightStartupConfig(
