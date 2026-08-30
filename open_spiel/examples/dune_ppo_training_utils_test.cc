@@ -2970,6 +2970,203 @@ void TestVrpoQReferencePreflightContracts() {
   } TEST_END();
 }
 
+void TestVrpoPhase4aSchemaAndBootstrapContracts() {
+  TEST_BEGIN("VRPO phase 4a: strict four-arm manifest and matched bootstrap identities") {
+    const auto arms = CanonicalVrpoPhase4Arms();
+    std::string error;
+    UTILS_CHECK(ValidateVrpoPhase4ArmConfigs(arms, &error));
+    CHECK_EQ(arms[0].arm_id, std::string("PPO_CAP10"));
+    CHECK_EQ(arms[1].logit_cap, 0.0);
+    CHECK_EQ(VrpoPhase4AlgorithmName(arms[2].algorithm),
+             std::string("vrpo"));
+    CHECK_EQ(arms[3].logit_cap, 0.0);
+
+    torch::manual_seed(1234);
+    auto source_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        8, 16, 7, 1, false);
+    std::set<std::string> actor_names;
+    for (const auto& item : source_actor->named_parameters()) {
+      actor_names.insert(item.key());
+    }
+    UTILS_CHECK(!actor_names.empty());
+
+    std::array<VrpoPhase4BootIdentity, 4> boots;
+    std::array<std::vector<std::string>, 4> copied_names;
+    std::array<std::vector<std::vector<int64_t>>, 4> copied_shapes;
+    constexpr uint64_t q_seed = 20260831;
+    for (size_t arm = 0; arm < boots.size(); ++arm) {
+      torch::manual_seed(9000 + arm);
+      auto target_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          8, 16, 7, 1, false);
+      UTILS_CHECK(BuildVrpoPhase4BootIdentity(
+          *source_actor, *target_actor, actor_names, q_seed,
+          &boots[arm], &error));
+      std::vector<VrpoNamedParameterIdentity> identities;
+      UTILS_CHECK(VrpoNamedParameterIdentities(
+          *target_actor, &actor_names, &identities, &error));
+      for (const auto& identity : identities) {
+        copied_names[arm].push_back(identity.name);
+        copied_shapes[arm].push_back(identity.shape);
+      }
+      if (arm > 0) {
+        UTILS_CHECK(copied_names[arm] == copied_names[0]);
+        UTILS_CHECK(copied_shapes[arm] == copied_shapes[0]);
+        CHECK_EQ(boots[arm].actor_subset_sha256,
+                 boots[0].actor_subset_sha256);
+        CHECK_EQ(boots[arm].actor_names_shapes_sha256,
+                 boots[0].actor_names_shapes_sha256);
+        CHECK_EQ(boots[arm].q_init_sha256, boots[0].q_init_sha256);
+        CHECK_EQ(boots[arm].q_names_shapes_sha256,
+                 boots[0].q_names_shapes_sha256);
+        CHECK_EQ(boots[arm].module_layout_sha256,
+                 boots[0].module_layout_sha256);
+      }
+    }
+
+    auto q_module = std::make_shared<DuneVrpoQNetImpl>(q_seed);
+    std::vector<VrpoNamedParameterIdentity> actor_identities;
+    std::vector<VrpoNamedParameterIdentity> q_identities;
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *source_actor, &actor_names, &actor_identities, &error));
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *q_module, nullptr, &q_identities, &error));
+    const auto groups = CanonicalVrpoPhase4OptimizerGroups();
+    CHECK_EQ(groups.size(), static_cast<size_t>(3));
+    CHECK_EQ(groups[0].optimizer_name, std::string("actor"));
+    CHECK_EQ(groups[0].group_name, std::string("actor_policy"));
+    CHECK_EQ(groups[1].group_name, std::string("actor_trunk_value"));
+    CHECK_EQ(groups[2].optimizer_name, std::string("q"));
+    CHECK_EQ(groups[2].group_name, std::string("q_critic"));
+    for (const auto& group : groups) {
+      CHECK_EQ(group.learning_rate, 2.5e-4);
+      CHECK_EQ(group.beta1, 0.9);
+      CHECK_EQ(group.beta2, 0.999);
+      CHECK_EQ(group.epsilon, 1e-5);
+      CHECK_EQ(group.weight_decay, 0.0);
+    }
+    const std::string zero_state = VrpoOptimizerZeroStateIdentitySha256(
+        groups, actor_identities, q_identities);
+    UTILS_CHECK(zero_state.size() == 64);
+    CHECK_EQ(zero_state, VrpoOptimizerZeroStateIdentitySha256(
+                             groups, actor_identities, q_identities));
+
+    VrpoPhase4ManifestBinding binding;
+    binding.source_actor_model_sha256 = std::string(64, '1');
+    binding.source_actor_manifest_sha256 = std::string(64, '2');
+    binding.source_code_sha256 = std::string(64, '3');
+    binding.actor_subset_sha256 = boots[0].actor_subset_sha256;
+    binding.actor_names_shapes_sha256 =
+        boots[0].actor_names_shapes_sha256;
+    binding.q_init_sha256 = boots[0].q_init_sha256;
+    binding.q_names_shapes_sha256 = boots[0].q_names_shapes_sha256;
+    binding.module_layout_sha256 = boots[0].module_layout_sha256;
+    binding.optimizer_zero_state_sha256 = zero_state;
+    binding.q_init_seed = q_seed;
+    binding.experiment_uuid = "12345678-1234-1234-1234-123456789abc";
+    binding.base_seed = 8301000;
+    binding.start_episode_id = 1000010000;
+    binding.end_episode_id_inclusive = 1000010039;
+
+    std::array<json::Object, 4> manifests;
+    std::set<std::string> fingerprints;
+    for (size_t arm = 0; arm < manifests.size(); ++arm) {
+      manifests[arm] = BuildVrpoPhase4Manifest(arms[arm], binding);
+      UTILS_CHECK(ValidateVrpoPhase4ManifestStrict(
+          manifests[arm], arms[arm], binding, &error));
+      const auto it = manifests[arm].find("config_fingerprint");
+      UTILS_CHECK(it != manifests[arm].end() && it->second.IsString());
+      fingerprints.insert(it->second.GetString());
+      UTILS_CHECK(manifests[arm].at("actor_optimizer_fresh").GetBool());
+      UTILS_CHECK(manifests[arm].at("q_optimizer_fresh").GetBool());
+      UTILS_CHECK(!manifests[arm]
+                       .at("source_optimizer_moments_loaded")
+                       .GetBool());
+      UTILS_CHECK(manifests[arm]
+                      .at("value_module_present_all_arms")
+                      .GetBool());
+      UTILS_CHECK(manifests[arm]
+                      .at("q_module_present_all_arms")
+                      .GetBool());
+    }
+    CHECK_EQ(fingerprints.size(), static_cast<size_t>(4));
+    UTILS_CHECK(ValidateVrpoPhase4ManifestSetMatched(manifests, &error));
+
+    auto require_manifest_reject = [&](json::Object malformed,
+                                       const std::string& needle) {
+      UTILS_CHECK(!ValidateVrpoPhase4ManifestStrict(
+          malformed, arms[0], binding, &error));
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    auto malformed = manifests[0];
+    malformed.erase("q_init_sha256");
+    require_manifest_reject(malformed, "missing or extra");
+    malformed = manifests[0];
+    malformed["unexpected"] = true;
+    require_manifest_reject(malformed, "missing or extra");
+    malformed = manifests[0];
+    malformed["rollout_amp"] = "false";
+    require_manifest_reject(malformed, "rollout_amp");
+    for (const std::string& field :
+         {"q_init_sha256", "allow_tf32", "central_schema_sha256",
+          "reward_convention_sha256", "actor_epochs",
+          "source_actor_model_sha256"}) {
+      malformed = manifests[0];
+      if (malformed[field].IsString()) malformed[field] = std::string(64, 'f');
+      else if (malformed[field].IsBool()) malformed[field] = false;
+      else malformed[field] = int64_t{99};
+      require_manifest_reject(malformed, field);
+    }
+    json::Object legacy;
+    legacy["schema"] = "legacy";
+    require_manifest_reject(legacy, "missing or extra");
+
+    auto unmatched = manifests;
+    unmatched[1]["q_init_seed"] = int64_t{9};
+    UTILS_CHECK(!ValidateVrpoPhase4ManifestSetMatched(unmatched, &error));
+    auto nondefault_precision = arms;
+    nondefault_precision[0].rollout_amp = true;
+    UTILS_CHECK(!ValidateVrpoPhase4ArmConfigs(
+        nondefault_precision, &error));
+    auto invalid_binding = binding;
+    invalid_binding.source_actor_model_sha256 = "bad";
+    UTILS_CHECK(!ValidateVrpoPhase4ManifestBinding(
+        invalid_binding, &error));
+    invalid_binding = binding;
+    invalid_binding.experiment_uuid = "bad";
+    UTILS_CHECK(!ValidateVrpoPhase4ManifestBinding(
+        invalid_binding, &error));
+    invalid_binding = binding;
+    invalid_binding.end_episode_id_inclusive =
+        invalid_binding.start_episode_id - 1;
+    UTILS_CHECK(!ValidateVrpoPhase4ManifestBinding(
+        invalid_binding, &error));
+    auto unregistered_arm = arms[0];
+    unregistered_arm.arm_id = "LEGACY";
+    UTILS_CHECK(!ValidateVrpoPhase4ArmConfig(unregistered_arm, &error));
+
+    auto missing_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+        8, 16, 6, 1, false);
+    VrpoPhase4BootIdentity rejected_boot;
+    UTILS_CHECK(!BuildVrpoPhase4BootIdentity(
+        *source_actor, *missing_target, actor_names, q_seed,
+        &rejected_boot, &error));
+    VrpoPhase4BootIdentity different_q;
+    auto same_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+        8, 16, 7, 1, false);
+    UTILS_CHECK(BuildVrpoPhase4BootIdentity(
+        *source_actor, *same_target, actor_names, q_seed + 1,
+        &different_q, &error));
+    UTILS_CHECK(different_q.q_init_sha256 != boots[0].q_init_sha256);
+
+    std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
+    UTILS_CHECK(trainer.good());
+    std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
+                               std::istreambuf_iterator<char>());
+    UTILS_CHECK(trainer_source.find("BuildVrpoPhase4Manifest") ==
+                std::string::npos);
+  } TEST_END();
+}
+
 void TestVrpoGlobalExpectedSarsaLambdaReference() {
   TEST_BEGIN("VRPO phase 1: global Expected-SARSA(lambda) reference and strict timeline validation") {
     auto make_row = [](uint64_t episode, Player actor,
@@ -3282,6 +3479,7 @@ int main() {
   TestVrpoCapturedEpisodeAndZeroShapingRewards();
   TestVrpoCaptureStartupAndLazyOptimizerContracts();
   TestVrpoQReferencePreflightContracts();
+  TestVrpoPhase4aSchemaAndBootstrapContracts();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

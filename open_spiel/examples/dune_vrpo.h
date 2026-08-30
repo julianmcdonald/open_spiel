@@ -18,6 +18,7 @@
 #include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
+#include "open_spiel/utils/json.h"
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
@@ -1660,6 +1661,583 @@ inline bool ComputeVrpoCapturedEpisodeReference(
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4a: pure four-arm schema/bootstrap contracts. Nothing below has a
+// production caller; it exists to freeze the experiment before any optimizer
+// or training loop is implemented.
+
+enum class VrpoPhase4Algorithm { kPpo, kVrpo };
+
+inline std::string VrpoPhase4AlgorithmName(VrpoPhase4Algorithm algorithm) {
+  return algorithm == VrpoPhase4Algorithm::kPpo ? "ppo" : "vrpo";
+}
+
+struct VrpoPhase4ArmConfig {
+  std::string arm_id;
+  VrpoPhase4Algorithm algorithm = VrpoPhase4Algorithm::kPpo;
+  double logit_cap = 10.0;
+  bool rollout_amp = false;
+  bool train_amp = false;
+  bool allow_tf32 = true;
+  double gamma = 1.0;
+  double lambda = 1.0;
+  double reward_scale = 4.0;
+  double shaped_reward_weight = 0.0;
+  double tleilaxu_breadcrumb_weight = 0.0;
+  double tleilaxu_level7_breadcrumb_weight = 0.0;
+  double specimen_exchange_penalty = 0.0;
+  bool complete_game_batches = true;
+  int minibatches_per_epoch = 16;
+  int actor_epochs = 4;
+  int q_epochs = 4;
+  int critic_replay_rollouts = 1;
+};
+
+inline std::array<VrpoPhase4ArmConfig, 4> CanonicalVrpoPhase4Arms() {
+  VrpoPhase4ArmConfig ppo_cap;
+  ppo_cap.arm_id = "PPO_CAP10";
+  VrpoPhase4ArmConfig ppo_uncapped = ppo_cap;
+  ppo_uncapped.arm_id = "PPO_UNCAPPED";
+  ppo_uncapped.logit_cap = 0.0;
+  VrpoPhase4ArmConfig vrpo_cap = ppo_cap;
+  vrpo_cap.arm_id = "VRPO_CAP10";
+  vrpo_cap.algorithm = VrpoPhase4Algorithm::kVrpo;
+  VrpoPhase4ArmConfig vrpo_uncapped = vrpo_cap;
+  vrpo_uncapped.arm_id = "VRPO_UNCAPPED";
+  vrpo_uncapped.logit_cap = 0.0;
+  return {ppo_cap, ppo_uncapped, vrpo_cap, vrpo_uncapped};
+}
+
+struct VrpoOptimizerGroupSpec {
+  std::string optimizer_name;
+  std::string group_name;
+  double learning_rate = 2.5e-4;
+  double beta1 = 0.9;
+  double beta2 = 0.999;
+  double epsilon = 1e-5;
+  double weight_decay = 0.0;
+  std::vector<std::string> parameter_prefixes;
+};
+
+inline std::vector<VrpoOptimizerGroupSpec>
+CanonicalVrpoPhase4OptimizerGroups() {
+  return {
+      {"actor", "actor_policy", 2.5e-4, 0.9, 0.999, 1e-5, 0.0,
+       {"policy_head"}},
+      {"actor", "actor_trunk_value", 2.5e-4, 0.9, 0.999, 1e-5, 0.0,
+       {"input_layer", "res", "value_head"}},
+      {"q", "q_critic", 2.5e-4, 0.9, 0.999, 1e-5, 0.0,
+       {"input_layer", "res", "q_head"}},
+  };
+}
+
+inline std::string VrpoOptimizerGroupSpecSha256(
+    const std::vector<VrpoOptimizerGroupSpec>& groups) {
+  std::string payload = "dune_vrpo_phase4_optimizer_groups_v1";
+  const uint64_t count = groups.size();
+  vrpo_capture_internal::AppendPod(&payload, count);
+  for (const auto& group : groups) {
+    payload.append(group.optimizer_name);
+    payload.push_back('\0');
+    payload.append(group.group_name);
+    payload.push_back('\0');
+    vrpo_capture_internal::AppendPod(&payload, group.learning_rate);
+    vrpo_capture_internal::AppendPod(&payload, group.beta1);
+    vrpo_capture_internal::AppendPod(&payload, group.beta2);
+    vrpo_capture_internal::AppendPod(&payload, group.epsilon);
+    vrpo_capture_internal::AppendPod(&payload, group.weight_decay);
+    const uint64_t prefixes = group.parameter_prefixes.size();
+    vrpo_capture_internal::AppendPod(&payload, prefixes);
+    for (const auto& prefix : group.parameter_prefixes) {
+      payload.append(prefix);
+      payload.push_back('\0');
+    }
+  }
+  return ComputeStringSHA256(payload);
+}
+
+struct VrpoPhase4ManifestBinding {
+  std::string source_actor_model_sha256;
+  std::string source_actor_manifest_sha256;
+  std::string source_code_sha256;
+  int64_t actor_observation_dim = 5580;
+  int64_t actor_hidden_dim = 2048;
+  int64_t actor_action_dim = 2391;
+  int64_t actor_residual_blocks = 8;
+  std::string actor_subset_sha256;
+  std::string actor_names_shapes_sha256;
+  std::string q_init_sha256;
+  std::string q_names_shapes_sha256;
+  std::string module_layout_sha256;
+  std::string optimizer_zero_state_sha256;
+  uint64_t q_init_seed = 0;
+  std::string experiment_uuid;
+  uint64_t base_seed = 0;
+  uint64_t start_episode_id = 0;
+  uint64_t end_episode_id_inclusive = 0;
+};
+
+inline constexpr char kVrpoPhase4ManifestSchemaLabel[] =
+    "dune_vrpo_phase4a_manifest_v1_strict_flat";
+inline constexpr char kVrpoQAbsoluteBoundaryLabel[] =
+    "q_output_actor_relative_then_checked_absolute_seat_0_1_2_3";
+
+inline json::Object VrpoPhase4FingerprintObject(
+    const VrpoPhase4ArmConfig& config,
+    const VrpoPhase4ManifestBinding& binding) {
+  json::Object out;
+  out["algorithm"] = VrpoPhase4AlgorithmName(config.algorithm);
+  out["logit_cap"] = config.logit_cap;
+  out["rollout_amp"] = config.rollout_amp;
+  out["train_amp"] = config.train_amp;
+  out["allow_tf32"] = config.allow_tf32;
+  out["gamma"] = config.gamma;
+  out["lambda"] = config.lambda;
+  out["reward_scale"] = config.reward_scale;
+  out["shaped_reward_weight"] = config.shaped_reward_weight;
+  out["tleilaxu_breadcrumb_weight"] = config.tleilaxu_breadcrumb_weight;
+  out["tleilaxu_level7_breadcrumb_weight"] =
+      config.tleilaxu_level7_breadcrumb_weight;
+  out["specimen_exchange_penalty"] = config.specimen_exchange_penalty;
+  out["complete_game_batches"] = config.complete_game_batches;
+  out["minibatches_per_epoch"] =
+      static_cast<int64_t>(config.minibatches_per_epoch);
+  out["actor_epochs"] = static_cast<int64_t>(config.actor_epochs);
+  out["q_epochs"] = static_cast<int64_t>(config.q_epochs);
+  out["critic_replay_rollouts"] =
+      static_cast<int64_t>(config.critic_replay_rollouts);
+  out["source_actor_model_sha256"] = binding.source_actor_model_sha256;
+  out["source_actor_manifest_sha256"] = binding.source_actor_manifest_sha256;
+  out["source_code_sha256"] = binding.source_code_sha256;
+  out["actor_subset_sha256"] = binding.actor_subset_sha256;
+  out["actor_names_shapes_sha256"] = binding.actor_names_shapes_sha256;
+  out["central_schema_sha256"] =
+      dune_imperium::kVrpoCentralCriticTensorSchemaSha256;
+  out["central_approximation_label"] =
+      dune_imperium::kVrpoCentralCriticTensorSchemaLabel;
+  out["q_init_seed"] = static_cast<int64_t>(binding.q_init_seed);
+  out["q_init_sha256"] = binding.q_init_sha256;
+  out["q_names_shapes_sha256"] = binding.q_names_shapes_sha256;
+  out["q_input_dim"] =
+      static_cast<int64_t>(dune_imperium::kVrpoCentralCriticTensorSize);
+  out["q_hidden_dim"] = int64_t{kVrpoQHiddenDim};
+  out["q_residual_blocks"] = int64_t{kVrpoQNumResBlocks};
+  out["q_action_dim"] = int64_t{kVrpoDuneActionDim};
+  out["q_reward_perspectives"] = int64_t{kVrpoNumSeats};
+  out["q_absolute_boundary_label"] = kVrpoQAbsoluteBoundaryLabel;
+  out["reward_convention_sha256"] =
+      kVrpoZeroShapingRewardConventionSha256;
+  out["module_layout_sha256"] = binding.module_layout_sha256;
+  out["optimizer_groups_sha256"] = VrpoOptimizerGroupSpecSha256(
+      CanonicalVrpoPhase4OptimizerGroups());
+  const auto optimizer_groups = CanonicalVrpoPhase4OptimizerGroups();
+  out["optimizer_group_count"] =
+      static_cast<int64_t>(optimizer_groups.size());
+  for (size_t index = 0; index < optimizer_groups.size(); ++index) {
+    const std::string prefix =
+        "optimizer_group_" + std::to_string(index) + "_";
+    const auto& group = optimizer_groups[index];
+    out[prefix + "optimizer"] = group.optimizer_name;
+    out[prefix + "name"] = group.group_name;
+    out[prefix + "learning_rate"] = group.learning_rate;
+    out[prefix + "beta1"] = group.beta1;
+    out[prefix + "beta2"] = group.beta2;
+    out[prefix + "epsilon"] = group.epsilon;
+    out[prefix + "weight_decay"] = group.weight_decay;
+    std::string prefixes;
+    for (const auto& value : group.parameter_prefixes) {
+      if (!prefixes.empty()) prefixes.push_back(',');
+      prefixes.append(value);
+    }
+    out[prefix + "parameter_prefixes"] = prefixes;
+  }
+  out["optimizer_zero_state_sha256"] =
+      binding.optimizer_zero_state_sha256;
+  out["optimizer_zero_state_schema"] =
+      "adamw_step0_exp_avg0_exp_avg_sq0_all_parameters_v1";
+  out["source_optimizer_moments_loaded"] = false;
+  out["actor_optimizer_fresh"] = true;
+  out["q_optimizer_fresh"] = true;
+  out["value_module_present_all_arms"] = true;
+  out["q_module_present_all_arms"] = true;
+  out["actor_observation_dim"] = binding.actor_observation_dim;
+  out["actor_hidden_dim"] = binding.actor_hidden_dim;
+  out["actor_action_dim"] = binding.actor_action_dim;
+  out["actor_residual_blocks"] = binding.actor_residual_blocks;
+  out["experiment_uuid"] = binding.experiment_uuid;
+  out["base_seed"] = static_cast<int64_t>(binding.base_seed);
+  out["start_episode_id"] =
+      static_cast<int64_t>(binding.start_episode_id);
+  out["end_episode_id_inclusive"] =
+      static_cast<int64_t>(binding.end_episode_id_inclusive);
+  return out;
+}
+
+inline std::string VrpoPhase4ConfigFingerprint(
+    const VrpoPhase4ArmConfig& config,
+    const VrpoPhase4ManifestBinding& binding) {
+  return ComputeStringSHA256(
+      json::ToString(VrpoPhase4FingerprintObject(config, binding)));
+}
+
+inline json::Object BuildVrpoPhase4Manifest(
+    const VrpoPhase4ArmConfig& config,
+    const VrpoPhase4ManifestBinding& binding) {
+  json::Object out = VrpoPhase4FingerprintObject(config, binding);
+  out["schema"] = kVrpoPhase4ManifestSchemaLabel;
+  out["arm_id"] = config.arm_id;
+  out["config_fingerprint"] =
+      VrpoPhase4ConfigFingerprint(config, binding);
+  return out;
+}
+
+inline bool ValidateVrpoPhase4ArmConfig(
+    const VrpoPhase4ArmConfig& config, std::string* error) {
+  const auto canonical = CanonicalVrpoPhase4Arms();
+  for (const auto& expected : canonical) {
+    if (config.arm_id != expected.arm_id) continue;
+    const json::Object actual_object = VrpoPhase4FingerprintObject(
+        config, VrpoPhase4ManifestBinding{});
+    const json::Object expected_object = VrpoPhase4FingerprintObject(
+        expected, VrpoPhase4ManifestBinding{});
+    if (json::ToString(actual_object) != json::ToString(expected_object)) {
+      if (error != nullptr) {
+        *error = "phase4 arm differs outside registered algorithm/cap cell";
+      }
+      return false;
+    }
+    return true;
+  }
+  if (error != nullptr) *error = "phase4 arm ID is not registered";
+  return false;
+}
+
+inline bool ValidateVrpoPhase4ManifestBinding(
+    const VrpoPhase4ManifestBinding& binding, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  auto lower_hex64 = [](const std::string& value) {
+    return value.size() == 64 &&
+        std::all_of(value.begin(), value.end(), [](char c) {
+          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+  };
+  for (const auto* digest :
+       {&binding.source_actor_model_sha256,
+        &binding.source_actor_manifest_sha256,
+        &binding.source_code_sha256, &binding.actor_subset_sha256,
+        &binding.actor_names_shapes_sha256, &binding.q_init_sha256,
+        &binding.q_names_shapes_sha256, &binding.module_layout_sha256,
+        &binding.optimizer_zero_state_sha256}) {
+    if (!lower_hex64(*digest)) {
+      return fail("phase4 binding contains an invalid SHA-256");
+    }
+  }
+  if (binding.actor_observation_dim != kVrpoDuneInformationStateSize ||
+      binding.actor_hidden_dim != 2048 ||
+      binding.actor_action_dim != kVrpoDuneActionDim ||
+      binding.actor_residual_blocks != 8) {
+    return fail("phase4 binding actor architecture is invalid");
+  }
+  const std::string& uuid = binding.experiment_uuid;
+  if (uuid.size() != 36) return fail("phase4 experiment UUID is invalid");
+  for (size_t i = 0; i < uuid.size(); ++i) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (uuid[i] != '-') return fail("phase4 experiment UUID is invalid");
+    } else if (!((uuid[i] >= '0' && uuid[i] <= '9') ||
+                 (uuid[i] >= 'a' && uuid[i] <= 'f'))) {
+      return fail("phase4 experiment UUID is invalid");
+    }
+  }
+  if (binding.q_init_seed == 0 || binding.base_seed == 0 ||
+      binding.q_init_seed > static_cast<uint64_t>(
+          std::numeric_limits<int64_t>::max()) ||
+      binding.base_seed > static_cast<uint64_t>(
+          std::numeric_limits<int64_t>::max()) ||
+      binding.end_episode_id_inclusive < binding.start_episode_id ||
+      binding.end_episode_id_inclusive > static_cast<uint64_t>(
+          std::numeric_limits<int64_t>::max())) {
+    return fail("phase4 binding seed/episode range is invalid");
+  }
+  return true;
+}
+
+inline bool VrpoJsonValuesExactlyEqual(const json::Value& first,
+                                       const json::Value& second) {
+  if (first.index() != second.index()) return false;
+  if (first.IsBool()) return first.GetBool() == second.GetBool();
+  if (first.IsInt()) return first.GetInt() == second.GetInt();
+  if (first.IsDouble()) return first.GetDouble() == second.GetDouble();
+  if (first.IsString()) return first.GetString() == second.GetString();
+  return json::ToString(first) == json::ToString(second);
+}
+
+inline bool ValidateVrpoPhase4ManifestStrict(
+    const json::Object& actual, const VrpoPhase4ArmConfig& config,
+    const VrpoPhase4ManifestBinding& binding, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  std::string contract_error;
+  if (!ValidateVrpoPhase4ArmConfig(config, &contract_error)) {
+    return fail(contract_error);
+  }
+  if (!ValidateVrpoPhase4ManifestBinding(binding, &contract_error)) {
+    return fail(contract_error);
+  }
+  const json::Object expected = BuildVrpoPhase4Manifest(config, binding);
+  if (actual.size() != expected.size()) {
+    return fail("phase4 manifest has missing or extra fields");
+  }
+  for (const auto& item : expected) {
+    const auto it = actual.find(item.first);
+    if (it == actual.end()) {
+      return fail("phase4 manifest missing field: " + item.first);
+    }
+    if (!VrpoJsonValuesExactlyEqual(it->second, item.second)) {
+      return fail("phase4 manifest type/value mismatch: " + item.first);
+    }
+  }
+  return true;
+}
+
+inline bool ValidateVrpoPhase4ArmConfigs(
+    const std::array<VrpoPhase4ArmConfig, 4>& arms, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  for (size_t i = 0; i < arms.size(); ++i) {
+    std::string arm_error;
+    if (!ValidateVrpoPhase4ArmConfig(arms[i], &arm_error)) return fail(arm_error);
+  }
+  std::set<std::string> ids;
+  for (const auto& arm : arms) {
+    if (!ids.insert(arm.arm_id).second) return fail("phase4 arm IDs repeat");
+  }
+  return true;
+}
+
+inline bool ValidateVrpoPhase4ManifestSetMatched(
+    const std::array<json::Object, 4>& manifests, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  const std::set<std::string> treatment_fields = {
+      "arm_id", "algorithm", "logit_cap", "config_fingerprint"};
+  const json::Object& reference = manifests.front();
+  for (size_t arm = 1; arm < manifests.size(); ++arm) {
+    if (manifests[arm].size() != reference.size()) {
+      return fail("phase4 manifests have different field sets");
+    }
+    for (const auto& item : reference) {
+      if (treatment_fields.count(item.first)) continue;
+      const auto it = manifests[arm].find(item.first);
+      if (it == manifests[arm].end() ||
+          !VrpoJsonValuesExactlyEqual(item.second, it->second)) {
+        return fail("phase4 matched field differs: " + item.first);
+      }
+    }
+  }
+  std::set<std::string> fingerprints;
+  std::set<std::string> treatment_cells;
+  std::set<std::string> arm_ids;
+  for (const auto& manifest : manifests) {
+    const auto it = manifest.find("config_fingerprint");
+    if (it == manifest.end() || !it->second.IsString() ||
+        !fingerprints.insert(it->second.GetString()).second) {
+      return fail("phase4 fingerprints are missing or not distinct");
+    }
+    const auto algorithm = manifest.find("algorithm");
+    const auto cap = manifest.find("logit_cap");
+    const auto id = manifest.find("arm_id");
+    if (algorithm == manifest.end() || !algorithm->second.IsString() ||
+        cap == manifest.end() || !cap->second.IsDouble() ||
+        id == manifest.end() || !id->second.IsString()) {
+      return fail("phase4 treatment identity fields are malformed");
+    }
+    treatment_cells.insert(
+        algorithm->second.GetString() + ":" +
+        (cap->second.GetDouble() == 10.0 ? "10" :
+         cap->second.GetDouble() == 0.0 ? "0" : "invalid"));
+    arm_ids.insert(id->second.GetString());
+  }
+  if (treatment_cells !=
+          std::set<std::string>({"ppo:0", "ppo:10", "vrpo:0", "vrpo:10"}) ||
+      arm_ids != std::set<std::string>({"PPO_CAP10", "PPO_UNCAPPED",
+                                        "VRPO_CAP10", "VRPO_UNCAPPED"})) {
+    return fail("phase4 treatment cells are not the registered 2x2");
+  }
+  return true;
+}
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
+struct VrpoNamedParameterIdentity {
+  std::string name;
+  std::vector<int64_t> shape;
+  std::string value_sha256;
+};
+
+inline bool VrpoNamedParameterIdentities(
+    torch::nn::Module& module,
+    const std::set<std::string>* selected_names,
+    std::vector<VrpoNamedParameterIdentity>* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) output->clear();
+    return false;
+  };
+  if (output == nullptr) return fail("null named-parameter identity output");
+  output->clear();
+  std::set<std::string> found;
+  for (const auto& item : module.named_parameters()) {
+    if (selected_names != nullptr && !selected_names->count(item.key())) {
+      continue;
+    }
+    torch::Tensor tensor =
+        item.value().detach().contiguous().cpu().to(torch::kFloat32);
+    if (!torch::isfinite(tensor).all().item<bool>()) {
+      return fail("named parameter is nonfinite: " + item.key());
+    }
+    std::string bytes;
+    bytes.append(reinterpret_cast<const char*>(tensor.data_ptr<float>()),
+                 tensor.numel() * sizeof(float));
+    output->push_back({item.key(),
+                       std::vector<int64_t>(tensor.sizes().begin(),
+                                            tensor.sizes().end()),
+                       ComputeStringSHA256(bytes)});
+    found.insert(item.key());
+  }
+  if (selected_names != nullptr && found != *selected_names) {
+    return fail("named actor subset is missing one or more parameters");
+  }
+  return true;
+}
+
+inline std::string VrpoNamedParameterIdentitySha256(
+    const std::vector<VrpoNamedParameterIdentity>& identities,
+    bool include_values) {
+  std::string payload = include_values
+      ? "dune_vrpo_named_parameter_values_v1"
+      : "dune_vrpo_named_parameter_layout_v1";
+  const uint64_t count = identities.size();
+  vrpo_capture_internal::AppendPod(&payload, count);
+  for (const auto& identity : identities) {
+    payload.append(identity.name);
+    payload.push_back('\0');
+    const uint64_t rank = identity.shape.size();
+    vrpo_capture_internal::AppendPod(&payload, rank);
+    for (int64_t dim : identity.shape) {
+      vrpo_capture_internal::AppendPod(&payload, dim);
+    }
+    if (include_values) payload.append(identity.value_sha256);
+  }
+  return ComputeStringSHA256(payload);
+}
+
+inline bool CopyVrpoActorSubsetByName(
+    torch::nn::Module& source, torch::nn::Module& target,
+    const std::set<std::string>& selected_names,
+    std::vector<VrpoNamedParameterIdentity>* copied, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (copied != nullptr) copied->clear();
+    return false;
+  };
+  if (copied == nullptr || selected_names.empty()) {
+    return fail("actor subset copy requires names and output");
+  }
+  auto source_parameters = source.named_parameters();
+  auto target_parameters = target.named_parameters();
+  torch::NoGradGuard no_grad;
+  for (const std::string& name : selected_names) {
+    auto* source_tensor = source_parameters.find(name);
+    auto* target_tensor = target_parameters.find(name);
+    if (source_tensor == nullptr || target_tensor == nullptr ||
+        source_tensor->sizes() != target_tensor->sizes()) {
+      return fail("actor subset name/shape mismatch: " + name);
+    }
+    target_tensor->copy_(source_tensor->to(target_tensor->device()));
+  }
+  return VrpoNamedParameterIdentities(
+      target, &selected_names, copied, error);
+}
+
+struct VrpoPhase4BootIdentity {
+  std::string actor_subset_sha256;
+  std::string actor_names_shapes_sha256;
+  std::string q_init_sha256;
+  std::string q_names_shapes_sha256;
+  std::string module_layout_sha256;
+};
+
+inline bool BuildVrpoPhase4BootIdentity(
+    torch::nn::Module& source_actor, torch::nn::Module& target_actor,
+    const std::set<std::string>& actor_subset_names, uint64_t q_seed,
+    VrpoPhase4BootIdentity* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = VrpoPhase4BootIdentity{};
+    return false;
+  };
+  if (output == nullptr || q_seed == 0) return fail("invalid boot identity input");
+  *output = VrpoPhase4BootIdentity{};
+  std::vector<VrpoNamedParameterIdentity> actor;
+  if (!CopyVrpoActorSubsetByName(
+          source_actor, target_actor, actor_subset_names, &actor, error)) {
+    return false;
+  }
+  DuneVrpoQNetImpl q(q_seed);
+  std::vector<VrpoNamedParameterIdentity> q_identities;
+  if (!VrpoNamedParameterIdentities(
+          q, nullptr, &q_identities, error)) {
+    return false;
+  }
+  VrpoPhase4BootIdentity result;
+  result.actor_subset_sha256 =
+      VrpoNamedParameterIdentitySha256(actor, true);
+  result.actor_names_shapes_sha256 =
+      VrpoNamedParameterIdentitySha256(actor, false);
+  if (!VrpoQModuleParameterSha256(q, &result.q_init_sha256, error)) {
+    return false;
+  }
+  result.q_names_shapes_sha256 =
+      VrpoNamedParameterIdentitySha256(q_identities, false);
+  std::string layout_payload = "dune_vrpo_phase4_module_layout_v1";
+  layout_payload.push_back('\0');
+  layout_payload.append(result.actor_names_shapes_sha256);
+  layout_payload.append(result.q_names_shapes_sha256);
+  result.module_layout_sha256 = ComputeStringSHA256(layout_payload);
+  *output = std::move(result);
+  return true;
+}
+
+inline std::string VrpoOptimizerZeroStateIdentitySha256(
+    const std::vector<VrpoOptimizerGroupSpec>& groups,
+    const std::vector<VrpoNamedParameterIdentity>& actor,
+    const std::vector<VrpoNamedParameterIdentity>& q) {
+  std::string payload = "dune_vrpo_phase4_fresh_zero_optimizer_state_v1";
+  payload.append(VrpoOptimizerGroupSpecSha256(groups));
+  payload.append(VrpoNamedParameterIdentitySha256(actor, false));
+  payload.append(VrpoNamedParameterIdentitySha256(q, false));
+  const bool source_moments_loaded = false;
+  const double zero = 0.0;
+  vrpo_capture_internal::AppendPod(&payload, source_moments_loaded);
+  for (size_t i = 0; i < actor.size() + q.size(); ++i) {
+    vrpo_capture_internal::AppendPod(&payload, zero);  // step
+    vrpo_capture_internal::AppendPod(&payload, zero);  // exp_avg identity
+    vrpo_capture_internal::AppendPod(&payload, zero);  // exp_avg_sq identity
+  }
+  return ComputeStringSHA256(payload);
+}
+
+#endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
 }  // namespace open_spiel
 
