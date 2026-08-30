@@ -1175,7 +1175,6 @@ inline bool ValidateVrpoBootstrapStartupConfig(
     return fail("VRPO bootstrap reward/gamma/lambda contract is invalid");
   }
   const auto arms = CanonicalVrpoPhase4Arms();
-  std::vector<std::pair<uint64_t, uint64_t>> ranges;
   for (size_t i = 0; i < config.ranges.size(); ++i) {
     const auto& range = config.ranges[i];
     if (range.arm_id != arms[i].arm_id || range.start_episode_id == 0 ||
@@ -1184,12 +1183,12 @@ inline bool ValidateVrpoBootstrapStartupConfig(
             std::numeric_limits<int64_t>::max())) {
       return fail("VRPO bootstrap arm episode range is invalid");
     }
-    ranges.push_back({range.start_episode_id, range.end_episode_id_inclusive});
-  }
-  std::sort(ranges.begin(), ranges.end());
-  for (size_t i = 1; i < ranges.size(); ++i) {
-    if (ranges[i].first <= ranges[i - 1].second) {
-      return fail("VRPO bootstrap arm episode ranges overlap");
+    if (i > 0 &&
+        (range.start_episode_id != config.ranges[0].start_episode_id ||
+         range.end_episode_id_inclusive !=
+             config.ranges[0].end_episode_id_inclusive)) {
+      return fail(
+          "VRPO bootstrap requires identical paired episode ranges");
     }
   }
   return true;
@@ -1261,7 +1260,7 @@ inline bool ValidateVrpoBootstrapManifestSet(
   }
   const std::set<std::string> allowed = {
       "arm_id", "algorithm", "logit_cap", "config_fingerprint",
-      "start_episode_id", "end_episode_id_inclusive"};
+  };
   for (size_t i = 1; i < phase4.size(); ++i) {
     for (const auto& field : phase4[0]) {
       if (allowed.count(field.first)) continue;
@@ -1275,15 +1274,13 @@ inline bool ValidateVrpoBootstrapManifestSet(
       }
     }
   }
-  std::vector<std::pair<uint64_t, uint64_t>> ranges;
-  for (const auto& binding : bindings) {
-    ranges.push_back({binding.start_episode_id,
-                      binding.end_episode_id_inclusive});
-  }
-  std::sort(ranges.begin(), ranges.end());
-  for (size_t i = 1; i < ranges.size(); ++i) {
-    if (ranges[i].first <= ranges[i - 1].second) {
-      if (error != nullptr) *error = "VRPO bootstrap manifest ranges overlap";
+  for (size_t i = 1; i < bindings.size(); ++i) {
+    if (bindings[i].start_episode_id != bindings[0].start_episode_id ||
+        bindings[i].end_episode_id_inclusive !=
+            bindings[0].end_episode_id_inclusive) {
+      if (error != nullptr) {
+        *error = "VRPO bootstrap manifest paired episode ranges differ";
+      }
       return false;
     }
   }
@@ -1392,6 +1389,11 @@ inline bool WriteVrpoBootstrapRootAtomic(
   root_manifest["experiment_uuid"] = startup.experiment_uuid;
   root_manifest["q_init_seed"] = static_cast<int64_t>(startup.q_init_seed);
   root_manifest["base_seed"] = static_cast<int64_t>(startup.base_seed);
+  root_manifest["paired_episode_range"] = true;
+  root_manifest["common_start_episode_id"] =
+      static_cast<int64_t>(startup.ranges[0].start_episode_id);
+  root_manifest["common_end_episode_id_inclusive"] =
+      static_cast<int64_t>(startup.ranges[0].end_episode_id_inclusive);
   root_manifest["optimizer_constructed"] = true;
   root_manifest["optimizer_steps"] = int64_t{0};
   root_manifest["backward_calls"] = int64_t{0};
@@ -1446,6 +1448,16 @@ inline bool WriteVrpoBootstrapRootAtomic(
       std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
         return item.optimizer_zero_state_sha256 ==
             bindings[0].optimizer_zero_state_sha256;
+      });
+  matching["base_seed_equal"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.base_seed == bindings[0].base_seed;
+      });
+  matching["paired_episode_range"] =
+      std::all_of(bindings.begin() + 1, bindings.end(), [&](const auto& item) {
+        return item.start_episode_id == bindings[0].start_episode_id &&
+            item.end_episode_id_inclusive ==
+                bindings[0].end_episode_id_inclusive;
       });
   root_manifest["matching_matrix"] = std::move(matching);
   root_manifest["classification"] = "VALID_BOOTSTRAP";

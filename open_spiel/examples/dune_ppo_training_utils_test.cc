@@ -3692,8 +3692,7 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
     startup.allow_tf32 = true;
     for (size_t arm = 0; arm < arms.size(); ++arm) {
       startup.ranges[arm] = {
-          arms[arm].arm_id, 1000030000 + arm * 100,
-          1000030039 + arm * 100};
+          arms[arm].arm_id, 1000030000, 1000030039};
     }
     std::string error;
     UTILS_CHECK(ValidateVrpoBootstrapStartupConfig(startup, &error));
@@ -3718,9 +3717,15 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
     invalid_startup.source_code_sha256 = "bad";
     reject_startup(invalid_startup, "identity");
     invalid_startup = startup;
-    invalid_startup.ranges[1].start_episode_id =
-        invalid_startup.ranges[0].start_episode_id;
-    reject_startup(invalid_startup, "overlap");
+    ++invalid_startup.ranges[1].start_episode_id;
+    reject_startup(invalid_startup, "identical paired");
+    invalid_startup = startup;
+    ++invalid_startup.ranges[2].end_episode_id_inclusive;
+    reject_startup(invalid_startup, "identical paired");
+    invalid_startup = startup;
+    invalid_startup.ranges[3].start_episode_id = 1000030100;
+    invalid_startup.ranges[3].end_episode_id_inclusive = 1000030139;
+    reject_startup(invalid_startup, "identical paired");
     UTILS_CHECK(ValidateVrpoBootstrapObservedFileIdentities(
         startup, startup.source_actor_model_sha256,
         startup.source_actor_model_size, startup.source_manifest_sha256,
@@ -3828,9 +3833,14 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
       base.q_init_seed = startup.q_init_seed;
       base.experiment_uuid = experiment_uuid;
       base.base_seed = startup.base_seed;
-      base.start_episode_id = startup.ranges[arm].start_episode_id;
+      base.start_episode_id = startup.ranges[0].start_episode_id;
       base.end_episode_id_inclusive =
-          startup.ranges[arm].end_episode_id_inclusive;
+          startup.ranges[0].end_episode_id_inclusive;
+      CHECK_EQ(base.base_seed, startup.base_seed);
+      CHECK_EQ(base.start_episode_id,
+               startup.ranges[0].start_episode_id);
+      CHECK_EQ(base.end_episode_id_inclusive,
+               startup.ranges[0].end_episode_id_inclusive);
       VrpoPhase4ManifestBinding binding;
       UTILS_CHECK(DeriveVrpoPhase4ManifestBinding(
           *actor, *q, optimizer_storage[arm], base, layout,
@@ -3883,14 +3893,34 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
              startup.executed_binary_size);
     CHECK_EQ(result.at("experiment_uuid").GetString(),
              startup.experiment_uuid);
+    UTILS_CHECK(result.at("paired_episode_range").GetBool());
+    CHECK_EQ(result.at("common_start_episode_id").GetInt(),
+             static_cast<int64_t>(startup.ranges[0].start_episode_id));
+    CHECK_EQ(result.at("common_end_episode_id_inclusive").GetInt(),
+             static_cast<int64_t>(
+                 startup.ranges[0].end_episode_id_inclusive));
     UTILS_CHECK(std::filesystem::is_regular_file(
         root / "BOOTSTRAP_RESULT.json"));
     for (const auto& arm : arms) {
       UTILS_CHECK(std::filesystem::is_regular_file(
           VrpoExpandedPaths(root / arm.arm_id).manifest));
     }
+    const auto& arm_records = result.at("arms").GetArray();
+    CHECK_EQ(arm_records.size(), arms.size());
+    for (size_t arm = 0; arm < arm_records.size(); ++arm) {
+      const auto& record = arm_records[arm].GetObject();
+      CHECK_EQ(record.at("arm_id").GetString(), arms[arm].arm_id);
+      CHECK_EQ(record.at("start_episode_id").GetInt(),
+               static_cast<int64_t>(startup.ranges[0].start_episode_id));
+      CHECK_EQ(record.at("end_episode_id_inclusive").GetInt(),
+               static_cast<int64_t>(
+                   startup.ranges[0].end_episode_id_inclusive));
+    }
     auto matching = result.at("matching_matrix").GetObject();
     for (const auto& field : matching) UTILS_CHECK(field.second.GetBool());
+    UTILS_CHECK(matching.at("base_seed_equal").GetBool());
+    UTILS_CHECK(matching.at("paired_episode_range").GetBool());
+    UTILS_CHECK(matching.find("episode_range_equal") == matching.end());
 
     const auto preexisting = parent / "preexisting";
     std::filesystem::create_directories(preexisting);
@@ -3952,17 +3982,14 @@ void TestVrpoPhase4cBootstrapOnlyIntegration() {
     mismatch_inputs = inputs;
     mismatch_inputs[0].binding.experiment_uuid.clear();
     require_arm_startup_mismatch(mismatch_inputs, "uuid_missing");
+    mismatch_inputs = inputs;
+    ++mismatch_inputs[1].binding.start_episode_id;
+    require_arm_startup_mismatch(mismatch_inputs, "range_start");
+    mismatch_inputs = inputs;
+    ++mismatch_inputs[2].binding.end_episode_id_inclusive;
+    require_arm_startup_mismatch(mismatch_inputs, "range_end");
     auto wrong_inputs = inputs;
-    wrong_inputs[1].binding.start_episode_id =
-        wrong_inputs[0].binding.start_episode_id;
     auto wrong_startup = startup;
-    const auto wrong_root = parent / "wrong_range";
-    wrong_startup.root = wrong_root.string();
-    UTILS_CHECK(!WriteVrpoBootstrapRootAtomic(
-        wrong_root, wrong_startup, wrong_inputs,
-        VrpoBootstrapFailurePoint::kNone, &rejected_result, &error));
-    UTILS_CHECK(!std::filesystem::exists(wrong_root));
-    wrong_inputs = inputs;
     wrong_inputs[0].layout.label = "production_dune_vrpo_layout_v1";
     wrong_inputs[0].layout.test_fixture = false;
     const auto wrong_layout_root = parent / "wrong_layout";

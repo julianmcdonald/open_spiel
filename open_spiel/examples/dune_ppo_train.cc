@@ -177,14 +177,22 @@ ABSL_FLAG(uint64_t, vrpo_bootstrap_q_seed, 0,
           "Required shared deterministic Q initialization seed.");
 ABSL_FLAG(uint64_t, vrpo_bootstrap_base_seed, 0,
           "Required shared four-arm training base seed.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_start, 0, "PPO cap10 episode start.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_end, 0, "PPO cap10 episode end inclusive.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_start, 0, "PPO uncapped episode start.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_end, 0, "PPO uncapped episode end inclusive.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_start, 0, "VRPO cap10 episode start.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_end, 0, "VRPO cap10 episode end inclusive.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_start, 0, "VRPO uncapped episode start.");
-ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_end, 0, "VRPO uncapped episode end inclusive.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_start, 0,
+          "Shared paired episode start, repeated for PPO cap10.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_cap10_end, 0,
+          "Shared paired episode end inclusive, repeated for PPO cap10.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_start, 0,
+          "Shared paired episode start, repeated for PPO uncapped.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_ppo_uncapped_end, 0,
+          "Shared paired episode end inclusive, repeated for PPO uncapped.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_start, 0,
+          "Shared paired episode start, repeated for VRPO cap10.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_cap10_end, 0,
+          "Shared paired episode end inclusive, repeated for VRPO cap10.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_start, 0,
+          "Shared paired episode start, repeated for VRPO uncapped.");
+ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_end, 0,
+          "Shared paired episode end inclusive, repeated for VRPO uncapped.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -6160,6 +6168,10 @@ int main(int argc, char** argv) {
     std::string common_q_hash;
     std::string common_layout_hash;
     std::string common_zero_hash;
+    const uint64_t common_start_episode_id =
+        vrpo_bootstrap_config.ranges[0].start_episode_id;
+    const uint64_t common_end_episode_id_inclusive =
+        vrpo_bootstrap_config.ranges[0].end_episode_id_inclusive;
     for (size_t arm = 0; arm < inputs.size(); ++arm) {
       auto actor =
           std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
@@ -6188,10 +6200,9 @@ int main(int argc, char** argv) {
       binding_base.experiment_uuid = experiment_uuid;
       binding_base.base_seed =
           absl::GetFlag(FLAGS_vrpo_bootstrap_base_seed);
-      binding_base.start_episode_id =
-          vrpo_bootstrap_config.ranges[arm].start_episode_id;
+      binding_base.start_episode_id = common_start_episode_id;
       binding_base.end_episode_id_inclusive =
-          vrpo_bootstrap_config.ranges[arm].end_episode_id_inclusive;
+          common_end_episode_id_inclusive;
       std::vector<open_spiel::VrpoNamedParameterIdentity> actor_layout_records;
       std::vector<open_spiel::VrpoNamedParameterIdentity> q_layout_records;
       open_spiel::VrpoNamedParameterIdentities(
