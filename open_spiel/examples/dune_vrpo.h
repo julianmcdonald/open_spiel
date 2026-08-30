@@ -3,13 +3,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dune_sha256.h"
@@ -30,6 +33,8 @@ inline constexpr int kVrpoJointInformationSize =
     kVrpoNumSeats * kVrpoDuneInformationStateSize;
 inline constexpr int kVrpoDuneActionDim = 2391;
 inline constexpr double kVrpoMaxProbabilityTolerance = 1e-6;
+inline constexpr int kVrpoQPreflightMaxChunkRows = 256;
+inline constexpr double kVrpoQPreflightMaxAgreementTolerance = 1e-6;
 inline constexpr char kVrpoJointInformationEncodingLabel[] =
     "actor_relative_joint_information_proxy_not_full_markov_state_v1";
 inline constexpr bool kVrpoJointInformationIsFullMarkovState = false;
@@ -204,6 +209,21 @@ inline bool VrpoActorRelativeQToAbsolute(
 inline constexpr int kVrpoQHiddenDim = 512;
 inline constexpr int kVrpoQNumResBlocks = 2;
 inline constexpr double kVrpoQFinalInitScale = 0.01;
+inline std::atomic<int64_t> g_vrpo_q_constructor_calls{0};
+inline std::atomic<int64_t> g_vrpo_q_forward_checked_calls{0};
+
+inline void ResetVrpoQInstrumentation() {
+  g_vrpo_q_constructor_calls.store(0, std::memory_order_relaxed);
+  g_vrpo_q_forward_checked_calls.store(0, std::memory_order_relaxed);
+}
+
+inline int64_t VrpoQConstructorCalls() {
+  return g_vrpo_q_constructor_calls.load(std::memory_order_relaxed);
+}
+
+inline int64_t VrpoQForwardCheckedCalls() {
+  return g_vrpo_q_forward_checked_calls.load(std::memory_order_relaxed);
+}
 
 struct DuneVrpoQResBlockImpl : torch::nn::Module {
   torch::nn::Linear fc1{nullptr};
@@ -245,6 +265,7 @@ struct DuneVrpoQNetImpl : torch::nn::Module {
 
   explicit DuneVrpoQNetImpl(uint64_t registered_init_seed)
       : init_seed(registered_init_seed) {
+    g_vrpo_q_constructor_calls.fetch_add(1, std::memory_order_relaxed);
     input_layer = register_module(
         "input_layer",
         torch::nn::Linear(dune_imperium::kVrpoCentralCriticTensorSize,
@@ -279,6 +300,7 @@ struct DuneVrpoQNetImpl : torch::nn::Module {
 
   bool ForwardChecked(const torch::Tensor& input, torch::Tensor* output,
                       std::string* error) {
+    g_vrpo_q_forward_checked_calls.fetch_add(1, std::memory_order_relaxed);
     auto fail = [&](const std::string& message) {
       if (error != nullptr) *error = message;
       if (output != nullptr) *output = torch::Tensor();
@@ -618,6 +640,238 @@ inline bool ComputeVrpoExpectedSarsaLambdaReference(
   return true;
 }
 
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
+struct VrpoTensorReferenceTrace {
+  uint64_t episode_id = 0;
+  std::vector<VrpoReferenceRow> rows;
+  std::string canonical_sha256;
+};
+
+inline bool ComputeVrpoExpectedSarsaLambdaTensorReference(
+    const std::vector<VrpoTimelineRow>& timeline, double gamma,
+    double lambda, VrpoTensorReferenceTrace* output, std::string* error,
+    double probability_tolerance = 1e-9) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = VrpoTensorReferenceTrace{};
+    return false;
+  };
+  if (output == nullptr) return fail("null tensor-reference output");
+  *output = VrpoTensorReferenceTrace{};
+  if (timeline.empty()) return fail("tensor-reference timeline is empty");
+  if (!std::isfinite(gamma) || gamma < 0.0 || gamma > 1.0 ||
+      !std::isfinite(lambda) || lambda < 0.0 || lambda > 1.0 ||
+      !std::isfinite(probability_tolerance) ||
+      probability_tolerance < 0.0 ||
+      probability_tolerance > kVrpoMaxProbabilityTolerance) {
+    return fail("tensor-reference gamma/lambda/tolerance is invalid");
+  }
+
+  const uint64_t episode_id = timeline.front().episode_id;
+  const int64_t row_count = static_cast<int64_t>(timeline.size());
+  const auto options = torch::TensorOptions()
+                           .dtype(torch::kFloat64)
+                           .device(torch::kCPU);
+  torch::Tensor v = torch::zeros({row_count, kVrpoNumSeats}, options);
+  torch::Tensor chosen_q = torch::zeros({row_count, kVrpoNumSeats}, options);
+  torch::Tensor rewards = torch::zeros({row_count, kVrpoNumSeats}, options);
+  torch::Tensor actors = torch::empty(
+      {row_count}, torch::TensorOptions().dtype(torch::kInt64));
+
+  for (int64_t t = 0; t < row_count; ++t) {
+    const VrpoTimelineRow& row = timeline[t];
+    if (row.episode_id != episode_id) {
+      return fail("tensor-reference crosses an episode boundary");
+    }
+    if (row.actor < 0 || row.actor >= kVrpoNumSeats) {
+      return fail("tensor-reference actor is out of range");
+    }
+    if (row.terminal_after != (t + 1 == row_count)) {
+      return fail("tensor-reference terminal boundary is invalid");
+    }
+    const size_t legal_count = row.legal_actions.size();
+    if (legal_count == 0 || row.legal_probabilities.size() != legal_count ||
+        row.legal_q_values.size() != legal_count || row.chosen_index < 0 ||
+        row.chosen_index >= static_cast<int>(legal_count) ||
+        row.legal_actions[row.chosen_index] != row.chosen_action) {
+      return fail("tensor-reference row widths/choice are invalid");
+    }
+    std::set<Action> seen;
+    double probability_sum = 0.0;
+    std::vector<double> q_flat;
+    q_flat.reserve(legal_count * kVrpoNumSeats);
+    for (size_t a = 0; a < legal_count; ++a) {
+      const Action action = row.legal_actions[a];
+      if (action < 0 || action >= kVrpoDuneActionDim ||
+          !seen.insert(action).second) {
+        return fail("tensor-reference legal action is invalid");
+      }
+      const double probability = row.legal_probabilities[a];
+      if (!std::isfinite(probability) || probability < 0.0 ||
+          probability > 1.0 + probability_tolerance) {
+        return fail("tensor-reference probability is invalid");
+      }
+      probability_sum += probability;
+      for (double q : row.legal_q_values[a]) {
+        if (!std::isfinite(q)) {
+          return fail("tensor-reference Q input is nonfinite");
+        }
+        q_flat.push_back(q);
+      }
+    }
+    if (!std::isfinite(probability_sum) ||
+        std::abs(probability_sum - 1.0) > probability_tolerance) {
+      return fail("tensor-reference probabilities do not sum to one");
+    }
+    for (double reward : row.rewards) {
+      if (!std::isfinite(reward)) {
+        return fail("tensor-reference reward is nonfinite");
+      }
+    }
+
+    torch::Tensor probabilities = torch::from_blob(
+        const_cast<double*>(row.legal_probabilities.data()),
+        {static_cast<int64_t>(legal_count)}, options).clone();
+    torch::Tensor q = torch::from_blob(
+        q_flat.data(),
+        {static_cast<int64_t>(legal_count), kVrpoNumSeats}, options).clone();
+    v[t].copy_((probabilities.unsqueeze(1) * q).sum(0));
+    chosen_q[t].copy_(q[row.chosen_index]);
+    rewards[t].copy_(torch::from_blob(
+        const_cast<double*>(row.rewards.data()), {kVrpoNumSeats}, options));
+    actors[t] = static_cast<int64_t>(row.actor);
+  }
+
+  torch::Tensor next_v = torch::zeros_like(v);
+  if (row_count > 1) {
+    next_v.narrow(0, 0, row_count - 1)
+        .copy_(v.narrow(0, 1, row_count - 1));
+  }
+  torch::Tensor delta = rewards + gamma * next_v - chosen_q;
+  torch::Tensor g = torch::zeros_like(delta);
+  torch::Tensor next_g = torch::zeros({kVrpoNumSeats}, options);
+  for (int64_t reverse = row_count; reverse-- > 0;) {
+    g[reverse].copy_(delta[reverse] + gamma * lambda * next_g);
+    next_g.copy_(g[reverse]);
+  }
+  torch::Tensor q_target = chosen_q + g;
+  torch::Tensor actor_advantage =
+      (chosen_q - v + g).gather(1, actors.unsqueeze(1)).squeeze(1);
+  for (const torch::Tensor& tensor :
+       {v, delta, g, q_target, actor_advantage}) {
+    if (!torch::isfinite(tensor).all().item<bool>()) {
+      return fail("tensor-reference derived output is nonfinite");
+    }
+  }
+
+  VrpoTensorReferenceTrace result;
+  result.episode_id = episode_id;
+  result.rows.resize(timeline.size());
+  std::string payload = "dune_vrpo_tensor_expected_sarsa_lambda_v1";
+  payload.append(reinterpret_cast<const char*>(&gamma), sizeof(gamma));
+  payload.append(reinterpret_cast<const char*>(&lambda), sizeof(lambda));
+  const uint64_t count = timeline.size();
+  payload.append(reinterpret_cast<const char*>(&count), sizeof(count));
+  for (int64_t t = 0; t < row_count; ++t) {
+    VrpoReferenceRow& row = result.rows[t];
+    for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+      row.v[seat] = v[t][seat].item<double>();
+      row.delta[seat] = delta[t][seat].item<double>();
+      row.g[seat] = g[t][seat].item<double>();
+      row.q_target[seat] = q_target[t][seat].item<double>();
+    }
+    row.actor_advantage = actor_advantage[t].item<double>();
+    for (double value : row.v) {
+      payload.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    for (double value : row.delta) {
+      payload.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    for (double value : row.g) {
+      payload.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    for (double value : row.q_target) {
+      payload.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    payload.append(reinterpret_cast<const char*>(&row.actor_advantage),
+                   sizeof(row.actor_advantage));
+  }
+  result.canonical_sha256 = ComputeStringSHA256(payload);
+  *output = std::move(result);
+  return true;
+}
+
+struct VrpoReferenceAgreement {
+  int64_t compared_values = 0;
+  int64_t mismatch_count = 0;
+  double max_abs_v = 0.0;
+  double max_abs_delta = 0.0;
+  double max_abs_g = 0.0;
+  double max_abs_q_target = 0.0;
+  double max_abs_actor_advantage = 0.0;
+};
+
+inline bool CompareVrpoReferenceTraces(
+    const VrpoReferenceTrace& scalar,
+    const VrpoTensorReferenceTrace& tensor, double abs_tolerance,
+    double rel_tolerance, VrpoReferenceAgreement* output,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = VrpoReferenceAgreement{};
+    return false;
+  };
+  if (output == nullptr) return fail("null reference-agreement output");
+  *output = VrpoReferenceAgreement{};
+  if (scalar.episode_id != tensor.episode_id ||
+      scalar.rows.size() != tensor.rows.size() || scalar.rows.empty()) {
+    return fail("reference-agreement row identity differs");
+  }
+  for (double tolerance : {abs_tolerance, rel_tolerance}) {
+    if (!std::isfinite(tolerance) || tolerance < 0.0 ||
+        tolerance > kVrpoQPreflightMaxAgreementTolerance) {
+      return fail("reference-agreement tolerance is invalid");
+    }
+  }
+  auto compare = [&](double first, double second, double* maximum) {
+    const double difference = std::abs(first - second);
+    *maximum = std::max(*maximum, difference);
+    ++output->compared_values;
+    const double bound = abs_tolerance +
+        rel_tolerance * std::max(std::abs(first), std::abs(second));
+    if (!std::isfinite(first) || !std::isfinite(second) ||
+        difference > bound) {
+      ++output->mismatch_count;
+    }
+  };
+  for (size_t t = 0; t < scalar.rows.size(); ++t) {
+    for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+      compare(scalar.rows[t].v[seat], tensor.rows[t].v[seat],
+              &output->max_abs_v);
+      compare(scalar.rows[t].delta[seat], tensor.rows[t].delta[seat],
+              &output->max_abs_delta);
+      compare(scalar.rows[t].g[seat], tensor.rows[t].g[seat],
+              &output->max_abs_g);
+      compare(scalar.rows[t].q_target[seat],
+              tensor.rows[t].q_target[seat],
+              &output->max_abs_q_target);
+    }
+    compare(scalar.rows[t].actor_advantage,
+            tensor.rows[t].actor_advantage,
+            &output->max_abs_actor_advantage);
+  }
+  if (output->mismatch_count != 0) {
+    if (error != nullptr) {
+      *error = "scalar/tensor reference recurrence differs";
+    }
+    return false;
+  }
+  return true;
+}
+
+#endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
 inline constexpr char kVrpoCaptureSchemaLabel[] =
     "dune_vrpo_capture_v1|episode_id:uint64|global_row_index:int64_contiguous_zero_based|actor:absolute_0_3|actor_obs:float32x5580|central:float32x9012|central_schema_sha256|legal_ids:ordered_unique_in_range|chosen_index_action|legal_behavior_probabilities:float64|rewards:absolute_float64x4|terminal_after|counterfactual=false|row_sha256";
 inline constexpr char kVrpoCaptureSchemaSha256[] =
@@ -784,6 +1038,77 @@ inline bool VrpoCaptureShouldConstructOptimizer(bool capture_active) {
   return !capture_active;
 }
 
+struct VrpoQPreflightStartupConfig {
+  VrpoCaptureStartupConfig capture;
+  uint64_t q_init_seed = 0;
+  int q_chunk_rows = 0;
+  double agreement_abs_tolerance = 1e-10;
+  double agreement_rel_tolerance = 1e-10;
+  int64_t gpu_peak_increment_limit_bytes = 0;
+};
+
+inline bool ValidateVrpoQPreflightStartupConfig(
+    const VrpoQPreflightStartupConfig& config, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  std::string capture_error;
+  if (!ValidateVrpoCaptureStartupConfig(config.capture, &capture_error)) {
+    return fail("Q preflight capture contract failed: " + capture_error);
+  }
+  if (config.capture.rollout_games != 1 || config.capture.threads != 1) {
+    return fail("Q preflight requires exactly one game and one thread");
+  }
+  if (config.q_init_seed == 0 || config.q_chunk_rows < 1 ||
+      config.q_chunk_rows > kVrpoQPreflightMaxChunkRows) {
+    return fail("Q preflight seed/chunk contract is invalid");
+  }
+  for (double tolerance : {config.agreement_abs_tolerance,
+                           config.agreement_rel_tolerance}) {
+    if (!std::isfinite(tolerance) || tolerance < 0.0 ||
+        tolerance > kVrpoQPreflightMaxAgreementTolerance) {
+      return fail("Q preflight agreement tolerance is invalid");
+    }
+  }
+  if (config.gpu_peak_increment_limit_bytes <= 0) {
+    return fail("Q preflight GPU memory ceiling must be positive");
+  }
+  return true;
+}
+
+inline bool BuildVrpoChunkRanges(
+    size_t rows, int chunk_rows,
+    std::vector<std::pair<size_t, size_t>>* ranges, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (ranges != nullptr) ranges->clear();
+    return false;
+  };
+  if (ranges == nullptr) return fail("null Q chunk-range output");
+  ranges->clear();
+  if (rows == 0 || chunk_rows < 1 ||
+      chunk_rows > kVrpoQPreflightMaxChunkRows) {
+    return fail("Q chunk range input is invalid");
+  }
+  for (size_t begin = 0; begin < rows;
+       begin += static_cast<size_t>(chunk_rows)) {
+    const size_t count = std::min(
+        static_cast<size_t>(chunk_rows), rows - begin);
+    ranges->push_back({begin, count});
+  }
+  size_t cursor = 0;
+  for (const auto& range : *ranges) {
+    if (range.first != cursor || range.second == 0 ||
+        range.second > static_cast<size_t>(chunk_rows)) {
+      return fail("Q chunk ranges are not an exact ordered partition");
+    }
+    cursor += range.second;
+  }
+  if (cursor != rows) return fail("Q chunk ranges do not cover every row");
+  return true;
+}
+
 struct VrpoRolloutPairingView {
   uint64_t episode_id = 0;
   Player actor = kInvalidPlayer;
@@ -852,6 +1177,65 @@ inline bool ValidateVrpoSortedEpisodeIds(
   return true;
 }
 
+struct VrpoPreQGateResult {
+  bool valid = false;
+  int64_t captured_rows = 0;
+  int64_t rollout_rows = 0;
+  int64_t paired_rows = 0;
+  std::vector<std::string> errors;
+};
+
+inline VrpoPreQGateResult ValidateVrpoPreQCaptureRolloutGate(
+    const std::vector<VrpoCapturedEpisode>& episodes,
+    const std::vector<VrpoRolloutPairingView>& rollout_rows,
+    uint64_t start_episode_id, int rollout_games) {
+  VrpoPreQGateResult result;
+  result.rollout_rows = static_cast<int64_t>(rollout_rows.size());
+  auto reject = [&](const std::string& message) {
+    result.errors.push_back(message);
+  };
+  std::string id_error;
+  if (!ValidateVrpoSortedEpisodeIds(
+          episodes, start_episode_id, rollout_games, &id_error)) {
+    reject("pre-Q exact episode range failed: " + id_error);
+  }
+  size_t cursor = 0;
+  for (const auto& episode : episodes) {
+    result.captured_rows += static_cast<int64_t>(episode.rows.size());
+    std::string episode_error;
+    if (!ValidateVrpoCapturedEpisode(episode, &episode_error)) {
+      reject("pre-Q captured episode validation failed: " + episode_error);
+      cursor += episode.rows.size();
+      continue;
+    }
+    for (const auto& captured : episode.rows) {
+      if (cursor >= rollout_rows.size()) {
+        reject("pre-Q rollout ended before captured rows");
+        ++cursor;
+        continue;
+      }
+      std::string pairing_error;
+      if (ValidateVrpoCaptureRolloutPairing(
+              captured, rollout_rows[cursor], &pairing_error)) {
+        ++result.paired_rows;
+      } else {
+        reject("pre-Q capture/rollout pairing failed at row " +
+               std::to_string(cursor) + ": " + pairing_error);
+      }
+      ++cursor;
+    }
+  }
+  if (cursor != rollout_rows.size() ||
+      result.captured_rows != result.rollout_rows) {
+    reject("pre-Q capture/rollout row counts differ");
+  }
+  if (result.paired_rows != result.captured_rows) {
+    reject("pre-Q exhaustive row pairing is incomplete");
+  }
+  result.valid = result.errors.empty();
+  return result;
+}
+
 inline bool ValidateVrpoCaptureRewardMetadata(
     const VrpoCapturedEpisode& episode, double registered_reward_scale,
     double registered_gamma, double registered_lambda,
@@ -872,6 +1256,13 @@ inline std::vector<std::string> VrpoCaptureSourceRelativePaths() {
           "open_spiel/examples/dune_vrpo.h",
           "open_spiel/games/dune_imperium/dune_imperium.h",
           "open_spiel/games/dune_imperium/dune_imperium.cc"};
+}
+
+inline std::vector<std::string> VrpoQPreflightSourceRelativePaths() {
+  std::vector<std::string> paths = VrpoCaptureSourceRelativePaths();
+  paths.push_back("open_spiel/examples/dune_seed_utils.h");
+  paths.push_back("open_spiel/examples/dune_sha256.h");
+  return paths;
 }
 
 struct VrpoZeroShapingRewardConfig {
@@ -1195,6 +1586,50 @@ inline bool VrpoCapturedEpisodeToTimeline(
     converted.push_back(std::move(row));
   }
   *timeline = std::move(converted);
+  return true;
+}
+
+inline bool VrpoLegalQEvidenceSha256(
+    const VrpoCapturedEpisode& episode,
+    const std::vector<std::vector<VrpoActorRelativeSeatValues>>&
+        relative_legal_q_by_row,
+    std::string* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) output->clear();
+    return false;
+  };
+  if (output == nullptr) return fail("null legal-Q evidence hash output");
+  output->clear();
+  std::vector<VrpoTimelineRow> timeline;
+  std::string conversion_error;
+  if (!VrpoCapturedEpisodeToTimeline(
+          episode, relative_legal_q_by_row, &timeline,
+          &conversion_error)) {
+    return fail("legal-Q evidence conversion failed: " + conversion_error);
+  }
+  std::string payload = "dune_vrpo_legal_q_evidence_v1";
+  payload.append(episode.capture_sha256);
+  for (size_t t = 0; t < timeline.size(); ++t) {
+    const VrpoTimelineRow& absolute = timeline[t];
+    vrpo_capture_internal::AppendPod(&payload, absolute.episode_id);
+    const int64_t row_index = static_cast<int64_t>(t);
+    vrpo_capture_internal::AppendPod(&payload, row_index);
+    vrpo_capture_internal::AppendPod(&payload, absolute.actor);
+    const uint64_t legal_count = absolute.legal_actions.size();
+    vrpo_capture_internal::AppendPod(&payload, legal_count);
+    for (size_t a = 0; a < legal_count; ++a) {
+      vrpo_capture_internal::AppendPod(&payload,
+                                       absolute.legal_actions[a]);
+      for (double value : relative_legal_q_by_row[t][a].slots) {
+        vrpo_capture_internal::AppendPod(&payload, value);
+      }
+      for (double value : absolute.legal_q_values[a]) {
+        vrpo_capture_internal::AppendPod(&payload, value);
+      }
+    }
+  }
+  *output = ComputeStringSHA256(payload);
   return true;
 }
 

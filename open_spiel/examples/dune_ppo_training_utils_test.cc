@@ -2433,6 +2433,14 @@ void TestVrpoCapturedEpisodeAndZeroShapingRewards() {
         timeline, episode.gamma, episode.lambda, &direct, &error,
         episode.probability_tolerance));
     CHECK_EQ(from_capture.canonical_sha256, direct.canonical_sha256);
+    std::string legal_q_hash;
+    UTILS_CHECK(VrpoLegalQEvidenceSha256(
+        episode, relative_q, &legal_q_hash, &error));
+    UTILS_CHECK(legal_q_hash.size() == 64);
+    std::string repeated_legal_q_hash;
+    UTILS_CHECK(VrpoLegalQEvidenceSha256(
+        episode, relative_q, &repeated_legal_q_hash, &error));
+    CHECK_EQ(legal_q_hash, repeated_legal_q_hash);
 
     auto expect_invalid = [&](VrpoCapturedEpisode malformed,
                               const std::string& needle) {
@@ -2722,6 +2730,243 @@ void TestVrpoCaptureStartupAndLazyOptimizerContracts() {
                 std::string::npos);
     UTILS_CHECK(body.find("std::filesystem::exists(tmp)") !=
                 std::string::npos);
+  } TEST_END();
+}
+
+void TestVrpoQReferencePreflightContracts() {
+  TEST_BEGIN("VRPO phase 3b: bounded chunks and independent tensor recurrence") {
+    VrpoQPreflightStartupConfig startup;
+    startup.capture.game = "dune_imperium";
+    startup.capture.registration_id = "q-preflight";
+    startup.capture.source_root = "/source";
+    startup.capture.source_sha256 = std::string(64, 'a');
+    startup.capture.diagnostics_only = true;
+    startup.capture.init_mode = "diagnostic";
+    startup.capture.rollout_games = 1;
+    startup.capture.threads = 1;
+    startup.capture.rollout_amp = false;
+    startup.capture.train_amp = false;
+    startup.capture.allow_tf32 = true;
+    startup.q_init_seed = 20260831;
+    startup.q_chunk_rows = 256;
+    startup.gpu_peak_increment_limit_bytes = 256LL * 1024 * 1024;
+    std::string error;
+    UTILS_CHECK(ValidateVrpoQPreflightStartupConfig(startup, &error));
+    auto invalid_startup = startup;
+    invalid_startup.capture.rollout_games = 2;
+    UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
+        invalid_startup, &error));
+    invalid_startup = startup;
+    invalid_startup.q_chunk_rows = 257;
+    UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
+        invalid_startup, &error));
+    invalid_startup = startup;
+    invalid_startup.q_init_seed = 0;
+    UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
+        invalid_startup, &error));
+    invalid_startup = startup;
+    invalid_startup.agreement_abs_tolerance = 1e-5;
+    UTILS_CHECK(!ValidateVrpoQPreflightStartupConfig(
+        invalid_startup, &error));
+    const auto q_sources = VrpoQPreflightSourceRelativePaths();
+    CHECK_EQ(q_sources.size(), static_cast<size_t>(7));
+    CHECK_EQ(q_sources.back(),
+             std::string("open_spiel/examples/dune_sha256.h"));
+
+    for (const auto& fixture :
+         std::vector<std::pair<size_t, int>>{{1, 1}, {255, 256},
+                                             {256, 256}, {257, 256},
+                                             {845, 256}}) {
+      std::vector<std::pair<size_t, size_t>> ranges;
+      UTILS_CHECK(BuildVrpoChunkRanges(
+          fixture.first, fixture.second, &ranges, &error));
+      size_t cursor = 0;
+      for (const auto& range : ranges) {
+        CHECK_EQ(range.first, cursor);
+        UTILS_CHECK(range.second > 0);
+        UTILS_CHECK(range.second <= static_cast<size_t>(fixture.second));
+        cursor += range.second;
+      }
+      CHECK_EQ(cursor, fixture.first);
+    }
+    std::vector<std::pair<size_t, size_t>> rejected_ranges = {{9, 9}};
+    UTILS_CHECK(!BuildVrpoChunkRanges(
+        0, 256, &rejected_ranges, &error));
+    UTILS_CHECK(rejected_ranges.empty());
+
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    auto* dune_state =
+        dynamic_cast<dune_imperium::DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+    VrpoCapturedEpisode captured_episode;
+    captured_episode.episode_id = 900;
+    VrpoCapturedRow captured_row;
+    captured_row.episode_id = 900;
+    captured_row.global_row_index = 0;
+    captured_row.actor = 0;
+    captured_row.actor_observation = state->InformationStateTensor(0);
+    captured_row.central_tensor = dune_state->VrpoCentralCriticTensor(0);
+    captured_row.central_schema_sha256 =
+        dune_imperium::kVrpoCentralCriticTensorSchemaSha256;
+    captured_row.legal_actions = {1};
+    captured_row.chosen_index = 0;
+    captured_row.chosen_action = 1;
+    captured_row.legal_behavior_probabilities = {1.0};
+    captured_episode.rows.push_back(std::move(captured_row));
+    VrpoZeroShapingRewardConfig reward_config;
+    UTILS_CHECK(FinalizeVrpoZeroShapingEpisode(
+        &captured_episode, {2.25, 0.25, -0.75, -1.75},
+        reward_config, &error));
+    VrpoRolloutPairingView good_view;
+    good_view.episode_id = 900;
+    good_view.actor = 0;
+    good_view.actor_observation =
+        &captured_episode.rows[0].actor_observation;
+    good_view.legal_actions = &captured_episode.rows[0].legal_actions;
+    good_view.action = 1;
+    good_view.chosen_log_probability = 0.0f;
+    auto exercise_gate = [&](std::vector<VrpoCapturedEpisode> episodes,
+                             std::vector<VrpoRolloutPairingView> views,
+                             uint64_t start) {
+      ResetVrpoQInstrumentation();
+      const VrpoPreQGateResult gate =
+          ValidateVrpoPreQCaptureRolloutGate(episodes, views, start, 1);
+      if (gate.valid) {
+        auto model = std::make_shared<DuneVrpoQNetImpl>(20260831);
+        torch::Tensor output;
+        torch::Tensor probe = torch::zeros(
+            {1, dune_imperium::kVrpoCentralCriticTensorSize},
+            torch::TensorOptions().dtype(torch::kFloat32));
+        UTILS_CHECK(model->ForwardChecked(probe, &output, &error));
+      }
+      return gate;
+    };
+    const VrpoPreQGateResult positive = exercise_gate(
+        {captured_episode}, {good_view}, 900);
+    UTILS_CHECK(positive.valid);
+    CHECK_EQ(VrpoQConstructorCalls(), int64_t{1});
+    CHECK_EQ(VrpoQForwardCheckedCalls(), int64_t{1});
+
+    auto require_pre_q_reject = [&](std::vector<VrpoCapturedEpisode> episodes,
+                                    std::vector<VrpoRolloutPairingView> views,
+                                    uint64_t start,
+                                    const std::string& needle) {
+      const VrpoPreQGateResult gate =
+          exercise_gate(std::move(episodes), std::move(views), start);
+      UTILS_CHECK(!gate.valid);
+      UTILS_CHECK(std::any_of(
+          gate.errors.begin(), gate.errors.end(), [&](const std::string& item) {
+            return item.find(needle) != std::string::npos;
+          }));
+      CHECK_EQ(VrpoQConstructorCalls(), int64_t{0});
+      CHECK_EQ(VrpoQForwardCheckedCalls(), int64_t{0});
+    };
+    require_pre_q_reject({captured_episode}, {good_view}, 901,
+                         "exact episode range");
+    auto bad_episode = captured_episode;
+    bad_episode.rows[0].global_row_index = 1;
+    require_pre_q_reject({bad_episode}, {good_view}, 900,
+                         "captured episode validation");
+    require_pre_q_reject({captured_episode}, {}, 900, "row counts differ");
+    auto bad_view = good_view;
+    bad_view.episode_id = 901;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "episode mismatch");
+    bad_view = good_view;
+    bad_view.actor = 1;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "actor mismatch");
+    std::vector<float> bad_obs =
+        captured_episode.rows[0].actor_observation;
+    bad_obs[0] += 1.0f;
+    bad_view = good_view;
+    bad_view.actor_observation = &bad_obs;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "observation mismatch");
+    std::vector<Action> bad_legal = {2};
+    bad_view = good_view;
+    bad_view.legal_actions = &bad_legal;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "ordered legal actions mismatch");
+    bad_view = good_view;
+    bad_view.action = 2;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "chosen action mismatch");
+    bad_view = good_view;
+    bad_view.chosen_log_probability = 1.0f;
+    require_pre_q_reject({captured_episode}, {bad_view}, 900,
+                         "log-probability mismatch");
+
+    auto row = [](uint64_t episode, Player actor,
+                  std::vector<Action> legal, int chosen,
+                  std::vector<double> probabilities,
+                  std::vector<VrpoSeatValues> q,
+                  VrpoSeatValues rewards, bool terminal) {
+      VrpoTimelineRow result;
+      result.episode_id = episode;
+      result.actor = actor;
+      result.legal_actions = std::move(legal);
+      result.chosen_index = chosen;
+      result.chosen_action = result.legal_actions[chosen];
+      result.legal_probabilities = std::move(probabilities);
+      result.legal_q_values = std::move(q);
+      result.rewards = rewards;
+      result.terminal_after = terminal;
+      return result;
+    };
+    std::vector<VrpoTimelineRow> timeline;
+    timeline.push_back(row(
+        77, 0, {1, 2}, 1, {0.25, 0.75},
+        {{1.0, 2.0, 3.0, 4.0}, {4.0, 3.0, 2.0, 1.0}},
+        {0.0, 0.0, 0.0, 0.0}, false));
+    timeline.push_back(row(
+        77, 2, {3, 4}, 0, {0.6, 0.4},
+        {{0.5, 1.5, 2.5, 3.5}, {3.5, 2.5, 1.5, 0.5}},
+        {0.0, 0.0, 0.0, 0.0}, false));
+    timeline.push_back(row(
+        77, 3, {5}, 0, {1.0}, {{0.0, 0.0, 0.0, 0.0}},
+        {0.5, -0.5, 0.25, -0.25}, true));
+    for (double lambda : {0.0, 1.0}) {
+      VrpoReferenceTrace scalar;
+      VrpoTensorReferenceTrace tensor;
+      UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+          timeline, 1.0, lambda, &scalar, &error));
+      UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaTensorReference(
+          timeline, 1.0, lambda, &tensor, &error));
+      VrpoReferenceAgreement agreement;
+      UTILS_CHECK(CompareVrpoReferenceTraces(
+          scalar, tensor, 1e-10, 1e-10, &agreement, &error));
+      CHECK_EQ(agreement.mismatch_count, int64_t{0});
+      CHECK_EQ(agreement.compared_values,
+               static_cast<int64_t>(timeline.size() * 17));
+      UTILS_CHECK(tensor.canonical_sha256.size() == 64);
+
+      auto corrupted = tensor;
+      corrupted.rows[0].g[0] += 1e-3;
+      UTILS_CHECK(!CompareVrpoReferenceTraces(
+          scalar, corrupted, 1e-10, 1e-10, &agreement, &error));
+      UTILS_CHECK(agreement.mismatch_count > 0);
+    }
+
+    std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
+    UTILS_CHECK(trainer.good());
+    std::string source((std::istreambuf_iterator<char>(trainer)),
+                       std::istreambuf_iterator<char>());
+    UTILS_CHECK(source.find("dune_vrpo_q_reference_preflight_v1") !=
+                std::string::npos);
+    UTILS_CHECK(source.find("VALID_Q_REFERENCE_PREFLIGHT") !=
+                std::string::npos);
+    UTILS_CHECK(source.find("WriteVrpoCaptureArtifact(") <
+                source.find("WriteVrpoQPreflightArtifact("));
+    const size_t q_branch = source.find("if (vrpo_q_preflight) {");
+    const size_t pre_q_gate = source.find(
+        "ValidateVrpoPreQCaptureRolloutGate(", q_branch);
+    const size_t q_run = source.find(
+        "RunVrpoQReferencePreflight(", q_branch);
+    UTILS_CHECK(q_branch != std::string::npos &&
+                pre_q_gate != std::string::npos &&
+                q_run != std::string::npos && pre_q_gate < q_run);
   } TEST_END();
 }
 
@@ -3036,6 +3281,7 @@ int main() {
   TestVrpoDeterministicQModule();
   TestVrpoCapturedEpisodeAndZeroShapingRewards();
   TestVrpoCaptureStartupAndLazyOptimizerContracts();
+  TestVrpoQReferencePreflightContracts();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

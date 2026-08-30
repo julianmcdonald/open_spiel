@@ -38,6 +38,7 @@
 #include "open_spiel/spiel.h"
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/torch.h>
 
 #include "dune_network.h"
@@ -135,6 +136,20 @@ ABSL_FLAG(std::string, vrpo_capture_source_root, "",
           "Required source root for the fixed VRPO capture source list.");
 ABSL_FLAG(std::string, vrpo_capture_source_sha256, "",
           "Required canonical VRPO capture source digest.");
+ABSL_FLAG(std::string, vrpo_q_preflight_output, "",
+          "Fresh atomic JSON output for the no-training VRPO Q/reference preflight.");
+ABSL_FLAG(std::string, vrpo_q_preflight_registration_id, "",
+          "Required immutable registration identifier for the Q/reference preflight.");
+ABSL_FLAG(uint64_t, vrpo_q_init_seed, 0,
+          "Required deterministic VRPO Q initialization seed.");
+ABSL_FLAG(int, vrpo_q_chunk_rows, 0,
+          "Required Q forward chunk size in [1,256].");
+ABSL_FLAG(double, vrpo_q_agreement_abs_tolerance, 1e-10,
+          "Absolute scalar/tensor recurrence agreement tolerance.");
+ABSL_FLAG(double, vrpo_q_agreement_rel_tolerance, 1e-10,
+          "Relative scalar/tensor recurrence agreement tolerance.");
+ABSL_FLAG(int64_t, vrpo_q_gpu_peak_increment_limit_bytes, 268435456,
+          "Hard incremental GPU allocator peak ceiling for Q preflight.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -3468,7 +3483,8 @@ PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
 }
 
 PpoNumericalParitySourceProvenance LoadVrpoCaptureSourceProvenance(
-    const std::string& source_root, const std::string& registered_sha256) {
+    const std::string& source_root, const std::string& registered_sha256,
+    const std::vector<std::string>& relative_paths) {
   std::error_code ec;
   const std::filesystem::path canonical_root =
       std::filesystem::canonical(source_root, ec);
@@ -3479,7 +3495,7 @@ PpoNumericalParitySourceProvenance LoadVrpoCaptureSourceProvenance(
   PpoNumericalParitySourceProvenance out;
   out.root = canonical_root.string();
   std::string canonical_payload;
-  for (const std::string& relative : VrpoCaptureSourceRelativePaths()) {
+  for (const std::string& relative : relative_paths) {
     const std::filesystem::path path = canonical_root / relative;
     if (!std::filesystem::is_regular_file(path)) {
       SpielFatalError("VRPO capture required source is not regular: " +
@@ -5036,6 +5052,612 @@ bool WriteVrpoCaptureArtifact(
   return valid;
 }
 
+struct VrpoValueStats {
+  int64_t count = 0;
+  double min = 0.0;
+  double max = 0.0;
+  double mean = 0.0;
+  double stddev = 0.0;
+};
+
+VrpoValueStats SummarizeVrpoValues(const std::vector<double>& values) {
+  VrpoValueStats out;
+  if (values.empty()) return out;
+  out.count = static_cast<int64_t>(values.size());
+  out.min = *std::min_element(values.begin(), values.end());
+  out.max = *std::max_element(values.begin(), values.end());
+  double sum = 0.0;
+  for (double value : values) sum += value;
+  out.mean = sum / static_cast<double>(values.size());
+  double squared = 0.0;
+  for (double value : values) {
+    const double delta = value - out.mean;
+    squared += delta * delta;
+  }
+  out.stddev = std::sqrt(squared / static_cast<double>(values.size()));
+  return out;
+}
+
+json::Object VrpoValueStatsJson(const VrpoValueStats& stats) {
+  json::Object out;
+  out["count"] = stats.count;
+  out["min"] = stats.min;
+  out["max"] = stats.max;
+  out["mean"] = stats.mean;
+  out["stddev"] = stats.stddev;
+  return out;
+}
+
+struct VrpoQPreflightResult {
+  bool valid = false;
+  bool pre_q_gate_valid = false;
+  bool q_constructed = false;
+  std::vector<std::string> errors;
+  int64_t pre_q_captured_rows = 0;
+  int64_t pre_q_rollout_rows = 0;
+  int64_t pre_q_paired_rows = 0;
+  int64_t q_constructor_calls = 0;
+  int64_t rows = 0;
+  int64_t legal_values = 0;
+  int64_t forced_rows = 0;
+  int64_t nontrivial_rows = 0;
+  std::array<int64_t, kVrpoNumSeats> actor_rows = {0, 0, 0, 0};
+  int64_t q_forward_calls = 0;
+  int64_t max_chunk_rows = 0;
+  int64_t nonfinite_values = 0;
+  int64_t gpu_peak_allocated_increment_bytes = 0;
+  int64_t gpu_peak_reserved_increment_bytes = 0;
+  std::string q_parameter_sha256_before;
+  std::string q_parameter_sha256_after;
+  std::string legal_q_evidence_sha256;
+  std::string scalar_reference_sha256;
+  std::string tensor_reference_sha256;
+  std::string input_dtype = "Float32";
+  std::string output_dtype = "Float32";
+  std::string device;
+  bool autocast_enabled = false;
+  VrpoReferenceAgreement agreement;
+  VrpoValueStats q_values;
+  VrpoValueStats chosen_q_values;
+  VrpoValueStats v_values;
+  VrpoValueStats delta_values;
+  VrpoValueStats g_values;
+  VrpoValueStats q_target_values;
+  VrpoValueStats actor_advantages;
+  double pack_h2d_s = 0.0;
+  double q_forward_s = 0.0;
+  double legal_gather_d2h_s = 0.0;
+  double scalar_reference_s = 0.0;
+  double tensor_reference_s = 0.0;
+  double total_s = 0.0;
+};
+
+struct VrpoCudaMemoryStats {
+  int64_t allocated = 0;
+  int64_t reserved = 0;
+  int64_t peak_allocated = 0;
+  int64_t peak_reserved = 0;
+};
+
+VrpoCudaMemoryStats ReadVrpoCudaMemory(torch::Device device) {
+  VrpoCudaMemoryStats out;
+  if (!device.is_cuda()) return out;
+  const c10::DeviceIndex index =
+      device.has_index() ? device.index() : c10::cuda::current_device();
+  const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(index);
+  constexpr size_t aggregate = static_cast<size_t>(
+      c10::CachingAllocator::StatType::AGGREGATE);
+  out.allocated = stats.allocated_bytes[aggregate].current;
+  out.reserved = stats.reserved_bytes[aggregate].current;
+  out.peak_allocated = stats.allocated_bytes[aggregate].peak;
+  out.peak_reserved = stats.reserved_bytes[aggregate].peak;
+  return out;
+}
+
+VrpoQPreflightResult RunVrpoQReferencePreflight(
+    const VrpoCapturedEpisode& episode, torch::Device device,
+    uint64_t q_init_seed, int chunk_rows, double abs_tolerance,
+    double rel_tolerance, int64_t gpu_peak_increment_limit_bytes) {
+  VrpoQPreflightResult out;
+  out.device = device.str();
+  const auto total_start = std::chrono::steady_clock::now();
+  auto reject = [&](const std::string& message) { out.errors.push_back(message); };
+  std::string validation_error;
+  if (!ValidateVrpoCapturedEpisode(episode, &validation_error)) {
+    reject("captured episode invalid before Q: " + validation_error);
+    return out;
+  }
+  std::vector<std::pair<size_t, size_t>> ranges;
+  if (!BuildVrpoChunkRanges(
+          episode.rows.size(), chunk_rows, &ranges, &validation_error)) {
+    reject(validation_error);
+    return out;
+  }
+
+  const VrpoCudaMemoryStats memory_before = ReadVrpoCudaMemory(device);
+  if (device.is_cuda()) {
+    const c10::DeviceIndex index =
+        device.has_index() ? device.index() : c10::cuda::current_device();
+    c10::cuda::CUDACachingAllocator::resetPeakStats(index);
+  }
+
+  auto q_model = std::make_shared<DuneVrpoQNetImpl>(q_init_seed);
+  out.q_constructed = true;
+  out.q_constructor_calls = VrpoQConstructorCalls();
+  if (!VrpoQModuleParameterSha256(
+          *q_model, &out.q_parameter_sha256_before, &validation_error)) {
+    reject("Q initialization hash failed: " + validation_error);
+    return out;
+  }
+  q_model->to(device);
+  q_model->eval();
+
+  std::vector<std::vector<VrpoActorRelativeSeatValues>> relative_q(
+      episode.rows.size());
+  std::vector<double> all_q;
+  std::vector<double> chosen_q;
+  out.rows = static_cast<int64_t>(episode.rows.size());
+  for (const auto& row : episode.rows) {
+    out.legal_values += static_cast<int64_t>(row.legal_actions.size()) *
+                        kVrpoNumSeats;
+    if (row.legal_actions.size() == 1) ++out.forced_rows;
+    else ++out.nontrivial_rows;
+    ++out.actor_rows[row.actor];
+  }
+  all_q.reserve(static_cast<size_t>(out.legal_values));
+  chosen_q.reserve(episode.rows.size() * kVrpoNumSeats);
+
+  {
+    c10::InferenceMode inference_guard;
+    torch::NoGradGuard no_grad;
+    AutocastGuard autocast_guard(device.type(), false);
+    out.autocast_enabled =
+        device.is_cuda()
+            ? at::autocast::is_autocast_enabled(at::kCUDA)
+            : at::autocast::is_autocast_enabled(at::kCPU);
+    for (const auto& range : ranges) {
+      out.max_chunk_rows = std::max<int64_t>(
+          out.max_chunk_rows, static_cast<int64_t>(range.second));
+      const auto pack_start = std::chrono::steady_clock::now();
+      torch::Tensor cpu = torch::empty(
+          {static_cast<int64_t>(range.second),
+           dune_imperium::kVrpoCentralCriticTensorSize},
+          torch::TensorOptions().dtype(torch::kFloat32));
+      float* destination = cpu.data_ptr<float>();
+      for (size_t local = 0; local < range.second; ++local) {
+        const auto& central = episode.rows[range.first + local].central_tensor;
+        std::memcpy(
+            destination + local * dune_imperium::kVrpoCentralCriticTensorSize,
+            central.data(), central.size() * sizeof(float));
+      }
+      torch::Tensor input = cpu.to(device);
+      out.pack_h2d_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - pack_start).count();
+
+      const auto forward_start = std::chrono::steady_clock::now();
+      torch::Tensor dense_q;
+      std::string forward_error;
+      if (!q_model->ForwardChecked(input, &dense_q, &forward_error)) {
+        reject("Q forward failed: " + forward_error);
+        break;
+      }
+      ++out.q_forward_calls;
+      if (dense_q.scalar_type() != torch::kFloat32) {
+        reject("Q output dtype is not Float32");
+        break;
+      }
+      out.q_forward_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - forward_start).count();
+
+      const auto gather_start = std::chrono::steady_clock::now();
+      for (size_t local = 0; local < range.second; ++local) {
+        const size_t global = range.first + local;
+        const VrpoCapturedRow& row = episode.rows[global];
+        torch::Tensor legal_cpu = torch::from_blob(
+            const_cast<Action*>(row.legal_actions.data()),
+            {static_cast<int64_t>(row.legal_actions.size())},
+            torch::TensorOptions().dtype(torch::kInt64)).clone();
+        torch::Tensor gathered = dense_q[static_cast<int64_t>(local)]
+            .index_select(0, legal_cpu.to(device))
+            .to(torch::kCPU)
+            .to(torch::kFloat64)
+            .contiguous();
+        relative_q[global].resize(row.legal_actions.size());
+        const double* values = gathered.data_ptr<double>();
+        for (size_t a = 0; a < row.legal_actions.size(); ++a) {
+          for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+            const double value = values[a * kVrpoNumSeats + slot];
+            relative_q[global][a].slots[slot] = value;
+            all_q.push_back(value);
+            if (!std::isfinite(value)) ++out.nonfinite_values;
+            if (static_cast<int>(a) == row.chosen_index) {
+              chosen_q.push_back(value);
+            }
+          }
+        }
+      }
+      out.legal_gather_d2h_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - gather_start).count();
+    }
+  }
+
+  if (out.errors.empty() && out.nonfinite_values == 0) {
+    std::string evidence_error;
+    if (!VrpoLegalQEvidenceSha256(
+            episode, relative_q, &out.legal_q_evidence_sha256,
+            &evidence_error)) {
+      reject(evidence_error);
+    }
+  }
+  std::vector<VrpoTimelineRow> timeline;
+  if (out.errors.empty() &&
+      !VrpoCapturedEpisodeToTimeline(
+          episode, relative_q, &timeline, &validation_error)) {
+    reject(validation_error);
+  }
+  VrpoReferenceTrace scalar;
+  if (out.errors.empty()) {
+    const auto start = std::chrono::steady_clock::now();
+    if (!ComputeVrpoExpectedSarsaLambdaReference(
+            timeline, episode.gamma, episode.lambda, &scalar,
+            &validation_error, episode.probability_tolerance)) {
+      reject("scalar reference failed: " + validation_error);
+    }
+    out.scalar_reference_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    out.scalar_reference_sha256 = scalar.canonical_sha256;
+  }
+  VrpoTensorReferenceTrace tensor;
+  if (out.errors.empty()) {
+    const auto start = std::chrono::steady_clock::now();
+    if (!ComputeVrpoExpectedSarsaLambdaTensorReference(
+            timeline, episode.gamma, episode.lambda, &tensor,
+            &validation_error, episode.probability_tolerance)) {
+      reject("tensor reference failed: " + validation_error);
+    }
+    out.tensor_reference_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    out.tensor_reference_sha256 = tensor.canonical_sha256;
+  }
+  if (out.errors.empty() &&
+      !CompareVrpoReferenceTraces(
+          scalar, tensor, abs_tolerance, rel_tolerance,
+          &out.agreement, &validation_error)) {
+    reject(validation_error);
+  }
+  if (!VrpoQModuleParameterSha256(
+          *q_model, &out.q_parameter_sha256_after, &validation_error)) {
+    reject("post-forward Q hash failed: " + validation_error);
+  }
+  if (out.q_parameter_sha256_before != out.q_parameter_sha256_after) {
+    reject("Q parameters changed during preflight");
+  }
+
+  const VrpoCudaMemoryStats memory_after = ReadVrpoCudaMemory(device);
+  if (device.is_cuda()) {
+    out.gpu_peak_allocated_increment_bytes = std::max<int64_t>(
+        0, memory_after.peak_allocated - memory_before.allocated);
+    out.gpu_peak_reserved_increment_bytes = std::max<int64_t>(
+        0, memory_after.peak_reserved - memory_before.reserved);
+    if (out.gpu_peak_allocated_increment_bytes >
+            gpu_peak_increment_limit_bytes ||
+        out.gpu_peak_reserved_increment_bytes >
+            gpu_peak_increment_limit_bytes) {
+      reject("Q preflight GPU memory ceiling exceeded");
+    }
+  }
+
+  std::vector<double> v_values, delta_values, g_values, target_values,
+      advantages;
+  for (const auto& row : scalar.rows) {
+    v_values.insert(v_values.end(), row.v.begin(), row.v.end());
+    delta_values.insert(delta_values.end(), row.delta.begin(), row.delta.end());
+    g_values.insert(g_values.end(), row.g.begin(), row.g.end());
+    target_values.insert(target_values.end(), row.q_target.begin(),
+                         row.q_target.end());
+    advantages.push_back(row.actor_advantage);
+  }
+  out.q_values = SummarizeVrpoValues(all_q);
+  out.chosen_q_values = SummarizeVrpoValues(chosen_q);
+  out.v_values = SummarizeVrpoValues(v_values);
+  out.delta_values = SummarizeVrpoValues(delta_values);
+  out.g_values = SummarizeVrpoValues(g_values);
+  out.q_target_values = SummarizeVrpoValues(target_values);
+  out.actor_advantages = SummarizeVrpoValues(advantages);
+  out.total_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - total_start).count();
+  const int64_t expected_calls = static_cast<int64_t>(ranges.size());
+  if (out.q_forward_calls != expected_calls) {
+    reject("Q forward call count differs from chunk partition");
+  }
+  out.valid = out.errors.empty();
+  out.q_constructor_calls = VrpoQConstructorCalls();
+  out.q_forward_calls = VrpoQForwardCheckedCalls();
+  return out;
+}
+
+bool WriteVrpoQPreflightArtifact(
+    const std::string& output_path,
+    const std::vector<VrpoCapturedEpisode>& episodes,
+    const CollectResult& collect, const VrpoQPreflightResult& result,
+    const std::string& command_line,
+    const PpoNumericalParitySourceProvenance& source_provenance,
+    const std::string& source_manifest,
+    const std::string& source_manifest_sha256, int64_t source_global_update,
+    const std::string& source_checkpoint_uuid,
+    const std::string& config_fingerprint,
+    const std::string& model_hash_before,
+    const std::string& model_hash_after,
+    const std::string& inference_hash_before,
+    const std::string& inference_hash_after,
+    bool tf32_cublas_before, bool tf32_cudnn_before,
+    bool tf32_cublas_after, bool tf32_cudnn_after,
+    bool optimizer_constructed) {
+  std::vector<std::string> errors = result.errors;
+  auto require = [&](bool ok, const std::string& message) {
+    if (!ok) errors.push_back(message);
+  };
+  require(episodes.size() == 1 && collect.games == 1,
+          "Q preflight requires one complete game");
+  std::string validation_error;
+  require(ValidateVrpoSortedEpisodeIds(
+              episodes, absl::GetFlag(FLAGS_start_episode_id), 1,
+              &validation_error),
+          validation_error);
+  int64_t paired_rows = 0;
+  size_t rollout_cursor = 0;
+  for (const auto& episode : episodes) {
+    std::string episode_error;
+    require(ValidateVrpoCapturedEpisode(episode, &episode_error),
+            "captured episode invalid: " + episode_error);
+    for (const auto& row : episode.rows) {
+      if (rollout_cursor < collect.rollout.size()) {
+        const PpoTransition& transition = collect.rollout[rollout_cursor];
+        VrpoRolloutPairingView pairing;
+        pairing.episode_id = transition.episode_id;
+        pairing.actor = transition.player_id;
+        pairing.actor_observation = &transition.state;
+        pairing.legal_actions = &transition.legal_actions;
+        pairing.action = transition.action;
+        pairing.chosen_log_probability = transition.old_log_prob;
+        std::string pairing_error;
+        if (ValidateVrpoCaptureRolloutPairing(row, pairing, &pairing_error)) {
+          ++paired_rows;
+        } else {
+          errors.push_back("capture/rollout pairing failed: " + pairing_error);
+        }
+      }
+      ++rollout_cursor;
+    }
+  }
+  require(rollout_cursor == collect.rollout.size() &&
+              paired_rows == result.rows,
+          "Q preflight capture/rollout row coverage differs");
+  require(result.pre_q_gate_valid &&
+              result.pre_q_captured_rows == result.pre_q_rollout_rows &&
+              result.pre_q_paired_rows == result.pre_q_captured_rows,
+          "pre-Q exhaustive capture/rollout gate failed");
+  require(result.q_constructed && result.q_constructor_calls == 1,
+          "Q construction count is invalid");
+  require(result.valid && result.rows > 0 && result.legal_values > 0 &&
+              result.nonfinite_values == 0,
+          "Q/reference computation is incomplete or invalid");
+  require(result.q_forward_calls > 0 && result.max_chunk_rows > 0 &&
+              result.max_chunk_rows <= kVrpoQPreflightMaxChunkRows,
+          "Q forward/chunk counters are invalid");
+  require(result.agreement.mismatch_count == 0 &&
+              result.agreement.compared_values == result.rows * 17,
+          "scalar/tensor recurrence agreement is incomplete");
+  require(result.q_parameter_sha256_before.size() == 64 &&
+              result.q_parameter_sha256_before ==
+                  result.q_parameter_sha256_after &&
+              result.legal_q_evidence_sha256.size() == 64 &&
+              result.scalar_reference_sha256.size() == 64 &&
+              result.tensor_reference_sha256.size() == 64,
+          "Q/reference evidence hashes are invalid");
+  require(!optimizer_constructed, "optimizer was constructed");
+  require(model_hash_before == model_hash_after &&
+              inference_hash_before == inference_hash_after &&
+              model_hash_before == inference_hash_before,
+          "actor model immutability/equality failed");
+  require(!absl::GetFlag(FLAGS_rollout_amp) &&
+              !absl::GetFlag(FLAGS_train_amp) &&
+              absl::GetFlag(FLAGS_allow_tf32) && tf32_cublas_before &&
+              tf32_cudnn_before && tf32_cublas_after && tf32_cudnn_after,
+          "FP32/TF32 runtime contract failed");
+
+  json::Object root;
+  root["schema"] = "dune_vrpo_q_reference_preflight_v1";
+  root["registration_id"] =
+      absl::GetFlag(FLAGS_vrpo_q_preflight_registration_id);
+  root["scope"] = "vrpo_q_reference_preflight_only";
+  root["epistemic_label"] = "no_training_q_reference_preflight";
+  root["training_authorized"] = false;
+  root["optimizer_constructed"] = optimizer_constructed;
+  root["optimizer_steps"] = int64_t{0};
+  root["backward_calls"] = int64_t{0};
+  root["training_updates"] = int64_t{0};
+  root["pre_q_gate_valid"] = result.pre_q_gate_valid;
+  root["pre_q_captured_rows"] = result.pre_q_captured_rows;
+  root["pre_q_rollout_rows"] = result.pre_q_rollout_rows;
+  root["pre_q_paired_rows"] = result.pre_q_paired_rows;
+  root["q_constructed"] = result.q_constructed;
+  root["q_constructor_calls"] = result.q_constructor_calls;
+  root["command_line"] = command_line;
+  root["config_fingerprint"] = config_fingerprint;
+  root["games_collected"] = static_cast<int64_t>(collect.games);
+  root["threads"] = static_cast<int64_t>(absl::GetFlag(FLAGS_threads));
+  root["seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+  root["episode_id"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id));
+  root["captured_rows"] = result.rows;
+  root["paired_rows"] = paired_rows;
+  root["legal_q_values"] = result.legal_values;
+  root["forced_rows"] = result.forced_rows;
+  root["nontrivial_rows"] = result.nontrivial_rows;
+  json::Array actor_rows;
+  for (int64_t count : result.actor_rows) actor_rows.emplace_back(count);
+  root["actor_rows_absolute_seat"] = std::move(actor_rows);
+  root["q_init_seed"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_vrpo_q_init_seed));
+  root["q_chunk_rows"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_vrpo_q_chunk_rows));
+  root["q_forward_calls"] = result.q_forward_calls;
+  root["q_max_chunk_rows"] = result.max_chunk_rows;
+  root["q_input_dtype"] = result.input_dtype;
+  root["q_output_dtype"] = result.output_dtype;
+  root["q_device"] = result.device;
+  root["q_input_dim"] =
+      static_cast<int64_t>(dune_imperium::kVrpoCentralCriticTensorSize);
+  root["q_hidden_dim"] = int64_t{kVrpoQHiddenDim};
+  root["q_residual_blocks"] = int64_t{kVrpoQNumResBlocks};
+  root["q_action_dim"] = int64_t{kVrpoDuneActionDim};
+  root["q_reward_perspectives"] = int64_t{kVrpoNumSeats};
+  root["q_output_order"] = "actor_relative_slots_0_1_2_3";
+  root["q_autocast_enabled"] = result.autocast_enabled;
+  root["q_nonfinite_values"] = result.nonfinite_values;
+  root["q_parameter_sha256_before"] = result.q_parameter_sha256_before;
+  root["q_parameter_sha256_after"] = result.q_parameter_sha256_after;
+  root["legal_q_evidence_sha256"] = result.legal_q_evidence_sha256;
+  root["scalar_reference_sha256"] = result.scalar_reference_sha256;
+  root["tensor_reference_sha256"] = result.tensor_reference_sha256;
+  root["capture_sha256"] =
+      episodes.empty() ? std::string() : episodes.front().capture_sha256;
+  root["central_schema_sha256"] =
+      dune_imperium::kVrpoCentralCriticTensorSchemaSha256;
+  root["capture_schema_sha256"] = kVrpoCaptureSchemaSha256;
+  root["reward_convention_sha256"] =
+      kVrpoZeroShapingRewardConventionSha256;
+  root["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  root["gamma"] = absl::GetFlag(FLAGS_gamma);
+  root["lambda"] = absl::GetFlag(FLAGS_gae_lambda);
+  root["probability_tolerance"] = 1e-9;
+  root["agreement_abs_tolerance"] =
+      absl::GetFlag(FLAGS_vrpo_q_agreement_abs_tolerance);
+  root["agreement_rel_tolerance"] =
+      absl::GetFlag(FLAGS_vrpo_q_agreement_rel_tolerance);
+  json::Object agreement;
+  agreement["compared_values"] = result.agreement.compared_values;
+  agreement["mismatch_count"] = result.agreement.mismatch_count;
+  agreement["max_abs_v"] = result.agreement.max_abs_v;
+  agreement["max_abs_delta"] = result.agreement.max_abs_delta;
+  agreement["max_abs_g"] = result.agreement.max_abs_g;
+  agreement["max_abs_q_target"] = result.agreement.max_abs_q_target;
+  agreement["max_abs_actor_advantage"] =
+      result.agreement.max_abs_actor_advantage;
+  root["scalar_tensor_agreement"] = std::move(agreement);
+  json::Object summaries;
+  summaries["q"] = VrpoValueStatsJson(result.q_values);
+  summaries["chosen_q"] = VrpoValueStatsJson(result.chosen_q_values);
+  summaries["v"] = VrpoValueStatsJson(result.v_values);
+  summaries["delta"] = VrpoValueStatsJson(result.delta_values);
+  summaries["g"] = VrpoValueStatsJson(result.g_values);
+  summaries["q_target"] = VrpoValueStatsJson(result.q_target_values);
+  summaries["actor_advantage"] =
+      VrpoValueStatsJson(result.actor_advantages);
+  root["numeric_summaries"] = std::move(summaries);
+  json::Object timing;
+  timing["pack_h2d_s"] = result.pack_h2d_s;
+  timing["q_forward_s"] = result.q_forward_s;
+  timing["legal_gather_d2h_s"] = result.legal_gather_d2h_s;
+  timing["scalar_reference_s"] = result.scalar_reference_s;
+  timing["tensor_reference_s"] = result.tensor_reference_s;
+  timing["total_s"] = result.total_s;
+  root["timing"] = std::move(timing);
+  json::Object memory;
+  memory["capture_host_tensor_bytes"] = result.rows *
+      static_cast<int64_t>(kVrpoDuneInformationStateSize +
+                           dune_imperium::kVrpoCentralCriticTensorSize) *
+      static_cast<int64_t>(sizeof(float));
+  memory["max_chunk_input_bytes"] = result.max_chunk_rows *
+      static_cast<int64_t>(dune_imperium::kVrpoCentralCriticTensorSize) *
+      static_cast<int64_t>(sizeof(float));
+  memory["max_chunk_dense_q_bytes"] = result.max_chunk_rows *
+      static_cast<int64_t>(kVrpoDuneActionDim) * kVrpoNumSeats *
+      static_cast<int64_t>(sizeof(float));
+  memory["gpu_peak_allocated_increment_bytes"] =
+      result.gpu_peak_allocated_increment_bytes;
+  memory["gpu_peak_reserved_increment_bytes"] =
+      result.gpu_peak_reserved_increment_bytes;
+  memory["gpu_peak_increment_limit_bytes"] =
+      absl::GetFlag(FLAGS_vrpo_q_gpu_peak_increment_limit_bytes);
+  root["memory"] = std::move(memory);
+  root["rollout_amp"] = absl::GetFlag(FLAGS_rollout_amp);
+  root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["allow_tf32"] = absl::GetFlag(FLAGS_allow_tf32);
+  json::Object precision_runtime;
+  precision_runtime["tf32_cublas_before"] = tf32_cublas_before;
+  precision_runtime["tf32_cublas_after"] = tf32_cublas_after;
+  precision_runtime["tf32_cudnn_before"] = tf32_cudnn_before;
+  precision_runtime["tf32_cudnn_after"] = tf32_cudnn_after;
+  root["precision_runtime"] = std::move(precision_runtime);
+  root["model_state_sha256_before"] = model_hash_before;
+  root["model_state_sha256_after"] = model_hash_after;
+  root["inference_state_sha256_before"] = inference_hash_before;
+  root["inference_state_sha256_after"] = inference_hash_after;
+
+  size_t model_size = 0;
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  json::Object source;
+  source["model_path"] = std::filesystem::absolute(model_path).string();
+  source["model_sha256"] = ComputeFileSHA256(model_path, &model_size);
+  source["model_size"] = static_cast<int64_t>(model_size);
+  source["manifest_path"] = std::filesystem::absolute(source_manifest).string();
+  source["manifest_sha256"] = source_manifest_sha256;
+  source["global_update"] = source_global_update;
+  source["checkpoint_uuid"] = source_checkpoint_uuid;
+  size_t binary_size = 0;
+  std::error_code ec;
+  const auto binary_path = std::filesystem::read_symlink("/proc/self/exe", ec);
+  require(!ec && !binary_path.empty(), "could not resolve binary path");
+  if (!ec && !binary_path.empty()) {
+    source["binary_path"] = binary_path.string();
+    source["binary_sha256"] =
+        ComputeFileSHA256(binary_path.string(), &binary_size);
+    source["binary_size"] = static_cast<int64_t>(binary_size);
+  }
+  root["source"] = std::move(source);
+  json::Object source_code;
+  source_code["root"] = source_provenance.root;
+  source_code["combined_sha256"] = source_provenance.combined_sha256;
+  json::Array source_files;
+  for (const auto& file : source_provenance.files) {
+    json::Object record;
+    record["relative_path"] = file.relative_path;
+    record["absolute_path"] = file.absolute_path;
+    record["size"] = file.size;
+    record["sha256"] = file.sha256;
+    source_files.emplace_back(std::move(record));
+  }
+  source_code["files"] = std::move(source_files);
+  root["source_code"] = std::move(source_code);
+  json::Array validation_errors;
+  for (const auto& item : errors) validation_errors.emplace_back(item);
+  root["validation_errors"] = std::move(validation_errors);
+  const bool valid = errors.empty();
+  root["classification"] =
+      valid ? "VALID_Q_REFERENCE_PREFLIGHT" : "INVALID";
+  root["status"] = valid ? "VALID" : "INVALID";
+
+  const std::filesystem::path output(output_path);
+  const std::filesystem::path tmp = output_path + ".tmp";
+  if (std::filesystem::exists(output) || std::filesystem::exists(tmp)) {
+    SpielFatalError("VRPO Q preflight output already exists");
+  }
+  if (!output.parent_path().empty()) {
+    std::filesystem::create_directories(output.parent_path());
+  }
+  {
+    std::ofstream stream(tmp, std::ios::trunc);
+    if (!stream) SpielFatalError("cannot create VRPO Q preflight temp artifact");
+    stream << json::ToString(root, true) << "\n";
+    stream.flush();
+    if (!stream) SpielFatalError("VRPO Q preflight artifact write failed");
+  }
+  std::filesystem::rename(tmp, output);
+  return valid;
+}
+
 
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -5055,9 +5677,14 @@ int main(int argc, char** argv) {
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
   const bool vrpo_capture =
       !absl::GetFlag(FLAGS_vrpo_capture_output).empty();
-  if (numerical_parity && vrpo_capture) {
+  const bool vrpo_q_preflight =
+      !absl::GetFlag(FLAGS_vrpo_q_preflight_output).empty();
+  const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
+  if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
+          static_cast<int>(vrpo_q_preflight) >
+      1) {
     open_spiel::SpielFatalError(
-        "Numerical parity and VRPO capture modes are mutually exclusive");
+        "Numerical parity, VRPO capture, and VRPO Q preflight modes are mutually exclusive");
   }
   if (numerical_parity) {
     auto parity_stop = [](const std::string& message) {
@@ -5151,11 +5778,13 @@ int main(int argc, char** argv) {
       parity_stop("output or temp path already exists (fresh output required)");
     }
   }
-  if (vrpo_capture) {
+  if (vrpo_diagnostics) {
     open_spiel::VrpoCaptureStartupConfig config;
     config.game = absl::GetFlag(FLAGS_game);
     config.registration_id =
-        absl::GetFlag(FLAGS_vrpo_capture_registration_id);
+        vrpo_q_preflight
+            ? absl::GetFlag(FLAGS_vrpo_q_preflight_registration_id)
+            : absl::GetFlag(FLAGS_vrpo_capture_registration_id);
     config.source_root = absl::GetFlag(FLAGS_vrpo_capture_source_root);
     config.source_sha256 =
         absl::GetFlag(FLAGS_vrpo_capture_source_sha256);
@@ -5187,9 +5816,21 @@ int main(int argc, char** argv) {
     config.gamma = absl::GetFlag(FLAGS_gamma);
     config.lambda = absl::GetFlag(FLAGS_gae_lambda);
     std::string gate_error;
-    if (!open_spiel::ValidateVrpoCaptureStartupConfig(config, &gate_error)) {
+    const bool gate_valid = vrpo_q_preflight
+        ? open_spiel::ValidateVrpoQPreflightStartupConfig(
+              open_spiel::VrpoQPreflightStartupConfig{
+                  config,
+                  absl::GetFlag(FLAGS_vrpo_q_init_seed),
+                  absl::GetFlag(FLAGS_vrpo_q_chunk_rows),
+                  absl::GetFlag(FLAGS_vrpo_q_agreement_abs_tolerance),
+                  absl::GetFlag(FLAGS_vrpo_q_agreement_rel_tolerance),
+                  absl::GetFlag(
+                      FLAGS_vrpo_q_gpu_peak_increment_limit_bytes)},
+              &gate_error)
+        : open_spiel::ValidateVrpoCaptureStartupConfig(config, &gate_error);
+    if (!gate_valid) {
       open_spiel::SpielFatalError(
-          "VRPO capture configuration rejected: " + gate_error);
+          "VRPO diagnostics configuration rejected: " + gate_error);
     }
     if (absl::GetFlag(FLAGS_artifact_manifest).empty()) {
       open_spiel::SpielFatalError(
@@ -5200,7 +5841,9 @@ int main(int argc, char** argv) {
       open_spiel::SpielFatalError(
           "VRPO capture requires checkpoint writes disabled");
     }
-    const std::string output = absl::GetFlag(FLAGS_vrpo_capture_output);
+    const std::string output = vrpo_q_preflight
+        ? absl::GetFlag(FLAGS_vrpo_q_preflight_output)
+        : absl::GetFlag(FLAGS_vrpo_capture_output);
     if (std::filesystem::exists(output) ||
         std::filesystem::exists(output + ".tmp")) {
       open_spiel::SpielFatalError(
@@ -5300,11 +5943,14 @@ int main(int argc, char** argv) {
             absl::GetFlag(FLAGS_numerical_parity_source_root),
             absl::GetFlag(FLAGS_numerical_parity_source_sha256));
   }
-  if (vrpo_capture) {
+  if (vrpo_diagnostics) {
     vrpo_source_provenance =
         open_spiel::LoadVrpoCaptureSourceProvenance(
             absl::GetFlag(FLAGS_vrpo_capture_source_root),
-            absl::GetFlag(FLAGS_vrpo_capture_source_sha256));
+            absl::GetFlag(FLAGS_vrpo_capture_source_sha256),
+            vrpo_q_preflight
+                ? open_spiel::VrpoQPreflightSourceRelativePaths()
+                : open_spiel::VrpoCaptureSourceRelativePaths());
   }
 
   // PWO-5 section 7.2 / Appendix A.1.
@@ -5412,7 +6058,7 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
-  if (open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_capture)) {
+  if (open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
     // Section 7.4: materialize BEFORE any load, so the entries exist in all six
@@ -5689,9 +6335,9 @@ int main(int argc, char** argv) {
     // checkpoint can be audited without pretending to resume it, loading Adam
     // moments, synthesizing a bootstrap manifest, or making any checkpoint
     // path writable.
-    if (!numerical_parity && !vrpo_capture) {
+    if (!numerical_parity && !vrpo_diagnostics) {
       SpielFatalError(
-          "init_mode=diagnostic is reserved for numerical parity or VRPO capture");
+          "init_mode=diagnostic is reserved for numerical parity or VRPO diagnostics");
     }
     const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     parity_source_manifest = absl::GetFlag(FLAGS_artifact_manifest);
@@ -7889,16 +8535,16 @@ int main(int argc, char** argv) {
 
   // Collect first rollout synchronously.
   const std::string parity_model_hash_before =
-      (numerical_parity || vrpo_capture)
+      (numerical_parity || vrpo_diagnostics)
           ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
-      (numerical_parity || vrpo_capture)
+      (numerical_parity || vrpo_diagnostics)
           ? open_spiel::HashAllModelState(inference_model) : "";
   const bool parity_tf32_cublas_before =
-      (numerical_parity || vrpo_capture) &&
+      (numerical_parity || vrpo_diagnostics) &&
       at::globalContext().allowTF32CuBLAS();
   const bool parity_tf32_cudnn_before =
-      (numerical_parity || vrpo_capture) &&
+      (numerical_parity || vrpo_diagnostics) &&
       at::globalContext().allowTF32CuDNN();
   float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
@@ -7907,7 +8553,7 @@ int main(int argc, char** argv) {
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
-      vrpo_capture ? &vrpo_capture_buffer : nullptr);
+      vrpo_diagnostics ? &vrpo_capture_buffer : nullptr);
   if (vrpo_capture) {
     std::vector<open_spiel::VrpoCapturedEpisode> episodes =
         vrpo_capture_buffer.TakeSorted();
@@ -7931,6 +8577,75 @@ int main(int argc, char** argv) {
     std::cout << "VRPO diagnostics capture "
               << (valid ? "VALID" : "INVALID") << ": "
               << absl::GetFlag(FLAGS_vrpo_capture_output) << "\n";
+    return valid ? 0 : 3;
+  }
+  if (vrpo_q_preflight) {
+    std::vector<open_spiel::VrpoCapturedEpisode> episodes =
+        vrpo_capture_buffer.TakeSorted();
+    open_spiel::ResetVrpoQInstrumentation();
+    std::vector<open_spiel::VrpoRolloutPairingView> rollout_views;
+    rollout_views.reserve(current_collect.rollout.size());
+    for (const auto& transition : current_collect.rollout) {
+      open_spiel::VrpoRolloutPairingView view;
+      view.episode_id = transition.episode_id;
+      view.actor = transition.player_id;
+      view.actor_observation = &transition.state;
+      view.legal_actions = &transition.legal_actions;
+      view.action = transition.action;
+      view.chosen_log_probability = transition.old_log_prob;
+      rollout_views.push_back(view);
+    }
+    const open_spiel::VrpoPreQGateResult pre_q_gate =
+        open_spiel::ValidateVrpoPreQCaptureRolloutGate(
+            episodes, rollout_views,
+            absl::GetFlag(FLAGS_start_episode_id),
+            absl::GetFlag(FLAGS_rollout_games));
+    open_spiel::VrpoQPreflightResult q_result;
+    q_result.pre_q_gate_valid = pre_q_gate.valid;
+    q_result.pre_q_captured_rows = pre_q_gate.captured_rows;
+    q_result.pre_q_rollout_rows = pre_q_gate.rollout_rows;
+    q_result.pre_q_paired_rows = pre_q_gate.paired_rows;
+    if (pre_q_gate.valid) {
+      q_result = open_spiel::RunVrpoQReferencePreflight(
+          episodes.front(), device,
+          absl::GetFlag(FLAGS_vrpo_q_init_seed),
+          absl::GetFlag(FLAGS_vrpo_q_chunk_rows),
+          absl::GetFlag(FLAGS_vrpo_q_agreement_abs_tolerance),
+          absl::GetFlag(FLAGS_vrpo_q_agreement_rel_tolerance),
+          absl::GetFlag(FLAGS_vrpo_q_gpu_peak_increment_limit_bytes));
+      q_result.pre_q_gate_valid = true;
+      q_result.pre_q_captured_rows = pre_q_gate.captured_rows;
+      q_result.pre_q_rollout_rows = pre_q_gate.rollout_rows;
+      q_result.pre_q_paired_rows = pre_q_gate.paired_rows;
+    } else {
+      q_result.errors = pre_q_gate.errors;
+      q_result.q_constructed = false;
+      q_result.q_constructor_calls =
+          open_spiel::VrpoQConstructorCalls();
+      q_result.q_forward_calls =
+          open_spiel::VrpoQForwardCheckedCalls();
+    }
+    const std::string model_hash_after =
+        open_spiel::HashAllModelState(training_model);
+    const std::string inference_hash_after =
+        open_spiel::HashAllModelState(inference_model);
+    const bool tf32_cublas_after =
+        at::globalContext().allowTF32CuBLAS();
+    const bool tf32_cudnn_after =
+        at::globalContext().allowTF32CuDNN();
+    const bool valid = open_spiel::WriteVrpoQPreflightArtifact(
+        absl::GetFlag(FLAGS_vrpo_q_preflight_output), episodes,
+        current_collect, q_result, parity_command_line,
+        vrpo_source_provenance, parity_source_manifest,
+        parity_source_manifest_sha256, parity_source_global_update,
+        parity_source_checkpoint_uuid, config_fingerprint,
+        parity_model_hash_before, model_hash_after,
+        parity_inference_hash_before, inference_hash_after,
+        parity_tf32_cublas_before, parity_tf32_cudnn_before,
+        tf32_cublas_after, tf32_cudnn_after, optimizer_constructed);
+    std::cout << "VRPO Q/reference preflight "
+              << (valid ? "VALID" : "INVALID") << ": "
+              << absl::GetFlag(FLAGS_vrpo_q_preflight_output) << "\n";
     return valid ? 0 : 3;
   }
   if (numerical_parity) {
