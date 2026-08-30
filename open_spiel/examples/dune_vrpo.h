@@ -11,6 +11,7 @@
 #include <limits>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1669,8 +1670,17 @@ inline bool ComputeVrpoCapturedEpisodeReference(
 
 enum class VrpoPhase4Algorithm { kPpo, kVrpo };
 
+inline bool VrpoPhase4AlgorithmValid(VrpoPhase4Algorithm algorithm) {
+  return algorithm == VrpoPhase4Algorithm::kPpo ||
+      algorithm == VrpoPhase4Algorithm::kVrpo;
+}
+
 inline std::string VrpoPhase4AlgorithmName(VrpoPhase4Algorithm algorithm) {
-  return algorithm == VrpoPhase4Algorithm::kPpo ? "ppo" : "vrpo";
+  switch (algorithm) {
+    case VrpoPhase4Algorithm::kPpo: return "ppo";
+    case VrpoPhase4Algorithm::kVrpo: return "vrpo";
+  }
+  throw std::invalid_argument("invalid VRPO phase4 algorithm enum");
 }
 
 struct VrpoPhase4ArmConfig {
@@ -1771,6 +1781,7 @@ struct VrpoPhase4ManifestBinding {
   std::string q_names_shapes_sha256;
   std::string module_layout_sha256;
   std::string optimizer_zero_state_sha256;
+  std::string optimizer_groups_sha256;
   uint64_t q_init_seed = 0;
   std::string experiment_uuid;
   uint64_t base_seed = 0;
@@ -1829,8 +1840,7 @@ inline json::Object VrpoPhase4FingerprintObject(
   out["reward_convention_sha256"] =
       kVrpoZeroShapingRewardConventionSha256;
   out["module_layout_sha256"] = binding.module_layout_sha256;
-  out["optimizer_groups_sha256"] = VrpoOptimizerGroupSpecSha256(
-      CanonicalVrpoPhase4OptimizerGroups());
+  out["optimizer_groups_sha256"] = binding.optimizer_groups_sha256;
   const auto optimizer_groups = CanonicalVrpoPhase4OptimizerGroups();
   out["optimizer_group_count"] =
       static_cast<int64_t>(optimizer_groups.size());
@@ -1894,6 +1904,10 @@ inline json::Object BuildVrpoPhase4Manifest(
 
 inline bool ValidateVrpoPhase4ArmConfig(
     const VrpoPhase4ArmConfig& config, std::string* error) {
+  if (!VrpoPhase4AlgorithmValid(config.algorithm)) {
+    if (error != nullptr) *error = "phase4 algorithm enum is invalid";
+    return false;
+  }
   const auto canonical = CanonicalVrpoPhase4Arms();
   for (const auto& expected : canonical) {
     if (config.arm_id != expected.arm_id) continue;
@@ -1931,7 +1945,8 @@ inline bool ValidateVrpoPhase4ManifestBinding(
         &binding.source_code_sha256, &binding.actor_subset_sha256,
         &binding.actor_names_shapes_sha256, &binding.q_init_sha256,
         &binding.q_names_shapes_sha256, &binding.module_layout_sha256,
-        &binding.optimizer_zero_state_sha256}) {
+        &binding.optimizer_zero_state_sha256,
+        &binding.optimizer_groups_sha256}) {
     if (!lower_hex64(*digest)) {
       return fail("phase4 binding contains an invalid SHA-256");
     }
@@ -1941,6 +1956,10 @@ inline bool ValidateVrpoPhase4ManifestBinding(
       binding.actor_action_dim != kVrpoDuneActionDim ||
       binding.actor_residual_blocks != 8) {
     return fail("phase4 binding actor architecture is invalid");
+  }
+  if (binding.optimizer_groups_sha256 != VrpoOptimizerGroupSpecSha256(
+          CanonicalVrpoPhase4OptimizerGroups())) {
+    return fail("phase4 binding optimizer group hash is not canonical");
   }
   const std::string& uuid = binding.experiment_uuid;
   if (uuid.size() != 36) return fail("phase4 experiment UUID is invalid");

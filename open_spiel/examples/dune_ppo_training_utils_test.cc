@@ -51,6 +51,7 @@
 #include "dune_ppo_numerical_parity.h"
 #include "dune_sha256.h"
 #include "dune_vrpo.h"
+#include "dune_vrpo_checkpoint.h"
 #include <chrono>
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -3061,6 +3062,7 @@ void TestVrpoPhase4aSchemaAndBootstrapContracts() {
     binding.q_names_shapes_sha256 = boots[0].q_names_shapes_sha256;
     binding.module_layout_sha256 = boots[0].module_layout_sha256;
     binding.optimizer_zero_state_sha256 = zero_state;
+    binding.optimizer_groups_sha256 = VrpoOptimizerGroupSpecSha256(groups);
     binding.q_init_seed = q_seed;
     binding.experiment_uuid = "12345678-1234-1234-1234-123456789abc";
     binding.base_seed = 8301000;
@@ -3163,6 +3165,493 @@ void TestVrpoPhase4aSchemaAndBootstrapContracts() {
     std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
                                std::istreambuf_iterator<char>());
     UTILS_CHECK(trainer_source.find("BuildVrpoPhase4Manifest") ==
+                std::string::npos);
+  } TEST_END();
+}
+
+struct TinyVrpoQCheckpointModule : torch::nn::Module {
+  torch::nn::Linear input_layer{nullptr};
+  torch::nn::Linear q_head{nullptr};
+  TinyVrpoQCheckpointModule() {
+    input_layer = register_module("input_layer", torch::nn::Linear(8, 6));
+    q_head = register_module("q_head", torch::nn::Linear(6, 12));
+  }
+  torch::Tensor forward(torch::Tensor input) {
+    return q_head->forward(torch::relu(input_layer->forward(input)));
+  }
+};
+
+void TestVrpoPhase4bExpandedCheckpointRoundtrip() {
+  TEST_BEGIN("VRPO phase 4b: atomic expanded checkpoint roundtrip and fail-closed files") {
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() /
+        ("dune_vrpo_phase4b_test_" + std::to_string(::getpid()));
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(root, cleanup_ec);
+    std::filesystem::create_directories(root);
+    const auto arms = CanonicalVrpoPhase4Arms();
+    constexpr uint64_t q_seed = 20260831;
+    torch::manual_seed(4567);
+    auto source_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        8, 16, 7, 1, false);
+    torch::manual_seed(q_seed);
+    auto source_q = std::make_shared<TinyVrpoQCheckpointModule>();
+    VrpoFreshOptimizers source_optimizers;
+    std::string error;
+    UTILS_CHECK(MakeVrpoFreshOptimizers(
+        *source_actor, *source_q, &source_optimizers, &error));
+    std::set<std::string> actor_covered;
+    actor_covered.insert(source_optimizers.actor_policy_names.begin(),
+                         source_optimizers.actor_policy_names.end());
+    actor_covered.insert(source_optimizers.actor_trunk_value_names.begin(),
+                         source_optimizers.actor_trunk_value_names.end());
+    CHECK_EQ(actor_covered.size(), source_actor->named_parameters().size());
+    std::set<std::string> policy_names(
+        source_optimizers.actor_policy_names.begin(),
+        source_optimizers.actor_policy_names.end());
+    for (const auto& name : source_optimizers.actor_trunk_value_names) {
+      UTILS_CHECK(!policy_names.count(name));
+    }
+    CHECK_EQ(source_optimizers.q_names.size(),
+             source_q->named_parameters().size());
+    std::string zero_state;
+    UTILS_CHECK(ValidateVrpoOptimizerGroupsAndZeroState(
+        source_optimizers, *source_actor, *source_q,
+        &zero_state, &error));
+    auto require_optimizer_reject = [&](VrpoFreshOptimizers& malformed) {
+      std::string rejected_identity;
+      UTILS_CHECK(!ValidateVrpoOptimizerGroupsAndZeroState(
+          malformed, *source_actor, *source_q,
+          &rejected_identity, &error));
+      UTILS_CHECK(rejected_identity.empty());
+    };
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      std::swap(malformed.actor->param_groups()[0].params()[0],
+                malformed.actor->param_groups()[1].params()[0]);
+      require_optimizer_reject(malformed);
+    }
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      malformed.actor->param_groups()[1].params().push_back(
+          malformed.actor->param_groups()[0].params()[0]);
+      require_optimizer_reject(malformed);
+    }
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      auto key = malformed.actor->param_groups()[0]
+                     .params()[0]
+                     .unsafeGetTensorImpl();
+      malformed.actor->state().erase(key);
+      require_optimizer_reject(malformed);
+    }
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      torch::Tensor extra = torch::zeros({1});
+      auto state = std::make_unique<torch::optim::AdamWParamState>();
+      state->step(0);
+      state->exp_avg(torch::zeros_like(extra));
+      state->exp_avg_sq(torch::zeros_like(extra));
+      malformed.actor->state()[extra.unsafeGetTensorImpl()] =
+          std::move(state);
+      require_optimizer_reject(malformed);
+    }
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      malformed.actor_group_names[0] = "swapped_name";
+      require_optimizer_reject(malformed);
+    }
+    {
+      VrpoFreshOptimizers malformed;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *source_actor, *source_q, &malformed, &error));
+      auto& options = static_cast<torch::optim::AdamWOptions&>(
+          malformed.q->param_groups()[0].options());
+      options.weight_decay(0.1);
+      require_optimizer_reject(malformed);
+    }
+
+    std::vector<VrpoNamedParameterIdentity> actor_identities;
+    std::vector<VrpoNamedParameterIdentity> q_identities;
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *source_actor, nullptr, &actor_identities, &error));
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *source_q, nullptr, &q_identities, &error));
+    VrpoPhase4ManifestBinding binding;
+    binding.source_actor_model_sha256 = std::string(64, '1');
+    binding.source_actor_manifest_sha256 = std::string(64, '2');
+    binding.source_code_sha256 = std::string(64, '3');
+    binding.actor_subset_sha256 =
+        VrpoNamedParameterIdentitySha256(actor_identities, true);
+    binding.actor_names_shapes_sha256 =
+        VrpoNamedParameterIdentitySha256(actor_identities, false);
+    binding.q_init_sha256 =
+        VrpoNamedParameterIdentitySha256(q_identities, true);
+    binding.q_names_shapes_sha256 =
+        VrpoNamedParameterIdentitySha256(q_identities, false);
+    std::string layout_payload = "dune_vrpo_phase4_module_layout_v1";
+    layout_payload.push_back('\0');
+    layout_payload += binding.actor_names_shapes_sha256;
+    layout_payload += binding.q_names_shapes_sha256;
+    binding.module_layout_sha256 = ComputeStringSHA256(layout_payload);
+    binding.optimizer_zero_state_sha256 = zero_state;
+    binding.optimizer_groups_sha256 = VrpoOptimizerGroupSpecSha256(
+        CanonicalVrpoPhase4OptimizerGroups());
+    binding.q_init_seed = q_seed;
+    binding.experiment_uuid = "12345678-1234-1234-1234-123456789abc";
+    binding.base_seed = 8302000;
+    binding.start_episode_id = 1000020000;
+    binding.end_episode_id_inclusive = 1000020039;
+    UTILS_CHECK(ValidateVrpoPhase4ManifestBinding(binding, &error));
+    VrpoExpandedExpectedLayout serialized_layout;
+    serialized_layout.label = "tiny_test_fixture_v1";
+    serialized_layout.test_fixture = true;
+    serialized_layout.actor_observation_dim = 8;
+    serialized_layout.actor_hidden_dim = 16;
+    serialized_layout.actor_action_dim = 7;
+    serialized_layout.actor_residual_blocks = 1;
+    serialized_layout.actor_names_shapes_sha256 =
+        binding.actor_names_shapes_sha256;
+    serialized_layout.q_names_shapes_sha256 =
+        binding.q_names_shapes_sha256;
+    UTILS_CHECK(ValidateVrpoExpandedLiveLayout(
+        *source_actor, *source_q, serialized_layout, binding, &error));
+
+    const torch::Tensor actor_probe = torch::randn({3, 8});
+    const torch::Tensor q_probe = torch::randn({3, 8});
+    torch::Tensor expected_actor_logits;
+    torch::Tensor expected_actor_values;
+    torch::Tensor expected_q;
+    {
+      torch::NoGradGuard no_grad;
+      const auto actor_output = source_actor->forward(actor_probe);
+      expected_actor_logits = actor_output.logits.clone();
+      expected_actor_values = actor_output.values.clone();
+      expected_q = source_q->forward(q_probe).clone();
+    }
+
+    std::array<json::Object, 4> expanded_manifests;
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      const auto directory = root / ("arm_" + std::to_string(arm));
+      const std::string uuid =
+          "00000000-0000-4000-8000-00000000000" +
+          std::to_string(arm);
+      VrpoExpandedArchiveIdentity saved_archive_identity;
+      UTILS_CHECK(SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[arm], binding, serialized_layout, uuid, 0,
+          binding.start_episode_id, source_actor, source_q,
+          source_optimizers, VrpoCheckpointFailurePoint::kNone, &error,
+          &saved_archive_identity));
+      UTILS_CHECK(saved_archive_identity.combined_sha256.size() == 64);
+      for (const auto& file : saved_archive_identity.files) {
+        UTILS_CHECK(file.size > 0);
+        UTILS_CHECK(file.sha256.size() == 64);
+      }
+      UTILS_CHECK(std::filesystem::is_regular_file(
+          VrpoExpandedPaths(directory).manifest));
+      UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[arm], binding, serialized_layout, uuid, 0,
+          binding.start_episode_id, source_actor, source_q,
+          source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+
+      torch::manual_seed(9999 + arm);
+      auto loaded_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          8, 16, 7, 1, false);
+      torch::manual_seed(1111 + arm);
+      auto loaded_q = std::make_shared<TinyVrpoQCheckpointModule>();
+      VrpoFreshOptimizers loaded_optimizers;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *loaded_actor, *loaded_q, &loaded_optimizers, &error));
+      VrpoExpandedArchiveIdentity loaded_archive_identity;
+      UTILS_CHECK(LoadAndValidateVrpoExpandedCheckpoint(
+          directory, arms[arm], binding, serialized_layout,
+          loaded_actor, loaded_q,
+          loaded_optimizers, &expanded_manifests[arm], &error,
+          &loaded_archive_identity));
+      CHECK_EQ(loaded_archive_identity.combined_sha256,
+               saved_archive_identity.combined_sha256);
+      {
+        torch::NoGradGuard no_grad;
+        const auto actor_output = loaded_actor->forward(actor_probe);
+        UTILS_CHECK(torch::equal(actor_output.logits,
+                                 expected_actor_logits));
+        UTILS_CHECK(torch::equal(actor_output.values,
+                                 expected_actor_values));
+        UTILS_CHECK(torch::equal(loaded_q->forward(q_probe), expected_q));
+      }
+      std::string loaded_zero;
+      UTILS_CHECK(ValidateVrpoOptimizerGroupsAndZeroState(
+          loaded_optimizers, *loaded_actor, *loaded_q,
+          &loaded_zero, &error));
+      CHECK_EQ(loaded_zero, zero_state);
+      UTILS_CHECK(!expanded_manifests[arm]
+                       .at("source_optimizer_moments_loaded")
+                       .GetBool());
+    }
+    UTILS_CHECK(ValidateVrpoExpandedManifestSet(
+        expanded_manifests, arms, binding, &error));
+    auto swapped_set = expanded_manifests;
+    std::swap(swapped_set[0]["phase4_contract"],
+              swapped_set[1]["phase4_contract"]);
+    UTILS_CHECK(!ValidateVrpoExpandedManifestSet(
+        swapped_set, arms, binding, &error));
+    auto invalid_enum_set = expanded_manifests;
+    invalid_enum_set[0]["phase4_contract"].GetObject()["algorithm"] =
+        "invalid";
+    UTILS_CHECK(!ValidateVrpoExpandedManifestSet(
+        invalid_enum_set, arms, binding, &error));
+
+    // An independently valid archive may be internally self-consistent yet
+    // belong to a different registered boot identity. File hashes must pass;
+    // rejection must occur only after deserialization against the EXTERNAL
+    // binding supplied by the caller.
+    torch::manual_seed(7654);
+    auto alternate_actor =
+        std::make_shared<SharedDunePolicyValueNetImpl>(8, 16, 7, 1, false);
+    torch::manual_seed(q_seed + 1);
+    auto alternate_q = std::make_shared<TinyVrpoQCheckpointModule>();
+    VrpoFreshOptimizers alternate_optimizers;
+    UTILS_CHECK(MakeVrpoFreshOptimizers(
+        *alternate_actor, *alternate_q, &alternate_optimizers, &error));
+    std::vector<VrpoNamedParameterIdentity> alternate_actor_identities;
+    std::vector<VrpoNamedParameterIdentity> alternate_q_identities;
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *alternate_actor, nullptr, &alternate_actor_identities, &error));
+    UTILS_CHECK(VrpoNamedParameterIdentities(
+        *alternate_q, nullptr, &alternate_q_identities, &error));
+    std::string alternate_zero;
+    UTILS_CHECK(ValidateVrpoOptimizerGroupsAndZeroState(
+        alternate_optimizers, *alternate_actor, *alternate_q,
+        &alternate_zero, &error));
+    VrpoPhase4ManifestBinding alternate_binding = binding;
+    alternate_binding.source_actor_model_sha256 = std::string(64, '4');
+    alternate_binding.source_actor_manifest_sha256 = std::string(64, '5');
+    alternate_binding.actor_subset_sha256 =
+        VrpoNamedParameterIdentitySha256(alternate_actor_identities, true);
+    alternate_binding.actor_names_shapes_sha256 =
+        VrpoNamedParameterIdentitySha256(alternate_actor_identities, false);
+    alternate_binding.q_init_sha256 =
+        VrpoNamedParameterIdentitySha256(alternate_q_identities, true);
+    alternate_binding.q_names_shapes_sha256 =
+        VrpoNamedParameterIdentitySha256(alternate_q_identities, false);
+    std::string alternate_layout_payload =
+        "dune_vrpo_phase4_module_layout_v1";
+    alternate_layout_payload.push_back('\0');
+    alternate_layout_payload += alternate_binding.actor_names_shapes_sha256;
+    alternate_layout_payload += alternate_binding.q_names_shapes_sha256;
+    alternate_binding.module_layout_sha256 =
+        ComputeStringSHA256(alternate_layout_payload);
+    alternate_binding.optimizer_zero_state_sha256 = alternate_zero;
+    alternate_binding.q_init_seed = q_seed + 1;
+    VrpoExpandedExpectedLayout alternate_layout = serialized_layout;
+    alternate_layout.actor_names_shapes_sha256 =
+        alternate_binding.actor_names_shapes_sha256;
+    alternate_layout.q_names_shapes_sha256 =
+        alternate_binding.q_names_shapes_sha256;
+    const auto external_mismatch_directory = root / "external_identity";
+    UTILS_CHECK(SaveVrpoExpandedCheckpointAtomic(
+        external_mismatch_directory, arms[0], alternate_binding,
+        alternate_layout, "99999999-9999-4999-8999-999999999999", 0,
+        alternate_binding.start_episode_id, alternate_actor, alternate_q,
+        alternate_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+    auto external_actor_target =
+        std::make_shared<SharedDunePolicyValueNetImpl>(8, 16, 7, 1, false);
+    auto external_q_target = std::make_shared<TinyVrpoQCheckpointModule>();
+    VrpoFreshOptimizers external_optimizers_target;
+    UTILS_CHECK(MakeVrpoFreshOptimizers(
+        *external_actor_target, *external_q_target,
+        &external_optimizers_target, &error));
+    json::Object external_manifest;
+    UTILS_CHECK(!LoadAndValidateVrpoExpandedCheckpoint(
+        external_mismatch_directory, arms[0], binding, serialized_layout,
+        external_actor_target, external_q_target,
+        external_optimizers_target, &external_manifest, &error));
+    UTILS_CHECK(error.find("external registered binding") !=
+                std::string::npos);
+    CleanupVrpoExpandedDirectory(
+        VrpoExpandedPaths(external_mismatch_directory));
+
+    const std::array<VrpoCheckpointFailurePoint, 10> failure_points = {
+        VrpoCheckpointFailurePoint::kAfterActorTemp,
+        VrpoCheckpointFailurePoint::kAfterQTemp,
+        VrpoCheckpointFailurePoint::kAfterActorOptimizerTemp,
+        VrpoCheckpointFailurePoint::kAfterQOptimizerTemp,
+        VrpoCheckpointFailurePoint::kAfterManifestTemp,
+        VrpoCheckpointFailurePoint::kAfterActorRename,
+        VrpoCheckpointFailurePoint::kAfterQRename,
+        VrpoCheckpointFailurePoint::kAfterActorOptimizerRename,
+        VrpoCheckpointFailurePoint::kAfterQOptimizerRename,
+        VrpoCheckpointFailurePoint::kNone};
+    for (size_t index = 0; index + 1 < failure_points.size(); ++index) {
+      const auto directory = root / ("failure_" + std::to_string(index));
+      UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[0], binding, serialized_layout,
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 0,
+          binding.start_episode_id, source_actor, source_q,
+          source_optimizers, failure_points[index], &error));
+      UTILS_CHECK(!std::filesystem::exists(directory));
+    }
+    auto require_binding_reject = [&](VrpoPhase4ManifestBinding mutated,
+                                      const std::string& label) {
+      const auto directory = root / ("binding_" + label);
+      UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[0], mutated, serialized_layout,
+          "cccccccc-cccc-4ccc-8ccc-cccccccccccc", 0,
+          mutated.start_episode_id, source_actor, source_q,
+          source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+      UTILS_CHECK(!std::filesystem::exists(directory));
+    };
+    auto mutated_binding = binding;
+    mutated_binding.actor_subset_sha256 = std::string(64, 'a');
+    require_binding_reject(mutated_binding, "actor");
+    mutated_binding = binding;
+    mutated_binding.q_init_sha256 = std::string(64, 'b');
+    require_binding_reject(mutated_binding, "q");
+    mutated_binding = binding;
+    mutated_binding.module_layout_sha256 = std::string(64, 'c');
+    require_binding_reject(mutated_binding, "layout");
+    mutated_binding = binding;
+    mutated_binding.optimizer_groups_sha256 = std::string(64, 'd');
+    require_binding_reject(mutated_binding, "groups");
+    const auto wrong_next_directory = root / "wrong_next";
+    UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+        wrong_next_directory, arms[0], binding, serialized_layout,
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 0,
+        binding.start_episode_id + 1, source_actor, source_q,
+        source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+    UTILS_CHECK(!std::filesystem::exists(wrong_next_directory));
+    auto invalid_arm = arms[0];
+    invalid_arm.algorithm = static_cast<VrpoPhase4Algorithm>(99);
+    UTILS_CHECK(!ValidateVrpoPhase4ArmConfig(invalid_arm, &error));
+    bool invalid_name_threw = false;
+    try {
+      (void)VrpoPhase4AlgorithmName(invalid_arm.algorithm);
+    } catch (const std::invalid_argument&) {
+      invalid_name_threw = true;
+    }
+    UTILS_CHECK(invalid_name_threw);
+    const auto invalid_enum_directory = root / "invalid_enum";
+    UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+        invalid_enum_directory, invalid_arm, binding, serialized_layout,
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 0,
+        binding.start_episode_id, source_actor, source_q,
+        source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+    UTILS_CHECK(!std::filesystem::exists(invalid_enum_directory));
+    auto false_production_layout = serialized_layout;
+    false_production_layout.test_fixture = false;
+    false_production_layout.label = "production_dune_vrpo_layout_v1";
+    const auto false_production_directory = root / "false_production";
+    UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+        false_production_directory, arms[0], binding,
+        false_production_layout,
+        "ffffffff-ffff-4fff-8fff-ffffffffffff", 0,
+        binding.start_episode_id, source_actor, source_q,
+        source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+    UTILS_CHECK(!std::filesystem::exists(false_production_directory));
+    auto require_layout_reject = [&](VrpoExpandedExpectedLayout layout,
+                                     const std::string& label) {
+      const auto directory = root / ("layout_" + label);
+      UTILS_CHECK(!SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[0], binding, layout,
+          "abababab-abab-4aba-8aba-abababababab", 0,
+          binding.start_episode_id, source_actor, source_q,
+          source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+      UTILS_CHECK(!std::filesystem::exists(directory));
+    };
+    auto wrong_layout = serialized_layout;
+    wrong_layout.actor_action_dim = 8;
+    require_layout_reject(wrong_layout, "actor_shape");
+    wrong_layout = serialized_layout;
+    wrong_layout.q_names_shapes_sha256 = std::string(64, 'a');
+    require_layout_reject(wrong_layout, "q_shape");
+
+    auto make_mutation_fixture = [&](const std::string& label) {
+      const auto directory = root / label;
+      UTILS_CHECK(SaveVrpoExpandedCheckpointAtomic(
+          directory, arms[0], binding, serialized_layout,
+          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 0,
+          binding.start_episode_id, source_actor, source_q,
+          source_optimizers, VrpoCheckpointFailurePoint::kNone, &error));
+      return directory;
+    };
+    auto expect_load_reject = [&](const std::filesystem::path& directory) {
+      auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          8, 16, 7, 1, false);
+      auto q = std::make_shared<TinyVrpoQCheckpointModule>();
+      VrpoFreshOptimizers optimizers;
+      UTILS_CHECK(MakeVrpoFreshOptimizers(
+          *actor, *q, &optimizers, &error));
+      json::Object manifest;
+      UTILS_CHECK(!LoadAndValidateVrpoExpandedCheckpoint(
+          directory, arms[0], binding, serialized_layout,
+          actor, q, optimizers,
+          &manifest, &error));
+      CleanupVrpoExpandedDirectory(VrpoExpandedPaths(directory));
+    };
+    {
+      const auto directory = make_mutation_fixture("missing");
+      std::filesystem::remove(VrpoExpandedPaths(directory).q_optimizer);
+      expect_load_reject(directory);
+    }
+    {
+      const auto directory = make_mutation_fixture("extra");
+      std::ofstream(directory / "orphan.bin") << "orphan";
+      expect_load_reject(directory);
+    }
+    {
+      const auto directory = make_mutation_fixture("corrupt");
+      std::ofstream(VrpoExpandedPaths(directory).actor_model,
+                    std::ios::app | std::ios::binary) << "corrupt";
+      expect_load_reject(directory);
+    }
+    {
+      const auto directory = make_mutation_fixture("swapped");
+      const auto paths = VrpoExpandedPaths(directory);
+      const auto temporary = directory / "swap.tmp";
+      std::filesystem::rename(paths.actor_model, temporary);
+      std::filesystem::rename(paths.q_model, paths.actor_model);
+      std::filesystem::rename(temporary, paths.q_model);
+      expect_load_reject(directory);
+    }
+    {
+      const auto directory = make_mutation_fixture("swapped_optimizers");
+      const auto paths = VrpoExpandedPaths(directory);
+      const auto temporary = directory / "swap_optimizer.tmp";
+      std::filesystem::rename(paths.actor_optimizer, temporary);
+      std::filesystem::rename(paths.q_optimizer, paths.actor_optimizer);
+      std::filesystem::rename(temporary, paths.q_optimizer);
+      expect_load_reject(directory);
+    }
+    {
+      const auto directory = make_mutation_fixture("partial_manifest");
+      json::Object manifest;
+      UTILS_CHECK(ReadVrpoExpandedManifest(directory, &manifest, &error));
+      manifest.erase("q_model_sha256");
+      std::ofstream(VrpoExpandedPaths(directory).manifest, std::ios::trunc)
+          << json::ToString(manifest, true) << "\n";
+      expect_load_reject(directory);
+    }
+    for (size_t arm = 0; arm < arms.size(); ++arm) {
+      CleanupVrpoExpandedDirectory(
+          VrpoExpandedPaths(root / ("arm_" + std::to_string(arm))));
+    }
+    std::filesystem::remove_all(root, cleanup_ec);
+    UTILS_CHECK(!std::filesystem::exists(root));
+
+    std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
+    std::string trainer_source((std::istreambuf_iterator<char>(trainer)),
+                               std::istreambuf_iterator<char>());
+    UTILS_CHECK(trainer_source.find("dune_vrpo_checkpoint.h") ==
                 std::string::npos);
   } TEST_END();
 }
@@ -3480,6 +3969,7 @@ int main() {
   TestVrpoCaptureStartupAndLazyOptimizerContracts();
   TestVrpoQReferencePreflightContracts();
   TestVrpoPhase4aSchemaAndBootstrapContracts();
+  TestVrpoPhase4bExpandedCheckpointRoundtrip();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
