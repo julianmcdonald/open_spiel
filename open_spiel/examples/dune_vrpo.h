@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -656,6 +657,222 @@ struct VrpoCapturedEpisode {
   bool rewards_finalized = false;
   std::string capture_sha256;
 };
+
+inline bool ValidateVrpoCapturedEpisode(const VrpoCapturedEpisode& episode,
+                                        std::string* error);
+
+class VrpoCapturedEpisodeBuffer {
+ public:
+  bool PublishValidated(VrpoCapturedEpisode episode, std::string* error) {
+    std::string validation_error;
+    if (!ValidateVrpoCapturedEpisode(episode, &validation_error)) {
+      if (error != nullptr) {
+        *error = "refusing malformed VRPO episode publication: " +
+                 validation_error;
+      }
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!episode_ids_.insert(episode.episode_id).second) {
+      if (error != nullptr) *error = "duplicate VRPO episode ID";
+      return false;
+    }
+    episodes_.push_back(std::move(episode));
+    return true;
+  }
+
+  std::vector<VrpoCapturedEpisode> TakeSorted() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::sort(episodes_.begin(), episodes_.end(),
+              [](const auto& first, const auto& second) {
+                return first.episode_id < second.episode_id;
+              });
+    std::vector<VrpoCapturedEpisode> result = std::move(episodes_);
+    episodes_.clear();
+    episode_ids_.clear();
+    return result;
+  }
+
+  size_t Size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return episodes_.size();
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::set<uint64_t> episode_ids_;
+  std::vector<VrpoCapturedEpisode> episodes_;
+};
+
+struct VrpoCaptureStartupConfig {
+  std::string game;
+  std::string registration_id;
+  std::string source_root;
+  std::string source_sha256;
+  bool diagnostics_only = false;
+  std::string init_mode;
+  int rollout_games = 0;
+  int threads = 0;
+  bool rollout_amp = true;
+  bool train_amp = true;
+  bool allow_tf32 = true;
+  bool pipeline = false;
+  bool online_search_collection = false;
+  bool search_pi_mode = false;
+  bool train_value_only = false;
+  bool sample_counterfactual_states = false;
+  bool has_search_label_dir = false;
+  double shaped_reward_weight = 0.0;
+  double tleilaxu_breadcrumb_weight = 0.0;
+  double tleilaxu_level7_breadcrumb_weight = 0.0;
+  double specimen_exchange_penalty = 0.0;
+  double reward_scale = 4.0;
+  double gamma = 1.0;
+  double lambda = 1.0;
+};
+
+inline bool ValidateVrpoCaptureStartupConfig(
+    const VrpoCaptureStartupConfig& config, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  auto lower_hex64 = [](const std::string& value) {
+    return value.size() == 64 &&
+           std::all_of(value.begin(), value.end(), [](char c) {
+             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+  };
+  if (config.game != "dune_imperium") return fail("VRPO capture requires exact Dune game");
+  if (!config.diagnostics_only || config.init_mode != "diagnostic") {
+    return fail("VRPO capture requires diagnostics_only diagnostic init");
+  }
+  if (config.registration_id.empty() || config.source_root.empty() ||
+      !lower_hex64(config.source_sha256)) {
+    return fail("VRPO capture registration/source identity is invalid");
+  }
+  if (config.rollout_games < 1 || config.rollout_games > 4 ||
+      config.threads < 1 || config.threads > 4) {
+    return fail("VRPO capture games/threads exceed registered ceilings");
+  }
+  if (config.rollout_amp || config.train_amp || !config.allow_tf32) {
+    return fail("VRPO capture requires FP32 rollout/learner and TF32 enabled");
+  }
+  if (config.pipeline || config.online_search_collection ||
+      config.search_pi_mode || config.train_value_only ||
+      config.sample_counterfactual_states || config.has_search_label_dir) {
+    return fail("VRPO capture forbids training/search/counterfactual paths");
+  }
+  for (double coefficient :
+       {config.shaped_reward_weight, config.tleilaxu_breadcrumb_weight,
+        config.tleilaxu_level7_breadcrumb_weight,
+        config.specimen_exchange_penalty}) {
+    if (!std::isfinite(coefficient) || coefficient != 0.0) {
+      return fail("VRPO capture requires all shaping coefficients exactly zero");
+    }
+  }
+  if (config.reward_scale != 4.0 || !std::isfinite(config.gamma) ||
+      config.gamma < 0.0 || config.gamma > 1.0 ||
+      !std::isfinite(config.lambda) || config.lambda < 0.0 ||
+      config.lambda > 1.0) {
+    return fail("VRPO capture reward scale/gamma/lambda is invalid");
+  }
+  return true;
+}
+
+inline bool VrpoCaptureShouldConstructOptimizer(bool capture_active) {
+  return !capture_active;
+}
+
+struct VrpoRolloutPairingView {
+  uint64_t episode_id = 0;
+  Player actor = kInvalidPlayer;
+  const std::vector<float>* actor_observation = nullptr;
+  const std::vector<Action>* legal_actions = nullptr;
+  Action action = kInvalidAction;
+  float chosen_log_probability = 0.0f;
+};
+
+inline bool ValidateVrpoCaptureRolloutPairing(
+    const VrpoCapturedRow& captured, const VrpoRolloutPairingView& rollout,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (rollout.actor_observation == nullptr || rollout.legal_actions == nullptr) {
+    return fail("capture/rollout pairing view is incomplete");
+  }
+  if (captured.episode_id != rollout.episode_id) {
+    return fail("capture/rollout episode mismatch");
+  }
+  if (captured.actor != rollout.actor) {
+    return fail("capture/rollout actor mismatch");
+  }
+  if (captured.actor_observation.size() != rollout.actor_observation->size() ||
+      std::memcmp(captured.actor_observation.data(),
+                  rollout.actor_observation->data(),
+                  captured.actor_observation.size() * sizeof(float)) != 0) {
+    return fail("capture/rollout actor observation mismatch");
+  }
+  if (captured.legal_actions != *rollout.legal_actions) {
+    return fail("capture/rollout ordered legal actions mismatch");
+  }
+  if (captured.chosen_action != rollout.action) {
+    return fail("capture/rollout chosen action mismatch");
+  }
+  if (captured.chosen_index < 0 ||
+      captured.chosen_index >=
+          static_cast<int>(captured.legal_behavior_probabilities.size())) {
+    return fail("capture chosen index is invalid for pairing");
+  }
+  const double probability =
+      captured.legal_behavior_probabilities[captured.chosen_index];
+  const float expected_log = static_cast<float>(std::log(probability));
+  if (rollout.chosen_log_probability != expected_log) {
+    return fail("capture/rollout chosen log-probability mismatch");
+  }
+  return true;
+}
+
+inline bool ValidateVrpoSortedEpisodeIds(
+    const std::vector<VrpoCapturedEpisode>& episodes,
+    uint64_t start_episode_id, int rollout_games, std::string* error) {
+  if (rollout_games <= 0 ||
+      episodes.size() != static_cast<size_t>(rollout_games)) {
+    if (error != nullptr) *error = "captured episode count mismatch";
+    return false;
+  }
+  for (int i = 0; i < rollout_games; ++i) {
+    if (episodes[i].episode_id != start_episode_id + i) {
+      if (error != nullptr) *error = "captured episode IDs are not exact/sorted";
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool ValidateVrpoCaptureRewardMetadata(
+    const VrpoCapturedEpisode& episode, double registered_reward_scale,
+    double registered_gamma, double registered_lambda,
+    double registered_probability_tolerance, std::string* error) {
+  const bool valid = episode.reward_scale == registered_reward_scale &&
+      episode.gamma == registered_gamma &&
+      episode.lambda == registered_lambda &&
+      episode.probability_tolerance == registered_probability_tolerance;
+  if (!valid && error != nullptr) {
+    *error = "captured reward metadata differs from registered values";
+  }
+  return valid;
+}
+
+inline std::vector<std::string> VrpoCaptureSourceRelativePaths() {
+  return {"open_spiel/examples/dune_ppo_train.cc",
+          "open_spiel/examples/dune_network.h",
+          "open_spiel/examples/dune_vrpo.h",
+          "open_spiel/games/dune_imperium/dune_imperium.h",
+          "open_spiel/games/dune_imperium/dune_imperium.cc"};
+}
 
 struct VrpoZeroShapingRewardConfig {
   double reward_scale = 4.0;

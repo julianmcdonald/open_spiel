@@ -987,6 +987,56 @@ void TestSamplePolicyActionTinyProbabilityNotFloored() {
   } TEST_END();
 }
 
+void TestSamplePolicyDistributionWrapperParity() {
+  TEST_BEGIN("VRPO phase 3a: distribution sampler is bit/RNG identical to legacy pair API") {
+    const std::vector<std::vector<float>> logits_cases = {
+        {0.0f, 1.0f, -2.0f, 3.0f},
+        {-100.0f, 0.0f, 100.0f, -30.0f},
+        {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f, 0.0f}};
+    const std::vector<Action> legal = {0, 1, 2, 3};
+    for (uint64_t seed = 1; seed <= 32; ++seed) {
+      for (const auto& logits : logits_cases) {
+        std::mt19937_64 pair_rng(seed);
+        std::mt19937_64 full_rng(seed);
+        const auto pair = SamplePolicyAction(&pair_rng, logits, legal);
+        std::vector<double> probabilities;
+        const PolicyDistributionSample full =
+            SamplePolicyDistribution(&full_rng, logits, legal,
+                                     &probabilities);
+        CHECK_EQ(pair.first, full.action);
+        CHECK_EQ(pair.second, full.chosen_log_probability);
+        CHECK_EQ(full.action, legal[full.chosen_index]);
+        CHECK_EQ(probabilities.size(), legal.size());
+        double mass = 0.0;
+        for (double probability : probabilities) {
+          UTILS_CHECK(std::isfinite(probability));
+          UTILS_CHECK(probability >= 0.0);
+          mass += probability;
+        }
+        UTILS_CHECK(std::abs(mass - 1.0) < 1e-12);
+        CHECK_EQ(full.chosen_log_probability,
+                 static_cast<float>(std::log(
+                     probabilities[full.chosen_index])));
+        CHECK_EQ(pair_rng(), full_rng());
+
+        std::mt19937_64 inactive_rng(seed);
+        int64_t output_writes = 0;
+        const auto inactive =
+            policy_sampling_internal::SamplePolicyDistributionImpl(
+                &inactive_rng, logits, legal,
+                /*ordered_legal_probabilities=*/nullptr,
+                /*chosen_index=*/nullptr, &output_writes);
+        CHECK_EQ(inactive.first, pair.first);
+        CHECK_EQ(inactive.second, pair.second);
+        CHECK_EQ(output_writes, int64_t{0});
+        std::mt19937_64 pair_next(seed);
+        (void)SamplePolicyAction(&pair_next, logits, legal);
+        CHECK_EQ(inactive_rng(), pair_next());
+      }
+    }
+  } TEST_END();
+}
+
 // PPO finding 2: the [18B Aux] metrics existed only on stdout.
 static PpoUpdateStats MakeAuxDiagnosticsStats() {
   PpoUpdateStats stats;
@@ -2496,6 +2546,182 @@ void TestVrpoCapturedEpisodeAndZeroShapingRewards() {
         std::numeric_limits<double>::infinity();
     UTILS_CHECK(!VrpoCapturedEpisodeToTimeline(
         episode, wrong_q, &timeline, &error));
+
+    VrpoCapturedEpisodeBuffer buffer;
+    malformed = episode;
+    malformed.rows[0].row_sha256 = std::string(64, '0');
+    UTILS_CHECK(!buffer.PublishValidated(malformed, &error));
+    CHECK_EQ(buffer.Size(), static_cast<size_t>(0));
+    UTILS_CHECK(buffer.PublishValidated(episode, &error));
+    CHECK_EQ(buffer.Size(), static_cast<size_t>(1));
+    UTILS_CHECK(!buffer.PublishValidated(episode, &error));
+    UTILS_CHECK(error.find("duplicate") != std::string::npos);
+    VrpoCapturedEpisode earlier = make_episode();
+    earlier.episode_id = 100;
+    for (auto& row : earlier.rows) row.episode_id = 100;
+    UTILS_CHECK(FinalizeVrpoZeroShapingEpisode(
+        &earlier, terminal_returns, config, &error));
+    UTILS_CHECK(buffer.PublishValidated(earlier, &error));
+    std::vector<VrpoCapturedEpisode> sorted = buffer.TakeSorted();
+    CHECK_EQ(sorted.size(), static_cast<size_t>(2));
+    CHECK_EQ(sorted[0].episode_id, uint64_t{100});
+    CHECK_EQ(sorted[1].episode_id, uint64_t{101});
+
+    const VrpoCapturedRow& captured = episode.rows[0];
+    VrpoRolloutPairingView pairing;
+    pairing.episode_id = captured.episode_id;
+    pairing.actor = captured.actor;
+    pairing.actor_observation = &captured.actor_observation;
+    pairing.legal_actions = &captured.legal_actions;
+    pairing.action = captured.chosen_action;
+    pairing.chosen_log_probability = static_cast<float>(std::log(
+        captured.legal_behavior_probabilities[captured.chosen_index]));
+    UTILS_CHECK(ValidateVrpoCaptureRolloutPairing(
+        captured, pairing, &error));
+    auto bad_pairing = pairing;
+    bad_pairing.episode_id++;
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+    bad_pairing = pairing;
+    bad_pairing.actor = (captured.actor + 1) % 4;
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+    std::vector<float> bad_observation = captured.actor_observation;
+    bad_observation[0] += 1.0f;
+    bad_pairing = pairing;
+    bad_pairing.actor_observation = &bad_observation;
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+    std::vector<Action> bad_legal = captured.legal_actions;
+    std::reverse(bad_legal.begin(), bad_legal.end());
+    bad_pairing = pairing;
+    bad_pairing.legal_actions = &bad_legal;
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+    bad_pairing = pairing;
+    bad_pairing.action = captured.legal_actions[1 - captured.chosen_index];
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+    bad_pairing = pairing;
+    bad_pairing.chosen_log_probability += 1.0f;
+    UTILS_CHECK(!ValidateVrpoCaptureRolloutPairing(
+        captured, bad_pairing, &error));
+
+    UTILS_CHECK(ValidateVrpoSortedEpisodeIds(sorted, 100, 2, &error));
+    auto wrong_ids = sorted;
+    wrong_ids[1].episode_id = 102;
+    UTILS_CHECK(!ValidateVrpoSortedEpisodeIds(
+        wrong_ids, 100, 2, &error));
+    UTILS_CHECK(ValidateVrpoCaptureRewardMetadata(
+        episode, 4.0, 0.9, 0.8, 1e-9, &error));
+    UTILS_CHECK(!ValidateVrpoCaptureRewardMetadata(
+        episode, 3.0, 0.9, 0.8, 1e-9, &error));
+    UTILS_CHECK(!ValidateVrpoCaptureRewardMetadata(
+        episode, 4.0, 1.0, 0.8, 1e-9, &error));
+    UTILS_CHECK(!ValidateVrpoCaptureRewardMetadata(
+        episode, 4.0, 0.9, 1.0, 1e-9, &error));
+    UTILS_CHECK(!ValidateVrpoCaptureRewardMetadata(
+        episode, 4.0, 0.9, 0.8, 1e-6, &error));
+  } TEST_END();
+}
+
+void TestVrpoCaptureStartupAndLazyOptimizerContracts() {
+  TEST_BEGIN("VRPO phase 3a: startup gate, lazy optimizer, and status-last source contract") {
+    VrpoCaptureStartupConfig config;
+    config.game = "dune_imperium";
+    config.registration_id = "registered";
+    config.source_root = "/source";
+    config.source_sha256 = std::string(64, 'a');
+    config.diagnostics_only = true;
+    config.init_mode = "diagnostic";
+    config.rollout_games = 2;
+    config.threads = 2;
+    config.rollout_amp = false;
+    config.train_amp = false;
+    config.allow_tf32 = true;
+    std::string error;
+    UTILS_CHECK(ValidateVrpoCaptureStartupConfig(config, &error));
+    auto reject = [&](const VrpoCaptureStartupConfig& malformed,
+                      const std::string& needle) {
+      UTILS_CHECK(!ValidateVrpoCaptureStartupConfig(malformed, &error));
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    auto malformed = config;
+    malformed.game = "tic_tac_toe";
+    reject(malformed, "exact Dune");
+    malformed = config;
+    malformed.diagnostics_only = false;
+    reject(malformed, "diagnostics_only");
+    malformed = config;
+    malformed.init_mode = "checkpoint";
+    reject(malformed, "diagnostic init");
+    malformed = config;
+    malformed.rollout_games = 5;
+    reject(malformed, "ceilings");
+    malformed = config;
+    malformed.threads = 5;
+    reject(malformed, "ceilings");
+    malformed = config;
+    malformed.rollout_amp = true;
+    reject(malformed, "FP32");
+    malformed = config;
+    malformed.train_amp = true;
+    reject(malformed, "FP32");
+    malformed = config;
+    malformed.allow_tf32 = false;
+    reject(malformed, "TF32");
+    malformed = config;
+    malformed.pipeline = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.online_search_collection = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.search_pi_mode = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.sample_counterfactual_states = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.train_value_only = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.has_search_label_dir = true;
+    reject(malformed, "forbids");
+    malformed = config;
+    malformed.shaped_reward_weight = 0.01;
+    reject(malformed, "shaping");
+    malformed = config;
+    malformed.source_sha256 = "bad";
+    reject(malformed, "identity");
+    malformed = config;
+    malformed.reward_scale = 3.0;
+    reject(malformed, "reward scale");
+    malformed = config;
+    malformed.gamma = 1.1;
+    reject(malformed, "gamma");
+    malformed = config;
+    malformed.lambda = -0.1;
+    reject(malformed, "lambda");
+    UTILS_CHECK(!VrpoCaptureShouldConstructOptimizer(true));
+    UTILS_CHECK(VrpoCaptureShouldConstructOptimizer(false));
+
+    const std::vector<std::string> source_paths =
+        VrpoCaptureSourceRelativePaths();
+    CHECK_EQ(source_paths.size(), static_cast<size_t>(5));
+    std::ifstream source("open_spiel/examples/dune_ppo_train.cc");
+    UTILS_CHECK(source.good());
+    std::string text((std::istreambuf_iterator<char>(source)),
+                     std::istreambuf_iterator<char>());
+    const size_t writer = text.find("bool WriteVrpoCaptureArtifact(");
+    const size_t writer_end = text.find("#endif", writer);
+    UTILS_CHECK(writer != std::string::npos && writer_end != std::string::npos);
+    const std::string body = text.substr(writer, writer_end - writer);
+    UTILS_CHECK(body.rfind("root[\"status\"]") > body.rfind("require("));
+    UTILS_CHECK(body.find("std::filesystem::exists(output)") !=
+                std::string::npos);
+    UTILS_CHECK(body.find("std::filesystem::exists(tmp)") !=
+                std::string::npos);
   } TEST_END();
 }
 
@@ -2793,6 +3019,7 @@ int main() {
   TestSamplePolicyActionZeroMassFallback();
   TestSamplePolicyActionDefaultCapParity();
   TestSamplePolicyActionTinyProbabilityNotFloored();
+  TestSamplePolicyDistributionWrapperParity();
   TestDiagnosticsPersistAuxMetrics();
   TestDiagnosticsCsvSchemaGate();
   TestDiagPrepassCadenced();
@@ -2808,6 +3035,7 @@ int main() {
   TestVrpoCentralCriticTensor();
   TestVrpoDeterministicQModule();
   TestVrpoCapturedEpisodeAndZeroShapingRewards();
+  TestVrpoCaptureStartupAndLazyOptimizerContracts();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif

@@ -425,10 +425,20 @@ inline void CenterAndCapLegalLogits(std::vector<float>& logits,
 //
 // Shared by the PPO rollout and the swordmaster planner rollout so the two
 // cannot drift apart in their policy transform.
+struct PolicyDistributionSample {
+    Action action = kInvalidAction;
+    size_t chosen_index = 0;
+    float chosen_log_probability = 0.0f;
+};
+
+namespace policy_sampling_internal {
+
 template <typename RngType>
-inline std::pair<Action, float> SamplePolicyAction(
+inline std::pair<Action, float> SamplePolicyDistributionImpl(
     RngType* rng, const std::vector<float>& logits,
-    const std::vector<Action>& legal_actions) {
+    const std::vector<Action>& legal_actions,
+    std::vector<double>* ordered_legal_probabilities,
+    size_t* chosen_index, int64_t* probability_output_writes) {
     SPIEL_CHECK_FALSE(legal_actions.empty());
 
     float max_logit = -std::numeric_limits<float>::infinity();
@@ -469,7 +479,46 @@ inline std::pair<Action, float> SamplePolicyAction(
     // never used — while the update recomputes the true log_softmax, unfloored.
     double prob = weights[sampled_index] / total_weight;
     SPIEL_CHECK_GT(prob, 0.0);
-    return {legal_actions[sampled_index], static_cast<float>(std::log(prob))};
+    if (chosen_index != nullptr) *chosen_index = sampled_index;
+    if (ordered_legal_probabilities != nullptr) {
+      ordered_legal_probabilities->clear();
+      ordered_legal_probabilities->reserve(weights.size());
+      for (double weight : weights) {
+        ordered_legal_probabilities->push_back(weight / total_weight);
+        if (probability_output_writes != nullptr) {
+          ++*probability_output_writes;
+        }
+      }
+    }
+    return {legal_actions[sampled_index],
+            static_cast<float>(std::log(prob))};
+}
+
+}  // namespace policy_sampling_internal
+
+template <typename RngType>
+inline PolicyDistributionSample SamplePolicyDistribution(
+    RngType* rng, const std::vector<float>& logits,
+    const std::vector<Action>& legal_actions,
+    std::vector<double>* ordered_legal_probabilities) {
+    PolicyDistributionSample result;
+    const auto pair = policy_sampling_internal::SamplePolicyDistributionImpl(
+        rng, logits, legal_actions, ordered_legal_probabilities,
+        &result.chosen_index, nullptr);
+    result.action = pair.first;
+    result.chosen_log_probability = pair.second;
+    return result;
+}
+
+template <typename RngType>
+inline std::pair<Action, float> SamplePolicyAction(
+    RngType* rng, const std::vector<float>& logits,
+    const std::vector<Action>& legal_actions) {
+    return policy_sampling_internal::SamplePolicyDistributionImpl(
+        rng, logits, legal_actions,
+        /*ordered_legal_probabilities=*/nullptr,
+        /*chosen_index=*/nullptr,
+        /*probability_output_writes=*/nullptr);
 }
 
 struct EvaluatorStats {

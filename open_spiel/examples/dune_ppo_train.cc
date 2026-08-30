@@ -45,6 +45,7 @@
 #include "dune_sha256.h"
 #include "dune_ppo_training_utils.h"
 #include "dune_ppo_numerical_parity.h"
+#include "dune_vrpo.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
@@ -126,6 +127,14 @@ ABSL_FLAG(double, numerical_parity_min_ratio, -1.0,
           "Required minimum unchanged-weight chosen-action probability ratio.");
 ABSL_FLAG(double, numerical_parity_max_ratio, -1.0,
           "Required maximum unchanged-weight chosen-action probability ratio.");
+ABSL_FLAG(std::string, vrpo_capture_output, "",
+          "Fresh atomic JSON output for the diagnostics-only VRPO episode capture.");
+ABSL_FLAG(std::string, vrpo_capture_registration_id, "",
+          "Required immutable registration identifier for VRPO capture.");
+ABSL_FLAG(std::string, vrpo_capture_source_root, "",
+          "Required source root for the fixed VRPO capture source list.");
+ABSL_FLAG(std::string, vrpo_capture_source_sha256, "",
+          "Required canonical VRPO capture source digest.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -1570,7 +1579,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   std::vector<PpoTransition>* trajectory,
                   std::atomic<uint64_t>* total_env_steps,
                   float reward_lambda,
-                  WorkerStats* local_stats) {
+                  WorkerStats* local_stats,
+                  VrpoCapturedEpisode* vrpo_episode) {
+
+  if (vrpo_episode != nullptr) {
+    *vrpo_episode = VrpoCapturedEpisode{};
+    vrpo_episode->episode_id = episode_id;
+  }
 
   auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
   std::mt19937_64 policy_rng[4];
@@ -1895,9 +1910,16 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         canary_measure_this_decision = false;
       }
 
-      auto policy_sample = SamplePolicyAction(&policy_rng[current_player], logits, actions);
-      Action action = policy_sample.first;
-      float old_log_prob = policy_sample.second;
+      std::optional<std::vector<double>> vrpo_legal_probabilities;
+      if (vrpo_episode != nullptr) vrpo_legal_probabilities.emplace();
+      const PolicyDistributionSample policy_sample =
+          SamplePolicyDistribution(&policy_rng[current_player], logits,
+                                   actions,
+                                   vrpo_legal_probabilities.has_value()
+                                       ? &*vrpo_legal_probabilities
+                                       : nullptr);
+      Action action = policy_sample.action;
+      float old_log_prob = policy_sample.chosen_log_probability;
       if (parity_capture) {
         const std::vector<int64_t> legal_ids(actions.begin(), actions.end());
         std::string validation_error;
@@ -2051,6 +2073,29 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
+      if (vrpo_episode != nullptr) {
+        if (dune_state == nullptr) {
+          SpielFatalError("VRPO capture requires DuneImperiumState");
+        }
+        VrpoCapturedRow captured;
+        captured.episode_id = episode_id;
+        captured.global_row_index =
+            static_cast<int64_t>(vrpo_episode->rows.size());
+        captured.actor = current_player;
+        captured.actor_observation = obs;
+        captured.central_tensor =
+            dune_state->VrpoCentralCriticTensor(current_player);
+        captured.central_schema_sha256 =
+            dune_imperium::kVrpoCentralCriticTensorSchemaSha256;
+        captured.legal_actions = actions;
+        captured.chosen_index =
+            static_cast<int>(policy_sample.chosen_index);
+        captured.chosen_action = action;
+        captured.legal_behavior_probabilities =
+            std::move(*vrpo_legal_probabilities);
+        vrpo_episode->rows.push_back(std::move(captured));
+      }
+
       state->ApplyAction(action);
       total_env_steps->fetch_add(1, std::memory_order_relaxed);
 
@@ -2202,6 +2247,28 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     }
 
     std::vector<double> terminal_returns = state->Returns();
+    if (vrpo_episode != nullptr) {
+      VrpoSeatValues returns = {terminal_returns[0], terminal_returns[1],
+                                terminal_returns[2], terminal_returns[3]};
+      VrpoZeroShapingRewardConfig config;
+      config.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+      config.gamma = absl::GetFlag(FLAGS_gamma);
+      config.lambda = absl::GetFlag(FLAGS_gae_lambda);
+      config.shaped_reward_weight =
+          absl::GetFlag(FLAGS_shaped_reward_weight);
+      config.tleilaxu_breadcrumb_weight =
+          absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+      config.tleilaxu_level7_breadcrumb_weight =
+          absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+      config.specimen_exchange_penalty =
+          absl::GetFlag(FLAGS_specimen_exchange_penalty);
+      std::string finalize_error;
+      if (!FinalizeVrpoZeroShapingEpisode(
+              vrpo_episode, returns, config, &finalize_error)) {
+        SpielFatalError("VRPO capture finalization failed: " +
+                        finalize_error);
+      }
+    }
     double gamma = absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gamma);
     double gae_lambda = absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gae_lambda);
     float reward_scale = static_cast<float>(
@@ -2261,7 +2328,8 @@ void RolloutWorker(int thread_id, const Game* game,
                     std::atomic<uint64_t>* local_episode_id,
                     uint64_t start_episode_id,
                     int rollout_games,
-                    float reward_lambda) {
+                    float reward_lambda,
+                    VrpoCapturedEpisodeBuffer* vrpo_buffer) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
   while (true) {
@@ -2273,8 +2341,17 @@ void RolloutWorker(int thread_id, const Game* game,
       break;
     }
     std::vector<PpoTransition> trajectory;
+    VrpoCapturedEpisode vrpo_episode;
     int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
-                              total_env_steps, reward_lambda, &local_stats);
+                              total_env_steps, reward_lambda, &local_stats,
+                              vrpo_buffer != nullptr ? &vrpo_episode : nullptr);
+    if (vrpo_buffer != nullptr) {
+      std::string publish_error;
+      if (!vrpo_buffer->PublishValidated(std::move(vrpo_episode),
+                                         &publish_error)) {
+        SpielFatalError("VRPO capture publication failed: " + publish_error);
+      }
+    }
     local_stats.games += 1;
     local_stats.moves += moves;
     size_t size = rollout_buffer->PushTrajectory(std::move(trajectory));
@@ -2439,7 +2516,8 @@ CollectResult CollectRollout(const Game* game,
                              int num_threads,
                              std::atomic<uint64_t>* next_episode_id,
                              int rollout_games,
-                             float reward_lambda) {
+                             float reward_lambda,
+                             VrpoCapturedEpisodeBuffer* vrpo_buffer = nullptr) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
@@ -2454,7 +2532,8 @@ CollectResult CollectRollout(const Game* game,
   for (int i = 0; i < num_threads; ++i) {
     workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
                          &rollout_buffer, &stop_collection, total_env_steps,
-                         &worker_stats, &local_episode_id, actual_start_ep, rollout_games, reward_lambda);
+                         &worker_stats, &local_episode_id, actual_start_ep,
+                         rollout_games, reward_lambda, vrpo_buffer);
   }
   for (auto& worker : workers) worker.join();
 
@@ -3384,6 +3463,44 @@ PpoNumericalParitySourceProvenance LoadPpoNumericalParitySourceProvenance(
     SpielFatalError(
         "Numerical parity registered source SHA-256 mismatch: expected " +
         registered_sha256 + " computed " + out.combined_sha256);
+  }
+  return out;
+}
+
+PpoNumericalParitySourceProvenance LoadVrpoCaptureSourceProvenance(
+    const std::string& source_root, const std::string& registered_sha256) {
+  std::error_code ec;
+  const std::filesystem::path canonical_root =
+      std::filesystem::canonical(source_root, ec);
+  if (ec || !std::filesystem::is_directory(canonical_root)) {
+    SpielFatalError("VRPO capture source root is not a readable directory: " +
+                    source_root);
+  }
+  PpoNumericalParitySourceProvenance out;
+  out.root = canonical_root.string();
+  std::string canonical_payload;
+  for (const std::string& relative : VrpoCaptureSourceRelativePaths()) {
+    const std::filesystem::path path = canonical_root / relative;
+    if (!std::filesystem::is_regular_file(path)) {
+      SpielFatalError("VRPO capture required source is not regular: " +
+                      path.string());
+    }
+    size_t size = 0;
+    const std::string digest = ComputeFileSHA256(path.string(), &size);
+    if (digest.size() != 64) {
+      SpielFatalError("VRPO capture could not hash source: " + path.string());
+    }
+    out.files.push_back({relative, path.string(),
+                         static_cast<int64_t>(size), digest});
+    canonical_payload.append(relative);
+    canonical_payload.push_back('\0');
+    canonical_payload.append(digest);
+    canonical_payload.push_back('\n');
+  }
+  out.combined_sha256 = ComputeStringSHA256(canonical_payload);
+  if (out.combined_sha256 != registered_sha256) {
+    SpielFatalError("VRPO capture source digest mismatch: expected " +
+                    registered_sha256 + " computed " + out.combined_sha256);
   }
   return out;
 }
@@ -4679,6 +4796,246 @@ bool WritePpoNumericalParityArtifactV5(
   return root["status"] == "VALID";
 }
 
+bool WriteVrpoCaptureArtifact(
+    const std::string& output_path,
+    const std::vector<VrpoCapturedEpisode>& episodes,
+    const CollectResult& collect, const std::string& command_line,
+    const PpoNumericalParitySourceProvenance& source_provenance,
+    const std::string& source_manifest,
+    const std::string& source_manifest_sha256, int64_t source_global_update,
+    const std::string& source_checkpoint_uuid,
+    const std::string& config_fingerprint,
+    const std::string& model_hash_before,
+    const std::string& model_hash_after,
+    const std::string& inference_hash_before,
+    const std::string& inference_hash_after,
+    bool tf32_cublas_before, bool tf32_cudnn_before,
+    bool tf32_cublas_after, bool tf32_cudnn_after,
+    bool optimizer_constructed) {
+  std::vector<std::string> errors;
+  auto require = [&](bool ok, const std::string& message) {
+    if (!ok) errors.push_back(message);
+  };
+  require(!episodes.empty(), "no complete captured episodes");
+  require(episodes.size() == static_cast<size_t>(collect.games),
+          "captured episode count differs from collected games");
+  require(episodes.size() ==
+              static_cast<size_t>(absl::GetFlag(FLAGS_rollout_games)),
+          "captured episode count differs from registered games");
+  std::string id_error;
+  require(ValidateVrpoSortedEpisodeIds(
+              episodes, absl::GetFlag(FLAGS_start_episode_id),
+              absl::GetFlag(FLAGS_rollout_games), &id_error),
+          id_error);
+  require(!optimizer_constructed, "optimizer was constructed");
+  require(model_hash_before == model_hash_after &&
+              inference_hash_before == inference_hash_after &&
+              model_hash_before == inference_hash_before,
+          "model immutability/equality failed");
+  require(!absl::GetFlag(FLAGS_rollout_amp) &&
+              !absl::GetFlag(FLAGS_train_amp) &&
+              absl::GetFlag(FLAGS_allow_tf32) && tf32_cublas_before &&
+              tf32_cudnn_before && tf32_cublas_after && tf32_cudnn_after,
+          "FP32/TF32 runtime contract failed");
+
+  int64_t total_rows = 0;
+  int64_t sampler_exact_rows = 0;
+  size_t rollout_cursor = 0;
+  std::set<uint64_t> episode_ids;
+  json::Array episode_json;
+  for (const auto& episode : episodes) {
+    std::string validation_error;
+    const bool episode_valid =
+        ValidateVrpoCapturedEpisode(episode, &validation_error);
+    require(episode_valid,
+            "captured episode invalid: " + validation_error);
+    std::string metadata_error;
+    const bool metadata_valid = ValidateVrpoCaptureRewardMetadata(
+        episode, absl::GetFlag(FLAGS_reward_scale),
+        absl::GetFlag(FLAGS_gamma), absl::GetFlag(FLAGS_gae_lambda),
+        1e-9, &metadata_error);
+    require(metadata_valid, metadata_error);
+    require(episode_ids.insert(episode.episode_id).second,
+            "duplicate captured episode ID");
+    VrpoSeatValues reward_sums = {0.0, 0.0, 0.0, 0.0};
+    int64_t terminal_rows = 0;
+    for (const auto& row : episode.rows) {
+      for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+        reward_sums[seat] += row.rewards[seat];
+      }
+      if (row.terminal_after) ++terminal_rows;
+      if (rollout_cursor < collect.rollout.size()) {
+        const PpoTransition& transition = collect.rollout[rollout_cursor];
+        VrpoRolloutPairingView pairing;
+        pairing.episode_id = transition.episode_id;
+        pairing.actor = transition.player_id;
+        pairing.actor_observation = &transition.state;
+        pairing.legal_actions = &transition.legal_actions;
+        pairing.action = transition.action;
+        pairing.chosen_log_probability = transition.old_log_prob;
+        std::string pairing_error;
+        if (ValidateVrpoCaptureRolloutPairing(
+                row, pairing, &pairing_error)) {
+          ++sampler_exact_rows;
+        } else {
+          errors.push_back("capture/rollout pairing failed: " + pairing_error);
+        }
+      }
+      ++rollout_cursor;
+    }
+    total_rows += episode.rows.size();
+    json::Object record;
+    record["episode_id"] = static_cast<int64_t>(episode.episode_id);
+    record["rows"] = static_cast<int64_t>(episode.rows.size());
+    record["first_global_row_index"] = int64_t{0};
+    record["last_global_row_index"] =
+        static_cast<int64_t>(episode.rows.size()) - 1;
+    record["capture_sha256"] = episode.capture_sha256;
+    record["terminal_rows"] = terminal_rows;
+    json::Array rewards;
+    for (double value : reward_sums) rewards.emplace_back(value);
+    record["absolute_reward_sums"] = std::move(rewards);
+    json::Array terminal_returns;
+    for (double value : episode.terminal_returns) {
+      terminal_returns.emplace_back(value);
+    }
+    record["terminal_returns"] = std::move(terminal_returns);
+    bool reward_conservation = episode_valid && metadata_valid;
+    for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+      reward_conservation = reward_conservation &&
+          reward_sums[seat] ==
+              std::clamp(episode.terminal_returns[seat] /
+                             episode.reward_scale,
+                         -1.0, 1.0);
+    }
+    record["reward_conservation"] = reward_conservation;
+    require(reward_conservation, "episode reward conservation failed");
+    episode_json.emplace_back(std::move(record));
+  }
+  require(rollout_cursor == collect.rollout.size(),
+          "capture and rollout row counts differ");
+  require(sampler_exact_rows == total_rows,
+          "sampler chosen scalar/probability checks incomplete");
+  require(collect.episode_ids_unique, "rollout episode IDs are not unique");
+
+  json::Object root;
+  root["schema"] = "dune_vrpo_diagnostics_capture_v1";
+  root["registration_id"] =
+      absl::GetFlag(FLAGS_vrpo_capture_registration_id);
+  root["scope"] = "vrpo_capture_only";
+  root["training_authorized"] = false;
+  root["optimizer_constructed"] = optimizer_constructed;
+  root["optimizer_steps"] = int64_t{0};
+  root["backward_calls"] = int64_t{0};
+  root["training_updates"] = int64_t{0};
+  root["q_forward_calls"] = int64_t{0};
+  root["command_line"] = command_line;
+  root["config_fingerprint"] = config_fingerprint;
+  root["games_collected"] = static_cast<int64_t>(collect.games);
+  root["rollout_games"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
+  root["threads"] = static_cast<int64_t>(absl::GetFlag(FLAGS_threads));
+  root["seed"] = static_cast<int64_t>(absl::GetFlag(FLAGS_seed));
+  root["start_episode_id"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id));
+  root["end_episode_id_inclusive"] =
+      static_cast<int64_t>(absl::GetFlag(FLAGS_start_episode_id)) +
+      static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games)) - 1;
+  root["episode_ids_unique"] = collect.episode_ids_unique;
+  root["captured_episodes"] = static_cast<int64_t>(episodes.size());
+  root["captured_rows"] = total_rows;
+  root["sampler_exact_rows"] = sampler_exact_rows;
+  root["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  root["gamma"] = absl::GetFlag(FLAGS_gamma);
+  root["lambda"] = absl::GetFlag(FLAGS_gae_lambda);
+  root["probability_tolerance"] = 1e-9;
+  root["episodes"] = std::move(episode_json);
+  root["capture_schema_label"] = kVrpoCaptureSchemaLabel;
+  root["capture_schema_sha256"] = kVrpoCaptureSchemaSha256;
+  root["central_schema_label"] =
+      dune_imperium::kVrpoCentralCriticTensorSchemaLabel;
+  root["central_schema_sha256"] =
+      dune_imperium::kVrpoCentralCriticTensorSchemaSha256;
+  root["reward_convention_label"] =
+      kVrpoZeroShapingRewardConventionLabel;
+  root["reward_convention_sha256"] =
+      kVrpoZeroShapingRewardConventionSha256;
+  root["rollout_amp"] = absl::GetFlag(FLAGS_rollout_amp);
+  root["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+  root["allow_tf32"] = absl::GetFlag(FLAGS_allow_tf32);
+  json::Object runtime;
+  runtime["tf32_cublas_before"] = tf32_cublas_before;
+  runtime["tf32_cublas_after"] = tf32_cublas_after;
+  runtime["tf32_cudnn_before"] = tf32_cudnn_before;
+  runtime["tf32_cudnn_after"] = tf32_cudnn_after;
+  root["precision_runtime"] = std::move(runtime);
+  root["model_state_sha256_before"] = model_hash_before;
+  root["model_state_sha256_after"] = model_hash_after;
+  root["inference_state_sha256_before"] = inference_hash_before;
+  root["inference_state_sha256_after"] = inference_hash_after;
+
+  size_t model_size = 0;
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  json::Object source;
+  source["model_path"] = std::filesystem::absolute(model_path).string();
+  source["model_sha256"] = ComputeFileSHA256(model_path, &model_size);
+  source["model_size"] = static_cast<int64_t>(model_size);
+  source["manifest_path"] = std::filesystem::absolute(source_manifest).string();
+  source["manifest_sha256"] = source_manifest_sha256;
+  source["global_update"] = source_global_update;
+  source["checkpoint_uuid"] = source_checkpoint_uuid;
+  size_t binary_size = 0;
+  std::error_code ec;
+  const auto binary_path = std::filesystem::read_symlink("/proc/self/exe", ec);
+  require(!ec && !binary_path.empty(), "could not resolve binary path");
+  if (!ec && !binary_path.empty()) {
+    source["binary_path"] = binary_path.string();
+    source["binary_sha256"] =
+        ComputeFileSHA256(binary_path.string(), &binary_size);
+    source["binary_size"] = static_cast<int64_t>(binary_size);
+  }
+  root["source"] = std::move(source);
+  json::Object source_code;
+  source_code["root"] = source_provenance.root;
+  source_code["combined_sha256"] = source_provenance.combined_sha256;
+  json::Array source_files;
+  for (const auto& file : source_provenance.files) {
+    json::Object record;
+    record["relative_path"] = file.relative_path;
+    record["absolute_path"] = file.absolute_path;
+    record["size"] = file.size;
+    record["sha256"] = file.sha256;
+    source_files.emplace_back(std::move(record));
+  }
+  source_code["files"] = std::move(source_files);
+  root["source_code"] = std::move(source_code);
+  json::Array validation_errors;
+  for (const auto& error : errors) validation_errors.emplace_back(error);
+  root["validation_errors"] = std::move(validation_errors);
+  // Status is deliberately assigned after every possible require/reject.
+  const bool valid = errors.empty();
+  root["classification"] = valid ? "VALID_CAPTURE" : "INVALID";
+  root["status"] = valid ? "VALID" : "INVALID";
+
+  const std::filesystem::path output(output_path);
+  const std::filesystem::path tmp = output_path + ".tmp";
+  if (std::filesystem::exists(output) || std::filesystem::exists(tmp)) {
+    SpielFatalError("VRPO capture output already exists");
+  }
+  if (!output.parent_path().empty()) {
+    std::filesystem::create_directories(output.parent_path());
+  }
+  {
+    std::ofstream stream(tmp, std::ios::trunc);
+    if (!stream) SpielFatalError("cannot create VRPO capture temp artifact");
+    stream << json::ToString(root, true) << "\n";
+    stream.flush();
+    if (!stream) SpielFatalError("VRPO capture artifact write failed");
+  }
+  std::filesystem::rename(tmp, output);
+  return valid;
+}
+
 
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
@@ -4696,6 +5053,12 @@ int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
   const bool numerical_parity =
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
+  const bool vrpo_capture =
+      !absl::GetFlag(FLAGS_vrpo_capture_output).empty();
+  if (numerical_parity && vrpo_capture) {
+    open_spiel::SpielFatalError(
+        "Numerical parity and VRPO capture modes are mutually exclusive");
+  }
   if (numerical_parity) {
     auto parity_stop = [](const std::string& message) {
       open_spiel::SpielFatalError(
@@ -4788,6 +5151,62 @@ int main(int argc, char** argv) {
       parity_stop("output or temp path already exists (fresh output required)");
     }
   }
+  if (vrpo_capture) {
+    open_spiel::VrpoCaptureStartupConfig config;
+    config.game = absl::GetFlag(FLAGS_game);
+    config.registration_id =
+        absl::GetFlag(FLAGS_vrpo_capture_registration_id);
+    config.source_root = absl::GetFlag(FLAGS_vrpo_capture_source_root);
+    config.source_sha256 =
+        absl::GetFlag(FLAGS_vrpo_capture_source_sha256);
+    config.diagnostics_only = absl::GetFlag(FLAGS_diagnostics_only);
+    config.init_mode = absl::GetFlag(FLAGS_init_mode);
+    config.rollout_games = absl::GetFlag(FLAGS_rollout_games);
+    config.threads = absl::GetFlag(FLAGS_threads);
+    config.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+    config.train_amp = absl::GetFlag(FLAGS_train_amp);
+    config.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    config.pipeline = absl::GetFlag(FLAGS_pipeline);
+    config.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    config.search_pi_mode = absl::GetFlag(FLAGS_search_pi_mode);
+    config.train_value_only = absl::GetFlag(FLAGS_train_value_only);
+    config.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    config.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    config.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    config.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    config.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    config.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    config.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    config.gamma = absl::GetFlag(FLAGS_gamma);
+    config.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    std::string gate_error;
+    if (!open_spiel::ValidateVrpoCaptureStartupConfig(config, &gate_error)) {
+      open_spiel::SpielFatalError(
+          "VRPO capture configuration rejected: " + gate_error);
+    }
+    if (absl::GetFlag(FLAGS_artifact_manifest).empty()) {
+      open_spiel::SpielFatalError(
+          "VRPO capture requires --artifact_manifest");
+    }
+    if (absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint)) {
+      open_spiel::SpielFatalError(
+          "VRPO capture requires checkpoint writes disabled");
+    }
+    const std::string output = absl::GetFlag(FLAGS_vrpo_capture_output);
+    if (std::filesystem::exists(output) ||
+        std::filesystem::exists(output + ".tmp")) {
+      open_spiel::SpielFatalError(
+          "VRPO capture output or temp already exists");
+    }
+  }
   // PWO-5 section 10.2: the reserved final-gate base-seed range, enforced at
   // the launcher so the exclusion is mechanical rather than a matter of
   // operator care. Checked before ANY other work.
@@ -4870,6 +5289,8 @@ int main(int argc, char** argv) {
   }
   open_spiel::PpoNumericalParitySourceProvenance
       parity_source_provenance;
+  open_spiel::PpoNumericalParitySourceProvenance
+      vrpo_source_provenance;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -4878,6 +5299,12 @@ int main(int argc, char** argv) {
         open_spiel::LoadPpoNumericalParitySourceProvenance(
             absl::GetFlag(FLAGS_numerical_parity_source_root),
             absl::GetFlag(FLAGS_numerical_parity_source_sha256));
+  }
+  if (vrpo_capture) {
+    vrpo_source_provenance =
+        open_spiel::LoadVrpoCaptureSourceProvenance(
+            absl::GetFlag(FLAGS_vrpo_capture_source_root),
+            absl::GetFlag(FLAGS_vrpo_capture_source_sha256));
   }
 
   // PWO-5 section 7.2 / Appendix A.1.
@@ -4983,10 +5410,15 @@ int main(int argc, char** argv) {
   training_model->train();
   inference_model->eval();
 
-  auto optimizer = open_spiel::MakeOptimizer(training_model);
-  // Section 7.4: materialize BEFORE any load, so the entries exist in all six
-  // arms; a subsequent load simply overwrites the ones the archive carries.
-  open_spiel::MaterializeAuxOptimizerState(training_model, *optimizer);
+  std::unique_ptr<torch::optim::AdamW> optimizer;
+  bool optimizer_constructed = false;
+  if (open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_capture)) {
+    optimizer = open_spiel::MakeOptimizer(training_model);
+    optimizer_constructed = true;
+    // Section 7.4: materialize BEFORE any load, so the entries exist in all six
+    // arms; a subsequent load simply overwrites the ones the archive carries.
+    open_spiel::MaterializeAuxOptimizerState(training_model, *optimizer);
+  }
 
   // --- PWO-5 sections 5.2, 8.5, 8.6: the auxiliary data path. -------------
   //
@@ -5257,9 +5689,9 @@ int main(int argc, char** argv) {
     // checkpoint can be audited without pretending to resume it, loading Adam
     // moments, synthesizing a bootstrap manifest, or making any checkpoint
     // path writable.
-    if (!numerical_parity) {
+    if (!numerical_parity && !vrpo_capture) {
       SpielFatalError(
-          "init_mode=diagnostic is reserved for --numerical_parity_output");
+          "init_mode=diagnostic is reserved for numerical parity or VRPO capture");
     }
     const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
     parity_source_manifest = absl::GetFlag(FLAGS_artifact_manifest);
@@ -7457,19 +7889,50 @@ int main(int argc, char** argv) {
 
   // Collect first rollout synchronously.
   const std::string parity_model_hash_before =
-      numerical_parity ? open_spiel::HashAllModelState(training_model) : "";
+      (numerical_parity || vrpo_capture)
+          ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
-      numerical_parity ? open_spiel::HashAllModelState(inference_model) : "";
+      (numerical_parity || vrpo_capture)
+          ? open_spiel::HashAllModelState(inference_model) : "";
   const bool parity_tf32_cublas_before =
-      numerical_parity && at::globalContext().allowTF32CuBLAS();
+      (numerical_parity || vrpo_capture) &&
+      at::globalContext().allowTF32CuBLAS();
   const bool parity_tf32_cudnn_before =
-      numerical_parity && at::globalContext().allowTF32CuDNN();
+      (numerical_parity || vrpo_capture) &&
+      at::globalContext().allowTF32CuDNN();
   float reward_lambda = ComputeRewardLambda(total_env_steps.load(),
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
+  open_spiel::VrpoCapturedEpisodeBuffer vrpo_capture_buffer;
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-      rollout_games, reward_lambda);
+      rollout_games, reward_lambda,
+      vrpo_capture ? &vrpo_capture_buffer : nullptr);
+  if (vrpo_capture) {
+    std::vector<open_spiel::VrpoCapturedEpisode> episodes =
+        vrpo_capture_buffer.TakeSorted();
+    const std::string model_hash_after =
+        open_spiel::HashAllModelState(training_model);
+    const std::string inference_hash_after =
+        open_spiel::HashAllModelState(inference_model);
+    const bool tf32_cublas_after =
+        at::globalContext().allowTF32CuBLAS();
+    const bool tf32_cudnn_after =
+        at::globalContext().allowTF32CuDNN();
+    const bool valid = open_spiel::WriteVrpoCaptureArtifact(
+        absl::GetFlag(FLAGS_vrpo_capture_output), episodes, current_collect,
+        parity_command_line, vrpo_source_provenance,
+        parity_source_manifest, parity_source_manifest_sha256,
+        parity_source_global_update, parity_source_checkpoint_uuid,
+        config_fingerprint, parity_model_hash_before, model_hash_after,
+        parity_inference_hash_before, inference_hash_after,
+        parity_tf32_cublas_before, parity_tf32_cudnn_before,
+        tf32_cublas_after, tf32_cudnn_after, optimizer_constructed);
+    std::cout << "VRPO diagnostics capture "
+              << (valid ? "VALID" : "INVALID") << ": "
+              << absl::GetFlag(FLAGS_vrpo_capture_output) << "\n";
+    return valid ? 0 : 3;
+  }
   if (numerical_parity) {
     const auto batch_evaluator =
         std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator);
