@@ -153,6 +153,120 @@ inline bool FiniteTensor(const torch::Tensor& tensor) {
          torch::isfinite(tensor).all().item<bool>();
 }
 
+struct ModuleRuntimePlacement {
+  torch::Device device = torch::kCPU;
+  torch::Dtype dtype = torch::kFloat32;
+};
+
+// Expanded archives are deliberately CPU-portable. LibTorch restores archive
+// tensors on CPU, so every load/rollback must explicitly put the live module
+// back on the device and dtype that owned the transaction before serialization.
+inline bool CaptureUniformModuleRuntimePlacement(
+    torch::nn::Module& module, ModuleRuntimePlacement* output,
+    std::string* error) {
+  if (output == nullptr) {
+    if (error != nullptr) *error = "null module runtime-placement output";
+    return false;
+  }
+  bool first = true;
+  for (const auto& item : module.named_parameters()) {
+    const torch::Tensor& parameter = item.value();
+    if (!parameter.defined() || !parameter.is_floating_point()) {
+      if (error != nullptr) *error = "module has undefined/nonfloating parameter";
+      return false;
+    }
+    if (first) {
+      output->device = parameter.device();
+      output->dtype = parameter.scalar_type();
+      first = false;
+    } else if (parameter.device() != output->device ||
+               parameter.scalar_type() != output->dtype) {
+      if (error != nullptr) *error = "module parameters do not share device/dtype";
+      return false;
+    }
+  }
+  if (first) {
+    if (error != nullptr) *error = "module has no parameters";
+    return false;
+  }
+  return true;
+}
+
+inline bool RestoreModuleRuntimePlacement(
+    torch::nn::Module& module, const ModuleRuntimePlacement& expected,
+    std::string* error) {
+  // Keep the two conversions explicit: some LibTorch overload sets accept a
+  // device-type sentinel but retain CPU storage after InputArchive::load.
+  module.to(expected.device);
+  module.to(expected.dtype);
+  ModuleRuntimePlacement observed;
+  if (!CaptureUniformModuleRuntimePlacement(module, &observed, error)) {
+    return false;
+  }
+  if (observed.device != expected.device || observed.dtype != expected.dtype) {
+    if (error != nullptr) *error = "module load changed device/dtype";
+    return false;
+  }
+  return true;
+}
+
+// The optimizer archive maps states by parameter position but serializes their
+// tensors on CPU. Rebind every numerical moment in canonical param-group order
+// to the live parameter's device/dtype before accepting the state.
+inline bool MigrateAdamWOptimizerStateToParameterDevices(
+    torch::optim::Optimizer& optimizer, std::string* error) {
+  torch::NoGradGuard no_grad;
+  std::set<c10::TensorImpl*> seen;
+  for (const auto& group : optimizer.param_groups()) {
+    for (const torch::Tensor& parameter : group.params()) {
+      c10::TensorImpl* key = parameter.unsafeGetTensorImpl();
+      if (!seen.insert(key).second) {
+        if (error != nullptr) *error = "optimizer has duplicate parameter";
+        return false;
+      }
+      const auto found = optimizer.state().find(key);
+      if (found == optimizer.state().end()) {
+        if (error != nullptr) *error = "optimizer state is missing parameter";
+        return false;
+      }
+      auto* state = dynamic_cast<torch::optim::AdamWParamState*>(
+          found->second.get());
+      if (state == nullptr || state->step() < 0 ||
+          !state->exp_avg().defined() || !state->exp_avg_sq().defined() ||
+          state->exp_avg().sizes() != parameter.sizes() ||
+          state->exp_avg_sq().sizes() != parameter.sizes()) {
+        if (error != nullptr) *error = "optimizer state has invalid AdamW moments";
+        return false;
+      }
+      state->exp_avg(state->exp_avg().to(parameter.device(),
+                                         parameter.scalar_type()));
+      state->exp_avg_sq(state->exp_avg_sq().to(parameter.device(),
+                                               parameter.scalar_type()));
+      if (state->max_exp_avg_sq().defined()) {
+        if (state->max_exp_avg_sq().sizes() != parameter.sizes()) {
+          if (error != nullptr) *error = "optimizer AMSGrad moment has wrong shape";
+          return false;
+        }
+        state->max_exp_avg_sq(state->max_exp_avg_sq().to(
+            parameter.device(), parameter.scalar_type()));
+      }
+      if (state->exp_avg().device() != parameter.device() ||
+          state->exp_avg_sq().device() != parameter.device() ||
+          state->exp_avg().scalar_type() != parameter.scalar_type() ||
+          state->exp_avg_sq().scalar_type() != parameter.scalar_type() ||
+          !FiniteTensor(state->exp_avg()) || !FiniteTensor(state->exp_avg_sq())) {
+        if (error != nullptr) *error = "optimizer moment device/dtype migration failed";
+        return false;
+      }
+    }
+  }
+  if (optimizer.state().size() != seen.size()) {
+    if (error != nullptr) *error = "optimizer state has extra parameter";
+    return false;
+  }
+  return true;
+}
+
 inline bool ModuleValueSha256(torch::nn::Module& module,
                               const std::string& prefix,
                               std::string* output, std::string* error) {
@@ -398,6 +512,13 @@ class TrainingTransaction {
       q_requires_grad_.push_back(item.value().requires_grad());
     }
     try {
+      if (!CaptureUniformModuleRuntimePlacement(
+              actor_model, &actor_placement_, error) ||
+          !CaptureUniformModuleRuntimePlacement(
+              q_model, &q_placement_, error)) {
+        Clear();
+        return false;
+      }
       actor_module_bytes_ = SaveModule(actor_model);
       q_module_bytes_ = SaveModule(q_model);
       actor_optimizer_bytes_ = SaveOptimizer(actor_optimizer);
@@ -420,10 +541,24 @@ class TrainingTransaction {
     try {
       LoadModule(*actor_model_, actor_module_bytes_);
       LoadModule(*q_model_, q_module_bytes_);
+      std::string placement_error;
+      if (!RestoreModuleRuntimePlacement(
+              *actor_model_, actor_placement_, &placement_error) ||
+          !RestoreModuleRuntimePlacement(
+              *q_model_, q_placement_, &placement_error)) {
+        throw std::runtime_error(placement_error);
+      }
       actor_optimizer_->state().clear();
       q_optimizer_->state().clear();
       LoadOptimizer(*actor_optimizer_, actor_optimizer_bytes_);
       LoadOptimizer(*q_optimizer_, q_optimizer_bytes_);
+      std::string migration_error;
+      if (!MigrateAdamWOptimizerStateToParameterDevices(
+              *actor_optimizer_, &migration_error) ||
+          !MigrateAdamWOptimizerStateToParameterDevices(
+              *q_optimizer_, &migration_error)) {
+        throw std::runtime_error(migration_error);
+      }
       actor_optimizer_->zero_grad();
       q_optimizer_->zero_grad();
       RestoreRequiresGrad(*actor_model_, actor_requires_grad_);
@@ -506,6 +641,8 @@ class TrainingTransaction {
     q_optimizer_ = nullptr;
     actor_requires_grad_.clear();
     q_requires_grad_.clear();
+    actor_placement_ = ModuleRuntimePlacement{};
+    q_placement_ = ModuleRuntimePlacement{};
     actor_module_bytes_.clear();
     q_module_bytes_.clear();
     actor_optimizer_bytes_.clear();
@@ -521,6 +658,8 @@ class TrainingTransaction {
   torch::optim::Optimizer* q_optimizer_ = nullptr;
   std::vector<bool> actor_requires_grad_;
   std::vector<bool> q_requires_grad_;
+  ModuleRuntimePlacement actor_placement_;
+  ModuleRuntimePlacement q_placement_;
   std::string actor_module_bytes_;
   std::string q_module_bytes_;
   std::string actor_optimizer_bytes_;

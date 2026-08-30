@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -17,7 +18,7 @@
 #include <torch/torch.h>
 
 #include "dune_network.h"
-#include "dune_vrpo.h"
+#include "dune_vrpo_training.h"
 
 namespace open_spiel {
 
@@ -357,6 +358,150 @@ inline bool ValidateVrpoOptimizerGroupsAndZeroState(
   return true;
 }
 
+// Phase 4e resumes the materialized, all-parameter AdamW state written by the
+// phase-4c bootstrap and persists that same numerical state after update 1.
+// This validator deliberately shares the phase-4b group/name/coverage
+// contract, but permits non-zero moments and steps while still requiring a
+// complete, finite state for every registered parameter.
+inline bool ValidateVrpoOptimizerGroupsAndFiniteState(
+    const VrpoFreshOptimizers& optimizers,
+    SharedDunePolicyValueNetImpl& actor_model, torch::nn::Module& q_model,
+    std::string* actor_state_sha256, std::string* q_state_sha256,
+    std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (actor_state_sha256 != nullptr) actor_state_sha256->clear();
+    if (q_state_sha256 != nullptr) q_state_sha256->clear();
+    return false;
+  };
+  if (optimizers.actor == nullptr || optimizers.q == nullptr ||
+      actor_state_sha256 == nullptr || q_state_sha256 == nullptr) {
+    return fail("optimizer finite-state validation input is incomplete");
+  }
+  const auto specs = CanonicalVrpoPhase4OptimizerGroups();
+  if (optimizers.actor->param_groups().size() != 2 ||
+      optimizers.q->param_groups().size() != 1 ||
+      optimizers.actor_group_names !=
+          std::vector<std::string>({specs[0].group_name,
+                                    specs[1].group_name}) ||
+      optimizers.q_group_names !=
+          std::vector<std::string>({specs[2].group_name})) {
+    return fail("optimizer group count/names differ from contract");
+  }
+  auto options_match = [](const torch::optim::OptimizerParamGroup& group,
+                          const VrpoOptimizerGroupSpec& spec) {
+    const auto& options = static_cast<const torch::optim::AdamWOptions&>(
+        group.options());
+    return options.lr() == spec.learning_rate &&
+           std::get<0>(options.betas()) == spec.beta1 &&
+           std::get<1>(options.betas()) == spec.beta2 &&
+           options.eps() == spec.epsilon &&
+           options.weight_decay() == spec.weight_decay;
+  };
+  if (!options_match(optimizers.actor->param_groups()[0], specs[0]) ||
+      !options_match(optimizers.actor->param_groups()[1], specs[1]) ||
+      !options_match(optimizers.q->param_groups()[0], specs[2])) {
+    return fail("optimizer hyperparameters differ from contract");
+  }
+
+  std::map<c10::TensorImpl*, std::string> actor_names;
+  std::map<c10::TensorImpl*, std::string> q_names;
+  std::vector<std::string> expected_policy;
+  std::vector<std::string> expected_trunk_value;
+  std::vector<std::string> expected_q;
+  for (const auto& item : actor_model.named_parameters()) {
+    actor_names[item.value().unsafeGetTensorImpl()] = item.key();
+    (item.key().rfind("policy_head", 0) == 0 ? expected_policy
+                                              : expected_trunk_value)
+        .push_back(item.key());
+  }
+  for (const auto& item : q_model.named_parameters()) {
+    q_names[item.value().unsafeGetTensorImpl()] = item.key();
+    expected_q.push_back(item.key());
+  }
+  if (optimizers.actor_policy_names != expected_policy ||
+      optimizers.actor_trunk_value_names != expected_trunk_value ||
+      optimizers.q_names != expected_q) {
+    return fail("optimizer declared parameter memberships differ from modules");
+  }
+
+  auto validate_and_hash = [&](const torch::optim::Optimizer& optimizer,
+                               const std::vector<std::pair<
+                                   std::string, torch::Tensor>>& ordered,
+                               const std::string& label,
+                               std::string* digest) {
+    if (optimizer.state().size() != ordered.size()) return false;
+    std::string payload = "dune_vrpo_adamw_numerical_state_v1";
+    payload.append(label);
+    vrpo_capture_internal::AppendPod(
+        &payload, static_cast<uint64_t>(ordered.size()));
+    std::set<c10::TensorImpl*> seen;
+    for (const auto& named : ordered) {
+      c10::TensorImpl* key = named.second.unsafeGetTensorImpl();
+      if (!seen.insert(key).second) return false;
+      const auto found = optimizer.state().find(key);
+      if (found == optimizer.state().end()) return false;
+      const auto* state = dynamic_cast<const torch::optim::AdamWParamState*>(
+          found->second.get());
+      if (state == nullptr || state->step() < 0 ||
+          !state->exp_avg().defined() || !state->exp_avg_sq().defined() ||
+          state->exp_avg().sizes() != named.second.sizes() ||
+          state->exp_avg_sq().sizes() != named.second.sizes() ||
+          state->exp_avg().device() != named.second.device() ||
+          state->exp_avg_sq().device() != named.second.device() ||
+          state->exp_avg().scalar_type() != named.second.scalar_type() ||
+          state->exp_avg_sq().scalar_type() != named.second.scalar_type() ||
+          !torch::isfinite(state->exp_avg()).all().item<bool>() ||
+          !torch::isfinite(state->exp_avg_sq()).all().item<bool>()) {
+        return false;
+      }
+      payload.append(named.first);
+      payload.push_back('\0');
+      vrpo_capture_internal::AppendPod(&payload, state->step());
+      for (const torch::Tensor& moment :
+           {state->exp_avg(), state->exp_avg_sq()}) {
+        const torch::Tensor value =
+            moment.detach().contiguous().cpu().to(torch::kFloat32);
+        vrpo_capture_internal::AppendPod(&payload, value.numel());
+        payload.append(reinterpret_cast<const char*>(value.data_ptr<float>()),
+                       value.numel() * sizeof(float));
+      }
+    }
+    *digest = ComputeStringSHA256(payload);
+    return true;
+  };
+
+  std::vector<std::pair<std::string, torch::Tensor>> ordered_actor;
+  std::vector<std::pair<std::string, torch::Tensor>> ordered_q;
+  for (const auto& group : optimizers.actor->param_groups()) {
+    for (const auto& parameter : group.params()) {
+      const auto found = actor_names.find(parameter.unsafeGetTensorImpl());
+      if (found == actor_names.end()) {
+        return fail("actor optimizer contains a non-actor parameter");
+      }
+      ordered_actor.emplace_back(found->second, parameter);
+    }
+  }
+  for (const auto& group : optimizers.q->param_groups()) {
+    for (const auto& parameter : group.params()) {
+      const auto found = q_names.find(parameter.unsafeGetTensorImpl());
+      if (found == q_names.end() ||
+          actor_names.count(parameter.unsafeGetTensorImpl()) != 0) {
+        return fail("Q optimizer contains an invalid/overlapping parameter");
+      }
+      ordered_q.emplace_back(found->second, parameter);
+    }
+  }
+  if (ordered_actor.size() != actor_names.size() ||
+      ordered_q.size() != q_names.size() ||
+      !validate_and_hash(*optimizers.actor, ordered_actor, "actor",
+                         actor_state_sha256) ||
+      !validate_and_hash(*optimizers.q, ordered_q, "q", q_state_sha256)) {
+    return fail("optimizer numerical state is incomplete or nonfinite");
+  }
+  return true;
+}
+
 struct VrpoExpandedFileIdentity {
   std::string filename;
   int64_t size = 0;
@@ -417,11 +562,19 @@ inline void SaveVrpoModule(torch::nn::Module& module,
   archive.save_to(path.string());
 }
 
-inline void LoadVrpoModule(torch::nn::Module& module,
-                           const std::filesystem::path& path) {
+inline bool LoadVrpoModule(torch::nn::Module& module,
+                           const std::filesystem::path& path,
+                           std::string* error) {
+  vrpo_training_internal::ModuleRuntimePlacement placement;
+  if (!vrpo_training_internal::CaptureUniformModuleRuntimePlacement(
+          module, &placement, error)) {
+    return false;
+  }
   torch::serialize::InputArchive archive;
   archive.load_from(path.string(), torch::kCPU);
   module.load(archive);
+  return vrpo_training_internal::RestoreModuleRuntimePlacement(
+      module, placement, error);
 }
 
 inline json::Object BuildVrpoExpandedManifest(
@@ -436,7 +589,9 @@ inline json::Object BuildVrpoExpandedManifest(
     const VrpoExpandedFileIdentity& q_optimizer,
     const std::string& actor_values_sha256,
     const std::string& q_values_sha256,
-    const std::string& optimizer_zero_state_sha256) {
+    const std::string& optimizer_zero_state_sha256,
+    const std::string& actor_optimizer_state_sha256,
+    const std::string& q_optimizer_state_sha256) {
   json::Object out;
   out["schema"] = kVrpoExpandedCheckpointSchema;
   out["phase4_contract"] = json::Value(BuildVrpoPhase4Manifest(arm, binding));
@@ -447,6 +602,8 @@ inline json::Object BuildVrpoExpandedManifest(
   out["actor_values_sha256"] = actor_values_sha256;
   out["q_values_sha256"] = q_values_sha256;
   out["optimizer_zero_state_sha256"] = optimizer_zero_state_sha256;
+  out["actor_optimizer_state_sha256"] = actor_optimizer_state_sha256;
+  out["q_optimizer_state_sha256"] = q_optimizer_state_sha256;
   out["serialized_layout_label"] = serialized_layout.label;
   out["serialized_layout_test_fixture"] = serialized_layout.test_fixture;
   out["serialized_actor_observation_dim"] =
@@ -613,8 +770,12 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
   }
   if (actor_model == nullptr || q_model == nullptr ||
       optimizers.actor == nullptr || optimizers.q == nullptr ||
-      !VrpoCheckpointUuidValid(checkpoint_uuid) || global_update != 0 ||
-      next_episode_id != binding.start_episode_id) {
+      !VrpoCheckpointUuidValid(checkpoint_uuid) || global_update < 0 ||
+      global_update > 1 ||
+      (global_update == 0 && next_episode_id != binding.start_episode_id) ||
+      (global_update == 1 &&
+       (next_episode_id <= binding.start_episode_id ||
+        next_episode_id > binding.end_episode_id_inclusive + 1))) {
     if (error != nullptr) *error = "expanded checkpoint save input is invalid";
     return false;
   }
@@ -689,11 +850,24 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
             *q_model, expected_layout, &q_parameter_hash, error)) {
       return fail(error == nullptr ? "Q identity failed" : *error, paths);
     }
-    std::string zero_state_hash;
-    if (!ValidateVrpoOptimizerGroupsAndZeroState(
-            optimizers, *actor_model, *q_model, &zero_state_hash, error)) {
+    std::string zero_state_hash = binding.optimizer_zero_state_sha256;
+    std::string actor_optimizer_state_hash;
+    std::string q_optimizer_state_hash;
+    if (!ValidateVrpoOptimizerGroupsAndFiniteState(
+            optimizers, *actor_model, *q_model,
+            &actor_optimizer_state_hash, &q_optimizer_state_hash, error)) {
       return fail(error == nullptr ? "optimizer identity failed" : *error,
                   paths);
+    }
+    if (global_update == 0) {
+      std::string observed_zero_state;
+      if (!ValidateVrpoOptimizerGroupsAndZeroState(
+              optimizers, *actor_model, *q_model, &observed_zero_state,
+              error) || observed_zero_state != zero_state_hash) {
+        return fail(error == nullptr ? "optimizer zero-state identity failed"
+                                     : *error,
+                    paths);
+      }
     }
     const std::string actor_value_hash =
         VrpoNamedParameterIdentitySha256(actor_identities, true);
@@ -709,13 +883,13 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
     const std::string optimizer_groups_hash =
         VrpoOptimizerGroupSpecSha256(CanonicalVrpoPhase4OptimizerGroups());
     std::string binding_error;
-    if (binding.actor_subset_sha256 != actor_value_hash ||
+    if ((global_update == 0 &&
+         binding.actor_subset_sha256 != actor_value_hash) ||
         binding.actor_names_shapes_sha256 != actor_layout_hash ||
-        binding.q_init_sha256 != q_parameter_hash ||
+        (global_update == 0 && binding.q_init_sha256 != q_parameter_hash) ||
         binding.q_names_shapes_sha256 != q_layout_hash ||
         binding.module_layout_sha256 != module_layout_hash ||
-        binding.optimizer_groups_sha256 != optimizer_groups_hash ||
-        binding.optimizer_zero_state_sha256 != zero_state_hash) {
+        binding.optimizer_groups_sha256 != optimizer_groups_hash) {
       return fail("live module/optimizer identities differ from registered binding",
                   paths);
     }
@@ -742,8 +916,8 @@ inline bool SaveVrpoExpandedCheckpointAtomic(
         arm, binding, expected_layout, checkpoint_uuid, global_update,
         next_episode_id,
         actor_file, q_file, actor_optimizer_file, q_optimizer_file,
-        binding.actor_subset_sha256, binding.q_init_sha256,
-        zero_state_hash);
+        actor_value_hash, q_parameter_hash, zero_state_hash,
+        actor_optimizer_state_hash, q_optimizer_state_hash);
     {
       std::ofstream stream(manifest_tmp, std::ios::trunc);
       if (!stream) return fail("cannot write expanded manifest temp", paths);
@@ -860,7 +1034,9 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
     std::shared_ptr<torch::nn::Module> q_model,
     VrpoFreshOptimizers& optimizers, json::Object* loaded_manifest,
     std::string* error,
-    VrpoExpandedArchiveIdentity* archive_identity = nullptr) {
+    VrpoExpandedArchiveIdentity* archive_identity = nullptr,
+    int64_t expected_global_update = 0,
+    std::optional<uint64_t> expected_next_episode_id = std::nullopt) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     if (loaded_manifest != nullptr) loaded_manifest->clear();
@@ -916,13 +1092,16 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
   const auto next_it = manifest.find("next_episode_id");
   const auto source_moments_it =
       manifest.find("source_optimizer_moments_loaded");
-  if (!require_string("schema", kVrpoExpandedCheckpointSchema) ||
-      !require_int("global_update", 0) || uuid_it == manifest.end() ||
+  const uint64_t required_next_episode_id = expected_next_episode_id.value_or(
+      expected_binding.start_episode_id);
+  if (expected_global_update < 0 || expected_global_update > 1 ||
+      !require_string("schema", kVrpoExpandedCheckpointSchema) ||
+      !require_int("global_update", expected_global_update) ||
+      uuid_it == manifest.end() ||
       !uuid_it->second.IsString() ||
       !VrpoCheckpointUuidValid(uuid_it->second.GetString()) ||
       next_it == manifest.end() || !next_it->second.IsInt() ||
-      next_it->second.GetInt() !=
-          static_cast<int64_t>(expected_binding.start_episode_id) ||
+      next_it->second.GetInt() != static_cast<int64_t>(required_next_episode_id) ||
       source_moments_it == manifest.end() ||
       !source_moments_it->second.IsBool() ||
       source_moments_it->second.GetBool()) {
@@ -941,10 +1120,20 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
     }
   }
   try {
-    LoadVrpoModule(*actor_model, paths.actor_model);
-    LoadVrpoModule(*q_model, paths.q_model);
+    if (!LoadVrpoModule(*actor_model, paths.actor_model, error) ||
+        !LoadVrpoModule(*q_model, paths.q_model, error)) {
+      return fail(error == nullptr ? "expanded module placement restore failed"
+                                   : *error);
+    }
     torch::load(*optimizers.actor, paths.actor_optimizer.string());
     torch::load(*optimizers.q, paths.q_optimizer.string());
+    if (!vrpo_training_internal::MigrateAdamWOptimizerStateToParameterDevices(
+            *optimizers.actor, error) ||
+        !vrpo_training_internal::MigrateAdamWOptimizerStateToParameterDevices(
+            *optimizers.q, error)) {
+      return fail(error == nullptr ? "expanded optimizer migration failed"
+                                   : *error);
+    }
   } catch (const std::exception& exception) {
     return fail(std::string("expanded checkpoint deserialize failed: ") +
                 exception.what());
@@ -964,16 +1153,29 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
   }
   const std::string actor_values_hash =
       VrpoNamedParameterIdentitySha256(actor_identities, true);
-  std::string zero_state_hash;
-  if (!ValidateVrpoOptimizerGroupsAndZeroState(
-          optimizers, *actor_model, *q_model, &zero_state_hash, error)) {
+  std::string zero_state_hash = expected_binding.optimizer_zero_state_sha256;
+  std::string actor_optimizer_state_hash;
+  std::string q_optimizer_state_hash;
+  if (!ValidateVrpoOptimizerGroupsAndFiniteState(
+          optimizers, *actor_model, *q_model,
+          &actor_optimizer_state_hash, &q_optimizer_state_hash, error)) {
     return fail(error == nullptr ? "expanded optimizer validation failed" : *error);
+  }
+  if (expected_global_update == 0) {
+    std::string observed_zero_state;
+    if (!ValidateVrpoOptimizerGroupsAndZeroState(
+            optimizers, *actor_model, *q_model, &observed_zero_state, error) ||
+        observed_zero_state != zero_state_hash) {
+      return fail(error == nullptr ? "expanded zero-state validation failed"
+                                   : *error);
+    }
   }
   const std::string actual_optimizer_groups_hash =
       VrpoOptimizerGroupSpecSha256(CanonicalVrpoPhase4OptimizerGroups());
-  if (actor_values_hash != expected_binding.actor_subset_sha256 ||
-      q_values_hash != expected_binding.q_init_sha256 ||
-      zero_state_hash != expected_binding.optimizer_zero_state_sha256 ||
+  if ((expected_global_update == 0 &&
+       actor_values_hash != expected_binding.actor_subset_sha256) ||
+      (expected_global_update == 0 &&
+       q_values_hash != expected_binding.q_init_sha256) ||
       actual_optimizer_groups_hash !=
           expected_binding.optimizer_groups_sha256) {
     return fail("loaded identities differ from external registered binding");
@@ -992,7 +1194,10 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
   }
   if (!require_string("actor_values_sha256", actor_values_hash) ||
       !require_string("q_values_sha256", q_values_hash) ||
-      !require_string("optimizer_zero_state_sha256", zero_state_hash)) {
+      !require_string("optimizer_zero_state_sha256", zero_state_hash) ||
+      !require_string("actor_optimizer_state_sha256",
+                      actor_optimizer_state_hash) ||
+      !require_string("q_optimizer_state_sha256", q_optimizer_state_hash)) {
     return fail("expanded loaded parameter/optimizer identity mismatch");
   }
   const VrpoExpandedFileIdentity actor_file = VrpoFileIdentity(paths.actor_model);
@@ -1003,10 +1208,11 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
       VrpoFileIdentity(paths.q_optimizer);
   const json::Object expected = BuildVrpoExpandedManifest(
       expected_arm, expected_binding, expected_layout,
-      uuid_it->second.GetString(), 0,
+      uuid_it->second.GetString(), expected_global_update,
       static_cast<uint64_t>(next_it->second.GetInt()),
       actor_file, q_file, actor_optimizer_file, q_optimizer_file,
-      actor_values_hash, q_values_hash, zero_state_hash);
+      actor_values_hash, q_values_hash, zero_state_hash,
+      actor_optimizer_state_hash, q_optimizer_state_hash);
   if (!VrpoExpandedManifestStrictEqual(manifest, expected, error)) {
     return false;
   }

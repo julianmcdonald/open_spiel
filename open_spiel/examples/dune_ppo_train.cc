@@ -48,6 +48,7 @@
 #include "dune_ppo_numerical_parity.h"
 #include "dune_vrpo.h"
 #include "dune_vrpo_checkpoint.h"
+#include "dune_vrpo_phase4e.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
 #include "dune_search_pi.h"  // agent-turn search policy-iteration lane
@@ -197,6 +198,24 @@ ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_start, 0,
           "Shared paired episode start, repeated for VRPO uncapped.");
 ABSL_FLAG(uint64_t, vrpo_bootstrap_vrpo_uncapped_end, 0,
           "Shared paired episode end inclusive, repeated for VRPO uncapped.");
+ABSL_FLAG(std::string, vrpo_one_update_input_archive, "",
+          "Strict phase-4 expanded arm archive consumed by exactly one VRPO update.");
+ABSL_FLAG(std::string, vrpo_one_update_output_root, "",
+          "Fresh root receiving the atomic phase-4e update archive and result.");
+ABSL_FLAG(std::string, vrpo_one_update_registration_id, "",
+          "Required immutable registration ID for the one-update run.");
+ABSL_FLAG(std::string, vrpo_one_update_arm_id, "",
+          "Required registered arm ID: PPO_CAP10, PPO_UNCAPPED, VRPO_CAP10, or VRPO_UNCAPPED.");
+ABSL_FLAG(std::string, vrpo_one_update_source_root, "",
+          "Required source root for the phase-4e fixed source list.");
+ABSL_FLAG(std::string, vrpo_one_update_source_sha256, "",
+          "Required SHA-256 for the phase-4e fixed source list.");
+ABSL_FLAG(std::string, vrpo_one_update_binary_sha256, "",
+          "Required SHA-256 of the executing one-update trainer binary.");
+ABSL_FLAG(int64_t, vrpo_one_update_binary_size, 0,
+          "Required byte size of the executing one-update trainer binary.");
+ABSL_FLAG(std::string, vrpo_one_update_profile, "",
+          "Required registered one-update profile: smoke16 or M16.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5748,13 +5767,22 @@ int main(int argc, char** argv) {
       !absl::GetFlag(FLAGS_vrpo_q_preflight_output).empty();
   const bool vrpo_bootstrap =
       !absl::GetFlag(FLAGS_vrpo_bootstrap_root).empty();
+  const bool vrpo_one_update =
+      !absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
+      !absl::GetFlag(FLAGS_vrpo_one_update_output_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
           static_cast<int>(vrpo_q_preflight) +
-          static_cast<int>(vrpo_bootstrap) >
+          static_cast<int>(vrpo_bootstrap) + static_cast<int>(vrpo_one_update) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, VRPO Q preflight, and VRPO bootstrap modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, and VRPO one-update modes are mutually exclusive");
+  }
+  if (vrpo_one_update &&
+      (absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
+       absl::GetFlag(FLAGS_vrpo_one_update_output_root).empty())) {
+    open_spiel::SpielFatalError(
+        "VRPO one-update requires both input archive and fresh output root");
   }
   if (numerical_parity) {
     auto parity_stop = [](const std::string& message) {
@@ -6307,6 +6335,7 @@ int main(int argc, char** argv) {
       parity_source_provenance;
   open_spiel::PpoNumericalParitySourceProvenance
       vrpo_source_provenance;
+  open_spiel::VrpoPhase4eSourceIdentity vrpo_one_update_source_identity;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -6324,6 +6353,16 @@ int main(int argc, char** argv) {
             vrpo_q_preflight
                 ? open_spiel::VrpoQPreflightSourceRelativePaths()
                 : open_spiel::VrpoCaptureSourceRelativePaths());
+  }
+  if (vrpo_one_update) {
+    std::string source_error;
+    if (!open_spiel::LoadVrpoPhase4eSourceIdentity(
+            absl::GetFlag(FLAGS_vrpo_one_update_source_root),
+            absl::GetFlag(FLAGS_vrpo_one_update_source_sha256),
+            &vrpo_one_update_source_identity, &source_error)) {
+      SpielFatalError("VRPO one-update source identity rejected: " +
+                      source_error);
+    }
   }
 
   // PWO-5 section 7.2 / Appendix A.1.
@@ -6431,7 +6470,8 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
-  if (open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
+  if (!vrpo_one_update &&
+      open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
     // Section 7.4: materialize BEFORE any load, so the entries exist in all six
@@ -6604,6 +6644,17 @@ int main(int argc, char** argv) {
     SpielFatalError("Required flag --init_mode is missing. Must be 'random', 'checkpoint', 'bootstrap', or 'validate_legacy'.");
   }
 
+  // Phase 4e owns an intentionally separate optimizer/model path. It loads
+  // only the strict expanded arm archive; neither legacy PPO checkpoint nor
+  // optimizer state is read or writable on this path.
+  std::shared_ptr<open_spiel::DuneVrpoQNetImpl> vrpo_one_update_q;
+  open_spiel::VrpoFreshOptimizers vrpo_one_update_optimizers;
+  open_spiel::VrpoPhase4ArmConfig vrpo_one_update_arm;
+  open_spiel::VrpoPhase4ManifestBinding vrpo_one_update_binding;
+  open_spiel::VrpoExpandedExpectedLayout vrpo_one_update_layout;
+  open_spiel::VrpoExpandedArchiveIdentity vrpo_one_update_input_identity;
+  open_spiel::VrpoPhase4eStartupConfig vrpo_one_update_startup;
+
   // WO-PERF-TIMING. Enforced HERE, at startup, because FLAGS_pipeline is
   // defined in this TU and validating at the first update would waste a whole
   // rollout before failing.
@@ -6703,7 +6754,133 @@ int main(int argc, char** argv) {
   int64_t parity_source_global_update = -1;
   std::string parity_source_checkpoint_uuid;
 
-  if (init_mode == "diagnostic") {
+  if (vrpo_one_update) {
+    if (init_mode != "vrpo_one_update" ||
+        absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        !absl::GetFlag(FLAGS_artifact_manifest).empty()) {
+      SpielFatalError(
+          "VRPO one-update requires its dedicated init mode, production actor layout, and no legacy source/auxiliary manifest path");
+    }
+    const open_spiel::VrpoPhase4ArmConfig* selected_arm =
+        open_spiel::FindCanonicalVrpoPhase4Arm(
+            absl::GetFlag(FLAGS_vrpo_one_update_arm_id));
+    if (selected_arm == nullptr) {
+      SpielFatalError("VRPO one-update selected arm is not canonical");
+    }
+    vrpo_one_update_arm = *selected_arm;
+    std::error_code binary_ec;
+    const auto binary_path =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    if (binary_ec || binary_path.empty()) {
+      SpielFatalError("VRPO one-update cannot resolve the executed binary");
+    }
+    size_t binary_size = 0;
+    const std::string binary_sha256 =
+        open_spiel::ComputeFileSHA256(binary_path.string(), &binary_size);
+    if (binary_sha256 != absl::GetFlag(FLAGS_vrpo_one_update_binary_sha256) ||
+        static_cast<int64_t>(binary_size) !=
+            absl::GetFlag(FLAGS_vrpo_one_update_binary_size)) {
+      SpielFatalError("VRPO one-update executed binary identity mismatch");
+    }
+    vrpo_one_update_startup.game = absl::GetFlag(FLAGS_game);
+    vrpo_one_update_startup.registration_id =
+        absl::GetFlag(FLAGS_vrpo_one_update_registration_id);
+    vrpo_one_update_startup.selected_arm_id = vrpo_one_update_arm.arm_id;
+    vrpo_one_update_startup.input_archive =
+        absl::GetFlag(FLAGS_vrpo_one_update_input_archive);
+    vrpo_one_update_startup.output_root =
+        absl::GetFlag(FLAGS_vrpo_one_update_output_root);
+    vrpo_one_update_startup.source_root =
+        absl::GetFlag(FLAGS_vrpo_one_update_source_root);
+    vrpo_one_update_startup.source_code_sha256 =
+        vrpo_one_update_source_identity.combined_sha256;
+    vrpo_one_update_startup.executed_binary_sha256 = binary_sha256;
+    vrpo_one_update_startup.executed_binary_size =
+        static_cast<int64_t>(binary_size);
+    vrpo_one_update_startup.profile =
+        absl::GetFlag(FLAGS_vrpo_one_update_profile);
+    vrpo_one_update_startup.rollout_games =
+        absl::GetFlag(FLAGS_rollout_games);
+    vrpo_one_update_startup.threads = absl::GetFlag(FLAGS_threads);
+    vrpo_one_update_startup.diagnostics_only =
+        absl::GetFlag(FLAGS_diagnostics_only);
+    vrpo_one_update_startup.init_mode = init_mode;
+    vrpo_one_update_startup.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+    vrpo_one_update_startup.train_amp = absl::GetFlag(FLAGS_train_amp);
+    vrpo_one_update_startup.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    vrpo_one_update_startup.pipeline = absl::GetFlag(FLAGS_pipeline);
+    vrpo_one_update_startup.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    vrpo_one_update_startup.search_pi_mode =
+        absl::GetFlag(FLAGS_search_pi_mode);
+    vrpo_one_update_startup.train_value_only =
+        absl::GetFlag(FLAGS_train_value_only);
+    vrpo_one_update_startup.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    vrpo_one_update_startup.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    vrpo_one_update_startup.ordinary_checkpoint_writes_enabled =
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    vrpo_one_update_startup.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    vrpo_one_update_startup.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    vrpo_one_update_startup.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    vrpo_one_update_startup.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    vrpo_one_update_startup.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    vrpo_one_update_startup.gamma = absl::GetFlag(FLAGS_gamma);
+    vrpo_one_update_startup.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    std::string vrpo_one_update_error;
+    json::Object input_manifest;
+    if (!open_spiel::ReadVrpoPhase4eExternalBinding(
+            vrpo_one_update_startup.input_archive, vrpo_one_update_arm,
+            &vrpo_one_update_binding, &vrpo_one_update_layout, &input_manifest,
+            &vrpo_one_update_input_identity, &vrpo_one_update_error)) {
+      SpielFatalError("VRPO one-update input binding rejected: " +
+                      vrpo_one_update_error);
+    }
+    vrpo_one_update_startup.input_archive_sha256 =
+        vrpo_one_update_input_identity.combined_sha256;
+    if (!open_spiel::ValidateVrpoPhase4eStartupConfig(
+            vrpo_one_update_startup, &vrpo_one_update_error)) {
+      SpielFatalError("VRPO one-update startup rejected: " +
+                      vrpo_one_update_error);
+    }
+    // Never instantiate an archive-provided module shape: test fixtures and
+    // alternate layouts are rejected before the canonical Q is constructed.
+    if (vrpo_one_update_layout.test_fixture ||
+        vrpo_one_update_layout.label != "production_dune_vrpo_layout_v1" ||
+        vrpo_one_update_layout.actor_observation_dim != obs_size ||
+        vrpo_one_update_layout.actor_hidden_dim != 2048 ||
+        vrpo_one_update_layout.actor_action_dim != action_size ||
+        vrpo_one_update_layout.actor_residual_blocks != 8) {
+      SpielFatalError("VRPO one-update permits production expanded archives only");
+    }
+    vrpo_one_update_q = std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+        vrpo_one_update_binding.q_init_seed);
+    vrpo_one_update_q->to(device);
+    if (!open_spiel::MakeVrpoFreshOptimizers(
+            *training_model, *vrpo_one_update_q, &vrpo_one_update_optimizers,
+            &vrpo_one_update_error) ||
+        !open_spiel::LoadAndValidateVrpoExpandedCheckpoint(
+            vrpo_one_update_startup.input_archive, vrpo_one_update_arm,
+            vrpo_one_update_binding, vrpo_one_update_layout, training_model,
+            vrpo_one_update_q, vrpo_one_update_optimizers, &input_manifest,
+            &vrpo_one_update_error, nullptr, 0,
+            vrpo_one_update_binding.start_episode_id)) {
+      SpielFatalError("VRPO one-update strict expanded archive load failed: " +
+                      vrpo_one_update_error);
+    }
+    next_episode_id.store(vrpo_one_update_binding.start_episode_id);
+    total_env_steps.store(0);
+    start_update = 1;
+  } else if (init_mode == "diagnostic") {
     // A model-only, read-only load path. It exists specifically so a completed
     // checkpoint can be audited without pretending to resume it, loading Adam
     // moments, synthesizing a bootstrap manifest, or making any checkpoint
@@ -8926,7 +9103,7 @@ int main(int argc, char** argv) {
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
-      vrpo_diagnostics ? &vrpo_capture_buffer : nullptr);
+      (vrpo_diagnostics || vrpo_one_update) ? &vrpo_capture_buffer : nullptr);
   if (vrpo_capture) {
     std::vector<open_spiel::VrpoCapturedEpisode> episodes =
         vrpo_capture_buffer.TakeSorted();
@@ -9020,6 +9197,52 @@ int main(int argc, char** argv) {
               << (valid ? "VALID" : "INVALID") << ": "
               << absl::GetFlag(FLAGS_vrpo_q_preflight_output) << "\n";
     return valid ? 0 : 3;
+  }
+  if (vrpo_one_update) {
+    std::vector<open_spiel::VrpoCapturedEpisode> episodes =
+        vrpo_capture_buffer.TakeSorted();
+    std::vector<open_spiel::VrpoTrainingEpisode> training_episodes;
+    open_spiel::VrpoPhase4ePairingStats pairing;
+    std::string phase4e_error;
+    if (!current_collect.episode_ids_unique ||
+        current_collect.games !=
+            static_cast<uint64_t>(open_spiel::kVrpoPhase4eGames) ||
+        !open_spiel::BuildVrpoPhase4eTrainingEpisodes(
+            episodes, current_collect.rollout,
+            vrpo_one_update_binding.start_episode_id,
+            open_spiel::kVrpoPhase4eGames, &training_episodes, &pairing,
+            &phase4e_error)) {
+      SpielFatalError("VRPO one-update complete-game capture/pairing failed: " +
+                      phase4e_error);
+    }
+    open_spiel::VrpoActorForward actor_forward =
+        [model = training_model](const torch::Tensor& input) {
+          const auto output = model->forward(input);
+          return open_spiel::VrpoActorTrainingOutput{
+              output.logits, output.values};
+        };
+    open_spiel::VrpoQForward q_forward =
+        [q = vrpo_one_update_q](const torch::Tensor& input) {
+          torch::Tensor output;
+          std::string error;
+          if (!q->ForwardChecked(input, &output, &error)) {
+            throw std::runtime_error("VRPO Q forward rejected: " + error);
+          }
+          return output;
+        };
+    open_spiel::json::Object result;
+    if (!open_spiel::WriteVrpoPhase4eOneUpdate(
+            vrpo_one_update_startup, vrpo_one_update_arm,
+            vrpo_one_update_binding, vrpo_one_update_layout,
+            vrpo_one_update_input_identity, training_episodes, pairing,
+            training_model, vrpo_one_update_q, &vrpo_one_update_optimizers,
+            actor_forward, q_forward, open_spiel::VrpoPhase4eFailurePoint::kNone,
+            &result, &phase4e_error)) {
+      SpielFatalError("VRPO one-update transaction failed: " + phase4e_error);
+    }
+    std::cout << "VRPO one-update VALID: "
+              << vrpo_one_update_startup.output_root << "\n";
+    return 0;
   }
   if (numerical_parity) {
     const auto batch_evaluator =
