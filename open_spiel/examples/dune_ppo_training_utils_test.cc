@@ -50,6 +50,7 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_ppo_numerical_parity.h"
 #include "dune_sha256.h"
+#include "dune_vrpo.h"
 #include <chrono>
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -1906,6 +1907,334 @@ void TestPpoPrecisionFingerprintAndManifestMigration() {
   } TEST_END();
 }
 
+void TestVrpoActorRelativeJointInformationTensor() {
+  TEST_BEGIN("VRPO phase 1: actor-relative joint information is exact, finite, and explicitly non-full-state") {
+    auto game = LoadGame("dune_imperium");
+    CHECK_EQ(game->NumPlayers(), kVrpoNumSeats);
+    CHECK_EQ(game->InformationStateTensorSize(),
+             kVrpoDuneInformationStateSize);
+    auto state = game->NewInitialState();
+    auto* dune_state =
+        dynamic_cast<dune_imperium::DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+    dune_state->SetPlayerHandForTesting(1, {0});
+
+    std::vector<float> actor0;
+    std::string error;
+    UTILS_CHECK(ActorRelativeJointInformationTensor(
+        *state, /*actor=*/0, &actor0, &error));
+    CHECK_EQ(actor0.size(), static_cast<size_t>(kVrpoJointInformationSize));
+    UTILS_CHECK(std::all_of(actor0.begin(), actor0.end(),
+                            [](float value) { return std::isfinite(value); }));
+    for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+      const int absolute_seat = slot;
+      const std::vector<float> direct =
+          state->InformationStateTensor(absolute_seat);
+      UTILS_CHECK(std::equal(
+          direct.begin(), direct.end(),
+          actor0.begin() + slot * kVrpoDuneInformationStateSize));
+    }
+
+    std::vector<float> actor1;
+    UTILS_CHECK(ActorRelativeJointInformationTensor(
+        *state, /*actor=*/1, &actor1, &error));
+    for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+      const int absolute_seat = (1 + slot) % kVrpoNumSeats;
+      const std::vector<float> direct =
+          state->InformationStateTensor(absolute_seat);
+      UTILS_CHECK(std::equal(
+          direct.begin(), direct.end(),
+          actor1.begin() + slot * kVrpoDuneInformationStateSize));
+    }
+    std::vector<float> actor3;
+    UTILS_CHECK(ActorRelativeJointInformationTensor(
+        *state, /*actor=*/3, &actor3, &error));
+    for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+      const int absolute_seat = (3 + slot) % kVrpoNumSeats;
+      const std::vector<float> direct =
+          state->InformationStateTensor(absolute_seat);
+      UTILS_CHECK(std::equal(
+          direct.begin(), direct.end(),
+          actor3.begin() + slot * kVrpoDuneInformationStateSize));
+    }
+    const std::string hash0 = VrpoJointInformationSha256(0, actor0);
+    CHECK_EQ(hash0, VrpoJointInformationSha256(0, actor0));
+    UTILS_CHECK(hash0 != VrpoJointInformationSha256(1, actor1));
+
+    VrpoActorRelativeSeatValues relative;
+    relative.slots = {30.0, 0.0, 10.0, 20.0};
+    VrpoSeatValues absolute;
+    UTILS_CHECK(VrpoActorRelativeToAbsoluteSeatValues(
+        /*actor=*/3, relative, &absolute, &error));
+    UTILS_CHECK(absolute == VrpoSeatValues({0.0, 10.0, 20.0, 30.0}));
+    relative.slots[2] = std::numeric_limits<double>::infinity();
+    UTILS_CHECK(!VrpoActorRelativeToAbsoluteSeatValues(
+        /*actor=*/3, relative, &absolute, &error));
+    UTILS_CHECK(absolute == VrpoSeatValues({0.0, 0.0, 0.0, 0.0}));
+    relative.slots[2] = 10.0;
+    UTILS_CHECK(!VrpoActorRelativeToAbsoluteSeatValues(
+        /*actor=*/4, relative, &absolute, &error));
+
+    // Same public hand count, different private identity: player 0's direct
+    // tensor is unchanged, player 1's private segment and the joint proxy move.
+    const std::vector<float> p0_before = state->InformationStateTensor(0);
+    const std::vector<float> p1_before = state->InformationStateTensor(1);
+    dune_state->SetPlayerHandForTesting(1, {1});
+    const std::vector<float> p0_after = state->InformationStateTensor(0);
+    const std::vector<float> p1_after = state->InformationStateTensor(1);
+    UTILS_CHECK(p0_before == p0_after);
+    UTILS_CHECK(p1_before != p1_after);
+    std::vector<float> private_changed;
+    UTILS_CHECK(ActorRelativeJointInformationTensor(
+        *state, /*actor=*/0, &private_changed, &error));
+    UTILS_CHECK(private_changed != actor0);
+
+    CHECK_EQ(std::string(kVrpoJointInformationEncodingLabel),
+             std::string(
+                 "actor_relative_joint_information_proxy_not_full_markov_state_v1"));
+    UTILS_CHECK(!kVrpoJointInformationIsFullMarkovState);
+    UTILS_CHECK(!kVrpoJointInformationMayFeedActorInference);
+    std::vector<float> rejected = {1.0f};
+    UTILS_CHECK(!ActorRelativeJointInformationTensor(
+        *state, /*actor=*/-1, &rejected, &error));
+    UTILS_CHECK(rejected.empty());
+    auto wrong_game = LoadGame("tic_tac_toe");
+    auto wrong_state = wrong_game->NewInitialState();
+    UTILS_CHECK(!ActorRelativeJointInformationTensor(
+        *wrong_state, /*actor=*/0, &rejected, &error));
+    UTILS_CHECK(error.find("exact game identity dune_imperium") !=
+                std::string::npos);
+  } TEST_END();
+}
+
+void TestVrpoGlobalExpectedSarsaLambdaReference() {
+  TEST_BEGIN("VRPO phase 1: global Expected-SARSA(lambda) reference and strict timeline validation") {
+    auto make_row = [](uint64_t episode, Player actor,
+                       std::vector<Action> legal, int chosen_index,
+                       std::vector<double> probabilities,
+                       std::vector<VrpoSeatValues> q,
+                       VrpoSeatValues rewards, bool terminal) {
+      VrpoTimelineRow row;
+      row.episode_id = episode;
+      row.actor = actor;
+      row.legal_actions = std::move(legal);
+      row.chosen_index = chosen_index;
+      row.chosen_action = row.legal_actions.at(chosen_index);
+      row.legal_probabilities = std::move(probabilities);
+      row.legal_q_values = std::move(q);
+      row.rewards = rewards;
+      row.terminal_after = terminal;
+      return row;
+    };
+    std::vector<VrpoTimelineRow> timeline;
+    timeline.push_back(make_row(
+        7, 0, {10, 20}, 0, {0.25, 0.75},
+        {{2.0, 20.0, 200.0, 2000.0},
+         {4.0, 40.0, 400.0, 4000.0}},
+        {1.0, 2.0, 3.0, 4.0}, false));
+    timeline.push_back(make_row(
+        7, 1, {30, 40}, 1, {0.5, 0.5},
+        {{6.0, 60.0, 600.0, 6000.0},
+         {10.0, 100.0, 1000.0, 10000.0}},
+        {0.5, 1.0, 1.5, 2.0}, false));
+    timeline.push_back(make_row(
+        7, 2, {50}, 0, {1.0}, {{3.0, 30.0, 300.0, 3000.0}},
+        {7.0, 8.0, 9.0, 10.0}, true));
+
+    auto near = [](double actual, double expected) {
+      return std::abs(actual - expected) < 1e-12;
+    };
+    VrpoReferenceTrace lambda0;
+    std::string error;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        timeline, /*gamma=*/0.5, /*lambda=*/0.0, &lambda0, &error));
+    UTILS_CHECK(near(lambda0.rows[0].v[0], 3.5));
+    UTILS_CHECK(near(lambda0.rows[1].v[1], 80.0));
+    UTILS_CHECK(near(lambda0.rows[0].delta[0], 3.0));
+    UTILS_CHECK(near(lambda0.rows[1].delta[1], -84.0));
+    UTILS_CHECK(near(lambda0.rows[2].delta[2], -291.0));
+    UTILS_CHECK(near(lambda0.rows[0].g[0], 3.0));
+    UTILS_CHECK(near(lambda0.rows[0].actor_advantage, 1.5));
+    UTILS_CHECK(near(lambda0.rows[1].actor_advantage, -64.0));
+    UTILS_CHECK(near(lambda0.rows[2].q_target[0], 7.0));
+    const std::string lambda0_hash = lambda0.canonical_sha256;
+    VrpoReferenceTrace repeated;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        timeline, 0.5, 0.0, &repeated, &error));
+    CHECK_EQ(repeated.canonical_sha256, lambda0_hash);
+
+    VrpoReferenceTrace lambda1;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        timeline, 0.5, 1.0, &lambda1, &error));
+    UTILS_CHECK(lambda1.canonical_sha256 != lambda0_hash);
+    UTILS_CHECK(near(lambda1.rows[2].g[0], 4.0));
+    UTILS_CHECK(near(lambda1.rows[1].g[0], -6.0));
+    UTILS_CHECK(near(lambda1.rows[0].g[0], 0.0));
+    UTILS_CHECK(near(lambda1.rows[0].g[1], -25.5));
+    UTILS_CHECK(near(lambda1.rows[0].g[2], -294.0));
+    UTILS_CHECK(near(lambda1.rows[0].g[3], -2992.5));
+    UTILS_CHECK(near(lambda1.rows[0].actor_advantage, -1.5));
+    UTILS_CHECK(near(lambda1.rows[1].actor_advantage, -75.0));
+
+    auto tolerance_edge = timeline;
+    tolerance_edge[0].legal_probabilities = {0.5, 0.4999995};
+    VrpoReferenceTrace tolerance_trace;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        tolerance_edge, 0.5, 0.5, &tolerance_trace, &error,
+        kVrpoMaxProbabilityTolerance));
+    UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+        tolerance_edge, 0.5, 0.5, &tolerance_trace, &error));
+    UTILS_CHECK(error.find("sum to one") != std::string::npos);
+    UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+        timeline, 0.5, 0.5, &tolerance_trace, &error,
+        kVrpoMaxProbabilityTolerance * 1.01));
+    UTILS_CHECK(error.find("tolerance") != std::string::npos);
+
+    // Row 1 is an opponent action, but changing its seat-0 residual changes
+    // row 0's lambda trace. This rules out a same-player-successor shortcut.
+    auto opponent_changed = timeline;
+    opponent_changed[1].rewards[0] += 10.0;
+    VrpoReferenceTrace influenced;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        opponent_changed, 0.5, 1.0, &influenced, &error));
+    UTILS_CHECK(near(influenced.rows[0].g[0] - lambda1.rows[0].g[0],
+                     5.0));
+
+    std::vector<VrpoTimelineRow> perfect;
+    perfect.push_back(make_row(
+        11, 0, {1}, 0, {1.0}, {{2.0, 3.0, 4.0, 5.0}},
+        {1.0, 1.0, 1.0, 1.0}, false));
+    perfect.push_back(make_row(
+        11, 3, {2}, 0, {1.0}, {{2.0, 4.0, 6.0, 8.0}},
+        {2.0, 4.0, 6.0, 8.0}, true));
+    VrpoReferenceTrace perfect_trace;
+    UTILS_CHECK(ComputeVrpoExpectedSarsaLambdaReference(
+        perfect, 0.5, 0.7, &perfect_trace, &error));
+    for (const auto& row : perfect_trace.rows) {
+      for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+        UTILS_CHECK(near(row.delta[seat], 0.0));
+        UTILS_CHECK(near(row.g[seat], 0.0));
+      }
+      UTILS_CHECK(near(row.actor_advantage, 0.0));
+    }
+
+    std::vector<VrpoSeatValues> dense_q(kVrpoDuneActionDim,
+                                        {0.0, 0.0, 0.0, 0.0});
+    dense_q[10] = {2.0, 20.0, 200.0, 2000.0};
+    dense_q[20] = {4.0, 40.0, 400.0, 4000.0};
+    dense_q[999] = {1e300, 1e300, 1e300, 1e300};  // illegal: excluded
+    std::vector<VrpoSeatValues> legal_q;
+    UTILS_CHECK(GatherVrpoLegalQValues(
+        dense_q, {10, 20}, &legal_q, &error));
+    CHECK_EQ(legal_q.size(), static_cast<size_t>(2));
+    UTILS_CHECK(legal_q[0] == dense_q[10]);
+    UTILS_CHECK(legal_q[1] == dense_q[20]);
+
+    // Every input is finite, but the derived stages overflow. Each case must
+    // clear the output instead of publishing a partial trace/hash.
+    auto delta_overflow = timeline;
+    delta_overflow.back().rewards[0] =
+        std::numeric_limits<double>::max();
+    delta_overflow.back().legal_q_values[0][0] =
+        -std::numeric_limits<double>::max();
+    VrpoReferenceTrace overflow_trace;
+    UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+        delta_overflow, 0.5, 0.5, &overflow_trace, &error));
+    UTILS_CHECK(overflow_trace.rows.empty());
+    UTILS_CHECK(error.find("derived delta") != std::string::npos);
+
+    std::vector<VrpoTimelineRow> trace_overflow;
+    const double large = std::numeric_limits<double>::max() * 0.75;
+    trace_overflow.push_back(make_row(
+        12, 0, {1}, 0, {1.0}, {{0.0, 0.0, 0.0, 0.0}},
+        {large, 0.0, 0.0, 0.0}, false));
+    trace_overflow.push_back(make_row(
+        12, 1, {2}, 0, {1.0}, {{0.0, 0.0, 0.0, 0.0}},
+        {large, 0.0, 0.0, 0.0}, true));
+    UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+        trace_overflow, 1.0, 1.0, &overflow_trace, &error));
+    UTILS_CHECK(overflow_trace.rows.empty());
+    UTILS_CHECK(error.find("derived reverse G") != std::string::npos);
+
+    auto v_overflow = timeline;
+    v_overflow[0].legal_probabilities = {1.0000005, 0.0};
+    v_overflow[0].legal_q_values[0][0] =
+        std::numeric_limits<double>::max();
+    UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+        v_overflow, 0.5, 0.5, &overflow_trace, &error,
+        kVrpoMaxProbabilityTolerance));
+    UTILS_CHECK(error.find("derived V") != std::string::npos);
+
+    std::string rejected_hash = "stale";
+    std::vector<VrpoReferenceRow> short_reference = lambda0.rows;
+    short_reference.pop_back();
+    UTILS_CHECK(!vrpo_internal::ReferenceTraceSha256(
+        timeline, short_reference, 0.5, 0.0, &rejected_hash, &error));
+    UTILS_CHECK(rejected_hash.empty());
+    UTILS_CHECK(error.find("row counts differ") != std::string::npos);
+    auto nonfinite_reference = lambda0.rows;
+    nonfinite_reference[0].g[0] =
+        std::numeric_limits<double>::quiet_NaN();
+    UTILS_CHECK(!vrpo_internal::ReferenceTraceSha256(
+        timeline, nonfinite_reference, 0.5, 0.0, &rejected_hash, &error));
+    UTILS_CHECK(rejected_hash.empty());
+    UTILS_CHECK(error.find("reference row is nonfinite") !=
+                std::string::npos);
+
+    auto expect_reject = [&](std::vector<VrpoTimelineRow> malformed,
+                             const std::string& needle) {
+      VrpoReferenceTrace rejected;
+      UTILS_CHECK(!ComputeVrpoExpectedSarsaLambdaReference(
+          malformed, 0.5, 0.5, &rejected, &error));
+      UTILS_CHECK(rejected.rows.empty());
+      UTILS_CHECK(error.find(needle) != std::string::npos);
+    };
+    auto malformed = timeline;
+    malformed[0].legal_actions[1] = malformed[0].legal_actions[0];
+    malformed[0].chosen_action = malformed[0].legal_actions[0];
+    expect_reject(malformed, "duplicate");
+    malformed = timeline;
+    malformed[0].legal_actions[1] = kVrpoDuneActionDim;
+    expect_reject(malformed, "out-of-range");
+    malformed = timeline;
+    malformed[0].legal_probabilities = {0.4, 0.4};
+    expect_reject(malformed, "sum to one");
+    malformed = timeline;
+    malformed[0].legal_probabilities.pop_back();
+    expect_reject(malformed, "widths differ");
+    malformed = timeline;
+    malformed[0].chosen_action = 20;
+    expect_reject(malformed, "chosen index/action");
+    malformed = timeline;
+    malformed[0].actor = 4;
+    expect_reject(malformed, "actor is out of range");
+    malformed = timeline;
+    malformed[0].terminal_after = true;
+    expect_reject(malformed, "terminal boundary");
+    malformed = timeline;
+    malformed.back().terminal_after = false;
+    expect_reject(malformed, "terminal boundary");
+    malformed = timeline;
+    malformed[1].episode_id = 8;
+    expect_reject(malformed, "episode boundary");
+    malformed = timeline;
+    malformed[0].legal_q_values[0][0] =
+        std::numeric_limits<double>::quiet_NaN();
+    expect_reject(malformed, "nonfinite legal Q");
+    malformed = timeline;
+    malformed[0].rewards[0] =
+        std::numeric_limits<double>::infinity();
+    expect_reject(malformed, "nonfinite reward");
+
+    std::vector<VrpoSeatValues> rejected_q;
+    UTILS_CHECK(!GatherVrpoLegalQValues(
+        dense_q, {10, 10}, &rejected_q, &error));
+    UTILS_CHECK(rejected_q.empty());
+    UTILS_CHECK(!GatherVrpoLegalQValues(
+        dense_q, {kVrpoDuneActionDim}, &rejected_q, &error));
+  } TEST_END();
+}
+
 void TestRawPpoNumericalParitySourceCanonicalization() {
   TEST_BEGIN("Raw-PPO parity source provenance is fixed-order and mismatch-sensitive") {
     const std::vector<std::string> paths =
@@ -1983,6 +2312,8 @@ int main() {
   TestRawPpoNumericalParityV5SharedRowsFailClosed();
   TestRawPpoNumericalParityRawLogitPrecisionGate();
   TestPpoPrecisionFingerprintAndManifestMigration();
+  TestVrpoActorRelativeJointInformationTensor();
+  TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
 #endif
 
