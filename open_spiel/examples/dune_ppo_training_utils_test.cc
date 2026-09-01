@@ -6741,15 +6741,35 @@ void TestRawPpoNumericalParitySourceCanonicalization() {
 
 void TestVrpoScheduleScreenContractsAndCodecLive() {
   TEST_BEGIN("VRPO schedule screen contracts, actor-only codec, corruption, and forced rows") {
-    const auto& cells = CanonicalVrpoScheduleCells();
+    const auto* resolved_cells =
+        FindVrpoScheduleCellsForProfile(kVrpoScheduleProfile);
+    UTILS_CHECK(resolved_cells != nullptr);
+    UTILS_CHECK(FindVrpoScheduleCellsForProfile("schedule_v1") == nullptr);
+    const auto& cells = *resolved_cells;
     CHECK_EQ(cells.size(), 4);
     CHECK_EQ(cells[0].actor_epochs + cells[1].actor_epochs +
                  cells[2].actor_epochs + cells[3].actor_epochs,
              5);
-    CHECK_NEAR(cells[0].learning_rate, 2.5e-4, 0.0);
-    CHECK_NEAR(cells[1].learning_rate, 1.25e-4, 0.0);
-    CHECK_NEAR(cells[2].learning_rate, 1.0e-4, 0.0);
-    CHECK_NEAR(cells[3].learning_rate, 5.0e-5, 0.0);
+    CHECK_EQ(std::string(kVrpoScheduleProfile), "lower_lr_v2");
+    CHECK_EQ(std::string(kVrpoScheduleCorpusSchema),
+             "dune_vrpo_schedule_actor_corpus_v2");
+    CHECK_EQ(std::string(kVrpoScheduleCellResultSchema),
+             "dune_vrpo_schedule_cell_result_v2");
+    CHECK_EQ(std::string(kVrpoScheduleResultSchema),
+             "dune_vrpo_schedule_health_screen_v2");
+    CHECK_EQ(cells[0].cell_id, "T1_LR3E5_E1");
+    CHECK_EQ(cells[1].cell_id, "T2_LR2E5_E1");
+    CHECK_EQ(cells[2].cell_id, "T3_LR1P25E5_E1");
+    CHECK_EQ(cells[3].cell_id, "T4_LR1P25E5_E2");
+    CHECK_NEAR(cells[0].learning_rate, 3.0e-5, 0.0);
+    CHECK_NEAR(cells[1].learning_rate, 2.0e-5, 0.0);
+    CHECK_NEAR(cells[2].learning_rate, 1.25e-5, 0.0);
+    CHECK_NEAR(cells[3].learning_rate, 1.25e-5, 0.0);
+    CHECK_EQ(cells[0].actor_epochs, 1);
+    CHECK_EQ(cells[1].actor_epochs, 1);
+    CHECK_EQ(cells[2].actor_epochs, 1);
+    CHECK_EQ(cells[3].actor_epochs, 2);
+    CHECK_EQ(kVrpoScheduleMaxActorSteps, 80);
     auto fixture = MakeTinyVrpoPhase4eFixture(990000);
     auto source = MakeTinyVrpoPhase4eEpisodes(*fixture.actor, 10.0, 990000);
     std::string bytes, error;
@@ -6812,6 +6832,7 @@ void TestVrpoScheduleScreenContractsAndCodecLive() {
     VrpoScheduleStartupConfig startup;
     startup.game = "dune_imperium";
     startup.init_mode = "vrpo_schedule_screen";
+    startup.profile = kVrpoScheduleProfile;
     startup.registration_id = "schedule-test";
     startup.input_archive = root / "input";
     startup.output_root = root / "output_vrpo_schedule";
@@ -6855,6 +6876,9 @@ void TestVrpoScheduleScreenContractsAndCodecLive() {
     startup.init_mode = "vrpo_one_update";
     UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
     startup.init_mode = "vrpo_schedule_screen";
+    startup.profile = "schedule_v1";
+    UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    startup.profile = kVrpoScheduleProfile;
     startup.logit_cap = 0.0;
     UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
     std::filesystem::remove_all(root);
@@ -6964,6 +6988,57 @@ void TestVrpoScheduleHealthAndPpoEquivalenceLive() {
     VrpoScheduleCorpusIdentity sealed_identity;
     UTILS_CHECK(DecodeVrpoScheduleActorCorpus(
         corpus_bytes, &sealed_episodes, &sealed_identity, &error));
+
+    const uint64_t schedule_seed = 78881300;
+    std::array<std::string, 2> expected_partitions;
+    for (int epoch = 0; epoch < 2; ++epoch) {
+      VrpoEpisodePartitionPlan expected_plan;
+      UTILS_CHECK(BuildVrpoScheduleEpisodePartitionPlan(
+          sealed_episodes,
+          vrpo_training_internal::SplitMix64(schedule_seed + epoch + 1),
+          &expected_plan, &error));
+      expected_partitions[epoch] = expected_plan.canonical_sha256;
+    }
+    const std::array<int64_t, 4> expected_steps = {16, 16, 16, 32};
+    int64_t schedule_steps = 0;
+    int64_t schedule_rows_seen = 0;
+    const auto* schedule_cells =
+        FindVrpoScheduleCellsForProfile(kVrpoScheduleProfile);
+    UTILS_CHECK(schedule_cells != nullptr);
+    for (size_t cell_index = 0; cell_index < schedule_cells->size();
+         ++cell_index) {
+      const auto& cell = (*schedule_cells)[cell_index];
+      torch::manual_seed(774410);
+      auto schedule_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          5, 8, 6, 1, false);
+      std::unique_ptr<torch::optim::AdamW> schedule_optimizer;
+      UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+          *schedule_actor, cell.learning_rate, &schedule_optimizer, &error));
+      auto schedule_forward = [model = schedule_actor](
+                                  const torch::Tensor& input) {
+        const auto out = model->forward(input);
+        return VrpoActorTrainingOutput{out.logits, out.values};
+      };
+      VrpoScheduleActorOnlyUpdateStats schedule_stats;
+      UTILS_CHECK(RunVrpoScheduleActorOnlyPpoCell(
+          sealed_episodes, schedule_seed, cell.actor_epochs, *schedule_actor,
+          *schedule_optimizer, schedule_forward,
+          /*four_epoch_equivalence_test=*/false, nullptr, &schedule_stats,
+          &error));
+      CHECK_EQ(schedule_stats.ppo.actor_optimizer_steps,
+               expected_steps[cell_index]);
+      CHECK_EQ(schedule_stats.ppo.q_optimizer_steps, 0);
+      CHECK_EQ(schedule_stats.q_target_computations, 0);
+      for (int epoch = 0; epoch < cell.actor_epochs; ++epoch) {
+        CHECK_EQ(schedule_stats.ppo.actor_epoch_partition_sha256[epoch],
+                 expected_partitions[epoch]);
+      }
+      schedule_steps += schedule_stats.ppo.actor_optimizer_steps;
+      schedule_rows_seen += schedule_stats.ppo.actor_rows_seen;
+    }
+    CHECK_EQ(schedule_steps, kVrpoScheduleMaxActorSteps);
+    CHECK_EQ(schedule_rows_seen, sealed_identity.rows * 5);
+
     torch::manual_seed(774411);
     auto actor_only = std::make_shared<SharedDunePolicyValueNetImpl>(
         5, 8, 6, 1, false);

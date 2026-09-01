@@ -223,6 +223,8 @@ ABSL_FLAG(std::string, vrpo_schedule_screen_output_root, "",
           "Fresh root for the terminal PPO schedule-health screen.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_registration_id, "",
           "Immutable schedule-health screen registration ID.");
+ABSL_FLAG(std::string, vrpo_schedule_screen_profile, "",
+          "Required schedule-health profile: lower_lr_v2.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_source_root, "",
           "Source root for the fixed schedule-screen source list.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_source_sha256, "",
@@ -6999,6 +7001,8 @@ int main(int argc, char** argv) {
     }
     vrpo_schedule_startup.game = absl::GetFlag(FLAGS_game);
     vrpo_schedule_startup.init_mode = init_mode;
+    vrpo_schedule_startup.profile =
+        absl::GetFlag(FLAGS_vrpo_schedule_screen_profile);
     vrpo_schedule_startup.registration_id =
         absl::GetFlag(FLAGS_vrpo_schedule_screen_registration_id);
     vrpo_schedule_startup.input_archive =

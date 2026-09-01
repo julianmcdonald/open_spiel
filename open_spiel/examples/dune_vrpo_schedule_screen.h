@@ -25,10 +25,13 @@
 
 namespace open_spiel {
 
+inline constexpr char kVrpoScheduleProfile[] = "lower_lr_v2";
 inline constexpr char kVrpoScheduleCorpusSchema[] =
-    "dune_vrpo_schedule_actor_corpus_v1";
+    "dune_vrpo_schedule_actor_corpus_v2";
+inline constexpr char kVrpoScheduleCellResultSchema[] =
+    "dune_vrpo_schedule_cell_result_v2";
 inline constexpr char kVrpoScheduleResultSchema[] =
-    "dune_vrpo_schedule_health_screen_v1";
+    "dune_vrpo_schedule_health_screen_v2";
 inline constexpr char kVrpoScheduleQRole[] =
     "SOURCE_ARCHIVE_PROVENANCE_ONLY";
 inline std::atomic<int64_t> g_vrpo_schedule_q_target_computations{0};
@@ -118,20 +121,22 @@ class VrpoScheduleRunDeadline {
   mutable int test_checks_remaining_ = -1;
 };
 
-inline const std::array<VrpoScheduleCellSpec, 4>&
-CanonicalVrpoScheduleCells() {
+inline const std::array<VrpoScheduleCellSpec, 4>*
+FindVrpoScheduleCellsForProfile(const std::string& profile) {
+  if (profile != kVrpoScheduleProfile) return nullptr;
   static const std::array<VrpoScheduleCellSpec, 4> cells = {{
-      {"S1_LR2P5E4_E1", 2.5e-4, 1},
-      {"S2_LR1P25E4_E2", 1.25e-4, 2},
-      {"S3_LR1E4_E1", 1.0e-4, 1},
-      {"S4_LR5E5_E1", 5.0e-5, 1},
+      {"T1_LR3E5_E1", 3.0e-5, 1},
+      {"T2_LR2E5_E1", 2.0e-5, 1},
+      {"T3_LR1P25E5_E1", 1.25e-5, 1},
+      {"T4_LR1P25E5_E2", 1.25e-5, 2},
   }};
-  return cells;
+  return &cells;
 }
 
 struct VrpoScheduleStartupConfig {
   std::string game;
   std::string init_mode;
+  std::string profile;
   std::string registration_id;
   std::filesystem::path input_archive;
   std::filesystem::path output_root;
@@ -260,6 +265,7 @@ inline bool ValidateVrpoScheduleStartupConfig(
   };
   if (config.game != "dune_imperium" ||
       config.init_mode != "vrpo_schedule_screen" ||
+      config.profile != kVrpoScheduleProfile ||
       config.registration_id.empty() || config.input_archive.empty() ||
       config.output_root.empty() || config.source_root.empty() ||
       !VrpoPhase4eLowerHex64(config.source_code_sha256) ||
@@ -310,10 +316,13 @@ inline bool ValidateVrpoScheduleStartupConfig(
       !config.normalize_advantages || !config.clip_value_loss) {
     return fail("schedule-screen PPO mechanics are not the registered values");
   }
-  const auto& cells = CanonicalVrpoScheduleCells();
+  const auto* cells = FindVrpoScheduleCellsForProfile(config.profile);
+  if (cells == nullptr) {
+    return fail("schedule-screen profile has no canonical cell table");
+  }
   int64_t steps = 0;
   std::set<std::string> ids;
-  for (const auto& cell : cells) {
+  for (const auto& cell : *cells) {
     if (!ids.insert(cell.cell_id).second ||
         !std::isfinite(cell.learning_rate) || cell.learning_rate <= 0.0 ||
         (cell.actor_epochs != 1 && cell.actor_epochs != 2)) {
@@ -1837,6 +1846,7 @@ inline bool WriteVrpoScheduleScreen(
   }
   json::Object corpus_manifest;
   corpus_manifest["schema"] = kVrpoScheduleCorpusSchema;
+  corpus_manifest["profile"] = startup.profile;
   corpus_manifest["registration_id"] = startup.registration_id;
   corpus_manifest["filename"] = "ACTOR_CORPUS.bin";
   corpus_manifest["file_sha256"] = corpus_file_sha256;
@@ -1897,6 +1907,11 @@ inline bool WriteVrpoScheduleScreen(
   std::array<std::string, 4> common_partitions;
   int64_t total_actor_steps = 0;
   int64_t total_row_presentations = 0;
+  const auto* canonical_cells =
+      FindVrpoScheduleCellsForProfile(startup.profile);
+  if (canonical_cells == nullptr) {
+    return fail("schedule-screen profile resolution failed");
+  }
   const uint64_t update_seed = vrpo_training_internal::SplitMix64(
       startup.base_seed ^ 0x5343484544554c45ULL);
   for (int epoch = 0; epoch < 4; ++epoch) {
@@ -1910,11 +1925,10 @@ inline bool WriteVrpoScheduleScreen(
     }
     common_partitions[epoch] = plan.canonical_sha256;
   }
-  for (size_t cell_index = 0;
-       cell_index < CanonicalVrpoScheduleCells().size(); ++cell_index) {
+  for (size_t cell_index = 0; cell_index < canonical_cells->size();
+       ++cell_index) {
     if (!deadline.Check("before schedule cell", error)) return fail(*error);
-    const VrpoScheduleCellSpec& cell =
-        CanonicalVrpoScheduleCells()[cell_index];
+    const VrpoScheduleCellSpec& cell = (*canonical_cells)[cell_index];
     std::string load_error;
     if (!LoadVrpoModule(*actor,
                         VrpoExpandedPaths(startup.input_archive).actor_model,
@@ -2044,7 +2058,8 @@ inline bool WriteVrpoScheduleScreen(
     const std::string actor_file_sha =
         ComputeFileSHA256(actor_path.string(), &actor_file_size);
     json::Object cell_json;
-    cell_json["schema"] = "dune_vrpo_schedule_cell_result_v1";
+    cell_json["schema"] = kVrpoScheduleCellResultSchema;
+    cell_json["profile"] = startup.profile;
     cell_json["cell_id"] = cell.cell_id;
     cell_json["learning_rate"] = cell.learning_rate;
     cell_json["actor_epochs"] = static_cast<int64_t>(cell.actor_epochs);
@@ -2143,10 +2158,11 @@ inline bool WriteVrpoScheduleScreen(
   const auto selected = SelectVrpoScheduleEligibleCells(metrics);
   json::Array selected_ids;
   for (size_t index : selected) {
-    selected_ids.emplace_back(CanonicalVrpoScheduleCells()[index].cell_id);
+    selected_ids.emplace_back((*canonical_cells)[index].cell_id);
   }
   json::Object root;
   root["schema"] = kVrpoScheduleResultSchema;
+  root["profile"] = startup.profile;
   root["registration_id"] = startup.registration_id;
   root["purpose"] = "HEALTH_SCREEN_ONLY_NO_STRENGTH_NO_PROMOTION";
   root["training_authorized"] = false;
