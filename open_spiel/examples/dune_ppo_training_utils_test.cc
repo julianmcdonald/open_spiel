@@ -5404,11 +5404,48 @@ std::vector<VrpoTrainingEpisode> MakeTinyVrpoPhase4eEpisodes(
       row.ppo_return = row.ppo_old_value;
       row.rewards = {0.0, 0.0, 0.0, 0.0};
       row.terminal_after = step == 3;
+      if (row.terminal_after) {
+        row.rewards = {0.25, 0.0, -0.25, 0.125};
+      }
       episode.rows.push_back(std::move(row));
     }
     episodes.push_back(std::move(episode));
   }
   return episodes;
+}
+
+VrpoPhase4ePairingStats MakeTinyVrpoPhase4ePairingStats(
+    const std::vector<VrpoTrainingEpisode>& episodes) {
+  VrpoPhase4ePairingStats pairing;
+  pairing.episodes = episodes.size();
+  for (const auto& episode : episodes) {
+    VrpoPhase4eEpisodeEvidence evidence;
+    evidence.episode_id = episode.episode_id;
+    evidence.capture_rows = episode.rows.size();
+    evidence.rollout_rows = episode.rows.size();
+    evidence.paired_rows = episode.rows.size();
+    evidence.reward_scale = 4.0;
+    for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+      evidence.zero_shaping_terminal_rewards_absolute[seat] =
+          episode.rows.back().rewards[seat];
+      evidence.terminal_returns_absolute[seat] =
+          episode.rows.back().rewards[seat] * evidence.reward_scale;
+    }
+    for (const auto& row : episode.rows) {
+      ++evidence.actor_rows[row.actor];
+      ++pairing.actor_rows[row.actor];
+    }
+    evidence.pairing_sha256 = VrpoPhase4eEpisodePairingSha256(episode);
+    pairing.capture_rows += episode.rows.size();
+    pairing.rollout_rows += episode.rows.size();
+    pairing.paired_rows += episode.rows.size();
+    pairing.episode_evidence.push_back(std::move(evidence));
+  }
+  std::string error;
+  UTILS_CHECK(ComputeVrpoPhase4eEpisodeEvidenceAggregateSha256(
+      pairing.episode_evidence, &pairing.canonical_sha256, &error));
+  UTILS_CHECK(ValidateVrpoPhase4ePairingStats(pairing, &error));
+  return pairing;
 }
 
 struct TinyVrpoPhase4eQ : torch::nn::Module {
@@ -5525,15 +5562,8 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       startup.logit_cap = arms[arm_index].logit_cap;
       const auto episodes = MakeTinyVrpoPhase4eEpisodes(
           *actor, arms[arm_index].logit_cap, first_episode_id);
-      VrpoPhase4ePairingStats pairing;
-      pairing.episodes = kVrpoPhase4eGames;
-      pairing.capture_rows = 64;
-      pairing.rollout_rows = 64;
-      pairing.paired_rows = 64;
-      pairing.canonical_sha256 = std::string(64, '6');
-      for (const auto& episode : episodes) {
-        for (const auto& row : episode.rows) ++pairing.actor_rows[row.actor];
-      }
+      VrpoPhase4ePairingStats pairing =
+          MakeTinyVrpoPhase4ePairingStats(episodes);
       VrpoActorForward actor_forward = [actor](const torch::Tensor& input) {
         const auto output = actor->forward(input);
         return VrpoActorTrainingOutput{output.logits, output.values};
@@ -5557,11 +5587,389 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       CHECK_EQ(result.at("arm_logit_cap").GetDouble(),
                arms[arm_index].logit_cap);
       UTILS_CHECK(result.at("logit_cap_matched").GetBool());
+      UTILS_CHECK(ValidateVrpoPhase4eResultEvidence(result, &error));
+      CHECK_EQ(result.at("registered_reward_scale").GetDouble(), 4.0);
+      CHECK_EQ(result.at("registered_reward_scale_exact").GetString(), "4");
+      std::string recomputed_pairing;
+      UTILS_CHECK(RecomputeVrpoPhase4eEpisodeEvidenceAggregateFromResult(
+          result, &recomputed_pairing, &error));
+      CHECK_EQ(recomputed_pairing, pairing.canonical_sha256);
+      CHECK_EQ(result.at("episode_pairing_aggregate_sha256").GetString(),
+               pairing.canonical_sha256);
+      std::string recomputed_update_summary;
+      UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+          result, &recomputed_update_summary, &error));
+      CHECK_EQ(recomputed_update_summary,
+               result.at("update_deterministic_summary_sha256").GetString());
+      CHECK_EQ(result.at("actor_epoch_partition_sha256").GetArray().size(),
+               size_t{4});
+      CHECK_EQ(result.at("q_epoch_partition_sha256").GetArray().size(),
+               size_t{4});
+      const bool q_partitions_applicable =
+          arms[arm_index].algorithm == VrpoPhase4Algorithm::kVrpo;
+      CHECK_EQ(result.at("q_epoch_partitions_applicable").GetBool(),
+               q_partitions_applicable);
+      for (const auto& digest :
+           result.at("q_epoch_partition_sha256").GetArray()) {
+        UTILS_CHECK(digest.IsString());
+        UTILS_CHECK(q_partitions_applicable
+                        ? VrpoPhase4eLowerHex64(digest.GetString())
+                        : digest.GetString().empty());
+      }
+      const std::string compact_result = json::ToString(result, false);
+      UTILS_CHECK(compact_result.size() < 131072);
+      UTILS_CHECK(compact_result.find("actor_input") == std::string::npos);
+      UTILS_CHECK(compact_result.find("central_tensor") == std::string::npos);
+
+      if (arm_index == 0) {
+        auto expect_evidence_reject = [&](json::Object mutated) {
+          std::string mutation_error;
+          UTILS_CHECK(!ValidateVrpoPhase4eResultEvidence(
+              mutated, &mutation_error));
+          UTILS_CHECK(!mutation_error.empty());
+        };
+        {
+          auto mutated = result;
+          mutated.erase("episode_pairing_evidence");
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& values = mutated["episode_pairing_evidence"].GetArray();
+          values[1].GetObject()["episode_id"] =
+              values[0].GetObject().at("episode_id").GetInt();
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& values = mutated["episode_pairing_evidence"].GetArray();
+          std::swap(values[0], values[1]);
+          expect_evidence_reject(std::move(mutated));
+        }
+        for (const std::string& field :
+             {"capture_rows", "rollout_rows", "paired_rows"}) {
+          auto mutated = result;
+          auto& episode = mutated["episode_pairing_evidence"]
+                              .GetArray()[0].GetObject();
+          episode[field] = episode.at(field).GetInt() + 1;
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["episode_pairing_evidence"].GetArray()[0].GetObject()
+              ["actor_rows_by_absolute_seat"].GetArray()[0] = int64_t{2};
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["episode_pairing_evidence"].GetArray()[0].GetObject()
+              ["zero_shaping_terminal_rewards_by_absolute_seat_exact"]
+                  .GetArray()[0] = VrpoPhase4eCanonicalDouble(0.75);
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["registered_reward_scale"] = 8.0;
+          mutated["registered_reward_scale_exact"] = "8";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["registered_reward_scale"] = 8.0;
+          mutated["registered_reward_scale_exact"] = "4";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& episode = mutated["episode_pairing_evidence"]
+                              .GetArray()[0].GetObject();
+          episode["reward_scale"] = 8.0;
+          episode["reward_scale_exact"] = "8";
+          for (int seat = 0; seat < kVrpoNumSeats; ++seat) {
+            const double doubled =
+                episode["terminal_returns_by_absolute_seat"]
+                    .GetArray()[seat].GetDouble() * 2.0;
+            episode["terminal_returns_by_absolute_seat"]
+                .GetArray()[seat] = doubled;
+            episode["terminal_returns_by_absolute_seat_exact"]
+                .GetArray()[seat] = VrpoPhase4eCanonicalDouble(doubled);
+          }
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& episode = mutated["episode_pairing_evidence"]
+                              .GetArray()[0].GetObject();
+          episode["terminal_returns_by_absolute_seat"]
+              .GetArray()[0] = 1.0;
+          episode["terminal_returns_by_absolute_seat_exact"]
+              .GetArray()[0] = "4";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& episode = mutated["episode_pairing_evidence"]
+                              .GetArray()[0].GetObject();
+          episode["zero_shaping_terminal_rewards_by_absolute_seat"]
+              .GetArray()[0] = 0.25;
+          episode["zero_shaping_terminal_rewards_by_absolute_seat_exact"]
+              .GetArray()[0] = "0.5";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["episode_pairing_evidence"].GetArray()[0].GetObject()
+              ["pairing_sha256"] = std::string(64, 'a');
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          auto& partitions =
+              mutated["actor_epoch_partition_sha256"].GetArray();
+          std::swap(partitions[0], partitions[1]);
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["actor_epoch_partition_sha256"].GetArray().pop_back();
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["update_deterministic_summary_sha256"] =
+              std::string(64, 'f');
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["q_epoch_partitions_applicable"] = true;
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["terminal_outcome_convention"] = "seat-relative";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          auto mutated = result;
+          mutated["episode_pairing_evidence"].GetArray()[0].GetObject()
+              ["capture_rows"] = "four";
+          expect_evidence_reject(std::move(mutated));
+        }
+        {
+          const std::string point_one = VrpoPhase4eCanonicalDouble(0.1);
+          double parsed_point_one = 0.0;
+          UTILS_CHECK(point_one == "0.10000000000000001");
+          UTILS_CHECK(ParseVrpoPhase4eCanonicalDouble(
+              point_one, &parsed_point_one, &error));
+          CHECK_EQ(parsed_point_one, 0.1);
+          UTILS_CHECK(!ParseVrpoPhase4eCanonicalDouble(
+              "0.100000", &parsed_point_one, &error));
+        }
+        {
+          auto collision_a = result;
+          auto collision_b = result;
+          collision_a["actor_loss_mean"] = 0.123456;
+          collision_b["actor_loss_mean"] = 0.123456;
+          collision_a["actor_loss_mean_exact"] =
+              VrpoPhase4eCanonicalDouble(0.12345641);
+          collision_b["actor_loss_mean_exact"] =
+              VrpoPhase4eCanonicalDouble(0.12345649);
+          std::string summary_a;
+          std::string summary_b;
+          UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+              collision_a, &summary_a, &error));
+          UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+              collision_b, &summary_b, &error));
+          UTILS_CHECK(summary_a != summary_b);
+          collision_a["update_deterministic_summary_sha256"] = summary_a;
+          collision_b["update_deterministic_summary_sha256"] = summary_b;
+          UTILS_CHECK(ValidateVrpoPhase4eResultEvidence(
+              collision_a, &error));
+          UTILS_CHECK(ValidateVrpoPhase4eResultEvidence(
+              collision_b, &error));
+          const auto parsed_a = json::FromString(json::ToString(collision_a));
+          const auto parsed_b = json::FromString(json::ToString(collision_b));
+          UTILS_CHECK(parsed_a.has_value() && parsed_a->IsObject());
+          UTILS_CHECK(parsed_b.has_value() && parsed_b->IsObject());
+          std::string parsed_summary_a;
+          std::string parsed_summary_b;
+          UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+              parsed_a->GetObject(), &parsed_summary_a, &error));
+          UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+              parsed_b->GetObject(), &parsed_summary_b, &error));
+          CHECK_EQ(parsed_summary_a, summary_a);
+          CHECK_EQ(parsed_summary_b, summary_b);
+          UTILS_CHECK(parsed_summary_a != parsed_summary_b);
+        }
+        {
+          auto shifted = result;
+          for (auto& item : shifted["episode_pairing_evidence"].GetArray()) {
+            auto& episode = item.GetObject();
+            episode["episode_id"] = episode.at("episode_id").GetInt() + 64;
+          }
+          std::string shifted_aggregate;
+          UTILS_CHECK(RecomputeVrpoPhase4eEpisodeEvidenceAggregateFromResult(
+              shifted, &shifted_aggregate, &error));
+          shifted["episode_pairing_aggregate_sha256"] = shifted_aggregate;
+          shifted["pairing_sha256"] = shifted_aggregate;
+          expect_evidence_reject(std::move(shifted));
+        }
+        {
+          auto forged_pairing = pairing;
+          auto forged_episode = episodes[0];
+          forged_episode.rows[0].q_input =
+              forged_episode.rows[0].q_input.clone();
+          forged_episode.rows[0].q_input[0] += 0.5;
+          forged_pairing.episode_evidence[0].pairing_sha256 =
+              VrpoPhase4eEpisodePairingSha256(forged_episode);
+          UTILS_CHECK(ComputeVrpoPhase4eEpisodeEvidenceAggregateSha256(
+              forged_pairing.episode_evidence,
+              &forged_pairing.canonical_sha256, &error));
+          UTILS_CHECK(ValidateVrpoPhase4ePairingStats(
+              forged_pairing, &error));
+          UTILS_CHECK(!ValidateVrpoPhase4ePairingStatsAgainstEpisodes(
+              forged_pairing, episodes, &error));
+        }
+        {
+          auto outcome_mismatch = pairing;
+          outcome_mismatch.episode_evidence[0]
+              .zero_shaping_terminal_rewards_absolute[0] += 0.25;
+          outcome_mismatch.episode_evidence[0]
+              .terminal_returns_absolute[0] =
+              outcome_mismatch.episode_evidence[0]
+                  .zero_shaping_terminal_rewards_absolute[0] * 4.0;
+          UTILS_CHECK(ComputeVrpoPhase4eEpisodeEvidenceAggregateSha256(
+              outcome_mismatch.episode_evidence,
+              &outcome_mismatch.canonical_sha256, &error));
+          UTILS_CHECK(outcome_mismatch.canonical_sha256 !=
+                      pairing.canonical_sha256);
+          UTILS_CHECK(ValidateVrpoPhase4ePairingStats(
+              outcome_mismatch, &error));
+          UTILS_CHECK(!ValidateVrpoPhase4ePairingStatsAgainstEpisodes(
+              outcome_mismatch, episodes, &error));
+        }
+        {
+          uint64_t end_id = 0;
+          uint64_t next_id = 0;
+          int64_t start_json = 0;
+          int64_t next_json = 0;
+          int64_t signed_next = 0;
+          UTILS_CHECK(!CheckedVrpoPhase4eEpisodeRange(
+              std::numeric_limits<uint64_t>::max() - 8,
+              kVrpoPhase4eGames, &end_id, &next_id, &start_json, &next_json,
+              &error));
+          UTILS_CHECK(!CheckedVrpoPhase4eEpisodeRange(
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - 8),
+              kVrpoPhase4eGames, &end_id, &next_id, &start_json, &next_json,
+              &error));
+          UTILS_CHECK(!CheckedVrpoPhase4eSignedEpisodeRange(
+              std::numeric_limits<int64_t>::max() - 8,
+              kVrpoPhase4eGames, &signed_next, &error));
+        }
+        {
+          auto overflowed_root = result;
+          overflowed_root["start_episode_id"] =
+              std::numeric_limits<int64_t>::max() - 8;
+          overflowed_root["next_episode_id"] =
+              std::numeric_limits<int64_t>::max();
+          expect_evidence_reject(std::move(overflowed_root));
+        }
+        {
+          auto negative_root = result;
+          negative_root["start_episode_id"] = int64_t{-1};
+          negative_root["next_episode_id"] = int64_t{15};
+          expect_evidence_reject(std::move(negative_root));
+        }
+
+        const std::string base_row_digest =
+            VrpoPhase4eEpisodePairingSha256(episodes[0]);
+        auto expect_row_digest_change = [&](VrpoTrainingEpisode mutated) {
+          UTILS_CHECK(VrpoPhase4eEpisodePairingSha256(mutated) !=
+                      base_row_digest);
+        };
+        auto row_mutation = episodes[0];
+        std::swap(row_mutation.rows[0], row_mutation.rows[1]);
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].actor =
+            (row_mutation.rows[0].actor + 1) % kVrpoNumSeats;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].actor_input =
+            row_mutation.rows[0].actor_input.clone();
+        row_mutation.rows[0].actor_input[0] += 0.25;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].q_input = row_mutation.rows[0].q_input.clone();
+        row_mutation.rows[0].q_input[0] += 0.25;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        std::swap(row_mutation.rows[0].legal_actions[0],
+                  row_mutation.rows[0].legal_actions[1]);
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].chosen_action =
+            row_mutation.rows[0].legal_actions[1];
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].old_chosen_log_probability += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].old_legal_probabilities[0] += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].ppo_old_value += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].ppo_advantage += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].ppo_return += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].rewards[0] += 0.01;
+        expect_row_digest_change(std::move(row_mutation));
+        row_mutation = episodes[0];
+        row_mutation.rows[0].terminal_after = true;
+        expect_row_digest_change(std::move(row_mutation));
+      }
+      if (arm_index == 2) {
+        auto mutated = result;
+        mutated["q_epoch_partition_sha256"].GetArray()[0] = "";
+        UTILS_CHECK(!ValidateVrpoPhase4eResultEvidence(mutated, &error));
+        mutated = result;
+        mutated["q_epoch_partitions_applicable"] = false;
+        UTILS_CHECK(!ValidateVrpoPhase4eResultEvidence(mutated, &error));
+        mutated = result;
+        mutated["q_epoch_partition_not_applicable_reason"] =
+            "PPO_HAS_NO_Q_OPTIMIZER_STEPS";
+        UTILS_CHECK(!ValidateVrpoPhase4eResultEvidence(mutated, &error));
+      }
       CHECK_EQ(result.at("global_update").GetInt(), int64_t{1});
       CHECK_EQ(result.at("next_episode_id").GetInt(),
                static_cast<int64_t>(first_episode_id + kVrpoPhase4eGames));
       UTILS_CHECK(std::filesystem::is_regular_file(
           startup.output_root / "UPDATE_RESULT.json"));
+      {
+        std::ifstream stream(startup.output_root / "UPDATE_RESULT.json");
+        std::string serialized((std::istreambuf_iterator<char>(stream)),
+                               std::istreambuf_iterator<char>());
+        const auto parsed = json::FromString(serialized);
+        UTILS_CHECK(parsed.has_value() && parsed->IsObject());
+        UTILS_CHECK(ValidateVrpoPhase4eResultEvidence(
+            parsed->GetObject(), &error));
+        std::string disk_pairing;
+        std::string disk_summary;
+        UTILS_CHECK(RecomputeVrpoPhase4eEpisodeEvidenceAggregateFromResult(
+            parsed->GetObject(), &disk_pairing, &error));
+        UTILS_CHECK(RecomputeVrpoPhase4eUpdateDeterministicSummarySha256(
+            parsed->GetObject(), &disk_summary, &error));
+        CHECK_EQ(disk_pairing, pairing.canonical_sha256);
+        CHECK_EQ(disk_summary,
+                 parsed->GetObject()
+                     .at("update_deterministic_summary_sha256").GetString());
+      }
       VrpoExpandedArchiveIdentity input_after;
       UTILS_CHECK(ComputeVrpoExpandedArchiveIdentity(
           input, &input_after, &error));
@@ -5644,13 +6052,8 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
         startup.logit_cap = wrong_cap;
         const auto episodes = MakeTinyVrpoPhase4eEpisodes(
             *actor, arms[arm_index].logit_cap, first_episode_id);
-        VrpoPhase4ePairingStats pairing;
-        pairing.episodes = kVrpoPhase4eGames;
-        pairing.capture_rows = pairing.rollout_rows = pairing.paired_rows = 64;
-        pairing.canonical_sha256 = std::string(64, '6');
-        for (const auto& episode : episodes) {
-          for (const auto& row : episode.rows) ++pairing.actor_rows[row.actor];
-        }
+        VrpoPhase4ePairingStats pairing =
+            MakeTinyVrpoPhase4ePairingStats(episodes);
         VrpoActorForward actor_forward = [actor](const torch::Tensor& input) {
           const auto output = actor->forward(input);
           return VrpoActorTrainingOutput{output.logits, output.values};
@@ -5732,13 +6135,8 @@ void TestVrpoPhase4eOneUpdateArchiveAndRollback() {
       startup.logit_cap = arms[2].logit_cap;
       const auto episodes = MakeTinyVrpoPhase4eEpisodes(
           *actor, arms[2].logit_cap, first_episode_id);
-      VrpoPhase4ePairingStats pairing;
-      pairing.episodes = kVrpoPhase4eGames;
-      pairing.capture_rows = pairing.rollout_rows = pairing.paired_rows = 64;
-      pairing.canonical_sha256 = std::string(64, '6');
-      for (const auto& episode : episodes) {
-        for (const auto& row : episode.rows) ++pairing.actor_rows[row.actor];
-      }
+      VrpoPhase4ePairingStats pairing =
+          MakeTinyVrpoPhase4ePairingStats(episodes);
       VrpoActorForward actor_forward = [actor](const torch::Tensor& input) {
         const auto output = actor->forward(input);
         return VrpoActorTrainingOutput{output.logits, output.values};
@@ -6018,13 +6416,8 @@ void TestVrpoPhase4eCudaArchiveRestore() {
           row.q_input = row.q_input.to(device);
         }
       }
-      VrpoPhase4ePairingStats pairing;
-      pairing.episodes = kVrpoPhase4eGames;
-      pairing.capture_rows = pairing.rollout_rows = pairing.paired_rows = 64;
-      pairing.canonical_sha256 = std::string(64, '6');
-      for (const auto& episode : episodes) {
-        for (const auto& row : episode.rows) ++pairing.actor_rows[row.actor];
-      }
+      VrpoPhase4ePairingStats pairing =
+          MakeTinyVrpoPhase4ePairingStats(episodes);
       VrpoPhase4eStartupConfig startup;
       startup.game = "dune_imperium";
       startup.registration_id = "VRPO_PHASE4E_CUDA_TEST";
