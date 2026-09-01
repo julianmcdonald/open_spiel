@@ -53,6 +53,7 @@
 #include "dune_vrpo.h"
 #include "dune_vrpo_checkpoint.h"
 #include "dune_vrpo_phase4e.h"
+#include "dune_vrpo_schedule_screen.h"
 #include "dune_vrpo_training.h"
 #include <chrono>
 #include "open_spiel/spiel.h"
@@ -6737,6 +6738,335 @@ void TestRawPpoNumericalParitySourceCanonicalization() {
     UTILS_CHECK(error.find("lowercase SHA-256") != std::string::npos);
   } TEST_END();
 }
+
+void TestVrpoScheduleScreenContractsAndCodecLive() {
+  TEST_BEGIN("VRPO schedule screen contracts, actor-only codec, corruption, and forced rows") {
+    const auto& cells = CanonicalVrpoScheduleCells();
+    CHECK_EQ(cells.size(), 4);
+    CHECK_EQ(cells[0].actor_epochs + cells[1].actor_epochs +
+                 cells[2].actor_epochs + cells[3].actor_epochs,
+             5);
+    CHECK_NEAR(cells[0].learning_rate, 2.5e-4, 0.0);
+    CHECK_NEAR(cells[1].learning_rate, 1.25e-4, 0.0);
+    CHECK_NEAR(cells[2].learning_rate, 1.0e-4, 0.0);
+    CHECK_NEAR(cells[3].learning_rate, 5.0e-5, 0.0);
+    auto fixture = MakeTinyVrpoPhase4eFixture(990000);
+    auto source = MakeTinyVrpoPhase4eEpisodes(*fixture.actor, 10.0, 990000);
+    std::string bytes, error;
+    VrpoScheduleCorpusIdentity encoded;
+    UTILS_CHECK(EncodeVrpoScheduleActorCorpus(source, &bytes, &encoded,
+                                               &error));
+    CHECK_EQ(encoded.rows, 64);
+    CHECK_EQ(encoded.episode_sha256.size(), 16);
+    std::vector<VrpoTrainingEpisode> decoded_rows;
+    VrpoScheduleCorpusIdentity decoded;
+    UTILS_CHECK(DecodeVrpoScheduleActorCorpus(bytes, &decoded_rows, &decoded,
+                                               &error));
+    CHECK_EQ(decoded.payload_sha256, encoded.payload_sha256);
+    UTILS_CHECK(torch::equal(decoded_rows[0].rows[0].actor_input,
+                             source[0].rows[0].actor_input));
+    UTILS_CHECK(!decoded_rows[0].rows[0].q_input.defined());
+    const std::string sealed_digest = decoded.payload_sha256;
+    VrpoEpisodePartitionPlan sealed_plan_before;
+    UTILS_CHECK(BuildVrpoScheduleEpisodePartitionPlan(
+        decoded_rows, 445566, &sealed_plan_before, &error));
+    source[0].rows[0].actor_input.add_(1000.0);
+    source[0].rows[0].ppo_advantage += 500.0;
+    source[0].rows[0].row_id += 999999;
+    VrpoEpisodePartitionPlan sealed_plan_after;
+    UTILS_CHECK(BuildVrpoScheduleEpisodePartitionPlan(
+        decoded_rows, 445566, &sealed_plan_after, &error));
+    CHECK_EQ(sealed_plan_after.canonical_sha256,
+             sealed_plan_before.canonical_sha256);
+    CHECK_EQ(decoded.payload_sha256, sealed_digest);
+    auto missing_field = decoded_rows;
+    missing_field[0].rows[0].old_legal_probabilities.clear();
+    UTILS_CHECK(!ValidateVrpoScheduleActorEpisodes(missing_field, &error));
+    std::string corrupt = bytes;
+    corrupt[corrupt.size() / 2] ^= 1;
+    std::vector<VrpoTrainingEpisode> corrupt_rows;
+    VrpoScheduleCorpusIdentity corrupt_identity;
+    UTILS_CHECK(!DecodeVrpoScheduleActorCorpus(
+        corrupt, &corrupt_rows, &corrupt_identity, &error));
+    std::swap(source[0], source[1]);
+    UTILS_CHECK(!EncodeVrpoScheduleActorCorpus(source, &bytes, &encoded,
+                                                &error));
+
+    VrpoTrainingRow forced = decoded_rows[0].rows[0];
+    forced.legal_actions = {3};
+    forced.chosen_index = 0;
+    forced.chosen_action = 3;
+    forced.old_legal_probabilities = {1.0};
+    forced.old_chosen_log_probability = 0.0;
+    std::vector<double> probability;
+    UTILS_CHECK(VrpoTrainingLegalProbabilities(
+        torch::tensor({100.0, -100.0, 0.0, 500.0, 1.0, 2.0}), forced,
+        10.0, &probability, &error));
+    CHECK_EQ(probability.size(), 1);
+    CHECK_NEAR(probability[0], 1.0, 0.0);
+
+    const auto root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_schedule_config_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "input");
+    VrpoScheduleStartupConfig startup;
+    startup.game = "dune_imperium";
+    startup.init_mode = "vrpo_schedule_screen";
+    startup.registration_id = "schedule-test";
+    startup.input_archive = root / "input";
+    startup.output_root = root / "output_vrpo_schedule";
+    startup.source_root = root;
+    startup.source_code_sha256 = std::string(64, '1');
+    startup.executed_binary_sha256 = std::string(64, '2');
+    startup.executed_binary_size = 1;
+    startup.rollout_games = 16;
+    startup.threads = 8;
+    startup.eval_batch_size = 64;
+    startup.eval_timeout_ms = 2;
+    startup.evaluator_device_synchronize = true;
+    startup.seed_scheme_version = 2;
+    startup.runtime_device_is_cuda = true;
+    startup.runtime_device_index = 0;
+    startup.one_gpu_process = true;
+    startup.runtime_process_id = ::getpid();
+    startup.base_seed = 8302001;
+    startup.start_episode_id = 1200000000;
+    startup.allow_tf32 = true;
+    startup.reward_scale = 4.0;
+    startup.gamma = 1.0;
+    startup.lambda = 1.0;
+    startup.logit_cap = 10.0;
+    startup.ppo_minibatches = 16;
+    startup.ppo_minibatch_size = 2048;
+    startup.clip_epsilon = 0.2;
+    startup.entropy_coefficient = 0.01;
+    startup.value_coefficient = 0.5;
+    startup.gradient_clip_norm = 0.5;
+    startup.normalize_advantages = true;
+    startup.clip_value_loss = true;
+    UTILS_CHECK(ValidateVrpoScheduleStartupConfig(startup, &error));
+    startup.runtime_device_is_cuda = false;
+    startup.runtime_device_index = -1;
+    startup.one_gpu_process = false;
+    UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    startup.runtime_device_is_cuda = true;
+    startup.runtime_device_index = 0;
+    startup.one_gpu_process = true;
+    startup.init_mode = "vrpo_one_update";
+    UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    startup.init_mode = "vrpo_schedule_screen";
+    startup.logit_cap = 0.0;
+    UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    std::filesystem::remove_all(root);
+
+    for (const auto point : {VrpoScheduleFailurePoint::kOversize,
+                             VrpoScheduleFailurePoint::kDeadline,
+                             VrpoScheduleFailurePoint::kAfterActorTemp,
+                             VrpoScheduleFailurePoint::kFinalFsyncDeadline}) {
+      const auto failure_root = std::filesystem::temp_directory_path() /
+          ("dune_vrpo_schedule_resource_" + std::to_string(::getpid()) +
+           "_" + std::to_string(static_cast<int>(point)));
+      std::filesystem::remove_all(failure_root);
+      UTILS_CHECK(!ExerciseVrpoScheduleResourceFailureForTest(
+          failure_root, point, &error));
+      UTILS_CHECK(!std::filesystem::exists(failure_root));
+    }
+
+    ResetVrpoQInstrumentation();
+    UTILS_CHECK(!ValidateVrpoScheduleQProvenanceInstrumentation(
+        kVrpoScheduleQRole, &error));
+    {
+      DuneVrpoQNetImpl provenance_q(2026090201);
+      UTILS_CHECK(ValidateVrpoScheduleQProvenanceInstrumentation(
+          kVrpoScheduleQRole, &error));
+      InjectVrpoScheduleQTargetComputationForTest();
+      UTILS_CHECK(!ValidateVrpoScheduleQProvenanceInstrumentation(
+          kVrpoScheduleQRole, &error));
+      ResetVrpoScheduleQTargetInstrumentation();
+      UTILS_CHECK(ValidateVrpoScheduleQProvenanceInstrumentation(
+          kVrpoScheduleQRole, &error));
+      UTILS_CHECK(!ValidateVrpoScheduleQProvenanceInstrumentation(
+          "TRAINING_Q", &error));
+    }
+    ResetVrpoQInstrumentation();
+    {
+      DuneVrpoQNetImpl first_q(2026090202);
+      DuneVrpoQNetImpl second_q(2026090203);
+      UTILS_CHECK(!ValidateVrpoScheduleQProvenanceInstrumentation(
+          kVrpoScheduleQRole, &error));
+    }
+    ResetVrpoQInstrumentation();
+    {
+      DuneVrpoQNetImpl forwarded_q(2026090204);
+      torch::Tensor q_values;
+      UTILS_CHECK(forwarded_q.ForwardChecked(
+          torch::zeros({1, kVrpoCentralCriticTensorSize}, torch::kFloat32),
+          &q_values, &error));
+      UTILS_CHECK(!ValidateVrpoScheduleQProvenanceInstrumentation(
+          kVrpoScheduleQRole, &error));
+    }
+    ResetVrpoQInstrumentation();
+
+    const auto schedule_header = FindVrpoPhase4eSourceRoot() /
+        "open_spiel/examples/dune_vrpo_schedule_screen.h";
+    std::ifstream schedule_stream(schedule_header);
+    const std::string schedule_source(
+        (std::istreambuf_iterator<char>(schedule_stream)),
+        std::istreambuf_iterator<char>());
+    UTILS_CHECK(!schedule_source.empty());
+    UTILS_CHECK(schedule_source.find("ComputeVrpoTrainingTargets") ==
+                std::string::npos);
+    UTILS_CHECK(schedule_source.find("BuildReferences") ==
+                std::string::npos);
+    UTILS_CHECK(schedule_source.find("q_forward(") == std::string::npos);
+  } TEST_END();
+}
+
+void TestVrpoScheduleHealthAndPpoEquivalenceLive() {
+  TEST_BEGIN("VRPO schedule metric eligibility/selection and phase4d PPO equivalence") {
+    ResetVrpoScheduleQTargetInstrumentation();
+    std::vector<double> kls(200, 0.01), ratios(200, 1.0), tvs(200, 0.02);
+    VrpoScheduleHealthMetrics health;
+    std::string error;
+    UTILS_CHECK(FinalizeVrpoScheduleHealthMetrics(kls, ratios, tvs, 2,
+                                                   &health, &error));
+    UTILS_CHECK(health.eligible);
+    CHECK_NEAR(health.greedy_argmax_change_rate, 0.01, 1e-12);
+    kls[kls.size() - 1] = 0.6;
+    kls[kls.size() - 2] = 0.6;
+    kls[kls.size() - 3] = 0.6;
+    UTILS_CHECK(FinalizeVrpoScheduleHealthMetrics(kls, ratios, tvs, 2,
+                                                   &health, &error));
+    UTILS_CHECK(!health.eligible);
+    std::vector<VrpoScheduleHealthMetrics> candidates(4);
+    for (auto& value : candidates) value.eligible = true;
+    candidates[0].kl_mean = 0.02;
+    candidates[0].greedy_argmax_change_rate = 0.03;
+    candidates[1].kl_mean = 0.01;
+    candidates[1].greedy_argmax_change_rate = 0.02;
+    candidates[2].kl_mean = 0.03;
+    candidates[2].greedy_argmax_change_rate = 0.10;
+    candidates[3].kl_mean = 0.04;
+    candidates[3].greedy_argmax_change_rate = 0.04;
+    const auto selected = SelectVrpoScheduleEligibleCells(candidates);
+    CHECK_EQ(selected.size(), 2);
+    CHECK_EQ(selected[0], 1);
+    CHECK_EQ(selected[1], 2);
+
+    auto a = MakeTinyVrpoPhase4eFixture(991000);
+    auto full_episodes = MakeTinyVrpoPhase4eEpisodes(
+        *a.actor, 10.0, 991000);
+    std::string corpus_bytes;
+    VrpoScheduleCorpusIdentity corpus_identity;
+    UTILS_CHECK(EncodeVrpoScheduleActorCorpus(
+        full_episodes, &corpus_bytes, &corpus_identity, &error));
+    std::vector<VrpoTrainingEpisode> sealed_episodes;
+    VrpoScheduleCorpusIdentity sealed_identity;
+    UTILS_CHECK(DecodeVrpoScheduleActorCorpus(
+        corpus_bytes, &sealed_episodes, &sealed_identity, &error));
+    torch::manual_seed(774411);
+    auto actor_only = std::make_shared<SharedDunePolicyValueNetImpl>(
+        5, 8, 6, 1, false);
+    std::unique_ptr<torch::optim::AdamW> actor_only_optimizer;
+    UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+        *actor_only, 2.5e-4, &actor_only_optimizer, &error));
+    const auto* arm = FindCanonicalVrpoPhase4Arm("PPO_CAP10");
+    UTILS_CHECK(arm != nullptr);
+    auto actor_a = [model = a.actor](const torch::Tensor& input) {
+      const auto out = model->forward(input);
+      return VrpoActorTrainingOutput{out.logits, out.values};
+    };
+    auto actor_b = [model = actor_only](const torch::Tensor& input) {
+      const auto out = model->forward(input);
+      return VrpoActorTrainingOutput{out.logits, out.values};
+    };
+    auto q_a = [model = a.q](const torch::Tensor& input) {
+      return model->Forward(input);
+    };
+    VrpoTrainingUpdateStats direct;
+    VrpoScheduleActorOnlyUpdateStats wrapped;
+    UTILS_CHECK(RunVrpoPhase4dOneUpdate(
+        *arm, full_episodes, 78881234, *a.actor, *a.q,
+        *a.optimizers.actor, *a.optimizers.q, actor_a, q_a, &direct,
+        &error));
+    UTILS_CHECK(RunVrpoScheduleActorOnlyPpoCell(
+        sealed_episodes, 78881234, 4, *actor_only,
+        *actor_only_optimizer, actor_b,
+        /*four_epoch_equivalence_test=*/true, nullptr, &wrapped, &error));
+    CHECK_EQ(direct.actor_values_after_sha256,
+             wrapped.ppo.actor_values_after_sha256);
+    CHECK_EQ(wrapped.ppo.actor_optimizer_steps, 64);
+    CHECK_EQ(wrapped.ppo.q_optimizer_steps, 0);
+    CHECK_EQ(wrapped.q_target_computations, 0);
+    CHECK_NEAR(direct.actor_loss_mean, wrapped.ppo.actor_loss_mean, 0.0);
+    for (int epoch = 0; epoch < 4; ++epoch) {
+      CHECK_EQ(direct.actor_epoch_partition_sha256[epoch],
+               wrapped.ppo.actor_epoch_partition_sha256[epoch]);
+    }
+
+    torch::manual_seed(774411);
+    auto rollback_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        5, 8, 6, 1, false);
+    std::unique_ptr<torch::optim::AdamW> rollback_optimizer;
+    UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+        *rollback_actor, 2.5e-4, &rollback_optimizer, &error));
+    const std::string rollback_actor_before =
+        TinyVrpoModuleHash(*rollback_actor);
+    const std::string rollback_optimizer_before =
+        TinyVrpoOptimizerNumericalHash(*rollback_optimizer);
+    auto rollback_forward = [model = rollback_actor](
+                                const torch::Tensor& input) {
+      const auto out = model->forward(input);
+      return VrpoActorTrainingOutput{out.logits, out.values};
+    };
+    const auto expiring_deadline =
+        VrpoScheduleRunDeadline::ExpireAfterChecksForTest(18);
+    VrpoScheduleActorOnlyUpdateStats rollback_stats;
+    UTILS_CHECK(!RunVrpoScheduleActorOnlyPpoCell(
+        sealed_episodes, 78881236, 1, *rollback_actor,
+        *rollback_optimizer, rollback_forward,
+        /*four_epoch_equivalence_test=*/false, &expiring_deadline,
+        &rollback_stats, &error));
+    CHECK_EQ(TinyVrpoModuleHash(*rollback_actor), rollback_actor_before);
+    CHECK_EQ(TinyVrpoOptimizerNumericalHash(*rollback_optimizer),
+             rollback_optimizer_before);
+    InjectVrpoScheduleQTargetComputationForTest();
+    VrpoScheduleActorOnlyUpdateStats target_mismatch_stats;
+    UTILS_CHECK(!RunVrpoScheduleActorOnlyPpoCell(
+        sealed_episodes, 78881237, 1, *rollback_actor,
+        *rollback_optimizer, rollback_forward,
+        /*four_epoch_equivalence_test=*/false, nullptr,
+        &target_mismatch_stats, &error));
+    CHECK_EQ(TinyVrpoModuleHash(*rollback_actor), rollback_actor_before);
+    CHECK_EQ(TinyVrpoOptimizerNumericalHash(*rollback_optimizer),
+             rollback_optimizer_before);
+    ResetVrpoScheduleQTargetInstrumentation();
+    if (torch::cuda::is_available()) {
+      const torch::Device cuda(torch::kCUDA, 0);
+      torch::manual_seed(774411);
+      auto cuda_actor_model =
+          std::make_shared<SharedDunePolicyValueNetImpl>(5, 8, 6, 1, false);
+      cuda_actor_model->to(cuda, torch::kFloat32);
+      std::unique_ptr<torch::optim::AdamW> cuda_optimizer;
+      UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+          *cuda_actor_model, 2.5e-4, &cuda_optimizer, &error));
+      auto cuda_actor = [model = cuda_actor_model](
+                            const torch::Tensor& input) {
+        const auto out = model->forward(input);
+        return VrpoActorTrainingOutput{out.logits, out.values};
+      };
+      VrpoScheduleActorOnlyUpdateStats cuda_stats;
+      UTILS_CHECK(RunVrpoScheduleActorOnlyPpoCell(
+          sealed_episodes, 78881235, 1, *cuda_actor_model,
+          *cuda_optimizer, cuda_actor,
+          /*four_epoch_equivalence_test=*/false, nullptr, &cuda_stats,
+          &error));
+      CHECK_EQ(cuda_stats.ppo.actor_optimizer_steps, 16);
+      CHECK_EQ(cuda_stats.ppo.q_optimizer_steps, 0);
+      CHECK_EQ(cuda_stats.q_target_computations, 0);
+    }
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -6792,6 +7122,8 @@ int main() {
   TestVrpoPhase4eCudaArchiveRestore();
   TestVrpoGlobalExpectedSarsaLambdaReference();
   TestRawPpoNumericalParitySourceCanonicalization();
+  TestVrpoScheduleScreenContractsAndCodecLive();
+  TestVrpoScheduleHealthAndPpoEquivalenceLive();
 #endif
 
   // -----------------------------------------------------------------------
