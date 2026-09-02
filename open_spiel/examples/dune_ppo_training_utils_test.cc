@@ -53,6 +53,7 @@
 #include "dune_vrpo.h"
 #include "dune_vrpo_checkpoint.h"
 #include "dune_vrpo_phase4e.h"
+#include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_vrpo_training.h"
 #include <chrono>
@@ -7155,6 +7156,490 @@ void TestVrpoScheduleHealthAndPpoEquivalenceLive() {
     }
   } TEST_END();
 }
+
+VrpoPpoPilotStartupConfig MakeTinyVrpoPpoPilotStartup(
+    const std::filesystem::path& input,
+    const std::filesystem::path& output,
+    const VrpoExpandedArchiveIdentity& input_identity,
+    uint64_t first_episode_id) {
+  VrpoPpoPilotStartupConfig startup;
+  startup.game = "dune_imperium";
+  startup.init_mode = "vrpo_ppo_pilot";
+  startup.profile = kVrpoPpoPilotProfile;
+  startup.registration_id = "ppo-pilot-test";
+  startup.input_archive = input;
+  startup.output_root = output;
+  startup.source_root = "/source";
+  startup.source_code_sha256 = std::string(64, '1');
+  startup.executed_binary_sha256 = std::string(64, '2');
+  startup.executed_binary_size = 1;
+  startup.origin_archive_sha256 = input_identity.combined_sha256;
+  startup.evidence_root = input.parent_path();
+  startup.rollout_games = kVrpoPpoPilotGamesPerUpdate;
+  startup.threads = 8;
+  startup.eval_batch_size = 64;
+  startup.eval_timeout_ms = 2;
+  startup.evaluator_device_synchronize = true;
+  startup.seed_scheme_version = 2;
+  startup.runtime_device_is_cuda = true;
+  startup.runtime_device_index = 0;
+  startup.one_gpu_process = true;
+  startup.runtime_process_id = ::getpid();
+  startup.base_seed = 8302001;
+  startup.start_episode_id = first_episode_id;
+  startup.allow_tf32 = true;
+  startup.learning_rate = kVrpoPpoPilotLearningRate;
+  startup.ppo_update_epochs = kVrpoPpoPilotActorEpochs;
+  startup.reward_scale = 4.0;
+  startup.gamma = 1.0;
+  startup.lambda = 1.0;
+  startup.logit_cap = 10.0;
+  startup.ppo_minibatches = kVrpoTrainingMinibatchesPerEpoch;
+  startup.ppo_minibatch_size = 2048;
+  startup.clip_epsilon = kVrpoTrainingClipEpsilon;
+  startup.entropy_coefficient = kVrpoTrainingEntropyCoefficient;
+  startup.value_coefficient = kVrpoTrainingValueCoefficient;
+  startup.gradient_clip_norm = kVrpoTrainingGradientClipNorm;
+  startup.normalize_advantages = true;
+  startup.clip_value_loss = true;
+  return startup;
+}
+
+void TestVrpoPpoPilotContractsContinuationAndRollbackLive() {
+  TEST_BEGIN("VRPO finite PPO pilot contract, continuation, early stop, and rollback") {
+    CHECK_EQ(std::string(kVrpoPpoPilotProfile), "ppo_u3_4x16_v1");
+    CHECK_EQ(kVrpoPpoPilotUpdates, 4);
+    CHECK_EQ(kVrpoPpoPilotGamesPerUpdate, 16);
+    CHECK_EQ(kVrpoPpoPilotActorEpochs, 1);
+    CHECK_EQ(kVrpoPpoPilotStepsPerUpdate, 16);
+    CHECK_EQ(kVrpoPpoPilotMaxActorSteps, 64);
+    CHECK_NEAR(kVrpoPpoPilotLearningRate, 5.0e-6, 0.0);
+    CHECK_EQ(VrpoPhase4eCanonicalDouble(kVrpoPpoPilotLearningRate),
+             "5.0000000000000004e-06");
+    UTILS_CHECK(vrpo_ppo_pilot_internal::CurrentHealthPass(
+        VrpoScheduleHealthMetrics{100, 0.01, 0.02, 0.02, 0.03,
+                                  0.9, 1.0, 1.1, 0.01, 0.02, 0.01, true}));
+    VrpoScheduleHealthMetrics zero_change{
+        100, 0.01, 0.02, 0.02, 0.03, 0.9, 1.0, 1.1,
+        0.01, 0.02, 0.0, false};
+    UTILS_CHECK(!vrpo_ppo_pilot_internal::CurrentHealthPass(zero_change));
+    UTILS_CHECK(vrpo_ppo_pilot_internal::CumulativeHealthPass(zero_change));
+
+    const uint64_t first_episode_id = 1000200000;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_ppo_pilot_test_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root);
+    CHECK_EQ(std::string(kVrpoPpoPilotRegistrationId),
+             "VRPO_U15828_PPO_CAP10_LR5E6_PILOT4X16_20260902");
+    CHECK_EQ(kVrpoPpoPilotBaseSeed, uint64_t{8304001});
+    CHECK_EQ(kVrpoPpoPilotStartEpisodeId, uint64_t{1200200000});
+    CHECK_EQ(kVrpoPpoPilotEndEpisodeIdInclusive, uint64_t{1200200063});
+    CHECK_EQ(VrpoPpoPilotCanonicalEvidenceFiles().size(), 11);
+    CHECK_EQ(std::string(kVrpoPpoPilotConfirmValidationSha256),
+             "0afb3704f88e9bd65866941ca2e3d17534321ded43b77f8ef586f46f946a0600");
+    {
+      std::ifstream pilot_header(
+          FindVrpoPhase4eSourceRoot() /
+          "open_spiel/examples/dune_vrpo_ppo_pilot.h");
+      const std::string source_text(
+          (std::istreambuf_iterator<char>(pilot_header)),
+          std::istreambuf_iterator<char>());
+      UTILS_CHECK(source_text.find("const std::string& classification") ==
+                  std::string::npos);
+      UTILS_CHECK(source_text.find("VrpoPpoPilotRaw128Authorization") !=
+                  std::string::npos);
+    }
+
+    // Generic observer negatives exercise every immutable identity for CLI
+    // drift, swap, and missing-file failure without depending on runtime
+    // storage mounts.
+    const auto evidence_root = root / "evidence";
+    std::filesystem::create_directories(evidence_root);
+    std::vector<VrpoPpoPilotEvidenceFileSpec> evidence_specs;
+    std::vector<std::string> evidence_cli;
+    std::vector<std::string> evidence_contents;
+    for (int index = 0; index < 11; ++index) {
+      const std::string filename = "evidence_" + std::to_string(index);
+      const std::string contents =
+          "immutable-evidence-" + std::to_string(index) + "\n";
+      {
+        std::ofstream stream(evidence_root / filename,
+                             std::ios::binary | std::ios::trunc);
+        stream << contents;
+      }
+      const std::string digest = ComputeStringSHA256(contents);
+      evidence_specs.push_back(
+          {"identity_" + std::to_string(index), filename, digest});
+      evidence_cli.push_back(digest);
+      evidence_contents.push_back(contents);
+    }
+    std::vector<VrpoPpoPilotEvidenceObservation> evidence_observations;
+    std::string error;
+    UTILS_CHECK(ValidateVrpoPpoPilotEvidenceFiles(
+        evidence_root, evidence_specs, evidence_cli,
+        &evidence_observations, &error));
+    CHECK_EQ(evidence_observations.size(), 11);
+    for (size_t index = 0; index < evidence_specs.size(); ++index) {
+      auto drift = evidence_cli;
+      drift[index] = std::string(64, 'f');
+      UTILS_CHECK(!ValidateVrpoPpoPilotEvidenceFiles(
+          evidence_root, evidence_specs, drift, &evidence_observations,
+          &error));
+      auto swapped = evidence_cli;
+      std::swap(swapped[index],
+                swapped[(index + 1) % evidence_specs.size()]);
+      UTILS_CHECK(!ValidateVrpoPpoPilotEvidenceFiles(
+          evidence_root, evidence_specs, swapped, &evidence_observations,
+          &error));
+      const auto missing_path =
+          evidence_root / evidence_specs[index].relative_path;
+      std::filesystem::remove(missing_path, ec);
+      UTILS_CHECK(!ValidateVrpoPpoPilotEvidenceFiles(
+          evidence_root, evidence_specs, evidence_cli,
+          &evidence_observations, &error));
+      {
+        std::ofstream stream(missing_path,
+                             std::ios::binary | std::ios::trunc);
+        stream << evidence_contents[index];
+      }
+    }
+    const auto* arm = FindCanonicalVrpoPhase4Arm("PPO_CAP10");
+    UTILS_CHECK(arm != nullptr);
+    auto source = MakeTinyVrpoPhase4eFixture(first_episode_id);
+    const auto input = root / "input";
+    VrpoExpandedArchiveIdentity input_identity;
+    UTILS_CHECK(SaveVrpoExpandedCheckpointAtomic(
+        input, *arm, source.binding, source.layout,
+        "77777777-7777-4777-8777-777777777777", 0, first_episode_id,
+        source.actor, source.q, source.optimizers,
+        VrpoCheckpointFailurePoint::kNone, &error, &input_identity));
+    {
+      auto contract = MakeTinyVrpoPpoPilotStartup(
+          input, root / "contract_output", input_identity,
+          kVrpoPpoPilotStartEpisodeId);
+      contract.registration_id = kVrpoPpoPilotRegistrationId;
+      contract.base_seed = kVrpoPpoPilotBaseSeed;
+      contract.origin_archive_sha256 = kVrpoPpoPilotOriginArchiveSha256;
+      contract.evidence_cli_sha256.clear();
+      contract.evidence_observations.clear();
+      for (const auto& spec : VrpoPpoPilotCanonicalEvidenceFiles()) {
+        contract.evidence_cli_sha256.push_back(spec.expected_sha256);
+        contract.evidence_observations.push_back(
+            {spec.identity, spec.relative_path.string(), spec.expected_sha256,
+             spec.expected_sha256, spec.expected_sha256, 1, true});
+      }
+      UTILS_CHECK(ValidateVrpoPpoPilotStartupConfig(contract, &error));
+      for (const std::string bad_id :
+           {std::string(), std::string("OTHER_REGISTRATION")}) {
+        auto bad = contract;
+        bad.registration_id = bad_id;
+        UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(bad, &error));
+      }
+      auto bad_seed = contract;
+      ++bad_seed.base_seed;
+      UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(bad_seed, &error));
+      auto bad_start = contract;
+      ++bad_start.start_episode_id;
+      UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(bad_start, &error));
+      auto overflow = contract;
+      overflow.start_episode_id = std::numeric_limits<uint64_t>::max() - 10;
+      UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(overflow, &error));
+      auto drift = contract;
+      drift.evidence_cli_sha256[4] = std::string(64, 'f');
+      UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(drift, &error));
+      auto swapped = contract;
+      std::swap(swapped.evidence_observations[1],
+                swapped.evidence_observations[2]);
+      UTILS_CHECK(!ValidateVrpoPpoPilotStartupConfig(swapped, &error));
+    }
+
+    auto make_actor = [&]() {
+      auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+          5, 8, 6, 1, false);
+      UTILS_CHECK(LoadVrpoModule(
+          *actor, VrpoExpandedPaths(input).actor_model, &error));
+      return actor;
+    };
+    auto deadline = VrpoPpoPilotDeadline::Start(
+        std::chrono::steady_clock::now(), std::chrono::minutes(5));
+
+    // A late failure after the optimizer step rolls both actor parameters and
+    // all Adam moments/steps back and leaves no update directory.
+    {
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      auto actor = make_actor();
+      auto q = std::make_shared<DuneVrpoQNetImpl>(2026090207);
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+          *actor, kVrpoPpoPilotLearningRate, &optimizer, &error));
+      auto startup = MakeTinyVrpoPpoPilotStartup(
+          input, root / "late_failure", input_identity, first_episode_id);
+      VrpoPpoPilotState state;
+      UTILS_CHECK(InitializeVrpoPpoPilot(
+          startup, input_identity, source.layout, actor, q, *optimizer,
+          deadline, &state, &error));
+      const std::string actor_before = TinyVrpoModuleHash(*actor);
+      std::string optimizer_before;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 0, &optimizer_before, &error));
+      auto episodes = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id);
+      auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+      std::string collection_hash;
+      UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+          *actor, "", &collection_hash, &error));
+      VrpoPpoPilotDisposition disposition;
+      json::Object result;
+      auto shifted = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id + 1);
+      auto shifted_pairing = MakeTinyVrpoPhase4ePairingStats(shifted);
+      UTILS_CHECK(!WriteVrpoPpoPilotUpdate(
+          startup, source.binding, source.layout, input_identity, shifted,
+          shifted_pairing, collection_hash, actor, q, *optimizer,
+          torch::kCPU, deadline, 1, VrpoPpoPilotFailurePoint::kNone, &state,
+          &disposition, &result, &error));
+      UTILS_CHECK(!WriteVrpoPpoPilotUpdate(
+          startup, source.binding, source.layout, input_identity, episodes,
+          pairing, collection_hash, actor, q, *optimizer, torch::kCPU,
+          deadline, 1, VrpoPpoPilotFailurePoint::kLateAfterTraining, &state,
+          &disposition, &result, &error));
+      CHECK_EQ(TinyVrpoModuleHash(*actor), actor_before);
+      std::string optimizer_after;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 0, &optimizer_after, &error));
+      CHECK_EQ(optimizer_after, optimizer_before);
+      UTILS_CHECK(!std::filesystem::exists(
+          startup.output_root / "update_1"));
+      std::filesystem::remove_all(startup.output_root, ec);
+    }
+
+    // Two committed updates reuse the same Adam state. The injected valid
+    // health stop at update 2 commits update 2, blocks update 3, and publishes
+    // only the early-stop authorization boundary.
+    {
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      auto actor = make_actor();
+      const torch::Device pilot_device = torch::cuda::is_available()
+          ? torch::Device(torch::kCUDA, 0)
+          : torch::Device(torch::kCPU);
+      actor->to(pilot_device, torch::kFloat32);
+      auto q = std::make_shared<DuneVrpoQNetImpl>(2026090208);
+      q->to(pilot_device, torch::kFloat32);
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+          *actor, kVrpoPpoPilotLearningRate, &optimizer, &error));
+      auto startup = MakeTinyVrpoPpoPilotStartup(
+          input, root / "early_stop", input_identity, first_episode_id);
+      VrpoPpoPilotState state;
+      UTILS_CHECK(InitializeVrpoPpoPilot(
+          startup, input_identity, source.layout, actor, q, *optimizer,
+          deadline, &state, &error));
+      for (int update = 1; update <= 2; ++update) {
+        const std::string actor_before_update = TinyVrpoModuleHash(*actor);
+        std::string optimizer_before_update;
+        UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+            *optimizer, *actor, (update - 1) * 16,
+            &optimizer_before_update, &error));
+        const uint64_t update_start = first_episode_id + (update - 1) * 16;
+        auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0, update_start);
+        auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+        std::string collection_hash;
+        UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+            *actor, "", &collection_hash, &error));
+        VrpoPpoPilotDisposition disposition;
+        json::Object result;
+        const auto failure = update == 1
+            ? VrpoPpoPilotFailurePoint::kForceHealthPassForTest
+            : VrpoPpoPilotFailurePoint::kForceHealthStopAfterUpdate2;
+        const bool update_ok = WriteVrpoPpoPilotUpdate(
+            startup, source.binding, source.layout, input_identity, episodes,
+            pairing, collection_hash, actor, q, *optimizer, pilot_device,
+            deadline, update, failure, &state, &disposition, &result,
+            &error);
+        if (!update_ok) {
+          std::cerr << "\n  PPO-pilot test update " << update
+                    << " failed: " << error << "\n";
+        }
+        UTILS_CHECK(update_ok);
+        CHECK_EQ(state.completed_updates, update);
+        CHECK_EQ(state.total_actor_optimizer_steps, update * 16);
+        CHECK_EQ(result.at("actor_optimizer_step_after").GetInt(),
+                 update * 16);
+        CHECK_EQ(static_cast<int>(disposition),
+                 static_cast<int>(
+                     update == 1 ? VrpoPpoPilotDisposition::kContinue
+                                 : VrpoPpoPilotDisposition::kEarlyStop));
+        if (update == 2) {
+          CHECK_EQ(TinyVrpoModuleHash(*actor), actor_before_update);
+          std::string rolled_back_optimizer;
+          UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+              *optimizer, *actor, 16, &rolled_back_optimizer, &error));
+          CHECK_EQ(rolled_back_optimizer, optimizer_before_update);
+          CHECK_EQ(result.at("rollback_state").GetString(),
+                   "health_gate_failed_current_actor_and_optimizer_rolled_back");
+        }
+      }
+      UTILS_CHECK(state.stopped);
+      UTILS_CHECK(!state.completed);
+      UTILS_CHECK(std::filesystem::exists(
+          startup.output_root / "update_1" / "ACTOR_CORPUS.bin"));
+      UTILS_CHECK(std::filesystem::exists(
+          startup.output_root / "update_2" / "actor_optimizer.pt"));
+      auto third = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id + 32);
+      auto third_pairing = MakeTinyVrpoPhase4ePairingStats(third);
+      std::string collection_hash;
+      UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+          *actor, "", &collection_hash, &error));
+      VrpoPpoPilotDisposition disposition;
+      json::Object update_result;
+      UTILS_CHECK(!WriteVrpoPpoPilotUpdate(
+          startup, source.binding, source.layout, input_identity, third,
+          third_pairing, collection_hash, actor, q, *optimizer, pilot_device,
+          deadline, 3, VrpoPpoPilotFailurePoint::kNone, &state,
+          &disposition, &update_result, &error));
+      UTILS_CHECK(!std::filesystem::exists(
+          startup.output_root / "update_3"));
+      json::Object global;
+      UTILS_CHECK(WriteVrpoPpoPilotGlobalResult(
+          startup, input_identity, source.layout, state, *actor, *optimizer,
+          deadline, &global, &error));
+      CHECK_EQ(global.at("classification").GetString(),
+               "VALID_EARLY_STOP_HEALTH");
+      UTILS_CHECK(!global.at("raw128_authorized").GetBool());
+      UTILS_CHECK(!global.at("authorizes_fresh_raw_128_screen").GetBool());
+      UTILS_CHECK(!global.at("authorizes_longer_training").GetBool());
+      CHECK_EQ(global.at("completed_updates").GetInt(), 2);
+    }
+
+    // A fully committed four-update fixture is authorized only from verified
+    // state. Each forged terminal-state component independently fails closed;
+    // no caller-provided classification exists in this API.
+    {
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      auto actor = make_actor();
+      const torch::Device pilot_device = torch::cuda::is_available()
+          ? torch::Device(torch::kCUDA, 0)
+          : torch::Device(torch::kCPU);
+      actor->to(pilot_device, torch::kFloat32);
+      auto q = std::make_shared<DuneVrpoQNetImpl>(2026090209);
+      q->to(pilot_device, torch::kFloat32);
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+          *actor, kVrpoPpoPilotLearningRate, &optimizer, &error));
+      auto startup = MakeTinyVrpoPpoPilotStartup(
+          input, root / "complete", input_identity, first_episode_id);
+      VrpoPpoPilotState state;
+      UTILS_CHECK(InitializeVrpoPpoPilot(
+          startup, input_identity, source.layout, actor, q, *optimizer,
+          deadline, &state, &error));
+      for (int update = 1; update <= 4; ++update) {
+        auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0, first_episode_id + (update - 1) * 16);
+        auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+        std::string collection_hash;
+        UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+            *actor, "", &collection_hash, &error));
+        VrpoPpoPilotDisposition disposition;
+        json::Object update_result;
+        UTILS_CHECK(WriteVrpoPpoPilotUpdate(
+            startup, source.binding, source.layout, input_identity, episodes,
+            pairing, collection_hash, actor, q, *optimizer, pilot_device,
+            deadline, update,
+            VrpoPpoPilotFailurePoint::kForceHealthPassForTest, &state,
+            &disposition, &update_result, &error));
+      }
+      std::string denial;
+      UTILS_CHECK(VrpoPpoPilotRaw128Authorization(
+          startup, input_identity, source.layout, state, *actor, *optimizer,
+          &denial));
+      auto rejects = [&](VrpoPpoPilotState forged) {
+        UTILS_CHECK(!VrpoPpoPilotRaw128Authorization(
+            startup, input_identity, source.layout, forged, *actor,
+            *optimizer, &denial));
+      };
+      {
+        auto forged = state;
+        forged.completed = false;
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.stopped = true;
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.completed_updates = 3;
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.total_actor_optimizer_steps = 63;
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.committed_updates.pop_back();
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.latest_actor_optimizer_state_sha256 = std::string(64, 'f');
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.had_failure = true;
+        forged.failure_reason = "forged failure";
+        rejects(std::move(forged));
+      }
+      {
+        auto forged = state;
+        forged.committed_updates[2].GetObject()
+            ["current_rollout_health_pass"] = false;
+        rejects(std::move(forged));
+      }
+      auto& first_group = optimizer->param_groups().front();
+      auto first_key = first_group.params().front().unsafeGetTensorImpl();
+      auto* first_state = dynamic_cast<torch::optim::AdamWParamState*>(
+          optimizer->state().at(first_key).get());
+      UTILS_CHECK(first_state != nullptr);
+      first_state->step(63);
+      UTILS_CHECK(!VrpoPpoPilotRaw128Authorization(
+          startup, input_identity, source.layout, state, *actor, *optimizer,
+          &denial));
+      first_state->step(64);
+      const auto actor_checkpoint =
+          startup.output_root / "update_4" / "actor_model.pt";
+      const auto held_checkpoint =
+          startup.output_root / "update_4" / "actor_model.pt.held";
+      std::filesystem::rename(actor_checkpoint, held_checkpoint);
+      UTILS_CHECK(!VrpoPpoPilotRaw128Authorization(
+          startup, input_identity, source.layout, state, *actor, *optimizer,
+          &denial));
+      std::filesystem::rename(held_checkpoint, actor_checkpoint);
+      json::Object global;
+      UTILS_CHECK(WriteVrpoPpoPilotGlobalResult(
+          startup, input_identity, source.layout, state, *actor, *optimizer,
+          deadline, &global, &error));
+      CHECK_EQ(global.at("classification").GetString(),
+               "VALID_FOUR_UPDATE_PPO_PILOT_HEALTH_PASS");
+      UTILS_CHECK(global.at("raw128_authorized").GetBool());
+      UTILS_CHECK(global.at("authorizes_fresh_raw_128_screen").GetBool());
+      UTILS_CHECK(!global.at("authorizes_longer_training").GetBool());
+    }
+    std::filesystem::remove_all(root, ec);
+    ResetVrpoQInstrumentation();
+    ResetVrpoScheduleQTargetInstrumentation();
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -7212,6 +7697,7 @@ int main() {
   TestRawPpoNumericalParitySourceCanonicalization();
   TestVrpoScheduleScreenContractsAndCodecLive();
   TestVrpoScheduleHealthAndPpoEquivalenceLive();
+  TestVrpoPpoPilotContractsContinuationAndRollbackLive();
 #endif
 
   // -----------------------------------------------------------------------

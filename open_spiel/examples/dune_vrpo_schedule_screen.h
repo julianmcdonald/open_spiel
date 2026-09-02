@@ -1025,7 +1025,8 @@ inline bool RunVrpoScheduleActorOnlyPpoCell(
     const VrpoActorForward& actor_forward,
     bool four_epoch_equivalence_test,
     const VrpoScheduleRunDeadline* deadline,
-    VrpoScheduleActorOnlyUpdateStats* output, std::string* error) {
+    VrpoScheduleActorOnlyUpdateStats* output, std::string* error,
+    bool require_fresh_optimizer = true) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     if (output != nullptr) *output = VrpoScheduleActorOnlyUpdateStats{};
@@ -1038,7 +1039,9 @@ inline bool RunVrpoScheduleActorOnlyPpoCell(
       !ValidateVrpoScheduleActorEpisodes(episodes, error) ||
       !ValidateVrpoScheduleActorOptimizerCoverage(
           actor_optimizer, actor_model, error) ||
-      !vrpo_training_internal::OptimizerStateIsFresh(actor_optimizer, error)) {
+      (require_fresh_optimizer &&
+       !vrpo_training_internal::OptimizerStateIsFresh(actor_optimizer,
+                                                      error))) {
     return fail(error != nullptr && !error->empty()
                     ? *error
                     : "schedule actor-only PPO input is invalid");

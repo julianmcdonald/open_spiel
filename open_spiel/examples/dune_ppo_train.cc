@@ -49,6 +49,7 @@
 #include "dune_vrpo.h"
 #include "dune_vrpo_checkpoint.h"
 #include "dune_vrpo_phase4e.h"
+#include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
@@ -233,6 +234,37 @@ ABSL_FLAG(std::string, vrpo_schedule_screen_binary_sha256, "",
           "Registered SHA-256 of the executing schedule-screen binary.");
 ABSL_FLAG(int64_t, vrpo_schedule_screen_binary_size, 0,
           "Registered byte size of the executing schedule-screen binary.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_input_archive, "",
+          "Strict Sol-audited bootstrap-v2 PPO_CAP10 origin for the finite actor-only PPO pilot.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_output_root, "",
+          "Fresh root for exactly four sequential actor-only PPO updates.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_registration_id, "",
+          "Immutable finite PPO-pilot registration identifier.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_profile, "",
+          "Required finite pilot profile: ppo_u3_4x16_v1.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_source_root, "",
+          "Source root for the fixed PPO-pilot source list.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_source_sha256, "",
+          "Registered SHA-256 for the fixed PPO-pilot source list.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_binary_sha256, "",
+          "Registered SHA-256 of the executing PPO-pilot binary.");
+ABSL_FLAG(int64_t, vrpo_ppo_pilot_binary_size, 0,
+          "Registered byte size of the executing PPO-pilot binary.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_origin_archive_sha256, "",
+          "Registered combined SHA-256 of the exact bootstrap-v2 PPO_CAP10 origin.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_evidence_root, "",
+          "Root containing the exact immutable v3 schedule/screen/confirm evidence chain.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_v3_schedule_registration_sha256, "", "Exact v3 schedule registration SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_v3_schedule_result_sha256, "", "Exact v3 schedule result SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_v3_schedule_validation_sha256, "", "Exact v3 schedule validation SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_v3_schedule_corpus_manifest_sha256, "", "Exact v3 corpus manifest SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_v3_schedule_corpus_sha256, "", "Exact v3 actor corpus SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_selected_screen_manifest_sha256, "", "Exact selected two-cell screen manifest SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_selected_screen_result_sha256, "", "Exact selected two-cell screen result SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_selected_screen_validation_sha256, "", "Exact selected two-cell screen validation SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_manifest_sha256, "", "Exact U3 256-game confirmation manifest SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_result_sha256, "", "Exact U3 256-game confirmation result SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_validation_sha256, "", "Exact U3 256-game confirmation validation SHA-256.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5781,6 +5813,9 @@ int main(int argc, char** argv) {
   const open_spiel::VrpoScheduleRunDeadline vrpo_schedule_deadline =
       open_spiel::VrpoScheduleRunDeadline::Start(
           vrpo_schedule_process_start, std::chrono::seconds(1200));
+  const open_spiel::VrpoPpoPilotDeadline vrpo_ppo_pilot_deadline =
+      open_spiel::VrpoPpoPilotDeadline::Start(
+          vrpo_schedule_process_start, std::chrono::seconds(1800));
   const bool numerical_parity =
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
   const bool vrpo_capture =
@@ -5795,14 +5830,18 @@ int main(int argc, char** argv) {
   const bool vrpo_schedule_screen =
       !absl::GetFlag(FLAGS_vrpo_schedule_screen_input_archive).empty() ||
       !absl::GetFlag(FLAGS_vrpo_schedule_screen_output_root).empty();
+  const bool vrpo_ppo_pilot =
+      !absl::GetFlag(FLAGS_vrpo_ppo_pilot_input_archive).empty() ||
+      !absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
           static_cast<int>(vrpo_q_preflight) +
           static_cast<int>(vrpo_bootstrap) + static_cast<int>(vrpo_one_update) +
-          static_cast<int>(vrpo_schedule_screen) >
+          static_cast<int>(vrpo_schedule_screen) +
+          static_cast<int>(vrpo_ppo_pilot) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, and VRPO schedule-screen modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, and PPO-pilot modes are mutually exclusive");
   }
   if (vrpo_one_update &&
       (absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
@@ -5816,6 +5855,12 @@ int main(int argc, char** argv) {
     open_spiel::SpielFatalError(
         "VRPO schedule screen requires both input archive and fresh output root");
   }
+  if (vrpo_ppo_pilot &&
+      (absl::GetFlag(FLAGS_vrpo_ppo_pilot_input_archive).empty() ||
+       absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root).empty())) {
+    open_spiel::SpielFatalError(
+        "PPO pilot requires both input archive and fresh output root");
+  }
   if (vrpo_schedule_screen) {
     std::string resource_error;
     if (!open_spiel::vrpo_schedule_internal::CheckFreeSpaceBeforeStart(
@@ -5826,6 +5871,17 @@ int main(int argc, char** argv) {
       open_spiel::SpielFatalError(
           "VRPO schedule screen resource/deadline gate failed: " +
           resource_error);
+    }
+  }
+  if (vrpo_ppo_pilot) {
+    std::string resource_error;
+    if (!open_spiel::vrpo_ppo_pilot_internal::CheckFreeSpaceBeforeStart(
+            absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root),
+            &resource_error) ||
+        !vrpo_ppo_pilot_deadline.Check("before source/model load",
+                                       &resource_error)) {
+      open_spiel::SpielFatalError(
+          "PPO pilot resource/deadline gate failed: " + resource_error);
     }
   }
   if (numerical_parity) {
@@ -6375,9 +6431,9 @@ int main(int argc, char** argv) {
         "Raw-PPO numerical parity requires CUDA: without it the rollout side "
         "does not execute BF16 autocast and cannot test the registered gate.");
   }
-  if (vrpo_schedule_screen && !device.is_cuda()) {
+  if ((vrpo_schedule_screen || vrpo_ppo_pilot) && !device.is_cuda()) {
     SpielFatalError(
-        "VRPO schedule screen requires a checked CUDA runtime device");
+        "VRPO schedule screen and PPO pilot require a checked CUDA runtime device");
   }
   open_spiel::PpoNumericalParitySourceProvenance
       parity_source_provenance;
@@ -6385,6 +6441,10 @@ int main(int argc, char** argv) {
       vrpo_source_provenance;
   open_spiel::VrpoPhase4eSourceIdentity vrpo_one_update_source_identity;
   open_spiel::VrpoPhase4eSourceIdentity vrpo_schedule_source_identity;
+  open_spiel::VrpoPhase4eSourceIdentity vrpo_ppo_pilot_source_identity;
+  open_spiel::VrpoPpoPilotStartupConfig vrpo_ppo_pilot_preflight;
+  open_spiel::VrpoExpandedArchiveIdentity
+      vrpo_ppo_pilot_preloaded_input_identity;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -6426,6 +6486,81 @@ int main(int argc, char** argv) {
                                       &source_error)) {
       SpielFatalError(source_error);
     }
+  }
+  if (vrpo_ppo_pilot) {
+    std::string source_error;
+    if (absl::GetFlag(FLAGS_init_mode) != "vrpo_ppo_pilot" ||
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_profile) !=
+            open_spiel::kVrpoPpoPilotProfile ||
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_registration_id) !=
+            open_spiel::kVrpoPpoPilotRegistrationId ||
+        absl::GetFlag(FLAGS_seed) !=
+            static_cast<int>(open_spiel::kVrpoPpoPilotBaseSeed) ||
+        absl::GetFlag(FLAGS_start_episode_id) !=
+            open_spiel::kVrpoPpoPilotStartEpisodeId ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoPpoPilotUpdates) {
+      SpielFatalError(
+          "PPO pilot compiled profile/registration/seed/range contract rejected before model construction");
+    }
+    if (!open_spiel::LoadVrpoPpoPilotSourceIdentity(
+            absl::GetFlag(FLAGS_vrpo_ppo_pilot_source_root),
+            absl::GetFlag(FLAGS_vrpo_ppo_pilot_source_sha256),
+            &vrpo_ppo_pilot_source_identity, &source_error) ||
+        !vrpo_ppo_pilot_deadline.Check("after source identity",
+                                       &source_error)) {
+      SpielFatalError("PPO-pilot source identity rejected: " + source_error);
+    }
+    vrpo_ppo_pilot_preflight.input_archive =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_input_archive);
+    vrpo_ppo_pilot_preflight.output_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root);
+    vrpo_ppo_pilot_preflight.origin_archive_sha256 =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_origin_archive_sha256);
+    vrpo_ppo_pilot_preflight.evidence_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_evidence_root);
+    vrpo_ppo_pilot_preflight.evidence_cli_sha256 = {
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_v3_schedule_registration_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_v3_schedule_result_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_v3_schedule_validation_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_v3_schedule_corpus_manifest_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_v3_schedule_corpus_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_selected_screen_manifest_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_selected_screen_result_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_selected_screen_validation_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_confirm_manifest_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_confirm_result_sha256),
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_confirm_validation_sha256)};
+    std::error_code binary_ec;
+    const auto binary_path =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    size_t binary_size = 0;
+    const std::string binary_sha256 = binary_ec || binary_path.empty()
+        ? std::string()
+        : open_spiel::ComputeFileSHA256(binary_path.string(), &binary_size);
+    if (binary_sha256 !=
+            absl::GetFlag(FLAGS_vrpo_ppo_pilot_binary_sha256) ||
+        static_cast<int64_t>(binary_size) !=
+            absl::GetFlag(FLAGS_vrpo_ppo_pilot_binary_size) ||
+        !open_spiel::ComputeVrpoExpandedArchiveIdentity(
+            vrpo_ppo_pilot_preflight.input_archive,
+            &vrpo_ppo_pilot_preloaded_input_identity, &source_error) ||
+        vrpo_ppo_pilot_preloaded_input_identity.combined_sha256 !=
+            open_spiel::kVrpoPpoPilotOriginArchiveSha256 ||
+        vrpo_ppo_pilot_preflight.origin_archive_sha256 !=
+            open_spiel::kVrpoPpoPilotOriginArchiveSha256 ||
+        !open_spiel::ValidateVrpoPpoPilotEvidenceFiles(
+            vrpo_ppo_pilot_preflight.evidence_root,
+            open_spiel::VrpoPpoPilotCanonicalEvidenceFiles(),
+            vrpo_ppo_pilot_preflight.evidence_cli_sha256,
+            &vrpo_ppo_pilot_preflight.evidence_observations,
+            &source_error)) {
+      SpielFatalError(
+          "PPO pilot immutable binary/origin/evidence chain rejected before model construction: " +
+          source_error);
+    }
+    vrpo_ppo_pilot_preflight.executed_binary_sha256 = binary_sha256;
+    vrpo_ppo_pilot_preflight.executed_binary_size = binary_size;
   }
 
   // PWO-5 section 7.2 / Appendix A.1.
@@ -6533,7 +6668,7 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
-  if (!vrpo_one_update && !vrpo_schedule_screen &&
+  if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
@@ -6722,6 +6857,13 @@ int main(int argc, char** argv) {
   open_spiel::VrpoExpandedExpectedLayout vrpo_schedule_layout;
   open_spiel::VrpoExpandedArchiveIdentity vrpo_schedule_input_identity;
   open_spiel::VrpoScheduleStartupConfig vrpo_schedule_startup;
+  std::shared_ptr<open_spiel::DuneVrpoQNetImpl> vrpo_ppo_pilot_q;
+  std::unique_ptr<torch::optim::AdamW> vrpo_ppo_pilot_actor_optimizer;
+  open_spiel::VrpoPhase4ManifestBinding vrpo_ppo_pilot_binding;
+  open_spiel::VrpoExpandedExpectedLayout vrpo_ppo_pilot_layout;
+  open_spiel::VrpoExpandedArchiveIdentity vrpo_ppo_pilot_input_identity;
+  open_spiel::VrpoPpoPilotStartupConfig vrpo_ppo_pilot_startup;
+  open_spiel::VrpoPpoPilotState vrpo_ppo_pilot_state;
 
   // WO-PERF-TIMING. Enforced HERE, at startup, because FLAGS_pipeline is
   // defined in this TU and validating at the first update would waste a whole
@@ -7122,6 +7264,167 @@ int main(int argc, char** argv) {
                       schedule_error);
     }
     next_episode_id.store(vrpo_schedule_binding.start_episode_id);
+    total_env_steps.store(0);
+    start_update = 1;
+  } else if (vrpo_ppo_pilot) {
+    if (init_mode != "vrpo_ppo_pilot" ||
+        absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        !absl::GetFlag(FLAGS_artifact_manifest).empty() ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoPpoPilotUpdates ||
+        absl::GetFlag(FLAGS_ppo_update_epochs) !=
+            open_spiel::kVrpoPpoPilotActorEpochs ||
+        absl::GetFlag(FLAGS_learning_rate) !=
+            open_spiel::kVrpoPpoPilotLearningRate ||
+        absl::GetFlag(FLAGS_anneal_lr)) {
+      SpielFatalError(
+          "PPO pilot requires its dedicated mode, production actor layout, "
+          "fixed four-update LR5e-6/E1 profile, and no legacy paths/annealing");
+    }
+    const open_spiel::VrpoPhase4ArmConfig* ppo_cap10 =
+        open_spiel::FindCanonicalVrpoPhase4Arm("PPO_CAP10");
+    if (ppo_cap10 == nullptr) {
+      SpielFatalError("PPO pilot cannot resolve PPO_CAP10 origin contract");
+    }
+    json::Object input_manifest;
+    std::string pilot_error;
+    vrpo_ppo_pilot_startup = vrpo_ppo_pilot_preflight;
+    if (!open_spiel::ReadVrpoPhase4eExternalBinding(
+            vrpo_ppo_pilot_startup.input_archive, *ppo_cap10,
+            &vrpo_ppo_pilot_binding, &vrpo_ppo_pilot_layout,
+            &input_manifest, &vrpo_ppo_pilot_input_identity, &pilot_error)) {
+      SpielFatalError("PPO pilot input binding rejected: " + pilot_error);
+    }
+    vrpo_ppo_pilot_startup.game = absl::GetFlag(FLAGS_game);
+    vrpo_ppo_pilot_startup.init_mode = init_mode;
+    vrpo_ppo_pilot_startup.profile =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_profile);
+    vrpo_ppo_pilot_startup.registration_id =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_registration_id);
+    vrpo_ppo_pilot_startup.source_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_pilot_source_root);
+    vrpo_ppo_pilot_startup.source_code_sha256 =
+        vrpo_ppo_pilot_source_identity.combined_sha256;
+    vrpo_ppo_pilot_startup.rollout_games =
+        absl::GetFlag(FLAGS_rollout_games);
+    vrpo_ppo_pilot_startup.threads = absl::GetFlag(FLAGS_threads);
+    vrpo_ppo_pilot_startup.eval_batch_size =
+        absl::GetFlag(FLAGS_eval_batch_size);
+    vrpo_ppo_pilot_startup.eval_timeout_ms =
+        absl::GetFlag(FLAGS_eval_timeout_ms);
+    vrpo_ppo_pilot_startup.evaluator_device_synchronize =
+        absl::GetFlag(FLAGS_evaluator_device_synchronize);
+    vrpo_ppo_pilot_startup.deterministic_rollout_eval =
+        absl::GetFlag(FLAGS_deterministic_rollout_eval);
+    vrpo_ppo_pilot_startup.seed_scheme_version =
+        absl::GetFlag(FLAGS_seed_scheme_version);
+    vrpo_ppo_pilot_startup.runtime_device_is_cuda = device.is_cuda();
+    vrpo_ppo_pilot_startup.runtime_device_index =
+        device.has_index() ? device.index() : c10::cuda::current_device();
+    vrpo_ppo_pilot_startup.one_gpu_process =
+        device.is_cuda() && vrpo_ppo_pilot_startup.runtime_device_index >= 0;
+    vrpo_ppo_pilot_startup.runtime_process_id =
+        static_cast<int64_t>(::getpid());
+    vrpo_ppo_pilot_startup.base_seed =
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_seed));
+    vrpo_ppo_pilot_startup.start_episode_id =
+        absl::GetFlag(FLAGS_start_episode_id);
+    vrpo_ppo_pilot_startup.diagnostics_only =
+        absl::GetFlag(FLAGS_diagnostics_only);
+    vrpo_ppo_pilot_startup.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+    vrpo_ppo_pilot_startup.train_amp = absl::GetFlag(FLAGS_train_amp);
+    vrpo_ppo_pilot_startup.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    vrpo_ppo_pilot_startup.pipeline = absl::GetFlag(FLAGS_pipeline);
+    vrpo_ppo_pilot_startup.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    vrpo_ppo_pilot_startup.search_pi_mode =
+        absl::GetFlag(FLAGS_search_pi_mode);
+    vrpo_ppo_pilot_startup.train_value_only =
+        absl::GetFlag(FLAGS_train_value_only);
+    vrpo_ppo_pilot_startup.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    vrpo_ppo_pilot_startup.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    vrpo_ppo_pilot_startup.ordinary_checkpoint_writes_enabled =
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    vrpo_ppo_pilot_startup.anneal_lr = absl::GetFlag(FLAGS_anneal_lr);
+    vrpo_ppo_pilot_startup.learning_rate =
+        absl::GetFlag(FLAGS_learning_rate);
+    vrpo_ppo_pilot_startup.ppo_update_epochs =
+        absl::GetFlag(FLAGS_ppo_update_epochs);
+    vrpo_ppo_pilot_startup.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    vrpo_ppo_pilot_startup.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    vrpo_ppo_pilot_startup.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    vrpo_ppo_pilot_startup.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    vrpo_ppo_pilot_startup.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    vrpo_ppo_pilot_startup.gamma = absl::GetFlag(FLAGS_gamma);
+    vrpo_ppo_pilot_startup.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    vrpo_ppo_pilot_startup.logit_cap = absl::GetFlag(FLAGS_logit_cap);
+    vrpo_ppo_pilot_startup.ppo_minibatches =
+        open_spiel::kVrpoTrainingMinibatchesPerEpoch;
+    vrpo_ppo_pilot_startup.ppo_minibatch_size =
+        absl::GetFlag(FLAGS_ppo_minibatch_size);
+    vrpo_ppo_pilot_startup.clip_epsilon =
+        absl::GetFlag(FLAGS_ppo_clip_epsilon);
+    vrpo_ppo_pilot_startup.entropy_coefficient =
+        absl::GetFlag(FLAGS_entropy_coef);
+    vrpo_ppo_pilot_startup.value_coefficient =
+        absl::GetFlag(FLAGS_value_coef);
+    vrpo_ppo_pilot_startup.gradient_clip_norm =
+        absl::GetFlag(FLAGS_grad_clip_norm);
+    vrpo_ppo_pilot_startup.normalize_advantages =
+        absl::GetFlag(FLAGS_normalize_advantages);
+    vrpo_ppo_pilot_startup.clip_value_loss =
+        absl::GetFlag(FLAGS_ppo_clip_value_loss);
+    if (!open_spiel::ValidateVrpoPpoPilotStartupConfig(
+            vrpo_ppo_pilot_startup, &pilot_error)) {
+      SpielFatalError("PPO pilot startup rejected: " + pilot_error);
+    }
+    if (vrpo_ppo_pilot_input_identity.combined_sha256 !=
+            vrpo_ppo_pilot_startup.origin_archive_sha256 ||
+        vrpo_ppo_pilot_input_identity.combined_sha256 !=
+            vrpo_ppo_pilot_preloaded_input_identity.combined_sha256) {
+      SpielFatalError("PPO pilot origin archive identity mismatch");
+    }
+    if (vrpo_ppo_pilot_layout.test_fixture ||
+        vrpo_ppo_pilot_layout.label != "production_dune_vrpo_layout_v1" ||
+        vrpo_ppo_pilot_layout.actor_observation_dim != obs_size ||
+        vrpo_ppo_pilot_layout.actor_hidden_dim != 2048 ||
+        vrpo_ppo_pilot_layout.actor_action_dim != action_size ||
+        vrpo_ppo_pilot_layout.actor_residual_blocks != 8) {
+      SpielFatalError("PPO pilot permits production archive only");
+    }
+    open_spiel::ResetVrpoQInstrumentation();
+    open_spiel::ResetVrpoScheduleQTargetInstrumentation();
+    vrpo_ppo_pilot_q = std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+        vrpo_ppo_pilot_binding.q_init_seed);
+    vrpo_ppo_pilot_q->to(device);
+    if (!vrpo_ppo_pilot_deadline.Check("before source actor/Q load",
+                                       &pilot_error) ||
+        !open_spiel::LoadAndValidateVrpoScheduleSourceModules(
+            vrpo_ppo_pilot_startup.input_archive, *ppo_cap10,
+            vrpo_ppo_pilot_binding, vrpo_ppo_pilot_layout,
+            vrpo_ppo_pilot_input_identity, training_model,
+            vrpo_ppo_pilot_q, input_manifest, &pilot_error) ||
+        !open_spiel::MakeVrpoScheduleFreshActorOptimizer(
+            *training_model, open_spiel::kVrpoPpoPilotLearningRate,
+            &vrpo_ppo_pilot_actor_optimizer, &pilot_error) ||
+        !open_spiel::InitializeVrpoPpoPilot(
+            vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+            vrpo_ppo_pilot_layout, training_model, vrpo_ppo_pilot_q,
+            *vrpo_ppo_pilot_actor_optimizer, vrpo_ppo_pilot_deadline,
+            &vrpo_ppo_pilot_state, &pilot_error)) {
+      SpielFatalError("PPO pilot source/init failed: " + pilot_error);
+    }
+    next_episode_id.store(vrpo_ppo_pilot_startup.start_episode_id);
     total_env_steps.store(0);
     start_update = 1;
   } else if (init_mode == "diagnostic") {
@@ -7739,7 +8042,7 @@ int main(int argc, char** argv) {
     SpielFatalError("Unsupported init_mode: " + init_mode +
                     " (expected random, checkpoint, bootstrap, "
                     "validate_legacy, diagnostic, vrpo_one_update, or "
-                    "vrpo_schedule_screen)");
+                    "vrpo_schedule_screen, or vrpo_ppo_pilot)");
   }
 
   std::shared_mutex sync_mutex;
@@ -9330,10 +9633,12 @@ int main(int argc, char** argv) {
 
   // Collect first rollout synchronously.
   const std::string parity_model_hash_before =
-      (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen)
+      (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
+       vrpo_ppo_pilot)
           ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
-      (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen)
+      (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
+       vrpo_ppo_pilot)
           ? open_spiel::HashAllModelState(inference_model) : "";
   const bool parity_tf32_cublas_before =
       (numerical_parity || vrpo_diagnostics) &&
@@ -9345,23 +9650,32 @@ int main(int argc, char** argv) {
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
   open_spiel::VrpoCapturedEpisodeBuffer vrpo_capture_buffer;
-  if (vrpo_schedule_screen) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot) {
     std::string deadline_error;
-    if (!vrpo_schedule_deadline.Check("before rollout collection",
-                                      &deadline_error)) {
+    const bool deadline_ok = vrpo_schedule_screen
+        ? vrpo_schedule_deadline.Check("before rollout collection",
+                                       &deadline_error)
+        : vrpo_ppo_pilot_deadline.Check("before rollout collection",
+                                        &deadline_error);
+    if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
   }
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
-      (vrpo_diagnostics || vrpo_one_update || vrpo_schedule_screen)
+      (vrpo_diagnostics || vrpo_one_update || vrpo_schedule_screen ||
+       vrpo_ppo_pilot)
           ? &vrpo_capture_buffer
           : nullptr);
-  if (vrpo_schedule_screen) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot) {
     std::string deadline_error;
-    if (!vrpo_schedule_deadline.Check("after rollout collection",
-                                      &deadline_error)) {
+    const bool deadline_ok = vrpo_schedule_screen
+        ? vrpo_schedule_deadline.Check("after rollout collection",
+                                       &deadline_error)
+        : vrpo_ppo_pilot_deadline.Check("after rollout collection",
+                                        &deadline_error);
+    if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
   }
@@ -9546,6 +9860,150 @@ int main(int argc, char** argv) {
     std::cout << "VRPO schedule health screen VALID: "
               << vrpo_schedule_startup.output_root << "\n";
     return 0;
+  }
+  if (vrpo_ppo_pilot) {
+    std::vector<open_spiel::VrpoCapturedEpisode> captured =
+        vrpo_capture_buffer.TakeSorted();
+    std::string collection_actor_hash =
+        vrpo_ppo_pilot_state.initial_actor_values_sha256;
+    std::string first_actor_hash;
+    std::string first_inference_hash;
+    std::string first_collection_error;
+    if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+            *training_model, "", &first_actor_hash,
+            &first_collection_error) ||
+        !open_spiel::vrpo_training_internal::ModuleValueSha256(
+            *inference_model, "", &first_inference_hash,
+            &first_collection_error) ||
+        first_actor_hash != collection_actor_hash ||
+        first_inference_hash != collection_actor_hash) {
+      SpielFatalError(
+          "PPO pilot first collection actor/inference binding failed: " +
+          first_collection_error);
+    }
+    for (int update = 1; update <= open_spiel::kVrpoPpoPilotUpdates;
+         ++update) {
+      std::vector<open_spiel::VrpoTrainingEpisode> training_episodes;
+      open_spiel::VrpoPhase4ePairingStats pairing;
+      std::string pilot_error;
+      const uint64_t expected_start =
+          vrpo_ppo_pilot_startup.start_episode_id +
+          static_cast<uint64_t>(update - 1) *
+              open_spiel::kVrpoPpoPilotGamesPerUpdate;
+      if (!current_collect.episode_ids_unique ||
+          current_collect.games != static_cast<uint64_t>(
+              open_spiel::kVrpoPpoPilotGamesPerUpdate) ||
+          !open_spiel::BuildVrpoPhase4eTrainingEpisodes(
+              captured, current_collect.rollout, expected_start,
+              open_spiel::kVrpoPpoPilotGamesPerUpdate, &training_episodes,
+              &pairing, &pilot_error)) {
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        vrpo_ppo_pilot_state.had_failure = true;
+        vrpo_ppo_pilot_state.failure_reason =
+            "complete-game capture/pairing failed: " + pilot_error;
+        open_spiel::WriteVrpoPpoPilotGlobalResult(
+            vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+            vrpo_ppo_pilot_layout, vrpo_ppo_pilot_state, *training_model,
+            *vrpo_ppo_pilot_actor_optimizer,
+            vrpo_ppo_pilot_deadline, &invalid_result, &status_error);
+        SpielFatalError("PPO pilot complete-game capture/pairing failed: " +
+                        pilot_error);
+      }
+      open_spiel::VrpoPpoPilotDisposition disposition;
+      open_spiel::json::Object update_result;
+      if (!open_spiel::WriteVrpoPpoPilotUpdate(
+              vrpo_ppo_pilot_startup, vrpo_ppo_pilot_binding,
+              vrpo_ppo_pilot_layout, vrpo_ppo_pilot_input_identity,
+              training_episodes, pairing, collection_actor_hash,
+              training_model, vrpo_ppo_pilot_q,
+              *vrpo_ppo_pilot_actor_optimizer, device,
+              vrpo_ppo_pilot_deadline, update,
+              open_spiel::VrpoPpoPilotFailurePoint::kNone,
+              &vrpo_ppo_pilot_state, &disposition, &update_result,
+              &pilot_error)) {
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        vrpo_ppo_pilot_state.had_failure = true;
+        vrpo_ppo_pilot_state.failure_reason =
+            "update transaction failed: " + pilot_error;
+        open_spiel::WriteVrpoPpoPilotGlobalResult(
+            vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+            vrpo_ppo_pilot_layout, vrpo_ppo_pilot_state, *training_model,
+            *vrpo_ppo_pilot_actor_optimizer,
+            vrpo_ppo_pilot_deadline, &invalid_result, &status_error);
+        SpielFatalError("PPO pilot update transaction failed: " +
+                        pilot_error);
+      }
+      if (disposition == open_spiel::VrpoPpoPilotDisposition::kEarlyStop ||
+          disposition == open_spiel::VrpoPpoPilotDisposition::kComplete) {
+        open_spiel::json::Object pilot_result;
+        if (!open_spiel::WriteVrpoPpoPilotGlobalResult(
+                vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+                vrpo_ppo_pilot_layout, vrpo_ppo_pilot_state, *training_model,
+                *vrpo_ppo_pilot_actor_optimizer,
+                vrpo_ppo_pilot_deadline, &pilot_result, &pilot_error)) {
+          SpielFatalError("PPO pilot terminal status failed: " + pilot_error);
+        }
+        std::cout << "PPO pilot "
+                  << pilot_result.at("classification").GetString() << ": "
+                  << vrpo_ppo_pilot_startup.output_root << "\n";
+        return 0;
+      }
+
+      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+      std::string inference_hash;
+      if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *training_model, "", &collection_actor_hash, &pilot_error) ||
+          !open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *inference_model, "", &inference_hash, &pilot_error) ||
+          inference_hash != collection_actor_hash ||
+          !vrpo_ppo_pilot_deadline.Check("before next rollout collection",
+                                         &pilot_error)) {
+        vrpo_ppo_pilot_state.had_failure = true;
+        vrpo_ppo_pilot_state.failure_reason =
+            "inference synchronization failed: " + pilot_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoPilotGlobalResult(
+            vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+            vrpo_ppo_pilot_layout, vrpo_ppo_pilot_state, *training_model,
+            *vrpo_ppo_pilot_actor_optimizer, vrpo_ppo_pilot_deadline,
+            &invalid_result, &status_error);
+        SpielFatalError("PPO pilot inference synchronization failed: " +
+                        pilot_error);
+      }
+      open_spiel::VrpoCapturedEpisodeBuffer next_capture;
+      current_collect = open_spiel::CollectRollout(
+          game.get(), evaluator, obs_size, &total_env_steps, num_threads,
+          &next_episode_id, rollout_games, reward_lambda, &next_capture);
+      captured = next_capture.TakeSorted();
+      std::string actor_after_collection;
+      std::string inference_after_collection;
+      if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *training_model, "", &actor_after_collection, &pilot_error) ||
+          !open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *inference_model, "", &inference_after_collection,
+              &pilot_error) ||
+          actor_after_collection != collection_actor_hash ||
+          inference_after_collection != collection_actor_hash ||
+          !vrpo_ppo_pilot_deadline.Check("after next rollout collection",
+                                         &pilot_error)) {
+        vrpo_ppo_pilot_state.had_failure = true;
+        vrpo_ppo_pilot_state.failure_reason =
+            "collection mutated actor or exceeded deadline: " + pilot_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoPilotGlobalResult(
+            vrpo_ppo_pilot_startup, vrpo_ppo_pilot_input_identity,
+            vrpo_ppo_pilot_layout, vrpo_ppo_pilot_state, *training_model,
+            *vrpo_ppo_pilot_actor_optimizer, vrpo_ppo_pilot_deadline,
+            &invalid_result, &status_error);
+        SpielFatalError("PPO pilot collection mutated the actor: " +
+                        pilot_error);
+      }
+    }
+    SpielFatalError("PPO pilot loop exited without a terminal disposition");
   }
   if (numerical_parity) {
     const auto batch_evaluator =
