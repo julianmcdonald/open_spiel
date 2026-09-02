@@ -25,13 +25,13 @@
 
 namespace open_spiel {
 
-inline constexpr char kVrpoScheduleProfile[] = "lower_lr_v2";
+inline constexpr char kVrpoScheduleProfile[] = "ultralow_lr_v3";
 inline constexpr char kVrpoScheduleCorpusSchema[] =
-    "dune_vrpo_schedule_actor_corpus_v2";
+    "dune_vrpo_schedule_actor_corpus_v3";
 inline constexpr char kVrpoScheduleCellResultSchema[] =
-    "dune_vrpo_schedule_cell_result_v2";
+    "dune_vrpo_schedule_cell_result_v3";
 inline constexpr char kVrpoScheduleResultSchema[] =
-    "dune_vrpo_schedule_health_screen_v2";
+    "dune_vrpo_schedule_health_screen_v3";
 inline constexpr char kVrpoScheduleQRole[] =
     "SOURCE_ARCHIVE_PROVENANCE_ONLY";
 inline std::atomic<int64_t> g_vrpo_schedule_q_target_computations{0};
@@ -125,10 +125,10 @@ inline const std::array<VrpoScheduleCellSpec, 4>*
 FindVrpoScheduleCellsForProfile(const std::string& profile) {
   if (profile != kVrpoScheduleProfile) return nullptr;
   static const std::array<VrpoScheduleCellSpec, 4> cells = {{
-      {"T1_LR3E5_E1", 3.0e-5, 1},
-      {"T2_LR2E5_E1", 2.0e-5, 1},
-      {"T3_LR1P25E5_E1", 1.25e-5, 1},
-      {"T4_LR1P25E5_E2", 1.25e-5, 2},
+      {"U1_LR1E5_E1", 1.0e-5, 1},
+      {"U2_LR7P5E6_E1", 7.5e-6, 1},
+      {"U3_LR5E6_E1", 5.0e-6, 1},
+      {"U4_LR5E6_E2", 5.0e-6, 2},
   }};
   return &cells;
 }

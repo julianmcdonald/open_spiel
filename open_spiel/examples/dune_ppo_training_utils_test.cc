@@ -6744,27 +6744,30 @@ void TestVrpoScheduleScreenContractsAndCodecLive() {
     const auto* resolved_cells =
         FindVrpoScheduleCellsForProfile(kVrpoScheduleProfile);
     UTILS_CHECK(resolved_cells != nullptr);
-    UTILS_CHECK(FindVrpoScheduleCellsForProfile("schedule_v1") == nullptr);
+    UTILS_CHECK(FindVrpoScheduleCellsForProfile("") == nullptr);
+    UTILS_CHECK(FindVrpoScheduleCellsForProfile("lower_lr_v1") == nullptr);
+    UTILS_CHECK(FindVrpoScheduleCellsForProfile("lower_lr_v2") == nullptr);
+    UTILS_CHECK(FindVrpoScheduleCellsForProfile("other") == nullptr);
     const auto& cells = *resolved_cells;
     CHECK_EQ(cells.size(), 4);
     CHECK_EQ(cells[0].actor_epochs + cells[1].actor_epochs +
                  cells[2].actor_epochs + cells[3].actor_epochs,
              5);
-    CHECK_EQ(std::string(kVrpoScheduleProfile), "lower_lr_v2");
+    CHECK_EQ(std::string(kVrpoScheduleProfile), "ultralow_lr_v3");
     CHECK_EQ(std::string(kVrpoScheduleCorpusSchema),
-             "dune_vrpo_schedule_actor_corpus_v2");
+             "dune_vrpo_schedule_actor_corpus_v3");
     CHECK_EQ(std::string(kVrpoScheduleCellResultSchema),
-             "dune_vrpo_schedule_cell_result_v2");
+             "dune_vrpo_schedule_cell_result_v3");
     CHECK_EQ(std::string(kVrpoScheduleResultSchema),
-             "dune_vrpo_schedule_health_screen_v2");
-    CHECK_EQ(cells[0].cell_id, "T1_LR3E5_E1");
-    CHECK_EQ(cells[1].cell_id, "T2_LR2E5_E1");
-    CHECK_EQ(cells[2].cell_id, "T3_LR1P25E5_E1");
-    CHECK_EQ(cells[3].cell_id, "T4_LR1P25E5_E2");
-    CHECK_NEAR(cells[0].learning_rate, 3.0e-5, 0.0);
-    CHECK_NEAR(cells[1].learning_rate, 2.0e-5, 0.0);
-    CHECK_NEAR(cells[2].learning_rate, 1.25e-5, 0.0);
-    CHECK_NEAR(cells[3].learning_rate, 1.25e-5, 0.0);
+             "dune_vrpo_schedule_health_screen_v3");
+    CHECK_EQ(cells[0].cell_id, "U1_LR1E5_E1");
+    CHECK_EQ(cells[1].cell_id, "U2_LR7P5E6_E1");
+    CHECK_EQ(cells[2].cell_id, "U3_LR5E6_E1");
+    CHECK_EQ(cells[3].cell_id, "U4_LR5E6_E2");
+    CHECK_NEAR(cells[0].learning_rate, 1.0e-5, 0.0);
+    CHECK_NEAR(cells[1].learning_rate, 7.5e-6, 0.0);
+    CHECK_NEAR(cells[2].learning_rate, 5.0e-6, 0.0);
+    CHECK_NEAR(cells[3].learning_rate, 5.0e-6, 0.0);
     CHECK_EQ(cells[0].actor_epochs, 1);
     CHECK_EQ(cells[1].actor_epochs, 1);
     CHECK_EQ(cells[2].actor_epochs, 1);
@@ -6808,6 +6811,13 @@ void TestVrpoScheduleScreenContractsAndCodecLive() {
     VrpoScheduleCorpusIdentity corrupt_identity;
     UTILS_CHECK(!DecodeVrpoScheduleActorCorpus(
         corrupt, &corrupt_rows, &corrupt_identity, &error));
+    std::string legacy_schema = bytes;
+    const size_t schema_offset = legacy_schema.find(kVrpoScheduleCorpusSchema);
+    UTILS_CHECK(schema_offset != std::string::npos);
+    legacy_schema[schema_offset +
+                  std::string(kVrpoScheduleCorpusSchema).size() - 1] = '2';
+    UTILS_CHECK(!DecodeVrpoScheduleActorCorpus(
+        legacy_schema, &corrupt_rows, &corrupt_identity, &error));
     std::swap(source[0], source[1]);
     UTILS_CHECK(!EncodeVrpoScheduleActorCorpus(source, &bytes, &encoded,
                                                 &error));
@@ -6876,8 +6886,11 @@ void TestVrpoScheduleScreenContractsAndCodecLive() {
     startup.init_mode = "vrpo_one_update";
     UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
     startup.init_mode = "vrpo_schedule_screen";
-    startup.profile = "schedule_v1";
-    UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    for (const std::string& rejected_profile :
+         {"", "lower_lr_v1", "lower_lr_v2", "other"}) {
+      startup.profile = rejected_profile;
+      UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));
+    }
     startup.profile = kVrpoScheduleProfile;
     startup.logit_cap = 0.0;
     UTILS_CHECK(!ValidateVrpoScheduleStartupConfig(startup, &error));

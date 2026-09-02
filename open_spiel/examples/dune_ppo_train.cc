@@ -224,7 +224,7 @@ ABSL_FLAG(std::string, vrpo_schedule_screen_output_root, "",
 ABSL_FLAG(std::string, vrpo_schedule_screen_registration_id, "",
           "Immutable schedule-health screen registration ID.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_profile, "",
-          "Required schedule-health profile: lower_lr_v2.");
+          "Required schedule-health profile: ultralow_lr_v3.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_source_root, "",
           "Source root for the fixed schedule-screen source list.");
 ABSL_FLAG(std::string, vrpo_schedule_screen_source_sha256, "",
