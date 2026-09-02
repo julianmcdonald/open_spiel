@@ -50,6 +50,7 @@
 #include "dune_vrpo_checkpoint.h"
 #include "dune_vrpo_phase4e.h"
 #include "dune_vrpo_ppo_pilot.h"
+#include "dune_vrpo_ppo_continuation.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
@@ -265,6 +266,22 @@ ABSL_FLAG(std::string, vrpo_ppo_pilot_selected_screen_validation_sha256, "", "Ex
 ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_manifest_sha256, "", "Exact U3 256-game confirmation manifest SHA-256.");
 ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_result_sha256, "", "Exact U3 256-game confirmation result SHA-256.");
 ABSL_FLAG(std::string, vrpo_ppo_pilot_confirm_validation_sha256, "", "Exact U3 256-game confirmation validation SHA-256.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_output_root, "",
+          "Fresh root for the bounded actor-only PPO updates 5 through 8 continuation.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_registration_id, "",
+          "Immutable updates 5 through 8 continuation registration ID.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_profile, "",
+          "Required bounded continuation profile.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_evidence_root, "",
+          "Root containing the exact pilot/U4/raw128/confirm256 prior chain.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_source_root, "",
+          "Source root for the fixed PPO-continuation source list.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_source_sha256, "",
+          "Registered SHA-256 for the fixed PPO-continuation source list.");
+ABSL_FLAG(std::string, vrpo_ppo_continuation_binary_sha256, "",
+          "Registered SHA-256 of the executing continuation binary.");
+ABSL_FLAG(int64_t, vrpo_ppo_continuation_binary_size, 0,
+          "Registered byte size of the executing continuation binary.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5816,6 +5833,10 @@ int main(int argc, char** argv) {
   const open_spiel::VrpoPpoPilotDeadline vrpo_ppo_pilot_deadline =
       open_spiel::VrpoPpoPilotDeadline::Start(
           vrpo_schedule_process_start, std::chrono::seconds(1800));
+  const open_spiel::VrpoPpoContinuationDeadline
+      vrpo_ppo_continuation_deadline =
+          open_spiel::VrpoPpoContinuationDeadline::Start(
+              vrpo_schedule_process_start, std::chrono::seconds(1800));
   const bool numerical_parity =
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
   const bool vrpo_capture =
@@ -5833,15 +5854,18 @@ int main(int argc, char** argv) {
   const bool vrpo_ppo_pilot =
       !absl::GetFlag(FLAGS_vrpo_ppo_pilot_input_archive).empty() ||
       !absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root).empty();
+  const bool vrpo_ppo_continuation =
+      !absl::GetFlag(FLAGS_vrpo_ppo_continuation_output_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
           static_cast<int>(vrpo_q_preflight) +
           static_cast<int>(vrpo_bootstrap) + static_cast<int>(vrpo_one_update) +
           static_cast<int>(vrpo_schedule_screen) +
-          static_cast<int>(vrpo_ppo_pilot) >
+          static_cast<int>(vrpo_ppo_pilot) +
+          static_cast<int>(vrpo_ppo_continuation) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, and PPO-pilot modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, PPO-pilot, and PPO-continuation modes are mutually exclusive");
   }
   if (vrpo_one_update &&
       (absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
@@ -5860,6 +5884,12 @@ int main(int argc, char** argv) {
        absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root).empty())) {
     open_spiel::SpielFatalError(
         "PPO pilot requires both input archive and fresh output root");
+  }
+  if (vrpo_ppo_continuation &&
+      (absl::GetFlag(FLAGS_vrpo_ppo_continuation_registration_id).empty() ||
+       absl::GetFlag(FLAGS_vrpo_ppo_continuation_evidence_root).empty())) {
+    open_spiel::SpielFatalError(
+        "PPO continuation requires registration, evidence, and fresh output roots");
   }
   if (vrpo_schedule_screen) {
     std::string resource_error;
@@ -5882,6 +5912,18 @@ int main(int argc, char** argv) {
                                        &resource_error)) {
       open_spiel::SpielFatalError(
           "PPO pilot resource/deadline gate failed: " + resource_error);
+    }
+  }
+  if (vrpo_ppo_continuation) {
+    std::string resource_error;
+    if (!open_spiel::vrpo_ppo_pilot_internal::CheckFreeSpaceBeforeStart(
+            absl::GetFlag(FLAGS_vrpo_ppo_continuation_output_root),
+            &resource_error) ||
+        !vrpo_ppo_continuation_deadline.Check(
+            "before source/model load", &resource_error)) {
+      open_spiel::SpielFatalError(
+          "PPO continuation resource/deadline gate failed: " +
+          resource_error);
     }
   }
   if (numerical_parity) {
@@ -6431,9 +6473,10 @@ int main(int argc, char** argv) {
         "Raw-PPO numerical parity requires CUDA: without it the rollout side "
         "does not execute BF16 autocast and cannot test the registered gate.");
   }
-  if ((vrpo_schedule_screen || vrpo_ppo_pilot) && !device.is_cuda()) {
+  if ((vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) &&
+      !device.is_cuda()) {
     SpielFatalError(
-        "VRPO schedule screen and PPO pilot require a checked CUDA runtime device");
+        "VRPO schedule screen, PPO pilot, and PPO continuation require CUDA");
   }
   open_spiel::PpoNumericalParitySourceProvenance
       parity_source_provenance;
@@ -6445,6 +6488,10 @@ int main(int argc, char** argv) {
   open_spiel::VrpoPpoPilotStartupConfig vrpo_ppo_pilot_preflight;
   open_spiel::VrpoExpandedArchiveIdentity
       vrpo_ppo_pilot_preloaded_input_identity;
+  open_spiel::VrpoPhase4eSourceIdentity
+      vrpo_ppo_continuation_source_identity;
+  open_spiel::VrpoPpoContinuationStartupConfig
+      vrpo_ppo_continuation_preflight;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -6562,6 +6609,59 @@ int main(int argc, char** argv) {
     vrpo_ppo_pilot_preflight.executed_binary_sha256 = binary_sha256;
     vrpo_ppo_pilot_preflight.executed_binary_size = binary_size;
   }
+  if (vrpo_ppo_continuation) {
+    std::string source_error;
+    if (absl::GetFlag(FLAGS_init_mode) != "vrpo_ppo_continuation" ||
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_profile) !=
+            open_spiel::kVrpoPpoContinuationProfile ||
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_registration_id) !=
+            open_spiel::kVrpoPpoContinuationRegistrationId ||
+        absl::GetFlag(FLAGS_seed) != static_cast<int>(
+            open_spiel::kVrpoPpoContinuationBaseSeed) ||
+        absl::GetFlag(FLAGS_start_episode_id) !=
+            open_spiel::kVrpoPpoContinuationStartEpisodeId ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoPpoContinuationNewUpdates) {
+      SpielFatalError(
+          "PPO continuation compiled profile/registration/seed/range rejected before model construction");
+    }
+    if (!open_spiel::LoadVrpoPpoContinuationSourceIdentity(
+            absl::GetFlag(FLAGS_vrpo_ppo_continuation_source_root),
+            absl::GetFlag(FLAGS_vrpo_ppo_continuation_source_sha256),
+            &vrpo_ppo_continuation_source_identity, &source_error) ||
+        !vrpo_ppo_continuation_deadline.Check(
+            "after continuation source identity", &source_error)) {
+      SpielFatalError("PPO continuation source identity rejected: " +
+                      source_error);
+    }
+    vrpo_ppo_continuation_preflight.output_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_output_root);
+    vrpo_ppo_continuation_preflight.evidence_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_evidence_root);
+    if (!open_spiel::vrpo_ppo_continuation_internal::ValidatePriorSemantics(
+            vrpo_ppo_continuation_preflight.evidence_root,
+            &vrpo_ppo_continuation_preflight.prior, &source_error)) {
+      SpielFatalError(
+          "PPO continuation immutable pilot/confirmation chain rejected before model construction: " +
+          source_error);
+    }
+    std::error_code binary_ec;
+    const auto binary_path =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    size_t binary_size = 0;
+    const std::string binary_sha256 = binary_ec || binary_path.empty()
+        ? std::string()
+        : open_spiel::ComputeFileSHA256(binary_path.string(), &binary_size);
+    if (binary_sha256 !=
+            absl::GetFlag(FLAGS_vrpo_ppo_continuation_binary_sha256) ||
+        static_cast<int64_t>(binary_size) !=
+            absl::GetFlag(FLAGS_vrpo_ppo_continuation_binary_size)) {
+      SpielFatalError(
+          "PPO continuation executed binary identity mismatch before model construction");
+    }
+    vrpo_ppo_continuation_preflight.executed_binary_sha256 = binary_sha256;
+    vrpo_ppo_continuation_preflight.executed_binary_size = binary_size;
+  }
 
   // PWO-5 section 7.2 / Appendix A.1.
   //
@@ -6669,6 +6769,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
   if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
+      !vrpo_ppo_continuation &&
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
@@ -6864,6 +6965,15 @@ int main(int argc, char** argv) {
   open_spiel::VrpoExpandedArchiveIdentity vrpo_ppo_pilot_input_identity;
   open_spiel::VrpoPpoPilotStartupConfig vrpo_ppo_pilot_startup;
   open_spiel::VrpoPpoPilotState vrpo_ppo_pilot_state;
+  std::shared_ptr<open_spiel::DuneVrpoQNetImpl>
+      vrpo_ppo_continuation_q;
+  std::unique_ptr<torch::optim::AdamW>
+      vrpo_ppo_continuation_actor_optimizer;
+  open_spiel::VrpoPhase4ManifestBinding vrpo_ppo_continuation_binding;
+  open_spiel::VrpoExpandedExpectedLayout vrpo_ppo_continuation_layout;
+  open_spiel::VrpoPpoContinuationStartupConfig
+      vrpo_ppo_continuation_startup;
+  open_spiel::VrpoPpoContinuationState vrpo_ppo_continuation_state;
 
   // WO-PERF-TIMING. Enforced HERE, at startup, because FLAGS_pipeline is
   // defined in this TU and validating at the first update would waste a whole
@@ -7425,6 +7535,165 @@ int main(int argc, char** argv) {
       SpielFatalError("PPO pilot source/init failed: " + pilot_error);
     }
     next_episode_id.store(vrpo_ppo_pilot_startup.start_episode_id);
+    total_env_steps.store(0);
+    start_update = 1;
+  } else if (vrpo_ppo_continuation) {
+    if (init_mode != "vrpo_ppo_continuation" ||
+        absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        !absl::GetFlag(FLAGS_artifact_manifest).empty() ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoPpoContinuationNewUpdates ||
+        absl::GetFlag(FLAGS_ppo_update_epochs) !=
+            open_spiel::kVrpoPpoContinuationActorEpochs ||
+        absl::GetFlag(FLAGS_learning_rate) !=
+            open_spiel::kVrpoPpoContinuationLearningRate ||
+        absl::GetFlag(FLAGS_anneal_lr)) {
+      SpielFatalError(
+          "PPO continuation requires its dedicated production layout and fixed U5-U8 LR5e-6/E1 profile");
+    }
+    std::string continuation_error;
+    vrpo_ppo_continuation_startup = vrpo_ppo_continuation_preflight;
+    vrpo_ppo_continuation_startup.game = absl::GetFlag(FLAGS_game);
+    vrpo_ppo_continuation_startup.init_mode = init_mode;
+    vrpo_ppo_continuation_startup.profile =
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_profile);
+    vrpo_ppo_continuation_startup.registration_id =
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_registration_id);
+    vrpo_ppo_continuation_startup.source_root =
+        absl::GetFlag(FLAGS_vrpo_ppo_continuation_source_root);
+    vrpo_ppo_continuation_startup.source_code_sha256 =
+        vrpo_ppo_continuation_source_identity.combined_sha256;
+    vrpo_ppo_continuation_startup.rollout_games =
+        absl::GetFlag(FLAGS_rollout_games);
+    vrpo_ppo_continuation_startup.threads = absl::GetFlag(FLAGS_threads);
+    vrpo_ppo_continuation_startup.eval_batch_size =
+        absl::GetFlag(FLAGS_eval_batch_size);
+    vrpo_ppo_continuation_startup.eval_timeout_ms =
+        absl::GetFlag(FLAGS_eval_timeout_ms);
+    vrpo_ppo_continuation_startup.evaluator_device_synchronize =
+        absl::GetFlag(FLAGS_evaluator_device_synchronize);
+    vrpo_ppo_continuation_startup.deterministic_rollout_eval =
+        absl::GetFlag(FLAGS_deterministic_rollout_eval);
+    vrpo_ppo_continuation_startup.seed_scheme_version =
+        absl::GetFlag(FLAGS_seed_scheme_version);
+    vrpo_ppo_continuation_startup.runtime_device_is_cuda = device.is_cuda();
+    vrpo_ppo_continuation_startup.runtime_device_index =
+        device.has_index() ? device.index() : c10::cuda::current_device();
+    vrpo_ppo_continuation_startup.one_gpu_process = device.is_cuda() &&
+        vrpo_ppo_continuation_startup.runtime_device_index >= 0;
+    vrpo_ppo_continuation_startup.runtime_process_id =
+        static_cast<int64_t>(::getpid());
+    vrpo_ppo_continuation_startup.base_seed =
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_seed));
+    vrpo_ppo_continuation_startup.start_episode_id =
+        absl::GetFlag(FLAGS_start_episode_id);
+    vrpo_ppo_continuation_startup.diagnostics_only =
+        absl::GetFlag(FLAGS_diagnostics_only);
+    vrpo_ppo_continuation_startup.rollout_amp =
+        absl::GetFlag(FLAGS_rollout_amp);
+    vrpo_ppo_continuation_startup.train_amp =
+        absl::GetFlag(FLAGS_train_amp);
+    vrpo_ppo_continuation_startup.allow_tf32 =
+        absl::GetFlag(FLAGS_allow_tf32);
+    vrpo_ppo_continuation_startup.pipeline = absl::GetFlag(FLAGS_pipeline);
+    vrpo_ppo_continuation_startup.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    vrpo_ppo_continuation_startup.search_pi_mode =
+        absl::GetFlag(FLAGS_search_pi_mode);
+    vrpo_ppo_continuation_startup.train_value_only =
+        absl::GetFlag(FLAGS_train_value_only);
+    vrpo_ppo_continuation_startup.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    vrpo_ppo_continuation_startup.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    vrpo_ppo_continuation_startup.ordinary_checkpoint_writes_enabled =
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    vrpo_ppo_continuation_startup.anneal_lr =
+        absl::GetFlag(FLAGS_anneal_lr);
+    vrpo_ppo_continuation_startup.learning_rate =
+        absl::GetFlag(FLAGS_learning_rate);
+    vrpo_ppo_continuation_startup.ppo_update_epochs =
+        absl::GetFlag(FLAGS_ppo_update_epochs);
+    vrpo_ppo_continuation_startup.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    vrpo_ppo_continuation_startup.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    vrpo_ppo_continuation_startup.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    vrpo_ppo_continuation_startup.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    vrpo_ppo_continuation_startup.reward_scale =
+        absl::GetFlag(FLAGS_reward_scale);
+    vrpo_ppo_continuation_startup.gamma = absl::GetFlag(FLAGS_gamma);
+    vrpo_ppo_continuation_startup.lambda =
+        absl::GetFlag(FLAGS_gae_lambda);
+    vrpo_ppo_continuation_startup.logit_cap =
+        absl::GetFlag(FLAGS_logit_cap);
+    vrpo_ppo_continuation_startup.ppo_minibatches =
+        open_spiel::kVrpoTrainingMinibatchesPerEpoch;
+    vrpo_ppo_continuation_startup.ppo_minibatch_size =
+        absl::GetFlag(FLAGS_ppo_minibatch_size);
+    vrpo_ppo_continuation_startup.clip_epsilon =
+        absl::GetFlag(FLAGS_ppo_clip_epsilon);
+    vrpo_ppo_continuation_startup.entropy_coefficient =
+        absl::GetFlag(FLAGS_entropy_coef);
+    vrpo_ppo_continuation_startup.value_coefficient =
+        absl::GetFlag(FLAGS_value_coef);
+    vrpo_ppo_continuation_startup.gradient_clip_norm =
+        absl::GetFlag(FLAGS_grad_clip_norm);
+    vrpo_ppo_continuation_startup.normalize_advantages =
+        absl::GetFlag(FLAGS_normalize_advantages);
+    vrpo_ppo_continuation_startup.clip_value_loss =
+        absl::GetFlag(FLAGS_ppo_clip_value_loss);
+    if (!open_spiel::ValidateVrpoPpoContinuationStartupConfig(
+            vrpo_ppo_continuation_startup, &continuation_error)) {
+      SpielFatalError("PPO continuation startup rejected: " +
+                      continuation_error);
+    }
+    vrpo_ppo_continuation_layout.label =
+        "production_dune_vrpo_layout_v1";
+    vrpo_ppo_continuation_layout.test_fixture = false;
+    vrpo_ppo_continuation_layout.actor_observation_dim = obs_size;
+    vrpo_ppo_continuation_layout.actor_hidden_dim = 2048;
+    vrpo_ppo_continuation_layout.actor_action_dim = action_size;
+    vrpo_ppo_continuation_layout.actor_residual_blocks = 8;
+    if (obs_size != 5580 || action_size != 2391) {
+      SpielFatalError("PPO continuation permits the production Dune layout only");
+    }
+    vrpo_ppo_continuation_binding.source_actor_model_sha256 =
+        "68febee771509f88446286cc50983afd22d64f7772f6866def77bafd4aae36d2";
+    vrpo_ppo_continuation_binding.source_actor_manifest_sha256 =
+        "95df08e8c9ccdba0a402b610474022fa22374215842f7b0d6243ce09359b4512";
+    vrpo_ppo_continuation_binding.experiment_uuid =
+        "7b7b58a7-297c-4d98-8bb2-5f8f1b0a4c30";
+    vrpo_ppo_continuation_binding.q_init_seed =
+        open_spiel::kVrpoPpoContinuationQSeed;
+    vrpo_ppo_continuation_binding.base_seed =
+        open_spiel::kVrpoPpoContinuationBaseSeed;
+    vrpo_ppo_continuation_binding.start_episode_id =
+        open_spiel::kVrpoPpoContinuationStartEpisodeId;
+    vrpo_ppo_continuation_binding.end_episode_id_inclusive =
+        open_spiel::kVrpoPpoContinuationEndEpisodeIdInclusive;
+    open_spiel::ResetVrpoQInstrumentation();
+    open_spiel::ResetVrpoScheduleQTargetInstrumentation();
+    vrpo_ppo_continuation_q =
+        std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+            open_spiel::kVrpoPpoContinuationQSeed);
+    vrpo_ppo_continuation_q->to(device, torch::kFloat32);
+    if (!open_spiel::LoadAndInitializeVrpoPpoContinuation(
+            vrpo_ppo_continuation_startup, training_model,
+            vrpo_ppo_continuation_q, device,
+            vrpo_ppo_continuation_deadline,
+            &vrpo_ppo_continuation_actor_optimizer,
+            &vrpo_ppo_continuation_state, &continuation_error)) {
+      SpielFatalError("PPO continuation strict U4 load/init failed: " +
+                      continuation_error);
+    }
+    next_episode_id.store(vrpo_ppo_continuation_startup.start_episode_id);
     total_env_steps.store(0);
     start_update = 1;
   } else if (init_mode == "diagnostic") {
@@ -8042,7 +8311,8 @@ int main(int argc, char** argv) {
     SpielFatalError("Unsupported init_mode: " + init_mode +
                     " (expected random, checkpoint, bootstrap, "
                     "validate_legacy, diagnostic, vrpo_one_update, or "
-                    "vrpo_schedule_screen, or vrpo_ppo_pilot)");
+                    "vrpo_schedule_screen, vrpo_ppo_pilot, or "
+                    "vrpo_ppo_continuation)");
   }
 
   std::shared_mutex sync_mutex;
@@ -9634,11 +9904,11 @@ int main(int argc, char** argv) {
   // Collect first rollout synchronously.
   const std::string parity_model_hash_before =
       (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
-       vrpo_ppo_pilot)
+       vrpo_ppo_pilot || vrpo_ppo_continuation)
           ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
       (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
-       vrpo_ppo_pilot)
+       vrpo_ppo_pilot || vrpo_ppo_continuation)
           ? open_spiel::HashAllModelState(inference_model) : "";
   const bool parity_tf32_cublas_before =
       (numerical_parity || vrpo_diagnostics) &&
@@ -9650,13 +9920,16 @@ int main(int argc, char** argv) {
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
   open_spiel::VrpoCapturedEpisodeBuffer vrpo_capture_buffer;
-  if (vrpo_schedule_screen || vrpo_ppo_pilot) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) {
     std::string deadline_error;
     const bool deadline_ok = vrpo_schedule_screen
         ? vrpo_schedule_deadline.Check("before rollout collection",
                                        &deadline_error)
-        : vrpo_ppo_pilot_deadline.Check("before rollout collection",
-                                        &deadline_error);
+        : vrpo_ppo_pilot
+            ? vrpo_ppo_pilot_deadline.Check("before rollout collection",
+                                            &deadline_error)
+            : vrpo_ppo_continuation_deadline.Check(
+                  "before rollout collection", &deadline_error);
     if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
@@ -9665,16 +9938,19 @@ int main(int argc, char** argv) {
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
       (vrpo_diagnostics || vrpo_one_update || vrpo_schedule_screen ||
-       vrpo_ppo_pilot)
+       vrpo_ppo_pilot || vrpo_ppo_continuation)
           ? &vrpo_capture_buffer
           : nullptr);
-  if (vrpo_schedule_screen || vrpo_ppo_pilot) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) {
     std::string deadline_error;
     const bool deadline_ok = vrpo_schedule_screen
         ? vrpo_schedule_deadline.Check("after rollout collection",
                                        &deadline_error)
-        : vrpo_ppo_pilot_deadline.Check("after rollout collection",
-                                        &deadline_error);
+        : vrpo_ppo_pilot
+            ? vrpo_ppo_pilot_deadline.Check("after rollout collection",
+                                            &deadline_error)
+            : vrpo_ppo_continuation_deadline.Check(
+                  "after rollout collection", &deadline_error);
     if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
@@ -10004,6 +10280,164 @@ int main(int argc, char** argv) {
       }
     }
     SpielFatalError("PPO pilot loop exited without a terminal disposition");
+  }
+  if (vrpo_ppo_continuation) {
+    std::vector<open_spiel::VrpoCapturedEpisode> captured =
+        vrpo_capture_buffer.TakeSorted();
+    std::string collection_actor_hash =
+        vrpo_ppo_continuation_state.prior_actor_values_sha256;
+    std::string first_actor_hash;
+    std::string first_inference_hash;
+    std::string continuation_error;
+    if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+            *training_model, "", &first_actor_hash, &continuation_error) ||
+        !open_spiel::vrpo_training_internal::ModuleValueSha256(
+            *inference_model, "", &first_inference_hash,
+            &continuation_error) ||
+        first_actor_hash != collection_actor_hash ||
+        first_inference_hash != collection_actor_hash) {
+      SpielFatalError(
+          "PPO continuation first collection actor binding failed: " +
+          continuation_error);
+    }
+    for (int global_update =
+             open_spiel::kVrpoPpoContinuationFirstGlobalUpdate;
+         global_update <= open_spiel::kVrpoPpoContinuationLastGlobalUpdate;
+         ++global_update) {
+      const int local_update = global_update -
+          open_spiel::kVrpoPpoContinuationFirstGlobalUpdate + 1;
+      const uint64_t expected_start =
+          vrpo_ppo_continuation_startup.start_episode_id +
+          static_cast<uint64_t>(local_update - 1) *
+              open_spiel::kVrpoPpoContinuationGamesPerUpdate;
+      std::vector<open_spiel::VrpoTrainingEpisode> training_episodes;
+      open_spiel::VrpoPhase4ePairingStats pairing;
+      if (!current_collect.episode_ids_unique ||
+          current_collect.games != static_cast<uint64_t>(
+              open_spiel::kVrpoPpoContinuationGamesPerUpdate) ||
+          !open_spiel::BuildVrpoPhase4eTrainingEpisodes(
+              captured, current_collect.rollout, expected_start,
+              open_spiel::kVrpoPpoContinuationGamesPerUpdate,
+              &training_episodes, &pairing, &continuation_error)) {
+        vrpo_ppo_continuation_state.had_failure = true;
+        vrpo_ppo_continuation_state.failure_reason =
+            "complete-game capture/pairing failed: " + continuation_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoContinuationGlobalResult(
+            vrpo_ppo_continuation_startup,
+            vrpo_ppo_continuation_state, *training_model,
+            *vrpo_ppo_continuation_actor_optimizer,
+            vrpo_ppo_continuation_deadline, &invalid_result, &status_error);
+        SpielFatalError(
+            "PPO continuation capture/pairing failed: " +
+            continuation_error);
+      }
+      open_spiel::VrpoPpoContinuationDisposition disposition;
+      open_spiel::json::Object update_result;
+      if (!open_spiel::WriteVrpoPpoContinuationUpdate(
+              vrpo_ppo_continuation_startup,
+              vrpo_ppo_continuation_binding,
+              vrpo_ppo_continuation_layout, training_episodes, pairing,
+              collection_actor_hash, training_model,
+              vrpo_ppo_continuation_q,
+              *vrpo_ppo_continuation_actor_optimizer, device,
+              vrpo_ppo_continuation_deadline, global_update,
+              open_spiel::VrpoPpoContinuationFailurePoint::kNone,
+              &vrpo_ppo_continuation_state, &disposition, &update_result,
+              &continuation_error)) {
+        vrpo_ppo_continuation_state.had_failure = true;
+        vrpo_ppo_continuation_state.failure_reason =
+            "update transaction failed: " + continuation_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoContinuationGlobalResult(
+            vrpo_ppo_continuation_startup,
+            vrpo_ppo_continuation_state, *training_model,
+            *vrpo_ppo_continuation_actor_optimizer,
+            vrpo_ppo_continuation_deadline, &invalid_result, &status_error);
+        SpielFatalError("PPO continuation transaction failed: " +
+                        continuation_error);
+      }
+      if (disposition ==
+              open_spiel::VrpoPpoContinuationDisposition::kEarlyStop ||
+          disposition ==
+              open_spiel::VrpoPpoContinuationDisposition::kComplete) {
+        open_spiel::json::Object continuation_result;
+        if (!open_spiel::WriteVrpoPpoContinuationGlobalResult(
+                vrpo_ppo_continuation_startup,
+                vrpo_ppo_continuation_state, *training_model,
+                *vrpo_ppo_continuation_actor_optimizer,
+                vrpo_ppo_continuation_deadline, &continuation_result,
+                &continuation_error)) {
+          SpielFatalError("PPO continuation terminal status failed: " +
+                          continuation_error);
+        }
+        std::cout << "PPO continuation "
+                  << continuation_result.at("classification").GetString()
+                  << ": " << vrpo_ppo_continuation_startup.output_root
+                  << "\n";
+        return 0;
+      }
+
+      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+      std::string inference_hash;
+      if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *training_model, "", &collection_actor_hash,
+              &continuation_error) ||
+          !open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *inference_model, "", &inference_hash,
+              &continuation_error) ||
+          inference_hash != collection_actor_hash ||
+          !vrpo_ppo_continuation_deadline.Check(
+              "before next rollout collection", &continuation_error)) {
+        vrpo_ppo_continuation_state.had_failure = true;
+        vrpo_ppo_continuation_state.failure_reason =
+            "inference synchronization failed: " + continuation_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoContinuationGlobalResult(
+            vrpo_ppo_continuation_startup,
+            vrpo_ppo_continuation_state, *training_model,
+            *vrpo_ppo_continuation_actor_optimizer,
+            vrpo_ppo_continuation_deadline, &invalid_result, &status_error);
+        SpielFatalError("PPO continuation inference sync failed: " +
+                        continuation_error);
+      }
+      open_spiel::VrpoCapturedEpisodeBuffer next_capture;
+      current_collect = open_spiel::CollectRollout(
+          game.get(), evaluator, obs_size, &total_env_steps, num_threads,
+          &next_episode_id, rollout_games, reward_lambda, &next_capture);
+      captured = next_capture.TakeSorted();
+      std::string actor_after_collection;
+      std::string inference_after_collection;
+      if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *training_model, "", &actor_after_collection,
+              &continuation_error) ||
+          !open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *inference_model, "", &inference_after_collection,
+              &continuation_error) ||
+          actor_after_collection != collection_actor_hash ||
+          inference_after_collection != collection_actor_hash ||
+          !vrpo_ppo_continuation_deadline.Check(
+              "after next rollout collection", &continuation_error)) {
+        vrpo_ppo_continuation_state.had_failure = true;
+        vrpo_ppo_continuation_state.failure_reason =
+            "collection mutated actor or exceeded deadline: " +
+            continuation_error;
+        open_spiel::json::Object invalid_result;
+        std::string status_error;
+        open_spiel::WriteVrpoPpoContinuationGlobalResult(
+            vrpo_ppo_continuation_startup,
+            vrpo_ppo_continuation_state, *training_model,
+            *vrpo_ppo_continuation_actor_optimizer,
+            vrpo_ppo_continuation_deadline, &invalid_result, &status_error);
+        SpielFatalError("PPO continuation collection failed: " +
+                        continuation_error);
+      }
+    }
+    SpielFatalError(
+        "PPO continuation loop exited without terminal disposition");
   }
   if (numerical_parity) {
     const auto batch_evaluator =

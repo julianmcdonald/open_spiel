@@ -54,6 +54,7 @@
 #include "dune_vrpo_checkpoint.h"
 #include "dune_vrpo_phase4e.h"
 #include "dune_vrpo_ppo_pilot.h"
+#include "dune_vrpo_ppo_continuation.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_vrpo_training.h"
 #include <chrono>
@@ -7640,6 +7641,553 @@ void TestVrpoPpoPilotContractsContinuationAndRollbackLive() {
     ResetVrpoScheduleQTargetInstrumentation();
   } TEST_END();
 }
+
+VrpoPpoContinuationStartupConfig MakeTinyVrpoPpoContinuationStartup(
+    const std::filesystem::path& output,
+    const std::filesystem::path& evidence_root,
+    const VrpoPpoContinuationPriorEvidence& prior,
+    uint64_t first_episode_id) {
+  VrpoPpoContinuationStartupConfig startup;
+  startup.game = "dune_imperium";
+  startup.init_mode = "vrpo_ppo_continuation";
+  startup.profile = kVrpoPpoContinuationProfile;
+  startup.registration_id = "ppo-continuation-test";
+  startup.output_root = output;
+  startup.evidence_root = evidence_root;
+  startup.source_root = "/source";
+  startup.source_code_sha256 = std::string(64, '1');
+  startup.executed_binary_sha256 = std::string(64, '2');
+  startup.executed_binary_size = 1;
+  startup.prior = prior;
+  startup.rollout_games = kVrpoPpoContinuationGamesPerUpdate;
+  startup.threads = 8;
+  startup.eval_batch_size = 64;
+  startup.eval_timeout_ms = 2;
+  startup.evaluator_device_synchronize = true;
+  startup.seed_scheme_version = 2;
+  startup.runtime_device_is_cuda = true;
+  startup.runtime_device_index = 0;
+  startup.one_gpu_process = true;
+  startup.runtime_process_id = ::getpid();
+  startup.base_seed = 8304001;
+  startup.start_episode_id = first_episode_id;
+  startup.allow_tf32 = true;
+  startup.learning_rate = kVrpoPpoContinuationLearningRate;
+  startup.ppo_update_epochs = kVrpoPpoContinuationActorEpochs;
+  startup.reward_scale = 4.0;
+  startup.gamma = 1.0;
+  startup.lambda = 1.0;
+  startup.logit_cap = 10.0;
+  startup.ppo_minibatches = kVrpoTrainingMinibatchesPerEpoch;
+  startup.ppo_minibatch_size = 2048;
+  startup.clip_epsilon = kVrpoTrainingClipEpsilon;
+  startup.entropy_coefficient = kVrpoTrainingEntropyCoefficient;
+  startup.value_coefficient = kVrpoTrainingValueCoefficient;
+  startup.gradient_clip_norm = kVrpoTrainingGradientClipNorm;
+  startup.normalize_advantages = true;
+  startup.clip_value_loss = true;
+  return startup;
+}
+
+void TestVrpoPpoContinuationU5U8ContractsAndRollbackLive() {
+  TEST_BEGIN("VRPO PPO U5-U8 continuation strict load, steps, rollback, and authorization") {
+    CHECK_EQ(std::string(kVrpoPpoContinuationProfile),
+             "ppo_cap10_lr5e6_continue4_u5_u8_v1");
+    CHECK_EQ(std::string(kVrpoPpoContinuationRegistrationId),
+             "VRPO_U15828_PPO_CAP10_LR5E6_CONTINUE4_U5_U8_20260902");
+    CHECK_EQ(kVrpoPpoContinuationFirstGlobalUpdate, 5);
+    CHECK_EQ(kVrpoPpoContinuationLastGlobalUpdate, 8);
+    CHECK_EQ(kVrpoPpoContinuationPriorActorSteps, 64);
+    CHECK_EQ(kVrpoPpoContinuationFinalActorSteps, 128);
+    CHECK_EQ(VrpoPpoContinuationCanonicalEvidenceFiles().size(), 21);
+    CHECK_EQ(kVrpoPpoContinuationStartEpisodeId, uint64_t{1200200064});
+    CHECK_EQ(kVrpoPpoContinuationEndEpisodeIdInclusive,
+             uint64_t{1200200127});
+    {
+      ResetVrpoQInstrumentation();
+      auto production_q =
+          std::make_shared<DuneVrpoQNetImpl>(kVrpoPpoContinuationQSeed);
+      const torch::Device q_device = torch::cuda::is_available()
+          ? torch::Device(torch::kCUDA, 0)
+          : torch::Device(torch::kCPU);
+      production_q->to(q_device, torch::kFloat32);
+      std::string production_q_hash;
+      std::string production_q_error;
+      UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+          *production_q, "", &production_q_hash, &production_q_error));
+      CHECK_EQ(production_q_hash,
+               std::string(kVrpoPpoContinuationSourceQValuesSha256));
+      CHECK_EQ(VrpoQConstructorCalls(), 1);
+      CHECK_EQ(VrpoQForwardCheckedCalls(), 0);
+    }
+
+    const uint64_t first_episode_id = 1000300064;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_ppo_continuation_test_" +
+         std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root / "prior");
+    std::string error;
+    const auto* arm = FindCanonicalVrpoPhase4Arm("PPO_CAP10");
+    UTILS_CHECK(arm != nullptr);
+    auto source = MakeTinyVrpoPhase4eFixture(first_episode_id);
+    auto prior_actor = source.actor;
+    std::unique_ptr<torch::optim::AdamW> prior_optimizer;
+    UTILS_CHECK(MakeVrpoScheduleFreshActorOptimizer(
+        *prior_actor, kVrpoPpoContinuationLearningRate, &prior_optimizer,
+        &error));
+    for (auto& item : prior_optimizer->state()) {
+      auto* state = dynamic_cast<torch::optim::AdamWParamState*>(
+          item.second.get());
+      UTILS_CHECK(state != nullptr);
+      state->step(kVrpoPpoContinuationPriorActorSteps);
+    }
+    const auto prior_actor_path = root / "prior/actor_model.pt";
+    const auto prior_optimizer_path = root / "prior/actor_optimizer.pt";
+    torch::save(prior_actor, prior_actor_path.string());
+    torch::save(*prior_optimizer, prior_optimizer_path.string());
+
+    auto anchor_episodes = MakeTinyVrpoPhase4eEpisodes(
+        *prior_actor, 10.0, first_episode_id - 64);
+    std::string anchor_bytes;
+    VrpoScheduleCorpusIdentity anchor_identity;
+    UTILS_CHECK(EncodeVrpoScheduleActorCorpus(
+        anchor_episodes, &anchor_bytes, &anchor_identity, &error));
+    VrpoPpoContinuationPriorEvidence prior;
+    prior.observations.push_back(
+        {"fixture", "fixture", std::string(64, 'a'),
+         std::string(64, 'a'), std::string(64, 'a'), 1, true});
+    for (int update = 1; update <= 4; ++update) {
+      json::Object summary;
+      summary["update"] = static_cast<int64_t>(update);
+      summary["actor_optimizer_step_after"] =
+          static_cast<int64_t>(update * 16);
+      prior.prior_update_summaries.emplace_back(std::move(summary));
+    }
+    prior.frozen_update1_episodes = anchor_episodes;
+    prior.frozen_update1_payload_sha256 = anchor_identity.payload_sha256;
+    prior.actor_path = prior_actor_path;
+    prior.optimizer_path = prior_optimizer_path;
+    auto base_startup = MakeTinyVrpoPpoContinuationStartup(
+        root / "unused", root, prior, first_episode_id);
+    UTILS_CHECK(ValidateVrpoPpoContinuationStartupConfig(
+        base_startup, &error, /*test_fixture=*/true));
+    auto bad_start = base_startup;
+    ++bad_start.start_episode_id;
+    UTILS_CHECK(ValidateVrpoPpoContinuationStartupConfig(
+        bad_start, &error, /*test_fixture=*/true));
+    bad_start.learning_rate = 1.0e-5;
+    UTILS_CHECK(!ValidateVrpoPpoContinuationStartupConfig(
+        bad_start, &error, /*test_fixture=*/true));
+
+    auto deadline = VrpoPpoContinuationDeadline::Start(
+        std::chrono::steady_clock::now(), std::chrono::minutes(5));
+    for (const std::string& name : {"preexisting_root", "toctou_collision"}) {
+      auto startup = MakeTinyVrpoPpoContinuationStartup(
+          root / name, root, prior, first_episode_id);
+      if (name == "toctou_collision") {
+        UTILS_CHECK(ValidateVrpoPpoContinuationStartupConfig(
+            startup, &error, /*test_fixture=*/true));
+      }
+      std::filesystem::create_directory(startup.output_root);
+      const auto sentinel = startup.output_root / "sentinel";
+      {
+        std::ofstream stream(sentinel);
+        stream << "root-owned-by-caller\n";
+      }
+      if (name == "preexisting_root") {
+        UTILS_CHECK(!ValidateVrpoPpoContinuationStartupConfig(
+            startup, &error, /*test_fixture=*/true));
+      }
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      auto q = std::make_shared<DuneVrpoQNetImpl>(2026090210);
+      VrpoPpoContinuationState state;
+      UTILS_CHECK(!InitializeVrpoPpoContinuationFromLoadedState(
+          startup, prior_actor, q, *prior_optimizer, torch::kCPU, deadline,
+          &state, &error, /*test_fixture=*/true));
+      UTILS_CHECK(std::filesystem::is_regular_file(sentinel));
+      std::filesystem::remove_all(startup.output_root, ec);
+    }
+    {
+      auto startup = MakeTinyVrpoPpoContinuationStartup(
+          root / "device_mismatch", root, prior,
+          kVrpoPpoContinuationStartEpisodeId);
+      startup.registration_id = kVrpoPpoContinuationRegistrationId;
+      startup.base_seed = kVrpoPpoContinuationBaseSeed;
+      startup.runtime_device_index = 1;
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      auto q = std::make_shared<DuneVrpoQNetImpl>(2026090210);
+      VrpoPpoContinuationState state;
+      UTILS_CHECK(!InitializeVrpoPpoContinuationFromLoadedState(
+          startup, prior_actor, q, *prior_optimizer, torch::kCPU, deadline,
+          &state, &error, /*test_fixture=*/false));
+      UTILS_CHECK(!std::filesystem::exists(startup.output_root));
+    }
+    auto run_fixture = [&](const std::string& name,
+                           std::shared_ptr<SharedDunePolicyValueNetImpl>* actor,
+                           std::shared_ptr<DuneVrpoQNetImpl>* q,
+                           std::unique_ptr<torch::optim::AdamW>* optimizer,
+                           VrpoPpoContinuationState* state,
+                           VrpoPpoContinuationStartupConfig* startup) {
+      *startup = MakeTinyVrpoPpoContinuationStartup(
+          root / name, root, prior, first_episode_id);
+      *actor = std::make_shared<SharedDunePolicyValueNetImpl>(5, 8, 6, 1,
+                                                              false);
+      ResetVrpoQInstrumentation();
+      ResetVrpoScheduleQTargetInstrumentation();
+      *q = std::make_shared<DuneVrpoQNetImpl>(2026090211);
+      UTILS_CHECK(LoadAndInitializeVrpoPpoContinuation(
+          *startup, *actor, *q, torch::kCPU, deadline, optimizer, state,
+          &error, /*test_fixture=*/true));
+      CHECK_EQ(state->live_actor_optimizer_steps, 64);
+      std::string optimizer_hash;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          **optimizer, **actor, 64, &optimizer_hash, &error));
+    };
+
+    // Full U5-U8 chain proves the exact 80/96/112/128 Adam continuation and
+    // the internally derived eight-total-update authorization.
+    {
+      std::shared_ptr<SharedDunePolicyValueNetImpl> actor;
+      std::shared_ptr<DuneVrpoQNetImpl> q;
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      VrpoPpoContinuationState state;
+      VrpoPpoContinuationStartupConfig startup;
+      run_fixture("complete", &actor, &q, &optimizer, &state, &startup);
+      {
+        const auto preexisting_temp = startup.output_root / ".update_5.tmp";
+        const auto temp_sentinel = preexisting_temp / "sentinel";
+        std::filesystem::create_directory(preexisting_temp);
+        {
+          std::ofstream stream(temp_sentinel);
+          stream << "owned-by-caller\n";
+        }
+        auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0, first_episode_id);
+        auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+        std::string collection_hash;
+        UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+            *actor, "", &collection_hash, &error));
+        VrpoPpoContinuationDisposition disposition;
+        json::Object result;
+        UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+            startup, source.binding, source.layout, episodes, pairing,
+            collection_hash, actor, q, *optimizer, torch::kCPU, deadline, 5,
+            VrpoPpoContinuationFailurePoint::kNone, &state, &disposition,
+            &result, &error));
+        UTILS_CHECK(std::filesystem::is_regular_file(temp_sentinel));
+        std::filesystem::remove_all(preexisting_temp, ec);
+
+        const auto preexisting_final = startup.output_root / "update_6";
+        const auto final_sentinel = preexisting_final / "sentinel";
+        std::filesystem::create_directory(preexisting_final);
+        {
+          std::ofstream stream(final_sentinel);
+          stream << "owned-by-caller\n";
+        }
+        auto future = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0, first_episode_id + 16);
+        auto future_pairing = MakeTinyVrpoPhase4ePairingStats(future);
+        UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+            startup, source.binding, source.layout, future, future_pairing,
+            collection_hash, actor, q, *optimizer, torch::kCPU, deadline, 6,
+            VrpoPpoContinuationFailurePoint::kNone, &state, &disposition,
+            &result, &error));
+        UTILS_CHECK(std::filesystem::is_regular_file(final_sentinel));
+        std::filesystem::remove_all(preexisting_final, ec);
+      }
+      for (int global_update = 5; global_update <= 8; ++global_update) {
+        const uint64_t update_start = first_episode_id +
+            static_cast<uint64_t>(global_update - 5) * 16;
+        auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0, update_start);
+        auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+        std::string collection_hash;
+        UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+            *actor, "", &collection_hash, &error));
+        if (global_update == 5) {
+          auto shifted = MakeTinyVrpoPhase4eEpisodes(
+              *actor, 10.0, update_start + 1);
+          auto shifted_pairing = MakeTinyVrpoPhase4ePairingStats(shifted);
+          VrpoPpoContinuationDisposition rejected_disposition;
+          json::Object rejected_result;
+          UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+              startup, source.binding, source.layout, shifted,
+              shifted_pairing, collection_hash, actor, q, *optimizer,
+              torch::kCPU, deadline, global_update,
+              VrpoPpoContinuationFailurePoint::kNone, &state,
+              &rejected_disposition, &rejected_result, &error));
+        }
+        VrpoPpoContinuationDisposition disposition;
+        json::Object result;
+        UTILS_CHECK(WriteVrpoPpoContinuationUpdate(
+            startup, source.binding, source.layout, episodes, pairing,
+            collection_hash, actor, q, *optimizer, torch::kCPU, deadline,
+            global_update,
+            VrpoPpoContinuationFailurePoint::kForceHealthPassForTest,
+            &state, &disposition, &result, &error));
+        CHECK_EQ(result.at("actor_optimizer_step_after").GetInt(),
+                 global_update * 16);
+        CHECK_EQ(state.live_actor_optimizer_steps, global_update * 16);
+        CHECK_EQ(static_cast<int>(disposition),
+                 static_cast<int>(
+                     global_update == 8
+                         ? VrpoPpoContinuationDisposition::kComplete
+                         : VrpoPpoContinuationDisposition::kContinue));
+        if (global_update == 5) {
+          const auto committed_actor =
+              startup.output_root / "update_5/actor_model.pt";
+          const auto sentinel = startup.output_root / "update_5/sentinel";
+          size_t committed_actor_size = 0;
+          const std::string committed_actor_sha = ComputeFileSHA256(
+              committed_actor.string(), &committed_actor_size);
+          {
+            std::ofstream stream(sentinel);
+            stream << "committed-owned-by-earlier-invocation\n";
+          }
+          VrpoPpoContinuationDisposition duplicate_disposition;
+          json::Object duplicate_result;
+          UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+              startup, source.binding, source.layout, episodes, pairing,
+              collection_hash, actor, q, *optimizer, torch::kCPU, deadline,
+              5, VrpoPpoContinuationFailurePoint::kNone, &state,
+              &duplicate_disposition, &duplicate_result, &error));
+          size_t duplicate_actor_size = 0;
+          CHECK_EQ(ComputeFileSHA256(
+                       committed_actor.string(), &duplicate_actor_size),
+                   committed_actor_sha);
+          CHECK_EQ(duplicate_actor_size, committed_actor_size);
+          UTILS_CHECK(std::filesystem::is_regular_file(sentinel));
+          std::filesystem::remove(sentinel, ec);
+        }
+      }
+      std::string denial;
+      UTILS_CHECK(VrpoPpoContinuationRaw128DesignAuthorization(
+          startup, state, *actor, *optimizer, &denial,
+          /*test_fixture=*/true));
+      auto forged = state;
+      forged.live_actor_optimizer_steps = 127;
+      UTILS_CHECK(!VrpoPpoContinuationRaw128DesignAuthorization(
+          startup, forged, *actor, *optimizer, &denial,
+          /*test_fixture=*/true));
+      forged = state;
+      forged.prior_update_summaries.pop_back();
+      UTILS_CHECK(!VrpoPpoContinuationRaw128DesignAuthorization(
+          startup, forged, *actor, *optimizer, &denial,
+          /*test_fixture=*/true));
+      auto& first_group = optimizer->param_groups().front();
+      auto first_key = first_group.params().front().unsafeGetTensorImpl();
+      auto* first_state = dynamic_cast<torch::optim::AdamWParamState*>(
+          optimizer->state().at(first_key).get());
+      UTILS_CHECK(first_state != nullptr);
+      first_state->step(127);
+      UTILS_CHECK(!VrpoPpoContinuationRaw128DesignAuthorization(
+          startup, state, *actor, *optimizer, &denial,
+          /*test_fixture=*/true));
+      first_state->step(128);
+      const auto checkpoint = startup.output_root / "update_8/actor_model.pt";
+      const auto held = startup.output_root / "update_8/actor_model.pt.held";
+      std::filesystem::rename(checkpoint, held);
+      UTILS_CHECK(!VrpoPpoContinuationRaw128DesignAuthorization(
+          startup, state, *actor, *optimizer, &denial,
+          /*test_fixture=*/true));
+      std::filesystem::rename(held, checkpoint);
+      json::Object global;
+      UTILS_CHECK(WriteVrpoPpoContinuationGlobalResult(
+          startup, state, *actor, *optimizer, deadline, &global, &error,
+          /*test_fixture=*/true));
+      CHECK_EQ(global.at("classification").GetString(),
+               "VALID_EIGHT_TOTAL_UPDATE_PPO_HEALTH_PASS");
+      CHECK_EQ(global.at("total_update_summaries").GetInt(), 8);
+      UTILS_CHECK(global.at("raw128_design_authorized").GetBool());
+      UTILS_CHECK(
+          global.at("optimizer_persisted_across_updates_1_through_8")
+              .GetBool());
+      CHECK_EQ(global.at("all_eight_update_summaries").GetArray().size(), 8);
+      UTILS_CHECK(!global.at("raw_evaluation_launch_authorized").GetBool());
+    }
+
+    // U5 health stop retains its candidate, restores exact U4 actor/Adam, and
+    // makes U6 unreachable.
+    {
+      std::shared_ptr<SharedDunePolicyValueNetImpl> actor;
+      std::shared_ptr<DuneVrpoQNetImpl> q;
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      VrpoPpoContinuationState state;
+      VrpoPpoContinuationStartupConfig startup;
+      run_fixture("u5_stop", &actor, &q, &optimizer, &state, &startup);
+      const std::string actor_before = TinyVrpoModuleHash(*actor);
+      std::string optimizer_before;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 64, &optimizer_before, &error));
+      auto episodes = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id);
+      auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+      VrpoPpoContinuationDisposition disposition;
+      json::Object result;
+      UTILS_CHECK(WriteVrpoPpoContinuationUpdate(
+          startup, source.binding, source.layout, episodes, pairing,
+          actor_before, actor, q, *optimizer, torch::kCPU, deadline, 5,
+          VrpoPpoContinuationFailurePoint::kForceHealthStop, &state,
+          &disposition, &result, &error));
+      CHECK_EQ(TinyVrpoModuleHash(*actor), actor_before);
+      std::string optimizer_after;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 64, &optimizer_after, &error));
+      CHECK_EQ(optimizer_after, optimizer_before);
+      CHECK_EQ(state.live_actor_optimizer_steps, 64);
+      UTILS_CHECK(std::filesystem::exists(
+          startup.output_root / "update_5/actor_model.pt"));
+      auto next = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id + 16);
+      auto next_pairing = MakeTinyVrpoPhase4ePairingStats(next);
+      UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+          startup, source.binding, source.layout, next, next_pairing,
+          actor_before, actor, q, *optimizer, torch::kCPU, deadline, 6,
+          VrpoPpoContinuationFailurePoint::kNone, &state, &disposition,
+          &result, &error));
+      UTILS_CHECK(!std::filesystem::exists(startup.output_root / "update_6"));
+      json::Object global;
+      UTILS_CHECK(WriteVrpoPpoContinuationGlobalResult(
+          startup, state, *actor, *optimizer, deadline, &global, &error,
+          /*test_fixture=*/true));
+      CHECK_EQ(global.at("classification").GetString(),
+               "VALID_EARLY_STOP_HEALTH");
+      UTILS_CHECK(
+          !global.at("optimizer_persisted_across_updates_1_through_8")
+               .GetBool());
+      CHECK_EQ(global.at("available_update_summaries").GetArray().size(), 5);
+      UTILS_CHECK(global.find("all_eight_update_summaries") == global.end());
+      json::Object parsed_global;
+      UTILS_CHECK(vrpo_ppo_continuation_internal::ReadJsonObject(
+          startup.output_root / "CONTINUATION_RESULT.json", &parsed_global,
+          &error));
+      CHECK_EQ(parsed_global.at("classification").GetString(),
+               "VALID_EARLY_STOP_HEALTH");
+      UTILS_CHECK(parsed_global.find("all_eight_update_summaries") ==
+                  parsed_global.end());
+    }
+
+    // A later U6 stop preserves the accepted U5 state while retaining the U6
+    // candidate, proving rollback is to the last accepted continuation state
+    // rather than always to the original U4 input.
+    {
+      std::shared_ptr<SharedDunePolicyValueNetImpl> actor;
+      std::shared_ptr<DuneVrpoQNetImpl> q;
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      VrpoPpoContinuationState state;
+      VrpoPpoContinuationStartupConfig startup;
+      run_fixture("u6_stop", &actor, &q, &optimizer, &state, &startup);
+      std::string accepted_u5_actor;
+      std::string accepted_u5_optimizer;
+      for (int global_update = 5; global_update <= 6; ++global_update) {
+        auto episodes = MakeTinyVrpoPhase4eEpisodes(
+            *actor, 10.0,
+            first_episode_id + static_cast<uint64_t>(global_update - 5) * 16);
+        auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+        std::string collection_hash;
+        UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+            *actor, "", &collection_hash, &error));
+        VrpoPpoContinuationDisposition disposition;
+        json::Object result;
+        UTILS_CHECK(WriteVrpoPpoContinuationUpdate(
+            startup, source.binding, source.layout, episodes, pairing,
+            collection_hash, actor, q, *optimizer, torch::kCPU, deadline,
+            global_update,
+            global_update == 5
+                ? VrpoPpoContinuationFailurePoint::kForceHealthPassForTest
+                : VrpoPpoContinuationFailurePoint::kForceHealthStop,
+            &state, &disposition, &result, &error));
+        if (global_update == 5) {
+          accepted_u5_actor = TinyVrpoModuleHash(*actor);
+          UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+              *optimizer, *actor, 80, &accepted_u5_optimizer, &error));
+        }
+      }
+      CHECK_EQ(TinyVrpoModuleHash(*actor), accepted_u5_actor);
+      std::string live_optimizer;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 80, &live_optimizer, &error));
+      CHECK_EQ(live_optimizer, accepted_u5_optimizer);
+      CHECK_EQ(state.live_actor_optimizer_steps, 80);
+      CHECK_EQ(state.accepted_new_updates, 1);
+      CHECK_EQ(state.attempted_new_updates, 2);
+      UTILS_CHECK(state.stopped);
+      UTILS_CHECK(std::filesystem::exists(
+          startup.output_root / "update_6/actor_model.pt"));
+      UTILS_CHECK(!std::filesystem::exists(startup.output_root / "update_7"));
+    }
+
+    // A late invalid U5 failure rolls actor/Adam back and leaves no candidate.
+    {
+      std::shared_ptr<SharedDunePolicyValueNetImpl> actor;
+      std::shared_ptr<DuneVrpoQNetImpl> q;
+      std::unique_ptr<torch::optim::AdamW> optimizer;
+      VrpoPpoContinuationState state;
+      VrpoPpoContinuationStartupConfig startup;
+      run_fixture("invalid", &actor, &q, &optimizer, &state, &startup);
+      size_t prior_actor_size = 0;
+      size_t prior_optimizer_size = 0;
+      const std::string prior_actor_sha = ComputeFileSHA256(
+          prior.actor_path.string(), &prior_actor_size);
+      const std::string prior_optimizer_sha = ComputeFileSHA256(
+          prior.optimizer_path.string(), &prior_optimizer_size);
+      const std::string actor_before = TinyVrpoModuleHash(*actor);
+      auto episodes = MakeTinyVrpoPhase4eEpisodes(
+          *actor, 10.0, first_episode_id);
+      auto pairing = MakeTinyVrpoPhase4ePairingStats(episodes);
+      VrpoPpoContinuationDisposition disposition;
+      json::Object result;
+      UTILS_CHECK(!WriteVrpoPpoContinuationUpdate(
+          startup, source.binding, source.layout, episodes, pairing,
+          actor_before, actor, q, *optimizer, torch::kCPU, deadline, 5,
+          VrpoPpoContinuationFailurePoint::kLateAfterTraining, &state,
+          &disposition, &result, &error));
+      CHECK_EQ(TinyVrpoModuleHash(*actor), actor_before);
+      std::string optimizer_after;
+      UTILS_CHECK(vrpo_ppo_pilot_internal::ActorOptimizerStateSha256(
+          *optimizer, *actor, 64, &optimizer_after, &error));
+      CHECK_EQ(optimizer_after, state.latest_actor_optimizer_state_sha256);
+      UTILS_CHECK(!std::filesystem::exists(startup.output_root / "update_5"));
+      size_t prior_actor_size_after = 0;
+      size_t prior_optimizer_size_after = 0;
+      CHECK_EQ(ComputeFileSHA256(
+                   prior.actor_path.string(), &prior_actor_size_after),
+               prior_actor_sha);
+      CHECK_EQ(ComputeFileSHA256(
+                   prior.optimizer_path.string(),
+                   &prior_optimizer_size_after),
+               prior_optimizer_sha);
+      CHECK_EQ(prior_actor_size_after, prior_actor_size);
+      CHECK_EQ(prior_optimizer_size_after, prior_optimizer_size);
+      state.had_failure = true;
+      state.failure_reason = "injected invalid late failure";
+      json::Object global;
+      UTILS_CHECK(WriteVrpoPpoContinuationGlobalResult(
+          startup, state, *actor, *optimizer, deadline, &global, &error,
+          /*test_fixture=*/true));
+      CHECK_EQ(global.at("classification").GetString(), "INVALID");
+      UTILS_CHECK(
+          !global.at("optimizer_persisted_across_updates_1_through_8")
+               .GetBool());
+      CHECK_EQ(global.at("available_update_summaries").GetArray().size(), 4);
+      UTILS_CHECK(global.find("all_eight_update_summaries") == global.end());
+      json::Object parsed_global;
+      UTILS_CHECK(vrpo_ppo_continuation_internal::ReadJsonObject(
+          startup.output_root / "CONTINUATION_RESULT.json", &parsed_global,
+          &error));
+      CHECK_EQ(parsed_global.at("classification").GetString(), "INVALID");
+      UTILS_CHECK(parsed_global.find("all_eight_update_summaries") ==
+                  parsed_global.end());
+    }
+    std::filesystem::remove_all(root, ec);
+    ResetVrpoQInstrumentation();
+    ResetVrpoScheduleQTargetInstrumentation();
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -7698,6 +8246,7 @@ int main() {
   TestVrpoScheduleScreenContractsAndCodecLive();
   TestVrpoScheduleHealthAndPpoEquivalenceLive();
   TestVrpoPpoPilotContractsContinuationAndRollbackLive();
+  TestVrpoPpoContinuationU5U8ContractsAndRollbackLive();
 #endif
 
   // -----------------------------------------------------------------------
