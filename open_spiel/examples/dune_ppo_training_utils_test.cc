@@ -8191,6 +8191,99 @@ void TestVrpoPpoContinuationU5U8ContractsAndRollbackLive() {
 }
 
 void TestVrpoQWarmupQOnlyAndDecisionContracts() {
+  TEST_BEGIN("VRPO Q-warmup serialized Q preserves distinct hash domains") {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_qwarm_hash_domains_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root);
+    const auto q_path = root / "q_model.pt";
+    const auto prospective_output = root / "must_remain_absent";
+    auto q = std::make_shared<DuneVrpoQNetImpl>(kVrpoQWarmupQSeed);
+    q->to(torch::kCPU, torch::kFloat32);
+    std::string error;
+    std::string canonical_before;
+    std::string runtime_before;
+    VrpoExpandedExpectedLayout production_layout;
+    production_layout.test_fixture = false;
+    UTILS_CHECK(VrpoExpandedQValueIdentitySha256(
+        *q, production_layout, &canonical_before, &error));
+    UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+        *q, "", &runtime_before, &error));
+    CHECK_EQ(canonical_before,
+             std::string(kVrpoQWarmupInitialQCanonicalValuesSha256));
+    CHECK_EQ(runtime_before,
+             std::string(kVrpoQWarmupInitialQRuntimeValuesSha256));
+    UTILS_CHECK(canonical_before != runtime_before);
+    SaveVrpoModule(*q, q_path);
+
+    auto reloaded =
+        std::make_shared<DuneVrpoQNetImpl>(kVrpoQWarmupQSeed + 1);
+    reloaded->to(torch::kCPU, torch::kFloat32);
+    UTILS_CHECK(LoadVrpoModule(*reloaded, q_path, &error));
+    std::string canonical_after;
+    std::string runtime_after;
+    UTILS_CHECK(VrpoExpandedQValueIdentitySha256(
+        *reloaded, production_layout, &canonical_after, &error));
+    UTILS_CHECK(vrpo_training_internal::ModuleValueSha256(
+        *reloaded, "", &runtime_after, &error));
+    CHECK_EQ(canonical_after, canonical_before);
+    CHECK_EQ(runtime_after, runtime_before);
+
+    size_t file_size = 0;
+    const std::string file_sha256 =
+        ComputeFileSHA256(q_path.string(), &file_size);
+    UTILS_CHECK(file_size > 0);
+    vrpo_q_warmup_internal::QOriginIdentity identity;
+    UTILS_CHECK(
+        vrpo_q_warmup_internal::ValidateQOriginIdentityBeforeOptimizer(
+            *reloaded, q_path, file_sha256, canonical_before,
+            runtime_before, &identity, &error));
+    CHECK_EQ(identity.q_model_file_identity_schema,
+             std::string(kVrpoQWarmupQFileIdentitySchema));
+    CHECK_EQ(identity.q_canonical_values_schema,
+             std::string(kVrpoQWarmupCanonicalQOriginSchema));
+    CHECK_EQ(identity.q_runtime_module_values_schema,
+             std::string(kVrpoQWarmupRuntimeQStateSchema));
+    CHECK_EQ(identity.q_model_file_sha256, file_sha256);
+    CHECK_EQ(identity.q_canonical_values_sha256, canonical_before);
+    CHECK_EQ(identity.q_runtime_module_values_sha256, runtime_before);
+
+    auto actor_fixture = MakeTinyVrpoTrainingFixture();
+    const std::string actor_before =
+        vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+            *actor_fixture.actor, &error);
+    std::unique_ptr<torch::optim::AdamW> q_optimizer;
+    auto wrong = [](std::string digest) {
+      digest[0] = digest[0] == '0' ? '1' : '0';
+      return digest;
+    };
+    auto expect_pre_optimizer_reject = [&](const std::string& expected_file,
+                                            const std::string& expected_canonical,
+                                            const std::string& expected_runtime) {
+      identity = vrpo_q_warmup_internal::QOriginIdentity{};
+      UTILS_CHECK(
+          !vrpo_q_warmup_internal::ValidateQOriginIdentityBeforeOptimizer(
+              *reloaded, q_path, expected_file, expected_canonical,
+              expected_runtime, &identity, &error));
+      UTILS_CHECK(q_optimizer == nullptr);
+      UTILS_CHECK(!std::filesystem::exists(prospective_output));
+      CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                   *actor_fixture.actor, &error),
+               actor_before);
+      UTILS_CHECK(identity.q_model_file_sha256.empty());
+      UTILS_CHECK(identity.q_canonical_values_sha256.empty());
+      UTILS_CHECK(identity.q_runtime_module_values_sha256.empty());
+    };
+    expect_pre_optimizer_reject(
+        wrong(file_sha256), canonical_before, runtime_before);
+    expect_pre_optimizer_reject(
+        file_sha256, wrong(canonical_before), runtime_before);
+    expect_pre_optimizer_reject(
+        file_sha256, canonical_before, wrong(runtime_before));
+    std::filesystem::remove_all(root, ec);
+  } TEST_END();
+
   TEST_BEGIN("VRPO Q-warmup ownership preserves collisions and prior evidence") {
     const auto root = std::filesystem::temp_directory_path() /
         ("dune_vrpo_qwarm_ownership_" + std::to_string(::getpid()));
@@ -8579,7 +8672,7 @@ void TestVrpoQWarmupQOnlyAndDecisionContracts() {
              uint64_t{16});
     CHECK_EQ(kVrpoQWarmupFinalQSteps, int64_t{256});
     const auto evidence = VrpoQWarmupCanonicalEvidenceFiles();
-    CHECK_EQ(evidence.size(), size_t{18});
+    CHECK_EQ(evidence.size(), size_t{21});
     std::set<std::string> evidence_paths;
     for (const auto& item : evidence) {
       UTILS_CHECK(VrpoPhase4eLowerHex64(item.expected_sha256));

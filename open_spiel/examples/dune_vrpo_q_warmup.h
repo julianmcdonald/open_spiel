@@ -73,8 +73,20 @@ inline constexpr char kVrpoQWarmupActorValuesSha256[] =
     "8604ee82e76e86591b123c69ebab0a85e6b4aabd3bc088b48f922a35590a988d";
 inline constexpr char kVrpoQWarmupActorFileSha256[] =
     "8b3d4e5061ed8db611a266880d249b2064268d00f4c280d1e695c265f7ed46fd";
-inline constexpr char kVrpoQWarmupInitialQValuesSha256[] =
+// These two identities intentionally hash the same Q tensors in different,
+// independently versioned domains.  The canonical expanded-checkpoint
+// identity is the bootstrap-manifest contract.  The runtime module identity is
+// used for mutation/reload checks.  They must never be substituted.
+inline constexpr char kVrpoQWarmupCanonicalQOriginSchema[] =
+    "dune_vrpo_q_module_v1";
+inline constexpr char kVrpoQWarmupRuntimeQStateSchema[] =
+    "dune_vrpo_named_parameter_values_v1";
+inline constexpr char kVrpoQWarmupQFileIdentitySchema[] =
+    "sha256_file_bytes_v1";
+inline constexpr char kVrpoQWarmupInitialQCanonicalValuesSha256[] =
     "b98937b5f924af181116c94726158c0be808c831d639038e69b80c5ff0666553";
+inline constexpr char kVrpoQWarmupInitialQRuntimeValuesSha256[] =
+    "ff77fe5fd6b5b557206405ca6c12aa157baa94095560fbbbadbe2b72ef1b2c26";
 inline constexpr char kVrpoQWarmupInitialQFileSha256[] =
     "29a9e0b4bde117e00931be7cbc58f3f47d84cf9e2c492fd7141d5a1fce641646";
 inline constexpr char kVrpoQWarmupInitialQOptimizerFileSha256[] =
@@ -189,6 +201,15 @@ VrpoQWarmupCanonicalEvidenceFiles() {
       {"bootstrap_v2_q_optimizer",
        "bootstrap_u15828_fp32_v2_20260831/VRPO_CAP10/q_optimizer.pt",
        kVrpoQWarmupInitialQOptimizerFileSha256},
+      {"invalid_q_warmup_registration",
+       "registrations/vrpo_q_warmup4x16_holdout16_u4_20260902/registration.json",
+       "9a7cd9954f85c68d96146b2580ff40eaa284c3b1f35a4a526d99bdc317f63635"},
+      {"invalid_q_warmup_run_log",
+       "registrations/vrpo_q_warmup4x16_holdout16_u4_20260902/run.log",
+       "c18311e0fbd1445c361ecb16ccdef59df4ffdae29d9a11a4efc8cf1f475b9a0a"},
+      {"invalid_q_warmup_validation",
+       "registrations/vrpo_q_warmup4x16_holdout16_u4_20260902/validation.json",
+       "d1262ddffae563f0d89d6ca82f85a016a7d73d404085bafd773d9d71f7008554"},
   };
 }
 
@@ -384,6 +405,7 @@ inline bool ValidatePriorSemantics(
   json::Object bootstrap;
   json::Object bootstrap_validation;
   json::Object bootstrap_manifest;
+  json::Object invalid_predecessor_validation;
   if (!ReadJsonObject(root / specs[1].relative_path, &u4, error) ||
       !ReadJsonObject(root / specs[4].relative_path, &raw128, error) ||
       !ReadJsonObject(root / specs[6].relative_path, &confirm, error) ||
@@ -396,7 +418,9 @@ inline bool ValidatePriorSemantics(
       !ReadJsonObject(root / specs[14].relative_path,
                       &bootstrap_validation, error) ||
       !ReadJsonObject(root / specs[15].relative_path,
-                      &bootstrap_manifest, error)) {
+                      &bootstrap_manifest, error) ||
+      !ReadJsonObject(root / specs[20].relative_path,
+                      &invalid_predecessor_validation, error)) {
     return fail(error != nullptr ? *error : "Q-warmup evidence parse failed");
   }
   if (!StringIs(u4, "actor_after_sha256", kVrpoQWarmupActorValuesSha256) ||
@@ -417,10 +441,16 @@ inline bool ValidatePriorSemantics(
       !StringIs(bootstrap, "status", "VALID") ||
       !StringIs(bootstrap_validation, "status", "VALID") ||
       !StringIs(bootstrap_manifest, "q_values_sha256",
-                kVrpoQWarmupInitialQValuesSha256) ||
+                kVrpoQWarmupInitialQCanonicalValuesSha256) ||
       !StringIs(bootstrap_manifest, "q_optimizer_state_sha256",
                 kVrpoQWarmupInitialQOptimizerStateSha256) ||
-      !IntIs(bootstrap_manifest, "global_update", 0)) {
+      !IntIs(bootstrap_manifest, "global_update", 0) ||
+      !StringIs(invalid_predecessor_validation, "status",
+                "INVALID_FAIL_CLOSED") ||
+      !StringIs(invalid_predecessor_validation, "classification",
+                "Q_WARMUP_REJECTED_BEFORE_OUTPUT_ROOT_Q_RELOAD_IDENTITY_MISMATCH") ||
+      !StringIs(invalid_predecessor_validation, "registration_sha256",
+                "9a7cd9954f85c68d96146b2580ff40eaa284c3b1f35a4a526d99bdc317f63635")) {
     return fail("Q-warmup U4/confirmation/rollback/bootstrap semantics rejected");
   }
   const auto contract_it = bootstrap_manifest.find("phase4_contract");
@@ -567,6 +597,79 @@ inline std::string ModuleParametersAndBuffersSha256(
     return std::string();
   }
   return ComputeStringSHA256(payload);
+}
+
+struct QOriginIdentity {
+  std::string q_model_file_identity_schema;
+  std::string q_model_file_sha256;
+  int64_t q_model_file_size = 0;
+  std::string q_canonical_values_schema;
+  std::string q_canonical_values_sha256;
+  std::string q_runtime_module_values_schema;
+  std::string q_runtime_module_values_sha256;
+};
+
+// Validates three separate claims before a Q optimizer or output directory may
+// be constructed: exact serialized bytes, the canonical Dune-Q value identity
+// used by expanded checkpoint manifests, and the generic runtime module-state
+// identity used by training mutation checks.
+inline bool ValidateQOriginIdentityBeforeOptimizer(
+    DuneVrpoQNetImpl& q, const std::filesystem::path& q_model_path,
+    const std::string& expected_file_sha256,
+    const std::string& expected_canonical_values_sha256,
+    const std::string& expected_runtime_module_values_sha256,
+    QOriginIdentity* output, std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (output != nullptr) *output = QOriginIdentity{};
+    return false;
+  };
+  if (output == nullptr ||
+      !VrpoPhase4eLowerHex64(expected_file_sha256) ||
+      !VrpoPhase4eLowerHex64(expected_canonical_values_sha256) ||
+      !VrpoPhase4eLowerHex64(expected_runtime_module_values_sha256) ||
+      expected_canonical_values_sha256 ==
+          expected_runtime_module_values_sha256) {
+    return fail("Q-warmup Q-origin expected identities are invalid");
+  }
+  size_t file_size = 0;
+  const std::string file_sha256 =
+      ComputeFileSHA256(q_model_path.string(), &file_size);
+  if (file_size == 0 || file_sha256 != expected_file_sha256) {
+    return fail("Q-warmup serialized Q file identity mismatch");
+  }
+  std::string canonical_values_sha256;
+  std::string runtime_module_values_sha256;
+  VrpoExpandedExpectedLayout canonical_layout;
+  canonical_layout.test_fixture = false;
+  if (!VrpoExpandedQValueIdentitySha256(
+          q, canonical_layout, &canonical_values_sha256, error) ||
+      !vrpo_training_internal::ModuleValueSha256(
+          q, "", &runtime_module_values_sha256, error)) {
+    return fail(error != nullptr && !error->empty()
+                    ? *error
+                    : "Q-warmup Q-origin value hashing failed");
+  }
+  if (canonical_values_sha256 != expected_canonical_values_sha256) {
+    return fail("Q-warmup canonical expanded Dune-Q value identity mismatch");
+  }
+  if (runtime_module_values_sha256 !=
+      expected_runtime_module_values_sha256) {
+    return fail("Q-warmup generic runtime module-state identity mismatch");
+  }
+  if (canonical_values_sha256 == runtime_module_values_sha256) {
+    return fail("Q-warmup independently versioned Q identity domains alias");
+  }
+  QOriginIdentity identity;
+  identity.q_model_file_identity_schema = kVrpoQWarmupQFileIdentitySchema;
+  identity.q_model_file_sha256 = file_sha256;
+  identity.q_model_file_size = static_cast<int64_t>(file_size);
+  identity.q_canonical_values_schema = kVrpoQWarmupCanonicalQOriginSchema;
+  identity.q_canonical_values_sha256 = canonical_values_sha256;
+  identity.q_runtime_module_values_schema = kVrpoQWarmupRuntimeQStateSchema;
+  identity.q_runtime_module_values_sha256 = runtime_module_values_sha256;
+  *output = std::move(identity);
+  return true;
 }
 
 inline bool MakeFreshQOptimizer(
@@ -1780,8 +1883,9 @@ struct VrpoQWarmupState {
   int64_t q_optimizer_steps = 0;
   int64_t measured_peak_bytes = 0;
   std::string actor_state_sha256;
-  std::string initial_q_values_sha256;
-  std::string latest_q_values_sha256;
+  vrpo_q_warmup_internal::QOriginIdentity q_origin_identity;
+  std::string initial_q_runtime_module_values_sha256;
+  std::string latest_q_runtime_module_values_sha256;
   std::string latest_q_optimizer_state_sha256;
   std::vector<VrpoPpoPilotEvidenceObservation> evidence_observations;
   json::Array committed_updates;
@@ -2074,7 +2178,9 @@ inline bool InitializeVrpoQWarmupFromLoadedState(
     const std::shared_ptr<DuneVrpoQNetImpl>& q,
     torch::optim::AdamW& q_optimizer, const torch::Device& selected_device,
     const VrpoQWarmupDeadline& deadline, VrpoQWarmupState* state,
-    std::string* error, bool test_fixture = false) {
+    std::string* error, bool test_fixture = false,
+    const vrpo_q_warmup_internal::QOriginIdentity* prevalidated_q_origin =
+        nullptr) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     if (state != nullptr) *state = VrpoQWarmupState{};
@@ -2120,22 +2226,53 @@ inline bool InitializeVrpoQWarmupFromLoadedState(
   initialized.actor_state_sha256 =
       vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(*actor, error);
   std::string actor_values;
+  std::string current_q_canonical_values;
+  std::string current_q_runtime_values;
+  VrpoExpandedExpectedLayout canonical_q_layout;
+  canonical_q_layout.test_fixture = false;
   if (initialized.actor_state_sha256.empty() ||
       !vrpo_training_internal::ModuleValueSha256(
           *actor, "", &actor_values, error) ||
+      !VrpoExpandedQValueIdentitySha256(
+          *q, canonical_q_layout, &current_q_canonical_values, error) ||
       !vrpo_training_internal::ModuleValueSha256(
-          *q, "", &initialized.initial_q_values_sha256, error) ||
+          *q, "", &current_q_runtime_values, error) ||
       !vrpo_q_warmup_internal::QOptimizerStateSha256(
           q_optimizer, *q, 0,
           &initialized.latest_q_optimizer_state_sha256, error) ||
       (!test_fixture && actor_values != kVrpoQWarmupActorValuesSha256) ||
-      (!test_fixture && initialized.initial_q_values_sha256 !=
-                            kVrpoQWarmupInitialQValuesSha256)) {
+      (!test_fixture &&
+       (prevalidated_q_origin == nullptr ||
+        prevalidated_q_origin->q_model_file_sha256 !=
+            kVrpoQWarmupInitialQFileSha256 ||
+        prevalidated_q_origin->q_canonical_values_sha256 !=
+            kVrpoQWarmupInitialQCanonicalValuesSha256 ||
+        prevalidated_q_origin->q_runtime_module_values_sha256 !=
+            kVrpoQWarmupInitialQRuntimeValuesSha256 ||
+        current_q_canonical_values !=
+            prevalidated_q_origin->q_canonical_values_sha256 ||
+        current_q_runtime_values !=
+            prevalidated_q_origin->q_runtime_module_values_sha256))) {
     return fail(error != nullptr && !error->empty()
                     ? *error
                     : "Q-warmup exact actor/Q/optimizer origin rejected");
   }
-  initialized.latest_q_values_sha256 = initialized.initial_q_values_sha256;
+  if (prevalidated_q_origin != nullptr) {
+    initialized.q_origin_identity = *prevalidated_q_origin;
+  } else {
+    initialized.q_origin_identity.q_canonical_values_schema =
+        kVrpoQWarmupCanonicalQOriginSchema;
+    initialized.q_origin_identity.q_canonical_values_sha256 =
+        current_q_canonical_values;
+    initialized.q_origin_identity.q_runtime_module_values_schema =
+        kVrpoQWarmupRuntimeQStateSchema;
+    initialized.q_origin_identity.q_runtime_module_values_sha256 =
+        current_q_runtime_values;
+  }
+  initialized.initial_q_runtime_module_values_sha256 =
+      current_q_runtime_values;
+  initialized.latest_q_runtime_module_values_sha256 =
+      current_q_runtime_values;
   initialized.evidence_observations = startup.prior.observations;
   initialized.runtime_device_exact_match = true;
   bool owns_root = false;
@@ -2197,13 +2334,29 @@ inline bool LoadAndInitializeVrpoQWarmup(
       (!test_fixture && q_optimizer_sha !=
                             kVrpoQWarmupInitialQOptimizerFileSha256) ||
       !LoadVrpoModule(*actor, startup.prior.actor_path, error) ||
-      !LoadVrpoModule(*q, startup.prior.q_model_path, error) ||
-      !vrpo_q_warmup_internal::MakeFreshQOptimizer(
+      !LoadVrpoModule(*q, startup.prior.q_model_path, error)) {
+    return fail(error != nullptr && !error->empty()
+                    ? *error
+                    : "Q-warmup exact origins rejected");
+  }
+  vrpo_q_warmup_internal::QOriginIdentity q_origin;
+  if (!test_fixture &&
+      !vrpo_q_warmup_internal::ValidateQOriginIdentityBeforeOptimizer(
+          *q, startup.prior.q_model_path,
+          kVrpoQWarmupInitialQFileSha256,
+          kVrpoQWarmupInitialQCanonicalValuesSha256,
+          kVrpoQWarmupInitialQRuntimeValuesSha256,
+          &q_origin, error)) {
+    return fail(error != nullptr && !error->empty()
+                    ? *error
+                    : "Q-warmup exact Q origin rejected before optimizer");
+  }
+  if (!vrpo_q_warmup_internal::MakeFreshQOptimizer(
           *q, q_optimizer, error) ||
       !deadline.Check("after exact origins load", error) ||
       !InitializeVrpoQWarmupFromLoadedState(
           startup, actor, q, **q_optimizer, device, deadline, state,
-          error, test_fixture)) {
+          error, test_fixture, test_fixture ? nullptr : &q_origin)) {
     return fail(error != nullptr && !error->empty()
                     ? *error
                     : "Q-warmup exact origins rejected");
@@ -2276,7 +2429,7 @@ inline bool WriteVrpoQWarmupUpdate(
   if (actor_before != state->actor_state_sha256 ||
       !vrpo_training_internal::ModuleValueSha256(
           *q, "", &q_before, error) ||
-      q_before != state->latest_q_values_sha256 ||
+      q_before != state->latest_q_runtime_module_values_sha256 ||
       !vrpo_q_warmup_internal::QOptimizerStateSha256(
           q_optimizer, *q, state->q_optimizer_steps,
           &optimizer_before, error) ||
@@ -2401,8 +2554,20 @@ inline bool WriteVrpoQWarmupUpdate(
   result["actor_backward_calls"] = int64_t{0};
   result["actor_state_before_sha256"] = stats.actor_state_before_sha256;
   result["actor_state_after_sha256"] = stats.actor_state_after_sha256;
-  result["q_before_sha256"] = stats.q_values_before_sha256;
-  result["q_after_sha256"] = stats.q_values_after_sha256;
+  result["q_origin_file_identity_schema"] =
+      state->q_origin_identity.q_model_file_identity_schema;
+  result["q_origin_file_sha256"] =
+      state->q_origin_identity.q_model_file_sha256;
+  result["q_origin_canonical_values_schema"] =
+      state->q_origin_identity.q_canonical_values_schema;
+  result["q_origin_canonical_values_sha256"] =
+      state->q_origin_identity.q_canonical_values_sha256;
+  result["q_runtime_module_values_schema"] =
+      kVrpoQWarmupRuntimeQStateSchema;
+  result["q_runtime_module_values_before_sha256"] =
+      stats.q_values_before_sha256;
+  result["q_runtime_module_values_after_sha256"] =
+      stats.q_values_after_sha256;
   result["q_optimizer_step_before"] = state->q_optimizer_steps;
   result["q_optimizer_steps_this_update"] = stats.q_optimizer_steps;
   result["q_optimizer_step_after"] =
@@ -2467,7 +2632,8 @@ inline bool WriteVrpoQWarmupUpdate(
   }
   state->completed_updates = update_number;
   state->q_optimizer_steps += stats.q_optimizer_steps;
-  state->latest_q_values_sha256 = stats.q_values_after_sha256;
+  state->latest_q_runtime_module_values_sha256 =
+      stats.q_values_after_sha256;
   state->latest_q_optimizer_state_sha256 = optimizer_after;
   json::Object summary;
   summary["update"] = static_cast<int64_t>(update_number);
@@ -2475,7 +2641,10 @@ inline bool WriteVrpoQWarmupUpdate(
   summary["next_episode_id"] = static_cast<int64_t>(expected_next);
   summary["rows"] = pairing.paired_rows;
   summary["corpus_payload_sha256"] = corpus_identity.payload_sha256;
-  summary["q_after_sha256"] = stats.q_values_after_sha256;
+  summary["q_runtime_module_values_schema"] =
+      kVrpoQWarmupRuntimeQStateSchema;
+  summary["q_runtime_module_values_after_sha256"] =
+      stats.q_values_after_sha256;
   summary["q_optimizer_step_after"] = state->q_optimizer_steps;
   summary["q_optimizer_state_after_sha256"] = optimizer_after;
   summary["update_result_sha256"] =
@@ -2555,10 +2724,10 @@ inline bool WriteVrpoQWarmupHoldoutAndGlobalResult(
   if (actor_state != state->actor_state_sha256 ||
       !vrpo_training_internal::ModuleValueSha256(
           *initial_q, "", &initial_q_hash, error) ||
-      initial_q_hash != state->initial_q_values_sha256 ||
+      initial_q_hash != state->initial_q_runtime_module_values_sha256 ||
       !vrpo_training_internal::ModuleValueSha256(
           *final_q, "", &final_q_hash, error) ||
-      final_q_hash != state->latest_q_values_sha256 ||
+      final_q_hash != state->latest_q_runtime_module_values_sha256 ||
       !vrpo_q_warmup_internal::QOptimizerStateSha256(
           final_q_optimizer, *final_q, kVrpoQWarmupFinalQSteps,
           &optimizer_hash, error) ||
@@ -2648,8 +2817,14 @@ inline bool WriteVrpoQWarmupHoldoutAndGlobalResult(
   metrics["holdout_corpus_payload_sha256"] =
       evaluation.corpus_payload_sha256;
   metrics["holdout_row_identity_sha256"] = evaluation.row_identity_sha256;
-  metrics["initial_q_values_sha256"] = initial_q_hash;
-  metrics["final_q_values_sha256"] = final_q_hash;
+  metrics["q_origin_canonical_values_schema"] =
+      state->q_origin_identity.q_canonical_values_schema;
+  metrics["q_origin_canonical_values_sha256"] =
+      state->q_origin_identity.q_canonical_values_sha256;
+  metrics["q_runtime_module_values_schema"] =
+      kVrpoQWarmupRuntimeQStateSchema;
+  metrics["initial_q_runtime_module_values_sha256"] = initial_q_hash;
+  metrics["final_q_runtime_module_values_sha256"] = final_q_hash;
   metrics["initial"] = json::Value(
       vrpo_q_warmup_internal::MetricSetJson(evaluation.initial));
   metrics["final"] = json::Value(
@@ -2746,10 +2921,24 @@ inline bool WriteVrpoQWarmupHoldoutAndGlobalResult(
   result["actor_optimizer_constructed"] = false;
   result["actor_optimizer_steps"] = int64_t{0};
   result["actor_backward_calls"] = int64_t{0};
-  result["initial_q_values_sha256"] = state->initial_q_values_sha256;
+  result["q_model_file_identity_schema"] =
+      state->q_origin_identity.q_model_file_identity_schema;
+  result["q_model_file_sha256"] =
+      state->q_origin_identity.q_model_file_sha256;
+  result["q_model_file_size"] =
+      state->q_origin_identity.q_model_file_size;
+  result["q_canonical_values_schema"] =
+      state->q_origin_identity.q_canonical_values_schema;
+  result["initial_q_canonical_values_sha256"] =
+      state->q_origin_identity.q_canonical_values_sha256;
+  result["q_runtime_module_values_schema"] =
+      state->q_origin_identity.q_runtime_module_values_schema;
+  result["initial_q_runtime_module_values_sha256"] =
+      state->initial_q_runtime_module_values_sha256;
   result["fresh_canonical_q_adam_step0"] = true;
   result["source_optimizer_moments_loaded"] = false;
-  result["final_q_values_sha256"] = state->latest_q_values_sha256;
+  result["final_q_runtime_module_values_sha256"] =
+      state->latest_q_runtime_module_values_sha256;
   result["q_optimizer_steps"] = state->q_optimizer_steps;
   result["q_optimizer_state_sha256"] =
       state->latest_q_optimizer_state_sha256;

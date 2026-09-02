@@ -10738,7 +10738,8 @@ int main(int argc, char** argv) {
       std::string optimizer_hash;
       if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
               *vrpo_q_warmup_q, "", &q_hash, &warmup_error) ||
-          q_hash != vrpo_q_warmup_state.latest_q_values_sha256 ||
+          q_hash !=
+              vrpo_q_warmup_state.latest_q_runtime_module_values_sha256 ||
           !open_spiel::vrpo_q_warmup_internal::QOptimizerStateSha256(
               *vrpo_q_warmup_q_optimizer, *vrpo_q_warmup_q,
               vrpo_q_warmup_state.q_optimizer_steps,
