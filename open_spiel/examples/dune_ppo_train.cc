@@ -51,6 +51,7 @@
 #include "dune_vrpo_phase4e.h"
 #include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_ppo_continuation.h"
+#include "dune_vrpo_q_warmup.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
@@ -282,6 +283,22 @@ ABSL_FLAG(std::string, vrpo_ppo_continuation_binary_sha256, "",
           "Registered SHA-256 of the executing continuation binary.");
 ABSL_FLAG(int64_t, vrpo_ppo_continuation_binary_size, 0,
           "Registered byte size of the executing continuation binary.");
+ABSL_FLAG(std::string, vrpo_q_warmup_output_root, "",
+          "Fresh root for the frozen-actor four-update Q warm-up and holdout screen.");
+ABSL_FLAG(std::string, vrpo_q_warmup_registration_id, "",
+          "Immutable Q-warmup registration ID.");
+ABSL_FLAG(std::string, vrpo_q_warmup_profile, "",
+          "Required compiled Q-warmup profile.");
+ABSL_FLAG(std::string, vrpo_q_warmup_evidence_root, "",
+          "Root containing exact U4/confirmation/continuation/bootstrap evidence.");
+ABSL_FLAG(std::string, vrpo_q_warmup_source_root, "",
+          "Source root for the fixed Q-warmup source list.");
+ABSL_FLAG(std::string, vrpo_q_warmup_source_sha256, "",
+          "Registered SHA-256 for the fixed Q-warmup source list.");
+ABSL_FLAG(std::string, vrpo_q_warmup_binary_sha256, "",
+          "Registered SHA-256 of the executing Q-warmup binary.");
+ABSL_FLAG(int64_t, vrpo_q_warmup_binary_size, 0,
+          "Registered byte size of the executing Q-warmup binary.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5837,6 +5854,9 @@ int main(int argc, char** argv) {
       vrpo_ppo_continuation_deadline =
           open_spiel::VrpoPpoContinuationDeadline::Start(
               vrpo_schedule_process_start, std::chrono::seconds(1800));
+  const open_spiel::VrpoQWarmupDeadline vrpo_q_warmup_deadline =
+      open_spiel::VrpoQWarmupDeadline::Start(
+          vrpo_schedule_process_start, std::chrono::seconds(1800));
   const bool numerical_parity =
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
   const bool vrpo_capture =
@@ -5856,16 +5876,19 @@ int main(int argc, char** argv) {
       !absl::GetFlag(FLAGS_vrpo_ppo_pilot_output_root).empty();
   const bool vrpo_ppo_continuation =
       !absl::GetFlag(FLAGS_vrpo_ppo_continuation_output_root).empty();
+  const bool vrpo_q_warmup =
+      !absl::GetFlag(FLAGS_vrpo_q_warmup_output_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
           static_cast<int>(vrpo_q_preflight) +
           static_cast<int>(vrpo_bootstrap) + static_cast<int>(vrpo_one_update) +
           static_cast<int>(vrpo_schedule_screen) +
           static_cast<int>(vrpo_ppo_pilot) +
-          static_cast<int>(vrpo_ppo_continuation) >
+          static_cast<int>(vrpo_ppo_continuation) +
+          static_cast<int>(vrpo_q_warmup) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, PPO-pilot, and PPO-continuation modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, PPO-pilot, PPO-continuation, and Q-warmup modes are mutually exclusive");
   }
   if (vrpo_one_update &&
       (absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
@@ -5890,6 +5913,12 @@ int main(int argc, char** argv) {
        absl::GetFlag(FLAGS_vrpo_ppo_continuation_evidence_root).empty())) {
     open_spiel::SpielFatalError(
         "PPO continuation requires registration, evidence, and fresh output roots");
+  }
+  if (vrpo_q_warmup &&
+      (absl::GetFlag(FLAGS_vrpo_q_warmup_registration_id).empty() ||
+       absl::GetFlag(FLAGS_vrpo_q_warmup_evidence_root).empty())) {
+    open_spiel::SpielFatalError(
+        "Q warm-up requires registration, evidence, and fresh output roots");
   }
   if (vrpo_schedule_screen) {
     std::string resource_error;
@@ -6473,10 +6502,11 @@ int main(int argc, char** argv) {
         "Raw-PPO numerical parity requires CUDA: without it the rollout side "
         "does not execute BF16 autocast and cannot test the registered gate.");
   }
-  if ((vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) &&
+  if ((vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
+       vrpo_q_warmup) &&
       !device.is_cuda()) {
     SpielFatalError(
-        "VRPO schedule screen, PPO pilot, and PPO continuation require CUDA");
+        "VRPO schedule screen, PPO pilot, PPO continuation, and Q warm-up require CUDA");
   }
   open_spiel::PpoNumericalParitySourceProvenance
       parity_source_provenance;
@@ -6492,6 +6522,8 @@ int main(int argc, char** argv) {
       vrpo_ppo_continuation_source_identity;
   open_spiel::VrpoPpoContinuationStartupConfig
       vrpo_ppo_continuation_preflight;
+  open_spiel::VrpoPhase4eSourceIdentity vrpo_q_warmup_source_identity;
+  open_spiel::VrpoQWarmupStartupConfig vrpo_q_warmup_preflight;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -6662,6 +6694,58 @@ int main(int argc, char** argv) {
     vrpo_ppo_continuation_preflight.executed_binary_sha256 = binary_sha256;
     vrpo_ppo_continuation_preflight.executed_binary_size = binary_size;
   }
+  if (vrpo_q_warmup) {
+    std::string source_error;
+    if (absl::GetFlag(FLAGS_init_mode) != "vrpo_q_warmup" ||
+        absl::GetFlag(FLAGS_vrpo_q_warmup_profile) !=
+            open_spiel::kVrpoQWarmupProfile ||
+        absl::GetFlag(FLAGS_vrpo_q_warmup_registration_id) !=
+            open_spiel::kVrpoQWarmupRegistrationId ||
+        absl::GetFlag(FLAGS_seed) !=
+            static_cast<int>(open_spiel::kVrpoQWarmupBaseSeed) ||
+        absl::GetFlag(FLAGS_start_episode_id) !=
+            open_spiel::kVrpoQWarmupTrainStartEpisodeId ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoQWarmupUpdates) {
+      SpielFatalError(
+          "Q-warmup compiled profile/registration/seed/range rejected before model construction");
+    }
+    if (!open_spiel::LoadVrpoQWarmupSourceIdentity(
+            absl::GetFlag(FLAGS_vrpo_q_warmup_source_root),
+            absl::GetFlag(FLAGS_vrpo_q_warmup_source_sha256),
+            &vrpo_q_warmup_source_identity, &source_error) ||
+        !vrpo_q_warmup_deadline.Check("after Q-warmup source identity",
+                                      &source_error)) {
+      SpielFatalError("Q-warmup source identity rejected: " + source_error);
+    }
+    vrpo_q_warmup_preflight.output_root =
+        absl::GetFlag(FLAGS_vrpo_q_warmup_output_root);
+    vrpo_q_warmup_preflight.evidence_root =
+        absl::GetFlag(FLAGS_vrpo_q_warmup_evidence_root);
+    if (!open_spiel::vrpo_q_warmup_internal::ValidatePriorSemantics(
+            vrpo_q_warmup_preflight.evidence_root,
+            &vrpo_q_warmup_preflight.prior, &source_error)) {
+      SpielFatalError(
+          "Q-warmup immutable U4/confirmation/rollback/Q-origin chain rejected before model construction: " +
+          source_error);
+    }
+    std::error_code binary_ec;
+    const auto binary_path =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    size_t binary_size = 0;
+    const std::string binary_sha256 = binary_ec || binary_path.empty()
+        ? std::string()
+        : open_spiel::ComputeFileSHA256(binary_path.string(), &binary_size);
+    if (binary_sha256 !=
+            absl::GetFlag(FLAGS_vrpo_q_warmup_binary_sha256) ||
+        static_cast<int64_t>(binary_size) !=
+            absl::GetFlag(FLAGS_vrpo_q_warmup_binary_size)) {
+      SpielFatalError(
+          "Q-warmup executed binary identity mismatch before model construction");
+    }
+    vrpo_q_warmup_preflight.executed_binary_sha256 = binary_sha256;
+    vrpo_q_warmup_preflight.executed_binary_size = binary_size;
+  }
 
   // PWO-5 section 7.2 / Appendix A.1.
   //
@@ -6769,7 +6853,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
   if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
-      !vrpo_ppo_continuation &&
+      !vrpo_ppo_continuation && !vrpo_q_warmup &&
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
@@ -6974,6 +7058,11 @@ int main(int argc, char** argv) {
   open_spiel::VrpoPpoContinuationStartupConfig
       vrpo_ppo_continuation_startup;
   open_spiel::VrpoPpoContinuationState vrpo_ppo_continuation_state;
+  std::shared_ptr<open_spiel::DuneVrpoQNetImpl> vrpo_q_warmup_q;
+  std::unique_ptr<torch::optim::AdamW> vrpo_q_warmup_q_optimizer;
+  open_spiel::VrpoExpandedExpectedLayout vrpo_q_warmup_layout;
+  open_spiel::VrpoQWarmupStartupConfig vrpo_q_warmup_startup;
+  open_spiel::VrpoQWarmupState vrpo_q_warmup_state;
 
   // WO-PERF-TIMING. Enforced HERE, at startup, because FLAGS_pipeline is
   // defined in this TU and validating at the first update would waste a whole
@@ -7696,6 +7785,141 @@ int main(int argc, char** argv) {
     next_episode_id.store(vrpo_ppo_continuation_startup.start_episode_id);
     total_env_steps.store(0);
     start_update = 1;
+  } else if (vrpo_q_warmup) {
+    const auto q_spec = open_spiel::CanonicalVrpoPhase4OptimizerGroups()[2];
+    if (init_mode != "vrpo_q_warmup" ||
+        absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        !absl::GetFlag(FLAGS_artifact_manifest).empty() ||
+        absl::GetFlag(FLAGS_total_updates) !=
+            open_spiel::kVrpoQWarmupUpdates ||
+        absl::GetFlag(FLAGS_ppo_update_epochs) !=
+            open_spiel::kVrpoQWarmupQEpochs ||
+        absl::GetFlag(FLAGS_learning_rate) != q_spec.learning_rate ||
+        absl::GetFlag(FLAGS_anneal_lr)) {
+      SpielFatalError(
+          "Q-warmup requires its dedicated production layout and fixed Q4x16 profile");
+    }
+    std::string warmup_error;
+    vrpo_q_warmup_startup = vrpo_q_warmup_preflight;
+    vrpo_q_warmup_startup.game = absl::GetFlag(FLAGS_game);
+    vrpo_q_warmup_startup.init_mode = init_mode;
+    vrpo_q_warmup_startup.profile =
+        absl::GetFlag(FLAGS_vrpo_q_warmup_profile);
+    vrpo_q_warmup_startup.registration_id =
+        absl::GetFlag(FLAGS_vrpo_q_warmup_registration_id);
+    vrpo_q_warmup_startup.source_root =
+        absl::GetFlag(FLAGS_vrpo_q_warmup_source_root);
+    vrpo_q_warmup_startup.source_code_sha256 =
+        vrpo_q_warmup_source_identity.combined_sha256;
+    vrpo_q_warmup_startup.rollout_games =
+        absl::GetFlag(FLAGS_rollout_games);
+    vrpo_q_warmup_startup.threads = absl::GetFlag(FLAGS_threads);
+    vrpo_q_warmup_startup.eval_batch_size =
+        absl::GetFlag(FLAGS_eval_batch_size);
+    vrpo_q_warmup_startup.eval_timeout_ms =
+        absl::GetFlag(FLAGS_eval_timeout_ms);
+    vrpo_q_warmup_startup.evaluator_device_synchronize =
+        absl::GetFlag(FLAGS_evaluator_device_synchronize);
+    vrpo_q_warmup_startup.deterministic_rollout_eval =
+        absl::GetFlag(FLAGS_deterministic_rollout_eval);
+    vrpo_q_warmup_startup.seed_scheme_version =
+        absl::GetFlag(FLAGS_seed_scheme_version);
+    vrpo_q_warmup_startup.runtime_device_is_cuda = device.is_cuda();
+    vrpo_q_warmup_startup.runtime_device_index =
+        device.has_index() ? device.index() : c10::cuda::current_device();
+    vrpo_q_warmup_startup.one_gpu_process = device.is_cuda() &&
+        vrpo_q_warmup_startup.runtime_device_index >= 0;
+    vrpo_q_warmup_startup.runtime_process_id =
+        static_cast<int64_t>(::getpid());
+    vrpo_q_warmup_startup.base_seed =
+        static_cast<uint64_t>(absl::GetFlag(FLAGS_seed));
+    vrpo_q_warmup_startup.start_episode_id =
+        absl::GetFlag(FLAGS_start_episode_id);
+    vrpo_q_warmup_startup.diagnostics_only =
+        absl::GetFlag(FLAGS_diagnostics_only);
+    vrpo_q_warmup_startup.rollout_amp =
+        absl::GetFlag(FLAGS_rollout_amp);
+    vrpo_q_warmup_startup.train_amp = absl::GetFlag(FLAGS_train_amp);
+    vrpo_q_warmup_startup.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    vrpo_q_warmup_startup.pipeline = absl::GetFlag(FLAGS_pipeline);
+    vrpo_q_warmup_startup.online_search_collection =
+        absl::GetFlag(FLAGS_online_search_collection);
+    vrpo_q_warmup_startup.search_pi_mode =
+        absl::GetFlag(FLAGS_search_pi_mode);
+    vrpo_q_warmup_startup.train_value_only =
+        absl::GetFlag(FLAGS_train_value_only);
+    vrpo_q_warmup_startup.sample_counterfactual_states =
+        absl::GetFlag(FLAGS_sample_counterfactual_states);
+    vrpo_q_warmup_startup.has_search_label_dir =
+        !absl::GetFlag(FLAGS_search_label_dir).empty();
+    vrpo_q_warmup_startup.ordinary_checkpoint_writes_enabled =
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    vrpo_q_warmup_startup.anneal_lr = absl::GetFlag(FLAGS_anneal_lr);
+    vrpo_q_warmup_startup.learning_rate =
+        absl::GetFlag(FLAGS_learning_rate);
+    vrpo_q_warmup_startup.ppo_update_epochs =
+        absl::GetFlag(FLAGS_ppo_update_epochs);
+    vrpo_q_warmup_startup.shaped_reward_weight =
+        absl::GetFlag(FLAGS_shaped_reward_weight);
+    vrpo_q_warmup_startup.tleilaxu_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight);
+    vrpo_q_warmup_startup.tleilaxu_level7_breadcrumb_weight =
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
+    vrpo_q_warmup_startup.specimen_exchange_penalty =
+        absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    vrpo_q_warmup_startup.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    vrpo_q_warmup_startup.gamma = absl::GetFlag(FLAGS_gamma);
+    vrpo_q_warmup_startup.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    vrpo_q_warmup_startup.logit_cap = absl::GetFlag(FLAGS_logit_cap);
+    vrpo_q_warmup_startup.ppo_minibatches =
+        open_spiel::kVrpoTrainingMinibatchesPerEpoch;
+    vrpo_q_warmup_startup.ppo_minibatch_size =
+        absl::GetFlag(FLAGS_ppo_minibatch_size);
+    vrpo_q_warmup_startup.clip_epsilon =
+        absl::GetFlag(FLAGS_ppo_clip_epsilon);
+    vrpo_q_warmup_startup.entropy_coefficient =
+        absl::GetFlag(FLAGS_entropy_coef);
+    vrpo_q_warmup_startup.value_coefficient =
+        absl::GetFlag(FLAGS_value_coef);
+    vrpo_q_warmup_startup.gradient_clip_norm =
+        absl::GetFlag(FLAGS_grad_clip_norm);
+    vrpo_q_warmup_startup.normalize_advantages =
+        absl::GetFlag(FLAGS_normalize_advantages);
+    vrpo_q_warmup_startup.clip_value_loss =
+        absl::GetFlag(FLAGS_ppo_clip_value_loss);
+    if (!open_spiel::ValidateVrpoQWarmupStartupConfig(
+            vrpo_q_warmup_startup, &warmup_error)) {
+      SpielFatalError("Q-warmup startup rejected: " + warmup_error);
+    }
+    vrpo_q_warmup_layout.label = "production_dune_vrpo_layout_v1";
+    vrpo_q_warmup_layout.test_fixture = false;
+    vrpo_q_warmup_layout.actor_observation_dim = obs_size;
+    vrpo_q_warmup_layout.actor_hidden_dim = 2048;
+    vrpo_q_warmup_layout.actor_action_dim = action_size;
+    vrpo_q_warmup_layout.actor_residual_blocks = 8;
+    if (obs_size != 5580 || action_size != 2391) {
+      SpielFatalError("Q-warmup permits the production Dune layout only");
+    }
+    open_spiel::ResetVrpoQInstrumentation();
+    vrpo_q_warmup_q =
+        std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+            open_spiel::kVrpoQWarmupQSeed);
+    vrpo_q_warmup_q->to(device, torch::kFloat32);
+    if (!open_spiel::LoadAndInitializeVrpoQWarmup(
+            vrpo_q_warmup_startup, training_model, vrpo_q_warmup_q,
+            device, vrpo_q_warmup_deadline,
+            &vrpo_q_warmup_q_optimizer, &vrpo_q_warmup_state,
+            &warmup_error)) {
+      SpielFatalError("Q-warmup exact origin load/init failed: " +
+                      warmup_error);
+    }
+    next_episode_id.store(vrpo_q_warmup_startup.start_episode_id);
+    total_env_steps.store(0);
+    start_update = 1;
   } else if (init_mode == "diagnostic") {
     // A model-only, read-only load path. It exists specifically so a completed
     // checkpoint can be audited without pretending to resume it, loading Adam
@@ -8312,7 +8536,7 @@ int main(int argc, char** argv) {
                     " (expected random, checkpoint, bootstrap, "
                     "validate_legacy, diagnostic, vrpo_one_update, or "
                     "vrpo_schedule_screen, vrpo_ppo_pilot, or "
-                    "vrpo_ppo_continuation)");
+                    "vrpo_ppo_continuation, or vrpo_q_warmup)");
   }
 
   std::shared_mutex sync_mutex;
@@ -9904,11 +10128,11 @@ int main(int argc, char** argv) {
   // Collect first rollout synchronously.
   const std::string parity_model_hash_before =
       (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
-       vrpo_ppo_pilot || vrpo_ppo_continuation)
+       vrpo_ppo_pilot || vrpo_ppo_continuation || vrpo_q_warmup)
           ? open_spiel::HashAllModelState(training_model) : "";
   const std::string parity_inference_hash_before =
       (numerical_parity || vrpo_diagnostics || vrpo_schedule_screen ||
-       vrpo_ppo_pilot || vrpo_ppo_continuation)
+       vrpo_ppo_pilot || vrpo_ppo_continuation || vrpo_q_warmup)
           ? open_spiel::HashAllModelState(inference_model) : "";
   const bool parity_tf32_cublas_before =
       (numerical_parity || vrpo_diagnostics) &&
@@ -9920,7 +10144,8 @@ int main(int argc, char** argv) {
                                             absl::GetFlag(FLAGS_shaping_start_env_steps),
                                             absl::GetFlag(FLAGS_shaping_decay_env_steps));
   open_spiel::VrpoCapturedEpisodeBuffer vrpo_capture_buffer;
-  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
+      vrpo_q_warmup) {
     std::string deadline_error;
     const bool deadline_ok = vrpo_schedule_screen
         ? vrpo_schedule_deadline.Check("before rollout collection",
@@ -9928,8 +10153,11 @@ int main(int argc, char** argv) {
         : vrpo_ppo_pilot
             ? vrpo_ppo_pilot_deadline.Check("before rollout collection",
                                             &deadline_error)
-            : vrpo_ppo_continuation_deadline.Check(
-                  "before rollout collection", &deadline_error);
+            : vrpo_ppo_continuation
+                ? vrpo_ppo_continuation_deadline.Check(
+                      "before rollout collection", &deadline_error)
+                : vrpo_q_warmup_deadline.Check(
+                      "before rollout collection", &deadline_error);
     if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
@@ -9938,10 +10166,11 @@ int main(int argc, char** argv) {
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
       (vrpo_diagnostics || vrpo_one_update || vrpo_schedule_screen ||
-       vrpo_ppo_pilot || vrpo_ppo_continuation)
+       vrpo_ppo_pilot || vrpo_ppo_continuation || vrpo_q_warmup)
           ? &vrpo_capture_buffer
           : nullptr);
-  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation) {
+  if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
+      vrpo_q_warmup) {
     std::string deadline_error;
     const bool deadline_ok = vrpo_schedule_screen
         ? vrpo_schedule_deadline.Check("after rollout collection",
@@ -9949,8 +10178,11 @@ int main(int argc, char** argv) {
         : vrpo_ppo_pilot
             ? vrpo_ppo_pilot_deadline.Check("after rollout collection",
                                             &deadline_error)
-            : vrpo_ppo_continuation_deadline.Check(
-                  "after rollout collection", &deadline_error);
+            : vrpo_ppo_continuation
+                ? vrpo_ppo_continuation_deadline.Check(
+                      "after rollout collection", &deadline_error)
+                : vrpo_q_warmup_deadline.Check(
+                      "after rollout collection", &deadline_error);
     if (!deadline_ok) {
       SpielFatalError(deadline_error);
     }
@@ -10438,6 +10670,125 @@ int main(int argc, char** argv) {
     }
     SpielFatalError(
         "PPO continuation loop exited without terminal disposition");
+  }
+  if (vrpo_q_warmup) {
+    std::vector<open_spiel::VrpoCapturedEpisode> captured =
+        vrpo_capture_buffer.TakeSorted();
+    std::string warmup_error;
+    const std::string expected_actor_state =
+        vrpo_q_warmup_state.actor_state_sha256;
+    auto require_frozen_actor = [&](const std::string& stage) {
+      const std::string training_hash =
+          open_spiel::vrpo_q_warmup_internal::
+              ModuleParametersAndBuffersSha256(*training_model,
+                                               &warmup_error);
+      const std::string inference_hash =
+          open_spiel::vrpo_q_warmup_internal::
+              ModuleParametersAndBuffersSha256(*inference_model,
+                                               &warmup_error);
+      if (training_hash != expected_actor_state ||
+          inference_hash != expected_actor_state) {
+        SpielFatalError("Q-warmup actor moved at " + stage + ": " +
+                        warmup_error);
+      }
+    };
+    require_frozen_actor("first collection");
+    for (int update = 1; update <= open_spiel::kVrpoQWarmupUpdates;
+         ++update) {
+      const uint64_t expected_start =
+          open_spiel::kVrpoQWarmupTrainStartEpisodeId +
+          static_cast<uint64_t>(update - 1) *
+              open_spiel::kVrpoQWarmupGamesPerUpdate;
+      std::vector<open_spiel::VrpoTrainingEpisode> training_episodes;
+      open_spiel::VrpoPhase4ePairingStats pairing;
+      if (!current_collect.episode_ids_unique ||
+          current_collect.games != static_cast<uint64_t>(
+              open_spiel::kVrpoQWarmupGamesPerUpdate) ||
+          !open_spiel::BuildVrpoPhase4eTrainingEpisodes(
+              captured, current_collect.rollout, expected_start,
+              open_spiel::kVrpoQWarmupGamesPerUpdate,
+              &training_episodes, &pairing, &warmup_error)) {
+        SpielFatalError("Q-warmup training capture/pairing failed: " +
+                        warmup_error);
+      }
+      open_spiel::json::Object update_result;
+      if (!open_spiel::WriteVrpoQWarmupUpdate(
+              vrpo_q_warmup_startup, vrpo_q_warmup_layout,
+              training_episodes, pairing, training_model,
+              vrpo_q_warmup_q, *vrpo_q_warmup_q_optimizer, device,
+              vrpo_q_warmup_deadline, update,
+              open_spiel::VrpoQWarmupFailurePoint::kNone,
+              &vrpo_q_warmup_state, &update_result, &warmup_error)) {
+        SpielFatalError("Q-warmup Q-only update transaction failed: " +
+                        warmup_error);
+      }
+      require_frozen_actor("after Q-only update " +
+                           std::to_string(update));
+      if (!vrpo_q_warmup_deadline.Check(
+              "before next actor-only rollout collection", &warmup_error)) {
+        SpielFatalError(warmup_error);
+      }
+      open_spiel::VrpoCapturedEpisodeBuffer next_capture;
+      current_collect = open_spiel::CollectRollout(
+          game.get(), evaluator, obs_size, &total_env_steps, num_threads,
+          &next_episode_id, rollout_games, reward_lambda, &next_capture);
+      captured = next_capture.TakeSorted();
+      require_frozen_actor("after next actor-only rollout collection");
+      std::string q_hash;
+      std::string optimizer_hash;
+      if (!open_spiel::vrpo_training_internal::ModuleValueSha256(
+              *vrpo_q_warmup_q, "", &q_hash, &warmup_error) ||
+          q_hash != vrpo_q_warmup_state.latest_q_values_sha256 ||
+          !open_spiel::vrpo_q_warmup_internal::QOptimizerStateSha256(
+              *vrpo_q_warmup_q_optimizer, *vrpo_q_warmup_q,
+              vrpo_q_warmup_state.q_optimizer_steps,
+              &optimizer_hash, &warmup_error) ||
+          optimizer_hash !=
+              vrpo_q_warmup_state.latest_q_optimizer_state_sha256 ||
+          !vrpo_q_warmup_deadline.Check(
+              "after next actor-only rollout collection", &warmup_error)) {
+        SpielFatalError(
+            "Q-warmup rollout collection mutated Q/Adam or exceeded deadline: " +
+            warmup_error);
+      }
+    }
+    std::vector<open_spiel::VrpoTrainingEpisode> holdout_episodes;
+    open_spiel::VrpoPhase4ePairingStats holdout_pairing;
+    if (!current_collect.episode_ids_unique ||
+        current_collect.games != static_cast<uint64_t>(
+            open_spiel::kVrpoQWarmupHoldoutGames) ||
+        !open_spiel::BuildVrpoPhase4eTrainingEpisodes(
+            captured, current_collect.rollout,
+            open_spiel::kVrpoQWarmupHoldoutStartEpisodeId,
+            open_spiel::kVrpoQWarmupHoldoutGames,
+            &holdout_episodes, &holdout_pairing, &warmup_error)) {
+      SpielFatalError("Q-warmup holdout capture/pairing failed: " +
+                      warmup_error);
+    }
+    auto initial_q =
+        std::make_shared<open_spiel::DuneVrpoQNetImpl>(
+            open_spiel::kVrpoQWarmupQSeed);
+    initial_q->to(device, torch::kFloat32);
+    if (!open_spiel::LoadVrpoModule(
+            *initial_q, vrpo_q_warmup_startup.prior.q_model_path,
+            &warmup_error)) {
+      SpielFatalError("Q-warmup initial Q reload failed: " + warmup_error);
+    }
+    open_spiel::json::Object warmup_result;
+    if (!open_spiel::WriteVrpoQWarmupHoldoutAndGlobalResult(
+            vrpo_q_warmup_startup, vrpo_q_warmup_layout,
+            holdout_episodes, holdout_pairing, training_model, initial_q,
+            vrpo_q_warmup_q, *vrpo_q_warmup_q_optimizer,
+            vrpo_q_warmup_deadline,
+            open_spiel::VrpoQWarmupFailurePoint::kNone,
+            &vrpo_q_warmup_state, &warmup_result, &warmup_error)) {
+      SpielFatalError("Q-warmup holdout/status transaction failed: " +
+                      warmup_error);
+    }
+    std::cout << "Q-warmup "
+              << warmup_result.at("classification").GetString() << ": "
+              << vrpo_q_warmup_startup.output_root << "\n";
+    return 0;
   }
   if (numerical_parity) {
     const auto batch_evaluator =

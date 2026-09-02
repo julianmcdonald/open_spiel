@@ -55,6 +55,7 @@
 #include "dune_vrpo_phase4e.h"
 #include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_ppo_continuation.h"
+#include "dune_vrpo_q_warmup.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_vrpo_training.h"
 #include <chrono>
@@ -8188,6 +8189,515 @@ void TestVrpoPpoContinuationU5U8ContractsAndRollbackLive() {
     ResetVrpoScheduleQTargetInstrumentation();
   } TEST_END();
 }
+
+void TestVrpoQWarmupQOnlyAndDecisionContracts() {
+  TEST_BEGIN("VRPO Q-warmup ownership preserves collisions and prior evidence") {
+    const auto root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_qwarm_ownership_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root);
+    auto write_sentinel = [](const std::filesystem::path& path,
+                             const std::string& value) {
+      std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+      stream << value;
+      stream.flush();
+      UTILS_CHECK(stream.good());
+    };
+    auto read_sentinel = [](const std::filesystem::path& path) {
+      std::ifstream stream(path, std::ios::binary);
+      return std::string((std::istreambuf_iterator<char>(stream)),
+                         std::istreambuf_iterator<char>());
+    };
+
+    const auto preexisting_root = root / "preexisting_root";
+    std::filesystem::create_directory(preexisting_root);
+    write_sentinel(preexisting_root / "SENTINEL", "preexisting-root");
+    bool owns = true;
+    std::string error;
+    UTILS_CHECK(!vrpo_q_warmup_internal::ClaimFreshDirectory(
+        preexisting_root, &owns, &error));
+    UTILS_CHECK(!owns);
+    CHECK_EQ(read_sentinel(preexisting_root / "SENTINEL"),
+             "preexisting-root");
+    const auto claimed_root = root / "claimed_root";
+    UTILS_CHECK(vrpo_q_warmup_internal::ClaimFreshDirectory(
+        claimed_root, &owns, &error));
+    UTILS_CHECK(owns);
+    vrpo_ppo_pilot_internal::CleanupPath(claimed_root);
+
+    // This is the validate-then-collision case: destination appears after the
+    // source was prepared. The atomic no-replace commit preserves both trees.
+    const auto source = root / "rename_source";
+    const auto destination = root / "rename_destination";
+    std::filesystem::create_directory(source);
+    std::filesystem::create_directory(destination);
+    write_sentinel(source / "PAYLOAD", "ours");
+    write_sentinel(destination / "SENTINEL", "collision");
+    bool moved = true;
+    UTILS_CHECK(!vrpo_q_warmup_internal::RenameDirectoryNoReplace(
+        source, destination, &moved, &error));
+    UTILS_CHECK(!moved);
+    CHECK_EQ(read_sentinel(source / "PAYLOAD"), "ours");
+    CHECK_EQ(read_sentinel(destination / "SENTINEL"), "collision");
+    std::filesystem::remove_all(destination);
+    UTILS_CHECK(vrpo_q_warmup_internal::RenameDirectoryNoReplace(
+        source, destination, &moved, &error));
+    UTILS_CHECK(moved);
+    UTILS_CHECK(!std::filesystem::exists(source));
+    CHECK_EQ(read_sentinel(destination / "PAYLOAD"), "ours");
+
+    const auto atomic_output = root / "atomic_status.json";
+    write_sentinel(atomic_output, "foreign-status");
+    bool owns_output = true;
+    UTILS_CHECK(!vrpo_q_warmup_internal::WriteAtomicTextNoReplace(
+        atomic_output, "ours", &owns_output, &error));
+    UTILS_CHECK(!owns_output);
+    CHECK_EQ(read_sentinel(atomic_output), "foreign-status");
+    std::filesystem::remove(atomic_output);
+    write_sentinel(std::filesystem::path(atomic_output.string() + ".tmp"),
+                   "foreign-temp");
+    UTILS_CHECK(!vrpo_q_warmup_internal::WriteAtomicTextNoReplace(
+        atomic_output, "ours", &owns_output, &error));
+    CHECK_EQ(read_sentinel(
+                 std::filesystem::path(atomic_output.string() + ".tmp")),
+             "foreign-temp");
+    std::filesystem::remove(
+        std::filesystem::path(atomic_output.string() + ".tmp"));
+    UTILS_CHECK(vrpo_q_warmup_internal::WriteAtomicTextNoReplace(
+        atomic_output, "ours", &owns_output, &error));
+    UTILS_CHECK(owns_output);
+    CHECK_EQ(read_sentinel(atomic_output), "ours");
+
+    // Early duplicate/out-of-sequence rejection must not delete deterministic
+    // temp/final names or immutable prior evidence owned by another run.
+    const auto run_root = root / "run";
+    const auto prior_root = root / "prior";
+    std::filesystem::create_directory(run_root);
+    std::filesystem::create_directory(prior_root);
+    write_sentinel(prior_root / "IMMUTABLE", "prior-evidence");
+    const auto update_temp = run_root / ".update_1.tmp";
+    const auto update_final = run_root / "update_1";
+    std::filesystem::create_directory(update_temp);
+    std::filesystem::create_directory(update_final);
+    write_sentinel(update_temp / "SENTINEL", "foreign-update-temp");
+    write_sentinel(update_final / "SENTINEL", "foreign-update-final");
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    VrpoQWarmupStartupConfig startup;
+    startup.output_root = run_root;
+    startup.evidence_root = prior_root;
+    VrpoExpandedExpectedLayout layout;
+    VrpoPhase4ePairingStats pairing;
+    VrpoQWarmupState state;
+    json::Object result;
+    UTILS_CHECK(!WriteVrpoQWarmupUpdate(
+        startup, layout, {}, pairing, nullptr, nullptr,
+        *fixture.q_optimizer, torch::kCPU,
+        VrpoQWarmupDeadline::Start(std::chrono::steady_clock::now()), 1,
+        VrpoQWarmupFailurePoint::kNone, &state, &result, &error));
+    CHECK_EQ(read_sentinel(update_temp / "SENTINEL"),
+             "foreign-update-temp");
+    CHECK_EQ(read_sentinel(update_final / "SENTINEL"),
+             "foreign-update-final");
+    CHECK_EQ(read_sentinel(prior_root / "IMMUTABLE"), "prior-evidence");
+
+    std::filesystem::remove_all(update_temp);
+    std::filesystem::remove_all(update_final);
+    write_sentinel(run_root / "UNRELATED", "keep-out-of-sequence");
+    state.completed_updates = 2;
+    UTILS_CHECK(!WriteVrpoQWarmupUpdate(
+        startup, layout, {}, pairing, nullptr, nullptr,
+        *fixture.q_optimizer, torch::kCPU,
+        VrpoQWarmupDeadline::Start(std::chrono::steady_clock::now()), 1,
+        VrpoQWarmupFailurePoint::kNone, &state, &result, &error));
+    CHECK_EQ(read_sentinel(run_root / "UNRELATED"),
+             "keep-out-of-sequence");
+
+    const auto holdout_temp = run_root / ".holdout.tmp";
+    const auto holdout_final = run_root / "holdout";
+    std::filesystem::create_directory(holdout_temp);
+    std::filesystem::create_directory(holdout_final);
+    write_sentinel(holdout_temp / "SENTINEL", "foreign-holdout-temp");
+    write_sentinel(holdout_final / "SENTINEL", "foreign-holdout-final");
+    UTILS_CHECK(!WriteVrpoQWarmupHoldoutAndGlobalResult(
+        startup, layout, {}, pairing, nullptr, nullptr, nullptr,
+        *fixture.q_optimizer,
+        VrpoQWarmupDeadline::Start(std::chrono::steady_clock::now()),
+        VrpoQWarmupFailurePoint::kNone, &state, &result, &error));
+    CHECK_EQ(read_sentinel(holdout_temp / "SENTINEL"),
+             "foreign-holdout-temp");
+    CHECK_EQ(read_sentinel(holdout_final / "SENTINEL"),
+             "foreign-holdout-final");
+    CHECK_EQ(read_sentinel(prior_root / "IMMUTABLE"), "prior-evidence");
+    std::filesystem::remove_all(root, ec);
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup final status postcommit gates clean owned root") {
+    const auto base = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_qwarm_final_gate_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base);
+    auto exercise = [&](const std::string& name, bool force_bytes,
+                        bool force_deadline, bool expect_success) {
+      const auto run = base / name;
+      std::filesystem::create_directory(run);
+      bool owns_root = true;
+      int64_t peak = 0;
+      int64_t retained = -1;
+      std::string error;
+      const bool ok = vrpo_q_warmup_internal::CommitFinalStatusLast(
+          run, run / "Q_WARMUP_RESULT.json", "status\n",
+          VrpoQWarmupDeadline::Start(std::chrono::steady_clock::now()),
+          force_bytes, force_deadline, &owns_root, &peak, &retained, &error);
+      CHECK_EQ(ok, expect_success);
+      if (expect_success) {
+        UTILS_CHECK(!owns_root);
+        UTILS_CHECK(std::filesystem::is_regular_file(
+            run / "Q_WARMUP_RESULT.json"));
+        UTILS_CHECK(retained > 0);
+      } else {
+        UTILS_CHECK(!owns_root);
+        UTILS_CHECK(!std::filesystem::exists(run));
+      }
+    };
+    exercise("byte_overrun", true, false, false);
+    exercise("deadline_overrun", false, true, false);
+    exercise("valid", false, false, true);
+
+    const auto collision = base / "status_collision";
+    std::filesystem::create_directory(collision);
+    {
+      std::ofstream stream(collision / "Q_WARMUP_RESULT.json");
+      stream << "foreign-status";
+    }
+    bool owns_root = true;
+    int64_t peak = 0;
+    int64_t retained = -1;
+    std::string error;
+    UTILS_CHECK(!vrpo_q_warmup_internal::CommitFinalStatusLast(
+        collision, collision / "Q_WARMUP_RESULT.json", "ours\n",
+        VrpoQWarmupDeadline::Start(std::chrono::steady_clock::now()),
+        false, false, &owns_root, &peak, &retained, &error));
+    UTILS_CHECK(owns_root);
+    UTILS_CHECK(std::filesystem::exists(collision));
+    std::ifstream collision_stream(collision / "Q_WARMUP_RESULT.json");
+    std::string collision_text((std::istreambuf_iterator<char>(collision_stream)),
+                               std::istreambuf_iterator<char>());
+    CHECK_EQ(collision_text, "foreign-status");
+    std::filesystem::remove_all(base, ec);
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup central corpus is exhaustive and corruption closed") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+    std::string corpus;
+    VrpoScheduleCorpusIdentity encoded;
+    std::string error;
+    UTILS_CHECK(EncodeVrpoQWarmupCentralCorpus(
+        episodes, &corpus, &encoded, &error));
+    CHECK_EQ(encoded.episodes, int64_t{16});
+    CHECK_EQ(encoded.rows, int64_t{64});
+    UTILS_CHECK(VrpoPhase4eLowerHex64(encoded.payload_sha256));
+    std::vector<VrpoTrainingEpisode> decoded;
+    VrpoScheduleCorpusIdentity decoded_identity;
+    UTILS_CHECK(DecodeVrpoQWarmupCentralCorpus(
+        corpus, &decoded, &decoded_identity, &error));
+    CHECK_EQ(decoded_identity.payload_sha256, encoded.payload_sha256);
+    CHECK_EQ(decoded_identity.episode_sha256, encoded.episode_sha256);
+    CHECK_EQ(decoded.size(), episodes.size());
+    for (size_t episode = 0; episode < episodes.size(); ++episode) {
+      CHECK_EQ(decoded[episode].rows.size(), episodes[episode].rows.size());
+      for (size_t row = 0; row < episodes[episode].rows.size(); ++row) {
+        const auto& source = episodes[episode].rows[row];
+        const auto& restored = decoded[episode].rows[row];
+        CHECK_EQ(restored.row_id, source.row_id);
+        CHECK_EQ(restored.chosen_action, source.chosen_action);
+        UTILS_CHECK(restored.q_input.defined());
+        UTILS_CHECK(torch::equal(restored.actor_input.cpu(),
+                                 source.actor_input.cpu()));
+        UTILS_CHECK(torch::equal(restored.q_input.cpu(),
+                                 source.q_input.cpu()));
+        CHECK_EQ(restored.legal_actions, source.legal_actions);
+        CHECK_EQ(restored.old_legal_probabilities,
+                 source.old_legal_probabilities);
+        CHECK_EQ(restored.rewards, source.rewards);
+      }
+    }
+    std::string corrupted = corpus;
+    corrupted[corrupted.size() / 2] ^= 0x01;
+    UTILS_CHECK(!DecodeVrpoQWarmupCentralCorpus(
+        corrupted, &decoded, &decoded_identity, &error));
+    std::string truncated = corpus.substr(0, corpus.size() - 1);
+    UTILS_CHECK(!DecodeVrpoQWarmupCentralCorpus(
+        truncated, &decoded, &decoded_identity, &error));
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup Q-only mechanics, continuation, and rollback") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    std::unique_ptr<torch::optim::AdamW> q_optimizer;
+    std::string error;
+    UTILS_CHECK(vrpo_q_warmup_internal::MakeFreshQOptimizer(
+        *fixture.q, &q_optimizer, &error));
+    std::string initial_optimizer;
+    UTILS_CHECK(vrpo_q_warmup_internal::QOptimizerStateSha256(
+        *q_optimizer, *fixture.q, 0, &initial_optimizer, &error));
+    const std::string actor_before =
+        vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+            *fixture.actor, &error);
+    const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+    const VrpoPhase4ArmConfig* arm =
+        FindCanonicalVrpoPhase4Arm("VRPO_CAP10");
+    UTILS_CHECK(arm != nullptr);
+    VrpoTrainingTargetBundle expected_targets;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        *arm, episodes, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &expected_targets, &error));
+
+    VrpoQWarmupUpdateStats first;
+    UTILS_CHECK(RunVrpoQWarmupQOnlyUpdate(
+        episodes, 7001, *fixture.actor, *fixture.q, *q_optimizer,
+        fixture.actor_forward, fixture.q_forward, 0, &first, &error));
+    UTILS_CHECK(first.success);
+    CHECK_EQ(first.q_optimizer_steps, 64);
+    CHECK_EQ(first.q_backward_calls, 64);
+    CHECK_EQ(first.target_refreshes, 1);
+    CHECK_EQ(first.target_values_sha256,
+             expected_targets.target_values_sha256);
+    CHECK_EQ(first.actor_state_before_sha256, actor_before);
+    CHECK_EQ(first.actor_state_after_sha256, actor_before);
+    UTILS_CHECK(first.q_values_before_sha256 == q_before);
+    UTILS_CHECK(first.q_values_after_sha256 != q_before);
+    UTILS_CHECK(first.q_rows_seen > 0);
+    UTILS_CHECK(std::isfinite(first.q_loss_mean));
+    UTILS_CHECK(first.max_q_grad_norm > 0.0);
+    for (const auto& item : fixture.actor->named_parameters()) {
+      UTILS_CHECK(!item.value().grad().defined());
+    }
+
+    // A second call consumes the persisted Adam state, refreshes targets from
+    // the current Q, and advances every parameter from step 64 to step 128.
+    VrpoTrainingTargetBundle second_expected;
+    UTILS_CHECK(ComputeVrpoTrainingTargets(
+        *arm, episodes, *fixture.actor, *fixture.q,
+        fixture.actor_forward, fixture.q_forward, &second_expected, &error));
+    VrpoQWarmupUpdateStats second;
+    UTILS_CHECK(RunVrpoQWarmupQOnlyUpdate(
+        episodes, 7002, *fixture.actor, *fixture.q, *q_optimizer,
+        fixture.actor_forward, fixture.q_forward, 64, &second, &error));
+    CHECK_EQ(second.q_optimizer_steps, 64);
+    CHECK_EQ(second.target_values_sha256,
+             second_expected.target_values_sha256);
+    UTILS_CHECK(second.target_bundle_sha256 != first.target_bundle_sha256);
+    std::string step128;
+    UTILS_CHECK(vrpo_q_warmup_internal::QOptimizerStateSha256(
+        *q_optimizer, *fixture.q, 128, &step128, &error));
+    UTILS_CHECK(step128 != initial_optimizer);
+    CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                 *fixture.actor, &error),
+             actor_before);
+
+    // A later minibatch failure must restore both Q weights and the complete
+    // nonfresh Adam state, not merely clear gradients.
+    const std::string rollback_q = TinyVrpoModuleHash(*fixture.q);
+    const std::string rollback_optimizer = step128;
+    int forward_calls = 0;
+    VrpoQForward failing_forward =
+        [q = fixture.q, &forward_calls](const torch::Tensor& input) {
+          ++forward_calls;
+          torch::Tensor result = q->Forward(input);
+          if (forward_calls == 6) {
+            result.index_put_({0, 0, 0},
+                              std::numeric_limits<float>::quiet_NaN());
+          }
+          return result;
+        };
+    VrpoQWarmupUpdateStats rejected;
+    UTILS_CHECK(!RunVrpoQWarmupQOnlyUpdate(
+        episodes, 7003, *fixture.actor, *fixture.q, *q_optimizer,
+        fixture.actor_forward, failing_forward, 128, &rejected, &error));
+    CHECK_EQ(TinyVrpoModuleHash(*fixture.q), rollback_q);
+    std::string rollback_after;
+    UTILS_CHECK(vrpo_q_warmup_internal::QOptimizerStateSha256(
+        *q_optimizer, *fixture.q, 128, &rollback_after, &error));
+    CHECK_EQ(rollback_after, rollback_optimizer);
+    CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                 *fixture.actor, &error),
+             actor_before);
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup metric math and decision classification") {
+    std::string error;
+    VrpoQWarmupMetric metric;
+    UTILS_CHECK(ComputeVrpoQWarmupMetric(
+        {1.0, 2.0, 3.0}, {1.0, 1.0, 5.0}, &metric, &error));
+    CHECK_EQ(metric.count, 3);
+    CHECK_NEAR(metric.mse, 5.0 / 3.0, 1e-12);
+    CHECK_NEAR(metric.mae, 1.0, 1e-12);
+    CHECK_NEAR(metric.pearson, 0.8660254037844386, 1e-12);
+    UTILS_CHECK(metric.finite);
+    UTILS_CHECK(!metric.zero_variance);
+    VrpoQWarmupMetric zero_variance;
+    UTILS_CHECK(ComputeVrpoQWarmupMetric(
+        {2.0, 2.0, 2.0}, {1.0, 2.0, 3.0},
+        &zero_variance, &error));
+    UTILS_CHECK(zero_variance.zero_variance);
+    CHECK_NEAR(zero_variance.pearson, 0.0, 0.0);
+
+    VrpoQWarmupMetricSet initial;
+    VrpoQWarmupMetricSet improved;
+    initial.chosen_q = metric;
+    initial.policy_v = metric;
+    improved.chosen_q = metric;
+    improved.policy_v = metric;
+    improved.chosen_q.mse = 0.9 * metric.mse;
+    improved.policy_v.mse = 0.9 * metric.mse;
+    UTILS_CHECK(VrpoQWarmupImprovementPass(
+        initial, improved, true, true, true));
+    improved.policy_v.mse = 0.9000001 * metric.mse;
+    UTILS_CHECK(!VrpoQWarmupImprovementPass(
+        initial, improved, true, true, true));
+    improved.policy_v.mse = 0.8 * metric.mse;
+    improved.chosen_q.pearson = metric.pearson - 2e-6;
+    UTILS_CHECK(!VrpoQWarmupImprovementPass(
+        initial, improved, true, true, true));
+    UTILS_CHECK(!VrpoQWarmupImprovementPass(
+        initial, improved, false, true, true));
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup immutable profile, IDs, source, and deadline") {
+    CHECK_EQ(std::string(kVrpoQWarmupProfile),
+             std::string(kVrpoQWarmupRegistrationId));
+    CHECK_EQ(kVrpoQWarmupTrainEndEpisodeIdInclusive -
+                 kVrpoQWarmupTrainStartEpisodeId + 1,
+             uint64_t{64});
+    CHECK_EQ(kVrpoQWarmupHoldoutStartEpisodeId,
+             kVrpoQWarmupTrainEndEpisodeIdInclusive + 1);
+    CHECK_EQ(kVrpoQWarmupHoldoutEndEpisodeIdInclusive -
+                 kVrpoQWarmupHoldoutStartEpisodeId + 1,
+             uint64_t{16});
+    CHECK_EQ(kVrpoQWarmupFinalQSteps, int64_t{256});
+    const auto evidence = VrpoQWarmupCanonicalEvidenceFiles();
+    CHECK_EQ(evidence.size(), size_t{18});
+    std::set<std::string> evidence_paths;
+    for (const auto& item : evidence) {
+      UTILS_CHECK(VrpoPhase4eLowerHex64(item.expected_sha256));
+      UTILS_CHECK(evidence_paths.insert(item.relative_path.string()).second);
+    }
+    const auto sources = VrpoQWarmupSourceRelativePaths();
+    CHECK_EQ(sources.back(),
+             "open_spiel/examples/dune_vrpo_q_warmup.h");
+    std::set<std::string> source_set(sources.begin(), sources.end());
+    CHECK_EQ(source_set.size(), sources.size());
+    auto deadline = VrpoQWarmupDeadline::ExpireAfterChecksForTest(1);
+    std::string error;
+    UTILS_CHECK(deadline.Check("first", &error));
+    UTILS_CHECK(!deadline.Check("second", &error));
+
+    VrpoQWarmupStartupConfig startup;
+    startup.game = "dune_imperium";
+    startup.init_mode = "vrpo_q_warmup";
+    startup.profile = kVrpoQWarmupProfile;
+    startup.registration_id = "fixture";
+    startup.output_root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_qwarm_startup_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(startup.output_root);
+    startup.source_root = std::filesystem::temp_directory_path();
+    startup.source_code_sha256 = std::string(64, '1');
+    startup.executed_binary_sha256 = std::string(64, '2');
+    startup.executed_binary_size = 1;
+    startup.evidence_root = std::filesystem::temp_directory_path();
+    startup.prior.observations.push_back(
+        {"fixture", "fixture", std::string(64, '3'),
+         std::string(64, '3'), std::string(64, '3'), 1, true});
+    startup.prior.actor_path = "actor.pt";
+    startup.prior.q_model_path = "q.pt";
+    startup.prior.q_optimizer_path = "q_optimizer.pt";
+    startup.rollout_games = 16;
+    startup.threads = 8;
+    startup.eval_batch_size = 64;
+    startup.eval_timeout_ms = 2;
+    startup.evaluator_device_synchronize = true;
+    startup.seed_scheme_version = 2;
+    startup.runtime_device_is_cuda = true;
+    startup.runtime_device_index = 0;
+    startup.one_gpu_process = true;
+    startup.runtime_process_id = ::getpid();
+    startup.base_seed = 1;
+    startup.start_episode_id = 1;
+    startup.allow_tf32 = true;
+    startup.learning_rate =
+        CanonicalVrpoPhase4OptimizerGroups()[2].learning_rate;
+    startup.ppo_update_epochs = 4;
+    startup.reward_scale = 4.0;
+    startup.gamma = 1.0;
+    startup.lambda = 1.0;
+    startup.logit_cap = 10.0;
+    startup.ppo_minibatches = 16;
+    startup.ppo_minibatch_size = 2048;
+    startup.clip_epsilon = 0.2;
+    startup.entropy_coefficient = 0.01;
+    startup.value_coefficient = 0.5;
+    startup.gradient_clip_norm = 0.5;
+    startup.normalize_advantages = true;
+    startup.clip_value_loss = true;
+    UTILS_CHECK(ValidateVrpoQWarmupStartupConfig(
+        startup, &error, true));
+    startup.rollout_amp = true;
+    UTILS_CHECK(!ValidateVrpoQWarmupStartupConfig(
+        startup, &error, true));
+    startup.rollout_amp = false;
+    startup.logit_cap = 0.0;
+    UTILS_CHECK(!ValidateVrpoQWarmupStartupConfig(
+        startup, &error, true));
+    startup.logit_cap = 10.0;
+    std::filesystem::create_directory(startup.output_root);
+    UTILS_CHECK(!ValidateVrpoQWarmupStartupConfig(
+        startup, &error, true));
+    std::filesystem::remove_all(startup.output_root);
+  } TEST_END();
+
+  TEST_BEGIN("VRPO Q-warmup live CUDA placement keeps actor inert") {
+    if (torch::cuda::is_available()) {
+      auto fixture = MakeTinyVrpoTrainingFixture();
+      auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+      const torch::Device cuda(torch::kCUDA, 0);
+      fixture.actor->to(cuda, torch::kFloat32);
+      fixture.q->to(cuda, torch::kFloat32);
+      for (auto& episode : episodes) {
+        for (auto& row : episode.rows) {
+          row.actor_input = row.actor_input.to(cuda);
+          row.q_input = row.q_input.to(cuda);
+        }
+      }
+      std::unique_ptr<torch::optim::AdamW> q_optimizer;
+      std::string error;
+      UTILS_CHECK(vrpo_q_warmup_internal::MakeFreshQOptimizer(
+          *fixture.q, &q_optimizer, &error));
+      const std::string actor_before =
+          vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+              *fixture.actor, &error);
+      VrpoQWarmupUpdateStats stats;
+      UTILS_CHECK(RunVrpoQWarmupQOnlyUpdate(
+          episodes, 88001, *fixture.actor, *fixture.q, *q_optimizer,
+          fixture.actor_forward, fixture.q_forward, 0, &stats, &error));
+      CHECK_EQ(stats.q_optimizer_steps, int64_t{64});
+      CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                   *fixture.actor, &error),
+               actor_before);
+      for (const auto& item : fixture.actor->named_parameters()) {
+        UTILS_CHECK(item.value().device().is_cuda());
+        UTILS_CHECK(item.value().scalar_type() == torch::kFloat32);
+        UTILS_CHECK(!item.value().grad().defined());
+      }
+      std::string optimizer_hash;
+      UTILS_CHECK(vrpo_q_warmup_internal::QOptimizerStateSha256(
+          *q_optimizer, *fixture.q, 64, &optimizer_hash, &error));
+      UTILS_CHECK(VrpoPhase4eLowerHex64(optimizer_hash));
+    }
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -8247,6 +8757,7 @@ int main() {
   TestVrpoScheduleHealthAndPpoEquivalenceLive();
   TestVrpoPpoPilotContractsContinuationAndRollbackLive();
   TestVrpoPpoContinuationU5U8ContractsAndRollbackLive();
+  TestVrpoQWarmupQOnlyAndDecisionContracts();
 #endif
 
   // -----------------------------------------------------------------------
