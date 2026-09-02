@@ -52,6 +52,7 @@
 #include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_ppo_continuation.h"
 #include "dune_vrpo_q_warmup.h"
+#include "dune_vrpo_q_offline_screen.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_pwo5_aux.h"
 #include "dune_search_label_buffer.h"
@@ -299,6 +300,22 @@ ABSL_FLAG(std::string, vrpo_q_warmup_binary_sha256, "",
           "Registered SHA-256 of the executing Q-warmup binary.");
 ABSL_FLAG(int64_t, vrpo_q_warmup_binary_size, 0,
           "Registered byte size of the executing Q-warmup binary.");
+ABSL_FLAG(std::string, vrpo_q_offline_output_root, "",
+          "Fresh root for the terminal offline Q target/LR screen.");
+ABSL_FLAG(std::string, vrpo_q_offline_registration_id, "",
+          "Immutable offline Q target/LR screen registration ID.");
+ABSL_FLAG(std::string, vrpo_q_offline_profile, "",
+          "Required compiled offline Q screen profile.");
+ABSL_FLAG(std::string, vrpo_q_offline_evidence_root, "",
+          "Root containing the immutable Q-warmup retry evidence/corpora.");
+ABSL_FLAG(std::string, vrpo_q_offline_source_root, "",
+          "Source root for the fixed offline Q screen source list.");
+ABSL_FLAG(std::string, vrpo_q_offline_source_sha256, "",
+          "Registered SHA-256 of the offline Q screen source list.");
+ABSL_FLAG(std::string, vrpo_q_offline_binary_sha256, "",
+          "Registered SHA-256 of the executing offline Q screen binary.");
+ABSL_FLAG(int64_t, vrpo_q_offline_binary_size, 0,
+          "Registered byte size of the executing offline Q screen binary.");
 
 ABSL_FLAG(double, shaped_reward_weight, 0.0,
           "Weight for intermediate VP shaped rewards.");
@@ -5857,6 +5874,9 @@ int main(int argc, char** argv) {
   const open_spiel::VrpoQWarmupDeadline vrpo_q_warmup_deadline =
       open_spiel::VrpoQWarmupDeadline::Start(
           vrpo_schedule_process_start, std::chrono::seconds(1800));
+  const open_spiel::VrpoQOfflineDeadline vrpo_q_offline_deadline =
+      open_spiel::VrpoQOfflineDeadline::Start(
+          vrpo_schedule_process_start, std::chrono::seconds(1200));
   const bool numerical_parity =
       !absl::GetFlag(FLAGS_numerical_parity_output).empty();
   const bool vrpo_capture =
@@ -5878,6 +5898,8 @@ int main(int argc, char** argv) {
       !absl::GetFlag(FLAGS_vrpo_ppo_continuation_output_root).empty();
   const bool vrpo_q_warmup =
       !absl::GetFlag(FLAGS_vrpo_q_warmup_output_root).empty();
+  const bool vrpo_q_offline =
+      !absl::GetFlag(FLAGS_vrpo_q_offline_output_root).empty();
   const bool vrpo_diagnostics = vrpo_capture || vrpo_q_preflight;
   if (static_cast<int>(numerical_parity) + static_cast<int>(vrpo_capture) +
           static_cast<int>(vrpo_q_preflight) +
@@ -5885,10 +5907,11 @@ int main(int argc, char** argv) {
           static_cast<int>(vrpo_schedule_screen) +
           static_cast<int>(vrpo_ppo_pilot) +
           static_cast<int>(vrpo_ppo_continuation) +
-          static_cast<int>(vrpo_q_warmup) >
+          static_cast<int>(vrpo_q_warmup) +
+          static_cast<int>(vrpo_q_offline) >
       1) {
     open_spiel::SpielFatalError(
-        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, PPO-pilot, PPO-continuation, and Q-warmup modes are mutually exclusive");
+        "Numerical parity, VRPO capture, VRPO Q preflight, VRPO bootstrap, VRPO one-update, VRPO schedule-screen, PPO-pilot, PPO-continuation, Q-warmup, and offline-Q modes are mutually exclusive");
   }
   if (vrpo_one_update &&
       (absl::GetFlag(FLAGS_vrpo_one_update_input_archive).empty() ||
@@ -5919,6 +5942,12 @@ int main(int argc, char** argv) {
        absl::GetFlag(FLAGS_vrpo_q_warmup_evidence_root).empty())) {
     open_spiel::SpielFatalError(
         "Q warm-up requires registration, evidence, and fresh output roots");
+  }
+  if (vrpo_q_offline &&
+      (absl::GetFlag(FLAGS_vrpo_q_offline_registration_id).empty() ||
+       absl::GetFlag(FLAGS_vrpo_q_offline_evidence_root).empty())) {
+    open_spiel::SpielFatalError(
+        "Offline Q screen requires registration, evidence, and fresh output roots");
   }
   if (vrpo_schedule_screen) {
     std::string resource_error;
@@ -6503,10 +6532,10 @@ int main(int argc, char** argv) {
         "does not execute BF16 autocast and cannot test the registered gate.");
   }
   if ((vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
-       vrpo_q_warmup) &&
+       vrpo_q_warmup || vrpo_q_offline) &&
       !device.is_cuda()) {
     SpielFatalError(
-        "VRPO schedule screen, PPO pilot, PPO continuation, and Q warm-up require CUDA");
+        "VRPO schedule screen, PPO pilot, PPO continuation, Q warm-up, and offline Q screen require CUDA");
   }
   open_spiel::PpoNumericalParitySourceProvenance
       parity_source_provenance;
@@ -6524,6 +6553,8 @@ int main(int argc, char** argv) {
       vrpo_ppo_continuation_preflight;
   open_spiel::VrpoPhase4eSourceIdentity vrpo_q_warmup_source_identity;
   open_spiel::VrpoQWarmupStartupConfig vrpo_q_warmup_preflight;
+  open_spiel::VrpoPhase4eSourceIdentity vrpo_q_offline_source_identity;
+  open_spiel::VrpoQOfflineStartupConfig vrpo_q_offline_preflight;
   if (numerical_parity) {
     // Source identity is verified before model load and, critically, before a
     // rollout worker can be created. A mismatch cannot produce a partial
@@ -6746,6 +6777,54 @@ int main(int argc, char** argv) {
     vrpo_q_warmup_preflight.executed_binary_sha256 = binary_sha256;
     vrpo_q_warmup_preflight.executed_binary_size = binary_size;
   }
+  if (vrpo_q_offline) {
+    std::string source_error;
+    if (absl::GetFlag(FLAGS_init_mode) != "vrpo_q_offline_screen" ||
+        absl::GetFlag(FLAGS_vrpo_q_offline_profile) !=
+            open_spiel::kVrpoQOfflineProfile ||
+        absl::GetFlag(FLAGS_vrpo_q_offline_registration_id) !=
+            open_spiel::kVrpoQOfflineRegistrationId ||
+        absl::GetFlag(FLAGS_total_updates) != 0 ||
+        absl::GetFlag(FLAGS_rollout_games) != 0) {
+      SpielFatalError(
+          "Offline Q screen compiled profile/registration/no-collection contract rejected before model construction");
+    }
+    if (!open_spiel::LoadVrpoQOfflineSourceIdentity(
+            absl::GetFlag(FLAGS_vrpo_q_offline_source_root),
+            absl::GetFlag(FLAGS_vrpo_q_offline_source_sha256),
+            &vrpo_q_offline_source_identity, &source_error) ||
+        !vrpo_q_offline_deadline.Check(
+            "after offline-Q source identity", &source_error)) {
+      SpielFatalError("Offline Q source identity rejected: " + source_error);
+    }
+    vrpo_q_offline_preflight.output_root =
+        absl::GetFlag(FLAGS_vrpo_q_offline_output_root);
+    vrpo_q_offline_preflight.evidence_root =
+        absl::GetFlag(FLAGS_vrpo_q_offline_evidence_root);
+    if (!open_spiel::vrpo_q_offline_internal::ValidateRetryEvidence(
+            vrpo_q_offline_preflight.evidence_root,
+            &vrpo_q_offline_preflight.evidence, &source_error)) {
+      SpielFatalError(
+          "Offline Q immutable retry/corpus/origin chain rejected before model construction: " +
+          source_error);
+    }
+    std::error_code binary_ec;
+    const auto binary_path =
+        std::filesystem::read_symlink("/proc/self/exe", binary_ec);
+    size_t binary_size = 0;
+    const std::string binary_sha256 = binary_ec || binary_path.empty()
+        ? std::string()
+        : open_spiel::ComputeFileSHA256(binary_path.string(), &binary_size);
+    if (binary_sha256 !=
+            absl::GetFlag(FLAGS_vrpo_q_offline_binary_sha256) ||
+        static_cast<int64_t>(binary_size) !=
+            absl::GetFlag(FLAGS_vrpo_q_offline_binary_size)) {
+      SpielFatalError(
+          "Offline Q executed binary identity mismatch before model construction");
+    }
+    vrpo_q_offline_preflight.executed_binary_sha256 = binary_sha256;
+    vrpo_q_offline_preflight.executed_binary_size = binary_size;
+  }
 
   // PWO-5 section 7.2 / Appendix A.1.
   //
@@ -6850,10 +6929,77 @@ int main(int argc, char** argv) {
   training_model->train();
   inference_model->eval();
 
+  // The offline Q screen terminates here, before any actor optimizer,
+  // evaluator, rollout worker, or environment collection can be constructed.
+  if (vrpo_q_offline) {
+    std::string offline_error;
+    open_spiel::VrpoQOfflineStartupConfig startup =
+        vrpo_q_offline_preflight;
+    startup.game = absl::GetFlag(FLAGS_game);
+    startup.init_mode = absl::GetFlag(FLAGS_init_mode);
+    startup.profile = absl::GetFlag(FLAGS_vrpo_q_offline_profile);
+    startup.registration_id =
+        absl::GetFlag(FLAGS_vrpo_q_offline_registration_id);
+    startup.source_root = absl::GetFlag(FLAGS_vrpo_q_offline_source_root);
+    startup.source_code_sha256 =
+        vrpo_q_offline_source_identity.combined_sha256;
+    startup.runtime_device_is_cuda = device.is_cuda();
+    startup.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+    startup.train_amp = absl::GetFlag(FLAGS_train_amp);
+    startup.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+    startup.pipeline = absl::GetFlag(FLAGS_pipeline);
+    startup.diagnostics_only = absl::GetFlag(FLAGS_diagnostics_only);
+    startup.any_collection_or_training_side_path =
+        absl::GetFlag(FLAGS_total_updates) != 0 ||
+        absl::GetFlag(FLAGS_rollout_games) != 0 ||
+        absl::GetFlag(FLAGS_online_search_collection) ||
+        absl::GetFlag(FLAGS_search_pi_mode) ||
+        absl::GetFlag(FLAGS_train_value_only) ||
+        absl::GetFlag(FLAGS_sample_counterfactual_states) ||
+        !absl::GetFlag(FLAGS_search_label_dir).empty() ||
+        !absl::GetFlag(FLAGS_aux_target_path).empty() ||
+        !absl::GetFlag(FLAGS_artifact_manifest).empty() ||
+        absl::GetFlag(FLAGS_checkpoint_interval) != 0 ||
+        absl::GetFlag(FLAGS_save_final_checkpoint);
+    startup.logit_cap = absl::GetFlag(FLAGS_logit_cap);
+    startup.reward_scale = absl::GetFlag(FLAGS_reward_scale);
+    startup.gamma = absl::GetFlag(FLAGS_gamma);
+    startup.lambda = absl::GetFlag(FLAGS_gae_lambda);
+    startup.shaping = {
+        absl::GetFlag(FLAGS_shaped_reward_weight),
+        absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight),
+        absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight),
+        absl::GetFlag(FLAGS_specimen_exchange_penalty)};
+    if (absl::GetFlag(FLAGS_hidden_dim) != 2048 ||
+        absl::GetFlag(FLAGS_num_blocks) != 8 ||
+        absl::GetFlag(FLAGS_nonlinear_value_head) || obs_size != 5580 ||
+        action_size != 2391 ||
+        !open_spiel::ValidateVrpoQOfflineStartup(startup, &offline_error)) {
+      SpielFatalError("Offline Q startup rejected: " + offline_error);
+    }
+    open_spiel::VrpoExpandedExpectedLayout layout;
+    layout.label = "production_dune_vrpo_layout_v1";
+    layout.test_fixture = false;
+    layout.actor_observation_dim = obs_size;
+    layout.actor_hidden_dim = 2048;
+    layout.actor_action_dim = action_size;
+    layout.actor_residual_blocks = 8;
+    open_spiel::json::Object result;
+    if (!open_spiel::RunVrpoQOfflineScreen(
+            startup, vrpo_q_offline_source_identity, training_model, device,
+            layout, vrpo_q_offline_deadline, &result, &offline_error)) {
+      SpielFatalError("Offline Q target/LR screen failed: " + offline_error);
+    }
+    std::cout << "Offline Q screen "
+              << result.at("classification").GetString() << ": "
+              << startup.output_root << "\n";
+    return 0;
+  }
+
   std::unique_ptr<torch::optim::AdamW> optimizer;
   bool optimizer_constructed = false;
   if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
-      !vrpo_ppo_continuation && !vrpo_q_warmup &&
+      !vrpo_ppo_continuation && !vrpo_q_warmup && !vrpo_q_offline &&
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;

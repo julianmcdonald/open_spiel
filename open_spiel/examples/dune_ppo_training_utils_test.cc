@@ -56,6 +56,7 @@
 #include "dune_vrpo_ppo_pilot.h"
 #include "dune_vrpo_ppo_continuation.h"
 #include "dune_vrpo_q_warmup.h"
+#include "dune_vrpo_q_offline_screen.h"
 #include "dune_vrpo_schedule_screen.h"
 #include "dune_vrpo_training.h"
 #include <chrono>
@@ -8791,6 +8792,374 @@ void TestVrpoQWarmupQOnlyAndDecisionContracts() {
     }
   } TEST_END();
 }
+
+void TestVrpoQOfflineTargetLrScreenContracts() {
+  TEST_BEGIN("Offline Q cells, eligibility, and deterministic selection") {
+    const auto cells = CanonicalVrpoQOfflineCells();
+    CHECK_EQ(cells.size(), size_t{4});
+    CHECK_EQ(cells[0].id, "TD1");
+    CHECK_EQ(cells[1].id, "TD2");
+    CHECK_EQ(cells[2].id, "MC1");
+    CHECK_EQ(cells[3].id, "MC2");
+    CHECK_NEAR(cells[0].learning_rate, 1e-5, 0.0);
+    CHECK_NEAR(cells[1].learning_rate, 5e-6, 0.0);
+    UTILS_CHECK(cells[0].target_kind == VrpoQOfflineTargetKind::kTdLambda);
+    UTILS_CHECK(cells[2].target_kind == VrpoQOfflineTargetKind::kMonteCarlo);
+
+    auto partition_fixture = MakeTinyVrpoTrainingFixture();
+    auto partition_episodes = MakeTinyVrpoTrainingEpisodes(
+        *partition_fixture.actor, 10.0);
+    std::string partition_error;
+    for (int corpus = 0; corpus < kVrpoQOfflineCorpora; ++corpus) {
+      std::array<VrpoQOfflinePartitionBinding, kVrpoQOfflineCells> bindings;
+      std::array<std::string, kVrpoQOfflineCells> actual_hashes;
+      for (int cell = 0; cell < kVrpoQOfflineCells; ++cell) {
+        UTILS_CHECK(VrpoQOfflinePartitionBindingForCell(
+            cells[cell], corpus, &bindings[cell], &partition_error));
+        VrpoEpisodePartitionPlan plan;
+        UTILS_CHECK(BuildVrpoEpisodePartitionPlan(
+            partition_episodes, bindings[cell].seed, &plan,
+            &partition_error));
+        actual_hashes[cell] = plan.canonical_sha256;
+        CHECK_EQ(bindings[cell].expected_sha256,
+                 VrpoQOfflineExpectedPartitionSha256()[corpus]);
+      }
+      for (int cell = 1; cell < kVrpoQOfflineCells; ++cell) {
+        CHECK_EQ(bindings[cell].seed, bindings[0].seed);
+        CHECK_EQ(bindings[cell].expected_sha256,
+                 bindings[0].expected_sha256);
+        CHECK_EQ(actual_hashes[cell], actual_hashes[0]);
+      }
+      UTILS_CHECK(ValidateVrpoQOfflinePartitionBinding(
+          cells[0], corpus, bindings[0].seed,
+          bindings[0].expected_sha256, &partition_error));
+      UTILS_CHECK(!ValidateVrpoQOfflinePartitionBinding(
+          cells[0], corpus, bindings[0].seed + 1,
+          bindings[0].expected_sha256, &partition_error));
+      std::string wrong_hash = bindings[0].expected_sha256;
+      wrong_hash[0] = wrong_hash[0] == '0' ? '1' : '0';
+      UTILS_CHECK(!ValidateVrpoQOfflinePartitionBinding(
+          cells[0], corpus, bindings[0].seed, wrong_hash,
+          &partition_error));
+    }
+
+    std::vector<vrpo_q_offline_internal::CellDecision> decisions = {
+        {"TD1", 0, 0.80, 0.85, 0.01, 0.02, true},
+        {"TD2", 1, 0.82, 0.82, 0.02, 0.02, true},
+        {"MC1", 2, 0.70, 0.95, 0.03, 0.03, false},
+        {"MC2", 3, 0.80, 0.85, 0.01, 0.02, true}};
+    CHECK_EQ(vrpo_q_offline_internal::SelectCell(decisions), 1);
+    decisions[1].chosen_ratio = 0.80;
+    decisions[1].policy_ratio = 0.85;
+    decisions[1].chosen_pearson_gain = 0.01;
+    CHECK_EQ(vrpo_q_offline_internal::SelectCell(decisions), 0);
+    for (auto& decision : decisions) decision.eligible = false;
+    CHECK_EQ(vrpo_q_offline_internal::SelectCell(decisions), -1);
+  } TEST_END();
+
+  TEST_BEGIN("Offline Q MC targets use checked terminal absolute-seat returns") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+    std::map<uint64_t, VrpoTrainingTargetRow> targets;
+    std::string digest;
+    std::string error;
+    UTILS_CHECK(vrpo_q_offline_internal::BuildMonteCarloTargets(
+        episodes, &targets, &digest, &error));
+    CHECK_EQ(targets.size(), size_t{64});
+    UTILS_CHECK(VrpoPhase4eLowerHex64(digest));
+    for (const auto& episode : episodes) {
+      const VrpoSeatValues terminal = episode.rows.back().rewards;
+      for (const auto& row : episode.rows) {
+        const auto found = targets.find(row.row_id);
+        UTILS_CHECK(found != targets.end());
+        CHECK_EQ(found->second.q_target_absolute, terminal);
+        VrpoActorRelativeSeatValues relative;
+        for (int slot = 0; slot < kVrpoNumSeats; ++slot) {
+          CHECK_NEAR(found->second.q_target_actor_relative[slot],
+                     terminal[(row.actor + slot) % kVrpoNumSeats], 0.0);
+          relative.slots[slot] =
+              found->second.q_target_actor_relative[slot];
+        }
+        VrpoSeatValues roundtrip;
+        UTILS_CHECK(VrpoActorRelativeToAbsoluteSeatValues(
+            row.actor, relative, &roundtrip, &error));
+        CHECK_EQ(roundtrip, terminal);
+      }
+    }
+  } TEST_END();
+
+  TEST_BEGIN("Offline Q TD targets refresh and one-epoch Adam rolls back late failure") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+    std::unique_ptr<torch::optim::AdamW> optimizer;
+    std::string error;
+    UTILS_CHECK(vrpo_q_offline_internal::MakeFreshOptimizer(
+        *fixture.q, 1e-5, &optimizer, &error));
+    std::string step0;
+    UTILS_CHECK(vrpo_q_offline_internal::OptimizerStateSha256(
+        *optimizer, *fixture.q, 1e-5, 0, &step0, &error));
+    const std::string actor_before =
+        vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+            *fixture.actor, &error);
+    const std::string q_before = TinyVrpoModuleHash(*fixture.q);
+    vrpo_q_offline_internal::CellTrainingStats stats;
+    const auto cell = CanonicalVrpoQOfflineCells()[0];
+    UTILS_CHECK(vrpo_q_offline_internal::TrainOneCorpus(
+        cell, 0, episodes, *fixture.actor, *fixture.q, *optimizer,
+        fixture.actor_forward, fixture.q_forward, &stats, &error,
+        /*test_fixture=*/true));
+    CHECK_EQ(stats.optimizer_steps, int64_t{16});
+    CHECK_EQ(stats.backward_calls, int64_t{16});
+    CHECK_EQ(stats.target_refreshes, 1);
+    UTILS_CHECK(VrpoPhase4eLowerHex64(stats.target_sha256[0]));
+    UTILS_CHECK(VrpoPhase4eLowerHex64(stats.partition_sha256[0]));
+    CHECK_EQ(stats.target_q_runtime_source_sha256[0],
+             stats.pre_target_q_runtime_sha256[0]);
+    CHECK_EQ(stats.pre_target_q_runtime_sha256[0], q_before);
+    CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                 *fixture.actor, &error), actor_before);
+    std::string step16;
+    UTILS_CHECK(vrpo_q_offline_internal::OptimizerStateSha256(
+        *optimizer, *fixture.q, 1e-5, 16, &step16, &error));
+    UTILS_CHECK(step16 != step0);
+    const std::string q_step16 = TinyVrpoModuleHash(*fixture.q);
+
+    int forwards = 0;
+    VrpoQForward failing = [q = fixture.q, &forwards](
+                                const torch::Tensor& input) {
+      ++forwards;
+      auto out = q->Forward(input);
+      if (forwards == 6) {
+        out.index_put_({0, 0, 0},
+                       std::numeric_limits<float>::quiet_NaN());
+      }
+      return out;
+    };
+    vrpo_q_warmup_internal::QTransaction transaction;
+    UTILS_CHECK(transaction.Capture(*fixture.q, *optimizer, &error));
+    auto failed_stats = stats;
+    UTILS_CHECK(!vrpo_q_offline_internal::TrainOneCorpus(
+        cell, 1, episodes, *fixture.actor, *fixture.q, *optimizer,
+        fixture.actor_forward, failing, &failed_stats, &error,
+        /*test_fixture=*/true));
+    UTILS_CHECK(transaction.Rollback(&error));
+    CHECK_EQ(TinyVrpoModuleHash(*fixture.q), q_step16);
+    std::string rollback_optimizer;
+    UTILS_CHECK(vrpo_q_offline_internal::OptimizerStateSha256(
+        *optimizer, *fixture.q, 1e-5, 16, &rollback_optimizer, &error));
+    CHECK_EQ(rollback_optimizer, step16);
+    CHECK_EQ(vrpo_q_warmup_internal::ModuleParametersAndBuffersSha256(
+                 *fixture.actor, &error), actor_before);
+
+    UTILS_CHECK(vrpo_q_offline_internal::TrainOneCorpus(
+        cell, 1, episodes, *fixture.actor, *fixture.q, *optimizer,
+        fixture.actor_forward, fixture.q_forward, &stats, &error,
+        /*test_fixture=*/true));
+    CHECK_EQ(stats.optimizer_steps, int64_t{32});
+    UTILS_CHECK(stats.target_sha256[1] != stats.target_sha256[0]);
+    CHECK_EQ(stats.target_q_runtime_source_sha256[1],
+             stats.pre_target_q_runtime_sha256[1]);
+    CHECK_EQ(stats.pre_target_q_runtime_sha256[1], q_step16);
+    std::string step32;
+    UTILS_CHECK(vrpo_q_offline_internal::OptimizerStateSha256(
+        *optimizer, *fixture.q, 1e-5, 32, &step32, &error));
+    UTILS_CHECK(step32 != step16);
+  } TEST_END();
+
+  TEST_BEGIN("Offline Q strict ranges prevent train/holdout leakage") {
+    auto fixture = MakeTinyVrpoTrainingFixture();
+    auto episodes = MakeTinyVrpoTrainingEpisodes(*fixture.actor, 10.0);
+    for (size_t index = 0; index < episodes.size(); ++index) {
+      episodes[index].episode_id = 1000 + index;
+      for (auto& row : episodes[index].rows) row.episode_id = 1000 + index;
+    }
+    std::set<uint64_t> ids;
+    std::string error;
+    UTILS_CHECK(vrpo_q_offline_internal::ValidateCorpusRange(
+        episodes, 1000, 1015, &ids, &error));
+    CHECK_EQ(ids.size(), size_t{16});
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateCorpusRange(
+        episodes, 1000, 1015, &ids, &error));
+    ids.clear();
+    episodes[3].episode_id = episodes[2].episode_id;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateCorpusRange(
+        episodes, 1000, 1015, &ids, &error));
+  } TEST_END();
+
+  TEST_BEGIN("Offline Q profile, evidence, source, startup, and trainer boundary") {
+    CHECK_EQ(std::string(kVrpoQOfflineProfile),
+             std::string(kVrpoQOfflineRegistrationId));
+    CHECK_EQ(kVrpoQOfflineFinalSteps, int64_t{64});
+    CHECK_EQ(kVrpoQOfflineRetainedByteCeiling,
+             int64_t{2} * 1024 * 1024 * 1024);
+    CHECK_EQ(kVrpoQOfflinePeakByteCeiling,
+             int64_t{3} * 1024 * 1024 * 1024);
+    const auto evidence = VrpoQOfflineRetryEvidenceFiles();
+    CHECK_EQ(evidence.size(), size_t{28});
+    std::set<std::filesystem::path> evidence_paths;
+    for (const auto& item : evidence) {
+      UTILS_CHECK(VrpoPhase4eLowerHex64(item.expected_sha256));
+      UTILS_CHECK(evidence_paths.insert(item.relative_path).second);
+    }
+    const auto sources = VrpoQOfflineSourceRelativePaths();
+    CHECK_EQ(sources.back(),
+             "open_spiel/examples/dune_vrpo_q_offline_screen.h");
+    std::set<std::string> source_set(sources.begin(), sources.end());
+    CHECK_EQ(source_set.size(), sources.size());
+
+    VrpoQOfflineStartupConfig startup;
+    startup.game = "dune_imperium";
+    startup.init_mode = "vrpo_q_offline_screen";
+    startup.profile = kVrpoQOfflineProfile;
+    startup.registration_id = "fixture";
+    startup.output_root = std::filesystem::temp_directory_path() /
+        ("dune_vrpo_q_offline_startup_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(startup.output_root);
+    startup.evidence_root = std::filesystem::temp_directory_path();
+    startup.source_root = std::filesystem::temp_directory_path();
+    startup.source_code_sha256 = std::string(64, '1');
+    startup.executed_binary_sha256 = std::string(64, '2');
+    startup.executed_binary_size = 1;
+    startup.runtime_device_is_cuda = true;
+    startup.allow_tf32 = true;
+    startup.evidence.origin.actor_path = "actor.pt";
+    startup.evidence.origin.q_model_path = "q.pt";
+    startup.evidence.retry_observations.push_back(
+        {"fixture", "fixture", std::string(64, '3'),
+         std::string(64, '3'), std::string(64, '3'), 1, true});
+    std::string error;
+    UTILS_CHECK(ValidateVrpoQOfflineStartup(startup, &error, true));
+    startup.any_collection_or_training_side_path = true;
+    UTILS_CHECK(!ValidateVrpoQOfflineStartup(startup, &error, true));
+    startup.any_collection_or_training_side_path = false;
+    startup.logit_cap = 0.0;
+    UTILS_CHECK(!ValidateVrpoQOfflineStartup(startup, &error, true));
+    startup.logit_cap = 10.0;
+    std::filesystem::create_directory(startup.output_root);
+    UTILS_CHECK(!ValidateVrpoQOfflineStartup(startup, &error, true));
+    std::filesystem::remove_all(startup.output_root);
+
+    auto deadline = VrpoQOfflineDeadline::ExpireAfterChecksForTest(1);
+    UTILS_CHECK(deadline.Check("first", &error));
+    UTILS_CHECK(!deadline.Check("second", &error));
+
+    json::Object selection_artifact;
+    selection_artifact["holdout_used_for_training"] = false;
+    selection_artifact["holdout_used_for_selection"] = true;
+    selection_artifact["selected_metrics_are_selection_biased"] = true;
+    selection_artifact["selection_multiplicity"] = int64_t{4};
+    selection_artifact["selection_evidence_classification"] =
+        "SCREEN_ONLY_NOT_CONFIRMATORY_FRESH_DATA_REQUIRED";
+    const auto parsed_selection = json::FromString(
+        json::ToString(selection_artifact, true));
+    UTILS_CHECK(parsed_selection.has_value());
+    UTILS_CHECK(parsed_selection->IsObject());
+    UTILS_CHECK(vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        parsed_selection->GetObject(), &error));
+    auto missing = parsed_selection->GetObject();
+    missing.erase("holdout_used_for_selection");
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        missing, &error));
+    auto training_leak = parsed_selection->GetObject();
+    training_leak["holdout_used_for_training"] = true;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        training_leak, &error));
+    auto selection_false = parsed_selection->GetObject();
+    selection_false["holdout_used_for_selection"] = false;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        selection_false, &error));
+    auto false_bias = parsed_selection->GetObject();
+    false_bias["selected_metrics_are_selection_biased"] = false;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        false_bias, &error));
+    auto multiplicity_drift = parsed_selection->GetObject();
+    multiplicity_drift["selection_multiplicity"] = int64_t{3};
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateSelectionBiasMetadata(
+        multiplicity_drift, &error));
+
+    json::Object global_binding;
+    global_binding["registration_id"] = startup.registration_id;
+    global_binding["profile"] = startup.profile;
+    vrpo_q_offline_internal::ApplyGlobalArtifactBinding(
+        startup, kVrpoQOfflineActorRuntimeSha256,
+        kVrpoQWarmupActorValuesSha256, &global_binding);
+    const auto parsed_global = json::FromString(
+        json::ToString(global_binding, true));
+    UTILS_CHECK(parsed_global.has_value() && parsed_global->IsObject());
+    UTILS_CHECK(vrpo_q_offline_internal::ValidateGlobalArtifactBinding(
+        parsed_global->GetObject(), startup,
+        kVrpoQOfflineActorRuntimeSha256, kVrpoQWarmupActorValuesSha256,
+        &error));
+    auto global_omission = parsed_global->GetObject();
+    global_omission.erase("immutable_retry_observations");
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateGlobalArtifactBinding(
+        global_omission, startup, kVrpoQOfflineActorRuntimeSha256,
+        kVrpoQWarmupActorValuesSha256, &error));
+    auto global_domain_substitution = parsed_global->GetObject();
+    global_domain_substitution["initial_q_canonical_values_schema"] =
+        kVrpoQWarmupRuntimeQStateSchema;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateGlobalArtifactBinding(
+        global_domain_substitution, startup,
+        kVrpoQOfflineActorRuntimeSha256, kVrpoQWarmupActorValuesSha256,
+        &error));
+
+    vrpo_q_offline_internal::CellTrainingStats binding_stats;
+    binding_stats.q_before_sha256 =
+        kVrpoQWarmupInitialQRuntimeValuesSha256;
+    binding_stats.q_after_sha256 = std::string(64, 'a');
+    for (int corpus = 0; corpus < kVrpoQOfflineCorpora; ++corpus) {
+      binding_stats.target_sha256[corpus] = std::string(64, 'b');
+      binding_stats.pre_target_q_runtime_sha256[corpus] =
+          std::string(64, 'c');
+      binding_stats.target_q_runtime_source_sha256[corpus] =
+          std::string(64, 'c');
+    }
+    const auto binding_cell = CanonicalVrpoQOfflineCells()[0];
+    json::Object cell_binding;
+    cell_binding["registration_id"] = startup.registration_id;
+    cell_binding["cell_id"] = binding_cell.id;
+    vrpo_q_offline_internal::ApplyCellArtifactBinding(
+        startup, binding_cell, binding_stats, &cell_binding);
+    const auto parsed_cell = json::FromString(
+        json::ToString(cell_binding, true));
+    UTILS_CHECK(parsed_cell.has_value() && parsed_cell->IsObject());
+    UTILS_CHECK(vrpo_q_offline_internal::ValidateCellArtifactBinding(
+        parsed_cell->GetObject(), startup, binding_cell, binding_stats,
+        &error));
+    auto cell_omission = parsed_cell->GetObject();
+    cell_omission.erase("source_code_sha256");
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateCellArtifactBinding(
+        cell_omission, startup, binding_cell, binding_stats, &error));
+    auto cell_domain_substitution = parsed_cell->GetObject();
+    cell_domain_substitution["q_runtime_module_values_schema"] =
+        kVrpoQWarmupCanonicalQOriginSchema;
+    UTILS_CHECK(!vrpo_q_offline_internal::ValidateCellArtifactBinding(
+        cell_domain_substitution, startup, binding_cell, binding_stats,
+        &error));
+
+    std::ifstream trainer("open_spiel/examples/dune_ppo_train.cc");
+    const std::string text((std::istreambuf_iterator<char>(trainer)),
+                           std::istreambuf_iterator<char>());
+    const size_t boundary = text.find(
+        "The offline Q screen terminates here, before any actor optimizer");
+    const size_t optimizer = text.find(
+        "std::unique_ptr<torch::optim::AdamW> optimizer;", boundary);
+    UTILS_CHECK(boundary != std::string::npos);
+    UTILS_CHECK(optimizer != std::string::npos);
+    UTILS_CHECK(boundary < optimizer);
+    std::ifstream header(
+        "open_spiel/examples/dune_vrpo_q_offline_screen.h");
+    const std::string header_text(
+        (std::istreambuf_iterator<char>(header)),
+        std::istreambuf_iterator<char>());
+    UTILS_CHECK(header_text.find(
+        "result[\"environment_collection_calls\"] = int64_t{0}") !=
+                std::string::npos);
+    UTILS_CHECK(header_text.find(
+        "result[\"actor_optimizer_constructed\"] = false") !=
+                std::string::npos);
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -8851,6 +9220,7 @@ int main() {
   TestVrpoPpoPilotContractsContinuationAndRollbackLive();
   TestVrpoPpoContinuationU5U8ContractsAndRollbackLive();
   TestVrpoQWarmupQOnlyAndDecisionContracts();
+  TestVrpoQOfflineTargetLrScreenContracts();
 #endif
 
   // -----------------------------------------------------------------------
