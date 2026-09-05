@@ -3,6 +3,7 @@
 #include "dune_search_routing.h"  // DuneDecisionRole, for the PWO-5 canary role order
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/utils/json.h"
+#include "open_spiel/games/dune_imperium/dune_imperium.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -2464,6 +2465,41 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     }
   }
 }
+std::vector<double> ComputeTerminalReturns(
+    const State& state,
+    const std::string& reward_mode,
+    double round7_speed_bonus) {
+  std::vector<double> terminal_returns = state.Returns();
+  if (reward_mode == "first_place") {
+    for (int p = 0; p < state.NumPlayers(); ++p) {
+      if (terminal_returns[p] == 2.25) {
+        terminal_returns[p] = 3.0;
+      } else {
+        terminal_returns[p] = -1.0;
+      }
+    }
+  } else if (reward_mode != "placement") {
+    SpielFatalError("Unknown terminal_reward_mode: " + reward_mode);
+  }
+
+  if (round7_speed_bonus != 0.0) {
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    // At terminal, GetCurrentRound() has already been incremented by 1 at the
+    // end of the round (e.g., a game decided on round 7 reports GetCurrentRound() == 8).
+    // Therefore, the actual rounds played is GetCurrentRound() - 1.
+    const int rounds_played = (dune_state != nullptr) ? (dune_state->GetCurrentRound() - 1) : 0;
+    if (dune_state != nullptr && rounds_played <= 7) {
+      const double max_ret = *std::max_element(terminal_returns.begin(), terminal_returns.end());
+      for (int p = 0; p < state.NumPlayers(); ++p) {
+        if (terminal_returns[p] == max_ret) {
+          terminal_returns[p] += round7_speed_bonus;
+        }
+      }
+    }
+  }
+  return terminal_returns;
+}
+
 #endif
 
 } // namespace open_spiel

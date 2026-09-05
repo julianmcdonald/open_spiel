@@ -2483,31 +2483,10 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
     }
 
-    std::vector<double> terminal_returns = state->Returns();
-    const std::string reward_mode = absl::GetFlag(FLAGS_terminal_reward_mode);
-    if (reward_mode == "first_place") {
-      for (int p = 0; p < game.NumPlayers(); ++p) {
-        if (terminal_returns[p] == 2.25) {
-          terminal_returns[p] = 3.0;
-        } else {
-          terminal_returns[p] = -1.0;
-        }
-      }
-    } else if (reward_mode != "placement") {
-      SpielFatalError("Unknown terminal_reward_mode: " + reward_mode);
-    }
-
-    const double speed_bonus = absl::GetFlag(FLAGS_round7_speed_bonus);
-    if (speed_bonus != 0.0) {
-      const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
-      if (dune_state != nullptr && dune_state->GetCurrentRound() <= 7) {
-        for (int p = 0; p < game.NumPlayers(); ++p) {
-          if (terminal_returns[p] > 0.0) {
-            terminal_returns[p] += speed_bonus;
-          }
-        }
-      }
-    }
+    const std::vector<double> terminal_returns = open_spiel::ComputeTerminalReturns(
+        *state,
+        absl::GetFlag(FLAGS_terminal_reward_mode),
+        absl::GetFlag(FLAGS_round7_speed_bonus));
     if (vrpo_episode != nullptr) {
       VrpoSeatValues returns = {terminal_returns[0], terminal_returns[1],
                                 terminal_returns[2], terminal_returns[3]};

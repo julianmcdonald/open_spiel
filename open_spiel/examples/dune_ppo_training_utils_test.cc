@@ -10002,6 +10002,88 @@ int main() {
     CHECK_NEAR(s0.aux_ce, 0.0, 1e-12);
   } TEST_END();
 
+  TEST_BEGIN("Terminal rewards for completed rounds 6, 7, 8 and speed bonus / first-place reward") {
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune_state != nullptr);
+
+    dune_state->SetPhaseForTesting(GamePhase::kTerminal);
+    // Player 0 is winner (12 VP), Player 1 is 2nd (10 VP), Player 2 is 3rd (8 VP), Player 3 is 4th (6 VP)
+    dune_state->SetPlayerVpForTesting(0, 12);
+    dune_state->SetPlayerVpForTesting(1, 10);
+    dune_state->SetPlayerVpForTesting(2, 8);
+    dune_state->SetPlayerVpForTesting(3, 6);
+
+    // --- Completed Round 6 (at terminal, GetCurrentRound() == 7) ---
+    dune_state->SetRoundNumberForTesting(7);
+
+    // Placement mode with speed_bonus = 1.0:
+    // Only the actual winner (Player 0) gets the bonus (+1.0 -> 3.25).
+    // 2nd place (0.25) must NOT get the speed bonus.
+    auto r_r6_place = ComputeTerminalReturns(*state, "placement", 1.0);
+    CHECK_NEAR(r_r6_place[0], 3.25, 1e-6);
+    CHECK_NEAR(r_r6_place[1], 0.25, 1e-6);
+    CHECK_NEAR(r_r6_place[2], -0.75, 1e-6);
+    CHECK_NEAR(r_r6_place[3], -1.75, 1e-6);
+
+    // First-place mode with speed_bonus = 1.0:
+    // Winner gets 3.0 + 1.0 = 4.0; all opponents get -1.0.
+    auto r_r6_first = ComputeTerminalReturns(*state, "first_place", 1.0);
+    CHECK_NEAR(r_r6_first[0], 4.0, 1e-6);
+    CHECK_NEAR(r_r6_first[1], -1.0, 1e-6);
+    CHECK_NEAR(r_r6_first[2], -1.0, 1e-6);
+    CHECK_NEAR(r_r6_first[3], -1.0, 1e-6);
+
+    // --- Completed Round 7 (at terminal, GetCurrentRound() == 8) ---
+    // Boundary test: round 7 win MUST receive the speed bonus.
+    dune_state->SetRoundNumberForTesting(8);
+
+    auto r_r7_place = ComputeTerminalReturns(*state, "placement", 1.0);
+    CHECK_NEAR(r_r7_place[0], 3.25, 1e-6);
+    CHECK_NEAR(r_r7_place[1], 0.25, 1e-6);
+    CHECK_NEAR(r_r7_place[2], -0.75, 1e-6);
+    CHECK_NEAR(r_r7_place[3], -1.75, 1e-6);
+
+    auto r_r7_first = ComputeTerminalReturns(*state, "first_place", 1.0);
+    CHECK_NEAR(r_r7_first[0], 4.0, 1e-6);
+    CHECK_NEAR(r_r7_first[1], -1.0, 1e-6);
+    CHECK_NEAR(r_r7_first[2], -1.0, 1e-6);
+    CHECK_NEAR(r_r7_first[3], -1.0, 1e-6);
+
+    // --- Completed Round 8 (at terminal, GetCurrentRound() == 9) ---
+    // Boundary test: round 8 win MUST NOT receive the speed bonus.
+    dune_state->SetRoundNumberForTesting(9);
+
+    auto r_r8_place = ComputeTerminalReturns(*state, "placement", 1.0);
+    CHECK_NEAR(r_r8_place[0], 2.25, 1e-6);
+    CHECK_NEAR(r_r8_place[1], 0.25, 1e-6);
+    CHECK_NEAR(r_r8_place[2], -0.75, 1e-6);
+    CHECK_NEAR(r_r8_place[3], -1.75, 1e-6);
+
+    auto r_r8_first = ComputeTerminalReturns(*state, "first_place", 1.0);
+    CHECK_NEAR(r_r8_first[0], 3.0, 1e-6);
+    CHECK_NEAR(r_r8_first[1], -1.0, 1e-6);
+    CHECK_NEAR(r_r8_first[2], -1.0, 1e-6);
+    CHECK_NEAR(r_r8_first[3], -1.0, 1e-6);
+
+    // --- Zero speed bonus controls (speed_bonus = 0.0) ---
+    for (int r = 6; r <= 8; ++r) {
+      dune_state->SetRoundNumberForTesting(r + 1);
+      auto r_place_0 = ComputeTerminalReturns(*state, "placement", 0.0);
+      CHECK_NEAR(r_place_0[0], 2.25, 1e-6);
+      CHECK_NEAR(r_place_0[1], 0.25, 1e-6);
+      CHECK_NEAR(r_place_0[2], -0.75, 1e-6);
+      CHECK_NEAR(r_place_0[3], -1.75, 1e-6);
+
+      auto r_first_0 = ComputeTerminalReturns(*state, "first_place", 0.0);
+      CHECK_NEAR(r_first_0[0], 3.0, 1e-6);
+      CHECK_NEAR(r_first_0[1], -1.0, 1e-6);
+      CHECK_NEAR(r_first_0[2], -1.0, 1e-6);
+      CHECK_NEAR(r_first_0[3], -1.0, 1e-6);
+    }
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

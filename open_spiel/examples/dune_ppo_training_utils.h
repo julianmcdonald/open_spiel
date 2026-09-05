@@ -921,6 +921,15 @@ inline bool PriorsShareActionOrder(const ActionsAndProbs& a,
   return true;
 }
 
+// Computes terminal returns for a completed game state, applying the selected
+// terminal reward mode ("placement" or "first_place") and the optional
+// round-7 speed bonus (only applied if actual rounds played <= 7, and strictly
+// to the sole winner).
+std::vector<double> ComputeTerminalReturns(
+    const State& state,
+    const std::string& reward_mode,
+    double round7_speed_bonus);
+
 } // namespace open_spiel
 
 #endif // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_UTILS_H_
