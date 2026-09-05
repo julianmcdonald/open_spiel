@@ -340,6 +340,11 @@ ABSL_FLAG(bool, allow_shaping, false,
           "Allow experimental reward shaping flags to be non-zero.");
 ABSL_FLAG(double, reward_scale, 4.0,
           "Divide shaped plus terminal rewards by this value.");
+ABSL_FLAG(std::string, terminal_reward_mode, "placement",
+          "Terminal reward scheme for training: 'placement' (+2.25, +0.25, -0.75, -1.75) "
+          "or 'first_place' (+3.0 for 1st, -1.0 for 2nd/3rd/4th).");
+ABSL_FLAG(double, round7_speed_bonus, 0.0,
+          "Terminal reward bonus for candidate winning on or before round 7.");
 
 ABSL_FLAG(std::string, model_checkpoint, "dune_ppo_model.pt",
           "Model checkpoint to load/save.");
@@ -1413,6 +1418,8 @@ std::string ComputeLegacyConfigFingerprint() {
   config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
   config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
   config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  config_obj["terminal_reward_mode"] = absl::GetFlag(FLAGS_terminal_reward_mode);
+  config_obj["round7_speed_bonus"] = absl::GetFlag(FLAGS_round7_speed_bonus);
   config_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
   config_obj["pipeline"] = absl::GetFlag(FLAGS_pipeline);
   config_obj["rollout_games"] = absl::GetFlag(FLAGS_rollout_games);
@@ -1482,6 +1489,8 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
   config_obj["shaping_start_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_start_env_steps));
   config_obj["shaping_decay_env_steps"] = static_cast<int64_t>(absl::GetFlag(FLAGS_shaping_decay_env_steps));
   config_obj["reward_scale"] = absl::GetFlag(FLAGS_reward_scale);
+  config_obj["terminal_reward_mode"] = absl::GetFlag(FLAGS_terminal_reward_mode);
+  config_obj["round7_speed_bonus"] = absl::GetFlag(FLAGS_round7_speed_bonus);
   config_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
   config_obj["pipeline"] = absl::GetFlag(FLAGS_pipeline);
   config_obj["rollout_games"] = absl::GetFlag(FLAGS_rollout_games);
@@ -2428,6 +2437,30 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     }
 
     std::vector<double> terminal_returns = state->Returns();
+    const std::string reward_mode = absl::GetFlag(FLAGS_terminal_reward_mode);
+    if (reward_mode == "first_place") {
+      for (int p = 0; p < game.NumPlayers(); ++p) {
+        if (terminal_returns[p] == 2.25) {
+          terminal_returns[p] = 3.0;
+        } else {
+          terminal_returns[p] = -1.0;
+        }
+      }
+    } else if (reward_mode != "placement") {
+      SpielFatalError("Unknown terminal_reward_mode: " + reward_mode);
+    }
+
+    const double speed_bonus = absl::GetFlag(FLAGS_round7_speed_bonus);
+    if (speed_bonus != 0.0) {
+      const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      if (dune_state != nullptr && dune_state->GetCurrentRound() <= 7) {
+        for (int p = 0; p < game.NumPlayers(); ++p) {
+          if (terminal_returns[p] > 0.0) {
+            terminal_returns[p] += speed_bonus;
+          }
+        }
+      }
+    }
     if (vrpo_episode != nullptr) {
       VrpoSeatValues returns = {terminal_returns[0], terminal_returns[1],
                                 terminal_returns[2], terminal_returns[3]};

@@ -4114,6 +4114,77 @@ void TestTrainingFullFastSeedComponents() {
   std::cout << "TestTrainingFullFastSeedComponents Passed!\n\n";
 }
 
+void TestTemperatureLogDomainAndDepthZeroGuards() {
+  std::cout << "Running TestTemperatureLogDomainAndDepthZeroGuards...\n";
+  SkewedPriorFixture f;
+  // 1. Low positive temperatures: test 0.001 and 0.01
+  for (double temp : {0.001, 0.01, 0.1, 1.0, 2.0}) {
+    DuneSearchConfig config;
+    config.temperature = temp;
+    config.check_strategic_state = false;
+    config.min_visit_threshold = 0;
+    config.covered_prior_threshold = 0.0;
+    DunePUCTISMCTSBot bot(config, f.evaluator);
+    DuneSearchResult res = bot.RunSearch(*f.state, /*max_sims=*/8);
+    double prob_sum = 0.0;
+    for (const auto& ap : res.policy) {
+      assert(std::isfinite(ap.second));
+      assert(ap.second >= 0.0 && ap.second <= 1.0);
+      prob_sum += ap.second;
+    }
+    assert(std::abs(prob_sum - 1.0) < 1e-6);
+  }
+
+  // 2. Greedy temperature 0: exactly one action has prob 1.0
+  {
+    DuneSearchConfig config;
+    config.temperature = 0.0;
+    config.check_strategic_state = false;
+    config.min_visit_threshold = 0;
+    config.covered_prior_threshold = 0.0;
+    DunePUCTISMCTSBot bot(config, f.evaluator);
+    DuneSearchResult res = bot.RunSearch(*f.state, /*max_sims=*/8);
+    int ones = 0;
+    for (const auto& ap : res.policy) {
+      assert(std::isfinite(ap.second));
+      if (ap.second == 1.0) ++ones;
+    }
+    assert(ones == 1);
+  }
+
+  // 3. Zero simulations with temperature > 0: falls back to raw network prior, NEVER uniform
+  {
+    DuneSearchConfig config;
+    config.temperature = 0.5;
+    config.check_strategic_state = false;
+    DunePUCTISMCTSBot bot(config, f.evaluator);
+    DuneSearchResult res = bot.RunSearch(*f.state, /*max_sims=*/0);
+    // Evaluator has skewed prior: action 0 has prior 0.8, action 1 has 0.2
+    assert(res.policy[0].second != 0.5); // not uniform!
+  }
+
+  // 4. Depth cap zero guard: triggers SpielFatalError
+  {
+    DuneSearchConfig config;
+    config.max_search_decision_depth = 0;
+    bool caught = false;
+    SetErrorHandler([](const std::string& msg) {
+      throw std::runtime_error(msg);
+    });
+    try {
+      DunePUCTISMCTSBot bot(config, f.evaluator);
+    } catch (const std::runtime_error&) {
+      caught = true;
+    }
+    SetErrorHandler([](const std::string& err) {
+      std::cerr << "SpielFatalError: " << err << std::endl;
+      std::exit(1);
+    });
+    assert(caught);
+  }
+  std::cout << "TestTemperatureLogDomainAndDepthZeroGuards Passed!\n\n";
+}
+
 }  // namespace
 
 } // namespace open_spiel
@@ -4172,6 +4243,7 @@ int main() {
   open_spiel::TestTieBreakSeedIncludesNodeIdentity();
   // WO-16 (search finding 8)
   open_spiel::TestTrainingFullFastSeedComponents();
+  open_spiel::TestTemperatureLogDomainAndDepthZeroGuards();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

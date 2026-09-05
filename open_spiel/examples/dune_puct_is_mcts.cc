@@ -119,6 +119,13 @@ DunePUCTISMCTSBot::DunePUCTISMCTSBot(
       evaluators_(evaluators),
       root_node_(nullptr) {
   SPIEL_CHECK_EQ(evaluators_.size(), 4);
+  SPIEL_CHECK_TRUE(std::isfinite(config_.temperature));
+  SPIEL_CHECK_GE(config_.temperature, 0.0);
+  SPIEL_CHECK_TRUE(std::isfinite(config_.root_prior_temperature));
+  SPIEL_CHECK_GE(config_.root_prior_temperature, 0.0);
+  SPIEL_CHECK_TRUE(std::isfinite(config_.opponent_temperature));
+  SPIEL_CHECK_GE(config_.opponent_temperature, 0.0);
+  SPIEL_CHECK_TRUE(config_.max_search_decision_depth == -1 || config_.max_search_decision_depth > 0);
 }
 
 DunePUCTISMCTSBot::DunePUCTISMCTSBot(
@@ -297,10 +304,16 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   std::vector<double> tree_probs;
   tree_probs.reserve(priors.size());
   if (scale_root_prior) {
-    double sum = 0.0;
+    double max_log_p = -std::numeric_limits<double>::infinity();
     for (const auto& action_prob : priors) {
-      double p = std::pow(std::max(action_prob.second, 1e-12),
-                          1.0 / config_.root_prior_temperature);
+      double lp = std::log(std::max(action_prob.second, 1e-12));
+      if (lp > max_log_p) max_log_p = lp;
+    }
+    double sum = 0.0;
+    double inv_temp = 1.0 / config_.root_prior_temperature;
+    for (const auto& action_prob : priors) {
+      double lp = std::log(std::max(action_prob.second, 1e-12));
+      double p = std::exp((lp - max_log_p) * inv_temp);
       tree_probs.push_back(p);
       sum += p;
     }
@@ -627,17 +640,27 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(
         std::mt19937 sample_rng(sample_seed);
         ActionsAndProbs scaled;
         scaled.reserve(prior.size());
+        double max_log_p = -std::numeric_limits<double>::infinity();
+        for (const auto& ap : prior) {
+          double lp = std::log(std::max(ap.second, 1e-12));
+          if (lp > max_log_p) max_log_p = lp;
+        }
         double sum = 0.0;
         double inv_temp = 1.0 / temp;
         for (const auto& ap : prior) {
-          double p = std::pow(std::max(ap.second, 1e-12), inv_temp);
+          double lp = std::log(std::max(ap.second, 1e-12));
+          double p = std::exp((lp - max_log_p) * inv_temp);
           scaled.push_back({ap.first, p});
           sum += p;
         }
-        for (auto& ap : scaled) {
-          ap.second /= sum;
+        if (sum > 0.0) {
+          for (auto& ap : scaled) {
+            ap.second /= sum;
+          }
+          chosen_action = SampleAction(scaled, absl::Uniform(sample_rng, 0.0, 1.0)).first;
+        } else {
+          chosen_action = prior[0].first;
         }
-        chosen_action = SampleAction(scaled, absl::Uniform(sample_rng, 0.0, 1.0)).first;
       }
     }
 
@@ -1172,15 +1195,30 @@ ActionsAndProbs DunePUCTISMCTSBot::GetFinalPolicy(const State& state, DuneISMCTS
       policy.push_back({av.first, av.second / total_legal_visits});
     }
   } else {
-    double sum_pow = 0.0;
-    std::vector<double> pow_visits(action_visits.size());
+    double max_log_visits = -std::numeric_limits<double>::infinity();
+    for (const auto& av : action_visits) {
+      if (av.second > 0.0) {
+        double lv = std::log(av.second);
+        if (lv > max_log_visits) max_log_visits = lv;
+      }
+    }
+    if (!std::isfinite(max_log_visits)) {
+      return FilterAndNormalizeRawPriors(node, legal_actions);
+    }
     double inv_temp = 1.0 / config_.temperature;
+    double sum_w = 0.0;
+    std::vector<double> pow_visits(action_visits.size(), 0.0);
     for (size_t i = 0; i < action_visits.size(); ++i) {
-      pow_visits[i] = std::pow(action_visits[i].second, inv_temp);
-      sum_pow += pow_visits[i];
+      if (action_visits[i].second > 0.0) {
+        pow_visits[i] = std::exp((std::log(action_visits[i].second) - max_log_visits) * inv_temp);
+        sum_w += pow_visits[i];
+      }
+    }
+    if (sum_w <= 0.0) {
+      return FilterAndNormalizeRawPriors(node, legal_actions);
     }
     for (size_t i = 0; i < action_visits.size(); ++i) {
-      policy.push_back({action_visits[i].first, sum_pow > 0.0 ? (pow_visits[i] / sum_pow) : (1.0 / legal_actions.size())});
+      policy.push_back({action_visits[i].first, pow_visits[i] / sum_w});
     }
   }
 
