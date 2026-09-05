@@ -1266,7 +1266,54 @@ bool LoadOptimizerCheckpointMigrating(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, const std::string& path,
     torch::Device device) {
-  if (!model->has_aux_heads_) return false;
+  if (!model->has_aux_heads_) {
+    // Reverse migration: loading a 3-group archive (with auxiliary heads) into a 2-group model.
+    std::vector<torch::Tensor> policy_params = model->policy_head->parameters();
+    std::vector<torch::Tensor> other_params;
+    for (auto& param : model->parameters()) {
+      bool is_policy = false;
+      for (auto& q : policy_params) {
+        if (param.is_same(q)) { is_policy = true; break; }
+      }
+      if (!is_policy) other_params.push_back(param);
+    }
+    int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+    int64_t action_dim = 2391;
+    std::vector<torch::Tensor> dummy_aux = {
+        torch::zeros({1, hidden_dim}, device),
+        torch::zeros({1}, device),
+        torch::zeros({3, hidden_dim}, device),
+        torch::zeros({3}, device),
+        torch::zeros({action_dim, hidden_dim}, device),
+        torch::zeros({action_dim}, device)};
+    std::vector<torch::optim::OptimizerParamGroup> groups3;
+    groups3.emplace_back(policy_params);
+    groups3.emplace_back(other_params);
+    groups3.emplace_back(dummy_aux);
+    torch::optim::AdamW opt3(
+        groups3,
+        torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
+    try {
+      torch::load(opt3, path, device);
+    } catch (const c10::Error& e) {
+      std::cerr << "[MIGRATION ERROR] Reverse migration torch::load failed: " << e.msg() << std::endl;
+      return false;
+    }
+    int moved = 0;
+    for (auto& entry : opt3.state()) {
+      for (auto& p : model->parameters()) {
+        if (entry.first == p.unsafeGetTensorImpl()) {
+          optimizer.state()[entry.first] = std::move(entry.second);
+          ++moved;
+          break;
+        }
+      }
+    }
+    std::cout << "[MIGRATION] Loaded " << moved
+              << " parameter states from 3-group archive " << path
+              << " into 2-group optimizer without numerical change." << std::endl;
+    return true;
+  }
 
   // Reproduce the pre-migration grouping over the real model's tensors.
   std::vector<torch::Tensor> policy_params;
