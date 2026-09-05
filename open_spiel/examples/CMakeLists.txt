@@ -107,6 +107,14 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_scratch_test COMMAND dune_search_pi_scratch_test)
 
+  # Bounded search-training transfer pilot runner from placement U200
+  add_executable(dune_search_transfer_pilot
+    dune_search_transfer_pilot.cc dune_search_pi_scratch.cc
+    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_transfer_pilot dune_search ${TORCH_LIBRARIES})
+
   # Bounded persistent actor-learner smoke. This is an experimental target,
   # separate from the production generation-barrier trainer.
   add_executable(dune_search_pi_async_smoke
