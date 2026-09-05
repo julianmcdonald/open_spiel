@@ -160,6 +160,20 @@ ABSL_FLAG(double, live_continuation_reserve_seconds, 10.0, "Live continuation re
 ABSL_FLAG(bool, live_deadline, false, "Use live deadline budget mode instead of fixed simulations.");
 ABSL_FLAG(bool, use_session, true, "If true (default), drive the search seat through the persistent DuneSearchSession. If false, reproduce the July-14 reference protocol: a fresh full search per decision via DunePUCTISMCTSBot::Step() (bot->Step(), including its sample-on-fallback selection), with no shared session budget.");
 ABSL_FLAG(bool, policy_only, false, "Policy-only control arm: run the session in kPolicyOnly budget mode so the candidate plays the raw network policy on every decision (no search). Pair with --purchase_combat_budget=0 and --temperature=0 for a pure greedy-policy baseline vs the greedy opponents.");
+// Audit-only bridge to the Search-PI collector's exact per-root budget mode.
+// Default false preserves every historical benchmark invocation. This mode is
+// intentionally explicit rather than inferred from the numeric flags: a
+// fixed-session run with max_simulations=200 is NOT the training teacher.
+ABSL_FLAG(bool, audit_training_policy_iteration, false,
+          "Audit-only: use kTrainingPolicyIteration with independent per-root "
+          "budgets and wide short-window scope. Normal gameplay defaults are "
+          "unchanged when false.");
+ABSL_FLAG(int, pi_primary_simulations, 200,
+          "Audit-only kTrainingPolicyIteration primary-root budget.");
+ABSL_FLAG(int, pi_continuation_simulations, 64,
+          "Audit-only kTrainingPolicyIteration continuation-root budget.");
+ABSL_FLAG(int, pi_short_window_simulations, 64,
+          "Audit-only kTrainingPolicyIteration purchase/combat/other budget.");
 ABSL_FLAG(std::string, fresh_search_roles, "",
           "Decomposition arm 4 (Path B only, requires --use_session=false): "
           "comma-separated decision roles that receive a fresh full search; every "
@@ -463,6 +477,8 @@ std::string BudgetModeName(DuneSearchBudgetMode m) {
       return "fixed_session_simulations";
     case DuneSearchBudgetMode::kTrainingFullFast: return "training_full_fast";
     case DuneSearchBudgetMode::kLiveDeadline: return "live_deadline";
+    case DuneSearchBudgetMode::kTrainingPolicyIteration:
+      return "training_policy_iteration";
   }
   return "unknown";
 }
@@ -634,6 +650,18 @@ void WorkerThread(
         config.fixed_session_limit = absl::GetFlag(FLAGS_max_simulations);
         config.fixed_continuation_reserve = absl::GetFlag(FLAGS_fixed_continuation_reserve);
         config.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+        if (absl::GetFlag(FLAGS_audit_training_policy_iteration)) {
+          config.pi_primary_simulations =
+              absl::GetFlag(FLAGS_pi_primary_simulations);
+          config.pi_continuation_simulations =
+              absl::GetFlag(FLAGS_pi_continuation_simulations);
+          config.purchase_combat_budget =
+              absl::GetFlag(FLAGS_pi_short_window_simulations);
+          // The training teacher resets the short-window budget at every root;
+          // it is not a 500 ms role window shared by consecutive roots.
+          config.exact_short_window_budgets = true;
+          config.policy_only_covers_short_window = false;
+        }
         config.live_continuation_reserve_seconds = absl::GetFlag(FLAGS_live_continuation_reserve_seconds);
         config.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
         config.conservative_override_enabled = absl::GetFlag(FLAGS_conservative_override_enabled);
@@ -642,11 +670,14 @@ void WorkerThread(
         config.conservative_q_margin_threshold = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
         config.conservative_stability_checkpoint_fraction = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
         config.conservative_continuation_overrides_disabled = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
-        DuneSearchBudgetMode budget_mode = absl::GetFlag(FLAGS_policy_only)
-            ? DuneSearchBudgetMode::kPolicyOnly
-            : (absl::GetFlag(FLAGS_live_deadline)
-                ? DuneSearchBudgetMode::kLiveDeadline
-                : DuneSearchBudgetMode::kFixedSessionSimulations);
+        DuneSearchBudgetMode budget_mode =
+            absl::GetFlag(FLAGS_policy_only)
+                ? DuneSearchBudgetMode::kPolicyOnly
+                : (absl::GetFlag(FLAGS_audit_training_policy_iteration)
+                       ? DuneSearchBudgetMode::kTrainingPolicyIteration
+                       : (absl::GetFlag(FLAGS_live_deadline)
+                              ? DuneSearchBudgetMode::kLiveDeadline
+                              : DuneSearchBudgetMode::kFixedSessionSimulations));
         seat_evaluators[p] = search_evaluator;
         if (absl::GetFlag(FLAGS_use_session)) {
           seat_sessions[p] = std::make_unique<DuneSearchSession>(config, search_evaluator, budget_mode);
@@ -1140,6 +1171,10 @@ void WorkerThread(
               search_obj["phase"] = diag.phase;
               search_obj["decision_role"] = diag.decision_role;
               search_obj["budget_mode"] = diag.budget_mode;
+              search_obj["budget_mode_name"] =
+                  seat_provenance[current_player].budget_mode;
+              search_obj["audit_training_policy_iteration"] =
+                  absl::GetFlag(FLAGS_audit_training_policy_iteration);
               search_obj["hard_sim_limit"] = static_cast<int64_t>(diag.hard_sim_limit);
               search_obj["soft_sim_limit"] = static_cast<int64_t>(diag.soft_sim_limit);
               search_obj["hard_time_limit_ms"] = diag.hard_time_limit_ms;
@@ -2440,6 +2475,33 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // The training-policy-iteration bridge is deliberately opt-in and
+  // fail-closed. In particular, do not silently combine it with the legacy
+  // live-deadline or policy-only selectors: those would produce plausible
+  // output while no longer representing the registered training teacher.
+  if (absl::GetFlag(FLAGS_audit_training_policy_iteration)) {
+    if (!absl::GetFlag(FLAGS_use_session)) {
+      open_spiel::SpielFatalError(
+          "--audit_training_policy_iteration=true requires --use_session=true.");
+    }
+    if (absl::GetFlag(FLAGS_policy_only)) {
+      open_spiel::SpielFatalError(
+          "--audit_training_policy_iteration=true cannot be combined with "
+          "--policy_only=true.");
+    }
+    if (absl::GetFlag(FLAGS_live_deadline)) {
+      open_spiel::SpielFatalError(
+          "--audit_training_policy_iteration=true cannot be combined with "
+          "--live_deadline=true.");
+    }
+    if (absl::GetFlag(FLAGS_pi_primary_simulations) <= 0 ||
+        absl::GetFlag(FLAGS_pi_continuation_simulations) <= 0 ||
+        absl::GetFlag(FLAGS_pi_short_window_simulations) <= 0) {
+      open_spiel::SpielFatalError(
+          "kTrainingPolicyIteration audit budgets must all be positive.");
+    }
+  }
+
   // Arm-4 (agent-phase decomposition): the --fresh_search_roles filter is only
   // defined for the Path B fresh-search driver. Fail fast on misuse or typos,
   // before any threads spawn.
@@ -2820,6 +2882,14 @@ int main(int argc, char* argv[]) {
     agg_obj["simulated_opponent_temperature"] = absl::GetFlag(FLAGS_simulated_opponent_temperature);
     agg_obj["external_opponent_temperature"] = absl::GetFlag(FLAGS_external_opponent_temperature);
     agg_obj["disable_time_limit"] = absl::GetFlag(FLAGS_disable_time_limit);
+    agg_obj["audit_training_policy_iteration"] =
+        absl::GetFlag(FLAGS_audit_training_policy_iteration);
+    agg_obj["pi_primary_simulations"] =
+        static_cast<int64_t>(absl::GetFlag(FLAGS_pi_primary_simulations));
+    agg_obj["pi_continuation_simulations"] = static_cast<int64_t>(
+        absl::GetFlag(FLAGS_pi_continuation_simulations));
+    agg_obj["pi_short_window_simulations"] = static_cast<int64_t>(
+        absl::GetFlag(FLAGS_pi_short_window_simulations));
     agg_obj["utility_divisor"] = absl::GetFlag(FLAGS_utility_divisor);
     agg_obj["elapsed_wall_time_s"] = total_wall_time;
     agg_obj["games_per_hour"] = total_games * 3600.0 / total_wall_time;

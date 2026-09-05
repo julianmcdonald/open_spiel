@@ -266,7 +266,7 @@ inline bool ReadFile(const std::filesystem::path& path, std::string* output,
   }
   output->assign(std::istreambuf_iterator<char>(stream),
                  std::istreambuf_iterator<char>());
-  if (!stream.eof() || output->empty()) {
+  if (stream.bad() || output->empty()) {
     if (error != nullptr) *error = "offline-Q input read failed";
     output->clear();
     return false;

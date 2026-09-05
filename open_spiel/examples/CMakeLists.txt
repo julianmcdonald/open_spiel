@@ -181,6 +181,15 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_audit dune_search ${TORCH_LIBRARIES})
 
+  # Fixed-root Gen145 teacher-quality audit. Separate from the frozen PWO-3
+  # teacher-audit binary: it reuses the registered root identities and common-
+  # random-number rollout seeds but tests Search-PI's role-aware 200/64 and
+  # 800/256 budgets on the current checkpoint.
+  add_executable(dune_search_root_quality_audit
+    dune_search_root_quality_audit.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_root_quality_audit
+    dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_eval_1000 dune_eval_1000.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_eval_1000 ${TORCH_LIBRARIES})
 
