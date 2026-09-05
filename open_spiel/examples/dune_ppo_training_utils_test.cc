@@ -10084,6 +10084,86 @@ int main() {
     }
   } TEST_END();
 
+  // -----------------------------------------------------------------------
+  // Test 97: Checkpoint extension and manifest target_end_update validation
+  // -----------------------------------------------------------------------
+  TEST_BEGIN("ParseAndValidateManifest allows training extension past target_end_update") {
+    std::string model_f = "test_ext_model.pt";
+    std::string optim_f = "test_ext_optim.pt";
+    std::string manifest_f = "test_ext_manifest.json";
+
+    WriteMockFile(model_f, "ext model data");
+    WriteMockFile(optim_f, "ext optim data");
+
+    size_t model_sz = 0;
+    std::string model_h = ComputeFileSHA256(model_f, &model_sz);
+    size_t optim_sz = 0;
+    std::string optim_h = ComputeFileSHA256(optim_f, &optim_sz);
+
+    std::string manifest_json = absl::StrFormat(
+        R"({
+          "schema_version": 2,
+          "checkpoint_uuid": "11111111-2222-3333-4444-555555555555",
+          "global_update": 10,
+          "target_end_update": 100,
+          "total_env_steps": 5000,
+          "next_episode_id": 100,
+          "base_seed": 42,
+          "seed_scheme_version": 2,
+          "config_fingerprint": "ext_conf",
+          "search_label_fingerprint": "ext_lbl",
+          "run_uuid": "ext_run",
+          "rollout_amp": true,
+          "allow_tf32": true,
+          "model_filename": "%s",
+          "model_file_size": %d,
+          "model_sha256": "%s",
+          "optimizer_filename": "%s",
+          "optimizer_file_size": %d,
+          "optimizer_sha256": "%s",
+          "hidden_dim": 2048,
+          "num_blocks": 8
+        })",
+        model_f, model_sz, model_h, optim_f, optim_sz, optim_h);
+
+    WriteMockFile(manifest_f, manifest_json);
+
+    CheckpointManifest manifest;
+    std::string err;
+
+    // 1. Extending past previous target_end_update (target 200 > manifest target 100) must SUCCEED.
+    bool ok_ext = ParseAndValidateManifest(
+        manifest_f, model_f, optim_f, 42, 200, 2,
+        "ext_conf", "ext_conf", true, true, "ext_lbl", 2048, 8,
+        manifest, err);
+    if (!ok_ext) {
+      std::cout << "TEST 97 ERROR: " << err << "\n";
+    }
+    CHECK_EQ(ok_ext, true);
+    CHECK_EQ(manifest.global_update, 10);
+    CHECK_EQ(manifest.target_end_update, 100);
+
+    // 2. target_end_update <= manifest global_update (10 <= 10) must FAIL.
+    bool fail_equal = ParseAndValidateManifest(
+        manifest_f, model_f, optim_f, 42, 10, 2,
+        "ext_conf", "ext_conf_pre", true, true, "ext_lbl", 2048, 8,
+        manifest, err);
+    CHECK_EQ(fail_equal, false);
+    UTILS_CHECK(err.find("greater than manifest global update") != std::string::npos);
+
+    // 3. target_end_update < manifest global_update (5 < 10) must FAIL.
+    bool fail_less = ParseAndValidateManifest(
+        manifest_f, model_f, optim_f, 42, 5, 2,
+        "ext_conf", "ext_conf_pre", true, true, "ext_lbl", 2048, 8,
+        manifest, err);
+    CHECK_EQ(fail_less, false);
+    UTILS_CHECK(err.find("greater than manifest global update") != std::string::npos);
+
+    std::filesystem::remove(model_f);
+    std::filesystem::remove(optim_f);
+    std::filesystem::remove(manifest_f);
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

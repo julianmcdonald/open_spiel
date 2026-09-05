@@ -380,8 +380,8 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
     error_msg = absl::StrFormat("Base seed mismatch. Current: %d, Manifest: %d", current_base_seed, out_manifest.base_seed);
     return false;
   }
-  if (current_target_end_update != out_manifest.target_end_update) {
-    error_msg = absl::StrFormat("Target end update mismatch. Current: %d, Manifest: %d", current_target_end_update, out_manifest.target_end_update);
+  if (current_target_end_update <= out_manifest.global_update) {
+    error_msg = absl::StrFormat("Target end update (%d) must be greater than manifest global update (%d)", current_target_end_update, out_manifest.global_update);
     return false;
   }
   if (current_seed_scheme_version != out_manifest.seed_scheme_version) {
