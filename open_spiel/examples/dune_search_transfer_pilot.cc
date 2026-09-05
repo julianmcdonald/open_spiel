@@ -498,7 +498,7 @@ int RunSmokeTest() {
   std::cout << "[SMOKE] Using hardware device: " << device << "\n";
 
   int64_t obs_size = 5580;
-  int64_t action_dim = 150;
+  int64_t action_dim = 2391;
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
 
@@ -735,7 +735,7 @@ int RunVerifyParity() {
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
   int64_t obs_size = 5580;
-  int64_t action_dim = 150;
+  int64_t action_dim = 2391;
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
 
@@ -853,7 +853,7 @@ int RunCollect() {
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
   int64_t obs_size = 5580;
-  int64_t action_dim = 150;
+  int64_t action_dim = 2391;
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
 
@@ -1028,7 +1028,7 @@ int RunTrain() {
 
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
   int64_t obs_size = 5580;
-  int64_t action_dim = 150;
+  int64_t action_dim = 2391;
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
 
