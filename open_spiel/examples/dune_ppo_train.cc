@@ -9048,7 +9048,9 @@ int main(int argc, char** argv) {
         /*high_priority_stream=*/false,
         /*emit_batch_membership=*/numerical_parity,
         absl::GetFlag(FLAGS_rollout_amp),
-        absl::GetFlag(FLAGS_allow_tf32),
+        absl::GetFlag(FLAGS_allow_tf32));
+  }
+
   std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> opponent_models;
   std::vector<std::shared_ptr<open_spiel::IGameEvaluator>> opponent_evaluators;
   std::vector<std::string> opponent_hashes_before;
