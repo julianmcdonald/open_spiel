@@ -62,10 +62,15 @@
 #include "dune_search_pi_replay.h"  // row shards + uniform replay-window sampler
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
+#include "dune_opponent_pool.h"
 #include "open_spiel/utils/json.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The OpenSpiel game to train.");
+ABSL_FLAG(bool, single_learner_training, false,
+          "Enable single-seat rotating learner collection for opponent-pool study.");
+ABSL_FLAG(std::string, training_opponent_pool, "",
+          "Comma-separated list of frozen opponent checkpoint paths for training pool.");
 ABSL_FLAG(int, threads, 64, "Rollout worker threads.");
 ABSL_FLAG(int, total_updates, 1000, "Number of PPO collect/update cycles.");
 ABSL_FLAG(int, rollout_transitions, 32768,
@@ -1628,6 +1633,11 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
   config_obj["policy_kl_anchor_coeff"] =
       absl::GetFlag(FLAGS_policy_kl_anchor_coeff);
 
+  if (absl::GetFlag(FLAGS_single_learner_training)) {
+    config_obj["single_learner_training"] = true;
+    config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
+  }
+
   return config_obj;
 }
 
@@ -1877,12 +1887,18 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   std::atomic<uint64_t>* total_env_steps,
                   float reward_lambda,
                   WorkerStats* local_stats,
-                  VrpoCapturedEpisode* vrpo_episode) {
+                  VrpoCapturedEpisode* vrpo_episode,
+                  const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators) {
 
   if (vrpo_episode != nullptr) {
     *vrpo_episode = VrpoCapturedEpisode{};
     vrpo_episode->episode_id = episode_id;
   }
+
+  const bool single_learner = absl::GetFlag(FLAGS_single_learner_training);
+  const auto seat_assignment =
+      dune_opponent_pool::ComputeSeatAssignment(master, episode_id, opponent_evaluators.size());
+  const int learner_seat = single_learner ? seat_assignment.learner_seat : -1;
 
   auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
   std::mt19937_64 policy_rng[4];
@@ -1988,6 +2004,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         std::abort();
       }
 
+      const bool is_learner = (!single_learner) || (current_player == learner_seat);
+
       std::vector<float> obs(obs_size, 0.0f);
       if (provides_info_state_tensor && current_player >= 0) {
         state->InformationStateTensor(current_player, absl::MakeSpan(obs));
@@ -1995,10 +2013,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         state->ObservationTensor(current_player, absl::MakeSpan(obs));
       }
 
-      EvalResult result = evaluator->Evaluate(obs);
+      std::shared_ptr<IGameEvaluator> active_evaluator =
+          dune_opponent_pool::ResolveEvaluator(current_player, seat_assignment,
+                                               evaluator, opponent_evaluators);
+      EvalResult result = active_evaluator->Evaluate(obs);
       std::vector<float> logits = std::move(result.logits);
       const bool parity_capture =
-          !absl::GetFlag(FLAGS_numerical_parity_output).empty();
+          (!absl::GetFlag(FLAGS_numerical_parity_output).empty()) && is_learner;
       std::vector<float> parity_raw_legal_logits;
       if (parity_capture) {
         const int64_t decision_index =
@@ -2045,7 +2066,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       // decision's centered logit is identically 0 and would only dilute the
       // percentiles. Observational only: no RNG draw, no tensor op, nothing
       // read back into the acting path, so the sampled action is unaffected.
-      if (local_stats != nullptr && actions.size() >= 2) {
+      if (local_stats != nullptr && actions.size() >= 2 && is_learner) {
         double legal_sum = 0.0;
         int legal_count = 0;
         for (Action a : actions) {
@@ -2155,21 +2176,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
 
       // --- PWO-5 section 14.1b: NE and max_action_prob, the POST-cap half. --
-      //
-      // Taken from the distribution the behaviour policy ACTUALLY SAMPLES FROM
-      // (SamplePolicyAction, immediately below), which is the legal softmax of
-      // the capped logits. Post-cap is what section 14.2's positive-entropy-
-      // floor argument assumes: because the cap is applied BEFORE the softmax,
-      // the softmax argument range is bounded by (-c, +c), so post-cap entropy
-      // has a strictly positive floor for every n_legal >= 2 and can never
-      // reach 0 -- which is why an absolute entropy threshold is unanchorable
-      // and the rails are decline-based rather than absolute.
-      //
-      // The normalizer is log(n_legal) -- not log(vocabulary_size) and not
-      // log(len(visits)). n_legal >= 2 here by construction, so log(n_legal)
-      // > 0 always and the repository's two incompatible conventions for the
-      // n_legal == 1 case are both moot.
-      if (canary_measure_this_decision) {
+      if (canary_measure_this_decision && is_learner) {
         float max_logit = -std::numeric_limits<float>::infinity();
         for (Action a : actions) {
           if (a >= 0 && static_cast<size_t>(a) < logits.size()) {
@@ -2208,7 +2215,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
 
       std::optional<std::vector<double>> vrpo_legal_probabilities;
-      if (vrpo_episode != nullptr) vrpo_legal_probabilities.emplace();
+      if (vrpo_episode != nullptr && is_learner) vrpo_legal_probabilities.emplace();
       const PolicyDistributionSample policy_sample =
           SamplePolicyDistribution(&policy_rng[current_player], logits,
                                    actions,
@@ -2232,7 +2239,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      if (absl::GetFlag(FLAGS_sample_counterfactual_states) &&
+      if (absl::GetFlag(FLAGS_sample_counterfactual_states) && is_learner &&
           counterfactual_samples <
               absl::GetFlag(FLAGS_counterfactual_samples_per_game) &&
           ClassifyDuneDecisionRole(*state, current_player, false) == DuneDecisionRole::kAgentPrimary) {
@@ -2370,7 +2377,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      if (vrpo_episode != nullptr) {
+      if (vrpo_episode != nullptr && is_learner) {
         if (dune_state == nullptr) {
           SpielFatalError("VRPO capture requires DuneImperiumState");
         }
@@ -2413,32 +2420,34 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      PpoTransition transition;
-      transition.state = std::move(obs);
-      transition.legal_actions = std::move(actions);
-      transition.action = action;
-      transition.old_log_prob = old_log_prob;
-      transition.reward = 0.0f;
-      transition.value = result.value;
-      transition.advantage = 0.0f;
-      transition.return_value = 0.0f;
-      transition.player_id = current_player;
-      transition.episode_id = episode_id;
-      transition.behavior_legal_log_probs =
-          std::move(parity_behavior_log_probs);
-      transition.behavior_raw_legal_logits =
-          std::move(parity_raw_legal_logits);
-      transition.decision_role = parity_decision_role;
-      transition.behavior_physical_batch_id = result.physical_batch_id;
-      transition.behavior_physical_batch_size = result.physical_batch_size;
-      transition.behavior_physical_batch_row = result.physical_batch_row;
-      trajectory->push_back(std::move(transition));
+      if (is_learner) {
+        PpoTransition transition;
+        transition.state = std::move(obs);
+        transition.legal_actions = std::move(actions);
+        transition.action = action;
+        transition.old_log_prob = old_log_prob;
+        transition.reward = 0.0f;
+        transition.value = result.value;
+        transition.advantage = 0.0f;
+        transition.return_value = 0.0f;
+        transition.player_id = current_player;
+        transition.episode_id = episode_id;
+        transition.behavior_legal_log_probs =
+            std::move(parity_behavior_log_probs);
+        transition.behavior_raw_legal_logits =
+            std::move(parity_raw_legal_logits);
+        transition.decision_role = parity_decision_role;
+        transition.behavior_physical_batch_id = result.physical_batch_id;
+        transition.behavior_physical_batch_size = result.physical_batch_size;
+        transition.behavior_physical_batch_row = result.physical_batch_row;
+        trajectory->push_back(std::move(transition));
 
-      if (current_player >= 0 && current_player < game.NumPlayers()) {
-        last_transition_index[current_player] = static_cast<int>(trajectory->size() - 1);
+        if (current_player >= 0 && current_player < game.NumPlayers()) {
+          last_transition_index[current_player] = static_cast<int>(trajectory->size() - 1);
+        }
       }
 
-      if (dune_state != nullptr) {
+      if (dune_state != nullptr && is_learner) {
         if (current_player >= 0 && current_player < game.NumPlayers() &&
             action != dune_imperium::kActionCombatPass) {
           int post_strength = dune_imperium::CombatStrength(*dune_state, current_player);
@@ -2471,6 +2480,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
 
         for (int p = 0; p < game.NumPlayers(); ++p) {
+          if (single_learner && p != learner_seat) continue;
           int new_tleilaxu = dune_state->GetTleilaxuTrackForTesting(p);
           int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
           current_tleilaxu[p] = new_tleilaxu;
@@ -2494,6 +2504,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
 
         for (int p = 0; p < game.NumPlayers(); ++p) {
+          if (single_learner && p != learner_seat) continue;
           int raw_conflict_vp_delta = dune_state->ConflictVpDelta(p) - prev_conflict_vp[p];
           prev_conflict_vp[p] = dune_state->ConflictVpDelta(p);
 
@@ -2631,7 +2642,8 @@ void RolloutWorker(int thread_id, const Game* game,
                     uint64_t start_episode_id,
                     int rollout_games,
                     float reward_lambda,
-                    VrpoCapturedEpisodeBuffer* vrpo_buffer) {
+                    VrpoCapturedEpisodeBuffer* vrpo_buffer,
+                    const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
   while (true) {
@@ -2646,7 +2658,8 @@ void RolloutWorker(int thread_id, const Game* game,
     VrpoCapturedEpisode vrpo_episode;
     int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
                               total_env_steps, reward_lambda, &local_stats,
-                              vrpo_buffer != nullptr ? &vrpo_episode : nullptr);
+                              vrpo_buffer != nullptr ? &vrpo_episode : nullptr,
+                              opponent_evaluators);
     if (vrpo_buffer != nullptr) {
       std::string publish_error;
       if (!vrpo_buffer->PublishValidated(std::move(vrpo_episode),
@@ -2819,7 +2832,8 @@ CollectResult CollectRollout(const Game* game,
                              std::atomic<uint64_t>* next_episode_id,
                              int rollout_games,
                              float reward_lambda,
-                             VrpoCapturedEpisodeBuffer* vrpo_buffer = nullptr) {
+                             VrpoCapturedEpisodeBuffer* vrpo_buffer = nullptr,
+                             const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators = {}) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
@@ -2835,7 +2849,8 @@ CollectResult CollectRollout(const Game* game,
     workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
                          &rollout_buffer, &stop_collection, total_env_steps,
                          &worker_stats, &local_episode_id, actual_start_ep,
-                         rollout_games, reward_lambda, vrpo_buffer);
+                         rollout_games, reward_lambda, vrpo_buffer,
+                         std::cref(opponent_evaluators));
   }
   for (auto& worker : workers) worker.join();
 
@@ -8538,6 +8553,8 @@ int main(int argc, char** argv) {
         // loads it itself, and only from its own lineage.
         std::cout << "[search-PI] Skipping the PPO optimizer load here; the "
                      "lane's own optimizer is handled in the search-PI branch.\n";
+      } else if (absl::GetFlag(FLAGS_fresh_optimizer)) {
+        std::cout << "[INFO] fresh_optimizer is true: keeping fresh AdamW optimizer. Skipping optimizer checkpoint load.\n";
       } else if (!absl::GetFlag(FLAGS_train_value_only)) {
         // PWO-5 section 7.2: a pre-head archive migrates; a post-head archive
         // loads normally.
@@ -9032,7 +9049,52 @@ int main(int argc, char** argv) {
         /*emit_batch_membership=*/numerical_parity,
         absl::GetFlag(FLAGS_rollout_amp),
         absl::GetFlag(FLAGS_allow_tf32),
-        absl::GetFlag(FLAGS_separate_actor_critic) ? inference_critic : nullptr);
+  std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> opponent_models;
+  std::vector<std::shared_ptr<open_spiel::IGameEvaluator>> opponent_evaluators;
+  std::vector<std::string> opponent_hashes_before;
+
+  if (absl::GetFlag(FLAGS_single_learner_training)) {
+    std::string pool_str = absl::GetFlag(FLAGS_training_opponent_pool);
+    if (!pool_str.empty()) {
+      std::vector<std::string> opp_paths = dune_opponent_pool::ParseOpponentPoolPaths(pool_str);
+      for (const auto& opp_path : opp_paths) {
+        if (!std::filesystem::exists(opp_path)) {
+          SpielFatalError("Training opponent pool checkpoint does not exist: " + opp_path);
+        }
+        auto opp_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            absl::GetFlag(FLAGS_num_blocks), /*use_nonlinear=*/false);
+        opp_model->to(device);
+        open_spiel::LoadModelCheckpoint(opp_model, opp_path, device);
+        opp_model->eval();
+        for (auto& p : opp_model->parameters()) {
+          p.set_requires_grad(false);
+        }
+        std::string opp_hash = dune_opponent_pool::HashModelParametersAndBuffers(opp_model);
+        opponent_hashes_before.push_back(opp_hash);
+        opponent_models.push_back(opp_model);
+
+        std::shared_ptr<open_spiel::IGameEvaluator> opp_eval;
+        if (absl::GetFlag(FLAGS_deterministic_rollout_eval)) {
+          opp_eval = std::make_shared<open_spiel::DeterministicEvaluator>(
+              opp_model, device, &eval_mutex);
+        } else {
+          opp_eval = std::make_shared<open_spiel::BatchedEvaluator>(
+              opp_model, absl::GetFlag(FLAGS_eval_batch_size),
+              absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
+              absl::GetFlag(FLAGS_evaluator_device_synchronize),
+              /*high_priority_stream=*/false,
+              /*emit_batch_membership=*/false,
+              absl::GetFlag(FLAGS_rollout_amp),
+              absl::GetFlag(FLAGS_allow_tf32));
+        }
+        opponent_evaluators.push_back(opp_eval);
+      }
+      std::cout << "[OPPONENT POOL] Loaded " << opponent_evaluators.size()
+                << " frozen opponent models for single-learner training." << std::endl;
+    } else {
+      std::cout << "[OPPONENT POOL] Single-learner training active in current-policy control mode (Arm A: 0 pool models, snapshot opponent)." << std::endl;
+    }
   }
 
 
@@ -10646,7 +10708,8 @@ int main(int argc, char** argv) {
       (vrpo_diagnostics || vrpo_one_update || vrpo_schedule_screen ||
        vrpo_ppo_pilot || vrpo_ppo_continuation || vrpo_q_warmup)
           ? &vrpo_capture_buffer
-          : nullptr);
+          : nullptr,
+      opponent_evaluators);
   if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
       vrpo_q_warmup) {
     std::string deadline_error;
@@ -11494,7 +11557,7 @@ int main(int argc, char** argv) {
       bg_collect_thread = std::thread([&, next_reward_lambda]() {
         next_collect = open_spiel::CollectRollout(
             game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-            rollout_games, next_reward_lambda);
+            rollout_games, next_reward_lambda, nullptr, opponent_evaluators);
         // Phase 18B: aux for the NEXT update, from the same frozen snapshot, run
         // sequentially AFTER the rollout (design: collect PPO first, then aux).
         run_aux_collection(update + 1, next_collect);
@@ -11920,6 +11983,13 @@ int main(int argc, char** argv) {
       }
     }
 
+    for (size_t opp_i = 0; opp_i < opponent_models.size(); ++opp_i) {
+      std::string current_hash = dune_opponent_pool::HashModelParametersAndBuffers(opponent_models[opp_i]);
+      if (current_hash != opponent_hashes_before[opp_i]) {
+        SpielFatalError(absl::StrFormat("CRITICAL ERROR: Opponent model %d mutated during training!", opp_i));
+      }
+    }
+
     // Advance to next rollout.
     if (have_bg) {
       current_collect = std::move(next_collect);
@@ -11929,7 +11999,7 @@ int main(int argc, char** argv) {
                                                      absl::GetFlag(FLAGS_shaping_decay_env_steps));
       current_collect = open_spiel::CollectRollout(
           game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-          rollout_games, next_reward_lambda);
+          rollout_games, next_reward_lambda, nullptr, opponent_evaluators);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
       // Phase 18B (non-pipelined path): aux for the next update, same snapshot.
