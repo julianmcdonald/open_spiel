@@ -890,24 +890,23 @@ int RunCollect() {
   for (int t = 0; t < num_threads; ++t) {
     workers.emplace_back([&, t]() {
       while (true) {
-        int g = next_game.fetch_add(1);
-        if (g >= total_games) break;
+        int idx = next_game.fetch_add(1);
+        if (idx >= total_games) break;
+        int ep = absl::GetFlag(FLAGS_start_episode_id) + idx;
 
-        auto res = PlayCollectionGame(g, seed, game, cand_model, opp_model, device,
+        auto res = PlayCollectionGame(ep, seed, game, cand_model, opp_model, device,
                                       absl::GetFlag(FLAGS_candidate_logit_cap),
                                       absl::GetFlag(FLAGS_opponent_logit_cap));
 
         // Preassign whole-game partition:
-        // Seat rotation: g % 4 is seat.
-        // For balanced 96/32: 3 of every 4 games per seat are train, 1 is heldout.
-        // Formula: (g / 4) % 4 == 3 -> heldout (games 12..15, 28..31, 44..47, 60..63, 76..79, 92..95, 108..111, 124..127)
-        // Exactly 8 heldout games for each of the 4 seats = 32 heldout games total.
-        // Exactly 24 train games for each of the 4 seats = 96 train games total.
-        bool is_heldout = ((g / 4) % 4 == 3);
+        // Seat rotation: ep % 4 is seat.
+        // For balanced 3:1 partition (e.g. 96/32 or 384/128):
+        // 3 of every 4 games per seat are train/pool, 1 is heldout.
+        bool is_heldout = ((idx / 4) % 4 == 3);
 
         {
           std::lock_guard<std::mutex> lock(out_mutex);
-          game_results[g] = res;
+          game_results[idx] = res;
           if (is_heldout) {
             heldout_rows.insert(heldout_rows.end(),
                                 std::make_move_iterator(res.rows.begin()),
@@ -977,9 +976,11 @@ int RunCollect() {
   std::string meta_path = absl::GetFlag(FLAGS_output_meta_json);
   if (!meta_path.empty()) {
     json::Object meta;
+    int64_t h_games = total_games / 4;
+    int64_t tr_games = total_games - h_games;
     meta["total_games"] = static_cast<int64_t>(total_games);
-    meta["train_games"] = static_cast<int64_t>(96);
-    meta["heldout_games"] = static_cast<int64_t>(32);
+    meta["train_games"] = tr_games;
+    meta["heldout_games"] = h_games;
     meta["train_rows"] = static_cast<int64_t>(train_rows.size());
     meta["heldout_rows"] = static_cast<int64_t>(heldout_rows.size());
     meta["collection_wall_seconds"] = total_wall;
@@ -1077,6 +1078,77 @@ int RunTrain() {
             << "  Critic Pred Pre:         mean=" << stats.critic_pred_mean_pre << " sd=" << stats.critic_pred_sd_pre << "\n"
             << "  Critic Pred Post:        mean=" << stats.critic_pred_mean_post << " sd=" << stats.critic_pred_sd_post << "\n";
 
+  double heldout_ce = -1.0;
+  double heldout_mse = -1.0;
+  if (!heldout_rows.empty()) {
+    child_model->eval();
+    torch::NoGradGuard no_grad;
+    double h_ce_sum = 0.0;
+    double h_weight_sum = 0.0;
+    double h_mse_sum = 0.0;
+    int64_t h_rows = 0;
+    int64_t h_pol_rows = 0;
+
+    const int64_t hn = static_cast<int64_t>(heldout_rows.size());
+    for (int64_t start = 0; start < hn; start += cfg.minibatch_size) {
+      const int64_t length = std::min<int64_t>(cfg.minibatch_size, hn - start);
+      torch::Tensor mb_states = torch::zeros({length, obs_size}, torch::kFloat32);
+      torch::Tensor mb_masks = torch::zeros({length, action_dim}, torch::kBool);
+      torch::Tensor mb_targets = torch::zeros({length, action_dim}, torch::kFloat32);
+      torch::Tensor mb_weights = torch::zeros({length}, torch::kFloat32);
+      torch::Tensor mb_values = torch::zeros({length}, torch::kFloat32);
+
+      float* s_ptr = mb_states.data_ptr<float>();
+      bool* m_ptr = mb_masks.data_ptr<bool>();
+      float* t_ptr = mb_targets.data_ptr<float>();
+      float* w_ptr = mb_weights.data_ptr<float>();
+      float* v_ptr = mb_values.data_ptr<float>();
+
+      for (int64_t i = 0; i < length; ++i) {
+        const auto& r = heldout_rows[start + i];
+        int64_t copy = std::min<int64_t>(obs_size, static_cast<int64_t>(r.observation.size()));
+        if (copy > 0) std::memcpy(s_ptr + i * obs_size, r.observation.data(), copy * sizeof(float));
+        for (size_t j = 0; j < r.legal_actions.size(); ++j) {
+          Action a = r.legal_actions[j];
+          if (a >= 0 && a < action_dim) {
+            m_ptr[i * action_dim + a] = true;
+            if (r.policy_target_weight > 0.0 && j < r.target_probs.size()) {
+              t_ptr[i * action_dim + a] = static_cast<float>(r.target_probs[j]);
+            }
+          }
+        }
+        w_ptr[i] = static_cast<float>(r.policy_target_weight);
+        v_ptr[i] = static_cast<float>(r.value_target);
+      }
+
+      auto mb_states_dev = mb_states.to(device);
+      auto mb_masks_dev = mb_masks.to(device);
+      auto mb_targets_dev = mb_targets.to(device);
+      auto mb_weights_dev = mb_weights.to(device);
+      auto mb_values_dev = mb_values.to(device);
+
+      auto out = child_model->forward(mb_states_dev);
+      torch::Tensor logits = CenterAndCapLogitsTensor(out.logits, mb_masks_dev, static_cast<float>(cfg.logit_cap));
+      torch::Tensor log_probs = torch::log_softmax(logits.masked_fill(mb_masks_dev.logical_not(), -1e9f), -1);
+      torch::Tensor row_ce = -(mb_targets_dev * log_probs).sum(-1);
+      torch::Tensor val_mse = (out.values.squeeze(1) - mb_values_dev).pow(2);
+
+      h_ce_sum += (row_ce * mb_weights_dev).sum().item<double>();
+      h_weight_sum += mb_weights_dev.sum().item<double>();
+      h_mse_sum += val_mse.sum().item<double>();
+      h_rows += length;
+      h_pol_rows += (mb_weights_dev > 0.0).sum().item<int64_t>();
+    }
+
+    heldout_ce = h_weight_sum > 0.0 ? h_ce_sum / h_weight_sum : 0.0;
+    heldout_mse = h_rows > 0 ? h_mse_sum / h_rows : 0.0;
+    std::cout << "[HELDOUT SUMMARY]\n"
+              << "  Heldout Rows:            " << h_rows << "\n"
+              << "  Policy-Weighted Rows:    " << h_pol_rows << "\n"
+              << "  Heldout Policy CE:       " << heldout_ce << "\n"
+              << "  Heldout Value MSE:       " << heldout_mse << "\n";
+  }
+
   // Save trained model and dedicated optimizer
   if (!out_model.empty()) {
     torch::serialize::OutputArchive ar;
@@ -1101,6 +1173,8 @@ int RunTrain() {
     meta["value_backward_minibatches"] = static_cast<int64_t>(stats.value_backward_minibatches);
     meta["policy_ce"] = stats.policy_ce;
     meta["value_mse"] = stats.value_mse;
+    if (heldout_ce >= 0.0) meta["heldout_policy_ce"] = heldout_ce;
+    if (heldout_mse >= 0.0) meta["heldout_value_mse"] = heldout_mse;
     meta["policy_grad_norm"] = stats.policy_grad_norm;
     meta["value_grad_norm"] = stats.value_grad_norm;
     meta["learning_rate"] = lr;

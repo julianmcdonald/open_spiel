@@ -30,6 +30,7 @@
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
+#include "open_spiel/abseil-cpp/absl/flags/reflection.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_split.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -91,7 +92,7 @@ ABSL_FLAG(double, weight_decay, 0.0, "AdamW weight decay for torso/value params.
 ABSL_FLAG(double, policy_weight_decay, 0.0,
           "AdamW weight decay for policy-head params.");
 
-ABSL_FLAG(int, eval_batch_size, 64, "Target inference batch size.");
+ABSL_FLAG(int, eval_batch_size, 32, "Target inference batch size.");
 ABSL_FLAG(int, eval_timeout_ms, 2, "Inference batch timeout in milliseconds.");
 ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension.");
 ABSL_FLAG(int, num_blocks, 8, "Network residual block count.");
@@ -363,6 +364,19 @@ ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
           "Beneficial with separate inference/training GPUs. On a single GPU, "
           "both workloads compete for compute and pipelining may be slower.");
+ABSL_FLAG(bool, separate_actor_critic, false,
+          "Arm D: Train fully separate actor and critic networks.");
+ABSL_FLAG(bool, fresh_optimizer, false,
+          "Start with a fresh AdamW optimizer state even when initializing from a checkpoint.");
+ABSL_FLAG(std::string, critic_checkpoint, "",
+          "Critic model checkpoint to load/save (defaults to model_checkpoint if empty).");
+ABSL_FLAG(std::string, critic_optim_checkpoint, "",
+          "Critic optimizer checkpoint to load/save.");
+ABSL_FLAG(int, start_update_override, -1,
+          "Explicit override for start_update counter (e.g. 201 for study updates).");
+ABSL_FLAG(int, study_updates, -1,
+          "Number of study updates to run from start_update (e.g. 400).");
+
 
 ABSL_FLAG(std::string, search_label_dir, "",
           "[LEGACY offline-distillation mode] Directory containing precomputed "
@@ -933,6 +947,18 @@ void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
   std::unique_lock<std::shared_mutex> lock(*sync_mutex);
   CopyModelWeights(training_model, inference_model);
 }
+
+void SyncDualModels(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> training_actor,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> inference_actor,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> training_critic,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> inference_critic,
+    std::shared_mutex* sync_mutex) {
+  std::unique_lock<std::shared_mutex> lock(*sync_mutex);
+  CopyModelWeights(training_actor, inference_actor);
+  CopyModelWeights(training_critic, inference_critic);
+}
+
 
 std::string HashNonValueParameters(const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
   std::stringstream ss;
@@ -1721,6 +1747,38 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     const std::string& run_uuid,
                     const open_spiel::OnlineCollectionState* aux_state = nullptr,
                     const open_spiel::SearchPiState* search_pi_state = nullptr) {
+  if (model_path.empty() || optim_path.empty()) {
+    SpielFatalError("SaveCheckpoint called with empty path.");
+  }
+  std::string input_model = absl::GetFlag(FLAGS_model_checkpoint);
+  if (!input_model.empty()) {
+    std::error_code ec;
+    std::filesystem::path in_model = std::filesystem::absolute(input_model, ec);
+    std::filesystem::path out_model = std::filesystem::absolute(model_path, ec);
+    if (in_model == out_model) {
+      SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveCheckpoint attempted to overwrite input model checkpoint: " + input_model);
+    }
+    if (std::filesystem::exists(input_model) && std::filesystem::exists(model_path)) {
+      if (std::filesystem::equivalent(model_path, input_model, ec)) {
+        SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveCheckpoint attempted to overwrite input model checkpoint: " + input_model);
+      }
+    }
+  }
+  std::string input_optim = absl::GetFlag(FLAGS_optim_checkpoint);
+  if (!input_optim.empty()) {
+    std::error_code ec;
+    std::filesystem::path in_optim = std::filesystem::absolute(input_optim, ec);
+    std::filesystem::path out_optim = std::filesystem::absolute(optim_path, ec);
+    if (in_optim == out_optim) {
+      SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveCheckpoint attempted to overwrite input optimizer checkpoint: " + input_optim);
+    }
+    if (std::filesystem::exists(input_optim) && std::filesystem::exists(optim_path)) {
+      if (std::filesystem::equivalent(optim_path, input_optim, ec)) {
+        SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveCheckpoint attempted to overwrite input optimizer checkpoint: " + input_optim);
+      }
+    }
+  }
+
   std::string model_tmp = model_path + ".tmp";
   std::string optim_tmp = optim_path + ".tmp";
 
@@ -1805,6 +1863,8 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     SpielFatalError("SaveCheckpoint failed, aborting training to prevent corrupted states.");
   }
 }
+
+
 
 struct CounterfactualPending {
   PpoTransition transition;
@@ -6927,6 +6987,23 @@ int main(int argc, char** argv) {
   training_model->to(device);
   inference_model->to(device);
 
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_critic = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_critic = nullptr;
+  std::unique_ptr<torch::optim::AdamW> critic_optimizer = nullptr;
+  if (absl::GetFlag(FLAGS_separate_actor_critic)) {
+    training_critic =
+        std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+    inference_critic =
+        std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+    training_critic->to(device);
+    inference_critic->to(device);
+  }
+
+
   if (absl::GetFlag(FLAGS_sample_counterfactual_states) && !absl::GetFlag(FLAGS_train_value_only)) {
     SpielFatalError("Counterfactual states sampling can only be enabled during value-only training (train_value_only=true).");
   }
@@ -7062,6 +7139,9 @@ int main(int argc, char** argv) {
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
     optimizer = open_spiel::MakeOptimizer(training_model);
     optimizer_constructed = true;
+    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+      critic_optimizer = open_spiel::MakeOptimizer(training_critic);
+    }
     // Section 7.4: materialize BEFORE any load, so the entries exist in all six
     // arms; a subsequent load simply overwrites the ones the archive carries.
     open_spiel::MaterializeAuxOptimizerState(training_model, *optimizer);
@@ -8736,22 +8816,213 @@ int main(int argc, char** argv) {
                                  "  Model size and hash match Phase 1 manifest.\n"
                                  "  Optimizer size and hash match Phase 1 manifest.\n", actual_param_count);
     exit(0);
+  } else if (init_mode == "study") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    if (!std::filesystem::exists(model_path)) {
+      SpielFatalError("Model file not found for study: " + model_path);
+    }
+    LoadModelCheckpoint(training_model, model_path, device);
+    if (anchor_model) {
+      LoadModelCheckpoint(anchor_model, model_path, device);
+      anchor_model->eval();
+      for (auto& p : anchor_model->parameters()) p.set_requires_grad(false);
+    }
+
+    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+      std::string critic_path = absl::GetFlag(FLAGS_critic_checkpoint);
+      if (critic_path.empty()) critic_path = model_path;
+      if (!std::filesystem::exists(critic_path)) {
+        SpielFatalError("Critic file not found for study: " + critic_path);
+      }
+      LoadModelCheckpoint(training_critic, critic_path, device);
+
+      for (auto& item : training_model->named_parameters()) {
+        if (item.key().find("value_head") != std::string::npos) {
+          item.value().set_requires_grad(false);
+        }
+      }
+      for (auto& item : training_critic->named_parameters()) {
+        if (item.key().rfind("policy_head", 0) == 0) {
+          item.value().set_requires_grad(false);
+        }
+      }
+    }
+
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    if (std::filesystem::exists(m_path)) {
+      std::ifstream m_in(m_path);
+      std::string m_text((std::istreambuf_iterator<char>(m_in)),
+                         std::istreambuf_iterator<char>());
+      auto m_json = json::FromString(m_text);
+      if (m_json.has_value() && m_json->IsObject()) {
+        auto obj = m_json->GetObject();
+        if (obj.find("total_env_steps") != obj.end() && obj["total_env_steps"].IsInt()) {
+          total_env_steps.store(obj["total_env_steps"].GetInt());
+        }
+        if (obj.find("next_episode_id") != obj.end() && obj["next_episode_id"].IsInt()) {
+          next_episode_id.store(obj["next_episode_id"].GetInt());
+        }
+        if (obj.find("global_update") != obj.end() && obj["global_update"].IsInt()) {
+          start_update = obj["global_update"].GetInt() + 1;
+        }
+      }
+    }
+
+    int start_override = absl::GetFlag(FLAGS_start_update_override);
+    if (start_override > 0) {
+      start_update = start_override;
+    }
+    int study_n_updates = absl::GetFlag(FLAGS_study_updates);
+    if (study_n_updates > 0) {
+      target_end_update = start_update + study_n_updates - 1;
+    }
+
+    std::cout << "[STUDY] Starting controlled study (separate="
+              << (absl::GetFlag(FLAGS_separate_actor_critic) ? "true" : "false")
+              << ") from update " << start_update << " to " << target_end_update
+              << " (" << (target_end_update - start_update + 1) << " updates).\n";
+  } else if (init_mode == "study_resume") {
+    std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+    std::string optim_path = absl::GetFlag(FLAGS_optim_checkpoint);
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    std::string manifest_path = m_path.string();
+
+    if (!std::filesystem::exists(manifest_path)) {
+      SpielFatalError("Study resume: manifest not found: " + manifest_path);
+    }
+
+    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+      std::string critic_path = absl::GetFlag(FLAGS_critic_checkpoint);
+      std::string critic_opt_path = absl::GetFlag(FLAGS_critic_optim_checkpoint);
+
+      open_spiel::DualCheckpointManifest dual_manifest;
+      std::string err;
+      if (!open_spiel::ParseAndValidateDualManifest(
+              manifest_path, model_path, optim_path, critic_path, critic_opt_path,
+              master, target_end_update,
+              absl::GetFlag(FLAGS_seed_scheme_version),
+              config_fingerprint,
+              absl::GetFlag(FLAGS_rollout_amp),
+              absl::GetFlag(FLAGS_allow_tf32),
+              absl::GetFlag(FLAGS_hidden_dim),
+              absl::GetFlag(FLAGS_num_blocks),
+              dual_manifest, err)) {
+        SpielFatalError("Study resume dual validation failed: " + err);
+      }
+
+      LoadModelCheckpoint(training_model, model_path, device);
+      torch::load(*optimizer, optim_path, device);
+      LoadModelCheckpoint(training_critic, critic_path, device);
+      torch::load(*critic_optimizer, critic_opt_path, device);
+
+      for (auto& item : training_model->named_parameters()) {
+        if (item.key().find("value_head") != std::string::npos) {
+          item.value().set_requires_grad(false);
+        }
+      }
+      for (auto& item : training_critic->named_parameters()) {
+        if (item.key().rfind("policy_head", 0) == 0) {
+          item.value().set_requires_grad(false);
+        }
+      }
+
+      auto* te_flag = absl::FindCommandLineFlag("target_end_update");
+      if (te_flag && te_flag->CurrentValue() != te_flag->DefaultValue() &&
+          absl::GetFlag(FLAGS_target_end_update) != dual_manifest.target_end_update) {
+        SpielFatalError(absl::StrFormat(
+            "CLI --target_end_update=%d does not match manifest target_end_update=%d",
+            absl::GetFlag(FLAGS_target_end_update), dual_manifest.target_end_update));
+      }
+      auto* seed_flag = absl::FindCommandLineFlag("seed");
+      if (seed_flag && seed_flag->CurrentValue() != seed_flag->DefaultValue() &&
+          absl::GetFlag(FLAGS_seed) != 0 &&
+          absl::GetFlag(FLAGS_seed) != dual_manifest.base_seed) {
+        SpielFatalError(absl::StrFormat(
+            "CLI --seed=%llu does not match manifest base_seed=%llu",
+            static_cast<unsigned long long>(absl::GetFlag(FLAGS_seed)),
+            static_cast<unsigned long long>(dual_manifest.base_seed)));
+      }
+
+      start_update = dual_manifest.global_update + 1;
+      total_env_steps.store(dual_manifest.total_env_steps);
+      next_episode_id.store(dual_manifest.next_episode_id);
+      run_uuid = dual_manifest.run_uuid;
+      master = dual_manifest.base_seed;
+      target_end_update = dual_manifest.target_end_update;
+    } else {
+      open_spiel::CheckpointManifest shared_manifest;
+      std::string err;
+      std::string legacy_fingerprint = absl::GetFlag(FLAGS_train_value_only)
+          ? ""
+          : ComputeLegacyConfigFingerprint();
+      if (!open_spiel::ParseAndValidateManifest(
+              manifest_path, model_path, optim_path,
+              master, target_end_update,
+              absl::GetFlag(FLAGS_seed_scheme_version),
+              config_fingerprint,
+              pre_precision_config_fingerprint,
+              absl::GetFlag(FLAGS_rollout_amp),
+              absl::GetFlag(FLAGS_allow_tf32),
+              search_label_fingerprint,
+              absl::GetFlag(FLAGS_hidden_dim),
+              absl::GetFlag(FLAGS_num_blocks),
+              shared_manifest, err, legacy_fingerprint)) {
+        SpielFatalError("Study resume shared validation failed: " + err);
+      }
+
+      LoadModelCheckpoint(training_model, model_path, device);
+      torch::load(*optimizer, optim_path, device);
+
+      auto* te_flag = absl::FindCommandLineFlag("target_end_update");
+      if (te_flag && te_flag->CurrentValue() != te_flag->DefaultValue() &&
+          absl::GetFlag(FLAGS_target_end_update) != shared_manifest.target_end_update) {
+        SpielFatalError(absl::StrFormat(
+            "CLI --target_end_update=%d does not match manifest target_end_update=%d",
+            absl::GetFlag(FLAGS_target_end_update), shared_manifest.target_end_update));
+      }
+      auto* seed_flag = absl::FindCommandLineFlag("seed");
+      if (seed_flag && seed_flag->CurrentValue() != seed_flag->DefaultValue() &&
+          absl::GetFlag(FLAGS_seed) != 0 &&
+          absl::GetFlag(FLAGS_seed) != shared_manifest.base_seed) {
+        SpielFatalError(absl::StrFormat(
+            "CLI --seed=%llu does not match manifest base_seed=%llu",
+            static_cast<unsigned long long>(absl::GetFlag(FLAGS_seed)),
+            static_cast<unsigned long long>(shared_manifest.base_seed)));
+      }
+
+      start_update = shared_manifest.global_update + 1;
+      total_env_steps.store(shared_manifest.total_env_steps);
+      next_episode_id.store(shared_manifest.next_episode_id);
+      run_uuid = shared_manifest.run_uuid;
+      master = shared_manifest.base_seed;
+      target_end_update = shared_manifest.target_end_update;
+    }
+
+    std::cout << "[STUDY] Resuming study from update " << start_update
+              << " to " << target_end_update << ".\n";
   } else {
     SpielFatalError("Unsupported init_mode: " + init_mode +
                     " (expected random, checkpoint, bootstrap, "
-                    "validate_legacy, diagnostic, vrpo_one_update, or "
+                    "validate_legacy, diagnostic, study, study_resume, vrpo_one_update, or "
                     "vrpo_schedule_screen, vrpo_ppo_pilot, or "
                     "vrpo_ppo_continuation, or vrpo_q_warmup)");
   }
 
   std::shared_mutex sync_mutex;
   std::mutex eval_mutex;
-  open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+  if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+    SyncDualModels(training_model, inference_model, training_critic, inference_critic, &sync_mutex);
+  } else {
+    open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+  }
 
   std::shared_ptr<open_spiel::IGameEvaluator> evaluator;
   if (absl::GetFlag(FLAGS_deterministic_rollout_eval)) {
     evaluator = std::make_shared<open_spiel::DeterministicEvaluator>(
-        inference_model, device, &eval_mutex, &sync_mutex);
+        inference_model, device, &eval_mutex, &sync_mutex,
+        absl::GetFlag(FLAGS_separate_actor_critic) ? inference_critic : nullptr);
   } else {
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
         inference_model, absl::GetFlag(FLAGS_eval_batch_size),
@@ -8760,8 +9031,10 @@ int main(int argc, char** argv) {
         /*high_priority_stream=*/false,
         /*emit_batch_membership=*/numerical_parity,
         absl::GetFlag(FLAGS_rollout_amp),
-        absl::GetFlag(FLAGS_allow_tf32));
+        absl::GetFlag(FLAGS_allow_tf32),
+        absl::GetFlag(FLAGS_separate_actor_critic) ? inference_critic : nullptr);
   }
+
 
   // =========================================================================
   // Agent-turn search policy iteration (search-PI)
@@ -11159,8 +11432,14 @@ int main(int argc, char** argv) {
   }
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
     open_spiel::PpoUpdateStats stats =
-        open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
-                                   obs_size, action_size, device, master, start_update, anchor_model);
+        (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr)
+            ? open_spiel::TrainPpoUpdateSeparate(
+                  training_model, *optimizer, training_critic, *critic_optimizer,
+                  current_collect.rollout, obs_size, action_size, device, master,
+                  start_update)
+            : open_spiel::TrainPpoUpdate(
+                  training_model, *optimizer, current_collect.rollout,
+                  obs_size, action_size, device, master, start_update, anchor_model);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -11193,8 +11472,11 @@ int main(int argc, char** argv) {
     if (absl::GetFlag(FLAGS_anneal_lr)) {
       double frac = 1.0 - static_cast<double>(update - 1) /
                               std::max(1, target_end_update);
-      open_spiel::SetOptimizerLearningRate(*optimizer,
-                                           std::max(1e-8, frac * base_lr));
+      double current_lr = std::max(1e-8, frac * base_lr);
+      open_spiel::SetOptimizerLearningRate(*optimizer, current_lr);
+      if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
+        open_spiel::SetOptimizerLearningRate(*critic_optimizer, current_lr);
+      }
     }
 
     auto wall_start = std::chrono::high_resolution_clock::now();
@@ -11316,11 +11598,17 @@ int main(int argc, char** argv) {
     }
 
     open_spiel::PpoUpdateStats stats =
-        open_spiel::TrainPpoUpdate(training_model, *optimizer, current_collect.rollout,
-                                   obs_size, action_size, device, master, update, anchor_model,
-                                   current_collect.aux_examples, this_search_coef,
-                                   online_search_collection ? aux_abort_ratio : 0.0,
-                                   pwo5_batch, pwo5_cfg);
+        (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr)
+            ? open_spiel::TrainPpoUpdateSeparate(
+                  training_model, *optimizer, training_critic, *critic_optimizer,
+                  current_collect.rollout, obs_size, action_size, device, master,
+                  update)
+            : open_spiel::TrainPpoUpdate(
+                  training_model, *optimizer, current_collect.rollout,
+                  obs_size, action_size, device, master, update, anchor_model,
+                  current_collect.aux_examples, this_search_coef,
+                  online_search_collection ? aux_abort_ratio : 0.0,
+                  pwo5_batch, pwo5_cfg);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -11507,7 +11795,11 @@ int main(int argc, char** argv) {
       total_moves += next_collect.moves;
     }
 
-    open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+      SyncDualModels(training_model, inference_model, training_critic, inference_critic, &sync_mutex);
+    } else {
+      open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+    }
 
     auto wall_end = std::chrono::high_resolution_clock::now();
 
@@ -11600,18 +11892,32 @@ int main(int argc, char** argv) {
     bool is_pilot_update = (training_step == 10 || training_step == 25 || training_step == 50);
     if (is_pilot_update || (checkpoint_interval > 0 && update % checkpoint_interval == 0)) {
       std::string prefix = absl::GetFlag(FLAGS_run_prefix);
-      std::string model_path =
-          absl::StrCat(prefix, "_model_update_", update, ".pt");
-      std::string optim_path =
-          absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
-      open_spiel::OnlineCollectionState aux_ckpt = build_aux_state();
-      open_spiel::SaveCheckpoint(training_model, *optimizer, model_path,
-                                 optim_path, update, target_end_update,
-                                 total_env_steps.load(), next_episode_id.load(),
-                                 master, absl::GetFlag(FLAGS_seed_scheme_version),
-                                 config_fingerprint, search_label_fingerprint,
-                                 run_uuid,
-                                 online_search_collection ? &aux_ckpt : nullptr);
+      if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+        std::string actor_model_path = absl::StrCat(prefix, "_actor_model_update_", update, ".pt");
+        std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_update_", update, ".pt");
+        std::string critic_model_path = absl::StrCat(prefix, "_critic_model_update_", update, ".pt");
+        std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_update_", update, ".pt");
+        open_spiel::SaveDualCheckpoint(
+            training_model, *optimizer, training_critic, *critic_optimizer,
+            actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+            update, target_end_update, total_env_steps.load(), next_episode_id.load(),
+            master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+            search_label_fingerprint, run_uuid,
+            absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+      } else {
+        std::string model_path =
+            absl::StrCat(prefix, "_model_update_", update, ".pt");
+        std::string optim_path =
+            absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
+        open_spiel::OnlineCollectionState aux_ckpt = build_aux_state();
+        open_spiel::SaveCheckpoint(training_model, *optimizer, model_path,
+                                   optim_path, update, target_end_update,
+                                   total_env_steps.load(), next_episode_id.load(),
+                                   master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                   config_fingerprint, search_label_fingerprint,
+                                   run_uuid,
+                                   online_search_collection ? &aux_ckpt : nullptr);
+      }
     }
 
     // Advance to next rollout.
@@ -11648,16 +11954,32 @@ int main(int argc, char** argv) {
       static_cast<unsigned long long>(eval_stats.max_batch_size));
 
   if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
-    open_spiel::OnlineCollectionState aux_final = build_aux_state();
-    open_spiel::SaveCheckpoint(training_model, *optimizer,
-                               absl::GetFlag(FLAGS_model_checkpoint),
-                               absl::GetFlag(FLAGS_optim_checkpoint),
-                               target_end_update, target_end_update,
-                               total_env_steps.load(), next_episode_id.load(),
-                               master, absl::GetFlag(FLAGS_seed_scheme_version),
-                               config_fingerprint, search_label_fingerprint,
-                               run_uuid,
-                               online_search_collection ? &aux_final : nullptr);
+    std::string prefix = absl::GetFlag(FLAGS_run_prefix);
+    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+      std::string actor_model_path = absl::StrCat(prefix, "_actor_model_final.pt");
+      std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_final.pt");
+      std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
+      std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
+      open_spiel::SaveDualCheckpoint(
+          training_model, *optimizer, training_critic, *critic_optimizer,
+          actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+          target_end_update, target_end_update, total_env_steps.load(), next_episode_id.load(),
+          master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+          search_label_fingerprint, run_uuid,
+          absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+    } else {
+      std::string model_path = absl::StrCat(prefix, "_model_final.pt");
+      std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+      open_spiel::OnlineCollectionState aux_final = build_aux_state();
+      open_spiel::SaveCheckpoint(training_model, *optimizer,
+                                 model_path, optim_path,
+                                 target_end_update, target_end_update,
+                                 total_env_steps.load(), next_episode_id.load(),
+                                 master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                 config_fingerprint, search_label_fingerprint,
+                                 run_uuid,
+                                 online_search_collection ? &aux_final : nullptr);
+    }
   }
   return 0;
 #endif

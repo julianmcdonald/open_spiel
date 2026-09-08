@@ -551,6 +551,20 @@ PpoUpdateStats TrainPpoUpdate(
     const Pwo5AuxBatch& pwo5_aux = Pwo5AuxBatch(),
     const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig());
 
+// Arm D: Fully separate actor and critic networks.
+// Actor parameters produce policy logits and entropy loss; critic parameters produce
+// scalar values and value loss. Global gradient clipping is applied over the union of
+// active actor and critic parameters before stepping independent optimizers.
+PpoUpdateStats TrainPpoUpdateSeparate(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> actor_model,
+    torch::optim::AdamW& actor_optimizer,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model,
+    torch::optim::AdamW& critic_optimizer,
+    std::vector<PpoTransition>& batch,
+    int64_t obs_size, int64_t action_dim, torch::Device device,
+    uint64_t master, int global_update);
+
+
 // ---------------------------------------------------------------------------
 // PWO-5 head telemetry sidecar (amendment 1 ruling 6).
 // ---------------------------------------------------------------------------
@@ -818,6 +832,95 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               CheckpointManifest& out_manifest,
                               std::string& error_msg,
                               const std::string& current_legacy_config_fingerprint = "");
+
+struct DualCheckpointManifest {
+  int schema_version = 2;
+  std::string checkpoint_uuid;
+  std::string architecture;
+  bool separate_actor_critic = false;
+  std::string value_head_status;
+  std::string evaluation_role;
+  std::string warning;
+  int global_update = 0;
+  int target_end_update = 0;
+  uint64_t total_env_steps = 0;
+  uint64_t next_episode_id = 0;
+  uint64_t base_seed = 0;
+  int seed_scheme_version = 0;
+  std::string config_fingerprint;
+  std::string search_label_fingerprint;
+  std::string run_uuid;
+
+  std::string actor_model_filename;
+  size_t actor_model_file_size = 0;
+  std::string actor_model_sha256;
+  std::string actor_optimizer_filename;
+  size_t actor_optimizer_file_size = 0;
+  std::string actor_optimizer_sha256;
+
+  std::string critic_model_filename;
+  size_t critic_model_file_size = 0;
+  std::string critic_model_sha256;
+  std::string critic_optimizer_filename;
+  size_t critic_optimizer_file_size = 0;
+  std::string critic_optimizer_sha256;
+
+  int hidden_dim = 2048;
+  int num_blocks = 8;
+  bool rollout_amp = false;
+  bool allow_tf32 = false;
+};
+
+bool ParseAndValidateDualManifest(
+    const std::string& manifest_path,
+    std::string& actor_model_path,
+    std::string& actor_optim_path,
+    std::string& critic_model_path,
+    std::string& critic_optim_path,
+    uint64_t current_base_seed,
+    int current_target_end_update,
+    int current_seed_scheme_version,
+    const std::string& current_config_fingerprint,
+    bool current_rollout_amp,
+    bool current_allow_tf32,
+    int current_hidden_dim,
+    int current_num_blocks,
+    DualCheckpointManifest& out_manifest,
+    std::string& error_msg);
+
+inline std::string GenerateUUID() {
+  std::random_device rd;
+  std::mt19937_64 generator(rd());
+  uint64_t r1 = generator();
+  uint64_t r2 = generator();
+  uint32_t a = (r1 >> 32);
+  uint16_t b = (r1 >> 16) & 0xFFFF;
+  uint16_t c = (r1 & 0x0FFF) | 0x4000;
+  uint16_t d = ((r2 >> 48) & 0x3FFF) | 0x8000;
+  uint64_t e = r2 & 0xFFFFFFFFFFFFULL;
+  return absl::StrFormat("%08x-%04x-%04x-%04x-%012llx", a, b, c, d, e);
+}
+
+void SaveDualCheckpoint(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> actor_model,
+    torch::optim::AdamW& actor_optimizer,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model,
+    torch::optim::AdamW& critic_optimizer,
+    const std::string& actor_model_path,
+    const std::string& actor_optim_path,
+    const std::string& critic_model_path,
+    const std::string& critic_optim_path,
+    int global_update,
+    int target_end_update,
+    uint64_t total_env_steps,
+    uint64_t next_episode_id,
+    uint64_t base_seed,
+    int seed_scheme_version,
+    const std::string& config_fingerprint,
+    const std::string& search_label_fingerprint,
+    const std::string& run_uuid,
+    const std::string& input_model_to_protect = "",
+    const std::string& input_optim_to_protect = "");
 
 inline uint32_t Fnv1a(const uint8_t* data, size_t size) {
   uint32_t hash = 2166136261U;

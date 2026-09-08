@@ -79,6 +79,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_split_evaluator_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_split_evaluator_test COMMAND dune_split_evaluator_test)
 
+  add_executable(dune_split_parity_audit
+    dune_split_parity_audit.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_split_parity_audit dune_search ${TORCH_LIBRARIES})
+
   # Rung 4 replay route: the row shard codec and the uniform replay-window
   # sampler. Same source pairing as dune_search_pi_test because SearchPiRow and
   # its enums are defined alongside the generator.
@@ -402,6 +407,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_utils_test ${TORCH_LIBRARIES})
   add_test(NAME dune_offline_utils_test COMMAND dune_offline_utils_test)
+
+  add_executable(dune_separate_actor_critic_test dune_separate_actor_critic_test.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_separate_actor_critic_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_separate_actor_critic_test COMMAND dune_separate_actor_critic_test)
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()

@@ -429,6 +429,418 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
   return true;
 }
 
+bool ParseAndValidateDualManifest(
+    const std::string& manifest_path,
+    std::string& actor_model_path,
+    std::string& actor_optim_path,
+    std::string& critic_model_path,
+    std::string& critic_optim_path,
+    uint64_t current_base_seed,
+    int current_target_end_update,
+    int current_seed_scheme_version,
+    const std::string& current_config_fingerprint,
+    bool current_rollout_amp,
+    bool current_allow_tf32,
+    int current_hidden_dim,
+    int current_num_blocks,
+    DualCheckpointManifest& out_manifest,
+    std::string& error_msg) {
+  if (!std::filesystem::exists(manifest_path)) {
+    error_msg = "manifest file not found at: " + manifest_path;
+    return false;
+  }
+  std::ifstream ifs(manifest_path);
+  if (!ifs) {
+    error_msg = "Could not open manifest file at: " + manifest_path;
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(content);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    error_msg = "Manifest file is malformed JSON at: " + manifest_path;
+    return false;
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  auto get_string_field = [&](const std::string& key, std::string& val) -> bool {
+    auto it = manifest_obj.find(key);
+    if (it == manifest_obj.end() || !it->second.IsString()) {
+      error_msg = "Manifest missing required string field: " + key;
+      return false;
+    }
+    val = it->second.GetString();
+    return true;
+  };
+
+  auto get_int_field = [&](const std::string& key, int64_t& val) -> bool {
+    auto it = manifest_obj.find(key);
+    if (it == manifest_obj.end() || !it->second.IsInt()) {
+      error_msg = "Manifest missing required int field: " + key;
+      return false;
+    }
+    val = it->second.GetInt();
+    return true;
+  };
+
+  auto get_bool_field = [&](const std::string& key, bool& val) -> bool {
+    auto it = manifest_obj.find(key);
+    if (it == manifest_obj.end() || !it->second.IsBool()) {
+      error_msg = "Manifest missing required bool field: " + key;
+      return false;
+    }
+    val = it->second.GetBool();
+    return true;
+  };
+
+  int64_t schema_version = 0;
+  int64_t global_update = 0;
+  int64_t target_end_update = 0;
+  int64_t total_env_steps = 0;
+  int64_t next_episode_id = 0;
+  int64_t base_seed = 0;
+  int64_t seed_scheme_version = 0;
+  int64_t actor_model_file_size = 0;
+  int64_t actor_optimizer_file_size = 0;
+  int64_t critic_model_file_size = 0;
+  int64_t critic_optimizer_file_size = 0;
+  int64_t hidden_dim = 0;
+  int64_t num_blocks = 0;
+
+  if (!get_int_field("schema_version", schema_version) ||
+      !get_string_field("checkpoint_uuid", out_manifest.checkpoint_uuid) ||
+      !get_string_field("architecture", out_manifest.architecture) ||
+      !get_bool_field("separate_actor_critic", out_manifest.separate_actor_critic) ||
+      !get_int_field("global_update", global_update) ||
+      !get_int_field("target_end_update", target_end_update) ||
+      !get_int_field("total_env_steps", total_env_steps) ||
+      !get_int_field("next_episode_id", next_episode_id) ||
+      !get_int_field("base_seed", base_seed) ||
+      !get_int_field("seed_scheme_version", seed_scheme_version) ||
+      !get_string_field("config_fingerprint", out_manifest.config_fingerprint) ||
+      !get_string_field("run_uuid", out_manifest.run_uuid) ||
+      !get_string_field("model_filename", out_manifest.actor_model_filename) ||
+      !get_int_field("model_file_size", actor_model_file_size) ||
+      !get_string_field("model_sha256", out_manifest.actor_model_sha256) ||
+      !get_string_field("optimizer_filename", out_manifest.actor_optimizer_filename) ||
+      !get_int_field("optimizer_file_size", actor_optimizer_file_size) ||
+      !get_string_field("optimizer_sha256", out_manifest.actor_optimizer_sha256) ||
+      !get_string_field("critic_model_filename", out_manifest.critic_model_filename) ||
+      !get_int_field("critic_model_file_size", critic_model_file_size) ||
+      !get_string_field("critic_model_sha256", out_manifest.critic_model_sha256) ||
+      !get_string_field("critic_optimizer_filename", out_manifest.critic_optimizer_filename) ||
+      !get_int_field("critic_optimizer_file_size", critic_optimizer_file_size) ||
+      !get_string_field("critic_optimizer_sha256", out_manifest.critic_optimizer_sha256) ||
+      !get_int_field("hidden_dim", hidden_dim) ||
+      !get_int_field("num_blocks", num_blocks)) {
+    return false;
+  }
+
+  if (schema_version != 2) {
+    error_msg = absl::StrFormat("schema_version mismatch. Expected: 2, Got: %d", schema_version);
+    return false;
+  }
+
+  if (out_manifest.architecture != "separate_actor_critic" || !out_manifest.separate_actor_critic) {
+    error_msg = "Manifest architecture is not separate_actor_critic.";
+    return false;
+  }
+
+  out_manifest.schema_version = schema_version;
+  out_manifest.global_update = global_update;
+  out_manifest.target_end_update = target_end_update;
+  out_manifest.total_env_steps = total_env_steps;
+  out_manifest.next_episode_id = next_episode_id;
+  out_manifest.base_seed = base_seed;
+  out_manifest.seed_scheme_version = seed_scheme_version;
+  out_manifest.actor_model_file_size = actor_model_file_size;
+  out_manifest.actor_optimizer_file_size = actor_optimizer_file_size;
+  out_manifest.critic_model_file_size = critic_model_file_size;
+  out_manifest.critic_optimizer_file_size = critic_optimizer_file_size;
+  out_manifest.hidden_dim = hidden_dim;
+  out_manifest.num_blocks = num_blocks;
+
+  std::filesystem::path manifest_dir = std::filesystem::path(manifest_path).parent_path();
+  if (actor_model_path.empty()) {
+    actor_model_path = (manifest_dir / out_manifest.actor_model_filename).string();
+  }
+  if (actor_optim_path.empty()) {
+    actor_optim_path = (manifest_dir / out_manifest.actor_optimizer_filename).string();
+  }
+  if (critic_model_path.empty()) {
+    critic_model_path = (manifest_dir / out_manifest.critic_model_filename).string();
+  }
+  if (critic_optim_path.empty()) {
+    critic_optim_path = (manifest_dir / out_manifest.critic_optimizer_filename).string();
+  }
+
+  if (std::filesystem::path(actor_model_path).filename().string() != out_manifest.actor_model_filename) {
+    error_msg = "Actor model filename mismatch. Manifest: " + out_manifest.actor_model_filename + ", Actual: " + std::filesystem::path(actor_model_path).filename().string();
+    return false;
+  }
+  if (std::filesystem::path(actor_optim_path).filename().string() != out_manifest.actor_optimizer_filename) {
+    error_msg = "Actor optimizer filename mismatch. Manifest: " + out_manifest.actor_optimizer_filename + ", Actual: " + std::filesystem::path(actor_optim_path).filename().string();
+    return false;
+  }
+  if (std::filesystem::path(critic_model_path).filename().string() != out_manifest.critic_model_filename) {
+    error_msg = "Critic model filename mismatch. Manifest: " + out_manifest.critic_model_filename + ", Actual: " + std::filesystem::path(critic_model_path).filename().string();
+    return false;
+  }
+  if (std::filesystem::path(critic_optim_path).filename().string() != out_manifest.critic_optimizer_filename) {
+    error_msg = "Critic optimizer filename mismatch. Manifest: " + out_manifest.critic_optimizer_filename + ", Actual: " + std::filesystem::path(critic_optim_path).filename().string();
+    return false;
+  }
+
+  if (!std::filesystem::exists(actor_model_path)) {
+    error_msg = "Actor model file not found: " + actor_model_path;
+    return false;
+  }
+  if (!std::filesystem::exists(actor_optim_path)) {
+    error_msg = "Actor optimizer file not found: " + actor_optim_path;
+    return false;
+  }
+  if (!std::filesystem::exists(critic_model_path)) {
+    error_msg = "Critic model file not found: " + critic_model_path;
+    return false;
+  }
+  if (!std::filesystem::exists(critic_optim_path)) {
+    error_msg = "Critic optimizer file not found: " + critic_optim_path;
+    return false;
+  }
+
+  size_t actual_actor_size = 0;
+  std::string actual_actor_hash = open_spiel::ComputeFileSHA256(actor_model_path, &actual_actor_size);
+  if (actual_actor_size != out_manifest.actor_model_file_size) {
+    error_msg = absl::StrFormat("Actor model size mismatch. Manifest: %d, Actual: %d", out_manifest.actor_model_file_size, actual_actor_size);
+    return false;
+  }
+  if (actual_actor_hash != out_manifest.actor_model_sha256) {
+    error_msg = "Actor model SHA-256 mismatch. Manifest: " + out_manifest.actor_model_sha256 + ", Actual: " + actual_actor_hash;
+    return false;
+  }
+
+  size_t actual_actor_opt_size = 0;
+  std::string actual_actor_opt_hash = open_spiel::ComputeFileSHA256(actor_optim_path, &actual_actor_opt_size);
+  if (actual_actor_opt_size != out_manifest.actor_optimizer_file_size) {
+    error_msg = absl::StrFormat("Actor optimizer size mismatch. Manifest: %d, Actual: %d", out_manifest.actor_optimizer_file_size, actual_actor_opt_size);
+    return false;
+  }
+  if (actual_actor_opt_hash != out_manifest.actor_optimizer_sha256) {
+    error_msg = "Actor optimizer SHA-256 mismatch. Manifest: " + out_manifest.actor_optimizer_sha256 + ", Actual: " + actual_actor_opt_hash;
+    return false;
+  }
+
+  size_t actual_critic_size = 0;
+  std::string actual_critic_hash = open_spiel::ComputeFileSHA256(critic_model_path, &actual_critic_size);
+  if (actual_critic_size != out_manifest.critic_model_file_size) {
+    error_msg = absl::StrFormat("Critic model size mismatch. Manifest: %d, Actual: %d", out_manifest.critic_model_file_size, actual_critic_size);
+    return false;
+  }
+  if (actual_critic_hash != out_manifest.critic_model_sha256) {
+    error_msg = "Critic model SHA-256 mismatch. Manifest: " + out_manifest.critic_model_sha256 + ", Actual: " + actual_critic_hash;
+    return false;
+  }
+
+  size_t actual_critic_opt_size = 0;
+  std::string actual_critic_opt_hash = open_spiel::ComputeFileSHA256(critic_optim_path, &actual_critic_opt_size);
+  if (actual_critic_opt_size != out_manifest.critic_optimizer_file_size) {
+    error_msg = absl::StrFormat("Critic optimizer size mismatch. Manifest: %d, Actual: %d", out_manifest.critic_optimizer_file_size, actual_critic_opt_size);
+    return false;
+  }
+  if (actual_critic_opt_hash != out_manifest.critic_optimizer_sha256) {
+    error_msg = "Critic optimizer SHA-256 mismatch. Manifest: " + out_manifest.critic_optimizer_sha256 + ", Actual: " + actual_critic_opt_hash;
+    return false;
+  }
+
+  if (current_base_seed != 0 && current_base_seed != static_cast<uint64_t>(out_manifest.base_seed)) {
+    error_msg = absl::StrFormat("Base seed mismatch. Current: %llu, Manifest: %llu",
+                                static_cast<unsigned long long>(current_base_seed),
+                                static_cast<unsigned long long>(out_manifest.base_seed));
+    return false;
+  }
+  if (current_target_end_update <= out_manifest.global_update) {
+    error_msg = absl::StrFormat("Target end update (%d) must be greater than manifest global update (%d)", current_target_end_update, out_manifest.global_update);
+    return false;
+  }
+  if (current_seed_scheme_version != out_manifest.seed_scheme_version) {
+    error_msg = absl::StrFormat("Seed scheme version mismatch. Current: %d, Manifest: %d", current_seed_scheme_version, out_manifest.seed_scheme_version);
+    return false;
+  }
+  if (current_config_fingerprint != out_manifest.config_fingerprint) {
+    error_msg = "Config fingerprint mismatch.\n  Expected: " + out_manifest.config_fingerprint + "\n  Got:      " + current_config_fingerprint;
+    return false;
+  }
+  if (current_hidden_dim != out_manifest.hidden_dim) {
+    error_msg = absl::StrFormat("hidden_dim mismatch. Flags: %d, Manifest: %d", current_hidden_dim, out_manifest.hidden_dim);
+    return false;
+  }
+  if (current_num_blocks != out_manifest.num_blocks) {
+    error_msg = absl::StrFormat("num_blocks mismatch. Flags: %d, Manifest: %d", current_num_blocks, out_manifest.num_blocks);
+    return false;
+  }
+
+  bool manifest_rollout_amp = false, manifest_allow_tf32 = false;
+  if (get_bool_field("rollout_amp", manifest_rollout_amp) && manifest_rollout_amp != current_rollout_amp) {
+    error_msg = absl::StrFormat("rollout_amp mismatch. Flags: %d, Manifest: %d", current_rollout_amp, manifest_rollout_amp);
+    return false;
+  }
+  if (get_bool_field("allow_tf32", manifest_allow_tf32) && manifest_allow_tf32 != current_allow_tf32) {
+    error_msg = absl::StrFormat("allow_tf32 mismatch. Flags: %d, Manifest: %d", current_allow_tf32, manifest_allow_tf32);
+    return false;
+  }
+
+  return true;
+}
+
+void SaveDualCheckpoint(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> actor_model,
+    torch::optim::AdamW& actor_optimizer,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model,
+    torch::optim::AdamW& critic_optimizer,
+    const std::string& actor_model_path,
+    const std::string& actor_optim_path,
+    const std::string& critic_model_path,
+    const std::string& critic_optim_path,
+    int global_update,
+    int target_end_update,
+    uint64_t total_env_steps,
+    uint64_t next_episode_id,
+    uint64_t base_seed,
+    int seed_scheme_version,
+    const std::string& config_fingerprint,
+    const std::string& search_label_fingerprint,
+    const std::string& run_uuid,
+    const std::string& input_model_to_protect,
+    const std::string& input_optim_to_protect) {
+  if (actor_model_path.empty() || critic_model_path.empty() ||
+      actor_optim_path.empty() || critic_optim_path.empty()) {
+    SpielFatalError("SaveDualCheckpoint called with empty path.");
+  }
+
+  // Prevent overwriting input model or optimizer checkpoints
+  if (!input_model_to_protect.empty()) {
+    std::error_code ec;
+    std::filesystem::path in_model = std::filesystem::absolute(input_model_to_protect, ec);
+    std::filesystem::path out_actor = std::filesystem::absolute(actor_model_path, ec);
+    std::filesystem::path out_critic = std::filesystem::absolute(critic_model_path, ec);
+    if (in_model == out_actor || in_model == out_critic) {
+      SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveDualCheckpoint attempted to overwrite input model checkpoint: " + input_model_to_protect);
+    }
+    if (std::filesystem::exists(input_model_to_protect)) {
+      if ((std::filesystem::exists(actor_model_path) && std::filesystem::equivalent(actor_model_path, input_model_to_protect, ec)) ||
+          (std::filesystem::exists(critic_model_path) && std::filesystem::equivalent(critic_model_path, input_model_to_protect, ec))) {
+        SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveDualCheckpoint attempted to overwrite input model checkpoint: " + input_model_to_protect);
+      }
+    }
+  }
+  if (!input_optim_to_protect.empty()) {
+    std::error_code ec;
+    std::filesystem::path in_optim = std::filesystem::absolute(input_optim_to_protect, ec);
+    std::filesystem::path out_actor_opt = std::filesystem::absolute(actor_optim_path, ec);
+    std::filesystem::path out_critic_opt = std::filesystem::absolute(critic_optim_path, ec);
+    if (in_optim == out_actor_opt || in_optim == out_critic_opt) {
+      SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveDualCheckpoint attempted to overwrite input optimizer checkpoint: " + input_optim_to_protect);
+    }
+    if (std::filesystem::exists(input_optim_to_protect)) {
+      if ((std::filesystem::exists(actor_optim_path) && std::filesystem::equivalent(actor_optim_path, input_optim_to_protect, ec)) ||
+          (std::filesystem::exists(critic_optim_path) && std::filesystem::equivalent(critic_optim_path, input_optim_to_protect, ec))) {
+        SpielFatalError("CRITICAL BASELINE OVERWRITE ERROR: SaveDualCheckpoint attempted to overwrite input optimizer checkpoint: " + input_optim_to_protect);
+      }
+    }
+  }
+
+  std::string actor_tmp = actor_model_path + ".tmp";
+  std::string actor_optim_tmp = actor_optim_path + ".tmp";
+  std::string critic_tmp = critic_model_path + ".tmp";
+  std::string critic_optim_tmp = critic_optim_path + ".tmp";
+
+  std::filesystem::path manifest_path = actor_model_path;
+  manifest_path.replace_extension(".json");
+  std::string manifest_path_str = manifest_path.string();
+  std::string manifest_tmp = manifest_path_str + ".tmp";
+
+  try {
+    torch::save(actor_model, actor_tmp);
+    torch::save(actor_optimizer, actor_optim_tmp);
+    torch::save(critic_model, critic_tmp);
+    torch::save(critic_optimizer, critic_optim_tmp);
+
+    size_t actor_size = 0;
+    std::string actor_hash = ComputeFileSHA256(actor_tmp, &actor_size);
+    size_t actor_opt_size = 0;
+    std::string actor_opt_hash = ComputeFileSHA256(actor_optim_tmp, &actor_opt_size);
+    size_t critic_size = 0;
+    std::string critic_hash = ComputeFileSHA256(critic_tmp, &critic_size);
+    size_t critic_opt_size = 0;
+    std::string critic_opt_hash = ComputeFileSHA256(critic_optim_tmp, &critic_opt_size);
+
+    std::string checkpoint_uuid = GenerateUUID();
+    json::Object manifest_obj;
+    manifest_obj["schema_version"] = static_cast<int64_t>(2);
+    manifest_obj["checkpoint_uuid"] = checkpoint_uuid;
+    manifest_obj["architecture"] = "separate_actor_critic";
+    manifest_obj["separate_actor_critic"] = true;
+    manifest_obj["value_head_status"] = "actor_value_head_detached_and_stale";
+    manifest_obj["evaluation_role"] = "actor_only_no_value_head";
+    manifest_obj["warning"] =
+        "CRITICAL: Value head in this actor checkpoint is detached and was never updated after U200. Evaluators requiring leaf values must load the paired critic checkpoint, not this actor.";
+    manifest_obj["global_update"] = static_cast<int64_t>(global_update);
+    manifest_obj["target_end_update"] = static_cast<int64_t>(target_end_update);
+    manifest_obj["total_env_steps"] = static_cast<int64_t>(total_env_steps);
+    manifest_obj["next_episode_id"] = static_cast<int64_t>(next_episode_id);
+    manifest_obj["base_seed"] = static_cast<int64_t>(base_seed);
+    manifest_obj["seed_scheme_version"] = static_cast<int64_t>(seed_scheme_version);
+    manifest_obj["config_fingerprint"] = config_fingerprint;
+    manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
+    manifest_obj["run_uuid"] = run_uuid;
+
+    manifest_obj["model_filename"] = std::filesystem::path(actor_model_path).filename().string();
+    manifest_obj["model_file_size"] = static_cast<int64_t>(actor_size);
+    manifest_obj["model_sha256"] = actor_hash;
+    manifest_obj["optimizer_filename"] = std::filesystem::path(actor_optim_path).filename().string();
+    manifest_obj["optimizer_file_size"] = static_cast<int64_t>(actor_opt_size);
+    manifest_obj["optimizer_sha256"] = actor_opt_hash;
+
+    manifest_obj["critic_model_filename"] = std::filesystem::path(critic_model_path).filename().string();
+    manifest_obj["critic_model_file_size"] = static_cast<int64_t>(critic_size);
+    manifest_obj["critic_model_sha256"] = critic_hash;
+    manifest_obj["critic_optimizer_filename"] = std::filesystem::path(critic_optim_path).filename().string();
+    manifest_obj["critic_optimizer_file_size"] = static_cast<int64_t>(critic_opt_size);
+    manifest_obj["critic_optimizer_sha256"] = critic_opt_hash;
+
+    manifest_obj["hidden_dim"] = static_cast<int64_t>(actor_model->input_layer->weight.size(0));
+    manifest_obj["num_blocks"] = static_cast<int64_t>(actor_model->res_blocks.size());
+
+    {
+      std::ofstream ofs(manifest_tmp);
+      if (!ofs) {
+        throw std::runtime_error("Could not open manifest temp file for writing: " + manifest_tmp);
+      }
+      ofs << json::ToString(manifest_obj, true);
+    }
+
+    std::filesystem::rename(actor_tmp, actor_model_path);
+    std::filesystem::rename(actor_optim_tmp, actor_optim_path);
+    std::filesystem::rename(critic_tmp, critic_model_path);
+    std::filesystem::rename(critic_optim_tmp, critic_optim_path);
+    std::filesystem::rename(manifest_tmp, manifest_path);
+
+    std::cout << "Saved dual checkpoint successfully:\n"
+              << "  Actor Model: " << actor_model_path << " (" << actor_size << " bytes, sha256=" << actor_hash << ")\n"
+              << "  Actor Optimizer: " << actor_optim_path << " (" << actor_opt_size << " bytes, sha256=" << actor_opt_hash << ")\n"
+              << "  Critic Model: " << critic_model_path << " (" << critic_size << " bytes, sha256=" << critic_hash << ")\n"
+              << "  Critic Optimizer: " << critic_optim_path << " (" << critic_opt_size << " bytes, sha256=" << critic_opt_hash << ")\n"
+              << "  Manifest: " << manifest_path << "\n";
+  } catch (const std::exception& e) {
+    std::cerr << "CRITICAL ERROR: SaveDualCheckpoint failed: " << e.what() << "\n";
+    if (std::filesystem::exists(actor_tmp)) std::filesystem::remove(actor_tmp);
+    if (std::filesystem::exists(actor_optim_tmp)) std::filesystem::remove(actor_optim_tmp);
+    if (std::filesystem::exists(critic_tmp)) std::filesystem::remove(critic_tmp);
+    if (std::filesystem::exists(critic_optim_tmp)) std::filesystem::remove(critic_optim_tmp);
+    if (std::filesystem::exists(manifest_tmp)) std::filesystem::remove(manifest_tmp);
+    SpielFatalError("SaveDualCheckpoint failed, aborting training to prevent corrupted states.");
+  }
+}
+
 std::vector<std::pair<int64_t, int64_t>> ComputeAuxSlices(
     int64_t num_examples, int64_t num_minibatches) {
   std::vector<std::pair<int64_t, int64_t>> out;
@@ -1740,6 +2152,470 @@ PpoUpdateStats TrainPpoUpdate(
   phase_timer.Finalize(&stats.phase_timings);
   return stats;
 }
+
+PpoUpdateStats TrainPpoUpdateSeparate(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> actor_model,
+    torch::optim::AdamW& actor_optimizer,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model,
+    torch::optim::AdamW& critic_optimizer,
+    std::vector<PpoTransition>& batch,
+    int64_t obs_size, int64_t action_dim, torch::Device device,
+    uint64_t master, int global_update) {
+  PpoUpdateStats stats;
+  if (batch.empty()) return stats;
+  stats.rollout_hash = ComputeRolloutHash(batch);
+
+  int64_t n = static_cast<int64_t>(batch.size());
+  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
+
+  const std::string phase_timing_mode =
+      ::absl::GetFlag(::FLAGS_phase_timing_mode);
+  const bool phase_timing_on = (phase_timing_mode == "phases");
+  if (!phase_timing_on && phase_timing_mode != "off") {
+    SpielFatalError("Unknown --phase_timing_mode: '" + phase_timing_mode +
+                    "' (expected 'off' or 'phases').");
+  }
+  PhaseTimer phase_timer(phase_timing_on, device);
+
+  phase_timer.Begin(kPhaseTensorPackH2D);
+  torch::Tensor states_cpu = torch::empty({n, obs_size}, cpu_float);
+  torch::Tensor masks_cpu = torch::zeros({n, action_dim}, cpu_bool);
+  torch::Tensor actions_cpu = torch::empty({n}, cpu_long);
+  torch::Tensor old_log_probs_cpu = torch::empty({n}, cpu_float);
+  torch::Tensor advantages_cpu = torch::empty({n}, cpu_float);
+  torch::Tensor returns_cpu = torch::empty({n}, cpu_float);
+  torch::Tensor old_values_cpu = torch::empty({n}, cpu_float);
+
+  float* states_ptr = states_cpu.data_ptr<float>();
+  bool* masks_ptr = masks_cpu.data_ptr<bool>();
+  int64_t* actions_ptr = actions_cpu.data_ptr<int64_t>();
+  float* old_log_probs_ptr = old_log_probs_cpu.data_ptr<float>();
+  float* advantages_ptr = advantages_cpu.data_ptr<float>();
+  float* returns_ptr = returns_cpu.data_ptr<float>();
+  float* old_values_ptr = old_values_cpu.data_ptr<float>();
+
+  for (int64_t i = 0; i < n; ++i) {
+    const PpoTransition& transition = batch[i];
+    std::memcpy(states_ptr + i * obs_size, transition.state.data(),
+                obs_size * sizeof(float));
+    for (Action action : transition.legal_actions) {
+      if (action >= 0 && action < action_dim) {
+        masks_ptr[i * action_dim + action] = true;
+      }
+    }
+    actions_ptr[i] = transition.action;
+    old_log_probs_ptr[i] = transition.old_log_prob;
+    advantages_ptr[i] = transition.advantage;
+    returns_ptr[i] = transition.return_value;
+    old_values_ptr[i] = transition.value;
+  }
+
+  torch::Tensor states = states_cpu.to(device);
+  torch::Tensor masks = masks_cpu.to(device);
+  torch::Tensor actions = actions_cpu.to(device);
+  torch::Tensor old_log_probs = old_log_probs_cpu.to(device);
+  torch::Tensor advantages = advantages_cpu.to(device);
+  torch::Tensor returns = returns_cpu.to(device);
+  torch::Tensor old_values = old_values_cpu.to(device);
+  phase_timer.End(kPhaseTensorPackH2D);
+
+  int64_t minibatch_size =
+      std::min<int64_t>(::absl::GetFlag(::FLAGS_ppo_minibatch_size), n);
+  int update_epochs = std::max(1, ::absl::GetFlag(::FLAGS_ppo_update_epochs));
+  float clip_epsilon = static_cast<float>(::absl::GetFlag(::FLAGS_ppo_clip_epsilon));
+  bool normalize_advantages = ::absl::GetFlag(::FLAGS_normalize_advantages);
+  bool clip_value_loss = ::absl::GetFlag(::FLAGS_ppo_clip_value_loss);
+  float entropy_coef = static_cast<float>(::absl::GetFlag(::FLAGS_entropy_coef));
+  float value_coef = static_cast<float>(::absl::GetFlag(::FLAGS_value_coef));
+  float logit_cap = static_cast<float>(::absl::GetFlag(::FLAGS_logit_cap));
+  double target_kl = ::absl::GetFlag(::FLAGS_target_kl);
+
+  // 1. Episode-ID Uniqueness
+  std::unordered_set<uint64_t> seen_episodes;
+  bool episode_ids_unique = true;
+  if (!batch.empty()) {
+    uint64_t last_ep_id = batch[0].episode_id;
+    seen_episodes.insert(last_ep_id);
+    for (const auto& trans : batch) {
+      if (trans.episode_id != last_ep_id) {
+        last_ep_id = trans.episode_id;
+        if (seen_episodes.find(last_ep_id) != seen_episodes.end()) {
+          episode_ids_unique = false;
+        }
+        seen_episodes.insert(last_ep_id);
+      }
+    }
+  }
+  stats.episode_ids_unique = episode_ids_unique;
+
+  // 2. Nontrivial Mask and Transition Counts
+  torch::Tensor nontrivial_mask = (masks.sum(1) > 1);
+  int64_t nontrivial_count = nontrivial_mask.sum().item<int64_t>();
+  stats.total_transitions = n;
+  stats.nontrivial_transitions = nontrivial_count;
+  stats.forced_transitions = n - nontrivial_count;
+
+  // 3. Prepass: Policy KL Before (from actor_model) and Critic Saturation (from critic_model)
+  phase_timer.Begin(kPhaseDiagPrepass);
+  {
+    bool was_training = actor_model->is_training();
+    bool critic_was_training = critic_model->is_training();
+    actor_model->eval();
+    critic_model->eval();
+    double kl_before_sum = 0.0;
+    int64_t kl_before_nontrivial_count = 0;
+    double value_near_one_count = 0.0;
+    {
+      torch::NoGradGuard no_grad;
+      for (int64_t start = 0; start < n; start += minibatch_size) {
+        int64_t end = std::min(start + minibatch_size, n);
+        torch::Tensor mb_states = states.narrow(0, start, end - start);
+        torch::Tensor mb_masks = masks.narrow(0, start, end - start);
+        torch::Tensor mb_actions = actions.narrow(0, start, end - start);
+        torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
+        torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+
+        auto outputs = actor_model->forward(mb_states);
+        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+        torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+        torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+
+        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+        torch::Tensor ratio = torch::exp(log_ratio);
+        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+        torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+        if (masked_kl.numel() > 0) {
+          kl_before_sum += masked_kl.sum().item<double>();
+          kl_before_nontrivial_count += masked_kl.numel();
+        }
+
+        auto critic_outputs = critic_model->forward(mb_states);
+        torch::Tensor mb_values = critic_outputs.values.squeeze(1);
+        torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
+        value_near_one_count += mb_near_one.sum().item<double>();
+      }
+    }
+    if (was_training) {
+      actor_model->train();
+    }
+    if (critic_was_training) {
+      critic_model->train();
+    }
+    stats.policy_kl_before = (kl_before_nontrivial_count > 0)
+                                 ? (kl_before_sum / kl_before_nontrivial_count)
+                                 : 0.0;
+    stats.measured_transitions = kl_before_nontrivial_count;
+    stats.fraction_critic_near_1 = (n > 0) ? (value_near_one_count / n) : 0.0;
+  }
+  phase_timer.End(kPhaseDiagPrepass);
+
+  // 4. Return Calibration Diagnostics
+  std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
+  std::sort(returns_vec.begin(), returns_vec.end());
+  stats.return_min = returns_vec.front();
+  stats.return_max = returns_vec.back();
+  stats.return_p50 = returns_vec[n * 50 / 100];
+  stats.return_p95 = returns_vec[n * 95 / 100];
+  stats.return_p99 = returns_vec[n * 99 / 100];
+
+  std::vector<float> abs_returns_vec(n);
+  int64_t count_outside = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    abs_returns_vec[i] = std::abs(returns_ptr[i]);
+    if (returns_ptr[i] < -1.0f || returns_ptr[i] > 1.0f) {
+      count_outside++;
+    }
+  }
+  std::sort(abs_returns_vec.begin(), abs_returns_vec.end());
+  stats.abs_return_p99 = abs_returns_vec[n * 99 / 100];
+  stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
+
+  if (absl::GetFlag(FLAGS_diagnostics_only)) {
+    phase_timer.Finalize(&stats.phase_timings);
+    return stats;
+  }
+
+  // --- PPO Loss Loop ---
+  actor_model->train();
+  critic_model->train();
+
+  double weighted_policy_loss_sum = 0.0;
+  double weighted_entropy_sum = 0.0;
+  double weighted_kl_sum = 0.0;
+  double weighted_clip_fraction_sum = 0.0;
+  int64_t total_nontrivial_count = 0;
+  double value_loss_sum = 0.0;
+  double value_clip_frac_sum = 0.0;
+
+  for (int epoch = 0; epoch < update_epochs; ++epoch) {
+    uint64_t perm_seed = dune_seed::DeriveSeed(
+        master, dune_seed::kDomainTrain, global_update, epoch,
+        dune_seed::kStreamPPOPermutation);
+    at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
+    torch::Tensor permutation =
+        torch::randperm(n, gen,
+                        torch::TensorOptions()
+                            .device(torch::kCPU)
+                            .dtype(torch::kInt64))
+            .to(device);
+
+    double epoch_kl_sum = 0.0;
+    int64_t epoch_kl_nontrivial_count = 0;
+
+    for (int64_t start = 0; start < n; start += minibatch_size) {
+      int64_t end = std::min(start + minibatch_size, n);
+      torch::Tensor mb_idx = permutation.narrow(0, start, end - start);
+
+      torch::Tensor mb_states = states.index_select(0, mb_idx);
+      torch::Tensor mb_masks = masks.index_select(0, mb_idx);
+      torch::Tensor mb_actions = actions.index_select(0, mb_idx);
+      torch::Tensor mb_old_log_probs = old_log_probs.index_select(0, mb_idx);
+      torch::Tensor mb_advantages = advantages.index_select(0, mb_idx);
+      torch::Tensor mb_returns = returns.index_select(0, mb_idx);
+      torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
+      torch::Tensor mb_nontrivial = nontrivial_mask.index_select(0, mb_idx);
+
+      int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
+
+      actor_optimizer.zero_grad();
+      critic_optimizer.zero_grad();
+
+      torch::Tensor critic_loss;
+      torch::Tensor value_loss;
+      torch::Tensor value_clip_frac_t;
+
+      auto compute_critic_loss = [&]() {
+        auto critic_outputs = critic_model->forward(mb_states);
+        torch::Tensor new_values = critic_outputs.values.squeeze(1);
+        if (clip_value_loss) {
+          value_clip_frac_t =
+              ((new_values - mb_old_values).abs() > clip_epsilon)
+                  .to(torch::kFloat32)
+                  .mean();
+          torch::Tensor value_loss_unclipped = (new_values - mb_returns).pow(2);
+          torch::Tensor value_clipped =
+              mb_old_values +
+              (new_values - mb_old_values).clamp(-clip_epsilon, clip_epsilon);
+          torch::Tensor value_loss_clipped = (value_clipped - mb_returns).pow(2);
+          value_loss = 0.5f * torch::max(value_loss_unclipped, value_loss_clipped).mean();
+        } else {
+          value_loss = 0.5f * (new_values - mb_returns).pow(2).mean();
+        }
+        critic_loss = value_coef * value_loss;
+      };
+
+      torch::Tensor actor_loss;
+      torch::Tensor policy_loss, entropy, approx_kl, clip_fraction;
+
+      auto compute_actor_loss = [&]() {
+        auto actor_outputs = actor_model->forward(mb_states);
+        torch::Tensor logits =
+            CenterAndCapLogitsTensor(actor_outputs.logits, mb_masks, logit_cap);
+        torch::Tensor masked_logits =
+            logits.masked_fill(mb_masks.logical_not(), -1e9f);
+        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+        torch::Tensor probs = torch::softmax(masked_logits, -1);
+        torch::Tensor selected_log_probs =
+            log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+
+        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+        torch::Tensor ratio = torch::exp(log_ratio);
+
+        torch::Tensor mb_adv = mb_advantages;
+        if (normalize_advantages) {
+          if (mb_num_nontrivial > 1) {
+            torch::Tensor nontrivial_adv =
+                mb_advantages.masked_select(mb_nontrivial);
+            torch::Tensor mean = nontrivial_adv.mean();
+            torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
+            mb_adv = (mb_advantages - mean) / std;
+          }
+        }
+        mb_adv = mb_adv.detach();
+
+        torch::Tensor pg_loss1 = -mb_adv * ratio;
+        torch::Tensor pg_loss2 =
+            -mb_adv * ratio.clamp(1.0f - clip_epsilon, 1.0f + clip_epsilon);
+        torch::Tensor pg_loss = torch::max(pg_loss1, pg_loss2);
+
+        if (mb_num_nontrivial > 0) {
+          policy_loss = pg_loss.masked_select(mb_nontrivial).mean();
+          entropy =
+              -(probs * log_probs).sum(-1).masked_select(mb_nontrivial).mean();
+          approx_kl =
+              ((ratio - 1.0f) - log_ratio).masked_select(mb_nontrivial).mean();
+          clip_fraction = ((ratio - 1.0f).abs() > clip_epsilon)
+                              .to(torch::kFloat32)
+                              .masked_select(mb_nontrivial)
+                              .mean();
+          actor_loss = policy_loss - entropy_coef * entropy;
+        } else {
+          policy_loss = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          entropy = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          approx_kl = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          clip_fraction = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          actor_loss = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+        }
+      };
+
+      phase_timer.Begin(kPhasePpoForwardLoss);
+      if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
+        AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+        compute_critic_loss();
+        compute_actor_loss();
+      } else {
+        compute_critic_loss();
+        compute_actor_loss();
+      }
+      phase_timer.End(kPhasePpoForwardLoss);
+
+      phase_timer.Begin(kPhaseBackward);
+      critic_loss.backward();
+      if (mb_num_nontrivial > 0) {
+        actor_loss.backward();
+      }
+      phase_timer.End(kPhaseBackward);
+
+      // Pre-clip gradient telemetry
+      {
+        PhaseScope phase_scope_telemetry(&phase_timer, kPhaseGradTelemetry);
+        double policy_sq = 0.0, actor_trunk_sq = 0.0;
+        for (const auto& named : actor_model->named_parameters()) {
+          const torch::Tensor& g = named.value().grad();
+          if (!g.defined()) continue;
+          const double sq = g.pow(2).sum().item<double>();
+          if (named.key().rfind("policy_head", 0) == 0) {
+            policy_sq += sq;
+          } else {
+            actor_trunk_sq += sq;
+          }
+        }
+
+        double value_sq = 0.0, critic_trunk_sq = 0.0;
+        for (const auto& named : critic_model->named_parameters()) {
+          const torch::Tensor& g = named.value().grad();
+          if (!g.defined()) continue;
+          const double sq = g.pow(2).sum().item<double>();
+          if (named.key().find("value_head") != std::string::npos) {
+            value_sq += sq;
+          } else {
+            critic_trunk_sq += sq;
+          }
+        }
+
+        double trunk_sq = actor_trunk_sq + critic_trunk_sq;
+        stats.policy_head_grad_norm_sum += std::sqrt(policy_sq);
+        stats.value_head_grad_norm_sum += std::sqrt(value_sq);
+        stats.trunk_grad_norm_sum += std::sqrt(trunk_sq);
+        stats.head_grad_norm_count += 1;
+      }
+
+      // Joint global gradient clipping over the union of active parameters
+      std::vector<torch::Tensor> active_params;
+      for (const auto& p : actor_model->parameters()) {
+        if (p.requires_grad()) active_params.push_back(p);
+      }
+      for (const auto& p : critic_model->parameters()) {
+        if (p.requires_grad()) active_params.push_back(p);
+      }
+
+      phase_timer.Begin(kPhaseGradClip);
+      double grad_norm = torch::nn::utils::clip_grad_norm_(
+          active_params, ::absl::GetFlag(::FLAGS_grad_clip_norm));
+      phase_timer.End(kPhaseGradClip);
+
+      if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
+        stats.nonfinite_abort = true;
+        std::cerr << "Fatal PPO gradient norm: " << grad_norm << "\n";
+        std::exit(EXIT_FAILURE);
+      }
+      stats.grad_norm_sum += grad_norm;
+      stats.grad_norm_count += 1;
+      if (grad_norm > stats.grad_norm_max) stats.grad_norm_max = grad_norm;
+
+      phase_timer.Begin(kPhaseOptimizerStep);
+      actor_optimizer.step();
+      critic_optimizer.step();
+      phase_timer.End(kPhaseOptimizerStep);
+
+      phase_timer.Begin(kPhaseScalarReads);
+      double kl = approx_kl.item<double>();
+      value_loss_sum += value_loss.item<double>();
+      if (value_clip_frac_t.defined()) {
+        value_clip_frac_sum += value_clip_frac_t.item<double>();
+      }
+      stats.minibatches += 1;
+
+      if (mb_num_nontrivial > 0) {
+        weighted_policy_loss_sum += policy_loss.item<double>() * mb_num_nontrivial;
+        weighted_entropy_sum += entropy.item<double>() * mb_num_nontrivial;
+        weighted_kl_sum += kl * mb_num_nontrivial;
+        weighted_clip_fraction_sum +=
+            clip_fraction.item<double>() * mb_num_nontrivial;
+        total_nontrivial_count += mb_num_nontrivial;
+
+        epoch_kl_sum += kl * mb_num_nontrivial;
+        epoch_kl_nontrivial_count += mb_num_nontrivial;
+      }
+      phase_timer.End(kPhaseScalarReads);
+
+      if (target_kl > 0.0 && kl > target_kl) {
+        stats.early_stopped = true;
+        stats.kl_early_stop_epoch = epoch;
+        break;
+      }
+    }
+
+    double ep_kl = (epoch_kl_nontrivial_count > 0)
+                       ? (epoch_kl_sum / epoch_kl_nontrivial_count)
+                       : 0.0;
+    stats.epoch_kls.push_back(ep_kl);
+
+    if (stats.early_stopped) break;
+  }
+
+  if (stats.minibatches > 0) {
+    stats.value_loss = value_loss_sum / stats.minibatches;
+    stats.value_clip_fraction = value_clip_frac_sum / stats.minibatches;
+    if (total_nontrivial_count > 0) {
+      stats.policy_loss = weighted_policy_loss_sum / total_nontrivial_count;
+      stats.entropy = weighted_entropy_sum / total_nontrivial_count;
+      stats.approx_kl = weighted_kl_sum / total_nontrivial_count;
+      stats.clip_fraction = weighted_clip_fraction_sum / total_nontrivial_count;
+    } else {
+      stats.policy_loss = 0.0;
+      stats.entropy = 0.0;
+      stats.approx_kl = 0.0;
+      stats.clip_fraction = 0.0;
+    }
+  }
+
+  torch::Tensor returns_cpu_flat = returns_cpu;
+  torch::Tensor old_values_cpu_flat = old_values_cpu;
+  double return_var = returns_cpu_flat.var(/*unbiased=*/false).item<double>();
+  if (return_var > 1e-12) {
+    double residual_var =
+        (returns_cpu_flat - old_values_cpu_flat)
+            .var(/*unbiased=*/false)
+            .item<double>();
+    stats.explained_variance = 1.0 - residual_var / return_var;
+  } else {
+    stats.explained_variance = 0.0;
+  }
+
+  phase_timer.Finalize(&stats.phase_timings);
+  return stats;
+}
+
 
 // Linear-interpolated percentile over a sorted vector, matching the convention
 // the frozen scripts/eval/logit_cap_audit.py uses so the two agree on the same

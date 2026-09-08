@@ -571,8 +571,10 @@ public:
     DeterministicEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                            torch::Device device,
                            std::mutex* mutex,
-                           std::shared_mutex* sync_mutex = nullptr)
-        : model_(model), device_(device), mutex_(mutex), sync_mutex_(sync_mutex) {
+                           std::shared_mutex* sync_mutex = nullptr,
+                           std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr)
+        : model_(model), device_(device), mutex_(mutex), sync_mutex_(sync_mutex),
+          critic_model_(critic_model) {
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
     }
@@ -627,6 +629,7 @@ public:
             }
 
             SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+            SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
             if (device_.is_cuda()) {
                 // Blocking H2D (finding 1): the shared pinned input_tensor_ must
                 // not be reused by the next thread until this copy's DMA has
@@ -636,8 +639,10 @@ public:
                 device_tensor_.copy_(input_tensor_, /*non_blocking=*/false);
                 AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
                 outputs = model_->forward(device_tensor_);
+                critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_tensor_) : outputs;
             } else {
                 outputs = model_->forward(input_tensor_);
+                critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(input_tensor_) : outputs;
             }
             // Blocking device->host copy INSIDE the lock drains the stream before
             // the mutex is released, so the next thread cannot overwrite the
@@ -645,7 +650,7 @@ public:
             // reading them (belt-and-suspenders for the finding-1 race). No
             // numeric change: identical ops, just serialized under the lock.
             pred_logits = outputs.logits.to(torch::kCPU).to(torch::kFloat32);
-            pred_values = outputs.values.to(torch::kCPU).to(torch::kFloat32);
+            pred_values = critic_outputs.values.to(torch::kCPU).to(torch::kFloat32);
         }
 
         std::memcpy(result.logits.data(), pred_logits.data_ptr<float>(), action_dim_ * sizeof(float));
@@ -666,6 +671,7 @@ public:
 
 private:
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model_{nullptr};
     torch::Device device_;
     std::mutex* mutex_;
     std::shared_mutex* sync_mutex_;
@@ -762,8 +768,9 @@ public:
                      bool high_priority_stream = false,
                      bool emit_batch_membership = false,
                      bool rollout_amp = true,
-                     bool allow_tf32 = true)
-        : model_(model), target_batch_size_(target_batch_size),
+                     bool allow_tf32 = true,
+                     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr)
+        : model_(model), critic_model_(critic_model), target_batch_size_(target_batch_size),
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
           high_priority_stream_(high_priority_stream),
@@ -782,6 +789,9 @@ public:
         }
 
         model_->eval(); // Defensive hygiene: ResBlocks use LayerNorm so this is a no-op, but protects future Dropout additions.
+        if (critic_model_) {
+            critic_model_->eval();
+        }
         runner_thread_ = std::thread(&BatchedEvaluator::Runner, this);
     }
 
@@ -1280,6 +1290,7 @@ private:
     std::condition_variable park_cv_;
 
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
+    std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model_{nullptr};
     int target_batch_size_;
     int timeout_ms_;
     torch::Device device_;
@@ -1641,15 +1652,17 @@ private:
                 auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
                 device_obs.copy_(host_obs, /*non_blocking=*/true);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+                SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
                 {
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                     AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                  rollout_amp_);
                     outputs = model_->forward(device_obs);
+                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                 }
                 auto device_values = slot.device_values.narrow(
                     0, 0, batch_size);
-                device_values.copy_(outputs.values.reshape(
+                device_values.copy_(critic_outputs.values.reshape(
                                         {static_cast<int64_t>(batch_size)}),
                                     /*non_blocking=*/true);
                 if (slot.wants_logits) {
@@ -2023,12 +2036,14 @@ private:
                     AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                  rollout_amp_);
                     auto outputs = model_->forward(device_obs);
+                    auto critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                     pred_logits = outputs.logits;
-                    pred_values = outputs.values;
+                    pred_values = critic_outputs.values;
                 } else {
                     auto outputs = model_->forward(device_obs);
+                    auto critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                     pred_logits = outputs.logits;
-                    pred_values = outputs.values;
+                    pred_values = critic_outputs.values;
                 }
             }
             if (time_device_) dev_ev[2].record(dev_impl->getStream(device_));

@@ -163,6 +163,7 @@ struct GameResult {
   int ending_round;
   int current_vp;
   int final_scored_vp;
+  uint64_t chance_seed = 0;
 
   // PWO-5 section 13.5. The registered VP-margin estimand is
   //
@@ -764,6 +765,7 @@ void WorkerThread(
     }
 
     gr.placement = placement;
+    gr.chance_seed = chance_seed;
     gr.game_return = returns[model_player];
     if (dune_state) {
       gr.ending_round = dune_state->IsTerminal() ? (dune_state->GetCurrentRound() - 1)
@@ -1225,6 +1227,7 @@ void RunEvaluation() {
                 << ",\"terminal_reason\":\"" << gr.terminal_reason << "\""
                 << ",\"specimen_conversions\":"
                 << JsonIntArray(gr.specimen_conversions)
+                << ",\"seed\":" << gr.chance_seed
                 << "}\n";
     }
   }

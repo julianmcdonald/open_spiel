@@ -41,10 +41,13 @@
 #include "dune_sha256.h"
 #include "dune_terminal_vp_report.h"
 #include "dune_warmstart_helpers.h"  // ChooseHeuristicAcquisitionAction (swordmaster probe)
+#include "dune_split_evaluator.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
 #include <fstream>
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Path to load search agent model checkpoint.");
+ABSL_FLAG(std::string, search_value_checkpoint, "", "Path to load search agent value model checkpoint for SplitPolicyValueEvaluator. If empty, inherits model_checkpoint.");
+ABSL_FLAG(bool, force_split_evaluator, false, "Force using SplitPolicyValueEvaluator even when policy and value models share the same checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Path to load opponent model checkpoint. If empty, the search agent model is reused. If 'random', random opponents are used.");
 ABSL_FLAG(int, seed, 42, "Seed for deterministic RNG.");
 ABSL_FLAG(int, games, 1000, "How many games to play in total.");
@@ -407,7 +410,7 @@ std::set<DuneDecisionRole> ParseFreshSearchRoles(const std::string& csv) {
 // temperature 0 the first strictly-max-prior action (argmax, first-max
 // tie-break); at temperature > 0, an inverse-CDF sample from the prior. Empty
 // prior degrades to the first legal action.
-Action SelectRawPriorAction(DuneNNEvaluator& evaluator, const State& state,
+Action SelectRawPriorAction(open_spiel::algorithms::Evaluator& evaluator, const State& state,
                             double temperature, std::mt19937& rng) {
   ActionsAndProbs prior = evaluator.Prior(state);
   if (prior.empty()) {
@@ -468,7 +471,9 @@ struct SeatControllerProvenance {
 // makes these safe to touch from every worker without a lock; do not assign to
 // them from inside WorkerThread.
 std::string g_candidate_ckpt_sha256;
+std::string g_candidate_value_ckpt_sha256;
 std::string g_opponent_ckpt_sha256;
+bool g_using_split_evaluator = false;
 
 std::string BudgetModeName(DuneSearchBudgetMode m) {
   switch (m) {
@@ -490,6 +495,7 @@ void WorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
     std::shared_ptr<SharedDunePolicyValueNetImpl> search_model,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> search_value_model,
     std::shared_ptr<SharedDunePolicyValueNetImpl> opponent_model,
     std::atomic<int>& next_game_id,
     int total_games,
@@ -563,9 +569,20 @@ void WorkerThread(
     thread_stats.games_by_seat[search_seat]++;
 
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
-    // Create thread-local, bot-specific evaluator wrapping the shared search model
-    auto search_evaluator = std::make_shared<DuneNNEvaluator>(
-        search_model, device, candidate_logit_cap);
+    // Create thread-local, bot-specific evaluator wrapping search models
+    std::shared_ptr<open_spiel::algorithms::Evaluator> search_evaluator;
+    if (g_using_split_evaluator) {
+      auto policy_eval = std::make_shared<DuneNNEvaluator>(
+          search_model, device, candidate_logit_cap);
+      auto value_model_ptr = search_value_model ? search_value_model : search_model;
+      auto value_eval = std::make_shared<DuneNNEvaluator>(
+          value_model_ptr, device, candidate_logit_cap);
+      search_evaluator = std::make_shared<SplitPolicyValueEvaluator>(
+          policy_eval, value_eval);
+    } else {
+      search_evaluator = std::make_shared<DuneNNEvaluator>(
+          search_model, device, candidate_logit_cap);
+    }
 
     // Which seats run the search controller this game. In 'single' (legacy) and
     // 'mixed' that is exactly the candidate seat; in 'homogeneous' it is all
@@ -583,7 +600,7 @@ void WorkerThread(
     std::vector<std::unique_ptr<DuneSearchSession>> seat_sessions(4);
     // Per-seat evaluators: searched seats share the candidate evaluator (all
     // four copies are the SAME controller in homogeneous mode, by definition).
-    std::vector<std::shared_ptr<DuneNNEvaluator>> seat_evaluators(4);
+    std::vector<std::shared_ptr<open_spiel::algorithms::Evaluator>> seat_evaluators(4);
     // Path B (--use_session=false): a plain search bot driven by Step() per
     // decision, reproducing the July-14 reference protocol verbatim.
     std::unique_ptr<DunePUCTISMCTSBot> search_bot;
@@ -1447,6 +1464,19 @@ void WorkerThread(
         game_obj["returns"] = returns_arr;
         game_obj["search_return"] = returns[search_seat];
         game_obj["search_vp"] = search_vp;
+        game_obj["policy_checkpoint"] = absl::GetFlag(FLAGS_model_checkpoint);
+        game_obj["policy_checkpoint_sha256"] = open_spiel::g_candidate_ckpt_sha256;
+        game_obj["value_checkpoint"] = absl::GetFlag(FLAGS_search_value_checkpoint).empty()
+                                           ? absl::GetFlag(FLAGS_model_checkpoint)
+                                           : absl::GetFlag(FLAGS_search_value_checkpoint);
+        game_obj["value_checkpoint_sha256"] = open_spiel::g_candidate_value_ckpt_sha256;
+        game_obj["opponent_checkpoint"] = absl::GetFlag(FLAGS_opponent_checkpoint);
+        game_obj["opponent_checkpoint_sha256"] = open_spiel::g_opponent_ckpt_sha256;
+        game_obj["is_split_evaluator"] = open_spiel::g_using_split_evaluator;
+        game_obj["effective_search_mode"] =
+            absl::GetFlag(FLAGS_audit_training_policy_iteration)
+                ? "training_policy_iteration"
+                : (absl::GetFlag(FLAGS_policy_only) ? "policy_only" : "other");
 
         open_spiel::json::Array opp_vps_arr;
         for (int p = 0; p < 4; ++p) {
@@ -2633,6 +2663,15 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  std::string value_ckpt = absl::GetFlag(FLAGS_search_value_checkpoint);
+  bool force_split = absl::GetFlag(FLAGS_force_split_evaluator);
+  if (value_ckpt.empty()) {
+    value_ckpt = model_ckpt;
+  }
+  open_spiel::g_candidate_value_ckpt_sha256 = open_spiel::ComputeFileSHA256(value_ckpt);
+  open_spiel::g_using_split_evaluator =
+      force_split || (!absl::GetFlag(FLAGS_search_value_checkpoint).empty() && value_ckpt != model_ckpt);
+
   int hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
   int opp_hidden_dim = absl::GetFlag(FLAGS_opp_hidden_dim);
@@ -2646,7 +2685,7 @@ int main(int argc, char* argv[]) {
 
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
-  std::cout << "Loading search model weights from: " << model_ckpt << " on device " << device << "\n";
+  std::cout << "Loading search policy model weights from: " << model_ckpt << " on device " << device << "\n";
   auto search_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
       obs_size, hidden_dim, action_size, num_blocks,
       absl::GetFlag(FLAGS_nonlinear_value_head));
@@ -2660,6 +2699,29 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   search_model->to(device);
+
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> search_value_model = nullptr;
+  if (open_spiel::g_using_split_evaluator) {
+    if (value_ckpt == model_ckpt) {
+      search_value_model = search_model;
+      std::cout << "Using SplitPolicyValueEvaluator with shared network (aliased policy/value control arm)\n";
+    } else {
+      std::cout << "Loading search value model weights from: " << value_ckpt << " on device " << device << "\n";
+      search_value_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+          obs_size, hidden_dim, action_size, num_blocks,
+          absl::GetFlag(FLAGS_nonlinear_value_head));
+      search_value_model->eval();
+      try {
+        torch::serialize::InputArchive archive;
+        archive.load_from(value_ckpt, device);
+        search_value_model->load(archive);
+      } catch (const c10::Error& e) {
+        std::cerr << "Failed to load search value model weights:\n" << e.msg() << "\n";
+        return 1;
+      }
+      search_value_model->to(device);
+    }
+  }
 
   // WO-PERF-3: the corpus-root instrument is an entirely separate driver from
   // the full-game benchmark below. It is entered here, after the (identical)
@@ -2712,7 +2774,7 @@ int main(int argc, char* argv[]) {
   worker_threads.reserve(num_threads);
   for (int t = 0; t < num_threads; ++t) {
     worker_threads.emplace_back(
-        open_spiel::WorkerThread, t, game, search_model, opponent_model,
+        open_spiel::WorkerThread, t, game, search_model, search_value_model, opponent_model,
         std::ref(next_game_id), total_games, std::ref(completed_games),
         std::ref(log_mutex), std::ref(global_stats), std::ref(stats_mutex));
   }
