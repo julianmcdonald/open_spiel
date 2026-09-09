@@ -10164,6 +10164,276 @@ int main() {
     std::filesystem::remove(manifest_f);
   } TEST_END();
 
+  // -----------------------------------------------------------------------
+  // Test 98: Reverse-KL penalty (Arm B)
+  //   1) Zero KL at identical policies
+  //   2) Agreement with hand-computed distribution & forced row exclusion
+  //   3) Correct gradient direction
+  //   4) Frozen reference weights
+  //   5) Unchanged behavior when coefficient is zero
+  // -----------------------------------------------------------------------
+  TEST_BEGIN("Reverse-KL penalty: zero-at-id, hand-computed, gradient-direction, frozen-ref, coef-zero") {
+    const int64_t obs_size = 8;
+    const int64_t action_dim = 4;
+    torch::manual_seed(20260909);
+
+    auto make_model = [&]() {
+      auto m = std::make_shared<SharedDunePolicyValueNetImpl>(
+          obs_size, /*hidden_dim=*/32, action_dim, /*num_blocks=*/2);
+      m->to(torch::kCPU);
+      return m;
+    };
+
+    auto copy_weights = [](const std::shared_ptr<SharedDunePolicyValueNetImpl>& src,
+                           const std::shared_ptr<SharedDunePolicyValueNetImpl>& dst) {
+      torch::NoGradGuard ng;
+      for (size_t i = 0; i < src->parameters().size(); ++i) {
+        dst->parameters()[i].copy_(src->parameters()[i]);
+      }
+      for (size_t i = 0; i < src->buffers().size(); ++i) {
+        dst->buffers()[i].copy_(src->buffers()[i]);
+      }
+    };
+
+    // Fixture with 2 transitions:
+    // Row 0: nonforced (legal actions {0, 1}), action=0
+    // Row 1: forced (legal actions {2}), action=2
+    std::vector<PpoTransition> batch(2);
+    batch[0].state = std::vector<float>(obs_size, 0.1f);
+    batch[0].legal_actions = {0, 1};
+    batch[0].action = 0;
+    batch[0].reward = 0.0f;
+    batch[0].value = 0.0f;
+    batch[0].advantage = 0.0f;
+    batch[0].return_value = 0.0f;
+    batch[0].player_id = 0;
+    batch[0].episode_id = 1;
+
+    batch[1].state = std::vector<float>(obs_size, 0.2f);
+    batch[1].legal_actions = {2};  // forced
+    batch[1].action = 2;
+    batch[1].reward = 0.0f;
+    batch[1].value = 0.0f;
+    batch[1].advantage = 0.0f;
+    batch[1].return_value = 0.0f;
+    batch[1].player_id = 1;
+    batch[1].episode_id = 1;
+
+    // Subtest 1: Zero KL at identical policies
+    {
+      auto m_train = make_model();
+      auto m_coll = make_model();
+      copy_weights(m_train, m_coll);
+
+      // Populate old_log_probs from m_train
+      {
+        torch::NoGradGuard ng;
+        for (auto& t : batch) {
+          torch::Tensor state_t = torch::tensor(t.state).unsqueeze(0);
+          auto out = m_train->forward(state_t);
+          torch::Tensor mask = torch::zeros({1, action_dim}, torch::kBool);
+          for (Action a : t.legal_actions) mask[0][a] = true;
+          torch::Tensor logits = CenterAndCapLogitsTensor(out.logits, mask, 10.0f);
+          torch::Tensor masked = logits.masked_fill(mask.logical_not(), -1e9f);
+          torch::Tensor logp = torch::log_softmax(masked, -1);
+          t.old_log_prob = logp[0][t.action].item<float>();
+        }
+      }
+
+      absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+      absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+      absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+      absl::SetFlag(&FLAGS_normalize_advantages, false);
+      absl::SetFlag(&FLAGS_ppo_clip_value_loss, false);
+      absl::SetFlag(&FLAGS_entropy_coef, 0.0);
+      absl::SetFlag(&FLAGS_value_coef, 0.0);
+      absl::SetFlag(&FLAGS_logit_cap, 10.0);
+      absl::SetFlag(&FLAGS_target_kl, 0.0);
+      absl::SetFlag(&FLAGS_train_amp, false);
+      absl::SetFlag(&FLAGS_grad_clip_norm, 0.5);
+
+      torch::optim::AdamW opt(m_train->parameters(), torch::optim::AdamWOptions(0.0));
+      auto stats = TrainPpoUpdate(
+          m_train, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          m_coll, /*reverse_kl_coef=*/0.05);
+
+      CHECK_NEAR(stats.reverse_kl, 0.0, 1e-6);
+    }
+
+    // Subtest 2: Agreement with hand-computed distribution & forced row exclusion
+    {
+      auto m_train = make_model();
+      auto m_coll = make_model();
+
+      {
+        torch::NoGradGuard ng;
+        for (auto& p : m_train->parameters()) p.zero_();
+        for (auto& p : m_coll->parameters()) p.zero_();
+        for (auto& item : m_train->named_parameters()) {
+          if (item.key().find("policy_head") != std::string::npos &&
+              item.key().find("bias") != std::string::npos) {
+            item.value()[0] = 1.0f;
+            item.value()[1] = 0.0f;
+          }
+        }
+      }
+
+      {
+        torch::NoGradGuard ng;
+        for (auto& t : batch) {
+          torch::Tensor state_t = torch::tensor(t.state).unsqueeze(0);
+          auto out = m_train->forward(state_t);
+          torch::Tensor mask = torch::zeros({1, action_dim}, torch::kBool);
+          for (Action a : t.legal_actions) mask[0][a] = true;
+          torch::Tensor logits = CenterAndCapLogitsTensor(out.logits, mask, 10.0f);
+          torch::Tensor masked = logits.masked_fill(mask.logical_not(), -1e9f);
+          torch::Tensor logp = torch::log_softmax(masked, -1);
+          t.old_log_prob = logp[0][t.action].item<float>();
+        }
+      }
+
+      absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+      absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+      torch::optim::AdamW opt(m_train->parameters(), torch::optim::AdamWOptions(0.0));
+      auto stats = TrainPpoUpdate(
+          m_train, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          m_coll, /*reverse_kl_coef=*/0.05);
+
+      // Hand-computed value with ApplyLogitCapTensor (10 * tanh(x / 10)):
+      // Row 0 has legal actions {0, 1}.
+      // m_train logits centered: [0.5, -0.5]
+      // capped with 10*tanh(0.5/10) = 0.4995837 -> p_new = [0.7308945, 0.2691055]
+      // m_coll logits centered: [0.0, 0.0] -> p_coll = [0.5, 0.5]
+      // KL = 0.7308945 * ln(0.7308945 / 0.5) + 0.2691055 * ln(0.2691055 / 0.5)
+      //    = 0.1107806
+      // Row 1 is forced (legal actions {2}), so it is excluded from the reverse-KL penalty.
+      // Mean nonforced reverse-KL = 0.1107806.
+      const double expected_hand_kl = 0.1107806;
+      CHECK_NEAR(stats.reverse_kl, expected_hand_kl, 1e-5);
+    }
+
+    // Subtest 3: Correct gradient direction
+    {
+      auto m_train = make_model();
+      auto m_coll = make_model();
+      {
+        torch::NoGradGuard ng;
+        for (auto& p : m_train->parameters()) p.zero_();
+        for (auto& p : m_coll->parameters()) p.zero_();
+        for (auto& item : m_train->named_parameters()) {
+          if (item.key().find("policy_head") != std::string::npos &&
+              item.key().find("bias") != std::string::npos) {
+            item.value()[0] = 1.0f;
+            item.value()[1] = 0.0f;
+          }
+        }
+      }
+      {
+        torch::NoGradGuard ng;
+        for (auto& t : batch) {
+          torch::Tensor state_t = torch::tensor(t.state).unsqueeze(0);
+          auto out = m_train->forward(state_t);
+          torch::Tensor mask = torch::zeros({1, action_dim}, torch::kBool);
+          for (Action a : t.legal_actions) mask[0][a] = true;
+          torch::Tensor logits = CenterAndCapLogitsTensor(out.logits, mask, 10.0f);
+          torch::Tensor masked = logits.masked_fill(mask.logical_not(), -1e9f);
+          torch::Tensor logp = torch::log_softmax(masked, -1);
+          t.old_log_prob = logp[0][t.action].item<float>();
+        }
+      }
+
+      absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+      absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+      absl::SetFlag(&FLAGS_entropy_coef, 0.0);
+      absl::SetFlag(&FLAGS_value_coef, 0.0);
+      absl::SetFlag(&FLAGS_grad_clip_norm, 10.0);
+
+      torch::Tensor s0 = torch::tensor(batch[0].state).unsqueeze(0);
+      float logit0_before, logit1_before;
+      {
+        torch::NoGradGuard ng;
+        auto out = m_train->forward(s0);
+        logit0_before = out.logits[0][0].item<float>();
+        logit1_before = out.logits[0][1].item<float>();
+      }
+
+      torch::optim::AdamW opt(m_train->parameters(), torch::optim::AdamWOptions(1e-2));
+      TrainPpoUpdate(
+          m_train, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          m_coll, /*reverse_kl_coef=*/1.0);
+
+      float logit0_after, logit1_after;
+      {
+        torch::NoGradGuard ng;
+        auto out = m_train->forward(s0);
+        logit0_after = out.logits[0][0].item<float>();
+        logit1_after = out.logits[0][1].item<float>();
+      }
+
+      UTILS_CHECK(logit0_after < logit0_before);
+      UTILS_CHECK(logit1_after > logit1_before);
+    }
+
+    // Subtest 4: Frozen reference weights
+    {
+      auto m_train = make_model();
+      auto m_coll = make_model();
+      std::string coll_hash_before = HashModelParams(m_coll);
+
+      torch::optim::AdamW opt(m_train->parameters(), torch::optim::AdamWOptions(1e-3));
+      TrainPpoUpdate(
+          m_train, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          m_coll, /*reverse_kl_coef=*/0.05);
+
+      std::string coll_hash_after = HashModelParams(m_coll);
+      CHECK_EQ(coll_hash_before, coll_hash_after);
+      for (const auto& p : m_coll->parameters()) {
+        UTILS_CHECK(!p.grad().defined());
+      }
+    }
+
+    // Subtest 5: Unchanged behavior when coefficient is zero
+    {
+      auto m_train1 = make_model();
+      auto m_train2 = make_model();
+      copy_weights(m_train1, m_train2);
+      auto m_coll = make_model();
+
+      torch::optim::AdamW opt1(m_train1->parameters(), torch::optim::AdamWOptions(1e-3));
+      torch::optim::AdamW opt2(m_train2->parameters(), torch::optim::AdamWOptions(1e-3));
+
+      TrainPpoUpdate(
+          m_train1, opt1, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0);
+
+      TrainPpoUpdate(
+          m_train2, opt2, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345ULL, /*global_update=*/1,
+          /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+          m_coll, /*reverse_kl_coef=*/0.0);
+
+      std::string hash1 = HashModelParams(m_train1);
+      std::string hash2 = HashModelParams(m_train2);
+      CHECK_EQ(hash1, hash2);
+    }
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

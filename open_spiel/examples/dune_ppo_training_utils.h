@@ -400,6 +400,9 @@ struct PpoUpdateStats {
   double aux_ppo_norm_ratio = 0.0;    // aux_grad_norm_mean / ppo_grad_norm_mean
   bool aux_ratio_abort = false;       // ratio exceeded abort_grad_norm_ratio (caller aborts)
 
+  // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
+  double reverse_kl = 0.0;
+
   // WO-PERF-TIMING. All zero and `enabled == false` unless
   // --phase_timing_mode=phases. No diagnostics column consumes this; it is
   // written only to the phase_timing.jsonl sidecar.
@@ -549,7 +552,11 @@ PpoUpdateStats TrainPpoUpdate(
     // computed, no graph node, no gradient. That is what makes a head-off arm's
     // behaviour independent of the heads' numerics.
     const Pwo5AuxBatch& pwo5_aux = Pwo5AuxBatch(),
-    const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig());
+    const Pwo5AuxConfig& pwo5_cfg = Pwo5AuxConfig(),
+    // Arm B: reverse-KL penalty to the policy that collected the rollout.
+    // Detached collection snapshot; coefficient 0 => inert.
+    std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model = nullptr,
+    double reverse_kl_coef = 0.0);
 
 // Arm D: Fully separate actor and critic networks.
 // Actor parameters produce policy logits and entropy loss; critic parameters produce

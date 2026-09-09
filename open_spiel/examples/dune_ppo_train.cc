@@ -763,6 +763,11 @@ ABSL_FLAG(bool, emit_canary_columns, false,
           "is section 17.5 item 14: without the columns the section 14.2 halt "
           "rail cannot fire, and an unmonitored 300-update run is exactly the "
           "failure mode the u175 collapse lineage represents.");
+ABSL_FLAG(double, reverse_kl_coef, 0.0,
+          "Arm B treatment: coefficient on reverse-KL penalty to rollout collection policy "
+          "(0.05 in Arm B, 0.0 in Arm A). Detached, nonforced mean.");
+ABSL_FLAG(std::string, save_initial_model_and_exit, "",
+          "If non-empty, saves the newly constructed initial random model to this path and exits 0.");
 
 namespace open_spiel {
 namespace {
@@ -7002,6 +7007,14 @@ int main(int argc, char** argv) {
   training_model->to(device);
   inference_model->to(device);
 
+  const std::string save_init_path = absl::GetFlag(FLAGS_save_initial_model_and_exit);
+  if (!save_init_path.empty()) {
+    std::cout << "[INIT-EXPORT] Saving initial model to: " << save_init_path << std::endl;
+    torch::save(training_model, save_init_path);
+    std::cout << "[INIT-EXPORT] Initial model saved successfully. Exiting." << std::endl;
+    return 0;
+  }
+
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_critic = nullptr;
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_critic = nullptr;
   std::unique_ptr<torch::optim::AdamW> critic_optimizer = nullptr;
@@ -7018,6 +7031,14 @@ int main(int argc, char** argv) {
     inference_critic->to(device);
   }
 
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> collection_model = nullptr;
+  if (absl::GetFlag(FLAGS_reverse_kl_coef) > 0.0) {
+    collection_model =
+        std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+    collection_model->to(device);
+  }
 
   if (absl::GetFlag(FLAGS_sample_counterfactual_states) && !absl::GetFlag(FLAGS_train_value_only)) {
     SpielFatalError("Counterfactual states sampling can only be enabled during value-only training (train_value_only=true).");
@@ -9033,6 +9054,9 @@ int main(int argc, char** argv) {
     SyncDualModels(training_model, inference_model, training_critic, inference_critic, &sync_mutex);
   } else {
     open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
+  }
+  if (collection_model != nullptr) {
+    CopyModelWeights(training_model, collection_model);
   }
 
   std::shared_ptr<open_spiel::IGameEvaluator> evaluator;
@@ -11504,7 +11528,11 @@ int main(int argc, char** argv) {
                   start_update)
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
-                  obs_size, action_size, device, master, start_update, anchor_model);
+                  obs_size, action_size, device, master, start_update, anchor_model,
+                  /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+                  /*abort_grad_norm_ratio=*/0.0,
+                  open_spiel::Pwo5AuxBatch(), open_spiel::Pwo5AuxConfig(),
+                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef));
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -11673,7 +11701,8 @@ int main(int argc, char** argv) {
                   obs_size, action_size, device, master, update, anchor_model,
                   current_collect.aux_examples, this_search_coef,
                   online_search_collection ? aux_abort_ratio : 0.0,
-                  pwo5_batch, pwo5_cfg);
+                  pwo5_batch, pwo5_cfg,
+                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef));
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -11865,6 +11894,9 @@ int main(int argc, char** argv) {
     } else {
       open_spiel::SyncModels(training_model, inference_model, &sync_mutex);
     }
+    if (collection_model != nullptr) {
+      CopyModelWeights(training_model, collection_model);
+    }
 
     auto wall_end = std::chrono::high_resolution_clock::now();
 
@@ -11879,12 +11911,13 @@ int main(int argc, char** argv) {
         "Update %5d/%d | Transitions: %6zu | Games: %llu | "
         "Collect: %.2fs (%.0f t/s) | PPO: %.2fs | Wall: %.2fs | "
         "PolicyLoss: %.6f | ValueLoss: %.6f | Entropy: %.4f | "
-        "ApproxKL: %.6f | ClipFrac: %.3f | ExplVar: %.3f%s\n",
+        "ApproxKL: %.6f | ClipFrac: %.3f | ExplVar: %.3f%s%s\n",
         update, target_end_update, current_collect.rollout.size(),
         static_cast<unsigned long long>(total_games),
         collect_elapsed, sps, ppo_elapsed, wall_elapsed,
         stats.policy_loss, stats.value_loss, stats.entropy, stats.approx_kl,
         stats.clip_fraction, stats.explained_variance,
+        (absl::GetFlag(FLAGS_reverse_kl_coef) > 0.0 ? absl::StrFormat(" | RevKL: %.6f", stats.reverse_kl) : ""),
         stats.early_stopped ? " | early-stop" : "");
 
     // Phase 18B combined-optimization + collector diagnostics.

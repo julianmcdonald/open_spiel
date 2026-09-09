@@ -1160,7 +1160,9 @@ PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> anchor_model,
     const std::vector<SearchTrainingExample>& search_examples,
     double search_loss_coef, double abort_grad_norm_ratio,
-    const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg) {
+    const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model,
+    double reverse_kl_coef) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
   stats.rollout_hash = ComputeRolloutHash(batch);
@@ -1569,6 +1571,38 @@ PpoUpdateStats TrainPpoUpdate(
         {6}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
   }
 
+  // --- Reverse KL penalty (Arm B: PPO with reverse-KL to collection policy) ---
+  const bool reverse_kl_active =
+      (collection_model != nullptr && reverse_kl_coef > 0.0 &&
+       !::absl::GetFlag(::FLAGS_train_value_only));
+  torch::Tensor collection_log_probs;
+  if (reverse_kl_active) {
+    collection_log_probs = torch::empty(
+        {n, action_dim},
+        torch::TensorOptions().device(device).dtype(torch::kFloat32));
+    bool coll_was_training = collection_model->is_training();
+    collection_model->eval();
+    {
+      torch::NoGradGuard no_grad;
+      for (int64_t start = 0; start < n; start += minibatch_size) {
+        int64_t end = std::min(start + minibatch_size, n);
+        torch::Tensor mb_s = states.narrow(0, start, end - start);
+        torch::Tensor mb_m = masks.narrow(0, start, end - start);
+        auto coll_out = collection_model->forward(mb_s);
+        torch::Tensor coll_logits =
+            CenterAndCapLogitsTensor(coll_out.logits, mb_m, logit_cap);
+        torch::Tensor coll_masked_logits =
+            coll_logits.masked_fill(mb_m.logical_not(), -1e9f);
+        torch::Tensor coll_lp = torch::log_softmax(coll_masked_logits, -1);
+        collection_log_probs.narrow(0, start, end - start).copy_(coll_lp);
+      }
+    }
+    if (coll_was_training) {
+      collection_model->train();
+    }
+  }
+  double weighted_reverse_kl_sum = 0.0;
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
@@ -1591,6 +1625,10 @@ PpoUpdateStats TrainPpoUpdate(
       torch::Tensor mb_returns = returns.index_select(0, mb_idx);
       torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
       torch::Tensor mb_nontrivial = nontrivial_mask.index_select(0, mb_idx);
+      torch::Tensor mb_coll_lp;
+      if (reverse_kl_active) {
+        mb_coll_lp = collection_log_probs.index_select(0, mb_idx);
+      }
 
       int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
 
@@ -1774,6 +1812,7 @@ PpoUpdateStats TrainPpoUpdate(
       // Left undefined when --ppo_clip_value_loss=false: nothing is clipped, so
       // the fraction contributes 0 rather than a fabricated value.
       torch::Tensor value_clip_frac_t;
+      torch::Tensor reverse_kl_penalty_t;
 
       auto compute_loss = [&]() {
         auto outputs = model->forward(mb_states);
@@ -1873,6 +1912,14 @@ PpoUpdateStats TrainPpoUpdate(
 
           total_loss = policy_loss + value_coef * value_loss -
                        entropy_coef * entropy;
+          if (reverse_kl_active) {
+            torch::Tensor log_diff = log_probs - mb_coll_lp;
+            torch::Tensor kl_elem = probs * log_diff;
+            torch::Tensor legal_kl = torch::where(mb_masks, kl_elem, torch::zeros_like(kl_elem));
+            torch::Tensor decision_kl = legal_kl.sum(-1);
+            reverse_kl_penalty_t = decision_kl.masked_select(mb_nontrivial).mean();
+            total_loss = total_loss + static_cast<float>(reverse_kl_coef) * reverse_kl_penalty_t;
+          }
         } else {
           // 0 nontrivial transitions: train critic only
           policy_loss = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -2040,6 +2087,9 @@ PpoUpdateStats TrainPpoUpdate(
 
         epoch_kl_sum += kl * mb_num_nontrivial;
         epoch_kl_nontrivial_count += mb_num_nontrivial;
+        if (reverse_kl_active && reverse_kl_penalty_t.defined()) {
+          weighted_reverse_kl_sum += reverse_kl_penalty_t.item<double>() * mb_num_nontrivial;
+        }
       }
       phase_timer.End(kPhaseScalarReads);
 
@@ -2133,6 +2183,11 @@ PpoUpdateStats TrainPpoUpdate(
       stats.entropy = 0.0;
       stats.approx_kl = 0.0;
       stats.clip_fraction = 0.0;
+    }
+    if (reverse_kl_active && total_nontrivial_count > 0) {
+      stats.reverse_kl = weighted_reverse_kl_sum / total_nontrivial_count;
+    } else {
+      stats.reverse_kl = 0.0;
     }
   }
 
