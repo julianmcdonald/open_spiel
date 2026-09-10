@@ -576,12 +576,15 @@ public:
                            torch::Device device,
                            std::mutex* mutex,
                            std::shared_mutex* sync_mutex = nullptr,
-                           std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr)
-        : model_(model), device_(device), mutex_(mutex), sync_mutex_(sync_mutex),
-          critic_model_(critic_model) {
+                           std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr,
+                           bool rollout_amp = true)
+        : model_(model), critic_model_(critic_model), device_(device), mutex_(mutex),
+          sync_mutex_(sync_mutex), rollout_amp_(rollout_amp) {
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
     }
+
+    bool RolloutAmpForTesting() const { return rollout_amp_; }
 
     EvalResult Evaluate(const std::vector<float>& obs) override {
         torch::NoGradGuard no_grad;
@@ -641,7 +644,7 @@ public:
                 // synchronous (Torch inserts a stream sync), so the pinned
                 // staging buffer is free the moment copy_ returns.
                 device_tensor_.copy_(input_tensor_, /*non_blocking=*/false);
-                AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+                AutocastGuard autocast_guard(c10::DeviceType::CUDA, rollout_amp_);
                 outputs = model_->forward(device_tensor_);
                 critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_tensor_) : outputs;
             } else {
@@ -681,6 +684,7 @@ private:
     std::shared_mutex* sync_mutex_;
     int64_t model_input_dim_;
     int64_t action_dim_;
+    bool rollout_amp_{true};
     // Per-instance staging buffers, allocated lazily under mutex_ and freed once
     // by the owning (main) thread at destruction. Replaces the thread_local map
     // whose 64-way concurrent pinned-tensor free at thread exit segfaulted libcuda.
