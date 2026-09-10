@@ -496,6 +496,15 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
               *market_mode = it_mm->second.GetString();
             }
           }
+          if (input_dim != nullptr && *input_dim == dune_imperium::kExpandedInformationStateSize) {
+            auto it_schema = obj.find("feature_schema_sha256");
+            std::string schema_hash = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
+            if (schema_hash != dune_imperium::kMarketInformationSchemaV1Sha256) {
+              SpielFatalError(absl::StrFormat(
+                  "Expanded model checkpoint %s has invalid or missing feature_schema_sha256 ('%s', expected '%s')",
+                  model_path, schema_hash, dune_imperium::kMarketInformationSchemaV1Sha256));
+            }
+          }
           auto it_hd = obj.find("hidden_dim");
           auto it_nb = obj.find("num_blocks");
           if (it_hd != obj.end() && it_hd->second.IsInt() &&
@@ -1069,15 +1078,20 @@ void RunEvaluation() {
     if (main_input_dim == dune_imperium::kExpandedInformationStateSize) {
       cand_market_mode = ParseMarketMode(main_detected_market_mode);
       if (cand_market_mode == dune_imperium::MarketAppendixMode::kNone) {
-        cand_market_mode = dune_imperium::MarketAppendixMode::kZeros;
+        SpielFatalError(absl::StrFormat(
+            "Expanded candidate checkpoint %s has absent or invalid market_appendix_mode: '%s'",
+            model_checkpoint, main_detected_market_mode));
       }
     } else {
       cand_market_mode = dune_imperium::MarketAppendixMode::kNone;
     }
   } else {
     cand_market_mode = ParseMarketMode(cand_market_flag);
-    if (cand_market_mode != dune_imperium::MarketAppendixMode::kNone) {
-      main_input_dim = dune_imperium::kExpandedInformationStateSize;
+    if (cand_market_mode == dune_imperium::MarketAppendixMode::kNone &&
+        main_input_dim == dune_imperium::kExpandedInformationStateSize) {
+      SpielFatalError(absl::StrFormat(
+          "Expanded candidate checkpoint %s cannot use market_appendix_mode=none",
+          model_checkpoint));
     }
   }
 
@@ -1114,9 +1128,12 @@ void RunEvaluation() {
       SpielFatalError("Failed to detect model dimensions for opponent checkpoint: " + opp_path);
     }
     auto opp_market_mode = ParseMarketMode(opp_detected_market_mode_str);
-    if (opp_detected_input_dim == dune_imperium::kExpandedInformationStateSize &&
-        opp_market_mode == dune_imperium::MarketAppendixMode::kNone) {
-      opp_market_mode = dune_imperium::MarketAppendixMode::kZeros;
+    if (opp_detected_input_dim == dune_imperium::kExpandedInformationStateSize) {
+      if (opp_market_mode == dune_imperium::MarketAppendixMode::kNone) {
+        SpielFatalError(absl::StrFormat(
+            "Expanded opponent checkpoint %s has absent or invalid market_appendix_mode: '%s'",
+            opp_path, opp_detected_market_mode_str));
+      }
     }
     opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks, opp_detected_input_dim, opp_market_mode, MarketModeToString(opp_market_mode)});
 

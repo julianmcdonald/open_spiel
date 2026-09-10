@@ -9082,6 +9082,37 @@ int main(int argc, char** argv) {
         SpielFatalError("Study resume shared validation failed: " + err);
       }
 
+      // Verify market_appendix_mode and feature_schema match the current run's flags
+      {
+        std::ifstream mfs(manifest_path);
+        std::string content((std::istreambuf_iterator<char>(mfs)),
+                            std::istreambuf_iterator<char>());
+        auto parsed = open_spiel::json::FromString(content);
+        if (parsed && parsed->IsObject()) {
+          const auto& obj = parsed->GetObject();
+          auto it = obj.find("market_appendix_mode");
+          std::string manifest_mode = "none";
+          if (it != obj.end() && it->second.IsString()) {
+            manifest_mode = it->second.GetString();
+          }
+          std::string current_mode = absl::GetFlag(FLAGS_market_appendix_mode);
+          if (manifest_mode != current_mode) {
+            SpielFatalError(absl::StrFormat(
+                "market_appendix_mode mismatch on study_resume. Manifest: '%s', Flag: '%s'",
+                manifest_mode, current_mode));
+          }
+          if (current_mode != "none") {
+            auto it_schema = obj.find("feature_schema_sha256");
+            std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
+            if (manifest_schema != dune_imperium::kMarketInformationSchemaV1Sha256) {
+              SpielFatalError(absl::StrFormat(
+                  "feature_schema_sha256 mismatch on study_resume. Manifest: '%s', Expected: '%s'",
+                  manifest_schema, dune_imperium::kMarketInformationSchemaV1Sha256));
+            }
+          }
+        }
+      }
+
       LoadModelCheckpoint(training_model, model_path, device);
       torch::load(*optimizer, optim_path, device);
 
