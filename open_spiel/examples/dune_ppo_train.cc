@@ -679,6 +679,8 @@ ABSL_FLAG(int, counterfactual_samples_per_game, 4,
 ABSL_FLAG(int, counterfactual_replay_weight, 8,
           "Value-loss replay multiplicity for each sampled counterfactual successor.");
 ABSL_DECLARE_FLAG(double, policy_kl_anchor_coeff);
+ABSL_FLAG(std::string, market_appendix_mode, "none",
+          "Imperium market appendix mode: 'none' (legacy 5580), 'zeros' (expanded 6215 with zero appendix), 'ordered_market' (expanded 6215 with ordered market slots).");
 
 // ===========================================================================
 // PWO-5 gate 3 — Appendix A.1 of docs/PWO5_PILOT_REGISTRATION.md
@@ -1052,15 +1054,36 @@ bool LoadModelCheckpointMigrating(
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
   const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
 
+  int64_t ckpt_input_dim = input_dim;
+  {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, torch::kCPU);
+    torch::serialize::InputArchive in_archive;
+    if (archive.try_read("input_layer", in_archive)) {
+      torch::Tensor w;
+      if (in_archive.try_read("weight", w)) {
+        ckpt_input_dim = w.size(1);
+      }
+    }
+  }
+
   auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      input_dim, hidden_dim, action_dim, num_blocks, use_nonlinear,
+      ckpt_input_dim, hidden_dim, action_dim, num_blocks, use_nonlinear,
       /*with_aux_heads=*/false);
   temp_model->to(device);
   torch::load(temp_model, path, device);
 
   torch::NoGradGuard no_grad;
   // Trunk.
-  model->input_layer->weight.copy_(temp_model->input_layer->weight);
+  if (ckpt_input_dim == input_dim) {
+    model->input_layer->weight.copy_(temp_model->input_layer->weight);
+  } else if (ckpt_input_dim == 5580 && input_dim == 6215) {
+    model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
+    model->input_layer->weight.slice(1, 5580, 6215).zero_();
+  } else {
+    SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
+                                    ckpt_input_dim, input_dim));
+  }
   if (model->input_layer->bias.defined() &&
       temp_model->input_layer->bias.defined()) {
     model->input_layer->bias.copy_(temp_model->input_layer->bias);
@@ -1138,7 +1161,7 @@ void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   // PWO-5: when the model carries the auxiliary heads, the migrating loader is
   // the only correct path -- a plain torch::load would demand head tensors the
   // base checkpoint does not have and would abort the run.
-  if (model->has_aux_heads_) {
+  if (model->has_aux_heads_ || model->input_layer->weight.size(1) == 6215) {
     LoadModelCheckpointMigrating(model, path, device);
     return;
   }
@@ -1836,6 +1859,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["optimizer_sha256"] = optim_hash;
     manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
+    manifest_obj["observation_dim"] = static_cast<int64_t>(model->input_layer->weight.size(1));
+    manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
+    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
+      manifest_obj["feature_schema_label"] = std::string(dune_imperium::kMarketInformationSchemaV1);
+      manifest_obj["feature_schema_sha256"] = std::string(dune_imperium::kMarketInformationSchemaV1Sha256);
+    }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
       manifest_obj["pwo5"] = json::Value(g_pwo5_manifest_fields);
@@ -2012,7 +2041,11 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       const bool is_learner = (!single_learner) || (current_player == learner_seat);
 
       std::vector<float> obs(obs_size, 0.0f);
-      if (provides_info_state_tensor && current_player >= 0) {
+      if (dune_state != nullptr && obs_size == dune_imperium::kExpandedInformationStateSize) {
+        dune_imperium::MarketAppendixMode mode =
+            dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode));
+        dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs));
+      } else if (provides_info_state_tensor && current_player >= 0) {
         state->InformationStateTensor(current_player, absl::MakeSpan(obs));
       } else if (provides_observations_tensor && current_player >= 0) {
         state->ObservationTensor(current_player, absl::MakeSpan(obs));
@@ -6441,6 +6474,12 @@ int main(int argc, char** argv) {
   int64_t obs_size = game->GetType().provides_information_state_tensor
                          ? game->InformationStateTensorSize()
                          : game->ObservationTensorSize();
+  const std::string market_mode_str = absl::GetFlag(FLAGS_market_appendix_mode);
+  dune_imperium::MarketAppendixMode market_mode =
+      dune_imperium::ParseMarketAppendixMode(market_mode_str);
+  if (market_mode != dune_imperium::MarketAppendixMode::kNone) {
+    obs_size = dune_imperium::kExpandedInformationStateSize;
+  }
   int64_t action_size = game->NumDistinctActions();
 
   if (vrpo_bootstrap) {
@@ -8397,6 +8436,28 @@ int main(int argc, char** argv) {
       SpielFatalError(err);
     }
 
+    // Verify market_appendix_mode matches the current run's flag
+    {
+      std::ifstream mfs(manifest_path);
+      std::string content((std::istreambuf_iterator<char>(mfs)),
+                          std::istreambuf_iterator<char>());
+      auto parsed = open_spiel::json::FromString(content);
+      if (parsed && parsed->IsObject()) {
+        const auto& obj = parsed->GetObject();
+        auto it = obj.find("market_appendix_mode");
+        std::string manifest_mode = "none";
+        if (it != obj.end() && it->second.IsString()) {
+          manifest_mode = it->second.GetString();
+        }
+        std::string current_mode = absl::GetFlag(FLAGS_market_appendix_mode);
+        if (manifest_mode != current_mode) {
+          SpielFatalError(absl::StrFormat(
+              "market_appendix_mode mismatch on resume. Manifest: '%s', Flag: '%s'",
+              manifest_mode, current_mode));
+        }
+      }
+    }
+
     // ---------------------------------------------------------------------
     // PWO-5 Appendix A.1 note 3: the within-arm invariant. Every field of the
     // block -- both target flags, the split digest, the three head
@@ -8633,7 +8694,7 @@ int main(int argc, char** argv) {
     if (!std::filesystem::exists(model_path)) {
       SpielFatalError("Model file not found for bootstrap: " + model_path);
     }
-    if (!std::filesystem::exists(optim_path)) {
+    if (!absl::GetFlag(FLAGS_fresh_optimizer) && !std::filesystem::exists(optim_path)) {
       SpielFatalError("Optimizer file not found for bootstrap: " + optim_path);
     }
 
@@ -8658,6 +8719,8 @@ int main(int argc, char** argv) {
         std::cout << "[search-PI] Skipping the PPO optimizer load: this mode "
                      "takes WEIGHTS from the checkpoint and builds its own "
                      "optimizer.\n";
+      } else if (absl::GetFlag(FLAGS_fresh_optimizer)) {
+        std::cout << "[INFO] fresh_optimizer is true: keeping fresh AdamW optimizer. Skipping baseline optimizer load.\n";
       } else if (!absl::GetFlag(FLAGS_train_value_only)) {
         // PWO-5 section 7.2: the bootstrap path is where the Branch-A u2450
         // optimizer -- written before the three heads existed -- is migrated.
@@ -8675,7 +8738,10 @@ int main(int argc, char** argv) {
     size_t model_size = 0;
     std::string model_hash = open_spiel::ComputeFileSHA256(model_path, &model_size);
     size_t optim_size = 0;
-    std::string optim_hash = open_spiel::ComputeFileSHA256(optim_path, &optim_size);
+    std::string optim_hash = "";
+    if (std::filesystem::exists(optim_path)) {
+      optim_hash = open_spiel::ComputeFileSHA256(optim_path, &optim_size);
+    }
 
     std::filesystem::path m_path = model_path;
     m_path.replace_extension(".json");
@@ -8705,6 +8771,12 @@ int main(int argc, char** argv) {
     manifest_obj["optimizer_sha256"] = optim_hash;
     manifest_obj["hidden_dim"] = static_cast<int64_t>(absl::GetFlag(FLAGS_hidden_dim));
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
+    manifest_obj["observation_dim"] = static_cast<int64_t>(training_model->input_layer->weight.size(1));
+    manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
+    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
+      manifest_obj["feature_schema_label"] = std::string(dune_imperium::kMarketInformationSchemaV1);
+      manifest_obj["feature_schema_sha256"] = std::string(dune_imperium::kMarketInformationSchemaV1Sha256);
+    }
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
     // PWO-5 Appendix A.1 note 3: the same block the checkpoint writer emits, so
     // the bootstrap manifest an arm resumes FROM already carries the contract.

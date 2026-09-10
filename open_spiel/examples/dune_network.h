@@ -539,13 +539,17 @@ inline void CheckEvalObsSize(size_t obs_size, int64_t model_input_dim) {
     const int64_t size = static_cast<int64_t>(obs_size);
     const bool ok = (size == model_input_dim) ||
                     (size == 5580 && model_input_dim == 5584) ||
-                    (size == 5584 && model_input_dim == 5580);
+                    (size == 5584 && model_input_dim == 5580) ||
+                    (size == 6215 && model_input_dim == 5580) ||
+                    (size == 5580 && model_input_dim == 6215) ||
+                    (size == 6215 && model_input_dim == 5584) ||
+                    (size == 5584 && model_input_dim == 6215);
     if (!ok) {
         SpielFatalError("Evaluator observation size " +
                         std::to_string(obs_size) +
                         " is incompatible with model input dim " +
                         std::to_string(model_input_dim) +
-                        " (expected an exact match or the 5580/5584 pair).");
+                        " (expected an exact match or supported cross-layout pair).");
     }
 }
 

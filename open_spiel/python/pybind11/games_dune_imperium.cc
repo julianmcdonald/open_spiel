@@ -45,6 +45,11 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
   py::module_ di = m.def_submodule("dune_imperium");
 
   // ---- Enums ----
+  py::enum_<open_spiel::dune_imperium::MarketAppendixMode>(di, "MarketAppendixMode")
+      .value("kNone", open_spiel::dune_imperium::MarketAppendixMode::kNone)
+      .value("kZeros", open_spiel::dune_imperium::MarketAppendixMode::kZeros)
+      .value("kOrderedMarket", open_spiel::dune_imperium::MarketAppendixMode::kOrderedMarket)
+      .export_values();
 
   // --- Structs & Helpers ---
   py::class_<open_spiel::dune_imperium::IntrigueCard>(di, "IntrigueCard")
@@ -270,9 +275,24 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("get_deck_pool_cards_drawn",
            &DuneImperiumState::GetDeckPoolCardsDrawnForTesting,
            py::arg("player"))
-      .def("get_imperium_row", &DuneImperiumState::GetImperiumRowForTesting,
-           py::return_value_policy::reference_internal)
-      .def("get_tleilaxu_row", &DuneImperiumState::GetTleilaxuRowForTesting,
+       .def("get_imperium_row", &DuneImperiumState::GetImperiumRowForTesting,
+            py::return_value_policy::reference_internal)
+       .def("get_imperium_market_appendix",
+            &DuneImperiumState::GetImperiumMarketAppendix)
+       .def("information_state_tensor_with_appendix",
+            [](const DuneImperiumState &s, Player player,
+               open_spiel::dune_imperium::MarketAppendixMode mode) -> std::vector<float> {
+              return s.InformationStateTensorWithAppendix(player, mode);
+            },
+            py::arg("player"), py::arg("mode"))
+       .def("information_state_tensor_with_appendix",
+            [](const DuneImperiumState &s, Player player,
+               const std::string &mode_str) -> std::vector<float> {
+              return s.InformationStateTensorWithAppendix(
+                  player, dune_imperium::ParseMarketAppendixMode(mode_str));
+            },
+            py::arg("player"), py::arg("mode") = "ordered_market")
+       .def("get_tleilaxu_row", &DuneImperiumState::GetTleilaxuRowForTesting,
            py::return_value_policy::reference_internal)
       .def("get_imperium_draw_deck",
            &DuneImperiumState::GetImperiumDrawDeckForTesting,

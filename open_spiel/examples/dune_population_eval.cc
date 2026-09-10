@@ -108,6 +108,8 @@ ABSL_FLAG(double, opponent_logit_cap, 10.0,
 ABSL_FLAG(std::string, dump_logit_stats, "",
           "If non-empty, append one CSV row per CANDIDATE decision with pre-cap "
           "legal-centered logit statistics to this path (audit; off by default).");
+ABSL_FLAG(std::string, candidate_market_appendix_mode, "auto",
+          "Market appendix mode for candidate: 'auto' (infer from model/manifest), 'none', 'zeros', or 'ordered_market'.");
 
 namespace open_spiel {
 namespace {
@@ -431,10 +433,35 @@ std::vector<std::string> SplitCommaSeparated(const std::string& value) {
 
 
 
+struct OpponentMetadata {
+  std::string path;
+  int hidden_dim;
+  int num_blocks;
+  int input_dim;
+  dune_imperium::MarketAppendixMode market_mode;
+  std::string market_mode_str;
+};
+
+dune_imperium::MarketAppendixMode ParseMarketMode(const std::string& str) {
+  if (str == "ordered_market") return dune_imperium::MarketAppendixMode::kOrderedMarket;
+  if (str == "zeros") return dune_imperium::MarketAppendixMode::kZeros;
+  return dune_imperium::MarketAppendixMode::kNone;
+}
+
+std::string MarketModeToString(dune_imperium::MarketAppendixMode mode) {
+  switch (mode) {
+    case dune_imperium::MarketAppendixMode::kOrderedMarket: return "ordered_market";
+    case dune_imperium::MarketAppendixMode::kZeros: return "zeros";
+    case dune_imperium::MarketAppendixMode::kNone:
+    default: return "none";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Auto-detect model hidden_dim and num_blocks from JSON manifest or weight keys
 // ---------------------------------------------------------------------------
-bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* num_blocks) {
+bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* num_blocks,
+                           int* input_dim = nullptr, std::string* market_mode = nullptr) {
   // 1. Try to find a JSON file
   std::string json_path = "";
   std::filesystem::path p(model_path);
@@ -457,6 +484,18 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
         auto val_opt = json::FromString(content);
         if (val_opt.has_value() && val_opt->IsObject()) {
           const auto& obj = val_opt->GetObject();
+          if (input_dim != nullptr) {
+            auto it_od = obj.find("observation_dim");
+            if (it_od != obj.end() && it_od->second.IsInt()) {
+              *input_dim = static_cast<int>(it_od->second.GetInt());
+            }
+          }
+          if (market_mode != nullptr) {
+            auto it_mm = obj.find("market_appendix_mode");
+            if (it_mm != obj.end() && it_mm->second.IsString()) {
+              *market_mode = it_mm->second.GetString();
+            }
+          }
           auto it_hd = obj.find("hidden_dim");
           auto it_nb = obj.find("num_blocks");
           if (it_hd != obj.end() && it_hd->second.IsInt() &&
@@ -494,6 +533,9 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
     torch::Tensor weight;
     input_layer_archive.read("weight", weight);
     *hidden_dim = weight.size(0);
+    if (input_dim != nullptr) {
+      *input_dim = weight.size(1);
+    }
 
     int blocks = 0;
     while (true) {
@@ -532,6 +574,9 @@ void WorkerThread(
     const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
     const std::vector<std::string>& opponent_names,
     int64_t obs_size,
+    int candidate_input_dim,
+    dune_imperium::MarketAppendixMode candidate_market_mode,
+    const std::vector<OpponentMetadata>& opp_metadata,
     bool provides_info_state_tensor,
     bool provides_observations_tensor,
     std::atomic<int>& next_game_id,
@@ -551,8 +596,14 @@ void WorkerThread(
     std::ofstream* dump_out,
     std::vector<GameResult>& results) {
 
-  // Pre-allocate observation buffer reused across all games
-  std::vector<float> obs(obs_size, 0.0f);
+  // Pre-allocate observation buffers
+  std::vector<float> cand_obs(candidate_input_dim, 0.0f);
+  std::vector<std::vector<float>> opp_obs;
+  opp_obs.reserve(opponent_evaluators.size());
+  for (size_t i = 0; i < opponent_evaluators.size(); ++i) {
+    int dim = (i < opp_metadata.size()) ? opp_metadata[i].input_dim : static_cast<int>(obs_size);
+    opp_obs.emplace_back(dim, 0.0f);
+  }
 
   while (true) {
     const int result_index = next_game_id++;
@@ -665,22 +716,38 @@ void WorkerThread(
       bool use_opponent_model = (!use_model && !opponent_evaluators.empty());
 
       if (use_model || use_opponent_model) {
-        // Fill observation buffer
-        std::fill(obs.begin(), obs.end(), 0.0f);
-        if (provides_info_state_tensor) {
-          state->InformationStateTensor(current_player, absl::MakeSpan(obs));
-        } else if (provides_observations_tensor) {
-          state->ObservationTensor(current_player, absl::MakeSpan(obs));
-        }
-
-        // Select evaluator
-        std::shared_ptr<IGameEvaluator> evaluator = model_evaluator;
-        if (!use_model) {
+        std::shared_ptr<IGameEvaluator> evaluator;
+        std::vector<float>* p_obs = nullptr;
+        if (use_model) {
+          evaluator = model_evaluator;
+          p_obs = &cand_obs;
+          std::fill(cand_obs.begin(), cand_obs.end(), 0.0f);
+          if (dune_state != nullptr && candidate_input_dim == dune_imperium::kExpandedInformationStateSize) {
+            dune_state->InformationStateTensorWithAppendix(
+                current_player, candidate_market_mode, absl::MakeSpan(cand_obs));
+          } else if (provides_info_state_tensor) {
+            state->InformationStateTensor(current_player, absl::MakeSpan(cand_obs));
+          } else if (provides_observations_tensor) {
+            state->ObservationTensor(current_player, absl::MakeSpan(cand_obs));
+          }
+        } else {
           size_t idx = player_opp_idx[current_player];
           evaluator = opponent_evaluators[idx];
+          p_obs = &opp_obs[idx];
+          std::fill(opp_obs[idx].begin(), opp_obs[idx].end(), 0.0f);
+          int opp_dim = (idx < opp_metadata.size()) ? opp_metadata[idx].input_dim : static_cast<int>(obs_size);
+          auto opp_mode = (idx < opp_metadata.size()) ? opp_metadata[idx].market_mode : dune_imperium::MarketAppendixMode::kNone;
+          if (dune_state != nullptr && opp_dim == dune_imperium::kExpandedInformationStateSize) {
+            dune_state->InformationStateTensorWithAppendix(
+                current_player, opp_mode, absl::MakeSpan(opp_obs[idx]));
+          } else if (provides_info_state_tensor) {
+            state->InformationStateTensor(current_player, absl::MakeSpan(opp_obs[idx]));
+          } else if (provides_observations_tensor) {
+            state->ObservationTensor(current_player, absl::MakeSpan(opp_obs[idx]));
+          }
         }
 
-        EvalResult result = evaluator->Evaluate(obs);
+        EvalResult result = evaluator->Evaluate(*p_obs);
         if (use_model && dump_out != nullptr && dune_state != nullptr) {
           AppendLogitStatsRow(*dump_out, episode_id,
                               dune_state->GetCurrentRound(),
@@ -990,12 +1057,32 @@ void RunEvaluation() {
   // Load eval model with auto-detected dimensions
   int main_hidden_dim = hidden_dim;
   int main_num_blocks = num_blocks;
-  if (!DetectModelDimensions(model_checkpoint, &main_hidden_dim, &main_num_blocks)) {
+  int main_input_dim = static_cast<int>(obs_size);
+  std::string main_detected_market_mode = "none";
+  if (!DetectModelDimensions(model_checkpoint, &main_hidden_dim, &main_num_blocks, &main_input_dim, &main_detected_market_mode)) {
     SpielFatalError("Failed to detect model dimensions for main checkpoint: " + model_checkpoint);
   }
 
+  std::string cand_market_flag = absl::GetFlag(FLAGS_candidate_market_appendix_mode);
+  dune_imperium::MarketAppendixMode cand_market_mode = dune_imperium::MarketAppendixMode::kNone;
+  if (cand_market_flag == "auto") {
+    if (main_input_dim == dune_imperium::kExpandedInformationStateSize) {
+      cand_market_mode = ParseMarketMode(main_detected_market_mode);
+      if (cand_market_mode == dune_imperium::MarketAppendixMode::kNone) {
+        cand_market_mode = dune_imperium::MarketAppendixMode::kZeros;
+      }
+    } else {
+      cand_market_mode = dune_imperium::MarketAppendixMode::kNone;
+    }
+  } else {
+    cand_market_mode = ParseMarketMode(cand_market_flag);
+    if (cand_market_mode != dune_imperium::MarketAppendixMode::kNone) {
+      main_input_dim = dune_imperium::kExpandedInformationStateSize;
+    }
+  }
+
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      obs_size, main_hidden_dim, action_size, main_num_blocks,
+      main_input_dim, main_hidden_dim, action_size, main_num_blocks,
       absl::GetFlag(FLAGS_nonlinear_value_head));
   model->eval();
   {
@@ -1016,23 +1103,25 @@ void RunEvaluation() {
   }
 
   // Load opponent models with auto-detected dimensions
-  struct OpponentMetadata {
-    std::string path;
-    int hidden_dim;
-    int num_blocks;
-  };
   std::vector<OpponentMetadata> opp_metadata;
   std::vector<std::shared_ptr<IGameEvaluator>> opponent_evaluators;
   for (const std::string& opp_path : opponent_paths) {
     int opp_detected_hidden = opp_hidden_dim;
     int opp_detected_blocks = opp_num_blocks;
-    if (!DetectModelDimensions(opp_path, &opp_detected_hidden, &opp_detected_blocks)) {
+    int opp_detected_input_dim = static_cast<int>(obs_size);
+    std::string opp_detected_market_mode_str = "none";
+    if (!DetectModelDimensions(opp_path, &opp_detected_hidden, &opp_detected_blocks, &opp_detected_input_dim, &opp_detected_market_mode_str)) {
       SpielFatalError("Failed to detect model dimensions for opponent checkpoint: " + opp_path);
     }
-    opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks});
+    auto opp_market_mode = ParseMarketMode(opp_detected_market_mode_str);
+    if (opp_detected_input_dim == dune_imperium::kExpandedInformationStateSize &&
+        opp_market_mode == dune_imperium::MarketAppendixMode::kNone) {
+      opp_market_mode = dune_imperium::MarketAppendixMode::kZeros;
+    }
+    opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks, opp_detected_input_dim, opp_market_mode, MarketModeToString(opp_market_mode)});
 
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-        obs_size, opp_detected_hidden, action_size, opp_detected_blocks,
+        opp_detected_input_dim, opp_detected_hidden, action_size, opp_detected_blocks,
         absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
     opp_model->eval();
     {
@@ -1078,8 +1167,8 @@ void RunEvaluation() {
             << "\n"
             << "Batch size: " << eval_batch_size << "\n"
             << "Device:     " << device_name << "\n"
-            << "Hidden dim: " << hidden_dim << " / Blocks: " << num_blocks
-            << "\n";
+            << "Hidden dim: " << main_hidden_dim << " / Blocks: " << main_num_blocks
+            << " / Obs dim: " << main_input_dim << " (Market: " << MarketModeToString(cand_market_mode) << ")\n";
   if (use_opponent_model && (opp_hidden_dim != hidden_dim ||
                               opp_num_blocks != num_blocks)) {
     std::cout << "Opp dim:    " << opp_hidden_dim
@@ -1122,6 +1211,7 @@ void RunEvaluation() {
     threads.emplace_back(
         WorkerThread, static_cast<int>(t), game, model_evaluator,
         std::cref(opponent_evaluators), std::cref(opponent_names), obs_size,
+        main_input_dim, cand_market_mode, std::cref(opp_metadata),
         provides_info_state_tensor, provides_observations_tensor,
         std::ref(next_game_id), start_episode_id, total_games,
         base_seed, domain, greedy, temperature,
@@ -1346,6 +1436,8 @@ void RunEvaluation() {
               << absl::StrFormat("%.4f", opponent_logit_cap) << ",\n"
               << "  \"hidden_dim\": " << main_hidden_dim << ",\n"
               << "  \"num_blocks\": " << main_num_blocks << ",\n"
+              << "  \"candidate_input_dim\": " << main_input_dim << ",\n"
+              << "  \"candidate_market_mode\": \"" << MarketModeToString(cand_market_mode) << "\",\n"
               << "  \"opp_hidden_dim\": " << (opp_metadata.empty() ? -1 : opp_metadata[0].hidden_dim) << ",\n"
               << "  \"opp_num_blocks\": " << (opp_metadata.empty() ? -1 : opp_metadata[0].num_blocks) << ",\n"
               << "  \"execution_mode\": \"" << (deterministic ? "deterministic" : "batched") << "\",\n"
@@ -1355,7 +1447,9 @@ void RunEvaluation() {
         agg_out << "    {\n"
                 << "      \"checkpoint\": \"" << opp_metadata[i].path << "\",\n"
                 << "      \"hidden_dim\": " << opp_metadata[i].hidden_dim << ",\n"
-                << "      \"num_blocks\": " << opp_metadata[i].num_blocks << "\n"
+                << "      \"num_blocks\": " << opp_metadata[i].num_blocks << ",\n"
+                << "      \"input_dim\": " << opp_metadata[i].input_dim << ",\n"
+                << "      \"market_mode\": \"" << opp_metadata[i].market_mode_str << "\"\n"
                 << "    }" << (i + 1 < opp_metadata.size() ? "," : "") << "\n";
       }
       agg_out << "  ],\n"

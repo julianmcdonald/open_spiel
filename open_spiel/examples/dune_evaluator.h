@@ -289,7 +289,11 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   void CheckObsSize(size_t size) const {
     SPIEL_CHECK_TRUE(size == static_cast<size_t>(obs_size_) || 
                      (size == 5580 && obs_size_ == 5584) ||
-                     (size == 5584 && obs_size_ == 5580));
+                     (size == 5584 && obs_size_ == 5580) ||
+                     (size == 6215 && obs_size_ == 5580) ||
+                     (size == 5580 && obs_size_ == 6215) ||
+                     (size == 6215 && obs_size_ == 5584) ||
+                     (size == 5584 && obs_size_ == 6215));
   }
 
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
