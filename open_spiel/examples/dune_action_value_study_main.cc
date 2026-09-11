@@ -214,20 +214,41 @@ void RunPilot(const std::shared_ptr<const Game>& game, const std::filesystem::pa
     total_pilot_continuations += r.candidate_actions.size() * 8;
   }
 
-  auto rollout_start = std::chrono::steady_clock::now();
+  struct PilotTask {
+    const RootRecord* root;
+    Action action;
+    int replicate;
+  };
+  std::vector<PilotTask> tasks;
   for (const auto& r : pilot_roots) {
     for (Action a : r.candidate_actions) {
       for (int k = 0; k < 8; ++k) {
-        auto state = ReconstructState(game, r.history);
-        state->ApplyAction(a);
-        uint64_t c_seed = DeriveContinuationChanceSeed(Partition::kPilot, r.root_id, k);
-        uint64_t p_seed = DeriveContinuationPolicySeed(Partition::kPilot, r.root_id, k);
-        auto returns = RunRollout(game, std::move(state), c_seed, p_seed);
-        completed_continuations.fetch_add(1);
+        tasks.push_back({&r, a, k});
       }
     }
   }
 
+  auto rollout_start = std::chrono::steady_clock::now();
+  std::atomic<size_t> next_task{0};
+  std::vector<std::thread> workers;
+  for (int tid = 0; tid < num_threads; ++tid) {
+    workers.emplace_back([&]() {
+      while (true) {
+        size_t idx = next_task.fetch_add(1);
+        if (idx >= tasks.size()) break;
+        const auto& t = tasks[idx];
+        auto state = ReconstructState(game, t.root->history);
+        state->ApplyAction(t.action);
+        uint64_t c_seed = DeriveContinuationChanceSeed(Partition::kPilot, t.root->root_id, t.replicate);
+        uint64_t p_seed = DeriveContinuationPolicySeed(Partition::kPilot, t.root->root_id, t.replicate);
+        auto returns = RunRollout(game, std::move(state), c_seed, p_seed);
+        completed_continuations.fetch_add(1);
+      }
+    });
+  }
+  for (auto& w : workers) {
+    w.join();
+  }
   auto rollout_end = std::chrono::steady_clock::now();
   double rollout_sec = std::chrono::duration<double>(rollout_end - rollout_start).count();
   double throughput = completed_continuations.load() / rollout_sec;
