@@ -259,30 +259,288 @@ void TestBootstrapConfidenceIntervals() {
 
 void TestManifestContractAndCorruptionRejection() {
   std::cout << "Running TestManifestContractAndCorruptionRejection...\n" << std::flush;
-  ExecutableManifest manifest;
-  std::string json_str = manifest.ToJsonString();
-  auto parsed = json::FromString(json_str);
-  SPIEL_CHECK_TRUE(parsed.has_value());
+  auto game = LoadGame("dune_imperium");
 
-  auto reloaded = ExecutableManifest::FromJson(parsed.value().GetObject());
-  SPIEL_CHECK_EQ(reloaded.actor_input_dim, 5580);
-  SPIEL_CHECK_EQ(reloaded.critic_expected_input_dim, 9647);
-  SPIEL_CHECK_EQ(reloaded.roots_train, 2048);
-  SPIEL_CHECK_EQ(reloaded.roots_dev, 256);
-  SPIEL_CHECK_EQ(reloaded.roots_test, 512);
-  SPIEL_CHECK_EQ(reloaded.critic_init_seed, 19u);
-  SPIEL_CHECK_EQ(reloaded.deadline_seconds, 28800);
+  // 1. Manifest Contract & Corruption Rejection
+  {
+    ExecutableManifest manifest;
+    std::string err;
+    SPIEL_CHECK_TRUE(manifest.Validate(&err));
 
-  // Deliberate corruption checks:
-  // Corrupt SHA256 must be detected
-  std::string bad_sha = "0000000000000000000000000000000000000000000000000000000000000000";
-  SPIEL_CHECK_NE(bad_sha, manifest.actor_model_sha256);
+    std::string json_str = manifest.ToJsonString();
+    auto parsed = json::FromString(json_str);
+    SPIEL_CHECK_TRUE(parsed.has_value());
 
-  // Corrupt seed must be detected
-  uint64_t wrong_seed = 20;
-  SPIEL_CHECK_NE(wrong_seed, manifest.critic_init_seed);
+    auto reloaded = ExecutableManifest::FromJson(parsed.value().GetObject());
+    SPIEL_CHECK_TRUE(reloaded.Validate(&err));
+    SPIEL_CHECK_EQ(reloaded.actor_input_dim, 5580);
+    SPIEL_CHECK_EQ(reloaded.critic_expected_input_dim, 9647);
+    SPIEL_CHECK_EQ(reloaded.roots_train, 2048);
+    SPIEL_CHECK_EQ(reloaded.roots_dev, 256);
+    SPIEL_CHECK_EQ(reloaded.roots_test, 512);
+    SPIEL_CHECK_EQ(reloaded.critic_init_seed, 19u);
+    SPIEL_CHECK_EQ(reloaded.deadline_seconds, 28800);
 
-  std::cout << "  Passed TestManifestContractAndCorruptionRejection.\n";
+    // Test rejection of corrupted manifest fields:
+    ExecutableManifest bad_m1 = manifest;
+    bad_m1.roots_train = 2047;
+    SPIEL_CHECK_FALSE(bad_m1.Validate(&err));
+
+    ExecutableManifest bad_m2 = manifest;
+    bad_m2.actor_model_sha256 = "corrupted_sha";
+    SPIEL_CHECK_FALSE(bad_m2.Validate(&err));
+
+    ExecutableManifest bad_m3 = manifest;
+    bad_m3.critic_expected_input_dim = 9012;
+    SPIEL_CHECK_FALSE(bad_m3.Validate(&err));
+
+    ExecutableManifest bad_m4 = manifest;
+    bad_m4.critic_init_seed = 20;
+    SPIEL_CHECK_FALSE(bad_m4.Validate(&err));
+
+    ExecutableManifest bad_m5 = manifest;
+    bad_m5.target_s_replicate_index = 1;
+    SPIEL_CHECK_FALSE(bad_m5.Validate(&err));
+  }
+
+  // 2. Real Root Record Validation & Corruption Rejection
+  RootRecord good_root;
+  {
+    // Generate a natural state at round 2
+    auto state = game->NewInitialState();
+    std::mt19937_64 rng(42);
+    while (!state->IsTerminal()) {
+      if (state->IsChanceNode()) {
+        auto outcomes = state->ChanceOutcomes();
+        state->ApplyAction(SampleAction(outcomes, rng).first);
+        continue;
+      }
+      if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+        std::vector<Action> joint;
+        for (int p = 0; p < state->NumPlayers(); ++p) {
+          auto acts = state->LegalActions(p);
+          std::uniform_int_distribution<size_t> d(0, acts.size() - 1);
+          joint.push_back(acts[d(rng)]);
+        }
+        state->ApplyActions(joint);
+        continue;
+      }
+
+      Player p = state->CurrentPlayer();
+      auto legal = state->LegalActions();
+      DuneDecisionRole role = ClassifyDuneDecisionRole(*state, p, false);
+      const auto* ds = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      int cur_round = ds ? ds->GetCurrentRound() : 1;
+
+      if (role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 && cur_round >= 2) {
+        good_root.partition = Partition::kTrain;
+        good_root.source_episode_id = 0;
+        good_root.acting_player = p;
+        good_root.round = cur_round;
+        good_root.stratum = "agent_primary";
+        good_root.role = role;
+        good_root.history = state->History();
+        good_root.legal_actions = legal;
+        good_root.root_id = pwo2::HistoryHash(good_root.history).substr(0, 16);
+        std::vector<float> dummy_logits(kActionDim, 0.0f);
+        good_root.candidate_actions = SelectCandidateActions(
+            legal, dummy_logits, Partition::kTrain, good_root.root_id, &good_root.candidate_actor_probs);
+        good_root.reference_action = good_root.candidate_actions[0];
+        good_root.critic_input_9647 = ExtractCriticInput(*state, p);
+        break;
+      }
+
+      std::uniform_int_distribution<size_t> d(0, legal.size() - 1);
+      state->ApplyAction(legal[d(rng)]);
+    }
+
+    std::string val_err;
+    SPIEL_CHECK_TRUE(ValidateRootRecord(good_root, game, &val_err));
+
+    // Deliberate corruption checks on root:
+    RootRecord bad_r1 = good_root;
+    bad_r1.root_id = "0123456789abcdef"; // Mismatched hash
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r1, game, &val_err));
+
+    RootRecord bad_r2 = good_root;
+    bad_r2.round = 1; // Round out of [2, 10]
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r2, game, &val_err));
+
+    RootRecord bad_r3 = good_root;
+    bad_r3.acting_player = 4; // Out of range
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r3, game, &val_err));
+
+    RootRecord bad_r4 = good_root;
+    bad_r4.candidate_actions = {good_root.candidate_actions[0]}; // Only 1 candidate action
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r4, game, &val_err));
+
+    RootRecord bad_r5 = good_root;
+    bad_r5.critic_input_9647[0] += 5.0f; // Tampered critic input doesn't match state
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r5, game, &val_err));
+
+    RootRecord bad_r6 = good_root;
+    bad_r6.legal_actions = {9999}; // Tampered legal actions don't match reconstructed state
+    SPIEL_CHECK_FALSE(ValidateRootRecord(bad_r6, game, &val_err));
+  }
+
+  // 3. Real Continuation Record Validation & Corruption Rejection
+  ContinuationRecord good_cr;
+  {
+    good_cr.root_id = good_root.root_id;
+    good_cr.partition = Partition::kTrain;
+    good_cr.action = good_root.candidate_actions[0];
+    good_cr.replicate = 0;
+    good_cr.chance_seed = DeriveContinuationChanceSeed(Partition::kTrain, good_root.root_id, 0);
+    good_cr.policy_seed = DeriveContinuationPolicySeed(Partition::kTrain, good_root.root_id, 0);
+    good_cr.absolute_returns = {1.0, -0.33, -0.33, -0.34};
+    auto rel = ConvertAbsoluteReturnsToActorRelative(good_root.acting_player, good_cr.absolute_returns);
+    for (int s = 0; s < 4; ++s) {
+      good_cr.actor_relative_scaled_returns[s] = rel[s] / kUtilityDivisor;
+    }
+
+    std::string val_err;
+    SPIEL_CHECK_TRUE(ValidateContinuationRecord(good_cr, good_root, 16, &val_err));
+
+    // Deliberate corruption checks on continuation:
+    ContinuationRecord bad_cr1 = good_cr;
+    bad_cr1.root_id = "wrong_root_id___";
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr1, good_root, 16, &val_err));
+
+    ContinuationRecord bad_cr2 = good_cr;
+    bad_cr2.replicate = 16; // Out of range [0, 16)
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr2, good_root, 16, &val_err));
+
+    ContinuationRecord bad_cr3 = good_cr;
+    bad_cr3.chance_seed = 12345; // Wrong chance seed
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr3, good_root, 16, &val_err));
+
+    ContinuationRecord bad_cr4 = good_cr;
+    bad_cr4.policy_seed = 54321; // Wrong policy seed
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr4, good_root, 16, &val_err));
+
+    ContinuationRecord bad_cr5 = good_cr;
+    bad_cr5.actor_relative_scaled_returns[0] += 0.1; // Inconsistent return scaling
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr5, good_root, 16, &val_err));
+
+    ContinuationRecord bad_cr6 = good_cr;
+    bad_cr6.absolute_returns[0] = std::numeric_limits<double>::infinity(); // Non-finite return
+    SPIEL_CHECK_FALSE(ValidateContinuationRecord(bad_cr6, good_root, 16, &val_err));
+  }
+
+  // 4. Real Continuations Map Rejection: Duplicate Replicate replacing missing one
+  {
+    std::map<std::pair<std::string, Action>, std::vector<ContinuationRecord>> cont_map;
+    std::vector<RootRecord> root_vec = {good_root};
+
+    // Construct valid set with replicates 0 and 1
+    for (Action a : good_root.candidate_actions) {
+      for (int k = 0; k < 2; ++k) {
+        ContinuationRecord cr = good_cr;
+        cr.action = a;
+        cr.replicate = k;
+        cr.chance_seed = DeriveContinuationChanceSeed(Partition::kTrain, good_root.root_id, k);
+        cr.policy_seed = DeriveContinuationPolicySeed(Partition::kTrain, good_root.root_id, k);
+        cont_map[{good_root.root_id, a}].push_back(cr);
+      }
+    }
+
+    std::string val_err;
+    SPIEL_CHECK_TRUE(ValidateContinuations(root_vec, cont_map, Partition::kTrain, 2, &val_err));
+
+    // Corrupt by duplicating replicate 0 into replicate 1 (count is still 2, but replicate 1 is missing!)
+    auto corrupted_map = cont_map;
+    corrupted_map[{good_root.root_id, good_root.candidate_actions[0]}][1].replicate = 0;
+    corrupted_map[{good_root.root_id, good_root.candidate_actions[0]}][1].chance_seed =
+        DeriveContinuationChanceSeed(Partition::kTrain, good_root.root_id, 0);
+    corrupted_map[{good_root.root_id, good_root.candidate_actions[0]}][1].policy_seed =
+        DeriveContinuationPolicySeed(Partition::kTrain, good_root.root_id, 0);
+
+    // Validator MUST reject this duplicate replicate!
+    SPIEL_CHECK_FALSE(ValidateContinuations(root_vec, corrupted_map, Partition::kTrain, 2, &val_err));
+
+    // Corrupt by missing an action entirely
+    auto missing_act_map = cont_map;
+    missing_act_map.erase({good_root.root_id, good_root.candidate_actions.back()});
+    SPIEL_CHECK_FALSE(ValidateContinuations(root_vec, missing_act_map, Partition::kTrain, 2, &val_err));
+  }
+
+  // 5. Real Selected Checkpoints Validation & Corruption Rejection
+  {
+    std::string temp_sel = "/tmp/test_selected_checkpoints.json";
+    std::string temp_ckpt_s = "/tmp/test_critic_s.pt";
+    std::string temp_ckpt_m = "/tmp/test_critic_m.pt";
+
+    // Write dummy checkpoint files
+    {
+      std::ofstream f(temp_ckpt_s);
+      f << "dummy critic s weights";
+    }
+    {
+      std::ofstream f(temp_ckpt_m);
+      f << "dummy critic m weights";
+    }
+
+    std::string sha_s = ComputeFileSHA256(temp_ckpt_s);
+    std::string sha_m = ComputeFileSHA256(temp_ckpt_m);
+
+    json::Object sel_obj;
+    json::Object s_obj;
+    s_obj["path"] = temp_ckpt_s;
+    s_obj["sha256"] = sha_s;
+    sel_obj["critic_s"] = s_obj;
+
+    json::Object m_obj;
+    m_obj["path"] = temp_ckpt_m;
+    m_obj["sha256"] = sha_m;
+    sel_obj["critic_m"] = m_obj;
+
+    {
+      std::ofstream f(temp_sel);
+      f << json::ToString(sel_obj);
+    }
+
+    std::string val_err;
+    SPIEL_CHECK_TRUE(ValidateSelectedCheckpoints(temp_sel, &val_err));
+
+    // Tamper with file on disk so hash differs from recorded SHA-256
+    {
+      std::ofstream f(temp_ckpt_s, std::ios::app);
+      f << "TAMPERED";
+    }
+    SPIEL_CHECK_FALSE(ValidateSelectedCheckpoints(temp_sel, &val_err));
+
+    // Clean up
+    std::filesystem::remove(temp_sel);
+    std::filesystem::remove(temp_ckpt_s);
+    std::filesystem::remove(temp_ckpt_m);
+  }
+
+  // 6. Real Actor Immutability Validation & Corruption Rejection
+  {
+    auto test_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kActorInputDim, kActorHiddenDim, kActionDim, kActorNumBlocks, false);
+    for (auto& p : test_actor->parameters()) {
+      p.requires_grad_(false);
+    }
+    std::string val_err;
+    // With matching path, passes
+    SPIEL_CHECK_TRUE(ValidateActorImmutability(test_actor, kActorModelPathDefault, &val_err));
+
+    // If any parameter has requires_grad == true, must reject!
+    for (auto& p : test_actor->parameters()) {
+      p.requires_grad_(true);
+      break;
+    }
+    SPIEL_CHECK_FALSE(ValidateActorImmutability(test_actor, kActorModelPathDefault, &val_err));
+
+    // If disk hash differs, must reject!
+    for (auto& p : test_actor->parameters()) {
+      p.requires_grad_(false);
+    }
+    SPIEL_CHECK_FALSE(ValidateActorImmutability(test_actor, "/dev/null", &val_err));
+  }
+
+  std::cout << "  Passed TestManifestContractAndCorruptionRejection (all 6 validators demonstrated genuine rejection).\n";
 }
 
 }  // namespace action_value_study

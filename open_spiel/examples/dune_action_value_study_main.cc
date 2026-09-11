@@ -52,6 +52,13 @@ void InitializeActor(const std::string& path, const torch::Device& device, int b
   g_actor_model->to(device);
   g_actor_model->eval();
 
+  // Explicitly disable gradients for actor immutability
+  for (auto& p : g_actor_model->parameters()) {
+    p.requires_grad_(false);
+  }
+  std::string immut_err;
+  SPIEL_CHECK_TRUE(ValidateActorImmutability(g_actor_model, path, &immut_err));
+
   // Pure FP32, TF32 disabled
   at::globalContext().setAllowTF32CuBLAS(false);
   at::globalContext().setAllowTF32CuDNN(false);
@@ -139,207 +146,32 @@ void RunVerify() {
 // Phase: pilot
 void RunPilot(const std::shared_ptr<const Game>& game, const std::filesystem::path& out_dir, int num_threads) {
   std::cout << "\n=======================================================\n";
-  std::cout << "PHASE: Disposable 4-Root, 8-Continuation Pilot\n";
+  std::cout << "PHASE: Disposable 4-Root Pilot & Multi-Component Timing Benchmark\n";
   std::cout << "=======================================================\n";
 
-  auto start_time = std::chrono::steady_clock::now();
-  std::vector<RootRecord> pilot_roots;
-
-  // Generate 4 natural source games with u15828 to find 4 distinct roots
+  // 1. Benchmark source game generation (4 games across 4 threads with reservoir sampling)
+  std::cout << "Benchmarking parallel source game generation (4 pilot games)...\n";
+  auto source_bench_start = std::chrono::steady_clock::now();
+  std::vector<RootRecord> pilot_roots(4);
+  std::vector<std::thread> source_workers;
   for (int ep = 0; ep < 4; ++ep) {
-    uint64_t game_seed = DeriveSourceGameSeed(Partition::kPilot, ep);
-    std::mt19937_64 chance_rng(game_seed);
-    std::mt19937_64 policy_rng(dune_seed::DeriveSeed(kDomainPilot, kStreamContinuationPolicy, game_seed));
-
-    auto state = game->NewInitialState();
-    bool selected = false;
-    RootRecord rec;
-
-    while (!state->IsTerminal()) {
-      if (state->IsChanceNode()) {
-        auto outcomes = state->ChanceOutcomes();
-        state->ApplyAction(SampleAction(outcomes, chance_rng).first);
-        continue;
-      }
-      if (state->CurrentPlayer() == kSimultaneousPlayerId) {
-        std::vector<Action> joint;
-        for (int p = 0; p < state->NumPlayers(); ++p) {
-          auto acts = state->LegalActions(p);
-          std::uniform_int_distribution<size_t> d(0, acts.size() - 1);
-          joint.push_back(acts[d(chance_rng)]);
-        }
-        state->ApplyActions(joint);
-        continue;
-      }
-
-      Player player = state->CurrentPlayer();
-      auto legal = state->LegalActions();
-      DuneDecisionRole role = ClassifyDuneDecisionRole(*state, player, false);
-      const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
-      int current_round = dune_state ? dune_state->GetCurrentRound() : 1;
-
-      std::vector<float> obs(kActorInputDim, 0.0f);
-      state->InformationStateTensor(player, absl::MakeSpan(obs));
-      EvalResult eval_res = g_actor_evaluator->Evaluate(obs);
-      std::vector<float> logits = std::move(eval_res.logits);
-
-      if (!selected && role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 && current_round >= 2) {
-        rec.partition = Partition::kPilot;
-        rec.source_episode_id = ep;
-        rec.acting_player = player;
-        rec.round = current_round;
-        rec.stratum = "agent_primary";
-        rec.role = role;
-        rec.history = state->History();
-        rec.legal_actions = legal;
-        rec.root_id = pwo2::HistoryHash(rec.history).substr(0, 16);
-        rec.candidate_actions = SelectCandidateActions(legal, logits, Partition::kPilot, rec.root_id, &rec.candidate_actor_probs);
-        rec.reference_action = rec.candidate_actions[0];
-        rec.critic_input_9647 = ExtractCriticInput(*state, player);
-        selected = true;
-      }
-
-      CenterAndCapLegalLogits(logits, legal, 10.0f);
-      auto sampled = SamplePolicyDistribution(&policy_rng, logits, legal, nullptr);
-      state->ApplyAction(sampled.action);
-    }
-    SPIEL_CHECK_TRUE(selected);
-    pilot_roots.push_back(std::move(rec));
-  }
-
-  std::cout << "Selected 4 pilot roots. Running 8 continuations per candidate action...\n";
-  std::atomic<int> completed_continuations{0};
-  int total_pilot_continuations = 0;
-  for (const auto& r : pilot_roots) {
-    total_pilot_continuations += r.candidate_actions.size() * 8;
-  }
-
-  struct PilotTask {
-    const RootRecord* root;
-    Action action;
-    int replicate;
-  };
-  std::vector<PilotTask> tasks;
-  for (const auto& r : pilot_roots) {
-    for (Action a : r.candidate_actions) {
-      for (int k = 0; k < 8; ++k) {
-        tasks.push_back({&r, a, k});
-      }
-    }
-  }
-
-  auto rollout_start = std::chrono::steady_clock::now();
-  std::atomic<size_t> next_task{0};
-  std::vector<std::thread> workers;
-  for (int tid = 0; tid < num_threads; ++tid) {
-    workers.emplace_back([&]() {
-      while (true) {
-        size_t idx = next_task.fetch_add(1);
-        if (idx >= tasks.size()) break;
-        const auto& t = tasks[idx];
-        auto state = ReconstructState(game, t.root->history);
-        state->ApplyAction(t.action);
-        uint64_t c_seed = DeriveContinuationChanceSeed(Partition::kPilot, t.root->root_id, t.replicate);
-        uint64_t p_seed = DeriveContinuationPolicySeed(Partition::kPilot, t.root->root_id, t.replicate);
-        auto returns = RunRollout(game, std::move(state), c_seed, p_seed);
-        completed_continuations.fetch_add(1);
-      }
-    });
-  }
-  for (auto& w : workers) {
-    w.join();
-  }
-  auto rollout_end = std::chrono::steady_clock::now();
-  double rollout_sec = std::chrono::duration<double>(rollout_end - rollout_start).count();
-  double throughput = completed_continuations.load() / rollout_sec;
-
-  // Total continuations for main corpus:
-  // Train: 2048 * ~2.9 actions * 16 ~ 95,000
-  // Dev: 256 * ~2.9 actions * 32 ~ 23,700
-  // Test: 512 * ~2.9 actions * 64 ~ 95,000
-  // Total ~ 214,000
-  double estimated_total_conts = 214000.0;
-  double estimated_total_sec = estimated_total_conts / throughput;
-  double deadline_margin_sec = kTotalDeadlineSeconds * 0.85; // 15% margin = 24480s (6.8 hours)
-
-  std::cout << absl::StrFormat("Pilot completed: %d continuations in %.2f s (%.1f conts/sec)\n",
-                               completed_continuations.load(), rollout_sec, throughput);
-  std::cout << absl::StrFormat("Estimated full corpus rollout time: %.1f s (%.2f hours)\n",
-                               estimated_total_sec, estimated_total_sec / 3600.0);
-  std::cout << absl::StrFormat("Deadline with 15%% margin: %.1f s (6.8 hours)\n", deadline_margin_sec);
-
-  json::Object report;
-  report["pilot_roots"] = static_cast<int64_t>(pilot_roots.size());
-  report["pilot_continuations"] = static_cast<int64_t>(completed_continuations.load());
-  report["elapsed_sec"] = rollout_sec;
-  report["throughput_conts_per_sec"] = throughput;
-  report["estimated_total_conts"] = estimated_total_conts;
-  report["estimated_total_sec"] = estimated_total_sec;
-  report["fits_deadline_margin"] = (estimated_total_sec <= deadline_margin_sec);
-
-  std::ofstream out_f(out_dir / "pilot_throughput_report.json");
-  out_f << json::ToString(report) << "\n";
-  out_f.close();
-
-  if (estimated_total_sec > deadline_margin_sec) {
-    SpielFatalError(absl::StrFormat("Cannot fit 8-hour deadline with 15%% margin (estimated %.1f h > 6.8 h)",
-                                    estimated_total_sec / 3600.0));
-  }
-  std::cout << "PILOT PASSED! Timing margin verified.\n";
-}
-
-// Phase: generate_corpus
-void RunGenerateCorpus(const std::shared_ptr<const Game>& game, const std::filesystem::path& out_dir, int num_threads) {
-  std::cout << "\n=======================================================\n";
-  std::cout << "PHASE: Generate Corpus (2,816 Roots)\n";
-  std::cout << "=======================================================\n";
-
-  std::vector<RootRecord> all_roots;
-  all_roots.reserve(kRootsTotal);
-
-  // Targets per partition and seat
-  struct PartitionPlan {
-    Partition partition;
-    int target_total;
-    int target_per_seat;
-  };
-  std::vector<PartitionPlan> plans = {
-      {Partition::kTrain, kRootsTrain, kRootsTrain / 4}, // 2048, 512/seat
-      {Partition::kDev,   kRootsDev,   kRootsDev / 4},   // 256, 64/seat
-      {Partition::kTest,  kRootsTest,  kRootsTest / 4},  // 512, 128/seat
-  };
-
-  int global_episode_counter = 0;
-  std::map<int, int> round_distribution;
-  std::map<int, int> seat_distribution;
-
-  for (const auto& plan : plans) {
-    std::cout << "Generating partition: " << PartitionToString(plan.partition)
-              << " (target: " << plan.target_total << " roots, " << plan.target_per_seat << " per seat)...\n";
-
-    std::array<int, 4> seat_counts = {0, 0, 0, 0};
-    int partition_collected = 0;
-
-    while (partition_collected < plan.target_total) {
-      int ep = global_episode_counter++;
-      uint64_t game_seed = DeriveSourceGameSeed(plan.partition, ep);
+    source_workers.emplace_back([&, ep]() {
+      uint64_t game_seed = DeriveSourceGameSeed(Partition::kPilot, ep);
       std::mt19937_64 chance_rng(game_seed);
-      std::mt19937_64 policy_rng(dune_seed::DeriveSeed(PartitionDomain(plan.partition), kStreamContinuationPolicy, game_seed));
+      std::mt19937_64 policy_rng(dune_seed::DeriveSeed(kDomainPilot, kStreamContinuationPolicy, game_seed));
 
       auto state = game->NewInitialState();
-      bool found_root = false;
-      RootRecord candidate_record;
 
-      // Desired target seat for this game (round-robin among needed seats)
-      Player target_seat = -1;
-      int min_count = 1e9;
-      for (int s = 0; s < 4; ++s) {
-        if (seat_counts[s] < plan.target_per_seat && seat_counts[s] < min_count) {
-          min_count = seat_counts[s];
-          target_seat = s;
-        }
-      }
-      if (target_seat == -1) break;
+      struct EligibleCandidate {
+        int round;
+        std::vector<Action> history;
+        std::vector<Action> legal_actions;
+        std::vector<float> logits;
+        std::vector<float> critic_input;
+        DuneDecisionRole role;
+      };
+      std::vector<EligibleCandidate> eligible;
+      Player target_seat = ep % 4;
 
       while (!state->IsTerminal()) {
         if (state->IsChanceNode()) {
@@ -369,24 +201,16 @@ void RunGenerateCorpus(const std::shared_ptr<const Game>& game, const std::files
         EvalResult eval_res = g_actor_evaluator->Evaluate(obs);
         std::vector<float> logits = std::move(eval_res.logits);
 
-        // Deterministic eligibility check:
-        // agent-primary placement, legal >= 2, rounds 2..10, matching target seat
-        if (!found_root && role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 &&
+        if (role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 &&
             current_round >= 2 && current_round <= 10 && player == target_seat) {
-          candidate_record.partition = plan.partition;
-          candidate_record.source_episode_id = ep;
-          candidate_record.acting_player = player;
-          candidate_record.round = current_round;
-          candidate_record.stratum = "agent_primary";
-          candidate_record.role = role;
-          candidate_record.history = state->History();
-          candidate_record.legal_actions = legal;
-          candidate_record.root_id = pwo2::HistoryHash(candidate_record.history).substr(0, 16);
-          candidate_record.candidate_actions = SelectCandidateActions(
-              legal, logits, plan.partition, candidate_record.root_id, &candidate_record.candidate_actor_probs);
-          candidate_record.reference_action = candidate_record.candidate_actions[0];
-          candidate_record.critic_input_9647 = ExtractCriticInput(*state, player);
-          found_root = true;
+          EligibleCandidate ec;
+          ec.round = current_round;
+          ec.history = state->History();
+          ec.legal_actions = legal;
+          ec.logits = logits;
+          ec.critic_input = ExtractCriticInput(*state, player);
+          ec.role = role;
+          eligible.push_back(std::move(ec));
         }
 
         CenterAndCapLegalLogits(logits, legal, 10.0f);
@@ -394,76 +218,406 @@ void RunGenerateCorpus(const std::shared_ptr<const Game>& game, const std::files
         state->ApplyAction(sampled.action);
       }
 
-      if (found_root) {
-        seat_counts[target_seat]++;
-        partition_collected++;
-        round_distribution[candidate_record.round]++;
-        seat_distribution[candidate_record.acting_player]++;
-        all_roots.push_back(std::move(candidate_record));
-        if (partition_collected % 256 == 0 || partition_collected == plan.target_total) {
-          std::cout << absl::StrFormat("  [%s] Collected %d / %d roots (seats: %d, %d, %d, %d)\n",
-                                       PartitionToString(plan.partition), partition_collected,
-                                       plan.target_total, seat_counts[0], seat_counts[1],
-                                       seat_counts[2], seat_counts[3]);
-        }
+      SPIEL_CHECK_FALSE(eligible.empty());
+      uint64_t sel_seed = DeriveRootSelectionSeed(Partition::kPilot, ep);
+      std::mt19937_64 sel_rng(sel_seed);
+      std::uniform_int_distribution<size_t> sel_dist(0, eligible.size() - 1);
+      const auto& chosen = eligible[sel_dist(sel_rng)];
+
+      RootRecord rec;
+      rec.partition = Partition::kPilot;
+      rec.source_episode_id = ep;
+      rec.acting_player = target_seat;
+      rec.round = chosen.round;
+      rec.stratum = "agent_primary";
+      rec.role = chosen.role;
+      rec.history = chosen.history;
+      rec.legal_actions = chosen.legal_actions;
+      rec.root_id = pwo2::HistoryHash(rec.history).substr(0, 16);
+      rec.candidate_actions = SelectCandidateActions(
+          chosen.legal_actions, chosen.logits, Partition::kPilot, rec.root_id, &rec.candidate_actor_probs);
+      rec.reference_action = rec.candidate_actions[0];
+      rec.critic_input_9647 = chosen.critic_input;
+
+      std::string val_err;
+      SPIEL_CHECK_TRUE(ValidateRootRecord(rec, game, &val_err));
+      pilot_roots[ep] = std::move(rec);
+    });
+  }
+  for (auto& w : source_workers) w.join();
+  auto source_bench_end = std::chrono::steady_clock::now();
+  double source_bench_sec = std::chrono::duration<double>(source_bench_end - source_bench_start).count();
+  // With 64 worker threads, 2816 source games run in 2816/64 = 44 parallel batches.
+  // 4 games in 4 threads took source_bench_sec; 64 games in 64 threads takes approximately the same time.
+  double estimated_source_sec = 44.0 * source_bench_sec;
+  std::cout << absl::StrFormat("  Source game bench: 4 games in %.2f s -> Projected 2,816 games: %.1f s (%.2f hours)\n",
+                               source_bench_sec, estimated_source_sec, estimated_source_sec / 3600.0);
+
+  // 2. Benchmark branch rollouts (8 continuations per candidate action across num_threads)
+  std::cout << "Benchmarking branch rollouts on 4 pilot roots (8 continuations per candidate action)...\n";
+  struct PilotTask {
+    const RootRecord* root;
+    Action action;
+    int replicate;
+  };
+  std::vector<PilotTask> tasks;
+  for (const auto& r : pilot_roots) {
+    for (Action a : r.candidate_actions) {
+      for (int k = 0; k < 8; ++k) {
+        tasks.push_back({&r, a, k});
       }
     }
   }
 
-  SPIEL_CHECK_EQ(all_roots.size(), kRootsTotal);
+  std::atomic<int> completed_continuations{0};
+  auto rollout_start = std::chrono::steady_clock::now();
+  std::atomic<size_t> next_task{0};
+  std::vector<std::thread> rollout_workers;
+  for (int tid = 0; tid < num_threads; ++tid) {
+    rollout_workers.emplace_back([&]() {
+      while (true) {
+        size_t idx = next_task.fetch_add(1);
+        if (idx >= tasks.size()) break;
+        const auto& t = tasks[idx];
+        auto state = ReconstructState(game, t.root->history);
+        state->ApplyAction(t.action);
+        uint64_t c_seed = DeriveContinuationChanceSeed(Partition::kPilot, t.root->root_id, t.replicate);
+        uint64_t p_seed = DeriveContinuationPolicySeed(Partition::kPilot, t.root->root_id, t.replicate);
+        auto returns = RunRollout(game, std::move(state), c_seed, p_seed);
+        completed_continuations.fetch_add(1);
+      }
+    });
+  }
+  for (auto& w : rollout_workers) w.join();
+  auto rollout_end = std::chrono::steady_clock::now();
+  double rollout_sec = std::chrono::duration<double>(rollout_end - rollout_start).count();
+  double rollout_throughput = completed_continuations.load() / rollout_sec;
 
-  // Write corpus manifest and records
+  // Maximum possible continuations across entire corpus:
+  // Train: 2,048 roots * 3 actions * 16 reps = 98,304
+  // Dev: 256 roots * 3 actions * 32 reps = 24,576
+  // Test: 512 roots * 3 actions * 64 reps = 98,304
+  // Max total = 221,184
+  const double max_conts = 221184.0;
+  double estimated_rollout_sec = max_conts / rollout_throughput;
+  std::cout << absl::StrFormat("  Branch rollout bench: %d continuations in %.2f s (%.1f conts/sec)\n"
+                               "  Projected max %d continuations: %.1f s (%.2f hours)\n",
+                               completed_continuations.load(), rollout_sec, rollout_throughput,
+                               static_cast<int>(max_conts), estimated_rollout_sec, estimated_rollout_sec / 3600.0);
+
+  // 3. Benchmark critic training (10 steps with batch size 128)
+  std::cout << "Benchmarking critic training (10 AdamW optimizer steps)...\n";
+  auto train_bench_start = std::chrono::steady_clock::now();
+  torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
+  auto bench_critic = std::make_shared<DuneVrpoQNetImpl>(kRegisteredCriticInitSeed, kCriticInputDim);
+  bench_critic->to(device);
+  bench_critic->train();
+  torch::optim::AdamW bench_opt(
+      bench_critic->parameters(),
+      torch::optim::AdamWOptions(kCriticLearningRate).eps(kCriticAdamWEpsilon).weight_decay(kCriticWeightDecay));
+
+  torch::Tensor dummy_input = torch::randn({kCriticMinibatchSizeRoots, kCriticInputDim}, torch::kFloat32).to(device);
+  torch::Tensor dummy_target = torch::zeros({kCriticMinibatchSizeRoots, 4}, torch::kFloat32).to(device);
+  for (int step = 0; step < 10; ++step) {
+    torch::Tensor q_out;
+    std::string err;
+    SPIEL_CHECK_TRUE(bench_critic->ForwardChecked(dummy_input, &q_out, &err));
+    torch::Tensor loss = torch::mse_loss(q_out.index({torch::indexing::Slice(), 0, torch::indexing::Slice()}), dummy_target);
+    bench_opt.zero_grad();
+    loss.backward();
+    bench_opt.step();
+  }
+  auto train_bench_end = std::chrono::steady_clock::now();
+  double train_bench_sec = std::chrono::duration<double>(train_bench_end - train_bench_start).count();
+  // 100 epochs * 16 batches = 1600 steps for each critic (x2 = 3200 steps total)
+  double estimated_train_sec = (train_bench_sec / 10.0) * 3200.0;
+  std::cout << absl::StrFormat("  Critic train bench: 10 steps in %.2f s -> Projected 100 epochs (both critics): %.1f s (%.2f hours)\n",
+                               train_bench_sec, estimated_train_sec, estimated_train_sec / 3600.0);
+
+  // 4. Benchmark dev scoring
+  std::cout << "Benchmarking dev scoring (forward pass on 256 items)...\n";
+  auto eval_bench_start = std::chrono::steady_clock::now();
+  bench_critic->eval();
+  {
+    torch::NoGradGuard no_grad;
+    torch::Tensor dev_inp = torch::randn({256, kCriticInputDim}, torch::kFloat32).to(device);
+    torch::Tensor q_eval;
+    std::string err;
+    SPIEL_CHECK_TRUE(bench_critic->ForwardChecked(dev_inp, &q_eval, &err));
+  }
+  auto eval_bench_end = std::chrono::steady_clock::now();
+  double eval_bench_sec = std::chrono::duration<double>(eval_bench_end - eval_bench_start).count();
+  double estimated_eval_sec = eval_bench_sec * 20.0; // 10 checkpoint evaluations for 2 critics
+  std::cout << absl::StrFormat("  Dev eval bench: 256 items in %.4f s -> Projected checkpoint evaluations: %.1f s\n",
+                               eval_bench_sec, estimated_eval_sec);
+
+  // Total projected study time
+  double estimated_total_sec = estimated_source_sec + estimated_rollout_sec + estimated_train_sec + estimated_eval_sec;
+  double deadline_margin_sec = kTotalDeadlineSeconds * 0.85; // 15% margin = 24480s (6.8 hours)
+
+  std::cout << "\n=======================================================\n";
+  std::cout << "PILOT COMPREHENSIVE PROJECTION SUMMARY:\n";
+  std::cout << absl::StrFormat("  1. Source Generation : %7.1f s (%5.2f hours)\n", estimated_source_sec, estimated_source_sec / 3600.0);
+  std::cout << absl::StrFormat("  2. Branch Rollouts   : %7.1f s (%5.2f hours)\n", estimated_rollout_sec, estimated_rollout_sec / 3600.0);
+  std::cout << absl::StrFormat("  3. Critic Training   : %7.1f s (%5.2f hours)\n", estimated_train_sec, estimated_train_sec / 3600.0);
+  std::cout << absl::StrFormat("  4. Scoring & Eval    : %7.1f s (%5.2f hours)\n", estimated_eval_sec, estimated_eval_sec / 3600.0);
+  std::cout << absl::StrFormat("  TOTAL PROJECTED TIME : %7.1f s (%5.2f hours)\n", estimated_total_sec, estimated_total_sec / 3600.0);
+  std::cout << absl::StrFormat("  8h DEADLINE WITH 15%% MARGIN: %.1f s (6.80 hours)\n", deadline_margin_sec);
+  std::cout << "=======================================================\n";
+
+  json::Object report;
+  report["pilot_roots"] = static_cast<int64_t>(pilot_roots.size());
+  report["pilot_continuations"] = static_cast<int64_t>(completed_continuations.load());
+  report["throughput_conts_per_sec"] = rollout_throughput;
+  report["max_total_continuations"] = max_conts;
+  report["estimated_source_sec"] = estimated_source_sec;
+  report["estimated_rollout_sec"] = estimated_rollout_sec;
+  report["estimated_train_sec"] = estimated_train_sec;
+  report["estimated_eval_sec"] = estimated_eval_sec;
+  report["estimated_total_sec"] = estimated_total_sec;
+  report["deadline_margin_sec"] = deadline_margin_sec;
+  report["fits_deadline_margin"] = (estimated_total_sec <= deadline_margin_sec);
+
+  std::ofstream out_f(out_dir / "pilot_throughput_report.json");
+  out_f << json::ToString(report) << "\n";
+  out_f.close();
+
+  if (estimated_total_sec > deadline_margin_sec) {
+    SpielFatalError(absl::StrFormat("Cannot fit 8-hour deadline with 15%% margin (projected %.2f h > 6.80 h)",
+                                    estimated_total_sec / 3600.0));
+  }
+  std::cout << "PILOT PASSED! Timing margin verified across all study components.\n";
+}
+
+// Phase: generate_corpus
+void RunGenerateCorpus(const std::shared_ptr<const Game>& game, const std::filesystem::path& out_dir, int num_threads) {
+  std::cout << "\n=======================================================\n";
+  std::cout << "PHASE: Generate Corpus (2,816 Roots with Reservoir Sampling)\n";
+  std::cout << "=======================================================\n";
+
+  // Freeze and validate manifest first before collection!
+  std::filesystem::path manifest_path = out_dir / "corpus_manifest.json";
   ExecutableManifest manifest;
-  std::ofstream manifest_f(out_dir / "corpus_manifest.json");
+  std::ofstream manifest_f(manifest_path);
   manifest_f << manifest.ToJsonString() << "\n";
   manifest_f.close();
 
-  std::ofstream roots_f(out_dir / "corpus_roots.jsonl");
-  for (const auto& r : all_roots) {
-    json::Object obj;
-    obj["root_id"] = r.root_id;
-    obj["partition"] = PartitionToString(r.partition);
-    obj["source_episode_id"] = static_cast<int64_t>(r.source_episode_id);
-    obj["acting_player"] = static_cast<int64_t>(r.acting_player);
-    obj["round"] = static_cast<int64_t>(r.round);
-    obj["stratum"] = r.stratum;
-
-    json::Array hist;
-    for (Action a : r.history) hist.push_back(static_cast<int64_t>(a));
-    obj["history"] = hist;
-
-    json::Array leg;
-    for (Action a : r.legal_actions) leg.push_back(static_cast<int64_t>(a));
-    obj["legal_actions"] = leg;
-
-    json::Array cands;
-    for (Action a : r.candidate_actions) cands.push_back(static_cast<int64_t>(a));
-    obj["candidate_actions"] = cands;
-
-    obj["reference_action"] = static_cast<int64_t>(r.reference_action);
-
-    json::Array probs;
-    for (double p : r.candidate_actor_probs) probs.push_back(p);
-    obj["candidate_actor_probs"] = probs;
-
-    json::Array cinp;
-    for (float v : r.critic_input_9647) cinp.push_back(static_cast<double>(v));
-    obj["critic_input_9647"] = cinp;
-
-    roots_f << json::ToString(obj) << "\n";
+  std::string manifest_err;
+  ExecutableManifest loaded_manifest = ExecutableManifest::LoadFromFile(manifest_path, &manifest_err);
+  if (!manifest_err.empty()) {
+    SpielFatalError("Manifest validation failed: " + manifest_err);
   }
+
+  // Pre-planned root tasks: exactly 2816 roots
+  // Train: 2048 roots, ep = 0..2047, target_seat = ep % 4
+  // Dev:   256 roots,  ep = 0..255,  target_seat = ep % 4
+  // Test:  512 roots,  ep = 0..511,  target_seat = ep % 4
+  struct RootPlan {
+    Partition partition;
+    int episode_id;
+    Player target_seat;
+  };
+  std::vector<RootPlan> plans;
+  plans.reserve(kRootsTotal);
+
+  for (int ep = 0; ep < kRootsTrain; ++ep) {
+    plans.push_back({Partition::kTrain, ep, static_cast<Player>(ep % 4)});
+  }
+  for (int ep = 0; ep < kRootsDev; ++ep) {
+    plans.push_back({Partition::kDev, ep, static_cast<Player>(ep % 4)});
+  }
+  for (int ep = 0; ep < kRootsTest; ++ep) {
+    plans.push_back({Partition::kTest, ep, static_cast<Player>(ep % 4)});
+  }
+  SPIEL_CHECK_EQ(plans.size(), kRootsTotal);
+
+  std::filesystem::path roots_path = out_dir / "corpus_roots.jsonl";
+  std::ofstream roots_f(roots_path, std::ios::trunc);
+  if (!roots_f.is_open()) SpielFatalError("Cannot open " + roots_path.string());
+
+  std::mutex roots_mutex;
+  std::vector<RootRecord> all_roots;
+  all_roots.reserve(kRootsTotal);
+
+  std::atomic<size_t> next_plan_idx{0};
+  std::atomic<int> completed_roots{0};
+  std::map<int, int> round_distribution;
+  std::map<int, int> seat_distribution;
+
+  auto start_time = std::chrono::steady_clock::now();
+  std::vector<std::thread> workers;
+
+  for (int tid = 0; tid < num_threads; ++tid) {
+    workers.emplace_back([&]() {
+      while (true) {
+        size_t idx = next_plan_idx.fetch_add(1);
+        if (idx >= plans.size()) break;
+        const auto& plan = plans[idx];
+
+        uint64_t game_seed = DeriveSourceGameSeed(plan.partition, plan.episode_id);
+        std::mt19937_64 chance_rng(game_seed);
+        std::mt19937_64 policy_rng(dune_seed::DeriveSeed(PartitionDomain(plan.partition), kStreamContinuationPolicy, game_seed));
+
+        auto state = game->NewInitialState();
+
+        struct EligibleCandidate {
+          int round;
+          std::vector<Action> history;
+          std::vector<Action> legal_actions;
+          std::vector<float> logits;
+          std::vector<float> critic_input;
+          DuneDecisionRole role;
+        };
+        std::vector<EligibleCandidate> eligible;
+
+        while (!state->IsTerminal()) {
+          if (state->IsChanceNode()) {
+            auto outcomes = state->ChanceOutcomes();
+            state->ApplyAction(SampleAction(outcomes, chance_rng).first);
+            continue;
+          }
+          if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+            std::vector<Action> joint;
+            for (int p = 0; p < state->NumPlayers(); ++p) {
+              auto acts = state->LegalActions(p);
+              std::uniform_int_distribution<size_t> d(0, acts.size() - 1);
+              joint.push_back(acts[d(chance_rng)]);
+            }
+            state->ApplyActions(joint);
+            continue;
+          }
+
+          Player player = state->CurrentPlayer();
+          auto legal = state->LegalActions();
+          DuneDecisionRole role = ClassifyDuneDecisionRole(*state, player, false);
+          const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+          int current_round = dune_state ? dune_state->GetCurrentRound() : 1;
+
+          std::vector<float> obs(kActorInputDim, 0.0f);
+          state->InformationStateTensor(player, absl::MakeSpan(obs));
+          EvalResult eval_res = g_actor_evaluator->Evaluate(obs);
+          std::vector<float> logits = std::move(eval_res.logits);
+
+          // Eligibility criteria: agent-primary decision, >= 2 legal actions, rounds 2..10, designated seat
+          if (role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 &&
+              current_round >= 2 && current_round <= 10 && player == plan.target_seat) {
+            EligibleCandidate ec;
+            ec.round = current_round;
+            ec.history = state->History();
+            ec.legal_actions = legal;
+            ec.logits = logits;
+            ec.critic_input = ExtractCriticInput(*state, player);
+            ec.role = role;
+            eligible.push_back(std::move(ec));
+          }
+
+          CenterAndCapLegalLogits(logits, legal, 10.0f);
+          auto sampled = SamplePolicyDistribution(&policy_rng, logits, legal, nullptr);
+          state->ApplyAction(sampled.action);
+        }
+
+        SPIEL_CHECK_FALSE(eligible.empty());
+
+        // Reservoir sampling: uniform selection over all eligible decisions across rounds 2..10
+        uint64_t select_seed = DeriveRootSelectionSeed(plan.partition, plan.episode_id);
+        std::mt19937_64 select_rng(select_seed);
+        std::uniform_int_distribution<size_t> sel_dist(0, eligible.size() - 1);
+        size_t chosen_idx = sel_dist(select_rng);
+        const auto& chosen = eligible[chosen_idx];
+
+        RootRecord rec;
+        rec.partition = plan.partition;
+        rec.source_episode_id = plan.episode_id;
+        rec.acting_player = plan.target_seat;
+        rec.round = chosen.round;
+        rec.stratum = "agent_primary";
+        rec.role = chosen.role;
+        rec.history = chosen.history;
+        rec.legal_actions = chosen.legal_actions;
+        rec.root_id = pwo2::HistoryHash(rec.history).substr(0, 16);
+        rec.candidate_actions = SelectCandidateActions(
+            chosen.legal_actions, chosen.logits, plan.partition, rec.root_id, &rec.candidate_actor_probs);
+        rec.reference_action = rec.candidate_actions[0];
+        rec.critic_input_9647 = chosen.critic_input;
+
+        std::string val_err;
+        if (!ValidateRootRecord(rec, game, &val_err)) {
+          SpielFatalError("Root validation failed: " + val_err);
+        }
+
+        // Incremental write to file
+        {
+          std::lock_guard<std::mutex> lock(roots_mutex);
+          json::Object obj;
+          obj["root_id"] = rec.root_id;
+          obj["partition"] = PartitionToString(rec.partition);
+          obj["source_episode_id"] = static_cast<int64_t>(rec.source_episode_id);
+          obj["acting_player"] = static_cast<int64_t>(rec.acting_player);
+          obj["round"] = static_cast<int64_t>(rec.round);
+          obj["stratum"] = rec.stratum;
+
+          json::Array hist;
+          for (Action a : rec.history) hist.push_back(static_cast<int64_t>(a));
+          obj["history"] = hist;
+
+          json::Array leg;
+          for (Action a : rec.legal_actions) leg.push_back(static_cast<int64_t>(a));
+          obj["legal_actions"] = leg;
+
+          json::Array cands;
+          for (Action a : rec.candidate_actions) cands.push_back(static_cast<int64_t>(a));
+          obj["candidate_actions"] = cands;
+
+          obj["reference_action"] = static_cast<int64_t>(rec.reference_action);
+
+          json::Array probs;
+          for (double p : rec.candidate_actor_probs) probs.push_back(p);
+          obj["candidate_actor_probs"] = probs;
+
+          json::Array cinp;
+          for (float v : rec.critic_input_9647) cinp.push_back(static_cast<double>(v));
+          obj["critic_input_9647"] = cinp;
+
+          roots_f << json::ToString(obj) << "\n";
+          roots_f.flush();
+
+          round_distribution[rec.round]++;
+          seat_distribution[rec.acting_player]++;
+          all_roots.push_back(std::move(rec));
+        }
+
+        int done = completed_roots.fetch_add(1) + 1;
+        if (done % 256 == 0 || done == kRootsTotal) {
+          auto now = std::chrono::steady_clock::now();
+          double el = std::chrono::duration<double>(now - start_time).count();
+          std::cout << absl::StrFormat("  Collected %d / %d roots (%.1f%%, %.1f games/sec)\n",
+                                       done, kRootsTotal, 100.0 * done / kRootsTotal, done / el);
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) w.join();
   roots_f.close();
 
-  std::cout << "\nCORPUS GENERATION COMPLETE. Total roots: " << all_roots.size() << "\n";
-  std::cout << "Round distribution:\n";
-  for (const auto& kv : round_distribution) {
-    std::cout << absl::StrFormat("  Round %2d: %5d roots (%.1f%%)\n",
-                                 kv.first, kv.second, 100.0 * kv.second / all_roots.size());
+  // Validate the full corpus
+  std::string corpus_err;
+  if (!ValidateCorpus(all_roots, game, loaded_manifest, &corpus_err)) {
+    SpielFatalError("ValidateCorpus failed: " + corpus_err);
   }
-  std::cout << "Seat distribution:\n";
-  for (const auto& kv : seat_distribution) {
+
+  std::cout << "\nCORPUS GENERATION COMPLETE. Total roots: " << all_roots.size() << "\n";
+  std::cout << "Observed Round distribution across rounds 2..10:\n";
+  for (int rd = 2; rd <= 10; ++rd) {
+    int cnt = round_distribution[rd];
+    std::cout << absl::StrFormat("  Round %2d: %5d roots (%.1f%%)\n",
+                                 rd, cnt, 100.0 * cnt / all_roots.size());
+  }
+  std::cout << "Observed Seat distribution:\n";
+  for (int s = 0; s < 4; ++s) {
+    int cnt = seat_distribution[s];
     std::cout << absl::StrFormat("  Seat %d: %5d roots (%.1f%%)\n",
-                                 kv.first, kv.second, 100.0 * kv.second / all_roots.size());
+                                 s, cnt, 100.0 * cnt / all_roots.size());
   }
 }
 
@@ -514,7 +668,24 @@ void RunRolloutTrainDev(const std::shared_ptr<const Game>& game, const std::file
   std::cout << "PHASE: Rollout Train and Dev Partitions\n";
   std::cout << "=======================================================\n";
 
+  std::filesystem::path manifest_path = out_dir / "corpus_manifest.json";
+  std::string manifest_err;
+  ExecutableManifest manifest = ExecutableManifest::LoadFromFile(manifest_path, &manifest_err);
+  if (!manifest_err.empty()) {
+    SpielFatalError("Manifest validation failed: " + manifest_err);
+  }
+
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
   auto roots = LoadCorpusRoots(out_dir / "corpus_roots.jsonl");
+  std::string corpus_err;
+  if (!ValidateCorpus(roots, game, manifest, &corpus_err)) {
+    SpielFatalError("Corpus validation failed: " + corpus_err);
+  }
+
   std::filesystem::path conts_path = out_dir / "train_dev_continuations.jsonl";
   std::ofstream out_f(conts_path, std::ios::app);
 
@@ -655,8 +826,33 @@ void RunTrainCritics(const std::filesystem::path& out_dir, const torch::Device& 
   std::cout << "PHASE: Train Matched Critics (S vs M)\n";
   std::cout << "=======================================================\n";
 
+  std::filesystem::path manifest_path = out_dir / "corpus_manifest.json";
+  std::string manifest_err;
+  ExecutableManifest manifest = ExecutableManifest::LoadFromFile(manifest_path, &manifest_err);
+  if (!manifest_err.empty()) {
+    SpielFatalError("Manifest validation failed: " + manifest_err);
+  }
+
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
+  auto game = LoadGame("dune_imperium");
   auto roots = LoadCorpusRoots(out_dir / "corpus_roots.jsonl");
+  std::string corpus_err;
+  if (!ValidateCorpus(roots, game, manifest, &corpus_err)) {
+    SpielFatalError("Corpus validation failed: " + corpus_err);
+  }
+
   auto continuations = LoadContinuations(out_dir / "train_dev_continuations.jsonl");
+  std::string cont_err;
+  if (!ValidateContinuations(roots, continuations, Partition::kTrain, kContinuationsTrain, &cont_err)) {
+    SpielFatalError("Train continuations validation failed: " + cont_err);
+  }
+  if (!ValidateContinuations(roots, continuations, Partition::kDev, kContinuationsDev, &cont_err)) {
+    SpielFatalError("Dev continuations validation failed: " + cont_err);
+  }
 
   std::vector<RootRecord> train_roots;
   std::vector<RootRecord> dev_roots;
@@ -669,7 +865,7 @@ void RunTrainCritics(const std::filesystem::path& out_dir, const torch::Device& 
 
   // Compute immutable targets for each root & action:
   // For Train roots:
-  //   S: replicate 0 actor-relative scaled return vector
+  //   S: replicate 0 actor-relative scaled return vector (selected by replicate ID 0)
   //   M: mean over all 16 continuations
   struct ActionTarget {
     Action action;
@@ -699,9 +895,18 @@ void RunTrainCritics(const std::filesystem::path& out_dir, const torch::Device& 
       const auto& reps = continuations.at({r.root_id, a});
       SPIEL_CHECK_EQ(reps.size(), kContinuationsTrain);
 
+      const ContinuationRecord* rep0 = nullptr;
+      for (const auto& cr : reps) {
+        if (cr.replicate == 0) {
+          rep0 = &cr;
+          break;
+        }
+      }
+      SPIEL_CHECK_TRUE(rep0 != nullptr);
+
       ActionTarget at;
       at.action = a;
-      at.s_target = reps[0].actor_relative_scaled_returns;
+      at.s_target = rep0->actor_relative_scaled_returns;
 
       std::array<double, 4> sum{};
       for (const auto& cr : reps) {
@@ -989,13 +1194,31 @@ void RunRolloutTest(const std::shared_ptr<const Game>& game, const std::filesyst
   std::cout << "PHASE: Rollout Final Test Partition (64 Continuations per Action)\n";
   std::cout << "=======================================================\n";
 
-  // Check that checkpoint selection is frozen
+  std::filesystem::path manifest_path = out_dir / "corpus_manifest.json";
+  std::string manifest_err;
+  ExecutableManifest manifest = ExecutableManifest::LoadFromFile(manifest_path, &manifest_err);
+  if (!manifest_err.empty()) {
+    SpielFatalError("Manifest validation failed: " + manifest_err);
+  }
+
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
+  // Check and validate that checkpoint selection is frozen and hashes match disk
   std::filesystem::path sel_path = out_dir / "selected_checkpoints.json";
-  if (!std::filesystem::exists(sel_path)) {
-    SpielFatalError("Cannot run test rollouts before selected_checkpoints.json is frozen!");
+  std::string sel_err;
+  if (!ValidateSelectedCheckpoints(sel_path, &sel_err)) {
+    SpielFatalError("Selected checkpoints validation failed: " + sel_err);
   }
 
   auto roots = LoadCorpusRoots(out_dir / "corpus_roots.jsonl");
+  std::string corpus_err;
+  if (!ValidateCorpus(roots, game, manifest, &corpus_err)) {
+    SpielFatalError("Corpus validation failed: " + corpus_err);
+  }
+
   std::filesystem::path conts_path = out_dir / "test_continuations.jsonl";
   std::ofstream out_f(conts_path, std::ios::app);
 
@@ -1095,8 +1318,37 @@ void RunEvaluate(const std::filesystem::path& out_dir, const torch::Device& devi
   std::cout << "PHASE: Held-Out Test Evaluation & Fixed Verdict\n";
   std::cout << "=======================================================\n";
 
+  std::filesystem::path manifest_path = out_dir / "corpus_manifest.json";
+  std::string manifest_err;
+  ExecutableManifest manifest = ExecutableManifest::LoadFromFile(manifest_path, &manifest_err);
+  if (!manifest_err.empty()) {
+    SpielFatalError("Manifest validation failed: " + manifest_err);
+  }
+
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
+  // Validate selected checkpoints and SHA-256 hashes on disk
+  std::filesystem::path sel_path = out_dir / "selected_checkpoints.json";
+  std::string sel_err;
+  if (!ValidateSelectedCheckpoints(sel_path, &sel_err)) {
+    SpielFatalError("Selected checkpoints validation failed: " + sel_err);
+  }
+
+  auto game = LoadGame("dune_imperium");
   auto roots = LoadCorpusRoots(out_dir / "corpus_roots.jsonl");
+  std::string corpus_err;
+  if (!ValidateCorpus(roots, game, manifest, &corpus_err)) {
+    SpielFatalError("Corpus validation failed: " + corpus_err);
+  }
+
   auto continuations = LoadContinuations(out_dir / "test_continuations.jsonl");
+  std::string cont_err;
+  if (!ValidateContinuations(roots, continuations, Partition::kTest, kContinuationsTest, &cont_err)) {
+    SpielFatalError("Test continuations validation failed: " + cont_err);
+  }
 
   std::vector<RootRecord> test_roots;
   for (auto& r : roots) {
