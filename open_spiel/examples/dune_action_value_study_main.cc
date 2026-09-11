@@ -555,6 +555,7 @@ void RunGenerateCorpus(const std::shared_ptr<const Game>& game, const std::files
           obj["acting_player"] = static_cast<int64_t>(rec.acting_player);
           obj["round"] = static_cast<int64_t>(rec.round);
           obj["stratum"] = rec.stratum;
+          obj["role"] = static_cast<int64_t>(rec.role);
 
           json::Array hist;
           for (Action a : rec.history) hist.push_back(static_cast<int64_t>(a));
@@ -640,6 +641,11 @@ std::vector<RootRecord> LoadCorpusRoots(const std::filesystem::path& path) {
     r.acting_player = static_cast<Player>(obj.at("acting_player").GetInt());
     r.round = static_cast<int>(obj.at("round").GetInt());
     r.stratum = obj.at("stratum").GetString();
+    if (obj.find("role") != obj.end()) {
+      r.role = static_cast<DuneDecisionRole>(obj.at("role").GetInt());
+    } else if (r.stratum == "agent_primary") {
+      r.role = DuneDecisionRole::kAgentPrimary;
+    }
     r.reference_action = static_cast<Action>(obj.at("reference_action").GetInt());
 
     for (const auto& v : obj.at("history").GetArray()) {
