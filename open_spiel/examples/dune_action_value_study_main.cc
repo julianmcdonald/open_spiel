@@ -16,9 +16,9 @@
 ABSL_FLAG(std::string, phase, "all", "Execution phase: all, verify, pilot, corpus, rollout_train_dev, train, rollout_test, evaluate");
 ABSL_FLAG(std::string, output_dir, "", "Output directory on Storage");
 ABSL_FLAG(std::string, model_path, open_spiel::action_value_study::kActorModelPathDefault, "Frozen actor model checkpoint");
-ABSL_FLAG(int, threads, 16, "Number of worker threads");
+ABSL_FLAG(int, threads, 64, "Number of worker threads");
 ABSL_FLAG(int, eval_batch_size, 64, "BatchedEvaluator target batch size");
-ABSL_FLAG(int, eval_timeout_ms, 2, "BatchedEvaluator timeout ms");
+ABSL_FLAG(int, eval_timeout_ms, 1, "BatchedEvaluator timeout ms");
 
 namespace open_spiel {
 namespace action_value_study {
@@ -1464,5 +1464,7 @@ int main(int argc, char** argv) {
     SpielFatalError("Unknown phase: " + phase);
   }
 
+  g_actor_evaluator.reset();
+  g_actor_model.reset();
   return 0;
 }
