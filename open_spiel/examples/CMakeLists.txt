@@ -251,6 +251,14 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_native_verification_test dune_native_verification_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_native_verification_test ${TORCH_LIBRARIES})
 
+  add_executable(dune_action_value_study_test dune_action_value_study_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_compile_definitions(dune_action_value_study_test PRIVATE ACTION_VALUE_TEST_STANDALONE)
+  target_link_libraries(dune_action_value_study_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_action_value_study_test COMMAND dune_action_value_study_test)
+
+  add_executable(dune_action_value_study_main dune_action_value_study_main.cc dune_action_value_study_test.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_action_value_study_main dune_search ${TORCH_LIBRARIES})
+
   # PWO-3 Amendment 2 (docs/PWO3_AMENDMENT_2_PRECISION_RECOVERY.md). A SEPARATE
   # target on purpose: dune_pwo3_teacher_audit is the binary of record for every
   # PWO-3 measurement and must survive the amendment byte-for-byte, so the

@@ -371,19 +371,26 @@ TORCH_MODULE(DuneVrpoQResBlock);
 // Canonical matched Q module for every future 2x2 arm. The final dimension is
 // ACTOR-RELATIVE slot order; callers must use VrpoActorRelativeQToAbsolute
 // before constructing reference rows. No tanh, dropout, or batch norm.
+inline constexpr int kVrpoQInputDimLegacy = 9012;
+inline constexpr int kVrpoQInputDimWithMarket = 9647;
+
 struct DuneVrpoQNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
   DuneVrpoQResBlock res1{nullptr};
   DuneVrpoQResBlock res2{nullptr};
   torch::nn::Linear q_head{nullptr};
   uint64_t init_seed = 0;
+  int64_t expected_input_dim = dune_imperium::kVrpoCentralCriticTensorSize;
 
-  explicit DuneVrpoQNetImpl(uint64_t registered_init_seed)
-      : init_seed(registered_init_seed) {
+  explicit DuneVrpoQNetImpl(
+      uint64_t registered_init_seed,
+      int64_t configured_input_dim = dune_imperium::kVrpoCentralCriticTensorSize)
+      : init_seed(registered_init_seed),
+        expected_input_dim(configured_input_dim) {
     g_vrpo_q_constructor_calls.fetch_add(1, std::memory_order_relaxed);
     input_layer = register_module(
         "input_layer",
-        torch::nn::Linear(dune_imperium::kVrpoCentralCriticTensorSize,
+        torch::nn::Linear(expected_input_dim,
                           kVrpoQHiddenDim));
     res1 = register_module("res1", DuneVrpoQResBlock());
     res2 = register_module("res2", DuneVrpoQResBlock());
@@ -413,6 +420,22 @@ struct DuneVrpoQNetImpl : torch::nn::Module {
     initialize_linear(q_head, kVrpoQFinalInitScale);
   }
 
+  bool CheckSchema(std::string* error = nullptr) const {
+    if (!input_layer || !input_layer->weight.defined()) {
+      if (error != nullptr) *error = "input_layer weight is undefined";
+      return false;
+    }
+    if (input_layer->weight.size(1) != expected_input_dim) {
+      if (error != nullptr) {
+        *error = absl::StrFormat(
+            "Q layer weight width %d does not match declared schema %d",
+            input_layer->weight.size(1), expected_input_dim);
+      }
+      return false;
+    }
+    return true;
+  }
+
   bool ForwardChecked(const torch::Tensor& input, torch::Tensor* output,
                       std::string* error) {
     g_vrpo_q_forward_checked_calls.fetch_add(1, std::memory_order_relaxed);
@@ -423,9 +446,18 @@ struct DuneVrpoQNetImpl : torch::nn::Module {
     };
     if (output == nullptr) return fail("null Q output");
     *output = torch::Tensor();
+
+    std::string schema_err;
+    if (!CheckSchema(&schema_err)) {
+      return fail("schema validation failed: " + schema_err);
+    }
+
     if (!input.defined() || input.dim() != 2 || input.size(0) <= 0 ||
-        input.size(1) != dune_imperium::kVrpoCentralCriticTensorSize) {
-      return fail("Q input must have shape [positive_batch,9012]");
+        input.size(1) != expected_input_dim) {
+      return fail(absl::StrFormat(
+          "Q input width %d does not match declared schema %d",
+          input.defined() && input.dim() == 2 ? input.size(1) : -1,
+          expected_input_dim));
     }
     if (input.scalar_type() != torch::kFloat32) {
       return fail("Q input dtype must be Float32");
