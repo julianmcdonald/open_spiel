@@ -507,6 +507,45 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
                   model_path, schema_hash, schema.sha256));
             }
           }
+          auto it_sds = obj.find("semantic_descriptor_schema");
+          if (it_sds != obj.end() && it_sds->second.IsString()) {
+            std::string schema = it_sds->second.GetString();
+            if (schema != dune_semantic::kDescriptorSchemaVersionV2 &&
+                schema != dune_semantic::kDescriptorSchemaVersionV3) {
+              SpielFatalError(absl::StrFormat(
+                  "Model checkpoint %s has invalid semantic_descriptor_schema ('%s')",
+                  model_path, schema));
+            }
+          }
+          auto it_ess = obj.find("enable_semantic_scorer");
+          if (it_ess != obj.end()) {
+            bool enabled = (it_ess->second.IsBool() && it_ess->second.GetBool()) ||
+                           (it_ess->second.IsString() && it_ess->second.GetString() == "true");
+            if (enabled) {
+              if (it_sds == obj.end() || !it_sds->second.IsString()) {
+                SpielFatalError(absl::StrFormat(
+                    "Model checkpoint %s has enable_semantic_scorer=true but missing or invalid semantic_descriptor_schema",
+                    model_path));
+              }
+            }
+          }
+          if (input_dim != nullptr && *input_dim == dune_imperium::kFullPublicInformationStateSize) {
+            auto it_ess_9182 = obj.find("enable_semantic_scorer");
+            bool enabled = it_ess_9182 != obj.end() &&
+                           ((it_ess_9182->second.IsBool() && it_ess_9182->second.GetBool()) ||
+                            (it_ess_9182->second.IsString() && it_ess_9182->second.GetString() == "true"));
+            if (!enabled) {
+              SpielFatalError(absl::StrFormat(
+                  "Model checkpoint %s with 9182 input dim requires enable_semantic_scorer=true",
+                  model_path));
+            }
+            if (it_sds == obj.end() || !it_sds->second.IsString() ||
+                it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV3) {
+              SpielFatalError(absl::StrFormat(
+                  "Model checkpoint %s with 9182 input dim requires semantic_descriptor_schema='%s'",
+                  model_path, dune_semantic::kDescriptorSchemaVersionV3));
+            }
+          }
           auto it_hd = obj.find("hidden_dim");
           auto it_nb = obj.find("num_blocks");
           if (it_hd != obj.end() && it_hd->second.IsInt() &&
@@ -529,8 +568,10 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
           }
         }
       }
-    } catch (...) {
-      // Fallback
+    } catch (const open_spiel::SpielFatalErrorException&) {
+      throw;
+    } catch (const std::exception& e) {
+      SpielFatalError(absl::StrFormat("Error reading or parsing sidecar JSON for %s: %s", model_path, e.what()));
     }
   }
 
@@ -543,8 +584,12 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
     archive.read("input_layer", input_layer_archive);
     torch::Tensor weight;
     input_layer_archive.read("weight", weight);
-    if (weight.size(1) == dune_imperium::kOrderedCardSlotsInformationStateSize) {
-      SpielFatalError("Ordered-card-slot checkpoint requires valid schema metadata: " + model_path);
+    if (dune_imperium::IsExtendedInformationStateSize(weight.size(1))) {
+      SpielFatalError("Extended information state checkpoint requires valid schema metadata: " + model_path);
+    }
+    torch::serialize::InputArchive s_arch;
+    if (archive.try_read("semantic_scorer", s_arch)) {
+      SpielFatalError("Checkpoint contains semantic_scorer module but sidecar metadata is missing or invalid: " + model_path);
     }
     *hidden_dim = weight.size(0);
     if (input_dim != nullptr) {
@@ -764,7 +809,8 @@ void WorkerThread(
         dune_semantic::CandidateActionData cand_data;
         const dune_semantic::CandidateActionData* p_cand_data = nullptr;
         if (dune_state != nullptr) {
-          dune_semantic::ExtractCandidateDescriptors(*dune_state, legal_actions, &cand_data);
+          const std::string schema = evaluator ? evaluator->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
+          dune_semantic::ExtractCandidateDescriptors(*dune_state, legal_actions, &cand_data, schema);
           p_cand_data = &cand_data;
         }
         EvalResult result = evaluator->EvaluateWithActions(*p_obs, p_cand_data);

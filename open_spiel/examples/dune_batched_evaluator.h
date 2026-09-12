@@ -16,10 +16,29 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
  public:
   BatchedNNEvaluator(
       std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval,
-      float logit_cap = 10.0f)
+      float logit_cap = 10.0f,
+      dune_imperium::MarketAppendixMode market_mode = dune_imperium::MarketAppendixMode::kNone)
       : batched_eval_(batched_eval),
-        logit_cap_(logit_cap) {
-    obs_size_ = 5580;
+        logit_cap_(logit_cap),
+        market_mode_(market_mode) {
+    if (batched_eval_) {
+      obs_size_ = batched_eval_->ModelInputDim();
+      if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
+          batched_eval_->MarketMode() != dune_imperium::MarketAppendixMode::kNone) {
+        market_mode_ = batched_eval_->MarketMode();
+      }
+      if (market_mode_ == dune_imperium::MarketAppendixMode::kNone) {
+        if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+          market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+        } else if (obs_size_ == dune_imperium::kOrderedCardSlotsInformationStateSize) {
+          market_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
+        } else if (obs_size_ == dune_imperium::kExpandedInformationStateSize) {
+          SpielFatalError("Ambiguous 6,215 model requires explicit market_appendix_mode (cannot default to kZeros).");
+        }
+      }
+    } else {
+      obs_size_ = 5580;
+    }
   }
 
   std::vector<double> Evaluate(const State& state) override {
@@ -28,7 +47,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     std::vector<std::vector<float>> observations;
     observations.reserve(num_players);
     for (int p = 0; p < num_players; ++p) {
-      observations.push_back(state.InformationStateTensor(p));
+      observations.push_back(ModelObservation(state, p));
     }
     auto results = batched_eval_->EvaluateBatchValues(observations);
     for (int p = 0; p < num_players; ++p) {
@@ -51,9 +70,15 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     if (legal_actions.empty()) {
       return {};
     }
-    std::vector<float> obs = state.InformationStateTensor(current_player);
+    std::vector<float> obs = ModelObservation(state, current_player);
+    dune_semantic::CandidateActionData cand_data;
+    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    if (dune != nullptr) {
+      const std::string schema = batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
+      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
+    }
     open_spiel::CompactEvalResult result =
-        batched_eval_->EvaluateCompact(obs, legal_actions);
+        batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
 
     ActionsAndProbs policy;
     policy.reserve(result.actions.size());
@@ -79,15 +104,21 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     std::vector<std::vector<float>> observations;
     observations.reserve(num_players);
     for (int p = 0; p < num_players; ++p) {
-      observations.push_back(state.InformationStateTensor(p));
+      observations.push_back(ModelObservation(state, p));
     }
     std::vector<Action> legal_actions;
+    dune_semantic::CandidateActionData cand_data;
     if (current_player >= 0 && current_player < num_players) {
       legal_actions = state.LegalActions();
+      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+      if (dune != nullptr) {
+        const std::string schema = batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
+        dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
+      }
     }
     auto value_and_prior = batched_eval_->EvaluateBatchValuesWithCompactPrior(
         observations, static_cast<size_t>(current_player),
-        legal_actions);
+        legal_actions, &cand_data);
     auto& results = value_and_prior.first;
     const auto& compact_prior = value_and_prior.second;
 
@@ -96,7 +127,6 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       double val = result.value;
       values[p] = val;
       DuneNNEvaluator::RecordLeafValue(val);
-
     }
     policy.reserve(compact_prior.actions.size());
     for (size_t i = 0; i < compact_prior.actions.size(); ++i) {
@@ -106,9 +136,19 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   }
 
  private:
+  std::vector<float> ModelObservation(const State& state, Player player) const {
+    if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
+      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+      SPIEL_CHECK_TRUE(dune != nullptr);
+      return dune->InformationStateTensorWithAppendix(player, market_mode_);
+    }
+    return state.InformationStateTensor(player);
+  }
+
   std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval_;
   float logit_cap_;
   int64_t obs_size_;
+  dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
 };
 
 } // namespace open_spiel

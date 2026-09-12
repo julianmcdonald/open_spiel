@@ -81,8 +81,11 @@ class DuneNNEvaluator : public algorithms::Evaluator {
         market_mode_(market_mode) {
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
-    // Dynamically retrieve the expected observation input size from the model
     obs_size_ = model_->input_layer->weight.size(1);
+    if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
+        model_->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kNone) {
+      market_mode_ = model_->market_appendix_mode_;
+    }
     if (market_mode_ == dune_imperium::MarketAppendixMode::kNone) {
       if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
         market_mode_ =
@@ -91,10 +94,19 @@ class DuneNNEvaluator : public algorithms::Evaluator {
                  dune_imperium::kOrderedCardSlotsInformationStateSize) {
         market_mode_ =
             dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
-      } else if (obs_size_ == dune_imperium::kExpandedInformationStateSize) {
-        market_mode_ = dune_imperium::MarketAppendixMode::kOrderedMarket;
+      } else if (obs_size_ ==
+                 dune_imperium::kExpandedInformationStateSize) {
+        SpielFatalError("Ambiguous 6,215 model requires explicit market_appendix_mode (cannot default to kZeros).");
       }
     }
+  }
+
+  bool HasSemanticScorer() const {
+    return model_ != nullptr && model_->with_semantic_scorer_;
+  }
+  std::string SemanticDescriptorSchema() const {
+    if (model_ != nullptr) return model_->semantic_descriptor_schema_;
+    return dune_semantic::kDescriptorSchemaVersionV3;
   }
 
   std::vector<double> Evaluate(const State& state) override {
@@ -174,8 +186,8 @@ class DuneNNEvaluator : public algorithms::Evaluator {
           dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
       if (dune != nullptr) {
         dune_semantic::CandidateActionData cand_data;
-        dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions,
-                                                   &cand_data);
+        dune_semantic::ExtractCandidateDescriptors(
+            *dune, legal_actions, &cand_data, model_->semantic_descriptor_schema_);
         std::vector<const dune_semantic::CandidateActionData*> batch_cands = {
             &cand_data};
         dune_semantic::ApplySemanticScorerBatch(
@@ -272,8 +284,8 @@ class DuneNNEvaluator : public algorithms::Evaluator {
               dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
           if (dune != nullptr) {
             dune_semantic::CandidateActionData cand_data;
-            dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions,
-                                                       &cand_data);
+            dune_semantic::ExtractCandidateDescriptors(
+                *dune, legal_actions, &cand_data, model_->semantic_descriptor_schema_);
             std::vector<const dune_semantic::CandidateActionData*> batch_cands(
                 num_players, nullptr);
             batch_cands[current_player] = &cand_data;

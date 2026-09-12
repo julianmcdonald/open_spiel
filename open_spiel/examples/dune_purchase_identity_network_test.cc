@@ -12,6 +12,7 @@
 #include "dune_evaluator.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
+#include "open_spiel/spiel_utils.h"
 
 namespace open_spiel {
 namespace {
@@ -233,14 +234,414 @@ void TestEvaluatorSemanticScoring() {
   std::cout << "Evaluator semantic scoring verification passed.\n";
 }
 
+void TestSemanticDualHeadMigrationAndStagedGradients(const std::filesystem::path& output_dir) {
+  // 1. Source model: 5580, with semantic scorer (v2).
+  auto source = std::make_shared<SharedDunePolicyValueNetImpl>(
+      5580, 2048, 2391, 8, /*use_nonlinear=*/false, /*with_aux_heads=*/false,
+      /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  {
+    torch::NoGradGuard guard;
+    source->semantic_scorer_->out_layer->weight.fill_(0.25f);
+    if (source->semantic_scorer_->out_layer->bias.defined()) {
+      source->semantic_scorer_->out_layer->bias.fill_(0.1f);
+    }
+  }
+
+  // 2. Target model: 9182 (kFullPublicInformationStateSize), with semantic scorer (v3).
+  auto target = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 2048, 2391, 8, /*use_nonlinear=*/false, /*with_aux_heads=*/false,
+      /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+
+  // Copy weights: input layer via CopyInputToFullPublicInformation; matching named parameters bitwise.
+  {
+    torch::NoGradGuard guard;
+    CopyInputToFullPublicInformation(target->input_layer->weight, source->input_layer->weight, MarketAppendixMode::kNone);
+    if (target->input_layer->bias.defined() && source->input_layer->bias.defined()) {
+      target->input_layer->bias.copy_(source->input_layer->bias);
+    }
+    auto source_params = source->named_parameters();
+    for (auto& item : target->named_parameters()) {
+      if (item.key() != "input_layer.weight" && item.key() != "input_layer.bias" &&
+          item.key() != "semantic_scorer.out_layer_ext.weight" && item.key() != "semantic_scorer.out_layer_ext.bias") {
+        if (source_params.contains(item.key())) {
+          item.value().copy_(source_params[item.key()]);
+        }
+      }
+    }
+  }
+
+  // A. Verify out_layer_ext is initialized exactly to zero
+  SPIEL_CHECK_EQ(target->semantic_scorer_->out_layer_ext->weight.abs().sum().item<double>(), 0.0);
+  if (target->semantic_scorer_->out_layer_ext->bias.defined()) {
+    SPIEL_CHECK_EQ(target->semantic_scorer_->out_layer_ext->bias.abs().sum().item<double>(), 0.0);
+  }
+
+  source->eval();
+  target->eval();
+
+  // B. Forward parity verification on a simulated input and candidate actions
+  auto game = LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  while (!state->IsTerminal()) {
+    if (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+      continue;
+    }
+    const auto legal = state->LegalActions();
+    const auto* dune = dynamic_cast<const DuneImperiumState*>(state.get());
+    dune_semantic::CandidateActionData cand_data;
+    dune_semantic::ExtractCandidateDescriptors(*dune, legal, &cand_data);
+    bool has_supported = false;
+    for (uint8_t s : cand_data.supported) {
+      if (s != 0) { has_supported = true; break; }
+    }
+    if (has_supported) break;
+    state->ApplyAction(legal.front());
+  }
+
+  auto* dune_st = dynamic_cast<const DuneImperiumState*>(state.get());
+  SPIEL_CHECK_TRUE(dune_st != nullptr);
+  const auto legal_actions = state->LegalActions();
+
+  std::vector<float> old_obs(5580, 0.0f);
+  state->InformationStateTensor(state->CurrentPlayer(), absl::MakeSpan(old_obs));
+  std::vector<float> new_obs(kFullPublicInformationStateSize, 0.0f);
+  dune_st->InformationStateTensorWithAppendix(
+      state->CurrentPlayer(), MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(new_obs));
+
+  std::mutex src_m, tgt_m;
+  DeterministicEvaluator src_eval(source, torch::kCPU, &src_m, nullptr, nullptr, false);
+  DeterministicEvaluator tgt_eval(target, torch::kCPU, &tgt_m, nullptr, nullptr, false);
+
+  dune_semantic::CandidateActionData cdata_v2, cdata_v3;
+  dune_semantic::ExtractCandidateDescriptors(*dune_st, legal_actions, &cdata_v2, dune_semantic::kDescriptorSchemaVersionV2);
+  dune_semantic::ExtractCandidateDescriptors(*dune_st, legal_actions, &cdata_v3, dune_semantic::kDescriptorSchemaVersionV3);
+
+  auto res_src = src_eval.EvaluateWithActions(old_obs, &cdata_v2);
+  auto res_tgt = tgt_eval.EvaluateWithActions(new_obs, &cdata_v3);
+
+  double max_delta = 0.0;
+  for (Action a : legal_actions) {
+    double d = std::abs(static_cast<double>(res_src.logits[a] - res_tgt.logits[a]));
+    max_delta = std::max(max_delta, d);
+  }
+  std::cout << "Dual-head migration forward parity on 5580->9182 expansion: max logit delta = "
+            << max_delta << " (tolerance 1e-4)\n";
+  SPIEL_CHECK_LT(max_delta, 1e-4);
+
+  // C. Staged Gradient Verification:
+  // Zero-initialized out_layer_ext blocks embedding gradients on the first backward pass.
+  // First update out_layer_ext; then verify embedding gradients on a subsequent pass.
+  target->train();
+  target->zero_grad();
+
+  int batch_size = 1;
+  torch::Tensor trunk = torch::randn({batch_size, 2048});
+  torch::Tensor inout_logits = torch::zeros({batch_size, 2391});
+  torch::Tensor batch_indices = torch::tensor({0}, torch::kLong);
+  torch::Tensor action_indices = torch::tensor({705}, torch::kLong);
+  torch::Tensor feat_tensor = torch::zeros({1, 56});
+  torch::Tensor card_ids = torch::tensor({dune_semantic::kIntrigueCardVocabOffset + 5}, torch::kLong);
+  torch::Tensor space_ids = torch::tensor({0}, torch::kLong);
+  torch::Tensor supported_mask = torch::tensor({1.0f}, torch::kFloat32);
+  torch::Tensor is_ext_mask = torch::tensor({true}, torch::kBool);
+
+  target->semantic_scorer_->ComputeAndAddCorrections(
+      trunk, batch_indices, action_indices, feat_tensor, card_ids, space_ids,
+      supported_mask, inout_logits, is_ext_mask);
+
+  torch::Tensor loss1 = inout_logits.index_select(1, action_indices).sum();
+  loss1.backward();
+
+  // Pass 1:
+  SPIEL_CHECK_GT(target->semantic_scorer_->out_layer_ext->weight.grad().abs().sum().item<double>(), 0.0);
+  double card_embed_grad_pass1 = target->semantic_scorer_->card_embedding->weight.grad()
+                                     .slice(0, 128, 192).abs().sum().item<double>();
+  SPIEL_CHECK_EQ(card_embed_grad_pass1, 0.0);
+
+  // Update out_layer_ext
+  {
+    torch::NoGradGuard guard;
+    target->semantic_scorer_->out_layer_ext->weight.add_(
+        target->semantic_scorer_->out_layer_ext->weight.grad() * 0.1f);
+  }
+  target->zero_grad();
+
+  // Pass 2:
+  torch::Tensor inout_logits2 = torch::zeros({batch_size, 2391});
+  target->semantic_scorer_->ComputeAndAddCorrections(
+      trunk, batch_indices, action_indices, feat_tensor, card_ids, space_ids,
+      supported_mask, inout_logits2, is_ext_mask);
+
+  torch::Tensor loss2 = inout_logits2.index_select(1, action_indices).sum();
+  loss2.backward();
+
+  double card_embed_grad_pass2 = target->semantic_scorer_->card_embedding->weight.grad()
+                                     .slice(0, 128, 192).abs().sum().item<double>();
+  std::cout << "Staged gradient test passed: pass 1 embed grad = " << card_embed_grad_pass1
+            << ", pass 2 embed grad = " << card_embed_grad_pass2 << "\n";
+  SPIEL_CHECK_GT(card_embed_grad_pass2, 0.0);
+}
+
+void ThrowingErrorHandler(const std::string& msg) {
+  throw std::runtime_error(msg);
+}
+
+void ExitingErrorHandler(const std::string& msg) {
+  std::cerr << "Spiel Fatal Error: " << msg << std::endl;
+  std::exit(1);
+}
+
+void TestVersionAwareScorerDeserialization(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+
+  auto scorer_v2 = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+  const std::string v2_path = (temp_dir / "scorer_v2.pt").string();
+  {
+    torch::serialize::OutputArchive out_arch;
+    auto save_child = [&](const std::string& name, auto& mod) {
+      torch::serialize::OutputArchive c;
+      mod->save(c);
+      out_arch.write(name, c);
+    };
+    save_child("card_embedding", scorer_v2->card_embedding);
+    save_child("space_embedding", scorer_v2->space_embedding);
+    save_child("desc_proj", scorer_v2->desc_proj);
+    save_child("desc_ln", scorer_v2->desc_ln);
+    save_child("trunk_proj", scorer_v2->trunk_proj);
+    save_child("trunk_ln", scorer_v2->trunk_ln);
+    save_child("mlp1", scorer_v2->mlp1);
+    save_child("mlp1_ln", scorer_v2->mlp1_ln);
+    save_child("out_layer", scorer_v2->out_layer);
+    out_arch.save_to(v2_path);
+  }
+
+  auto target_scorer_a = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+  {
+    torch::NoGradGuard guard;
+    target_scorer_a->out_layer_ext->weight.fill_(1.0f);
+  }
+  {
+    torch::serialize::InputArchive in_arch;
+    in_arch.load_from(v2_path);
+    target_scorer_a->Load(in_arch, dune_semantic::kDescriptorSchemaVersionV2);
+  }
+  SPIEL_CHECK_EQ(target_scorer_a->out_layer_ext->weight.abs().sum().item<double>(), 0.0);
+  std::cout << "Version-aware scorer deserialization: v2-to-v3 explicit migration succeeded.\n";
+
+  bool caught_rejection = false;
+  open_spiel::SetErrorHandler(ThrowingErrorHandler);
+  try {
+    torch::serialize::InputArchive in_arch;
+    in_arch.load_from(v2_path);
+    target_scorer_a->Load(in_arch, dune_semantic::kDescriptorSchemaVersionV3);
+  } catch (const std::exception& e) {
+    caught_rejection = true;
+    std::cout << "Version-aware scorer deserialization: missing out_layer_ext rejected as expected: "
+              << e.what() << "\n";
+  }
+  open_spiel::SetErrorHandler(ExitingErrorHandler);
+  SPIEL_CHECK_TRUE(caught_rejection);
+
+  const std::string v3_path = (temp_dir / "scorer_v3.pt").string();
+  {
+    torch::NoGradGuard guard;
+    target_scorer_a->out_layer_ext->weight.fill_(0.42f);
+  }
+  {
+    torch::serialize::OutputArchive out_arch;
+    target_scorer_a->save(out_arch);
+    out_arch.save_to(v3_path);
+  }
+  auto target_scorer_c = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+  {
+    torch::serialize::InputArchive in_arch;
+    in_arch.load_from(v3_path);
+    target_scorer_c->Load(in_arch, dune_semantic::kDescriptorSchemaVersionV3);
+  }
+  SPIEL_CHECK_TRUE(torch::equal(target_scorer_c->out_layer_ext->weight,
+                               target_scorer_a->out_layer_ext->weight));
+  std::cout << "Version-aware scorer deserialization: v3 full load succeeded.\n";
+}
+
+void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+
+  // 1. Ambiguous 6215 checkpoint with kNone mode
+  {
+    auto m6215 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kExpandedInformationStateSize, 2048, 2391, 8);
+    const std::string p6215 = (temp_dir / "ambiguous_6215.pt").string();
+    torch::save(m6215, p6215);
+    std::ofstream jf((temp_dir / "ambiguous_6215.json").string());
+    jf << "{\"market_appendix_mode\": \"none\"}\n";
+    jf.close();
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kExpandedInformationStateSize, 2048, 2391, 8);
+      LoadModelCheckpointRobust(load_target, p6215, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: ambiguous 6215 rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+
+  // 2. 9182 checkpoint without sidecar
+  {
+    auto m9182 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+    const std::string p9182 = (temp_dir / "no_sidecar_9182.pt").string();
+    torch::save(m9182, p9182);
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, p9182, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: 9182 without sidecar rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+
+  // 3. 9182 checkpoint without scorer
+  {
+    auto m9182_noscorer = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, false);
+    const std::string p9182_ns = (temp_dir / "no_scorer_9182.pt").string();
+    torch::save(m9182_noscorer, p9182_ns);
+    std::ofstream jf((temp_dir / "no_scorer_9182.json").string());
+    jf << "{\"market_appendix_mode\": \"full_public_information_v3\"}\n";
+    jf.close();
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, p9182_ns, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: 9182 without scorer rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+
+  // 4. 9182 checkpoint with v2 scorer schema
+  {
+    auto m9182_v2 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+    const std::string p9182_v2 = (temp_dir / "scorer_v2_9182.pt").string();
+    torch::save(m9182_v2, p9182_v2);
+    std::ofstream jf((temp_dir / "scorer_v2_9182.json").string());
+    jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+       << "\"enable_semantic_scorer\": true,"
+       << "\"semantic_descriptor_schema\": \"semantic_action_v2\"}\n";
+    jf.close();
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, p9182_v2, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: 9182 with v2 scorer rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+}
+
+void TestPopulatedOptimizerMigration(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+
+  auto src_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      5580, 2048, 2391, 8, /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+  auto src_opt = MakeOptimizer(src_model);
+
+  torch::Tensor dummy_input = torch::randn({2, 5580});
+  auto out = src_model->forward(dummy_input);
+  torch::Tensor loss = out.logits.sum() + out.values.sum();
+  loss.backward();
+  src_opt->step();
+
+  const std::string optim_path = (temp_dir / "source_populated.optim.pt").string();
+  torch::save(*src_opt, optim_path);
+
+  auto target_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 2048, 2391, 8, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/true, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  auto target_opt = MakeOptimizer(target_model);
+
+  bool migrated = LoadOptimizerCheckpointMigrating(
+      target_model, *target_opt, optim_path, torch::kCPU);
+  SPIEL_CHECK_TRUE(migrated);
+
+  auto input_w_key = target_model->input_layer->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(target_opt->state().count(input_w_key), 0);
+  auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      target_opt->state()[input_w_key].get());
+  SPIEL_CHECK_TRUE(adam_state != nullptr);
+  SPIEL_CHECK_TRUE(adam_state->exp_avg().defined());
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 2048);
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(1), kFullPublicInformationStateSize);
+
+  auto* src_adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      src_opt->state()[src_model->input_layer->weight.unsafeGetTensorImpl()].get());
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg().slice(1, 0, 5580),
+      src_adam_state->exp_avg()));
+
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg().slice(1, 5580, kFullPublicInformationStateSize).abs().sum().item<double>(), 0.0);
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg_sq().slice(1, 5580, kFullPublicInformationStateSize).abs().sum().item<double>(), 0.0);
+
+  auto ext_w_key = target_model->semantic_scorer_->out_layer_ext->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(target_opt->state().count(ext_w_key), 0);
+  auto* ext_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      target_opt->state()[ext_w_key].get());
+  SPIEL_CHECK_TRUE(ext_state != nullptr);
+  SPIEL_CHECK_EQ(ext_state->step(), 0);
+  SPIEL_CHECK_EQ(ext_state->exp_avg().abs().sum().item<double>(), 0.0);
+  SPIEL_CHECK_EQ(ext_state->exp_avg_sq().abs().sum().item<double>(), 0.0);
+
+  target_model->train();
+  target_opt->zero_grad();
+  torch::Tensor target_input = torch::randn({2, kFullPublicInformationStateSize});
+  auto target_out = target_model->forward(target_input);
+  torch::Tensor target_loss = target_out.logits.sum() + target_out.values.sum();
+  target_loss.backward();
+  target_opt->step();
+
+  std::cout << "Populated optimizer migration verification passed: moments expanded and target step succeeded.\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
 int main(int argc, char** argv) {
   torch::set_num_threads(2);
   torch::manual_seed(901);
+  const std::filesystem::path artifacts_dir = argc > 1 ? argv[1] : "identity_test_artifacts";
   open_spiel::TestInputMigration();
-  open_spiel::TestIncumbentMigration(argc > 1 ? argv[1] : "identity_test_artifacts");
+  open_spiel::TestIncumbentMigration(artifacts_dir);
   open_spiel::TestEvaluatorSemanticScoring();
+  open_spiel::TestSemanticDualHeadMigrationAndStagedGradients(artifacts_dir);
+  open_spiel::TestVersionAwareScorerDeserialization(artifacts_dir / "version_aware");
+  open_spiel::TestFailClosedValidation(artifacts_dir / "fail_closed");
+  open_spiel::TestPopulatedOptimizerMigration(artifacts_dir / "optim_mig");
   return 0;
 }
+

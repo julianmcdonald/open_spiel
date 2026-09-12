@@ -950,6 +950,8 @@ void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
     }
     item.value().copy_(src->to(item.value().device()));
   }
+  target->market_appendix_mode_ = source->market_appendix_mode_;
+  target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
 }
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
@@ -1091,6 +1093,7 @@ bool LoadModelCheckpointMigrating(
 
   std::filesystem::path metadata_path(path);
   metadata_path.replace_extension(".json");
+  std::string source_schema = dune_semantic::kDescriptorSchemaVersionV2;
   if (std::filesystem::exists(metadata_path)) {
     std::ifstream input(metadata_path);
     if (input) {
@@ -1098,12 +1101,12 @@ bool LoadModelCheckpointMigrating(
       const auto metadata = open_spiel::json::FromString(content);
       if (metadata && metadata->IsObject()) {
         const auto& object = metadata->GetObject();
-        auto scorer_entry = object.find("enable_semantic_scorer");
-        if (scorer_entry != object.end() && scorer_entry->second.IsBool() && scorer_entry->second.GetBool()) {
-          auto schema_entry = object.find("semantic_descriptor_schema");
-          if (schema_entry == object.end() || !schema_entry->second.IsString() ||
-              schema_entry->second.GetString() != dune_semantic::kDescriptorSchemaVersion) {
-            SpielFatalError("Mismatched or missing semantic_descriptor_schema in metadata: " + metadata_path.string());
+        auto schema_entry = object.find("semantic_descriptor_schema");
+        if (schema_entry != object.end() && schema_entry->second.IsString()) {
+          source_schema = schema_entry->second.GetString();
+          if (source_schema != dune_semantic::kDescriptorSchemaVersionV2 &&
+              source_schema != dune_semantic::kDescriptorSchemaVersionV3) {
+            SpielFatalError("Mismatched or invalid semantic_descriptor_schema in metadata: " + metadata_path.string());
           }
         }
       }
@@ -1135,10 +1138,14 @@ bool LoadModelCheckpointMigrating(
     const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
     CopyInputToFullPublicInformation(model->input_layer->weight,
                                      temp_model->input_layer->weight, source_mode);
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
   } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
     const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
     CopyInputToOrderedCardSlots(model->input_layer->weight,
                                temp_model->input_layer->weight, source_mode);
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
   } else if (ckpt_input_dim == input_dim) {
     model->input_layer->weight.copy_(temp_model->input_layer->weight);
   } else if (ckpt_input_dim == 5580 && input_dim == 6215) {
@@ -1147,6 +1154,9 @@ bool LoadModelCheckpointMigrating(
   } else {
     SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
                                     ckpt_input_dim, input_dim));
+  }
+  if (model->with_semantic_scorer_) {
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
   }
   if (model->input_layer->bias.defined() &&
       temp_model->input_layer->bias.defined()) {
@@ -1222,8 +1232,9 @@ bool LoadModelCheckpointMigrating(
     archive.load_from(path, device);
     torch::serialize::InputArchive scorer_archive;
     if (archive.try_read("semantic_scorer", scorer_archive)) {
-      model->semantic_scorer_->load(scorer_archive);
-      std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path << std::endl;
+      model->semantic_scorer_->Load(scorer_archive, source_schema);
+      std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path
+                << " (schema: " << source_schema << ")" << std::endl;
     } else {
       std::cout << "[SEMANTIC SCORER] Checkpoint does not contain semantic_scorer; keeping zero-init scorer." << std::endl;
     }
@@ -1396,111 +1407,8 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
 // map by `TensorImpl*`, so after loading, the temp optimizer's state is already
 // keyed by the identities the real optimizer uses, and the entries can simply be
 // moved across. Nothing is re-derived and no state tensor is reconstructed, so
-// "optimizer state loaded without numerical change" is exact.
-//
-// Returns true if it migrated (the archive was pre-head), false if the caller
-// should do an ordinary load.
-bool LoadOptimizerCheckpointMigrating(
-    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
-    torch::optim::AdamW& optimizer, const std::string& path,
-    torch::Device device) {
-  if (!model->has_aux_heads_) {
-    // Reverse migration: loading a 3-group archive (with auxiliary heads) into a 2-group model.
-    std::vector<torch::Tensor> policy_params = model->policy_head->parameters();
-    std::vector<torch::Tensor> other_params;
-    for (auto& param : model->parameters()) {
-      bool is_policy = false;
-      for (auto& q : policy_params) {
-        if (param.is_same(q)) { is_policy = true; break; }
-      }
-      if (!is_policy) other_params.push_back(param);
-    }
-    int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
-    int64_t action_dim = 2391;
-    std::vector<torch::Tensor> dummy_aux = {
-        torch::zeros({1, hidden_dim}, device),
-        torch::zeros({1}, device),
-        torch::zeros({3, hidden_dim}, device),
-        torch::zeros({3}, device),
-        torch::zeros({action_dim, hidden_dim}, device),
-        torch::zeros({action_dim}, device)};
-    std::vector<torch::optim::OptimizerParamGroup> groups3;
-    groups3.emplace_back(policy_params);
-    groups3.emplace_back(other_params);
-    groups3.emplace_back(dummy_aux);
-    torch::optim::AdamW opt3(
-        groups3,
-        torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
-    try {
-      torch::load(opt3, path, device);
-    } catch (const c10::Error& e) {
-      std::cerr << "[MIGRATION ERROR] Reverse migration torch::load failed: " << e.msg() << std::endl;
-      return false;
-    }
-    int moved = 0;
-    for (auto& entry : opt3.state()) {
-      for (auto& p : model->parameters()) {
-        if (entry.first == p.unsafeGetTensorImpl()) {
-          optimizer.state()[entry.first] = std::move(entry.second);
-          ++moved;
-          break;
-        }
-      }
-    }
-    std::cout << "[MIGRATION] Loaded " << moved
-              << " parameter states from 3-group archive " << path
-              << " into 2-group optimizer without numerical change." << std::endl;
-    return true;
-  }
+// LoadOptimizerCheckpointMigrating is defined inline in dune_network.h
 
-  // Reproduce the pre-migration grouping over the real model's tensors.
-  std::vector<torch::Tensor> policy_params;
-  std::vector<torch::Tensor> other_params;
-  auto policy_params_set = model->policy_head->parameters();
-  std::vector<torch::Tensor> aux_params_set;
-  for (auto& p : model->final_vp_head->parameters()) aux_params_set.push_back(p);
-  for (auto& p : model->terminal_round_head->parameters()) aux_params_set.push_back(p);
-  for (auto& p : model->next_own_action_head->parameters()) aux_params_set.push_back(p);
-  for (auto& param : model->parameters()) {
-    bool is_policy = false;
-    for (auto& q : policy_params_set) {
-      if (param.is_same(q)) { is_policy = true; break; }
-    }
-    bool is_aux = false;
-    for (auto& q : aux_params_set) {
-      if (param.is_same(q)) { is_aux = true; break; }
-    }
-    if (is_policy) policy_params.push_back(param);
-    else if (!is_aux) other_params.push_back(param);
-  }
-
-  std::vector<torch::optim::OptimizerParamGroup> legacy_groups;
-  legacy_groups.emplace_back(policy_params);
-  legacy_groups.emplace_back(other_params);
-  torch::optim::AdamW legacy_optimizer(
-      legacy_groups,
-      torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
-
-  try {
-    torch::load(legacy_optimizer, path, device);
-  } catch (const c10::Error& e) {
-    // Not a pre-migration archive (or a genuinely broken one). Let the caller's
-    // ordinary load run and report its own error, so a real corruption is not
-    // misreported as a migration failure.
-    return false;
-  }
-
-  int moved = 0;
-  for (auto& entry : legacy_optimizer.state()) {
-    optimizer.state()[entry.first] = std::move(entry.second);
-    ++moved;
-  }
-  std::cout << "[PWO-5] MIGRATION: optimizer state moved for " << moved
-            << " pre-head parameters from " << path
-            << " without numerical change; the three heads' state is "
-               "materialized separately at zero." << std::endl;
-  return true;
-}
 
 // PWO-5 section 7.4 — MATERIALIZE the auxiliary heads' optimizer state.
 //
@@ -2162,7 +2070,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       dune_semantic::CandidateActionData cand_data;
       const dune_semantic::CandidateActionData* p_cand_data = nullptr;
       if (dune_state != nullptr) {
-        dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data);
+        const std::string cand_schema = active_evaluator ? active_evaluator->SemanticDescriptorSchema()
+                                                         : dune_semantic::kDescriptorSchemaVersion;
+        dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data, cand_schema);
         p_cand_data = &cand_data;
       }
       EvalResult result = active_evaluator->EvaluateWithActions(obs, p_cand_data);

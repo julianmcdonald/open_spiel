@@ -674,6 +674,29 @@ std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
     }
   }
 
+  dune_imperium::MarketAppendixMode detected_mode =
+      dune_imperium::MarketAppendixMode::kNone;
+  {
+    std::string json_path = checkpoint_path;
+    if (json_path.size() >= 3 && json_path.substr(json_path.size() - 3) == ".pt") {
+      json_path = json_path.substr(0, json_path.size() - 3) + ".json";
+      std::ifstream jf(json_path);
+      if (jf.good()) {
+        std::string jstr((std::istreambuf_iterator<char>(jf)),
+                         std::istreambuf_iterator<char>());
+        auto jval = open_spiel::json::FromString(jstr);
+        if (jval.has_value() && jval->IsObject()) {
+          const auto& dict = jval->GetObject();
+          auto it_mm = dict.find("market_appendix_mode");
+          if (it_mm != dict.end() && it_mm->second.IsString()) {
+            detected_mode = dune_imperium::ParseMarketAppendixMode(
+                it_mm->second.GetString());
+          }
+        }
+      }
+    }
+  }
+
   const bool has_scorer = CheckpointHasSemanticScorer(checkpoint_path, torch::kCPU);
 
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
@@ -683,7 +706,7 @@ std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
   LoadModelCheckpointRobust(model, checkpoint_path, device);
   model->to(device);
   model->eval();
-  return std::make_shared<DuneNNEvaluator>(model, device);
+  return std::make_shared<DuneNNEvaluator>(model, device, 10.0f, detected_mode);
 }
 
 void LoadCalibratedParameters(DuneSearchConfig& config) {

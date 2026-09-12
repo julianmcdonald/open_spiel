@@ -2685,20 +2685,34 @@ int main(int argc, char* argv[]) {
 
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
+  auto load_model_fn = [&](const std::string& ckpt_path, int h_dim, int n_blocks, bool nonlinear)
+      -> std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> {
+    int64_t model_dim = obs_size;
+    {
+      torch::serialize::InputArchive archive;
+      archive.load_from(ckpt_path, torch::kCPU);
+      torch::serialize::InputArchive in_archive;
+      if (archive.try_read("input_layer", in_archive)) {
+        torch::Tensor w;
+        if (in_archive.try_read("weight", w)) {
+          model_dim = w.size(1);
+        }
+      }
+    }
+    const bool has_scorer = open_spiel::CheckpointHasSemanticScorer(ckpt_path, torch::kCPU);
+    auto m = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        model_dim, h_dim, action_size, n_blocks, nonlinear,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0,
+        /*with_semantic_scorer=*/has_scorer);
+    open_spiel::LoadModelCheckpointRobust(m, ckpt_path, device);
+    m->to(device);
+    m->eval();
+    return m;
+  };
+
   std::cout << "Loading search policy model weights from: " << model_ckpt << " on device " << device << "\n";
-  auto search_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      obs_size, hidden_dim, action_size, num_blocks,
-      absl::GetFlag(FLAGS_nonlinear_value_head));
-  search_model->eval();
-  try {
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_ckpt, device);
-    search_model->load(archive);
-  } catch (const c10::Error& e) {
-    std::cerr << "Failed to load search model weights:\n" << e.msg() << "\n";
-    return 1;
-  }
-  search_model->to(device);
+  auto search_model = load_model_fn(model_ckpt, hidden_dim, num_blocks,
+                                    absl::GetFlag(FLAGS_nonlinear_value_head));
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> search_value_model = nullptr;
   if (open_spiel::g_using_split_evaluator) {
@@ -2707,19 +2721,8 @@ int main(int argc, char* argv[]) {
       std::cout << "Using SplitPolicyValueEvaluator with shared network (aliased policy/value control arm)\n";
     } else {
       std::cout << "Loading search value model weights from: " << value_ckpt << " on device " << device << "\n";
-      search_value_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-          obs_size, hidden_dim, action_size, num_blocks,
-          absl::GetFlag(FLAGS_nonlinear_value_head));
-      search_value_model->eval();
-      try {
-        torch::serialize::InputArchive archive;
-        archive.load_from(value_ckpt, device);
-        search_value_model->load(archive);
-      } catch (const c10::Error& e) {
-        std::cerr << "Failed to load search value model weights:\n" << e.msg() << "\n";
-        return 1;
-      }
-      search_value_model->to(device);
+      search_value_model = load_model_fn(value_ckpt, hidden_dim, num_blocks,
+                                         absl::GetFlag(FLAGS_nonlinear_value_head));
     }
   }
 
@@ -2739,19 +2742,8 @@ int main(int argc, char* argv[]) {
       opp_ckpt = model_ckpt;
     }
     std::cout << "Loading opponent model weights from: " << opp_ckpt << " on device " << device << "\n";
-    opponent_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-        obs_size, opp_hidden_dim, action_size, opp_num_blocks,
-        absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
-    opponent_model->eval();
-    try {
-      torch::serialize::InputArchive archive;
-      archive.load_from(opp_ckpt, device);
-      opponent_model->load(archive);
-    } catch (const c10::Error& e) {
-      std::cerr << "Failed to load opponent model weights:\n" << e.msg() << "\n";
-      return 1;
-    }
-    opponent_model->to(device);
+    opponent_model = load_model_fn(opp_ckpt, opp_hidden_dim, opp_num_blocks,
+                                   absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
   } else {
     std::cout << "Running against uniform random opponents.\n";
   }

@@ -21,10 +21,13 @@
 #include <random>
 #include <shared_mutex>
 #include <utility>
+#include <fstream>
+#include <filesystem>
 #include <ATen/autocast_mode.h>
 #include "open_spiel/examples/dune_hotspot_profile.h"
 
 #include "open_spiel/spiel.h"
+#include "open_spiel/utils/json.h"
 #include "dune_seed_utils.h"  // MakeTorchCPUGenerator, for the PWO-5 head init
 #include "dune_semantic_action_scorer.h"
 
@@ -101,10 +104,19 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   bool has_aux_heads_ = false;
   bool with_semantic_scorer_ = false;
   std::shared_ptr<dune_semantic::SemanticActionScorerImpl> semantic_scorer_{nullptr};
+  dune_imperium::MarketAppendixMode market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
+  std::string semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
 
   SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false) {
     use_nonlinear_value_head_ = use_nonlinear;
     with_semantic_scorer_ = with_semantic_scorer;
+    if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
+      market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
+      market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
+    } else if (input_dim == dune_imperium::kLegacyInformationStateSize) {
+      market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
+    }
     input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
 
     // Register custom submodules dynamically (res1, res2, etc.)
@@ -327,48 +339,168 @@ inline void LoadModelCheckpointRobust(
   torch::NoGradGuard no_grad;
   torch::serialize::InputArchive in_arch;
   const int64_t expected_input_dim = model->input_layer->weight.size(1);
-  if (archive.try_read("input_layer", in_arch)) {
-    model->input_layer->load(in_arch);
-    SPIEL_CHECK_EQ(model->input_layer->weight.size(1), expected_input_dim);
+  if (!archive.try_read("input_layer", in_arch)) {
+    SpielFatalError("LoadModelCheckpointRobust: Missing required module 'input_layer' in " + path);
   }
+  model->input_layer->load(in_arch);
+  if (model->input_layer->weight.size(1) != expected_input_dim) {
+    SpielFatalError("LoadModelCheckpointRobust: Mismatched input dimension in " + path);
+  }
+
   for (size_t i = 0; i < model->res_blocks.size(); ++i) {
     torch::serialize::InputArchive b_arch;
     std::string b_name = "res" + std::to_string(i + 1);
-    if (archive.try_read(b_name, b_arch)) {
-      model->res_blocks[i]->load(b_arch);
+    if (!archive.try_read(b_name, b_arch)) {
+      SpielFatalError("LoadModelCheckpointRobust: Missing required residual block '" + b_name + "' in " + path);
     }
+    model->res_blocks[i]->load(b_arch);
   }
+
   torch::serialize::InputArchive p_arch;
-  if (archive.try_read("policy_head", p_arch)) {
-    model->policy_head->load(p_arch);
+  if (!archive.try_read("policy_head", p_arch)) {
+    SpielFatalError("LoadModelCheckpointRobust: Missing required module 'policy_head' in " + path);
   }
+  model->policy_head->load(p_arch);
+
   torch::serialize::InputArchive v_arch;
-  if (archive.try_read("value_head", v_arch)) {
-    model->value_head->load(v_arch);
+  if (!archive.try_read("value_head", v_arch)) {
+    SpielFatalError("LoadModelCheckpointRobust: Missing required module 'value_head' in " + path);
   }
+  model->value_head->load(v_arch);
+
   if (model->use_nonlinear_value_head_) {
     torch::serialize::InputArchive v2_arch;
-    if (archive.try_read("value_head2", v2_arch)) {
-      model->value_head2->load(v2_arch);
+    if (!archive.try_read("value_head2", v2_arch)) {
+      SpielFatalError("LoadModelCheckpointRobust: Missing required module 'value_head2' in " + path);
     }
+    model->value_head2->load(v2_arch);
   }
+
   if (model->has_aux_heads_) {
     torch::serialize::InputArchive a1, a2, a3;
     if (archive.try_read("final_vp_head", a1)) model->final_vp_head->load(a1);
     if (archive.try_read("terminal_round_head", a2)) model->terminal_round_head->load(a2);
     if (archive.try_read("next_own_action_head", a3)) model->next_own_action_head->load(a3);
   }
+
+  // Find sidecar JSON by replacing any file extension
+  std::string json_path = path;
+  size_t last_dot = json_path.find_last_of('.');
+  if (last_dot != std::string::npos && last_dot > json_path.find_last_of("/\\")) {
+    json_path = json_path.substr(0, last_dot) + ".json";
+  } else {
+    json_path += ".json";
+  }
+
+  bool sidecar_found = false;
+  std::string sds_found = "";
+  dune_imperium::MarketAppendixMode mode_found = dune_imperium::MarketAppendixMode::kNone;
+  std::string feature_schema_sha = "";
+
+  std::ifstream jf(json_path);
+  if (jf.good()) {
+    sidecar_found = true;
+    std::string jstr((std::istreambuf_iterator<char>(jf)),
+                     std::istreambuf_iterator<char>());
+    auto jval = open_spiel::json::FromString(jstr);
+    if (!jval.has_value() || !jval->IsObject()) {
+      SpielFatalError("LoadModelCheckpointRobust: Malformed sidecar JSON in " + json_path);
+    }
+    const auto& dict = jval->GetObject();
+    auto it_sds = dict.find("semantic_descriptor_schema");
+    if (it_sds != dict.end() && it_sds->second.IsString()) {
+      sds_found = it_sds->second.GetString();
+      if (sds_found != dune_semantic::kDescriptorSchemaVersionV2 &&
+          sds_found != dune_semantic::kDescriptorSchemaVersionV3) {
+        SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                        " has invalid semantic_descriptor_schema ('" + sds_found + "')");
+      }
+      model->semantic_descriptor_schema_ = sds_found;
+    }
+
+    auto it_ess = dict.find("enable_semantic_scorer");
+    if (it_ess != dict.end()) {
+      bool enabled = (it_ess->second.IsBool() && it_ess->second.GetBool()) ||
+                     (it_ess->second.IsString() && it_ess->second.GetString() == "true");
+      if (enabled && sds_found.empty()) {
+        SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                        " has enable_semantic_scorer=true but missing or invalid semantic_descriptor_schema");
+      }
+    }
+
+    auto it_mode = dict.find("market_appendix_mode");
+    if (it_mode != dict.end() && it_mode->second.IsString()) {
+      mode_found = dune_imperium::ParseMarketAppendixMode(it_mode->second.GetString());
+      model->market_appendix_mode_ = mode_found;
+    }
+
+    auto it_hash = dict.find("feature_schema_sha256");
+    if (it_hash != dict.end() && it_hash->second.IsString()) {
+      feature_schema_sha = it_hash->second.GetString();
+    }
+  }
+
   torch::serialize::InputArchive s_arch_check;
   const bool checkpoint_has_scorer = archive.try_read("semantic_scorer", s_arch_check);
-  if (checkpoint_has_scorer && (!model->with_semantic_scorer_ || !model->semantic_scorer_)) {
-    SpielFatalError("LoadModelCheckpointRobust: Checkpoint at " + path +
-                    " contains a trained semantic scorer, but the model was "
-                    "instantiated without with_semantic_scorer=true.");
+
+  if (checkpoint_has_scorer) {
+    if (!sidecar_found) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint at " + path +
+                      " contains trained semantic scorer, but sidecar JSON is missing: " + json_path);
+    }
+    if (sds_found.empty()) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                      " contains semantic_scorer module but sidecar has missing or invalid semantic_descriptor_schema");
+    }
+    if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint at " + path +
+                      " contains a trained semantic scorer, but the model was "
+                      "instantiated without with_semantic_scorer=true.");
+    }
   }
+
+  if (dune_imperium::IsExtendedInformationStateSize(expected_input_dim)) {
+    if (!sidecar_found) {
+      SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires valid sidecar metadata: " + path);
+    }
+    if (mode_found == dune_imperium::MarketAppendixMode::kNone) {
+      SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires explicit market_appendix_mode: " + path);
+    }
+    const auto schema = dune_imperium::GetInformationStateSchema(mode_found);
+    if (expected_input_dim != schema.size) {
+      SpielFatalError("LoadModelCheckpointRobust: Input dimension mismatch with schema in " + path);
+    }
+    if (!feature_schema_sha.empty() && feature_schema_sha != schema.sha256) {
+      SpielFatalError("LoadModelCheckpointRobust: Invalid feature_schema_sha256 in " + path);
+    }
+  }
+
+  if (expected_input_dim == dune_imperium::kExpandedInformationStateSize) {
+    if (mode_found != dune_imperium::MarketAppendixMode::kZeros &&
+        mode_found != dune_imperium::MarketAppendixMode::kOrderedMarket) {
+      SpielFatalError("LoadModelCheckpointRobust: Ambiguous 6,215 checkpoint requires explicit market_appendix_mode ('zeros' or 'ordered_market'): " + path);
+    }
+  }
+
+  if (expected_input_dim == dune_imperium::kFullPublicInformationStateSize) {
+    if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV3) {
+      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires market_appendix_mode='full_public_information_v3': " + path);
+    }
+    if (!checkpoint_has_scorer) {
+      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires trained semantic scorer: " + path);
+    }
+    if (sds_found != dune_semantic::kDescriptorSchemaVersionV3) {
+      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires semantic_descriptor_schema='semantic_action_v3': " + path);
+    }
+    if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
+      SpielFatalError("LoadModelCheckpointRobust: 9182 model requires with_semantic_scorer=true: " + path);
+    }
+  }
+
   if (model->with_semantic_scorer_ && model->semantic_scorer_) {
     torch::serialize::InputArchive s_arch;
     if (archive.try_read("semantic_scorer", s_arch)) {
-      model->semantic_scorer_->load(s_arch);
+      model->semantic_scorer_->Load(s_arch, model->semantic_descriptor_schema_);
     }
   }
 }
@@ -382,6 +514,351 @@ inline bool CheckpointHasSemanticScorer(const std::string& path, torch::Device d
   } catch (...) {
     return false;
   }
+}
+
+inline std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    double lr = 2.5e-4, double weight_decay = 0.0,
+    double policy_weight_decay = 0.0) {
+  std::vector<torch::Tensor> policy_params;
+  std::vector<torch::Tensor> other_params;
+  std::vector<torch::Tensor> aux_head_params;
+
+  auto policy_params_set = model->policy_head->parameters();
+  std::vector<torch::Tensor> aux_params_set;
+  if (model->has_aux_heads_) {
+    for (auto& p : model->final_vp_head->parameters()) aux_params_set.push_back(p);
+    for (auto& p : model->terminal_round_head->parameters()) aux_params_set.push_back(p);
+    for (auto& p : model->next_own_action_head->parameters()) aux_params_set.push_back(p);
+  }
+  for (auto& param : model->parameters()) {
+    bool is_policy = false;
+    for (auto& policy_param : policy_params_set) {
+      if (param.is_same(policy_param)) { is_policy = true; break; }
+    }
+    bool is_aux = false;
+    for (auto& aux_param : aux_params_set) {
+      if (param.is_same(aux_param)) { is_aux = true; break; }
+    }
+    if (is_policy) policy_params.push_back(param);
+    else if (is_aux) aux_head_params.push_back(param);
+    else other_params.push_back(param);
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> groups;
+  groups.emplace_back(policy_params);
+  groups.emplace_back(other_params);
+  if (model->has_aux_heads_) {
+    groups.emplace_back(aux_head_params);
+  }
+  auto optimizer = std::make_unique<torch::optim::AdamW>(
+      groups, torch::optim::AdamWOptions(lr).eps(1e-5));
+  static_cast<torch::optim::AdamWOptions&>(
+      optimizer->param_groups()[0].options()).weight_decay(policy_weight_decay);
+  static_cast<torch::optim::AdamWOptions&>(
+      optimizer->param_groups()[1].options()).weight_decay(weight_decay);
+  if (model->has_aux_heads_) {
+    static_cast<torch::optim::AdamWOptions&>(
+        optimizer->param_groups()[2].options()).weight_decay(0.0);
+  }
+  return optimizer;
+}
+
+inline bool LoadOptimizerCheckpointMigrating(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer, const std::string& path,
+    torch::Device device, double lr = 2.5e-4) {
+  torch::serialize::InputArchive archive;
+  try {
+    archive.load_from(path, device);
+  } catch (const c10::Error& e) {
+    return false;
+  }
+
+  torch::serialize::InputArchive pg_archive;
+  size_t ckpt_num_groups = 0;
+  std::vector<int64_t> group_param_counts;
+  if (archive.try_read("param_groups", pg_archive)) {
+    while (true) {
+      std::string g_name = c10::to_string(ckpt_num_groups);
+      std::string g_alt = "param_groups/" + g_name;
+      torch::serialize::InputArchive sub_g;
+      if (pg_archive.try_read(g_alt, sub_g) || pg_archive.try_read(g_name, sub_g)) {
+        torch::Tensor p_sz_tensor;
+        int64_t p_sz = 0;
+        if (sub_g.try_read("params/size", p_sz_tensor)) {
+          p_sz = p_sz_tensor.item<int64_t>();
+        }
+        group_param_counts.push_back(p_sz);
+        ++ckpt_num_groups;
+      } else {
+        break;
+      }
+    }
+  }
+  if (ckpt_num_groups == 0) {
+    return false;
+  }
+
+  torch::serialize::InputArchive state_archive;
+  if (!archive.try_read("state", state_archive)) {
+    return false;
+  }
+
+  const auto state_keys = state_archive.keys();
+  const size_t total_ckpt_params = state_keys.size();
+
+  int64_t ckpt_input_dim = 0;
+  const int64_t hidden_dim = model->input_layer->weight.size(0);
+  const int64_t target_input_dim = model->input_layer->weight.size(1);
+
+  for (const auto& key : state_keys) {
+    torch::serialize::InputArchive p_arch;
+    if (state_archive.try_read(key, p_arch)) {
+      torch::Tensor exp_avg;
+      if (p_arch.try_read("exp_avg", exp_avg)) {
+        if (exp_avg.dim() == 2 && exp_avg.size(0) == hidden_dim) {
+          if (exp_avg.size(1) == 5580 || exp_avg.size(1) == 6215 || exp_avg.size(1) == 9182) {
+            ckpt_input_dim = exp_avg.size(1);
+            break;
+          }
+        }
+      }
+    }
+  }
+  if (ckpt_input_dim == 0) {
+    ckpt_input_dim = target_input_dim;
+  }
+
+  bool groups_match = (ckpt_num_groups == optimizer.param_groups().size());
+  bool input_dim_matches = (ckpt_input_dim == target_input_dim);
+  bool params_match = true;
+  if (groups_match) {
+    for (size_t g = 0; g < ckpt_num_groups; ++g) {
+      if (g < group_param_counts.size() &&
+          group_param_counts[g] != static_cast<int64_t>(optimizer.param_groups()[g].params().size())) {
+        params_match = false;
+        break;
+      }
+    }
+  } else {
+    params_match = false;
+  }
+
+  if (groups_match && input_dim_matches && params_match) {
+    return false;
+  }
+
+  const int num_blocks = static_cast<int>(model->res_blocks.size());
+  const bool use_nonlinear = model->use_nonlinear_value_head_;
+  const size_t base_torso_params = 2 + (num_blocks * 8) + (use_nonlinear ? 4 : 2);
+  const size_t policy_params_count = model->policy_head->bias.defined() ? 2 : 1;
+  const size_t aux_params_count = 6;
+
+  bool source_has_aux = (ckpt_num_groups >= 3);
+  bool source_has_scorer = false;
+  bool source_has_scorer_ext = false;
+
+  int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
+  if (ckpt_torso_params >= static_cast<int64_t>(base_torso_params + 18)) {
+    source_has_scorer = true;
+    source_has_scorer_ext = true;
+  } else if (ckpt_torso_params >= static_cast<int64_t>(base_torso_params + 16)) {
+    source_has_scorer = true;
+    source_has_scorer_ext = false;
+  } else {
+    source_has_scorer = false;
+    source_has_scorer_ext = false;
+  }
+
+  std::vector<torch::Tensor> src_policy_params;
+  src_policy_params.push_back(torch::zeros_like(model->policy_head->weight, device));
+  if (model->policy_head->bias.defined()) {
+    src_policy_params.push_back(torch::zeros_like(model->policy_head->bias, device));
+  }
+
+  std::vector<torch::Tensor> src_other_params;
+  torch::Tensor src_input_w = torch::zeros({model->input_layer->weight.size(0), ckpt_input_dim}, device);
+  src_other_params.push_back(src_input_w);
+  if (model->input_layer->bias.defined()) {
+    src_other_params.push_back(torch::zeros_like(model->input_layer->bias, device));
+  }
+
+  for (size_t b = 0; b < model->res_blocks.size(); ++b) {
+    for (auto& p : model->res_blocks[b]->parameters()) {
+      src_other_params.push_back(torch::zeros_like(p, device));
+    }
+  }
+
+  for (auto& p : model->value_head->parameters()) {
+    src_other_params.push_back(torch::zeros_like(p, device));
+  }
+  if (use_nonlinear && model->value_head2) {
+    for (auto& p : model->value_head2->parameters()) {
+      src_other_params.push_back(torch::zeros_like(p, device));
+    }
+  }
+
+  if (source_has_scorer && model->with_semantic_scorer_ && model->semantic_scorer_) {
+    auto add_module_params = [&](auto& mod) {
+      for (auto& p : mod->parameters()) {
+        src_other_params.push_back(torch::zeros_like(p, device));
+      }
+    };
+    add_module_params(model->semantic_scorer_->card_embedding);
+    add_module_params(model->semantic_scorer_->space_embedding);
+    add_module_params(model->semantic_scorer_->desc_proj);
+    add_module_params(model->semantic_scorer_->desc_ln);
+    add_module_params(model->semantic_scorer_->trunk_proj);
+    add_module_params(model->semantic_scorer_->trunk_ln);
+    add_module_params(model->semantic_scorer_->mlp1);
+    add_module_params(model->semantic_scorer_->mlp1_ln);
+    add_module_params(model->semantic_scorer_->out_layer);
+    if (source_has_scorer_ext) {
+      for (auto& p : model->semantic_scorer_->out_layer_ext->parameters()) {
+        src_other_params.push_back(torch::zeros_like(p, device));
+      }
+    }
+  }
+
+  std::vector<torch::Tensor> src_aux_params;
+  if (source_has_aux) {
+    const int64_t action_dim = model->policy_head->weight.size(0);
+    src_aux_params = {
+        torch::zeros({1, hidden_dim}, device),
+        torch::zeros({1}, device),
+        torch::zeros({3, hidden_dim}, device),
+        torch::zeros({3}, device),
+        torch::zeros({action_dim, hidden_dim}, device),
+        torch::zeros({action_dim}, device)};
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> src_groups;
+  src_groups.emplace_back(src_policy_params);
+  src_groups.emplace_back(src_other_params);
+  if (source_has_aux) {
+    src_groups.emplace_back(src_aux_params);
+  }
+
+  torch::optim::AdamW src_optimizer(
+      src_groups,
+      torch::optim::AdamWOptions(lr).eps(1e-5));
+
+  try {
+    torch::load(src_optimizer, path, device);
+  } catch (const c10::Error& e) {
+    std::cerr << "[MIGRATION ERROR] Temporary source optimizer torch::load failed: " << e.msg() << std::endl;
+    return false;
+  }
+
+  int moved = 0;
+  auto move_state = [&](const torch::Tensor& src_t, const torch::Tensor& dst_t) {
+    auto src_key = src_t.unsafeGetTensorImpl();
+    auto it = src_optimizer.state().find(src_key);
+    if (it != src_optimizer.state().end()) {
+      optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(it->second);
+      ++moved;
+      return true;
+    }
+    return false;
+  };
+
+  move_state(src_policy_params[0], model->policy_head->weight);
+  if (model->policy_head->bias.defined() && src_policy_params.size() > 1) {
+    move_state(src_policy_params[1], model->policy_head->bias);
+  }
+
+  {
+    auto src_key = src_input_w.unsafeGetTensorImpl();
+    auto it = src_optimizer.state().find(src_key);
+    if (it != src_optimizer.state().end()) {
+      auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(it->second.get());
+      if (adam_state && adam_state->exp_avg().defined()) {
+        const int64_t old_cols = adam_state->exp_avg().size(1);
+        const int64_t new_cols = model->input_layer->weight.size(1);
+        if (old_cols < new_cols) {
+          torch::Tensor new_exp_avg = torch::zeros(
+              {adam_state->exp_avg().size(0), new_cols}, adam_state->exp_avg().options());
+          new_exp_avg.slice(1, 0, old_cols).copy_(adam_state->exp_avg());
+          adam_state->exp_avg() = new_exp_avg;
+
+          torch::Tensor new_exp_avg_sq = torch::zeros(
+              {adam_state->exp_avg_sq().size(0), new_cols}, adam_state->exp_avg_sq().options());
+          new_exp_avg_sq.slice(1, 0, old_cols).copy_(adam_state->exp_avg_sq());
+          adam_state->exp_avg_sq() = new_exp_avg_sq;
+        }
+      }
+      optimizer.state()[model->input_layer->weight.unsafeGetTensorImpl()] = std::move(it->second);
+      ++moved;
+    }
+  }
+  if (model->input_layer->bias.defined() && src_other_params.size() > 1) {
+    move_state(src_other_params[1], model->input_layer->bias);
+  }
+
+  size_t src_res_idx = 1 + (model->input_layer->bias.defined() ? 1 : 0);
+  for (size_t b = 0; b < model->res_blocks.size(); ++b) {
+    for (auto& p : model->res_blocks[b]->parameters()) {
+      move_state(src_other_params[src_res_idx++], p);
+    }
+  }
+
+  for (auto& p : model->value_head->parameters()) {
+    move_state(src_other_params[src_res_idx++], p);
+  }
+  if (use_nonlinear && model->value_head2) {
+    for (auto& p : model->value_head2->parameters()) {
+      move_state(src_other_params[src_res_idx++], p);
+    }
+  }
+
+  if (source_has_scorer && model->with_semantic_scorer_ && model->semantic_scorer_) {
+    auto move_module_params = [&](auto& mod) {
+      for (auto& p : mod->parameters()) {
+        move_state(src_other_params[src_res_idx++], p);
+      }
+    };
+    move_module_params(model->semantic_scorer_->card_embedding);
+    move_module_params(model->semantic_scorer_->space_embedding);
+    move_module_params(model->semantic_scorer_->desc_proj);
+    move_module_params(model->semantic_scorer_->desc_ln);
+    move_module_params(model->semantic_scorer_->trunk_proj);
+    move_module_params(model->semantic_scorer_->trunk_ln);
+    move_module_params(model->semantic_scorer_->mlp1);
+    move_module_params(model->semantic_scorer_->mlp1_ln);
+    move_module_params(model->semantic_scorer_->out_layer);
+    if (source_has_scorer_ext) {
+      for (auto& p : model->semantic_scorer_->out_layer_ext->parameters()) {
+        move_state(src_other_params[src_res_idx++], p);
+      }
+    }
+  }
+
+  if (source_has_aux && model->has_aux_heads_) {
+    size_t aux_i = 0;
+    for (auto& p : model->final_vp_head->parameters()) move_state(src_aux_params[aux_i++], p);
+    for (auto& p : model->terminal_round_head->parameters()) move_state(src_aux_params[aux_i++], p);
+    for (auto& p : model->next_own_action_head->parameters()) move_state(src_aux_params[aux_i++], p);
+  }
+
+  int initialized_new = 0;
+  for (auto& group : optimizer.param_groups()) {
+    for (auto& param : group.params()) {
+      auto key = param.unsafeGetTensorImpl();
+      if (optimizer.state().find(key) == optimizer.state().end()) {
+        auto new_state = std::make_unique<torch::optim::AdamWParamState>();
+        new_state->step(0);
+        new_state->exp_avg(torch::zeros_like(param, torch::MemoryFormat::Preserve));
+        new_state->exp_avg_sq(torch::zeros_like(param, torch::MemoryFormat::Preserve));
+        optimizer.state()[key] = std::move(new_state);
+        ++initialized_new;
+      }
+    }
+  }
+
+  std::cout << "[MIGRATION] Optimizer migrated from " << path << ": moved " << moved
+            << " parameter states, initialized " << initialized_new << " new parameter states." << std::endl;
+  return true;
 }
 
 struct AutocastGuard {
@@ -694,6 +1171,10 @@ public:
     }
 
     virtual EvaluatorStats GetStats() const = 0;
+    virtual bool HasSemanticScorer() const { return false; }
+    virtual std::string SemanticDescriptorSchema() const {
+        return dune_semantic::kDescriptorSchemaVersionV3;
+    }
 };
 
 class DeterministicEvaluator : public IGameEvaluator {
@@ -708,6 +1189,14 @@ public:
           sync_mutex_(sync_mutex), rollout_amp_(rollout_amp) {
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
+    }
+
+    bool HasSemanticScorer() const override {
+        return model_ != nullptr && model_->with_semantic_scorer_;
+    }
+    std::string SemanticDescriptorSchema() const override {
+        if (model_ != nullptr) return model_->semantic_descriptor_schema_;
+        return dune_semantic::kDescriptorSchemaVersionV3;
     }
 
     bool RolloutAmpForTesting() const { return rollout_amp_; }
@@ -957,6 +1446,19 @@ public:
     }
     bool RolloutAmpForTesting() const { return rollout_amp_; }
     bool AllowTf32ForTesting() const { return allow_tf32_; }
+    int64_t ModelInputDim() const { return model_input_dim_; }
+    std::shared_ptr<SharedDunePolicyValueNetImpl> Model() const { return model_; }
+    dune_imperium::MarketAppendixMode MarketMode() const {
+        if (model_ != nullptr) return model_->market_appendix_mode_;
+        return dune_imperium::MarketAppendixMode::kNone;
+    }
+    bool HasSemanticScorer() const override {
+        return model_ != nullptr && model_->with_semantic_scorer_;
+    }
+    std::string SemanticDescriptorSchema() const override {
+        if (model_ != nullptr) return model_->semantic_descriptor_schema_;
+        return dune_semantic::kDescriptorSchemaVersionV3;
+    }
 
     EvalResult Evaluate(const std::vector<float>& obs) override {
         return EvaluateWithActions(obs, nullptr);
@@ -1068,9 +1570,10 @@ public:
 
     CompactEvalResult EvaluateCompact(
         const std::vector<float>& obs,
-        const std::vector<Action>& legal_actions) {
+        const std::vector<Action>& legal_actions,
+        const dune_semantic::CandidateActionData* action_data = nullptr) {
         if (!device_.is_cuda() || device_synchronize_) {
-            EvalResult full = Evaluate(obs);
+            EvalResult full = EvaluateWithActions(obs, action_data);
             CompactEvalResult compact;
             compact.actions = legal_actions;
             std::vector<float> logits = full.logits;
@@ -1105,6 +1608,7 @@ public:
             if (requests_.empty()) first_request_ts_ = now;
             Request req;
             req.obs = &obs;
+            req.action_data = action_data;
             req.ready_flag = &ready;
             req.compact_dest = &result;
             req.legal_actions = legal_actions;
@@ -1279,7 +1783,8 @@ public:
     std::pair<std::vector<EvalResult>, CompactEvalResult>
     EvaluateBatchValuesWithCompactPrior(
         const std::vector<std::vector<float>>& observations,
-        size_t prior_index, const std::vector<Action>& legal_actions) {
+        size_t prior_index, const std::vector<Action>& legal_actions,
+        const dune_semantic::CandidateActionData* action_data = nullptr) {
         std::vector<EvalResult> results(observations.size());
         CompactEvalResult compact;
         if (observations.empty() || prior_index >= observations.size()) {
@@ -1303,6 +1808,7 @@ public:
                 if (i == prior_index) {
                     req.compact_dest = &compact;
                     req.legal_actions = legal_actions;
+                    req.action_data = action_data;
                 }
                 req.group_id = gid;
                 req.group_size = gsize;
@@ -2294,16 +2800,47 @@ private:
             size_t action_dim = pred_logits.size(1);
 
             for (size_t i = 0; i < batch_size; ++i) {
-                batch[i].result_dest->logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
-                batch[i].result_dest->value = values_ptr[i];
+                if (batch[i].result_dest != nullptr) {
+                    batch[i].result_dest->logits.assign(logits_ptr + i * action_dim, logits_ptr + (i + 1) * action_dim);
+                    batch[i].result_dest->value = values_ptr[i];
 
-                if (emit_batch_membership_) {
-                    batch[i].result_dest->physical_batch_id =
-                        membership_batch_id;
-                    batch[i].result_dest->physical_batch_size =
-                        static_cast<int32_t>(batch_size);
-                    batch[i].result_dest->physical_batch_row =
-                        static_cast<int32_t>(i);
+                    if (emit_batch_membership_) {
+                        batch[i].result_dest->physical_batch_id =
+                            membership_batch_id;
+                        batch[i].result_dest->physical_batch_size =
+                            static_cast<int32_t>(batch_size);
+                        batch[i].result_dest->physical_batch_row =
+                            static_cast<int32_t>(i);
+                    }
+                }
+
+                if (batch[i].compact_dest != nullptr) {
+                    batch[i].compact_dest->actions = batch[i].legal_actions;
+                    std::vector<float> row_logits(
+                        logits_ptr + i * action_dim,
+                        logits_ptr + (i + 1) * action_dim);
+                    CenterAndCapLegalLogits(row_logits, batch[i].legal_actions, logit_cap_);
+                    double max_logit = -std::numeric_limits<double>::infinity();
+                    for (Action a : batch[i].legal_actions) {
+                        if (a >= 0 && static_cast<size_t>(a) < row_logits.size()) {
+                            max_logit = std::max(max_logit, static_cast<double>(row_logits[a]));
+                        }
+                    }
+                    double sum_exp = 0.0;
+                    for (Action a : batch[i].legal_actions) {
+                        if (a >= 0 && static_cast<size_t>(a) < row_logits.size()) {
+                            sum_exp += std::exp(static_cast<double>(row_logits[a]) - max_logit);
+                        }
+                    }
+                    batch[i].compact_dest->probabilities.clear();
+                    batch[i].compact_dest->probabilities.reserve(batch[i].legal_actions.size());
+                    for (Action a : batch[i].legal_actions) {
+                        double prob = (sum_exp > 0.0)
+                                          ? (std::exp(static_cast<double>(row_logits[a]) - max_logit) / sum_exp)
+                                          : (1.0 / batch[i].legal_actions.size());
+                        batch[i].compact_dest->probabilities.push_back(static_cast<float>(prob));
+                    }
+                    batch[i].compact_dest->value = values_ptr[i];
                 }
 
                 // Set the atomic flag (fast spinning threads will catch this instantly)

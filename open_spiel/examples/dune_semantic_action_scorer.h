@@ -20,7 +20,21 @@
 namespace open_spiel {
 namespace dune_semantic {
 
-inline constexpr const char* kDescriptorSchemaVersion = "semantic_action_v2";
+inline constexpr const char* kDescriptorSchemaVersionV2 = "semantic_action_v2";
+inline constexpr const char* kDescriptorSchemaVersionV3 = "semantic_action_v3";
+inline constexpr const char* kDescriptorSchemaVersion = kDescriptorSchemaVersionV3;
+
+inline constexpr int kIntrigueCardVocabOffset = 128;
+
+enum class ActionRole : uint8_t {
+  kUnsupported = 0,
+  kPrimaryCard = 1,
+  kBoardSpace = 2,
+  kMarketPurchase = 3,
+  kIndexedIntrigue = 4,
+  kGraftSolo = 5,
+  kHundroOffer = 6,
+};
 
 inline constexpr int kCardVocabSize = 256;
 inline constexpr int kCardEmbedDim = 32;
@@ -37,6 +51,7 @@ struct CandidateActionData {
   std::vector<int64_t> card_ids;     // [num_actions] in [0, kCardVocabSize - 1]
   std::vector<int64_t> space_ids;    // [num_actions] in [0, kSpaceVocabSize - 1]
   std::vector<uint8_t> supported;    // [num_actions] 1 if supported role, 0 otherwise
+  std::vector<ActionRole> roles;     // [num_actions] ActionRole
 
   bool empty() const { return actions.empty(); }
   size_t size() const { return actions.size(); }
@@ -46,6 +61,7 @@ struct CandidateActionData {
     card_ids.clear();
     space_ids.clear();
     supported.clear();
+    roles.clear();
   }
 };
 
@@ -53,7 +69,8 @@ struct CandidateActionData {
 inline void ExtractCandidateDescriptors(
     const dune_imperium::DuneImperiumState& state,
     const std::vector<Action>& legal_actions,
-    CandidateActionData* out_data) {
+    CandidateActionData* out_data,
+    const std::string& schema_version = kDescriptorSchemaVersionV3) {
   if (out_data == nullptr) return;
   out_data->clear();
   const size_t num_acts = legal_actions.size();
@@ -62,6 +79,7 @@ inline void ExtractCandidateDescriptors(
   out_data->card_ids.assign(num_acts, 0);
   out_data->space_ids.assign(num_acts, 0);
   out_data->supported.assign(num_acts, 0);
+  out_data->roles.assign(num_acts, ActionRole::kUnsupported);
 
   const Player cur_player = state.CurrentPlayer();
   const int leader_id = (cur_player >= 0 && cur_player < state.NumPlayers())
@@ -79,6 +97,7 @@ inline void ExtractCandidateDescriptors(
       out_data->card_ids[i] = std::clamp(card_id, 0, kCardVocabSize - 1);
       out_data->space_ids[i] = 0;
       out_data->supported[i] = 1;
+      out_data->roles[i] = ActionRole::kPrimaryCard;
 
       // Role one-hot
       f[1] = 1.0f; // is_primary_card
@@ -116,6 +135,7 @@ inline void ExtractCandidateDescriptors(
       out_data->card_ids[i] = 0;
       out_data->space_ids[i] = std::clamp(space->board_index, 0, kSpaceVocabSize - 1);
       out_data->supported[i] = 1;
+      out_data->roles[i] = ActionRole::kBoardSpace;
 
       // Role one-hot
       f[2] = 1.0f; // is_board_space
@@ -169,6 +189,7 @@ inline void ExtractCandidateDescriptors(
       const int slot = action - dune_imperium::kActionBuyImperiumRow0;
       out_data->space_ids[i] = 0;
       out_data->supported[i] = 1;
+      out_data->roles[i] = ActionRole::kMarketPurchase;
 
       // Role one-hot
       f[3] = 1.0f; // is_market_purchase
@@ -213,45 +234,112 @@ inline void ExtractCandidateDescriptors(
     // 4. Indexed Intrigue Choices (actions 700..719)
     if (action >= dune_imperium::kActionIntrigueChoiceTrashIntrigue0 &&
         action < dune_imperium::kActionIntrigueChoiceTrashIntrigue0 + 20) {
-      const int idx = action - dune_imperium::kActionIntrigueChoiceTrashIntrigue0;
-      f[0] = 1.0f;
-      out_data->space_ids[i] = 0;
-      out_data->supported[i] = 0;
-      if (cur_player >= 0 && cur_player < state.NumPlayers()) {
-        const auto& hand = state.GetIntrigueHandForTesting(cur_player);
-        if (idx >= 0 && idx < static_cast<int>(hand.size())) {
-          out_data->card_ids[i] = hand[idx] + 1;
+      if (schema_version != kDescriptorSchemaVersionV2) {
+        const int idx = action - dune_imperium::kActionIntrigueChoiceTrashIntrigue0;
+        out_data->space_ids[i] = 0;
+        if (cur_player >= 0 && cur_player < state.NumPlayers()) {
+          const auto& hand = state.GetIntrigueHandForTesting(cur_player);
+          if (idx >= 0 && idx < static_cast<int>(hand.size())) {
+            const int c = hand[idx];
+            out_data->card_ids[i] = (c >= 0 && c < 64) ? (kIntrigueCardVocabOffset + c) : 0;
+            out_data->supported[i] = 1;
+            out_data->roles[i] = ActionRole::kIndexedIntrigue;
+            f[0] = 0.0f;
+          } else {
+            out_data->card_ids[i] = 0;
+            out_data->supported[i] = 0;
+            out_data->roles[i] = ActionRole::kUnsupported;
+            f[0] = 1.0f;
+          }
         } else {
           out_data->card_ids[i] = 0;
+          out_data->supported[i] = 0;
+          out_data->roles[i] = ActionRole::kUnsupported;
+          f[0] = 1.0f;
         }
       } else {
         out_data->card_ids[i] = 0;
+        out_data->space_ids[i] = 0;
+        out_data->supported[i] = 0;
+        out_data->roles[i] = ActionRole::kUnsupported;
+        f[0] = 1.0f;
       }
       continue;
     }
 
     // 5. Graft Primary Identity on Solo Agent Play
     if (action == dune_imperium::kActionPlayAgentSolo) {
-      f[0] = 1.0f;
-      out_data->card_ids[i] = state.GetPendingGraftPrimaryId();
-      out_data->space_ids[i] = 0;
-      out_data->supported[i] = 0;
+      if (schema_version != kDescriptorSchemaVersionV2) {
+        const int primary = state.GetPendingGraftPrimaryId();
+        out_data->space_ids[i] = 0;
+        if (primary != dune_imperium::kInvalidCard && primary >= 0 && primary < kCardVocabSize) {
+          out_data->card_ids[i] = primary;
+          out_data->supported[i] = 1;
+          out_data->roles[i] = ActionRole::kGraftSolo;
+          f[0] = 0.0f;
+        } else {
+          out_data->card_ids[i] = 0;
+          out_data->supported[i] = 0;
+          out_data->roles[i] = ActionRole::kUnsupported;
+          f[0] = 1.0f;
+        }
+      } else {
+        out_data->card_ids[i] = 0;
+        out_data->space_ids[i] = 0;
+        out_data->supported[i] = 0;
+        out_data->roles[i] = ActionRole::kUnsupported;
+        f[0] = 1.0f;
+      }
       continue;
     }
 
     // 6. Hundro Setup Mode A/B Offers
     if (state.GetPendingHundroSetupPlayer() == cur_player) {
       if (action == dune_imperium::kActionIntrigueChoiceModeA) {
-        f[0] = 1.0f;
-        out_data->card_ids[i] = state.GetPendingHundroSetupCard(0) + 1;
-        out_data->space_ids[i] = 0;
-        out_data->supported[i] = 0;
+        if (schema_version != kDescriptorSchemaVersionV2) {
+          const int c = state.GetPendingHundroSetupCard(0);
+          out_data->space_ids[i] = 0;
+          if (c != dune_imperium::kInvalidCard && c >= 0 && c < 64) {
+            out_data->card_ids[i] = kIntrigueCardVocabOffset + c;
+            out_data->supported[i] = 1;
+            out_data->roles[i] = ActionRole::kHundroOffer;
+            f[0] = 0.0f;
+          } else {
+            out_data->card_ids[i] = 0;
+            out_data->supported[i] = 0;
+            out_data->roles[i] = ActionRole::kUnsupported;
+            f[0] = 1.0f;
+          }
+        } else {
+          out_data->card_ids[i] = 0;
+          out_data->space_ids[i] = 0;
+          out_data->supported[i] = 0;
+          out_data->roles[i] = ActionRole::kUnsupported;
+          f[0] = 1.0f;
+        }
         continue;
       } else if (action == dune_imperium::kActionIntrigueChoiceModeB) {
-        f[0] = 1.0f;
-        out_data->card_ids[i] = state.GetPendingHundroSetupCard(1) + 1;
-        out_data->space_ids[i] = 0;
-        out_data->supported[i] = 0;
+        if (schema_version != kDescriptorSchemaVersionV2) {
+          const int c = state.GetPendingHundroSetupCard(1);
+          out_data->space_ids[i] = 0;
+          if (c != dune_imperium::kInvalidCard && c >= 0 && c < 64) {
+            out_data->card_ids[i] = kIntrigueCardVocabOffset + c;
+            out_data->supported[i] = 1;
+            out_data->roles[i] = ActionRole::kHundroOffer;
+            f[0] = 0.0f;
+          } else {
+            out_data->card_ids[i] = 0;
+            out_data->supported[i] = 0;
+            out_data->roles[i] = ActionRole::kUnsupported;
+            f[0] = 1.0f;
+          }
+        } else {
+          out_data->card_ids[i] = 0;
+          out_data->space_ids[i] = 0;
+          out_data->supported[i] = 0;
+          out_data->roles[i] = ActionRole::kUnsupported;
+          f[0] = 1.0f;
+        }
         continue;
       }
     }
@@ -261,6 +349,7 @@ inline void ExtractCandidateDescriptors(
     out_data->card_ids[i] = 0;
     out_data->space_ids[i] = 0;
     out_data->supported[i] = 0;
+    out_data->roles[i] = ActionRole::kUnsupported;
   }
 }
 
@@ -278,6 +367,7 @@ struct SemanticActionScorerImpl : torch::nn::Module {
   torch::nn::Linear mlp1{nullptr};
   torch::nn::LayerNorm mlp1_ln{nullptr};
   torch::nn::Linear out_layer{nullptr};
+  torch::nn::Linear out_layer_ext{nullptr};
 
   SemanticActionScorerImpl() {
     card_embedding = register_module(
@@ -298,15 +388,61 @@ struct SemanticActionScorerImpl : torch::nn::Module {
         "mlp1_ln", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kScorerHiddenDim})));
     out_layer = register_module(
         "out_layer", torch::nn::Linear(kScorerHiddenDim, 1));
+    out_layer_ext = register_module(
+        "out_layer_ext", torch::nn::Linear(kScorerHiddenDim, 1));
 
-    // Initialize the final output layer to zero so initial corrections are exactly 0.0.
+    // Initialize the final output layers to zero so initial corrections are exactly 0.0.
     {
       torch::NoGradGuard no_grad;
       out_layer->weight.zero_();
       if (out_layer->bias.defined()) {
         out_layer->bias.zero_();
       }
+      out_layer_ext->weight.zero_();
+      if (out_layer_ext->bias.defined()) {
+        out_layer_ext->bias.zero_();
+      }
     }
+  }
+
+  void Load(torch::serialize::InputArchive& archive,
+            const std::string& schema_version = kDescriptorSchemaVersionV3) {
+    auto read_child = [&](const std::string& name, auto& module) {
+      torch::serialize::InputArchive child;
+      if (!archive.try_read(name, child)) {
+        SpielFatalError("SemanticActionScorer: missing required submodule '" + name + "'");
+      }
+      module->load(child);
+    };
+
+    read_child("card_embedding", card_embedding);
+    read_child("space_embedding", space_embedding);
+    read_child("desc_proj", desc_proj);
+    read_child("desc_ln", desc_ln);
+    read_child("trunk_proj", trunk_proj);
+    read_child("trunk_ln", trunk_ln);
+    read_child("mlp1", mlp1);
+    read_child("mlp1_ln", mlp1_ln);
+    read_child("out_layer", out_layer);
+
+    torch::serialize::InputArchive ext_arch;
+    if (archive.try_read("out_layer_ext", ext_arch)) {
+      out_layer_ext->load(ext_arch);
+    } else {
+      if (schema_version == kDescriptorSchemaVersionV2) {
+        torch::NoGradGuard no_grad;
+        out_layer_ext->weight.zero_();
+        if (out_layer_ext->bias.defined()) {
+          out_layer_ext->bias.zero_();
+        }
+      } else {
+        SpielFatalError("SemanticActionScorer: missing required submodule 'out_layer_ext' in v3 checkpoint");
+      }
+    }
+  }
+
+  void load(torch::serialize::InputArchive& archive) {
+    Load(archive, kDescriptorSchemaVersionV3);
   }
 
   // Forward computation: adds corrections directly to inout_logits at the specified positions.
@@ -318,7 +454,8 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       const torch::Tensor& card_ids,         // [M]
       const torch::Tensor& space_ids,        // [M]
       const torch::Tensor& supported_mask,   // [M]
-      torch::Tensor& inout_logits) {         // [B, 2391]
+      torch::Tensor& inout_logits,           // [B, 2391]
+      const torch::Tensor& is_ext_mask = torch::Tensor()) {
     if (batch_indices.numel() == 0 || feat_tensor.numel() == 0) {
       return;
     }
@@ -333,8 +470,16 @@ struct SemanticActionScorerImpl : torch::nn::Module {
 
     auto z = torch::cat({h_gathered, d_p}, -1);                            // [M, 512]
     auto u = torch::relu(mlp1_ln->forward(mlp1->forward(z)));              // [M, 256]
-    auto raw_corr = out_layer->forward(u).squeeze(-1);                     // [M]
-    auto corr = (raw_corr * supported_mask).to(inout_logits.dtype());                                 // [M]
+    
+    auto legacy_corr = out_layer->forward(u).squeeze(-1);                  // [M]
+    auto ext_corr = out_layer_ext->forward(u).squeeze(-1);                 // [M]
+    torch::Tensor raw_corr;
+    if (is_ext_mask.defined() && is_ext_mask.numel() > 0) {
+      raw_corr = torch::where(is_ext_mask, ext_corr, legacy_corr);
+    } else {
+      raw_corr = legacy_corr;
+    }
+    auto corr = (raw_corr * supported_mask).to(inout_logits.dtype());      // [M]
 
     // Out-of-place index_put preserves autograd graph for backward passes.
     inout_logits = inout_logits.index_put({batch_indices, action_indices},
@@ -363,6 +508,7 @@ inline void ApplySemanticScorerBatch(
   std::vector<int64_t> card_ids;
   std::vector<int64_t> space_ids;
   std::vector<float> supported;
+  std::vector<uint8_t> is_ext;
 
   batch_indices.reserve(total_cands);
   action_indices.reserve(total_cands);
@@ -370,6 +516,7 @@ inline void ApplySemanticScorerBatch(
   card_ids.reserve(total_cands);
   space_ids.reserve(total_cands);
   supported.reserve(total_cands);
+  is_ext.reserve(total_cands);
 
   for (size_t b = 0; b < batch_actions.size(); ++b) {
     const auto* data = batch_actions[b];
@@ -381,6 +528,13 @@ inline void ApplySemanticScorerBatch(
       card_ids.push_back(data->card_ids[j]);
       space_ids.push_back(data->space_ids[j]);
       supported.push_back(data->supported[j] ? 1.0f : 0.0f);
+      bool ext = false;
+      if (j < data->roles.size()) {
+        ext = (data->roles[j] == ActionRole::kIndexedIntrigue ||
+               data->roles[j] == ActionRole::kGraftSolo ||
+               data->roles[j] == ActionRole::kHundroOffer);
+      }
+      is_ext.push_back(ext ? 1 : 0);
     }
     features.insert(features.end(), data->features.begin(), data->features.end());
   }
@@ -393,11 +547,12 @@ inline void ApplySemanticScorerBatch(
   torch::Tensor c_t = torch::tensor(card_ids, opts_i64);
   torch::Tensor s_t = torch::tensor(space_ids, opts_i64);
   torch::Tensor supp_t = torch::tensor(supported, opts_f32);
+  torch::Tensor is_ext_t = torch::tensor(is_ext, torch::TensorOptions().dtype(torch::kUInt8).device(device)).to(torch::kBool);
   torch::Tensor feat_t = torch::tensor(features, torch::TensorOptions().dtype(torch::kFloat32))
                              .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(kSemanticFeatDim)})
                              .to(device);
 
-  scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits);
+  scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t);
 }
 
 #endif // OPEN_SPIEL_BUILD_WITH_LIBTORCH
