@@ -43,10 +43,11 @@ namespace action_value_study {
 // ===========================================================================
 // Domain and Stream Constants for Strict Domain Separation
 // ===========================================================================
-constexpr uint64_t kDomainPilot = 0x00A1;
-constexpr uint64_t kDomainTrain = 0x00A2;
-constexpr uint64_t kDomainDev   = 0x00A3;
-constexpr uint64_t kDomainTest  = 0x00A4;
+constexpr uint64_t kDomainPilot   = 0x00A1;
+constexpr uint64_t kDomainTrain   = 0x00A2;
+constexpr uint64_t kDomainDev     = 0x00A3;
+constexpr uint64_t kDomainTest    = 0x00A4;
+constexpr uint64_t kDomainConfirm = 0x00A5;
 
 constexpr uint64_t kStreamSourceGame              = 0x0011;
 constexpr uint64_t kStreamCandidateActionSample   = 0x0051;
@@ -83,11 +84,13 @@ inline constexpr int kCriticEvalIntervalEpochs = 5;
 inline constexpr int kRootsTrain = 2048;
 inline constexpr int kRootsDev = 256;
 inline constexpr int kRootsTest = 512;
+inline constexpr int kRootsConfirm = 512;
 inline constexpr int kRootsTotal = kRootsTrain + kRootsDev + kRootsTest; // 2816
 
 inline constexpr int kContinuationsTrain = 16;
 inline constexpr int kContinuationsDev = 32;
 inline constexpr int kContinuationsTest = 64;
+inline constexpr int kContinuationsConfirm = 64;
 
 inline constexpr double kUtilityDivisor = 4.0;
 inline constexpr int kBootstrapResamples = 10000;
@@ -109,15 +112,17 @@ enum class Partition {
   kPilot,
   kTrain,
   kDev,
-  kTest
+  kTest,
+  kConfirm
 };
 
 inline const char* PartitionToString(Partition p) {
   switch (p) {
-    case Partition::kPilot: return "pilot";
-    case Partition::kTrain: return "train";
-    case Partition::kDev:   return "dev";
-    case Partition::kTest:  return "test";
+    case Partition::kPilot:   return "pilot";
+    case Partition::kTrain:   return "train";
+    case Partition::kDev:     return "dev";
+    case Partition::kTest:    return "test";
+    case Partition::kConfirm: return "confirm";
   }
   return "unknown";
 }
@@ -127,15 +132,17 @@ inline Partition StringToPartition(const std::string& str) {
   if (str == "train") return Partition::kTrain;
   if (str == "dev") return Partition::kDev;
   if (str == "test") return Partition::kTest;
+  if (str == "confirm") return Partition::kConfirm;
   SpielFatalError("Unknown partition: " + str);
 }
 
 inline uint64_t PartitionDomain(Partition p) {
   switch (p) {
-    case Partition::kPilot: return kDomainPilot;
-    case Partition::kTrain: return kDomainTrain;
-    case Partition::kDev:   return kDomainDev;
-    case Partition::kTest:  return kDomainTest;
+    case Partition::kPilot:   return kDomainPilot;
+    case Partition::kTrain:   return kDomainTrain;
+    case Partition::kDev:     return kDomainDev;
+    case Partition::kTest:    return kDomainTest;
+    case Partition::kConfirm: return kDomainConfirm;
   }
   return 0;
 }

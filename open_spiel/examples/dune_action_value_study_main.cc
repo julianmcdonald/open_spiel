@@ -15,6 +15,10 @@
 
 ABSL_FLAG(std::string, phase, "all", "Execution phase: all, verify, pilot, corpus, rollout_train_dev, train, rollout_test, evaluate");
 ABSL_FLAG(std::string, output_dir, "", "Output directory on Storage");
+ABSL_FLAG(std::string, corpus_dir, "", "Corpus directory to read roots and continuations from");
+ABSL_FLAG(std::string, critic_m_path, "/run/media/warcr/Storage/dune_drl_runtime/round7/action_conditioned_critic_offline_20260911_130503/checkpoints/critic_m_epoch_005.pt", "Frozen Critic M checkpoint");
+ABSL_FLAG(std::string, critic_s_path, "/run/media/warcr/Storage/dune_drl_runtime/round7/action_conditioned_critic_offline_20260911_130503/checkpoints/critic_s_epoch_005.pt", "Frozen Critic S checkpoint");
+ABSL_FLAG(std::string, previous_corpus_path, "/run/media/warcr/Storage/dune_drl_runtime/round7/action_value_learnability_20260911_112329/corpus_roots.jsonl", "Previous corpus roots for overlap checking");
 ABSL_FLAG(std::string, model_path, open_spiel::action_value_study::kActorModelPathDefault, "Frozen actor model checkpoint");
 ABSL_FLAG(int, threads, 64, "Number of worker threads");
 ABSL_FLAG(int, eval_batch_size, 64, "BatchedEvaluator target batch size");
@@ -1662,6 +1666,1230 @@ void RunEvaluate(const std::filesystem::path& out_dir, const torch::Device& devi
   rep_f.close();
 }
 
+// ===========================================================================
+// Action-Conditioned Critic Head on Frozen u15828 Features & Privileged Input
+// ===========================================================================
+
+struct DuneActionConditionedCriticImpl : torch::nn::Module {
+  torch::nn::LayerNorm ln_h{nullptr};
+  torch::nn::LayerNorm ln_w{nullptr};
+  torch::nn::LayerNorm ln_priv{nullptr};
+  torch::nn::Linear proj_s{nullptr};
+  torch::nn::Linear proj_a{nullptr};
+  torch::nn::Linear proj_priv{nullptr};
+  torch::nn::Linear mlp1{nullptr};
+  torch::nn::Linear out{nullptr};
+
+  DuneActionConditionedCriticImpl(uint64_t init_seed = 19) {
+    // Non-trainable standardization (elementwise_affine = false, 0 trainable parameters)
+    ln_h = register_module("ln_h", torch::nn::LayerNorm(
+        torch::nn::LayerNormOptions({kActorHiddenDim}).elementwise_affine(false)));
+    ln_w = register_module("ln_w", torch::nn::LayerNorm(
+        torch::nn::LayerNormOptions({kActorHiddenDim}).elementwise_affine(false)));
+    ln_priv = register_module("ln_priv", torch::nn::LayerNorm(
+        torch::nn::LayerNormOptions({kCriticInputDim}).elementwise_affine(false)));
+
+    proj_s = register_module("proj_s", torch::nn::Linear(kActorHiddenDim, 128));
+    proj_a = register_module("proj_a", torch::nn::Linear(kActorHiddenDim, 128));
+    proj_priv = register_module("proj_priv", torch::nn::Linear(kCriticInputDim, 64));
+
+    // in_mlp = 128 (z_s) + 128 (z_a) + 128 (z_inter) + 64 (z_priv) + 1 (logit) + 1 (val) = 450
+    mlp1 = register_module("mlp1", torch::nn::Linear(450, 128));
+    out = register_module("out", torch::nn::Linear(128, 4));
+
+    int64_t param_count = 0;
+    for (const auto& p : parameters()) param_count += p.numel();
+    SPIEL_CHECK_EQ(param_count, 1200260);
+
+    torch::NoGradGuard no_grad;
+    at::Generator gen = dune_seed::MakeTorchCPUGenerator(init_seed);
+    auto init_linear = [&](torch::nn::Linear& layer, double scale) {
+      const double bound = 1.0 / std::sqrt(layer->weight.size(1));
+      layer->weight.uniform_(-bound, bound, gen);
+      layer->weight.mul_(scale);
+      if (layer->bias.defined()) layer->bias.zero_();
+    };
+    init_linear(proj_s, 1.0);
+    init_linear(proj_a, 1.0);
+    init_linear(proj_priv, 1.0);
+    init_linear(mlp1, 1.0);
+    init_linear(out, 0.01);
+  }
+
+  torch::Tensor Forward(
+      const torch::Tensor& h,
+      const torch::Tensor& w,
+      const torch::Tensor& priv,
+      const torch::Tensor& logit,
+      const torch::Tensor& val) {
+    auto z_s = proj_s->forward(ln_h->forward(h));
+    auto z_a = proj_a->forward(ln_w->forward(w));
+    auto z_priv = torch::relu(proj_priv->forward(ln_priv->forward(priv)));
+    auto z_inter = z_s * z_a;
+    auto z_all = torch::cat({z_s, z_a, z_inter, z_priv, logit, val}, /*dim=*/-1);
+    auto hidden = torch::relu(mlp1->forward(z_all));
+    return out->forward(hidden);
+  }
+};
+TORCH_MODULE(DuneActionConditionedCritic);
+
+struct ActionCandidateData {
+  Action action = kInvalidAction;
+  std::vector<float> w_a; // 2048
+  float logit = 0.0f;
+  std::array<double, 4> s_target{}; // for train: rep 0
+  std::array<double, 4> m_target{}; // for train: 16-rep mean
+  std::array<double, 4> dev_target{}; // for dev: 32-rep mean
+};
+
+struct ExtractedRootData {
+  std::string root_id;
+  Player acting_player = 0;
+  int round = 0;
+  std::vector<float> h_s; // 2048
+  float v_s = 0.0f; // tanh(value_head(h_s))
+  std::vector<float> priv_9647; // 9647
+  std::vector<ActionCandidateData> candidates;
+};
+
+void RunOfflineFrozenFeatureCritic(
+    const std::shared_ptr<const Game>& game,
+    const std::filesystem::path& corpus_dir,
+    const std::filesystem::path& out_dir,
+    const torch::Device& device) {
+  std::cout << "\n=======================================================\n";
+  std::cout << "PHASE: Offline Frozen-Feature Action-Conditioned Critic\n";
+  std::cout << "=======================================================\n";
+  std::cout << "Corpus directory : " << corpus_dir << std::endl;
+  std::cout << "Output directory : " << out_dir << std::endl;
+
+  std::filesystem::path roots_path = corpus_dir / "corpus_roots.jsonl";
+  std::filesystem::path conts_path = corpus_dir / "train_dev_continuations.jsonl";
+
+  if (!std::filesystem::exists(roots_path)) {
+    SpielFatalError("Roots file missing: " + roots_path.string());
+  }
+  if (!std::filesystem::exists(conts_path)) {
+    SpielFatalError("Continuations file missing: " + conts_path.string());
+  }
+
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
+  std::cout << "Loading corpus roots and continuations...\n";
+  auto roots = LoadCorpusRoots(roots_path);
+  auto continuations = LoadContinuations(conts_path);
+
+  std::vector<RootRecord> train_roots;
+  std::vector<RootRecord> dev_roots;
+  for (auto& r : roots) {
+    if (r.partition == Partition::kTrain) train_roots.push_back(std::move(r));
+    else if (r.partition == Partition::kDev) dev_roots.push_back(std::move(r));
+  }
+  SPIEL_CHECK_EQ(train_roots.size(), kRootsTrain); // 2048
+  SPIEL_CHECK_EQ(dev_roots.size(), kRootsDev); // 256
+  std::cout << absl::StrFormat("Loaded %d train roots and %d dev roots.\n",
+                               train_roots.size(), dev_roots.size());
+
+  auto extract_root = [&](const RootRecord& r, bool is_dev) -> ExtractedRootData {
+    ExtractedRootData data;
+    data.root_id = r.root_id;
+    data.acting_player = r.acting_player;
+    data.round = r.round;
+    data.priv_9647 = r.critic_input_9647;
+
+    auto state = ReconstructState(game, r.history);
+    std::vector<float> obs(kActorInputDim, 0.0f);
+    state->InformationStateTensor(r.acting_player, absl::MakeSpan(obs));
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor obs_tensor = torch::from_blob(
+        obs.data(), {1, kActorInputDim}, torch::kFloat32).clone().to(device);
+    torch::Tensor h_tensor = g_actor_model->Trunk(obs_tensor);
+    torch::Tensor v_raw = g_actor_model->value_head->forward(h_tensor);
+    torch::Tensor v_tanh = torch::tanh(v_raw);
+
+    data.v_s = v_tanh.squeeze().item<float>();
+    data.h_s.resize(kActorHiddenDim);
+    std::memcpy(data.h_s.data(), h_tensor.to(torch::kCPU).data_ptr<float>(),
+                kActorHiddenDim * sizeof(float));
+
+    for (Action a : r.candidate_actions) {
+      ActionCandidateData cd;
+      cd.action = a;
+
+      torch::Tensor w_tensor = g_actor_model->policy_head->weight[a];
+      cd.w_a.resize(kActorHiddenDim);
+      std::memcpy(cd.w_a.data(), w_tensor.to(torch::kCPU).data_ptr<float>(),
+                  kActorHiddenDim * sizeof(float));
+
+      float bias_a = g_actor_model->policy_head->bias.defined() ?
+          g_actor_model->policy_head->bias[a].item<float>() : 0.0f;
+      cd.logit = (torch::dot(h_tensor.squeeze(0), w_tensor.to(device)) + bias_a).item<float>();
+
+      const auto& reps = continuations.at({r.root_id, a});
+      if (!is_dev) {
+        SPIEL_CHECK_EQ(reps.size(), kContinuationsTrain);
+        const ContinuationRecord* rep0 = nullptr;
+        for (const auto& cr : reps) {
+          if (cr.replicate == 0) { rep0 = &cr; break; }
+        }
+        SPIEL_CHECK_TRUE(rep0 != nullptr);
+        cd.s_target = rep0->actor_relative_scaled_returns;
+
+        std::array<double, 4> sum{};
+        for (const auto& cr : reps) {
+          for (int p = 0; p < 4; ++p) sum[p] += cr.actor_relative_scaled_returns[p];
+        }
+        for (int p = 0; p < 4; ++p) cd.m_target[p] = sum[p] / reps.size();
+      } else {
+        SPIEL_CHECK_EQ(reps.size(), kContinuationsDev);
+        std::array<double, 4> sum{};
+        for (const auto& cr : reps) {
+          for (int p = 0; p < 4; ++p) sum[p] += cr.actor_relative_scaled_returns[p];
+        }
+        for (int p = 0; p < 4; ++p) cd.dev_target[p] = sum[p] / reps.size();
+      }
+
+      data.candidates.push_back(std::move(cd));
+    }
+    return data;
+  };
+
+  std::cout << "Extracting frozen representations for 2,048 train roots...\n";
+  std::vector<ExtractedRootData> train_data;
+  train_data.reserve(train_roots.size());
+  for (size_t i = 0; i < train_roots.size(); ++i) {
+    train_data.push_back(extract_root(train_roots[i], /*is_dev=*/false));
+    if ((i + 1) % 500 == 0 || i + 1 == train_roots.size()) {
+      std::cout << absl::StrFormat("  Train features: %zu / %zu\n", i + 1, train_roots.size());
+    }
+  }
+
+  std::cout << "Extracting frozen representations for 256 dev roots...\n";
+  std::vector<ExtractedRootData> dev_data;
+  dev_data.reserve(dev_roots.size());
+  for (size_t i = 0; i < dev_roots.size(); ++i) {
+    dev_data.push_back(extract_root(dev_roots[i], /*is_dev=*/true));
+  }
+  std::cout << "Feature extraction complete.\n";
+
+  // Recompute exact double-precision Zero-Difference Baselines
+  double exact_zero_dev_mse = 0.0;
+  for (const auto& dr : dev_data) {
+    double ref_val = dr.candidates[0].dev_target[0];
+    double root_err = 0.0;
+    int num_alts = dr.candidates.size() - 1;
+    for (size_t j = 1; j < dr.candidates.size(); ++j) {
+      double alt_val = dr.candidates[j].dev_target[0];
+      double diff = alt_val - ref_val;
+      root_err += diff * diff;
+    }
+    exact_zero_dev_mse += root_err / num_alts;
+  }
+  exact_zero_dev_mse /= dev_data.size();
+
+  double exact_zero_train_mse_m = 0.0;
+  for (const auto& tr : train_data) {
+    double ref_val = tr.candidates[0].m_target[0];
+    double root_err = 0.0;
+    int num_alts = tr.candidates.size() - 1;
+    for (size_t j = 1; j < tr.candidates.size(); ++j) {
+      double alt_val = tr.candidates[j].m_target[0];
+      double diff = alt_val - ref_val;
+      root_err += diff * diff;
+    }
+    exact_zero_train_mse_m += root_err / num_alts;
+  }
+  exact_zero_train_mse_m /= train_data.size();
+
+  std::cout << absl::StrFormat("Exact Recomputed Dev Zero-Diff MSE   : %.8f (utility units: %.6f)\n",
+                               exact_zero_dev_mse, exact_zero_dev_mse * 16.0);
+  std::cout << absl::StrFormat("Exact Recomputed Train Zero-Diff MSE : %.8f (utility units: %.6f)\n",
+                               exact_zero_train_mse_m, exact_zero_train_mse_m * 16.0);
+
+  // Evaluator function for Action-Difference MSE
+  auto evaluate_action_diff_mse = [&](
+      const std::vector<ExtractedRootData>& data,
+      std::shared_ptr<DuneActionConditionedCriticImpl>& critic,
+      bool use_m_target_for_train = false) -> double {
+    critic->eval();
+    torch::NoGradGuard no_grad;
+
+    int total_pairs = 0;
+    for (const auto& rd : data) total_pairs += rd.candidates.size();
+
+    torch::Tensor h_batch = torch::empty({total_pairs, kActorHiddenDim}, torch::kFloat32);
+    torch::Tensor w_batch = torch::empty({total_pairs, kActorHiddenDim}, torch::kFloat32);
+    torch::Tensor priv_batch = torch::empty({total_pairs, kCriticInputDim}, torch::kFloat32);
+    torch::Tensor logit_batch = torch::empty({total_pairs, 1}, torch::kFloat32);
+    torch::Tensor val_batch = torch::empty({total_pairs, 1}, torch::kFloat32);
+
+    int pair_idx = 0;
+    for (const auto& rd : data) {
+      for (const auto& cd : rd.candidates) {
+        std::memcpy(h_batch[pair_idx].data_ptr<float>(), rd.h_s.data(), kActorHiddenDim * sizeof(float));
+        std::memcpy(w_batch[pair_idx].data_ptr<float>(), cd.w_a.data(), kActorHiddenDim * sizeof(float));
+        std::memcpy(priv_batch[pair_idx].data_ptr<float>(), rd.priv_9647.data(), kCriticInputDim * sizeof(float));
+        logit_batch[pair_idx][0] = cd.logit;
+        val_batch[pair_idx][0] = rd.v_s;
+        pair_idx++;
+      }
+    }
+
+    h_batch = h_batch.to(device);
+    w_batch = w_batch.to(device);
+    priv_batch = priv_batch.to(device);
+    logit_batch = logit_batch.to(device);
+    val_batch = val_batch.to(device);
+
+    torch::Tensor q_pred = critic->Forward(h_batch, w_batch, priv_batch, logit_batch, val_batch);
+    torch::Tensor q_cpu = q_pred.to(torch::kCPU);
+
+    double total_root_err = 0.0;
+    pair_idx = 0;
+    for (const auto& rd : data) {
+      double ref_pred = q_cpu[pair_idx][0].item<double>();
+      double ref_true = 0.0;
+      if (data.size() == dev_data.size()) {
+        ref_true = rd.candidates[0].dev_target[0];
+      } else {
+        ref_true = use_m_target_for_train ? rd.candidates[0].m_target[0] : rd.candidates[0].s_target[0];
+      }
+      pair_idx++;
+
+      double root_err = 0.0;
+      int num_alts = rd.candidates.size() - 1;
+      for (size_t j = 1; j < rd.candidates.size(); ++j) {
+        double alt_pred = q_cpu[pair_idx][0].item<double>();
+        double alt_true = 0.0;
+        if (data.size() == dev_data.size()) {
+          alt_true = rd.candidates[j].dev_target[0];
+        } else {
+          alt_true = use_m_target_for_train ? rd.candidates[j].m_target[0] : rd.candidates[j].s_target[0];
+        }
+        pair_idx++;
+
+        double pred_diff = alt_pred - ref_pred;
+        double true_diff = alt_true - ref_true;
+        double diff_err = pred_diff - true_diff;
+        root_err += diff_err * diff_err;
+      }
+      total_root_err += root_err / num_alts;
+    }
+    return total_root_err / data.size();
+  };
+
+  // Pre-pack minibatches (16 batches of 128 roots)
+  const int batch_roots = kCriticMinibatchSizeRoots; // 128
+  const int num_batches = (train_data.size() + batch_roots - 1) / batch_roots;
+
+  struct PrepackedBatch {
+    torch::Tensor h;
+    torch::Tensor w;
+    torch::Tensor priv;
+    torch::Tensor logit;
+    torch::Tensor val;
+    torch::Tensor s_targets;
+    torch::Tensor m_targets;
+    std::vector<std::pair<int, int>> root_ranges;
+  };
+
+  std::vector<PrepackedBatch> minibatches;
+  minibatches.reserve(num_batches);
+
+  for (int b = 0; b < num_batches; ++b) {
+    int start_r = b * batch_roots;
+    int end_r = std::min(start_r + batch_roots, static_cast<int>(train_data.size()));
+    int batch_pairs = 0;
+    for (int r = start_r; r < end_r; ++r) batch_pairs += train_data[r].candidates.size();
+
+    PrepackedBatch pb;
+    pb.h = torch::empty({batch_pairs, kActorHiddenDim}, torch::kFloat32);
+    pb.w = torch::empty({batch_pairs, kActorHiddenDim}, torch::kFloat32);
+    pb.priv = torch::empty({batch_pairs, kCriticInputDim}, torch::kFloat32);
+    pb.logit = torch::empty({batch_pairs, 1}, torch::kFloat32);
+    pb.val = torch::empty({batch_pairs, 1}, torch::kFloat32);
+    pb.s_targets = torch::empty({batch_pairs, 4}, torch::kFloat32);
+    pb.m_targets = torch::empty({batch_pairs, 4}, torch::kFloat32);
+
+    int cur_p = 0;
+    for (int r = start_r; r < end_r; ++r) {
+      int r_start = cur_p;
+      for (const auto& cd : train_data[r].candidates) {
+        std::memcpy(pb.h[cur_p].data_ptr<float>(), train_data[r].h_s.data(), kActorHiddenDim * sizeof(float));
+        std::memcpy(pb.w[cur_p].data_ptr<float>(), cd.w_a.data(), kActorHiddenDim * sizeof(float));
+        std::memcpy(pb.priv[cur_p].data_ptr<float>(), train_data[r].priv_9647.data(), kCriticInputDim * sizeof(float));
+        pb.logit[cur_p][0] = cd.logit;
+        pb.val[cur_p][0] = train_data[r].v_s;
+        for (int p = 0; p < 4; ++p) {
+          pb.s_targets[cur_p][p] = static_cast<float>(cd.s_target[p]);
+          pb.m_targets[cur_p][p] = static_cast<float>(cd.m_target[p]);
+        }
+        cur_p++;
+      }
+      pb.root_ranges.emplace_back(r_start, cur_p);
+    }
+    pb.h = pb.h.to(device);
+    pb.w = pb.w.to(device);
+    pb.priv = pb.priv.to(device);
+    pb.logit = pb.logit.to(device);
+    pb.val = pb.val.to(device);
+    pb.s_targets = pb.s_targets.to(device);
+    pb.m_targets = pb.m_targets.to(device);
+    minibatches.push_back(std::move(pb));
+  }
+
+  // Instantiate Matched Critics S and M with seed 19
+  auto critic_s = std::make_shared<DuneActionConditionedCriticImpl>(kRegisteredCriticInitSeed);
+  auto critic_m = std::make_shared<DuneActionConditionedCriticImpl>(kRegisteredCriticInitSeed);
+  critic_s->to(device);
+  critic_m->to(device);
+
+  // Verify identical initial weights
+  for (const auto& p1 : critic_s->named_parameters()) {
+    const auto& p2 = critic_m->named_parameters()[p1.key()];
+    SPIEL_CHECK_TRUE(torch::equal(p1.value(), p2));
+  }
+  std::cout << "Verified bitwise identical initialization for Critic S and Critic M.\n";
+
+  torch::optim::AdamW opt_s(
+      critic_s->parameters(),
+      torch::optim::AdamWOptions(kCriticLearningRate)
+          .eps(kCriticAdamWEpsilon)
+          .weight_decay(1.0e-4));
+
+  torch::optim::AdamW opt_m(
+      critic_m->parameters(),
+      torch::optim::AdamWOptions(kCriticLearningRate)
+          .eps(kCriticAdamWEpsilon)
+          .weight_decay(1.0e-4));
+
+  std::filesystem::path ckpt_dir = out_dir / "checkpoints";
+  std::filesystem::create_directories(ckpt_dir);
+
+  struct CheckpointInfo {
+    int epoch = 0;
+    double train_action_diff_mse = 0.0;
+    double dev_action_diff_mse = 0.0;
+    std::string path;
+    std::string sha256;
+  };
+
+  std::vector<CheckpointInfo> s_history;
+  std::vector<CheckpointInfo> m_history;
+
+  auto record_eval = [&](int epoch) {
+    double dev_mse_s = evaluate_action_diff_mse(dev_data, critic_s, false);
+    double dev_mse_m = evaluate_action_diff_mse(dev_data, critic_m, true);
+    double tr_mse_s = evaluate_action_diff_mse(train_data, critic_s, false);
+    double tr_mse_m = evaluate_action_diff_mse(train_data, critic_m, true);
+
+    std::string path_s = (ckpt_dir / absl::StrFormat("critic_s_epoch_%03d.pt", epoch)).string();
+    std::string path_m = (ckpt_dir / absl::StrFormat("critic_m_epoch_%03d.pt", epoch)).string();
+
+    torch::serialize::OutputArchive out_s;
+    critic_s->save(out_s);
+    out_s.save_to(path_s);
+
+    torch::serialize::OutputArchive out_m;
+    critic_m->save(out_m);
+    out_m.save_to(path_m);
+
+    s_history.push_back({epoch, tr_mse_s, dev_mse_s, path_s, ComputeFileSHA256(path_s)});
+    m_history.push_back({epoch, tr_mse_m, dev_mse_m, path_m, ComputeFileSHA256(path_m)});
+
+    std::cout << absl::StrFormat("Epoch %3d | Train MSE: S=%.6f, M=%.6f | Dev MSE: S=%.6f, M=%.6f\n",
+                                 epoch, tr_mse_s, tr_mse_m, dev_mse_s, dev_mse_m);
+  };
+
+  std::cout << "\nEvaluating initialization (Epoch 0)...\n";
+  record_eval(0);
+
+  std::cout << "\nTraining for 100 epochs...\n";
+  for (int epoch = 1; epoch <= kCriticTotalEpochs; ++epoch) {
+    critic_s->train();
+    critic_m->train();
+
+    for (const auto& mb : minibatches) {
+      // Step Critic S
+      {
+        auto q_s = critic_s->Forward(mb.h, mb.w, mb.priv, mb.logit, mb.val);
+        torch::Tensor loss_s = torch::zeros({}, torch::kFloat32).to(device);
+        for (const auto& rng : mb.root_ranges) {
+          auto slice_pred = q_s.slice(0, rng.first, rng.second);
+          auto slice_tgt = mb.s_targets.slice(0, rng.first, rng.second);
+          loss_s = loss_s + torch::mean((slice_pred - slice_tgt) * (slice_pred - slice_tgt));
+        }
+        loss_s = loss_s / static_cast<float>(mb.root_ranges.size());
+
+        opt_s.zero_grad();
+        loss_s.backward();
+        torch::nn::utils::clip_grad_norm_(critic_s->parameters(), kCriticGradClipNorm);
+        opt_s.step();
+      }
+
+      // Step Critic M
+      {
+        auto q_m = critic_m->Forward(mb.h, mb.w, mb.priv, mb.logit, mb.val);
+        torch::Tensor loss_m = torch::zeros({}, torch::kFloat32).to(device);
+        for (const auto& rng : mb.root_ranges) {
+          auto slice_pred = q_m.slice(0, rng.first, rng.second);
+          auto slice_tgt = mb.m_targets.slice(0, rng.first, rng.second);
+          loss_m = loss_m + torch::mean((slice_pred - slice_tgt) * (slice_pred - slice_tgt));
+        }
+        loss_m = loss_m / static_cast<float>(mb.root_ranges.size());
+
+        opt_m.zero_grad();
+        loss_m.backward();
+        torch::nn::utils::clip_grad_norm_(critic_m->parameters(), kCriticGradClipNorm);
+        opt_m.step();
+      }
+    }
+
+    if (epoch % kCriticEvalIntervalEpochs == 0) {
+      record_eval(epoch);
+    }
+  }
+
+  // Checkpoint selection: lowest dev MSE among trained epochs (1..100)
+  CheckpointInfo best_s = s_history[1];
+  for (size_t i = 2; i < s_history.size(); ++i) {
+    if (s_history[i].dev_action_diff_mse < best_s.dev_action_diff_mse) {
+      best_s = s_history[i];
+    }
+  }
+
+  CheckpointInfo best_m = m_history[1];
+  for (size_t i = 2; i < m_history.size(); ++i) {
+    if (m_history[i].dev_action_diff_mse < best_m.dev_action_diff_mse) {
+      best_m = m_history[i];
+    }
+  }
+
+  double init_dev_mse_s = s_history[0].dev_action_diff_mse;
+  double init_dev_mse_m = m_history[0].dev_action_diff_mse;
+
+  bool s_beat_init = best_s.dev_action_diff_mse < init_dev_mse_s;
+  bool s_beat_zero = best_s.dev_action_diff_mse < exact_zero_dev_mse;
+  bool s_pass = s_beat_init && s_beat_zero;
+
+  bool m_beat_init = best_m.dev_action_diff_mse < init_dev_mse_m;
+  bool m_beat_zero = best_m.dev_action_diff_mse < exact_zero_dev_mse;
+  bool m_pass = m_beat_init && m_beat_zero;
+
+  bool overall_pass = m_pass || s_pass;
+  std::string verdict = overall_pass ? "PASS_DEVELOPMENT_SCREEN" : "FAIL_DEVELOPMENT_SCREEN";
+
+  std::cout << "\n=======================================================\n";
+  std::cout << "OFFLINE ACTION-CONDITIONED CRITIC STUDY RESULTS\n";
+  std::cout << "=======================================================\n";
+  std::cout << absl::StrFormat("Exact Recomputed Dev Zero-Diff MSE : %.8f\n", exact_zero_dev_mse);
+  std::cout << absl::StrFormat("Critic S Epoch 0 Init Dev MSE      : %.8f\n", init_dev_mse_s);
+  std::cout << absl::StrFormat("Critic S Best Trained (Epoch %d)    : %.8f (Beat Zero: %s, Beat Init: %s)\n",
+                               best_s.epoch, best_s.dev_action_diff_mse, s_beat_zero ? "YES" : "NO", s_beat_init ? "YES" : "NO");
+  std::cout << absl::StrFormat("Critic M Epoch 0 Init Dev MSE      : %.8f\n", init_dev_mse_m);
+  std::cout << absl::StrFormat("Critic M Best Trained (Epoch %d)    : %.8f (Beat Zero: %s, Beat Init: %s)\n",
+                               best_m.epoch, best_m.dev_action_diff_mse, m_beat_zero ? "YES" : "NO", m_beat_init ? "YES" : "NO");
+  std::cout << absl::StrFormat("Final Verdict                      : %s\n", verdict);
+  std::cout << "=======================================================\n\n";
+
+  // Build JSON report
+  json::Object rep;
+  rep["verdict"] = verdict;
+  rep["development_screen_passed"] = overall_pass;
+  rep["train_roots_count"] = static_cast<int64_t>(train_data.size());
+  rep["dev_roots_count"] = static_cast<int64_t>(dev_data.size());
+  rep["head_parameter_count"] = static_cast<int64_t>(1200260);
+  rep["exact_recomputed_dev_zero_diff_mse"] = exact_zero_dev_mse;
+  rep["exact_recomputed_train_zero_diff_mse"] = exact_zero_train_mse_m;
+
+  json::Object s_obj;
+  s_obj["init_dev_mse"] = init_dev_mse_s;
+  s_obj["best_epoch"] = static_cast<int64_t>(best_s.epoch);
+  s_obj["best_dev_mse"] = best_s.dev_action_diff_mse;
+  s_obj["best_train_mse"] = best_s.train_action_diff_mse;
+  s_obj["beat_zero_baseline"] = s_beat_zero;
+  s_obj["beat_initialization"] = s_beat_init;
+  s_obj["passed_screen"] = s_pass;
+  s_obj["checkpoint_path"] = best_s.path;
+  s_obj["checkpoint_sha256"] = best_s.sha256;
+  rep["critic_s"] = s_obj;
+
+  json::Object m_obj;
+  m_obj["init_dev_mse"] = init_dev_mse_m;
+  m_obj["best_epoch"] = static_cast<int64_t>(best_m.epoch);
+  m_obj["best_dev_mse"] = best_m.dev_action_diff_mse;
+  m_obj["best_train_mse"] = best_m.train_action_diff_mse;
+  m_obj["beat_zero_baseline"] = m_beat_zero;
+  m_obj["beat_initialization"] = m_beat_init;
+  m_obj["passed_screen"] = m_pass;
+  m_obj["checkpoint_path"] = best_m.path;
+  m_obj["checkpoint_sha256"] = best_m.sha256;
+  rep["critic_m"] = m_obj;
+
+  json::Array traj;
+  for (size_t i = 0; i < s_history.size(); ++i) {
+    json::Object step;
+    step["epoch"] = static_cast<int64_t>(s_history[i].epoch);
+    step["s_train_mse"] = s_history[i].train_action_diff_mse;
+    step["s_dev_mse"] = s_history[i].dev_action_diff_mse;
+    step["m_train_mse"] = m_history[i].train_action_diff_mse;
+    step["m_dev_mse"] = m_history[i].dev_action_diff_mse;
+    traj.push_back(step);
+  }
+  rep["trajectory"] = traj;
+
+  std::ofstream out_f(out_dir / "offline_critic_report.json");
+  out_f << json::ToString(rep) << "\n";
+  out_f.close();
+  std::cout << "Report written to: " << (out_dir / "offline_critic_report.json") << "\n";
+}
+
+// ===========================================================================
+// Fresh Confirmation Study on 512 Unseen Roots
+// ===========================================================================
+
+inline const char kExpectedCriticMSha256[] = "a52a1c3858eeb7bc78234d7445eb927d2aa8d9f9a274394bce76d645d82212b2";
+inline const char kExpectedCriticSSha256[] = "18bdab9f454406fed311d5293b8361438d2abf5da79a451fa186bc380803c936";
+
+void RunConfirmationStudy(
+    const std::shared_ptr<const Game>& game,
+    const std::filesystem::path& out_dir,
+    const torch::Device& device,
+    int num_threads) {
+  std::cout << "\n=======================================================\n";
+  std::cout << "PHASE: Fresh Independent Confirmation Study (512 Roots)\n";
+  std::cout << "=======================================================\n";
+  std::cout << "Output directory : " << out_dir << std::endl;
+
+  // 1. Verify frozen actor
+  std::string immut_err;
+  if (!ValidateActorImmutability(g_actor_model, absl::GetFlag(FLAGS_model_path), &immut_err)) {
+    SpielFatalError(immut_err);
+  }
+
+  // 2. Validate and load frozen Critic M and Critic S Epoch 5 checkpoints
+  std::string critic_m_path = absl::GetFlag(FLAGS_critic_m_path);
+  std::string critic_s_path = absl::GetFlag(FLAGS_critic_s_path);
+
+  if (!std::filesystem::exists(critic_m_path)) {
+    SpielFatalError("Critic M checkpoint missing: " + critic_m_path);
+  }
+  if (!std::filesystem::exists(critic_s_path)) {
+    SpielFatalError("Critic S checkpoint missing: " + critic_s_path);
+  }
+
+  std::string sha_m = ComputeFileSHA256(critic_m_path);
+  std::string sha_s = ComputeFileSHA256(critic_s_path);
+  std::cout << "Critic M SHA256 : " << sha_m << std::endl;
+  std::cout << "Critic S SHA256 : " << sha_s << std::endl;
+  SPIEL_CHECK_EQ(sha_m, kExpectedCriticMSha256);
+  SPIEL_CHECK_EQ(sha_s, kExpectedCriticSSha256);
+
+  auto critic_m = std::make_shared<DuneActionConditionedCriticImpl>();
+  torch::serialize::InputArchive arch_m;
+  arch_m.load_from(critic_m_path, device);
+  critic_m->load(arch_m);
+  critic_m->to(device);
+  critic_m->eval();
+
+  auto critic_s = std::make_shared<DuneActionConditionedCriticImpl>();
+  torch::serialize::InputArchive arch_s;
+  arch_s.load_from(critic_s_path, device);
+  critic_s->load(arch_s);
+  critic_s->to(device);
+  critic_s->eval();
+
+  for (auto& p : critic_m->parameters()) p.requires_grad_(false);
+  for (auto& p : critic_s->parameters()) p.requires_grad_(false);
+  std::cout << "Loaded frozen Critic M and Critic S models successfully.\n";
+
+  // 3. Load previous corpus roots for overlap checking
+  std::filesystem::path prev_corpus_path = absl::GetFlag(FLAGS_previous_corpus_path);
+  if (std::filesystem::is_directory(prev_corpus_path)) {
+    prev_corpus_path /= "corpus_roots.jsonl";
+  }
+  std::set<std::string> prev_root_ids;
+  std::set<std::string> prev_history_hashes;
+  if (std::filesystem::exists(prev_corpus_path)) {
+    auto prev_roots = LoadCorpusRoots(prev_corpus_path);
+    for (const auto& pr : prev_roots) {
+      prev_root_ids.insert(pr.root_id);
+      prev_history_hashes.insert(pwo2::HistoryHash(pr.history));
+    }
+    std::cout << "Loaded " << prev_root_ids.size() << " previous corpus root IDs for overlap verification.\n";
+  } else {
+    std::cout << "WARNING: previous corpus not found at " << prev_corpus_path << ", skipping overlap check.\n";
+  }
+
+  // 4. Generate 512 Confirmation Source Games & Roots
+  std::cout << "\nGenerating 512 confirmation source games with reservoir sampling (kDomainConfirm)...\n";
+  struct ConfirmPlan {
+    int episode_id;
+    Player target_seat;
+  };
+  std::vector<ConfirmPlan> plans;
+  for (int ep = 0; ep < kRootsConfirm; ++ep) {
+    plans.push_back({ep, static_cast<Player>(ep % 4)});
+  }
+
+  std::atomic<size_t> next_plan_idx{0};
+  std::vector<RootRecord> confirm_roots(kRootsConfirm);
+  std::vector<std::thread> source_workers;
+
+  for (int tid = 0; tid < num_threads; ++tid) {
+    source_workers.emplace_back([&]() {
+      while (true) {
+        size_t idx = next_plan_idx.fetch_add(1);
+        if (idx >= plans.size()) break;
+        const auto& plan = plans[idx];
+
+        uint64_t game_seed = DeriveSourceGameSeed(Partition::kConfirm, plan.episode_id);
+        std::mt19937_64 chance_rng(game_seed);
+        std::mt19937_64 policy_rng(dune_seed::DeriveSeed(kDomainConfirm, kStreamContinuationPolicy, game_seed));
+
+        auto state = game->NewInitialState();
+
+        struct EligibleCandidate {
+          int round;
+          std::vector<Action> history;
+          std::vector<Action> legal_actions;
+          std::vector<float> logits;
+          std::vector<float> critic_input;
+          DuneDecisionRole role;
+        };
+        std::vector<EligibleCandidate> eligible;
+
+        while (!state->IsTerminal()) {
+          if (state->IsChanceNode()) {
+            auto outcomes = state->ChanceOutcomes();
+            state->ApplyAction(SampleAction(outcomes, chance_rng).first);
+            continue;
+          }
+          if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+            std::vector<Action> joint;
+            for (int p = 0; p < state->NumPlayers(); ++p) {
+              auto acts = state->LegalActions(p);
+              std::uniform_int_distribution<size_t> d(0, acts.size() - 1);
+              joint.push_back(acts[d(chance_rng)]);
+            }
+            state->ApplyActions(joint);
+            continue;
+          }
+
+          Player player = state->CurrentPlayer();
+          auto legal = state->LegalActions();
+          DuneDecisionRole role = ClassifyDuneDecisionRole(*state, player, false);
+          const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+          int current_round = dune_state ? dune_state->GetCurrentRound() : 1;
+
+          std::vector<float> obs(kActorInputDim, 0.0f);
+          state->InformationStateTensor(player, absl::MakeSpan(obs));
+          EvalResult eval_res = g_actor_evaluator->Evaluate(obs);
+          std::vector<float> logits = std::move(eval_res.logits);
+
+          if (role == DuneDecisionRole::kAgentPrimary && legal.size() >= 2 &&
+              current_round >= 2 && current_round <= 10 && player == plan.target_seat) {
+            EligibleCandidate ec;
+            ec.round = current_round;
+            ec.history = state->History();
+            ec.legal_actions = legal;
+            ec.logits = logits;
+            ec.critic_input = ExtractCriticInput(*state, player);
+            ec.role = role;
+            eligible.push_back(std::move(ec));
+          }
+
+          CenterAndCapLegalLogits(logits, legal, 10.0f);
+          auto sampled = SamplePolicyDistribution(&policy_rng, logits, legal, nullptr);
+          state->ApplyAction(sampled.action);
+        }
+
+        SPIEL_CHECK_FALSE(eligible.empty());
+        uint64_t sel_seed = DeriveRootSelectionSeed(Partition::kConfirm, plan.episode_id);
+        std::mt19937_64 sel_rng(sel_seed);
+        std::uniform_int_distribution<size_t> sel_dist(0, eligible.size() - 1);
+        const auto& chosen = eligible[sel_dist(sel_rng)];
+
+        std::string hist_hash = pwo2::HistoryHash(chosen.history);
+        std::string root_id = hist_hash.substr(0, 16);
+
+        RootRecord rec;
+        rec.root_id = root_id;
+        rec.partition = Partition::kConfirm;
+        rec.source_episode_id = plan.episode_id;
+        rec.acting_player = plan.target_seat;
+        rec.round = chosen.round;
+        rec.stratum = absl::StrFormat("round_%02d_seat_%d", chosen.round, plan.target_seat);
+        rec.role = chosen.role;
+        rec.history = chosen.history;
+        rec.legal_actions = chosen.legal_actions;
+        rec.candidate_actions = SelectCandidateActions(
+            chosen.legal_actions, chosen.logits, Partition::kConfirm, root_id, &rec.candidate_actor_probs);
+        rec.reference_action = rec.candidate_actions[0];
+        rec.critic_input_9647 = chosen.critic_input;
+
+        confirm_roots[idx] = std::move(rec);
+      }
+    });
+  }
+  for (auto& w : source_workers) w.join();
+  std::cout << "Generated 512 confirmation roots.\n";
+
+  // Overlap verification
+  if (!prev_root_ids.empty()) {
+    for (const auto& cr : confirm_roots) {
+      SPIEL_CHECK_EQ(prev_root_ids.count(cr.root_id), 0u);
+      SPIEL_CHECK_EQ(prev_history_hashes.count(pwo2::HistoryHash(cr.history)), 0u);
+    }
+    std::cout << "VERIFIED: Exactly 0 root ID or history overlaps with previous 2,816-root corpus.\n";
+  }
+
+  // Count continuation budget
+  int total_confirm_conts = 0;
+  for (const auto& r : confirm_roots) {
+    total_confirm_conts += r.candidate_actions.size() * kContinuationsConfirm;
+  }
+  std::cout << absl::StrFormat("Total confirmation continuations: %d (max budget 98,304)\n", total_confirm_conts);
+
+  // Write manifest and roots
+  json::Object manifest_obj;
+  manifest_obj["study_name"] = "action_conditioned_critic_confirmation_20260911";
+  manifest_obj["roots_confirm"] = static_cast<int64_t>(kRootsConfirm);
+  manifest_obj["continuations_per_action"] = static_cast<int64_t>(kContinuationsConfirm);
+  manifest_obj["total_continuations"] = static_cast<int64_t>(total_confirm_conts);
+  manifest_obj["critic_m_sha256"] = sha_m;
+  manifest_obj["critic_s_sha256"] = sha_s;
+  manifest_obj["actor_sha256"] = ComputeFileSHA256(absl::GetFlag(FLAGS_model_path));
+
+  std::ofstream man_f(out_dir / "confirmation_manifest.json");
+  man_f << json::ToString(manifest_obj) << "\n";
+  man_f.close();
+
+  std::ofstream roots_f(out_dir / "confirmation_roots.jsonl");
+  for (const auto& r : confirm_roots) {
+    json::Object obj;
+    obj["root_id"] = r.root_id;
+    obj["partition"] = PartitionToString(r.partition);
+    obj["source_episode_id"] = static_cast<int64_t>(r.source_episode_id);
+    obj["acting_player"] = static_cast<int64_t>(r.acting_player);
+    obj["round"] = static_cast<int64_t>(r.round);
+    obj["stratum"] = r.stratum;
+    obj["role"] = static_cast<int64_t>(r.role);
+
+    json::Array hist;
+    for (Action a : r.history) hist.push_back(static_cast<int64_t>(a));
+    obj["history"] = hist;
+
+    json::Array legal;
+    for (Action a : r.legal_actions) legal.push_back(static_cast<int64_t>(a));
+    obj["legal_actions"] = legal;
+
+    json::Array cand;
+    for (Action a : r.candidate_actions) cand.push_back(static_cast<int64_t>(a));
+    obj["candidate_actions"] = cand;
+
+    obj["reference_action"] = static_cast<int64_t>(r.reference_action);
+
+    json::Array probs;
+    for (double p : r.candidate_actor_probs) probs.push_back(p);
+    obj["candidate_actor_probs"] = probs;
+
+    json::Array crit_in;
+    for (float v : r.critic_input_9647) crit_in.push_back(static_cast<double>(v));
+    obj["critic_input_9647"] = crit_in;
+
+    roots_f << json::ToString(obj) << "\n";
+  }
+  roots_f.close();
+
+  // 5. Rollout Continuations (64 continuations per candidate action)
+  std::cout << "\nRolling out " << total_confirm_conts << " confirmation continuations (64 threads)...\n";
+  std::filesystem::path conts_path = out_dir / "confirmation_continuations.jsonl";
+  std::ofstream conts_f(conts_path);
+  std::atomic<size_t> next_root_idx{0};
+  std::vector<std::thread> rollout_workers;
+  std::mutex cont_write_mutex;
+  std::atomic<int> completed_roots{0};
+
+  std::map<std::pair<std::string, Action>, std::vector<ContinuationRecord>> conts_map;
+  std::mutex map_mutex;
+
+  auto cont_start_time = std::chrono::steady_clock::now();
+
+  for (int tid = 0; tid < num_threads; ++tid) {
+    rollout_workers.emplace_back([&]() {
+      while (true) {
+        size_t idx = next_root_idx.fetch_add(1);
+        if (idx >= confirm_roots.size()) break;
+        const auto& r = confirm_roots[idx];
+
+        std::vector<ContinuationRecord> batch_records;
+        for (Action a : r.candidate_actions) {
+          for (int k = 0; k < kContinuationsConfirm; ++k) {
+            uint64_t c_seed = DeriveContinuationChanceSeed(Partition::kConfirm, r.root_id, k);
+            uint64_t p_seed = DeriveContinuationPolicySeed(Partition::kConfirm, r.root_id, k);
+
+            auto state = ReconstructState(game, r.history);
+            state->ApplyAction(a);
+            auto abs_returns = RunRollout(game, std::move(state), c_seed, p_seed);
+            auto rel_returns = ConvertAbsoluteReturnsToActorRelative(r.acting_player, abs_returns);
+
+            ContinuationRecord cr;
+            cr.root_id = r.root_id;
+            cr.partition = Partition::kConfirm;
+            cr.action = a;
+            cr.replicate = k;
+            cr.chance_seed = c_seed;
+            cr.policy_seed = p_seed;
+            cr.absolute_returns = abs_returns;
+            for (int s = 0; s < 4; ++s) {
+              cr.actor_relative_scaled_returns[s] = rel_returns[s] / kUtilityDivisor;
+            }
+            batch_records.push_back(std::move(cr));
+          }
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(cont_write_mutex);
+          for (const auto& cr : batch_records) {
+            json::Object obj;
+            obj["root_id"] = cr.root_id;
+            obj["partition"] = PartitionToString(cr.partition);
+            obj["action"] = static_cast<int64_t>(cr.action);
+            obj["replicate"] = static_cast<int64_t>(cr.replicate);
+            obj["chance_seed"] = static_cast<int64_t>(cr.chance_seed);
+            obj["policy_seed"] = static_cast<int64_t>(cr.policy_seed);
+
+            json::Array abs_ret;
+            for (double v : cr.absolute_returns) abs_ret.push_back(v);
+            obj["absolute_returns"] = abs_ret;
+
+            json::Array rel_ret;
+            for (double v : cr.actor_relative_scaled_returns) rel_ret.push_back(v);
+            obj["actor_relative_scaled_returns"] = rel_ret;
+
+            conts_f << json::ToString(obj) << "\n";
+          }
+          conts_f.flush();
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(map_mutex);
+          for (auto& cr : batch_records) {
+            conts_map[{cr.root_id, cr.action}].push_back(std::move(cr));
+          }
+        }
+
+        int done = completed_roots.fetch_add(1) + 1;
+        if (done % 50 == 0 || done == kRootsConfirm) {
+          auto now = std::chrono::steady_clock::now();
+          double elapsed_sec = std::chrono::duration<double>(now - cont_start_time).count();
+          double rate = (done * 64 * 2.6) / elapsed_sec;
+          std::cout << absl::StrFormat("  Rollout: %d / %d roots completed (%.1f conts/sec)\n",
+                                       done, kRootsConfirm, rate);
+        }
+      }
+    });
+  }
+  for (auto& w : rollout_workers) w.join();
+  conts_f.close();
+  std::cout << "All confirmation continuations completed.\n";
+
+  // 6. Evaluate Critic M and Critic S Predictions on Confirmation Bank
+  std::cout << "\nEvaluating Critic M and Critic S predictions on confirmation roots...\n";
+
+  std::vector<double> root_err_m(confirm_roots.size(), 0.0);
+  std::vector<double> root_err_s(confirm_roots.size(), 0.0);
+  std::vector<double> root_err_zero(confirm_roots.size(), 0.0);
+  std::vector<double> paired_diff_m_minus_zero(confirm_roots.size(), 0.0);
+  std::vector<double> paired_diff_m_minus_s(confirm_roots.size(), 0.0);
+  std::vector<double> per_root_utility_gain(confirm_roots.size(), 0.0);
+
+  std::vector<double> half1_action_diffs;
+  std::vector<double> half2_action_diffs;
+
+  int changed_count = 0;
+  std::map<int, int> changed_by_round;
+  std::map<int, int> changed_by_seat;
+
+  for (size_t i = 0; i < confirm_roots.size(); ++i) {
+    const auto& r = confirm_roots[i];
+
+    auto state = ReconstructState(game, r.history);
+    std::vector<float> obs(kActorInputDim, 0.0f);
+    state->InformationStateTensor(r.acting_player, absl::MakeSpan(obs));
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor obs_tensor = torch::from_blob(
+        obs.data(), {1, kActorInputDim}, torch::kFloat32).clone().to(device);
+    torch::Tensor h_tensor = g_actor_model->Trunk(obs_tensor);
+    torch::Tensor v_raw = g_actor_model->value_head->forward(h_tensor);
+    torch::Tensor v_tanh = torch::tanh(v_raw);
+
+    float v_s = v_tanh.squeeze().item<float>();
+    std::vector<float> h_s(kActorHiddenDim);
+    std::memcpy(h_s.data(), h_tensor.to(torch::kCPU).data_ptr<float>(),
+                kActorHiddenDim * sizeof(float));
+
+    int num_candidates = r.candidate_actions.size();
+    torch::Tensor h_batch = torch::empty({num_candidates, kActorHiddenDim}, torch::kFloat32);
+    torch::Tensor w_batch = torch::empty({num_candidates, kActorHiddenDim}, torch::kFloat32);
+    torch::Tensor priv_batch = torch::empty({num_candidates, kCriticInputDim}, torch::kFloat32);
+    torch::Tensor logit_batch = torch::empty({num_candidates, 1}, torch::kFloat32);
+    torch::Tensor val_batch = torch::empty({num_candidates, 1}, torch::kFloat32);
+
+    for (int c = 0; c < num_candidates; ++c) {
+      Action a = r.candidate_actions[c];
+      torch::Tensor w_tensor = g_actor_model->policy_head->weight[a];
+      float bias_a = g_actor_model->policy_head->bias.defined() ?
+          g_actor_model->policy_head->bias[a].item<float>() : 0.0f;
+      float logit = (torch::dot(h_tensor.squeeze(0), w_tensor.to(device)) + bias_a).item<float>();
+
+      std::memcpy(h_batch[c].data_ptr<float>(), h_s.data(), kActorHiddenDim * sizeof(float));
+      std::memcpy(w_batch[c].data_ptr<float>(), w_tensor.to(torch::kCPU).data_ptr<float>(),
+                  kActorHiddenDim * sizeof(float));
+      std::memcpy(priv_batch[c].data_ptr<float>(), r.critic_input_9647.data(),
+                  kCriticInputDim * sizeof(float));
+      logit_batch[c][0] = logit;
+      val_batch[c][0] = v_s;
+    }
+
+    h_batch = h_batch.to(device);
+    w_batch = w_batch.to(device);
+    priv_batch = priv_batch.to(device);
+    logit_batch = logit_batch.to(device);
+    val_batch = val_batch.to(device);
+
+    torch::Tensor qm_pred = critic_m->Forward(h_batch, w_batch, priv_batch, logit_batch, val_batch).to(torch::kCPU);
+    torch::Tensor qs_pred = critic_s->Forward(h_batch, w_batch, priv_batch, logit_batch, val_batch).to(torch::kCPU);
+
+    Action ref_action = r.candidate_actions[0];
+    const auto& ref_conts = conts_map.at({r.root_id, ref_action});
+    SPIEL_CHECK_EQ(ref_conts.size(), kContinuationsConfirm);
+
+    double sum_ref = 0.0, sum_ref_h1 = 0.0, sum_ref_h2 = 0.0;
+    for (int k = 0; k < kContinuationsConfirm; ++k) {
+      double ret_val = ref_conts[k].actor_relative_scaled_returns[0] * kUtilityDivisor; // unscaled utility
+      sum_ref += ret_val;
+      if (k < 32) sum_ref_h1 += ret_val;
+      else sum_ref_h2 += ret_val;
+    }
+    double true_ref_unscaled = sum_ref / kContinuationsConfirm;
+    double true_ref_scaled = true_ref_unscaled / kUtilityDivisor;
+    double true_ref_h1 = sum_ref_h1 / 32.0;
+    double true_ref_h2 = sum_ref_h2 / 32.0;
+
+    double pred_ref_m = qm_pred[0][0].item<double>(); // scaled units
+    double pred_ref_s = qs_pred[0][0].item<double>();
+
+    Action best_action_m = ref_action;
+    double best_q_m = pred_ref_m;
+
+    double root_sum_err_m = 0.0;
+    double root_sum_err_s = 0.0;
+    double root_sum_err_zero = 0.0;
+    int num_alts = num_candidates - 1;
+
+    for (int c = 1; c < num_candidates; ++c) {
+      Action alt_action = r.candidate_actions[c];
+      const auto& alt_conts = conts_map.at({r.root_id, alt_action});
+      SPIEL_CHECK_EQ(alt_conts.size(), kContinuationsConfirm);
+
+      double sum_alt = 0.0, sum_alt_h1 = 0.0, sum_alt_h2 = 0.0;
+      for (int k = 0; k < kContinuationsConfirm; ++k) {
+        double ret_val = alt_conts[k].actor_relative_scaled_returns[0] * kUtilityDivisor;
+        sum_alt += ret_val;
+        if (k < 32) sum_alt_h1 += ret_val;
+        else sum_alt_h2 += ret_val;
+      }
+      double true_alt_unscaled = sum_alt / kContinuationsConfirm;
+      double true_alt_scaled = true_alt_unscaled / kUtilityDivisor;
+      double true_alt_h1 = sum_alt_h1 / 32.0;
+      double true_alt_h2 = sum_alt_h2 / 32.0;
+
+      double pred_alt_m = qm_pred[c][0].item<double>();
+      double pred_alt_s = qs_pred[c][0].item<double>();
+
+      double true_diff = true_alt_scaled - true_ref_scaled;
+      double pred_diff_m = pred_alt_m - pred_ref_m;
+      double pred_diff_s = pred_alt_s - pred_ref_s;
+      double pred_diff_zero = 0.0;
+
+      double diff_err_m = pred_diff_m - true_diff;
+      double diff_err_s = pred_diff_s - true_diff;
+      double diff_err_zero = pred_diff_zero - true_diff;
+
+      root_sum_err_m += diff_err_m * diff_err_m;
+      root_sum_err_s += diff_err_s * diff_err_s;
+      root_sum_err_zero += diff_err_zero * diff_err_zero;
+
+      if (pred_alt_m > best_q_m) {
+        best_q_m = pred_alt_m;
+        best_action_m = alt_action;
+      }
+
+      half1_action_diffs.push_back(true_alt_h1 - true_ref_h1);
+      half2_action_diffs.push_back(true_alt_h2 - true_ref_h2);
+    }
+
+    root_err_m[i] = root_sum_err_m / num_alts;
+    root_err_s[i] = root_sum_err_s / num_alts;
+    root_err_zero[i] = root_sum_err_zero / num_alts;
+    paired_diff_m_minus_zero[i] = root_err_m[i] - root_err_zero[i];
+    paired_diff_m_minus_s[i] = root_err_m[i] - root_err_s[i];
+
+    // Local usefulness (unscaled utility units)
+    if (best_action_m != ref_action) {
+      changed_count++;
+      changed_by_round[r.round]++;
+      changed_by_seat[r.acting_player]++;
+      const auto& chosen_conts = conts_map.at({r.root_id, best_action_m});
+      double sum_chosen = 0.0;
+      for (int k = 0; k < kContinuationsConfirm; ++k) {
+        sum_chosen += chosen_conts[k].actor_relative_scaled_returns[0] * kUtilityDivisor;
+      }
+      double true_chosen_unscaled = sum_chosen / kContinuationsConfirm;
+      per_root_utility_gain[i] = true_chosen_unscaled - true_ref_unscaled;
+    } else {
+      per_root_utility_gain[i] = 0.0;
+    }
+  }
+
+  // Aggregate Metrics across all 512 confirmation roots
+  double mean_mse_m = std::accumulate(root_err_m.begin(), root_err_m.end(), 0.0) / confirm_roots.size();
+  double mean_mse_s = std::accumulate(root_err_s.begin(), root_err_s.end(), 0.0) / confirm_roots.size();
+  double mean_mse_zero = std::accumulate(root_err_zero.begin(), root_err_zero.end(), 0.0) / confirm_roots.size();
+
+  double red_m_vs_zero = (mean_mse_zero > 0.0) ? (mean_mse_zero - mean_mse_m) / mean_mse_zero : 0.0;
+  double red_m_vs_s = (mean_mse_s > 0.0) ? (mean_mse_s - mean_mse_m) / mean_mse_s : 0.0;
+  double red_s_vs_zero = (mean_mse_zero > 0.0) ? (mean_mse_zero - mean_mse_s) / mean_mse_zero : 0.0;
+
+  auto ci_m_minus_zero = Bootstrap95CI(paired_diff_m_minus_zero, kBootstrapResamples, kBootstrapSeed);
+  auto ci_m_minus_s = Bootstrap95CI(paired_diff_m_minus_s, kBootstrapResamples, kBootstrapSeed + 1);
+
+  double mean_util_gain = std::accumulate(per_root_utility_gain.begin(), per_root_utility_gain.end(), 0.0) / confirm_roots.size();
+  auto ci_util_gain = Bootstrap95CI(per_root_utility_gain, kBootstrapResamples, kBootstrapSeed + 2);
+  double changed_frac = static_cast<double>(changed_count) / confirm_roots.size();
+
+  // Target reliability correlation
+  double mean_h1 = 0.0, mean_h2 = 0.0;
+  for (size_t i = 0; i < half1_action_diffs.size(); ++i) {
+    mean_h1 += half1_action_diffs[i];
+    mean_h2 += half2_action_diffs[i];
+  }
+  mean_h1 /= half1_action_diffs.size();
+  mean_h2 /= half2_action_diffs.size();
+
+  double cov = 0.0, var1 = 0.0, var2 = 0.0, sum_abs_diff = 0.0, sum_sq_diff = 0.0;
+  for (size_t i = 0; i < half1_action_diffs.size(); ++i) {
+    double d1 = half1_action_diffs[i] - mean_h1;
+    double d2 = half2_action_diffs[i] - mean_h2;
+    cov += d1 * d2;
+    var1 += d1 * d1;
+    var2 += d2 * d2;
+    double ad = std::abs(half1_action_diffs[i] - half2_action_diffs[i]);
+    sum_abs_diff += ad;
+    sum_sq_diff += ad * ad;
+  }
+  double corr = (var1 > 0 && var2 > 0) ? cov / std::sqrt(var1 * var2) : 0.0;
+  double mean_abs_diff = sum_abs_diff / half1_action_diffs.size();
+  double agreement_mse = sum_sq_diff / half1_action_diffs.size();
+
+  // Check the Three Registered Criteria:
+  bool crit1_q_gain = (red_m_vs_zero >= 0.10) && (ci_m_minus_zero.second < 0.0);
+  bool crit2_averaging = (red_m_vs_s >= 0.10) && (ci_m_minus_s.second < 0.0);
+  bool crit3_local_gain = (mean_util_gain >= 0.05) && (ci_util_gain.first > 0.0);
+
+  std::cout << "\n=======================================================\n";
+  std::cout << "FRESH CONFIRMATION STUDY RESULTS (512 ROOTS)\n";
+  std::cout << "=======================================================\n";
+  std::cout << absl::StrFormat("Exact Zero-Diff MSE             : %.8f\n", mean_mse_zero);
+  std::cout << absl::StrFormat("Critic S Action-Diff MSE        : %.8f (Reduction vs Zero: %.2f%%)\n",
+                               mean_mse_s, red_s_vs_zero * 100.0);
+  std::cout << absl::StrFormat("Critic M Action-Diff MSE        : %.8f (Reduction vs Zero: %.2f%%, vs S: %.2f%%)\n",
+                               mean_mse_m, red_m_vs_zero * 100.0, red_m_vs_s * 100.0);
+  std::cout << absl::StrFormat("Paired Diff (M - Zero) 95%% CI  : [%.6f, %.6f]\n",
+                               ci_m_minus_zero.first, ci_m_minus_zero.second);
+  std::cout << absl::StrFormat("Paired Diff (M - S) 95%% CI     : [%.6f, %.6f]\n",
+                               ci_m_minus_s.first, ci_m_minus_s.second);
+  std::cout << absl::StrFormat("Mean Placement Utility Gain     : %+.4f [95%% CI: %+.4f, %+.4f]\n",
+                               mean_util_gain, ci_util_gain.first, ci_util_gain.second);
+  std::cout << absl::StrFormat("Decisions Changed               : %d / %d (%.1f%%)\n",
+                               changed_count, static_cast<int>(confirm_roots.size()), changed_frac * 100.0);
+  std::cout << absl::StrFormat("Target Reliability Correlation  : %.4f (Agreement MSE: %.4f)\n",
+                               corr, agreement_mse);
+  std::cout << "-------------------------------------------------------\n";
+  std::cout << absl::StrFormat("Criterion 1: Q-Prediction Gain (>=10%% vs Zero, CI high < 0) : %s\n",
+                               crit1_q_gain ? "CONFIRMED" : "NOT CONFIRMED");
+  std::cout << absl::StrFormat("Criterion 2: Averaging Benefit (>=10%% vs S, CI high < 0)    : %s\n",
+                               crit2_averaging ? "CONFIRMED" : "NOT CONFIRMED");
+  std::cout << absl::StrFormat("Criterion 3: Local-Choice Gain (>=+0.05, CI low > 0)          : %s\n",
+                               crit3_local_gain ? "CONFIRMED" : "NOT CONFIRMED");
+  std::cout << "=======================================================\n\n";
+
+  // Build JSON Report
+  json::Object rep;
+  rep["study_name"] = "action_conditioned_critic_confirmation_20260911";
+  rep["roots_count"] = static_cast<int64_t>(confirm_roots.size());
+  rep["total_continuations"] = static_cast<int64_t>(total_confirm_conts);
+  rep["critic_m_sha256"] = sha_m;
+  rep["critic_s_sha256"] = sha_s;
+
+  json::Object mse_obj;
+  mse_obj["mse_zero"] = mean_mse_zero;
+  mse_obj["mse_s"] = mean_mse_s;
+  mse_obj["mse_m"] = mean_mse_m;
+  mse_obj["reduction_m_vs_zero"] = red_m_vs_zero;
+  mse_obj["reduction_m_vs_s"] = red_m_vs_s;
+  mse_obj["reduction_s_vs_zero"] = red_s_vs_zero;
+  mse_obj["ci95_m_minus_zero_low"] = ci_m_minus_zero.first;
+  mse_obj["ci95_m_minus_zero_high"] = ci_m_minus_zero.second;
+  mse_obj["ci95_m_minus_s_low"] = ci_m_minus_s.first;
+  mse_obj["ci95_m_minus_s_high"] = ci_m_minus_s.second;
+  rep["action_diff_mse"] = mse_obj;
+
+  json::Object util_obj;
+  util_obj["mean_utility_gain"] = mean_util_gain;
+  util_obj["ci95_gain_low"] = ci_util_gain.first;
+  util_obj["ci95_gain_high"] = ci_util_gain.second;
+  util_obj["changed_count"] = static_cast<int64_t>(changed_count);
+  util_obj["changed_choice_fraction"] = changed_frac;
+
+  json::Object rd_breakdown;
+  for (const auto& kv : changed_by_round) {
+    rd_breakdown[std::to_string(kv.first)] = static_cast<int64_t>(kv.second);
+  }
+  util_obj["changed_by_round"] = rd_breakdown;
+
+  json::Object seat_breakdown;
+  for (const auto& kv : changed_by_seat) {
+    seat_breakdown[std::to_string(kv.first)] = static_cast<int64_t>(kv.second);
+  }
+  util_obj["changed_by_seat"] = seat_breakdown;
+  rep["local_usefulness"] = util_obj;
+
+  json::Object rel_obj;
+  rel_obj["pearson_correlation"] = corr;
+  rel_obj["mean_abs_diff"] = mean_abs_diff;
+  rel_obj["agreement_mse"] = agreement_mse;
+  rep["target_reliability"] = rel_obj;
+
+  json::Object crit_obj;
+  crit_obj["criterion_1_q_prediction_gain"] = crit1_q_gain;
+  crit_obj["criterion_2_averaging_benefit"] = crit2_averaging;
+  crit_obj["criterion_3_local_choice_gain"] = crit3_local_gain;
+  rep["criteria_evaluations"] = crit_obj;
+
+  std::ofstream rep_file(out_dir / "confirmation_report.json");
+  rep_file << json::ToString(rep) << "\n";
+  rep_file.close();
+  std::cout << "Confirmation report written to: " << (out_dir / "confirmation_report.json") << "\n";
+}
+
 }  // namespace action_value_study
 }  // namespace open_spiel
 
@@ -1710,6 +2938,12 @@ int main(int argc, char** argv) {
     RunRolloutTest(game, out_dir, threads);
   } else if (phase == "evaluate") {
     RunEvaluate(out_dir, device);
+  } else if (phase == "offline_action_conditioned_critic") {
+    std::string corpus_dir_str = absl::GetFlag(FLAGS_corpus_dir);
+    std::filesystem::path corpus_dir = corpus_dir_str.empty() ? out_dir : std::filesystem::path(corpus_dir_str);
+    RunOfflineFrozenFeatureCritic(game, corpus_dir, out_dir, device);
+  } else if (phase == "run_confirmation_study") {
+    RunConfirmationStudy(game, out_dir, device, threads);
   } else if (phase == "all") {
     RunVerify();
     RunPilot(game, out_dir, threads);
