@@ -72,14 +72,29 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   DuneNNEvaluator(
       std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       torch::Device device,
-      float logit_cap = 10.0f)
+      float logit_cap = 10.0f,
+      dune_imperium::MarketAppendixMode market_mode =
+          dune_imperium::MarketAppendixMode::kNone)
       : model_(model),
         device_(device),
-        logit_cap_(logit_cap) {
+        logit_cap_(logit_cap),
+        market_mode_(market_mode) {
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
     // Dynamically retrieve the expected observation input size from the model
     obs_size_ = model_->input_layer->weight.size(1);
+    if (market_mode_ == dune_imperium::MarketAppendixMode::kNone) {
+      if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+        market_mode_ =
+            dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+      } else if (obs_size_ ==
+                 dune_imperium::kOrderedCardSlotsInformationStateSize) {
+        market_mode_ =
+            dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
+      } else if (obs_size_ == dune_imperium::kExpandedInformationStateSize) {
+        market_mode_ = dune_imperium::MarketAppendixMode::kOrderedMarket;
+      }
+    }
   }
 
   std::vector<double> Evaluate(const State& state) override {
@@ -103,7 +118,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
     // Stack all players' observations
     for (int p = 0; p < num_players; ++p) {
-      std::vector<float> obs = state.InformationStateTensor(p);
+      std::vector<float> obs = ModelObservation(state, p);
       CheckObsSize(obs.size());
       
       std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
@@ -134,7 +149,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
       return {};
     }
 
-    std::vector<float> obs = state.InformationStateTensor(current_player);
+    std::vector<float> obs = ModelObservation(state, current_player);
     CheckObsSize(obs.size());
 
     // Pre-allocate a CPU tensor locally to ensure thread-safety
@@ -152,6 +167,21 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     std::vector<Action> legal_actions = state.LegalActions();
     if (legal_actions.empty()) {
       return {};
+    }
+
+    if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+      const auto* dune =
+          dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+      if (dune != nullptr) {
+        dune_semantic::CandidateActionData cand_data;
+        dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions,
+                                                   &cand_data);
+        std::vector<const dune_semantic::CandidateActionData*> batch_cands = {
+            &cand_data};
+        dune_semantic::ApplySemanticScorerBatch(
+            model_->semantic_scorer_, outputs.trunk, batch_cands,
+            outputs.logits, device_);
+      }
     }
 
     // Cast AMP FP16 outputs back to Float32 and move to CPU host
@@ -216,7 +246,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
     // Stack all players' observations
     for (int p = 0; p < num_players; ++p) {
-      std::vector<float> obs = state.InformationStateTensor(p);
+      std::vector<float> obs = ModelObservation(state, p);
       CheckObsSize(obs.size());
       std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
     }
@@ -237,6 +267,22 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (current_player >= 0 && current_player < num_players) {
       std::vector<Action> legal_actions = state.LegalActions();
       if (!legal_actions.empty()) {
+        if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+          const auto* dune =
+              dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+          if (dune != nullptr) {
+            dune_semantic::CandidateActionData cand_data;
+            dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions,
+                                                       &cand_data);
+            std::vector<const dune_semantic::CandidateActionData*> batch_cands(
+                num_players, nullptr);
+            batch_cands[current_player] = &cand_data;
+            dune_semantic::ApplySemanticScorerBatch(
+                model_->semantic_scorer_, outputs.trunk, batch_cands,
+                outputs.logits, device_);
+          }
+        }
+
         torch::Tensor player_logits = outputs.logits.index({current_player}).to(torch::kFloat32).to(torch::kCPU);
         float* logits_ptr = player_logits.data_ptr<float>();
         int64_t action_dim = player_logits.size(0);
@@ -277,6 +323,15 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   }
 
  private:
+  std::vector<float> ModelObservation(const State& state, Player player) const {
+    if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
+      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+      SPIEL_CHECK_TRUE(dune != nullptr);
+      return dune->InformationStateTensorWithAppendix(player, market_mode_);
+    }
+    return state.InformationStateTensor(player);
+  }
+
   static void AtomicMax(std::atomic<double>* target, double value) {
     double current = target->load(std::memory_order_relaxed);
     while (current < value &&
@@ -289,17 +344,14 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   void CheckObsSize(size_t size) const {
     SPIEL_CHECK_TRUE(size == static_cast<size_t>(obs_size_) || 
                      (size == 5580 && obs_size_ == 5584) ||
-                     (size == 5584 && obs_size_ == 5580) ||
-                     (size == 6215 && obs_size_ == 5580) ||
-                     (size == 5580 && obs_size_ == 6215) ||
-                     (size == 6215 && obs_size_ == 5584) ||
-                     (size == 5584 && obs_size_ == 6215));
+                     (size == 5584 && obs_size_ == 5580));
   }
 
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
   torch::Device device_;
   float logit_cap_;
   int64_t obs_size_;
+  dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
 };
 
 } // namespace open_spiel

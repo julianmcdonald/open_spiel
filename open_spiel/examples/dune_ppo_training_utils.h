@@ -49,6 +49,8 @@ struct PpoTransition {
   int64_t behavior_physical_batch_id = -1;
   int32_t behavior_physical_batch_size = -1;
   int32_t behavior_physical_batch_row = -1;
+  // Candidate action descriptors for the semantic action scorer.
+  dune_semantic::CandidateActionData candidate_data;
 };
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH

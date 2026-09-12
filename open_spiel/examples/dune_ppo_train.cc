@@ -114,6 +114,7 @@ ABSL_FLAG(bool, evaluator_device_synchronize, true,
           "Use whole-device CUDA synchronize after evaluator D2H copies.");
 ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
 ABSL_FLAG(bool, deterministic_rollout_eval, false, "Use deterministic batch-1 rollout evaluation.");
+ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the neural Semantic Action Scorer on legal candidate actions.");
 ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
 ABSL_FLAG(std::string, numerical_parity_output, "",
           "Fresh output JSON for the read-only rollout-BF16 versus learner-FP32 "
@@ -417,11 +418,8 @@ ABSL_FLAG(std::string, collector_acceptance_prior, "",
           "resuming a checkpoint whose manifest predates the field, because its "
           "cumulative counters were accumulated under tree_prior.");
 // --- Leader-selection search teacher (adopted 2026-08-16; fixed budget) ------
-// Leader picks were never searched, so the policy head learned Leader selection
-// from nothing but its own prior. These make the Leader decision a searched,
-// LABELLED training target. All three default OFF/inert: a run that wants
-// Leader teaching states so explicitly, and they are pinned into the config
-// fingerprint so a resume cannot silently change the teacher.
+// Ordinary PPO already trains leader choices from game returns. This optional
+// teacher adds search-generated labels; it is not required for leader learning.
 ABSL_FLAG(bool, search_leader_draft, false,
           "Search the Leader choice for each auxiliary game's designated "
           "searched seat and emit it as a leader_selection training label. "
@@ -680,7 +678,8 @@ ABSL_FLAG(int, counterfactual_replay_weight, 8,
           "Value-loss replay multiplicity for each sampled counterfactual successor.");
 ABSL_DECLARE_FLAG(double, policy_kl_anchor_coeff);
 ABSL_FLAG(std::string, market_appendix_mode, "none",
-          "Imperium market appendix mode: 'none' (legacy 5580), 'zeros' (expanded 6215 with zero appendix), 'ordered_market' (expanded 6215 with ordered market slots).");
+          "Card-slot input mode: 'none' (5580), 'zeros' or 'ordered_market' (6215), "
+          "or 'ordered_card_slots_v2' (7271: Imperium, Tleilaxu, and own Helena reserve).");
 
 // ===========================================================================
 // PWO-5 gate 3 — Appendix A.1 of docs/PWO5_PILOT_REGISTRATION.md
@@ -1045,6 +1044,38 @@ std::string HashAllModelState(
 // Numerical exactness: the trunk/policy/value tensors are `copy_`d from the
 // loaded temp model, which is a bitwise copy of the same dtype and shape. This
 // is what makes section 7.3's bitwise legacy-inference parity gate passable.
+dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
+    const std::string& checkpoint_path, int input_dim) {
+  if (input_dim == dune_imperium::kLegacyInformationStateSize) {
+    return dune_imperium::MarketAppendixMode::kNone;
+  }
+  SPIEL_CHECK_TRUE(dune_imperium::IsExtendedInformationStateSize(input_dim));
+  std::filesystem::path metadata_path(checkpoint_path);
+  metadata_path.replace_extension(".json");
+  std::ifstream input(metadata_path);
+  if (!input) SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
+  const std::string content((std::istreambuf_iterator<char>(input)), {});
+  const auto metadata = open_spiel::json::FromString(content);
+  if (!metadata || !metadata->IsObject()) {
+    SpielFatalError("Invalid card-slot checkpoint metadata: " + metadata_path.string());
+  }
+  const auto& object = metadata->GetObject();
+  auto mode_entry = object.find("market_appendix_mode");
+  auto dim_entry = object.find("observation_dim");
+  auto hash_entry = object.find("feature_schema_sha256");
+  if (mode_entry == object.end() || !mode_entry->second.IsString() ||
+      dim_entry == object.end() || !dim_entry->second.IsInt() ||
+      hash_entry == object.end() || !hash_entry->second.IsString()) {
+    SpielFatalError("Incomplete card-slot checkpoint schema: " + metadata_path.string());
+  }
+  const auto mode = dune_imperium::ParseMarketAppendixMode(mode_entry->second.GetString());
+  const auto schema = dune_imperium::GetInformationStateSchema(mode);
+  SPIEL_CHECK_EQ(schema.size, input_dim);
+  SPIEL_CHECK_EQ(dim_entry->second.GetInt(), input_dim);
+  SPIEL_CHECK_EQ(hash_entry->second.GetString(), std::string(schema.sha256));
+  return mode;
+}
+
 bool LoadModelCheckpointMigrating(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     const std::string& path, torch::Device device) {
@@ -1053,6 +1084,31 @@ bool LoadModelCheckpointMigrating(
   int64_t action_dim = model->policy_head->weight.size(0);
   int num_blocks = absl::GetFlag(FLAGS_num_blocks);
   const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
+  if (CheckpointHasSemanticScorer(path) && !model->with_semantic_scorer_) {
+    SpielFatalError("Model loading must preserve the source scorer; checkpoint at " + path +
+                    " has a semantic scorer but model was not configured with --enable_semantic_scorer=true.");
+  }
+
+  std::filesystem::path metadata_path(path);
+  metadata_path.replace_extension(".json");
+  if (std::filesystem::exists(metadata_path)) {
+    std::ifstream input(metadata_path);
+    if (input) {
+      const std::string content((std::istreambuf_iterator<char>(input)), {});
+      const auto metadata = open_spiel::json::FromString(content);
+      if (metadata && metadata->IsObject()) {
+        const auto& object = metadata->GetObject();
+        auto scorer_entry = object.find("enable_semantic_scorer");
+        if (scorer_entry != object.end() && scorer_entry->second.IsBool() && scorer_entry->second.GetBool()) {
+          auto schema_entry = object.find("semantic_descriptor_schema");
+          if (schema_entry == object.end() || !schema_entry->second.IsString() ||
+              schema_entry->second.GetString() != dune_semantic::kDescriptorSchemaVersion) {
+            SpielFatalError("Mismatched or missing semantic_descriptor_schema in metadata: " + metadata_path.string());
+          }
+        }
+      }
+    }
+  }
 
   int64_t ckpt_input_dim = input_dim;
   {
@@ -1075,7 +1131,15 @@ bool LoadModelCheckpointMigrating(
 
   torch::NoGradGuard no_grad;
   // Trunk.
-  if (ckpt_input_dim == input_dim) {
+  if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
+    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
+    CopyInputToFullPublicInformation(model->input_layer->weight,
+                                     temp_model->input_layer->weight, source_mode);
+  } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
+    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
+    CopyInputToOrderedCardSlots(model->input_layer->weight,
+                               temp_model->input_layer->weight, source_mode);
+  } else if (ckpt_input_dim == input_dim) {
     model->input_layer->weight.copy_(temp_model->input_layer->weight);
   } else if (ckpt_input_dim == 5580 && input_dim == 6215) {
     model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
@@ -1153,20 +1217,35 @@ bool LoadModelCheckpointMigrating(
                 << "." << std::endl;
     }
   }
+  if (model->with_semantic_scorer_) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive scorer_archive;
+    if (archive.try_read("semantic_scorer", scorer_archive)) {
+      model->semantic_scorer_->load(scorer_archive);
+      std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path << std::endl;
+    } else {
+      std::cout << "[SEMANTIC SCORER] Checkpoint does not contain semantic_scorer; keeping zero-init scorer." << std::endl;
+    }
+  }
   return migrated;
 }
 
 void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                          const std::string& path, torch::Device device) {
-  // PWO-5: when the model carries the auxiliary heads, the migrating loader is
-  // the only correct path -- a plain torch::load would demand head tensors the
-  // base checkpoint does not have and would abort the run.
-  if (model->has_aux_heads_ || model->input_layer->weight.size(1) == 6215) {
+  // PWO-5 & Semantic Scorer: when the model carries auxiliary heads or a semantic scorer,
+  // the migrating loader is the only correct path -- a plain torch::load would demand
+  // tensors the base checkpoint does not have and would abort the run.
+  if (model->has_aux_heads_ || model->with_semantic_scorer_ ||
+      CheckpointHasSemanticScorer(path) ||
+      dune_imperium::IsExtendedInformationStateSize(model->input_layer->weight.size(1))) {
     LoadModelCheckpointMigrating(model, path, device);
     return;
   }
   if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
+    const int64_t expected_input_dim = model->input_layer->weight.size(1);
     torch::load(model, path, device);
+    SPIEL_CHECK_EQ(model->input_layer->weight.size(1), expected_input_dim);
     return;
   }
   int64_t input_dim = model->input_layer->weight.size(1);
@@ -1666,6 +1745,25 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
   }
 
+  if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v3") {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
+    config_obj["market_appendix_mode"] = std::string("full_public_information_v3");
+    config_obj["observation_dim"] = schema.size;
+    config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  } else if (absl::GetFlag(FLAGS_market_appendix_mode) == "ordered_card_slots_v2") {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2);
+    config_obj["market_appendix_mode"] = std::string("ordered_card_slots_v2");
+    config_obj["observation_dim"] = schema.size;
+    config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  }
+
+  if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
+    config_obj["enable_semantic_scorer"] = true;
+    config_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+  }
+
   return config_obj;
 }
 
@@ -1862,8 +1960,15 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["observation_dim"] = static_cast<int64_t>(model->input_layer->weight.size(1));
     manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
     if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
-      manifest_obj["feature_schema_label"] = std::string(dune_imperium::kMarketInformationSchemaV1);
-      manifest_obj["feature_schema_sha256"] = std::string(dune_imperium::kMarketInformationSchemaV1Sha256);
+      const auto schema = dune_imperium::GetInformationStateSchema(
+          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
+      SPIEL_CHECK_EQ(model->input_layer->weight.size(1), schema.size);
+      manifest_obj["feature_schema_label"] = std::string(schema.label);
+      manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
+    }
+    manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
+    if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
+      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
@@ -2041,7 +2146,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       const bool is_learner = (!single_learner) || (current_player == learner_seat);
 
       std::vector<float> obs(obs_size, 0.0f);
-      if (dune_state != nullptr && obs_size == dune_imperium::kExpandedInformationStateSize) {
+      if (dune_state != nullptr && dune_imperium::IsExtendedInformationStateSize(obs_size)) {
         dune_imperium::MarketAppendixMode mode =
             dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode));
         dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs));
@@ -2054,7 +2159,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       std::shared_ptr<IGameEvaluator> active_evaluator =
           dune_opponent_pool::ResolveEvaluator(current_player, seat_assignment,
                                                evaluator, opponent_evaluators);
-      EvalResult result = active_evaluator->Evaluate(obs);
+      dune_semantic::CandidateActionData cand_data;
+      const dune_semantic::CandidateActionData* p_cand_data = nullptr;
+      if (dune_state != nullptr) {
+        dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data);
+        p_cand_data = &cand_data;
+      }
+      EvalResult result = active_evaluator->EvaluateWithActions(obs, p_cand_data);
       std::vector<float> logits = std::move(result.logits);
       const bool parity_capture =
           (!absl::GetFlag(FLAGS_numerical_parity_output).empty()) && is_learner;
@@ -2478,6 +2589,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.behavior_physical_batch_id = result.physical_batch_id;
         transition.behavior_physical_batch_size = result.physical_batch_size;
         transition.behavior_physical_batch_row = result.physical_batch_row;
+        transition.candidate_data = std::move(cand_data);
         trajectory->push_back(std::move(transition));
 
         if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -3255,7 +3367,16 @@ std::vector<PpoNumericalParityRow> ReplayPpoNumericalParityCell(
     torch::Tensor replay_raw_logits, replay_log_probs;
     auto replay_policy_path = [&]() {
       if (model_forward_calls != nullptr) ++*model_forward_calls;
-      const auto outputs = model->forward(states);
+      auto outputs = model->forward(states);
+      if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+        std::vector<const dune_semantic::CandidateActionData*> cands;
+        cands.reserve(count);
+        for (int64_t i = 0; i < count; ++i) {
+          cands.push_back(&batch[start + i].candidate_data);
+        }
+        dune_semantic::ApplySemanticScorerBatch(
+            model->semantic_scorer_, outputs.trunk, cands, outputs.logits, device);
+      }
       replay_raw_logits = outputs.logits;
       const torch::Tensor centered =
           CenterAndCapLogitsTensor(replay_raw_logits, masks, logit_cap);
@@ -4088,7 +4209,16 @@ PpoParityCellResult ReplayPpoTrainingModelOriginalGeometry(
     }
     torch::Tensor raw_logits, replay_log_probs;
     auto compute = [&]() {
-      const auto outputs = model->forward(states);
+      auto outputs = model->forward(states);
+      if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+        std::vector<const dune_semantic::CandidateActionData*> cands;
+        cands.reserve(count);
+        for (int64_t i = 0; i < count; ++i) {
+          cands.push_back(&batch[indices[i]].candidate_data);
+        }
+        dune_semantic::ApplySemanticScorerBatch(
+            model->semantic_scorer_, outputs.trunk, cands, outputs.logits, device);
+      }
       raw_logits = outputs.logits;
       const torch::Tensor centered =
           CenterAndCapLogitsTensor(raw_logits, masks, logit_cap);
@@ -6478,7 +6608,7 @@ int main(int argc, char** argv) {
   dune_imperium::MarketAppendixMode market_mode =
       dune_imperium::ParseMarketAppendixMode(market_mode_str);
   if (market_mode != dune_imperium::MarketAppendixMode::kNone) {
-    obs_size = dune_imperium::kExpandedInformationStateSize;
+    obs_size = dune_imperium::GetInformationStateSchema(market_mode).size;
   }
   int64_t action_size = game->NumDistinctActions();
 
@@ -7030,11 +7160,12 @@ int main(int argc, char** argv) {
               << " -> derived init seed " << pwo5_head_init_seed << std::endl;
   }
 
+  const bool enable_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer);
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
           absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-          pwo5_aux_layout, pwo5_head_init_seed);
+          pwo5_aux_layout, pwo5_head_init_seed, enable_scorer);
   // The INFERENCE model deliberately does NOT get the heads. Section 8.6
   // requires the three heads be computed "never in the rollout/inference
   // forward"; constructing them here would make that a matter of care instead
@@ -7042,7 +7173,8 @@ int main(int argc, char** argv) {
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+          absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
+          /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer);
   training_model->to(device);
   inference_model->to(device);
 
@@ -7075,7 +7207,8 @@ int main(int argc, char** argv) {
     collection_model =
         std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
             obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-            absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+            absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
+            /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer);
     collection_model->to(device);
   }
 
@@ -8774,8 +8907,15 @@ int main(int argc, char** argv) {
     manifest_obj["observation_dim"] = static_cast<int64_t>(training_model->input_layer->weight.size(1));
     manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
     if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
-      manifest_obj["feature_schema_label"] = std::string(dune_imperium::kMarketInformationSchemaV1);
-      manifest_obj["feature_schema_sha256"] = std::string(dune_imperium::kMarketInformationSchemaV1Sha256);
+      const auto schema = dune_imperium::GetInformationStateSchema(
+          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
+      SPIEL_CHECK_EQ(training_model->input_layer->weight.size(1), schema.size);
+      manifest_obj["feature_schema_label"] = std::string(schema.label);
+      manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
+    }
+    manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
+    if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
+      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
     }
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
     // PWO-5 Appendix A.1 note 3: the same block the checkpoint writer emits, so
@@ -9104,10 +9244,12 @@ int main(int argc, char** argv) {
           if (current_mode != "none") {
             auto it_schema = obj.find("feature_schema_sha256");
             std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
-            if (manifest_schema != dune_imperium::kMarketInformationSchemaV1Sha256) {
+            const auto schema = dune_imperium::GetInformationStateSchema(
+                dune_imperium::ParseMarketAppendixMode(current_mode));
+            if (manifest_schema != schema.sha256) {
               SpielFatalError(absl::StrFormat(
                   "feature_schema_sha256 mismatch on study_resume. Manifest: '%s', Expected: '%s'",
-                  manifest_schema, dune_imperium::kMarketInformationSchemaV1Sha256));
+                  manifest_schema, schema.sha256));
             }
           }
         }
@@ -9190,9 +9332,12 @@ int main(int argc, char** argv) {
         if (!std::filesystem::exists(opp_path)) {
           SpielFatalError("Training opponent pool checkpoint does not exist: " + opp_path);
         }
+        const bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path);
         auto opp_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
             obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-            absl::GetFlag(FLAGS_num_blocks), /*use_nonlinear=*/false);
+            absl::GetFlag(FLAGS_num_blocks), /*use_nonlinear=*/false,
+            /*with_aux_heads=*/false, /*head_init_seed=*/0,
+            /*with_semantic_scorer=*/opp_has_scorer);
         opp_model->to(device);
         open_spiel::LoadModelCheckpoint(opp_model, opp_path, device);
         opp_model->eval();

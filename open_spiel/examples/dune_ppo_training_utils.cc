@@ -1323,6 +1323,14 @@ PpoUpdateStats TrainPpoUpdate(
         torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
 
         auto outputs = model->forward(mb_states);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
+          for (int64_t i = start; i < end; ++i) {
+            mb_cands[i - start] = &batch[i].candidate_data;
+          }
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
+        }
         if (!::absl::GetFlag(::FLAGS_train_value_only)) {
           torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
           torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
@@ -1388,6 +1396,14 @@ PpoUpdateStats TrainPpoUpdate(
           torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
 
           auto outputs = model->forward(mb_states);
+          if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+            std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
+            for (int64_t i = start; i < end; ++i) {
+              mb_cands[i - start] = &batch[i].candidate_data;
+            }
+            dune_semantic::ApplySemanticScorerBatch(
+                model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
+          }
           torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
           torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
           torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
@@ -1589,6 +1605,14 @@ PpoUpdateStats TrainPpoUpdate(
         torch::Tensor mb_s = states.narrow(0, start, end - start);
         torch::Tensor mb_m = masks.narrow(0, start, end - start);
         auto coll_out = collection_model->forward(mb_s);
+        if (collection_model->with_semantic_scorer_ && collection_model->semantic_scorer_) {
+          std::vector<const dune_semantic::CandidateActionData*> coll_cands(end - start);
+          for (int64_t i = start; i < end; ++i) {
+            coll_cands[i - start] = &batch[i].candidate_data;
+          }
+          dune_semantic::ApplySemanticScorerBatch(
+              collection_model->semantic_scorer_, coll_out.trunk, coll_cands, coll_out.logits, device);
+        }
         torch::Tensor coll_logits =
             CenterAndCapLogitsTensor(coll_out.logits, mb_m, logit_cap);
         torch::Tensor coll_masked_logits =
@@ -1625,6 +1649,16 @@ PpoUpdateStats TrainPpoUpdate(
       torch::Tensor mb_returns = returns.index_select(0, mb_idx);
       torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
       torch::Tensor mb_nontrivial = nontrivial_mask.index_select(0, mb_idx);
+      std::vector<const dune_semantic::CandidateActionData*> mb_candidate_actions;
+      if (model->with_semantic_scorer_) {
+        const int64_t mb_len = end - start;
+        mb_candidate_actions.resize(mb_len);
+        torch::Tensor mb_idx_cpu = mb_idx.to(torch::kCPU);
+        const int64_t* mb_indices = mb_idx_cpu.data_ptr<int64_t>();
+        for (int64_t i = 0; i < mb_len; ++i) {
+          mb_candidate_actions[i] = &batch[mb_indices[i]].candidate_data;
+        }
+      }
       torch::Tensor mb_coll_lp;
       if (reverse_kl_active) {
         mb_coll_lp = collection_log_probs.index_select(0, mb_idx);
@@ -1816,6 +1850,10 @@ PpoUpdateStats TrainPpoUpdate(
 
       auto compute_loss = [&]() {
         auto outputs = model->forward(mb_states);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, outputs.trunk, mb_candidate_actions, outputs.logits, device);
+        }
 
         // 3. Critic loss (Retain all samples)
         torch::Tensor new_values = outputs.values.squeeze(1);
@@ -1849,6 +1887,10 @@ PpoUpdateStats TrainPpoUpdate(
           total_loss = value_coef * value_loss;
           if (anchor_model) {
             auto anchor_outputs = anchor_model->forward(mb_states);
+            if (anchor_model->with_semantic_scorer_ && anchor_model->semantic_scorer_) {
+              dune_semantic::ApplySemanticScorerBatch(
+                  anchor_model->semantic_scorer_, anchor_outputs.trunk, mb_candidate_actions, anchor_outputs.logits, device);
+            }
             torch::Tensor anchor_logits = CenterAndCapLogitsTensor(anchor_outputs.logits, mb_masks, logit_cap);
             torch::Tensor masked_anchor_logits = anchor_logits.masked_fill(mb_masks.logical_not(), -1e9f);
             torch::Tensor anchor_probs = torch::softmax(masked_anchor_logits, -1);
@@ -2331,8 +2373,15 @@ PpoUpdateStats TrainPpoUpdateSeparate(
         torch::Tensor mb_actions = actions.narrow(0, start, end - start);
         torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
         torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
-
         auto outputs = actor_model->forward(mb_states);
+        if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
+          std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
+          for (int64_t i = start; i < end; ++i) {
+            mb_cands[i - start] = &batch[i].candidate_data;
+          }
+          dune_semantic::ApplySemanticScorerBatch(
+              actor_model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
+        }
         torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
         torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
         torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
@@ -2433,6 +2482,16 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       torch::Tensor mb_returns = returns.index_select(0, mb_idx);
       torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
       torch::Tensor mb_nontrivial = nontrivial_mask.index_select(0, mb_idx);
+      std::vector<const dune_semantic::CandidateActionData*> mb_candidate_actions;
+      if (actor_model->with_semantic_scorer_) {
+        const int64_t mb_len = end - start;
+        mb_candidate_actions.resize(mb_len);
+        torch::Tensor mb_idx_cpu = mb_idx.to(torch::kCPU);
+        const int64_t* mb_indices = mb_idx_cpu.data_ptr<int64_t>();
+        for (int64_t i = 0; i < mb_len; ++i) {
+          mb_candidate_actions[i] = &batch[mb_indices[i]].candidate_data;
+        }
+      }
 
       int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
 
@@ -2468,6 +2527,10 @@ PpoUpdateStats TrainPpoUpdateSeparate(
 
       auto compute_actor_loss = [&]() {
         auto actor_outputs = actor_model->forward(mb_states);
+        if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              actor_model->semantic_scorer_, actor_outputs.trunk, mb_candidate_actions, actor_outputs.logits, device);
+        }
         torch::Tensor logits =
             CenterAndCapLogitsTensor(actor_outputs.logits, mb_masks, logit_cap);
         torch::Tensor masked_logits =

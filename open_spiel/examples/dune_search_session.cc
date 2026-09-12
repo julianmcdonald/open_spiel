@@ -660,9 +660,27 @@ std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
   int64_t action_size = game->NumDistinctActions();
 
   torch::Device device(device_str);
+
+  int64_t ckpt_input_dim = obs_size;
+  {
+    torch::serialize::InputArchive archive;
+    archive.load_from(checkpoint_path, torch::kCPU);
+    torch::serialize::InputArchive in_archive;
+    if (archive.try_read("input_layer", in_archive)) {
+      torch::Tensor w;
+      if (in_archive.try_read("weight", w)) {
+        ckpt_input_dim = w.size(1);
+      }
+    }
+  }
+
+  const bool has_scorer = CheckpointHasSemanticScorer(checkpoint_path, torch::kCPU);
+
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      obs_size, hidden_dim, action_size, num_blocks);
-  torch::load(model, checkpoint_path, device);
+      ckpt_input_dim, hidden_dim, action_size, num_blocks,
+      /*use_nonlinear=*/false, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+      /*with_semantic_scorer=*/has_scorer);
+  LoadModelCheckpointRobust(model, checkpoint_path, device);
   model->to(device);
   model->eval();
   return std::make_shared<DuneNNEvaluator>(model, device);

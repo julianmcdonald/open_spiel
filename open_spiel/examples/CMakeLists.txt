@@ -428,6 +428,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_opponent_pool_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_opponent_pool_test COMMAND dune_opponent_pool_test)
+
+  add_executable(dune_semantic_verification_test dune_semantic_verification_test.cc
+    ../games/dune_imperium/dune_imperium_test_utils.cc
+    dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_semantic_verification_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_semantic_verification_test COMMAND dune_semantic_verification_test)
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()

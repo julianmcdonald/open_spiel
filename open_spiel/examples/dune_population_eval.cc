@@ -50,6 +50,8 @@
 // ---------------------------------------------------------------------------
 ABSL_FLAG(std::string, model_checkpoint, "",
           "Path to the model checkpoint to evaluate.");
+ABSL_FLAG(bool, enable_semantic_scorer, false,
+          "Enable the neural Semantic Action Scorer for candidate evaluation.");
 ABSL_FLAG(std::string, opponent_checkpoints, "",
           "Comma-separated paths to opponent model checkpoints. "
           "Empty or \"random\" for random opponents.");
@@ -443,18 +445,11 @@ struct OpponentMetadata {
 };
 
 dune_imperium::MarketAppendixMode ParseMarketMode(const std::string& str) {
-  if (str == "ordered_market") return dune_imperium::MarketAppendixMode::kOrderedMarket;
-  if (str == "zeros") return dune_imperium::MarketAppendixMode::kZeros;
-  return dune_imperium::MarketAppendixMode::kNone;
+  return dune_imperium::ParseMarketAppendixMode(str);
 }
 
 std::string MarketModeToString(dune_imperium::MarketAppendixMode mode) {
-  switch (mode) {
-    case dune_imperium::MarketAppendixMode::kOrderedMarket: return "ordered_market";
-    case dune_imperium::MarketAppendixMode::kZeros: return "zeros";
-    case dune_imperium::MarketAppendixMode::kNone:
-    default: return "none";
-  }
+  return dune_imperium::MarketAppendixModeToString(mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -496,13 +491,20 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
               *market_mode = it_mm->second.GetString();
             }
           }
-          if (input_dim != nullptr && *input_dim == dune_imperium::kExpandedInformationStateSize) {
+          if (input_dim != nullptr && dune_imperium::IsExtendedInformationStateSize(*input_dim)) {
+            auto it_mode = obj.find("market_appendix_mode");
+            if (it_mode == obj.end() || !it_mode->second.IsString()) {
+              SpielFatalError("Missing card-slot input mode for " + model_path);
+            }
+            const auto mode = ParseMarketMode(it_mode->second.GetString());
+            const auto schema = dune_imperium::GetInformationStateSchema(mode);
+            SPIEL_CHECK_EQ(*input_dim, schema.size);
             auto it_schema = obj.find("feature_schema_sha256");
             std::string schema_hash = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
-            if (schema_hash != dune_imperium::kMarketInformationSchemaV1Sha256) {
+            if (schema_hash != schema.sha256) {
               SpielFatalError(absl::StrFormat(
                   "Expanded model checkpoint %s has invalid or missing feature_schema_sha256 ('%s', expected '%s')",
-                  model_path, schema_hash, dune_imperium::kMarketInformationSchemaV1Sha256));
+                  model_path, schema_hash, schema.sha256));
             }
           }
           auto it_hd = obj.find("hidden_dim");
@@ -541,6 +543,9 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
     archive.read("input_layer", input_layer_archive);
     torch::Tensor weight;
     input_layer_archive.read("weight", weight);
+    if (weight.size(1) == dune_imperium::kOrderedCardSlotsInformationStateSize) {
+      SpielFatalError("Ordered-card-slot checkpoint requires valid schema metadata: " + model_path);
+    }
     *hidden_dim = weight.size(0);
     if (input_dim != nullptr) {
       *input_dim = weight.size(1);
@@ -731,7 +736,7 @@ void WorkerThread(
           evaluator = model_evaluator;
           p_obs = &cand_obs;
           std::fill(cand_obs.begin(), cand_obs.end(), 0.0f);
-          if (dune_state != nullptr && candidate_input_dim == dune_imperium::kExpandedInformationStateSize) {
+          if (dune_state != nullptr && dune_imperium::IsExtendedInformationStateSize(candidate_input_dim)) {
             dune_state->InformationStateTensorWithAppendix(
                 current_player, candidate_market_mode, absl::MakeSpan(cand_obs));
           } else if (provides_info_state_tensor) {
@@ -746,7 +751,7 @@ void WorkerThread(
           std::fill(opp_obs[idx].begin(), opp_obs[idx].end(), 0.0f);
           int opp_dim = (idx < opp_metadata.size()) ? opp_metadata[idx].input_dim : static_cast<int>(obs_size);
           auto opp_mode = (idx < opp_metadata.size()) ? opp_metadata[idx].market_mode : dune_imperium::MarketAppendixMode::kNone;
-          if (dune_state != nullptr && opp_dim == dune_imperium::kExpandedInformationStateSize) {
+          if (dune_state != nullptr && dune_imperium::IsExtendedInformationStateSize(opp_dim)) {
             dune_state->InformationStateTensorWithAppendix(
                 current_player, opp_mode, absl::MakeSpan(opp_obs[idx]));
           } else if (provides_info_state_tensor) {
@@ -756,7 +761,13 @@ void WorkerThread(
           }
         }
 
-        EvalResult result = evaluator->Evaluate(*p_obs);
+        dune_semantic::CandidateActionData cand_data;
+        const dune_semantic::CandidateActionData* p_cand_data = nullptr;
+        if (dune_state != nullptr) {
+          dune_semantic::ExtractCandidateDescriptors(*dune_state, legal_actions, &cand_data);
+          p_cand_data = &cand_data;
+        }
+        EvalResult result = evaluator->EvaluateWithActions(*p_obs, p_cand_data);
         if (use_model && dump_out != nullptr && dune_state != nullptr) {
           AppendLogitStatsRow(*dump_out, episode_id,
                               dune_state->GetCurrentRound(),
@@ -1075,7 +1086,7 @@ void RunEvaluation() {
   std::string cand_market_flag = absl::GetFlag(FLAGS_candidate_market_appendix_mode);
   dune_imperium::MarketAppendixMode cand_market_mode = dune_imperium::MarketAppendixMode::kNone;
   if (cand_market_flag == "auto") {
-    if (main_input_dim == dune_imperium::kExpandedInformationStateSize) {
+    if (dune_imperium::IsExtendedInformationStateSize(main_input_dim)) {
       cand_market_mode = ParseMarketMode(main_detected_market_mode);
       if (cand_market_mode == dune_imperium::MarketAppendixMode::kNone) {
         SpielFatalError(absl::StrFormat(
@@ -1088,22 +1099,24 @@ void RunEvaluation() {
   } else {
     cand_market_mode = ParseMarketMode(cand_market_flag);
     if (cand_market_mode == dune_imperium::MarketAppendixMode::kNone &&
-        main_input_dim == dune_imperium::kExpandedInformationStateSize) {
+        dune_imperium::IsExtendedInformationStateSize(main_input_dim)) {
       SpielFatalError(absl::StrFormat(
           "Expanded candidate checkpoint %s cannot use market_appendix_mode=none",
           model_checkpoint));
     }
   }
 
+  if (cand_market_mode != dune_imperium::MarketAppendixMode::kNone) {
+    SPIEL_CHECK_EQ(main_input_dim,
+                   dune_imperium::GetInformationStateSchema(cand_market_mode).size);
+  }
+
+  bool cand_has_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer) || CheckpointHasSemanticScorer(model_checkpoint, device);
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
       main_input_dim, main_hidden_dim, action_size, main_num_blocks,
-      absl::GetFlag(FLAGS_nonlinear_value_head));
+      absl::GetFlag(FLAGS_nonlinear_value_head), false, 0, cand_has_scorer);
   model->eval();
-  {
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_checkpoint, device);
-    model->load(archive);
-  }
+  LoadModelCheckpointRobust(model, model_checkpoint, device);
   model->to(device);
 
   std::shared_ptr<IGameEvaluator> model_evaluator;
@@ -1128,24 +1141,23 @@ void RunEvaluation() {
       SpielFatalError("Failed to detect model dimensions for opponent checkpoint: " + opp_path);
     }
     auto opp_market_mode = ParseMarketMode(opp_detected_market_mode_str);
-    if (opp_detected_input_dim == dune_imperium::kExpandedInformationStateSize) {
+    if (dune_imperium::IsExtendedInformationStateSize(opp_detected_input_dim)) {
       if (opp_market_mode == dune_imperium::MarketAppendixMode::kNone) {
         SpielFatalError(absl::StrFormat(
             "Expanded opponent checkpoint %s has absent or invalid market_appendix_mode: '%s'",
             opp_path, opp_detected_market_mode_str));
       }
+      SPIEL_CHECK_EQ(opp_detected_input_dim,
+                     dune_imperium::GetInformationStateSchema(opp_market_mode).size);
     }
     opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks, opp_detected_input_dim, opp_market_mode, MarketModeToString(opp_market_mode)});
 
+    bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path, device);
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
         opp_detected_input_dim, opp_detected_hidden, action_size, opp_detected_blocks,
-        absl::GetFlag(FLAGS_opponent_nonlinear_value_head));
+        absl::GetFlag(FLAGS_opponent_nonlinear_value_head), false, 0, opp_has_scorer);
     opp_model->eval();
-    {
-      torch::serialize::InputArchive archive;
-      archive.load_from(opp_path, device);
-      opp_model->load(archive);
-    }
+    LoadModelCheckpointRobust(opp_model, opp_path, device);
     opp_model->to(device);
 
     if (deterministic) {

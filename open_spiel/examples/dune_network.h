@@ -26,6 +26,7 @@
 
 #include "open_spiel/spiel.h"
 #include "dune_seed_utils.h"  // MakeTorchCPUGenerator, for the PWO-5 head init
+#include "dune_semantic_action_scorer.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -98,9 +99,12 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear terminal_round_head{nullptr};  // 3 classes: <=8 / 9 / 10
   torch::nn::Linear next_own_action_head{nullptr}; // action_dim classes
   bool has_aux_heads_ = false;
+  bool with_semantic_scorer_ = false;
+  std::shared_ptr<dune_semantic::SemanticActionScorerImpl> semantic_scorer_{nullptr};
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0) {
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false) {
     use_nonlinear_value_head_ = use_nonlinear;
+    with_semantic_scorer_ = with_semantic_scorer;
     input_layer = register_module("input_layer", torch::nn::Linear(input_dim, hidden_dim));
 
     // Register custom submodules dynamically (res1, res2, etc.)
@@ -204,11 +208,25 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
       init_head(terminal_round_head);
       init_head(next_own_action_head);
     }
+
+    if (with_semantic_scorer_) {
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+      register_module("semantic_scorer", semantic_scorer_);
+    }
+  }
+
+  void EnableSemanticScorer() {
+    if (!with_semantic_scorer_) {
+      with_semantic_scorer_ = true;
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+      register_module("semantic_scorer", semantic_scorer_);
+    }
   }
 
   struct ModelOutputs {
     torch::Tensor logits;
     torch::Tensor values;
+    torch::Tensor trunk;
   };
 
   // The three auxiliary head outputs. Produced ONLY by ForwardAux().
@@ -239,7 +257,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     } else {
       values = torch::tanh(value_head->forward(x));
     }
-    return {logits, values};
+    return {logits, values, x};
   }
 
   // PWO-5 section 8.6's DEDICATED AUXILIARY FORWARD PATH.
@@ -262,6 +280,109 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);
+
+inline void CopyInputToOrderedCardSlots(
+    torch::Tensor target, const torch::Tensor& source,
+    dune_imperium::MarketAppendixMode source_mode) {
+  const auto schema = dune_imperium::GetInformationStateSchema(source_mode);
+  SPIEL_CHECK_EQ(source.dim(), 2);
+  SPIEL_CHECK_EQ(target.dim(), 2);
+  SPIEL_CHECK_EQ(source.size(0), target.size(0));
+  SPIEL_CHECK_EQ(source.size(1), schema.size);
+  SPIEL_CHECK_EQ(target.size(1),
+                 dune_imperium::kOrderedCardSlotsInformationStateSize);
+  // A zero-appendix model has never used its extra columns. Activating those
+  // columns must not import arbitrary saved values into the migrated policy.
+  const int copied_columns = source_mode == dune_imperium::MarketAppendixMode::kZeros
+      ? dune_imperium::kLegacyInformationStateSize : schema.size;
+  torch::NoGradGuard no_grad;
+  target.zero_();
+  target.slice(1, 0, copied_columns).copy_(source.slice(1, 0, copied_columns));
+}
+
+inline void CopyInputToFullPublicInformation(
+    torch::Tensor target, const torch::Tensor& source,
+    dune_imperium::MarketAppendixMode source_mode) {
+  const auto schema = dune_imperium::GetInformationStateSchema(source_mode);
+  SPIEL_CHECK_EQ(source.dim(), 2);
+  SPIEL_CHECK_EQ(target.dim(), 2);
+  SPIEL_CHECK_EQ(source.size(0), target.size(0));
+  SPIEL_CHECK_EQ(source.size(1), schema.size);
+  SPIEL_CHECK_EQ(target.size(1),
+                 dune_imperium::kFullPublicInformationStateSize);
+  const int copied_columns = source_mode == dune_imperium::MarketAppendixMode::kZeros
+      ? dune_imperium::kLegacyInformationStateSize : schema.size;
+  torch::NoGradGuard no_grad;
+  target.zero_();
+  target.slice(1, 0, copied_columns).copy_(source.slice(1, 0, copied_columns));
+}
+
+inline void LoadModelCheckpointRobust(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    const std::string& path,
+    torch::Device device) {
+  torch::serialize::InputArchive archive;
+  archive.load_from(path, device);
+
+  torch::NoGradGuard no_grad;
+  torch::serialize::InputArchive in_arch;
+  const int64_t expected_input_dim = model->input_layer->weight.size(1);
+  if (archive.try_read("input_layer", in_arch)) {
+    model->input_layer->load(in_arch);
+    SPIEL_CHECK_EQ(model->input_layer->weight.size(1), expected_input_dim);
+  }
+  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+    torch::serialize::InputArchive b_arch;
+    std::string b_name = "res" + std::to_string(i + 1);
+    if (archive.try_read(b_name, b_arch)) {
+      model->res_blocks[i]->load(b_arch);
+    }
+  }
+  torch::serialize::InputArchive p_arch;
+  if (archive.try_read("policy_head", p_arch)) {
+    model->policy_head->load(p_arch);
+  }
+  torch::serialize::InputArchive v_arch;
+  if (archive.try_read("value_head", v_arch)) {
+    model->value_head->load(v_arch);
+  }
+  if (model->use_nonlinear_value_head_) {
+    torch::serialize::InputArchive v2_arch;
+    if (archive.try_read("value_head2", v2_arch)) {
+      model->value_head2->load(v2_arch);
+    }
+  }
+  if (model->has_aux_heads_) {
+    torch::serialize::InputArchive a1, a2, a3;
+    if (archive.try_read("final_vp_head", a1)) model->final_vp_head->load(a1);
+    if (archive.try_read("terminal_round_head", a2)) model->terminal_round_head->load(a2);
+    if (archive.try_read("next_own_action_head", a3)) model->next_own_action_head->load(a3);
+  }
+  torch::serialize::InputArchive s_arch_check;
+  const bool checkpoint_has_scorer = archive.try_read("semantic_scorer", s_arch_check);
+  if (checkpoint_has_scorer && (!model->with_semantic_scorer_ || !model->semantic_scorer_)) {
+    SpielFatalError("LoadModelCheckpointRobust: Checkpoint at " + path +
+                    " contains a trained semantic scorer, but the model was "
+                    "instantiated without with_semantic_scorer=true.");
+  }
+  if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+    torch::serialize::InputArchive s_arch;
+    if (archive.try_read("semantic_scorer", s_arch)) {
+      model->semantic_scorer_->load(s_arch);
+    }
+  }
+}
+
+inline bool CheckpointHasSemanticScorer(const std::string& path, torch::Device device = torch::kCPU) {
+  try {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive s_arch;
+    return archive.try_read("semantic_scorer", s_arch);
+  } catch (...) {
+    return false;
+  }
+}
 
 struct AutocastGuard {
     c10::DeviceType device_type_;
@@ -557,6 +678,11 @@ class IGameEvaluator {
 public:
     virtual ~IGameEvaluator() = default;
     virtual EvalResult Evaluate(const std::vector<float>& obs) = 0;
+    virtual EvalResult EvaluateWithActions(
+        const std::vector<float>& obs,
+        const dune_semantic::CandidateActionData* action_data) {
+        return Evaluate(obs);
+    }
     virtual std::vector<EvalResult> EvaluateBatch(
         const std::vector<std::vector<float>>& observations) {
         std::vector<EvalResult> results;
@@ -587,6 +713,12 @@ public:
     bool RolloutAmpForTesting() const { return rollout_amp_; }
 
     EvalResult Evaluate(const std::vector<float>& obs) override {
+        return EvaluateWithActions(obs, nullptr);
+    }
+
+    EvalResult EvaluateWithActions(
+        const std::vector<float>& obs,
+        const dune_semantic::CandidateActionData* action_data) override {
         torch::NoGradGuard no_grad;
         EvalResult result;
         result.logits.resize(action_dim_);
@@ -651,6 +783,14 @@ public:
                 outputs = model_->forward(input_tensor_);
                 critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(input_tensor_) : outputs;
             }
+
+            if (model_->with_semantic_scorer_ && model_->semantic_scorer_ &&
+                action_data != nullptr && !action_data->empty()) {
+                std::vector<const dune_semantic::CandidateActionData*> single_batch = {action_data};
+                dune_semantic::ApplySemanticScorerBatch(
+                    model_->semantic_scorer_, outputs.trunk, single_batch, outputs.logits, device_);
+            }
+
             // Blocking device->host copy INSIDE the lock drains the stream before
             // the mutex is released, so the next thread cannot overwrite the
             // shared staging buffers while this request's async work may still be
@@ -818,8 +958,14 @@ public:
     bool RolloutAmpForTesting() const { return rollout_amp_; }
     bool AllowTf32ForTesting() const { return allow_tf32_; }
 
-    // Called by the actor threads
     EvalResult Evaluate(const std::vector<float>& obs) override {
+        return EvaluateWithActions(obs, nullptr);
+    }
+
+    // Called by the actor threads
+    EvalResult EvaluateWithActions(
+        const std::vector<float>& obs,
+        const dune_semantic::CandidateActionData* action_data) override {
         // Validate size in the caller thread (finding 6) so the runner never
         // over-reads/truncates and never faults on an unsupported request.
         CheckEvalObsSize(obs.size(), model_input_dim_);
@@ -837,6 +983,7 @@ public:
             }
             Request req;
             req.obs = &obs;
+            req.action_data = action_data;
             req.result_dest = &result;
             req.ready_flag = &ready;
             req.wants_logits = true;
@@ -1279,6 +1426,7 @@ public:
 private:
     struct Request {
         const std::vector<float>* obs = nullptr;
+        const dune_semantic::CandidateActionData* action_data = nullptr;
         EvalResult* result_dest = nullptr;
         std::atomic<bool>* ready_flag = nullptr;
         bool wants_logits = true;
@@ -1668,6 +1816,20 @@ private:
                     outputs = model_->forward(device_obs);
                     critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                 }
+                if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                    std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
+                    bool has_any_actions = false;
+                    for (size_t i = 0; i < batch_size; ++i) {
+                        batch_actions[i] = slot.batch[i].action_data;
+                        if (slot.batch[i].action_data != nullptr && !slot.batch[i].action_data->empty()) {
+                            has_any_actions = true;
+                        }
+                    }
+                    if (has_any_actions) {
+                        dune_semantic::ApplySemanticScorerBatch(
+                            model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                    }
+                }
                 auto device_values = slot.device_values.narrow(
                     0, 0, batch_size);
                 device_values.copy_(critic_outputs.values.reshape(
@@ -2040,19 +2202,33 @@ private:
             torch::Tensor pred_logits, pred_values;
             {
                 std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
+                SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+                SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
                 if (device_.is_cuda()) {
                     AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                  rollout_amp_);
-                    auto outputs = model_->forward(device_obs);
-                    auto critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
-                    pred_logits = outputs.logits;
-                    pred_values = critic_outputs.values;
+                    outputs = model_->forward(device_obs);
+                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                 } else {
-                    auto outputs = model_->forward(device_obs);
-                    auto critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
-                    pred_logits = outputs.logits;
-                    pred_values = critic_outputs.values;
+                    outputs = model_->forward(device_obs);
+                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                 }
+                if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                    std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
+                    bool has_any_actions = false;
+                    for (size_t i = 0; i < batch_size; ++i) {
+                        batch_actions[i] = batch[i].action_data;
+                        if (batch[i].action_data != nullptr && !batch[i].action_data->empty()) {
+                            has_any_actions = true;
+                        }
+                    }
+                    if (has_any_actions) {
+                        dune_semantic::ApplySemanticScorerBatch(
+                            model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                    }
+                }
+                pred_logits = outputs.logits;
+                pred_values = critic_outputs.values;
             }
             if (time_device_) dev_ev[2].record(dev_impl->getStream(device_));
 
