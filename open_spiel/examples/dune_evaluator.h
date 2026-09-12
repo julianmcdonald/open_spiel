@@ -82,6 +82,12 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
     obs_size_ = model_->input_layer->weight.size(1);
+    if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+      if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
+          model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3) {
+        SpielFatalError("DuneNNEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+      }
+    }
     if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
         model_->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kNone) {
       market_mode_ = model_->market_appendix_mode_;

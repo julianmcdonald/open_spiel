@@ -1146,11 +1146,26 @@ bool LoadModelCheckpointMigrating(
                                temp_model->input_layer->weight, source_mode);
     model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
     model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
-  } else if (ckpt_input_dim == input_dim) {
-    model->input_layer->weight.copy_(temp_model->input_layer->weight);
-  } else if (ckpt_input_dim == 5580 && input_dim == 6215) {
-    model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
-    model->input_layer->weight.slice(1, 5580, 6215).zero_();
+  } else if (input_dim == dune_imperium::kExpandedInformationStateSize) {
+    if (ckpt_input_dim == input_dim) {
+      model->input_layer->weight.copy_(temp_model->input_layer->weight);
+    } else if (ckpt_input_dim == 5580) {
+      model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
+      model->input_layer->weight.slice(1, 5580, 6215).zero_();
+    } else {
+      SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
+                                      ckpt_input_dim, input_dim));
+    }
+    const std::string flag_mode_str = absl::GetFlag(FLAGS_market_appendix_mode);
+    if (flag_mode_str != "none") {
+      model->market_appendix_mode_ = dune_imperium::ParseMarketAppendixMode(flag_mode_str);
+    } else {
+      model->market_appendix_mode_ = ReadCheckpointInputMode(path, ckpt_input_dim);
+    }
+    if (model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kZeros &&
+        model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kOrderedMarket) {
+      SpielFatalError("Ambiguous 6,215 model requires explicit market_appendix_mode ('zeros' or 'ordered_market')");
+    }
   } else {
     SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
                                     ckpt_input_dim, input_dim));
@@ -7071,6 +7086,9 @@ int main(int argc, char** argv) {
   }
 
   const bool enable_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer);
+  if (obs_size == dune_imperium::kFullPublicInformationStateSize && !enable_scorer) {
+    SpielFatalError("9,182 actor requires --enable_semantic_scorer=true");
+  }
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
@@ -7087,6 +7105,20 @@ int main(int argc, char** argv) {
           /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer);
   training_model->to(device);
   inference_model->to(device);
+
+  const std::string m_mode_str = absl::GetFlag(FLAGS_market_appendix_mode);
+  if (m_mode_str != "none") {
+    auto parsed_mode = dune_imperium::ParseMarketAppendixMode(m_mode_str);
+    training_model->market_appendix_mode_ = parsed_mode;
+    inference_model->market_appendix_mode_ = parsed_mode;
+  }
+  if (obs_size == dune_imperium::kExpandedInformationStateSize) {
+    if (absl::GetFlag(FLAGS_init_mode) == "random") {
+      if (m_mode_str != "zeros" && m_mode_str != "ordered_market") {
+        SpielFatalError("Fresh 6,215 model requires explicit --market_appendix_mode ('zeros' or 'ordered_market')");
+      }
+    }
+  }
 
   const std::string save_init_path = absl::GetFlag(FLAGS_save_initial_model_and_exit);
   if (!save_init_path.empty()) {
@@ -7255,10 +7287,10 @@ int main(int argc, char** argv) {
   if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
       !vrpo_ppo_continuation && !vrpo_q_warmup && !vrpo_q_offline &&
       open_spiel::VrpoCaptureShouldConstructOptimizer(vrpo_diagnostics)) {
-    optimizer = open_spiel::MakeOptimizer(training_model);
+    optimizer = MakeOptimizer(training_model);
     optimizer_constructed = true;
     if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
-      critic_optimizer = open_spiel::MakeOptimizer(training_critic);
+      critic_optimizer = MakeOptimizer(training_critic);
     }
     // Section 7.4: materialize BEFORE any load, so the entries exist in all six
     // arms; a subsequent load simply overwrites the ones the archive carries.
@@ -8459,6 +8491,10 @@ int main(int argc, char** argv) {
 
     CheckpointManifest manifest;
     std::string err;
+
+    // Automatic recovery from interrupted publication:
+    open_spiel::RecoverInterruptedBundleIfNeeded(model_path, optim_path, manifest_path);
+
     // Legacy fingerprints predate critic-remediation flags and therefore
     // cannot prove which parameters or data source were active. Never use
     // that compatibility escape hatch for value-only resumes.
@@ -8734,6 +8770,15 @@ int main(int argc, char** argv) {
       SpielFatalError("Refusing to bootstrap directly inside the frozen baseline or branch_a_frozen directory: " + model_path +
                       "\nRun bootstrap beside a BRANCH COPY in a separate output directory.");
     }
+    std::filesystem::path m_path = model_path;
+    m_path.replace_extension(".json");
+    std::string manifest_path = m_path.string();
+
+    // Check if a prior publication was interrupted.
+    // If active bundle was left in a mixed/interrupted state and valid .bak exists,
+    // restore the clean prior bundle FIRST so retry doesn't backup mixed files!
+    open_spiel::RecoverInterruptedBundleIfNeeded(model_path, optim_path, manifest_path);
+
     if (!std::filesystem::exists(model_path)) {
       SpielFatalError("Model file not found for bootstrap: " + model_path);
     }
@@ -8778,17 +8823,22 @@ int main(int argc, char** argv) {
       SpielFatalError("LibTorch load failed during bootstrap: " + std::string(e.msg()));
     }
 
-    size_t model_size = 0;
-    std::string model_hash = open_spiel::ComputeFileSHA256(model_path, &model_size);
-    size_t optim_size = 0;
-    std::string optim_hash = "";
-    if (std::filesystem::exists(optim_path)) {
-      optim_hash = open_spiel::ComputeFileSHA256(optim_path, &optim_size);
+    std::string model_tmp = model_path + ".tmp";
+    std::string optim_tmp = optim_path + ".tmp";
+
+    torch::save(training_model, model_tmp);
+    if (optimizer) {
+      torch::save(*optimizer, optim_tmp);
     }
 
-    std::filesystem::path m_path = model_path;
-    m_path.replace_extension(".json");
-    std::string manifest_path = m_path.string();
+    size_t model_size = 0;
+    std::string model_hash = open_spiel::ComputeFileSHA256(model_tmp, &model_size);
+    size_t optim_size = 0;
+    std::string optim_hash = "";
+    if (optimizer && std::filesystem::exists(optim_tmp)) {
+      optim_hash = open_spiel::ComputeFileSHA256(optim_tmp, &optim_size);
+    }
+
     std::string manifest_tmp = manifest_path + ".tmp";
 
     json::Object manifest_obj;
@@ -8843,8 +8893,118 @@ int main(int argc, char** argv) {
       }
       ofs << json::ToString(manifest_obj, true);
     }
-    std::filesystem::rename(manifest_tmp, manifest_path);
-    std::cout << "Successfully bootstrapped manifest at " << manifest_path << "\n";
+    // Coherent publication: preserve prior valid bundle under coherent names until manifest commit.
+    // Create backup copies (without moving the active files away), then atomically commit the
+    // new model and optimizer first, and commit the manifest last.
+    std::string model_bak = model_path + ".bak";
+    std::string optim_bak = optim_path + ".bak";
+    std::string manifest_bak = manifest_path + ".bak";
+
+    // 1. Create backups first with strict error checking.
+    // If ANY backup copy fails, fail closed immediately before touching active files!
+    std::error_code ec;
+    if (std::filesystem::exists(model_path, ec)) {
+      std::filesystem::copy_file(model_path, model_bak,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        SpielFatalError("Failed to create model backup (" + model_path + " -> " + model_bak + "): " + ec.message());
+      }
+    }
+    if (optimizer && std::filesystem::exists(optim_path, ec)) {
+      std::filesystem::copy_file(optim_path, optim_bak,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        SpielFatalError("Failed to create optimizer backup (" + optim_path + " -> " + optim_bak + "): " + ec.message());
+      }
+    }
+    if (std::filesystem::exists(manifest_path, ec)) {
+      std::filesystem::copy_file(manifest_path, manifest_bak,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        SpielFatalError("Failed to create manifest backup (" + manifest_path + " -> " + manifest_bak + "): " + ec.message());
+      }
+    }
+
+    // 2. If a prior manifest existed, verify that the newly created backup bundle is valid
+    // before touching any active files!
+    if (std::filesystem::exists(manifest_bak, ec)) {
+      std::string backup_err;
+      if (!open_spiel::CheckBundleIntegrity(manifest_bak, model_bak, optimizer ? optim_bak : "", &backup_err)) {
+        SpielFatalError("Backup bundle integrity check failed prior to artifact replacement: " + backup_err);
+      }
+    }
+
+    // 3. Atomically replace active artifacts: model and optimizer first, manifest last.
+    try {
+      std::filesystem::rename(model_tmp, model_path);
+      if (optimizer && std::filesystem::exists(optim_tmp, ec)) {
+        std::filesystem::rename(optim_tmp, optim_path);
+      }
+      std::filesystem::rename(manifest_tmp, manifest_path);
+    } catch (const std::exception& e) {
+      std::string rollback_err;
+      std::error_code rb_ec;
+      bool rb_failed = false;
+
+      auto safe_copy_rollback = [&](const std::string& src, const std::string& dst, const std::string& label) {
+        if (src.empty() || dst.empty() || src == dst) return;
+        std::error_code eq_ec;
+        if (std::filesystem::exists(dst, eq_ec) && std::filesystem::equivalent(src, dst, eq_ec)) {
+          return;
+        }
+        std::error_code cp_ec;
+        std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, cp_ec);
+        if (cp_ec) {
+          rollback_err += " [" + label + " rollback failed: " + cp_ec.message() + "]";
+          rb_failed = true;
+        }
+      };
+
+      if (std::filesystem::exists(model_bak, rb_ec)) {
+        safe_copy_rollback(model_bak, model_path, "model");
+      }
+      if (optimizer && std::filesystem::exists(optim_bak, rb_ec)) {
+        safe_copy_rollback(optim_bak, optim_path, "optim");
+      }
+      if (std::filesystem::exists(manifest_bak, rb_ec)) {
+        safe_copy_rollback(manifest_bak, manifest_path, "manifest");
+      }
+      std::string restored_verify_err;
+      if (!open_spiel::CheckBundleIntegrity(manifest_path, model_path, optimizer ? optim_path : "", &restored_verify_err)) {
+        rollback_err += " [restored active bundle failed verification: " + restored_verify_err + "]";
+        rb_failed = true;
+      }
+      if (rb_failed) {
+        SpielFatalError("Bootstrap publication failed (" + std::string(e.what()) +
+                        ") AND rollback to backup failed:" + rollback_err);
+      }
+      // Clean up temporary files
+      if (std::filesystem::exists(model_tmp, rb_ec)) std::filesystem::remove(model_tmp, rb_ec);
+      if (std::filesystem::exists(optim_tmp, rb_ec)) std::filesystem::remove(optim_tmp, rb_ec);
+      if (std::filesystem::exists(manifest_tmp, rb_ec)) std::filesystem::remove(manifest_tmp, rb_ec);
+
+      // Clean up backups now that rollback is complete and verified
+      if (std::filesystem::exists(model_bak, rb_ec)) std::filesystem::remove(model_bak, rb_ec);
+      if (std::filesystem::exists(optim_bak, rb_ec)) std::filesystem::remove(optim_bak, rb_ec);
+      if (std::filesystem::exists(manifest_bak, rb_ec)) std::filesystem::remove(manifest_bak, rb_ec);
+
+      SpielFatalError("Bootstrap publication failed: " + std::string(e.what()) +
+                      " (active files restored from prior backup)");
+    }
+
+    // 4. Verify the newly committed active bundle before unlinking backups!
+    std::string active_err;
+    if (!open_spiel::CheckBundleIntegrity(manifest_path, model_path, optimizer ? optim_path : "", &active_err)) {
+      SpielFatalError("Committed active bundle failed integrity verification: " + active_err);
+    }
+
+    // 5. Clean up .bak files now that publication is fully committed and verified.
+    std::error_code ec_clean;
+    if (std::filesystem::exists(model_bak, ec_clean)) std::filesystem::remove(model_bak, ec_clean);
+    if (std::filesystem::exists(optim_bak, ec_clean)) std::filesystem::remove(optim_bak, ec_clean);
+    if (std::filesystem::exists(manifest_bak, ec_clean)) std::filesystem::remove(manifest_bak, ec_clean);
+
+    std::cout << "Successfully bootstrapped migrated model, optimizer, and manifest at " << manifest_path << "\n";
     exit(0);
   } else if (init_mode == "validate_legacy") {
     std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
@@ -9049,6 +9209,8 @@ int main(int argc, char** argv) {
     m_path.replace_extension(".json");
     std::string manifest_path = m_path.string();
 
+    open_spiel::RecoverInterruptedBundleIfNeeded(model_path, optim_path, manifest_path);
+
     if (!std::filesystem::exists(manifest_path)) {
       SpielFatalError("Study resume: manifest not found: " + manifest_path);
     }
@@ -9243,6 +9405,9 @@ int main(int argc, char** argv) {
           SpielFatalError("Training opponent pool checkpoint does not exist: " + opp_path);
         }
         const bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path);
+        if (obs_size == dune_imperium::kFullPublicInformationStateSize && !opp_has_scorer) {
+          SpielFatalError("Opponent pool 9,182 actor requires an active semantic scorer with schema v3: " + opp_path);
+        }
         auto opp_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
             obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
             absl::GetFlag(FLAGS_num_blocks), /*use_nonlinear=*/false,
@@ -10284,7 +10449,8 @@ int main(int argc, char** argv) {
         // Historical reference path retained for old checkpoints and parity.
         auto pi_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
             inference_model, device,
-            static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
+            static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+            inference_model->market_appendix_mode_);
         open_spiel::SearchPiGenerator(pi_cfg).GenerateGeneration(
             pi_generation, game, pi_evaluator, &pi_rows, &pi_stats);
         pi_cfg.next_episode_id = pi_stats.next_episode_id;
@@ -10724,7 +10890,8 @@ int main(int argc, char** argv) {
     // run log records the cap the aux evaluator actually received.
     aux_logit_cap = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
     aux_evaluator = std::make_shared<open_spiel::DuneNNEvaluator>(
-        inference_model, device, aux_logit_cap);
+        inference_model, device, aux_logit_cap,
+        inference_model->market_appendix_mode_);
     aux_collector = std::make_shared<open_spiel::OnlineSearchCollector>(
         aux_config, config_fingerprint);
     std::cout << absl::StrFormat(

@@ -23,6 +23,12 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         market_mode_(market_mode) {
     if (batched_eval_) {
       obs_size_ = batched_eval_->ModelInputDim();
+      if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+        if (!batched_eval_->HasSemanticScorer() ||
+            batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV3) {
+          SpielFatalError("BatchedNNEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+        }
+      }
       if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
           batched_eval_->MarketMode() != dune_imperium::MarketAppendixMode::kNone) {
         market_mode_ = batched_eval_->MarketMode();

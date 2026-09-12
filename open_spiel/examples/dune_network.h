@@ -112,6 +112,9 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     with_semantic_scorer_ = with_semantic_scorer;
     if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
       market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+      if (with_semantic_scorer_) {
+        semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+      }
     } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
       market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
     } else if (input_dim == dune_imperium::kLegacyInformationStateSize) {
@@ -384,15 +387,10 @@ inline void LoadModelCheckpointRobust(
   }
 
   // Find sidecar JSON by replacing any file extension
-  std::string json_path = path;
-  size_t last_dot = json_path.find_last_of('.');
-  if (last_dot != std::string::npos && last_dot > json_path.find_last_of("/\\")) {
-    json_path = json_path.substr(0, last_dot) + ".json";
-  } else {
-    json_path += ".json";
-  }
+  std::string json_path = std::filesystem::path(path).replace_extension(".json").string();
 
   bool sidecar_found = false;
+  bool obs_dim_found = false;
   std::string sds_found = "";
   dune_imperium::MarketAppendixMode mode_found = dune_imperium::MarketAppendixMode::kNone;
   std::string feature_schema_sha = "";
@@ -438,6 +436,22 @@ inline void LoadModelCheckpointRobust(
     if (it_hash != dict.end() && it_hash->second.IsString()) {
       feature_schema_sha = it_hash->second.GetString();
     }
+
+    auto it_obs = dict.find("observation_dim");
+    if (it_obs != dict.end()) {
+      obs_dim_found = true;
+      int64_t obs_dim = -1;
+      if (it_obs->second.IsInt()) {
+        obs_dim = it_obs->second.GetInt();
+      } else if (it_obs->second.IsString()) {
+        obs_dim = std::stoll(it_obs->second.GetString());
+      }
+      if (obs_dim != expected_input_dim) {
+        SpielFatalError("LoadModelCheckpointRobust: Declared observation_dim (" +
+                        std::to_string(obs_dim) + ") does not match model input dimension (" +
+                        std::to_string(expected_input_dim) + ") in " + path);
+      }
+    }
   }
 
   torch::serialize::InputArchive s_arch_check;
@@ -463,6 +477,9 @@ inline void LoadModelCheckpointRobust(
     if (!sidecar_found) {
       SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires valid sidecar metadata: " + path);
     }
+    if (!obs_dim_found) {
+      SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires observation_dim in sidecar: " + path);
+    }
     if (mode_found == dune_imperium::MarketAppendixMode::kNone) {
       SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires explicit market_appendix_mode: " + path);
     }
@@ -470,8 +487,10 @@ inline void LoadModelCheckpointRobust(
     if (expected_input_dim != schema.size) {
       SpielFatalError("LoadModelCheckpointRobust: Input dimension mismatch with schema in " + path);
     }
-    if (!feature_schema_sha.empty() && feature_schema_sha != schema.sha256) {
-      SpielFatalError("LoadModelCheckpointRobust: Invalid feature_schema_sha256 in " + path);
+    if (feature_schema_sha.empty() || feature_schema_sha != schema.sha256) {
+      SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint " + path +
+                      " requires valid feature_schema_sha256 matching schema ('" +
+                      schema.sha256 + "')");
     }
   }
 
@@ -516,7 +535,7 @@ inline bool CheckpointHasSemanticScorer(const std::string& path, torch::Device d
   }
 }
 
-inline std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
+inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     double lr = 2.5e-4, double weight_decay = 0.0,
     double policy_weight_decay = 0.0) {
@@ -618,8 +637,10 @@ inline bool LoadOptimizerCheckpointMigrating(
       torch::Tensor exp_avg;
       if (p_arch.try_read("exp_avg", exp_avg)) {
         if (exp_avg.dim() == 2 && exp_avg.size(0) == hidden_dim) {
-          if (exp_avg.size(1) == 5580 || exp_avg.size(1) == 6215 || exp_avg.size(1) == 9182) {
-            ckpt_input_dim = exp_avg.size(1);
+          int64_t cols = exp_avg.size(1);
+          if (cols == 5580 || cols == 6215 || cols == 6255 || cols == 9182 ||
+              (cols != hidden_dim && cols != 1 && cols != 3 && cols != 2391)) {
+            ckpt_input_dim = cols;
             break;
           }
         }
@@ -627,6 +648,9 @@ inline bool LoadOptimizerCheckpointMigrating(
     }
   }
   if (ckpt_input_dim == 0) {
+    if (!state_keys.empty()) {
+      return false;
+    }
     ckpt_input_dim = target_input_dim;
   }
 
@@ -1189,6 +1213,12 @@ public:
           sync_mutex_(sync_mutex), rollout_amp_(rollout_amp) {
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
+        if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
+            if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
+                model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3) {
+                SpielFatalError("DeterministicEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+            }
+        }
     }
 
     bool HasSemanticScorer() const override {
@@ -1418,6 +1448,12 @@ public:
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
         model_action_dim_ = model_->policy_head->weight.size(0);
+        if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
+            if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
+                model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3) {
+                SpielFatalError("BatchedEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+            }
+        }
 
         // Enable TF32 for Ada Lovelace (RTX 4080 Super) speedup
         if (device_.is_cuda()) {

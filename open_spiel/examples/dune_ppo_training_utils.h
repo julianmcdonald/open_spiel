@@ -842,6 +842,23 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               std::string& error_msg,
                               const std::string& current_legacy_config_fingerprint = "");
 
+// Verifies that manifest_path exists, is valid JSON, and that the referenced
+// model_path (and optional optim_path) match the file size and SHA256 recorded
+// in the manifest. Returns true if and only if the bundle is complete and intact.
+bool CheckBundleIntegrity(const std::string& manifest_path,
+                          const std::string& model_path,
+                          const std::string& optim_path = "",
+                          std::string* error_msg = nullptr);
+
+// Checks if publication was interrupted. If .bak files exist:
+// - If the active bundle is complete and verified, cleans up stale .bak files.
+// - If the active bundle is incomplete/mixed and the backup bundle is intact,
+//   restores the active bundle from .bak and cleans up any .tmp files.
+// - Checks all filesystem error codes and throws SpielFatalError if restoration fails.
+void RecoverInterruptedBundleIfNeeded(const std::string& model_path,
+                                      const std::string& optim_path,
+                                      const std::string& manifest_path);
+
 struct DualCheckpointManifest {
   int schema_version = 2;
   std::string checkpoint_uuid;

@@ -429,6 +429,182 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
   return true;
 }
 
+bool CheckBundleIntegrity(const std::string& manifest_path,
+                          const std::string& model_path,
+                          const std::string& optim_path,
+                          std::string* error_msg) {
+  std::error_code ec;
+  if (!std::filesystem::exists(manifest_path, ec) || ec) {
+    if (error_msg) *error_msg = "manifest file not found at: " + manifest_path;
+    return false;
+  }
+
+  std::ifstream ifs(manifest_path);
+  if (!ifs) {
+    if (error_msg) *error_msg = "Could not open manifest file at: " + manifest_path;
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(content);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    if (error_msg) *error_msg = "Manifest file is malformed JSON at: " + manifest_path;
+    return false;
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  auto it_m_size = manifest_obj.find("model_file_size");
+  auto it_m_sha = manifest_obj.find("model_sha256");
+  if (it_m_size == manifest_obj.end() || !it_m_size->second.IsInt() ||
+      it_m_sha == manifest_obj.end() || !it_m_sha->second.IsString()) {
+    if (error_msg) *error_msg = "Manifest missing model_file_size or model_sha256: " + manifest_path;
+    return false;
+  }
+  int64_t exp_model_size = it_m_size->second.GetInt();
+  std::string exp_model_sha = it_m_sha->second.GetString();
+
+  if (!std::filesystem::exists(model_path, ec) || ec) {
+    if (error_msg) *error_msg = "Model file not found: " + model_path;
+    return false;
+  }
+  uintmax_t actual_model_size = std::filesystem::file_size(model_path, ec);
+  if (ec || static_cast<int64_t>(actual_model_size) != exp_model_size) {
+    if (error_msg) {
+      *error_msg = absl::StrFormat("Model file size mismatch. Manifest: %d, Actual: %d",
+                                   exp_model_size, actual_model_size);
+    }
+    return false;
+  }
+  size_t bytes_read = 0;
+  std::string actual_model_sha = open_spiel::ComputeFileSHA256(model_path, &bytes_read);
+  if (actual_model_sha != exp_model_sha) {
+    if (error_msg) {
+      *error_msg = "Model SHA-256 hash mismatch. Manifest: " + exp_model_sha + ", Actual: " + actual_model_sha;
+    }
+    return false;
+  }
+
+  // Check optimizer if tracked in manifest and optim_path is provided
+  auto it_o_size = manifest_obj.find("optimizer_file_size");
+  auto it_o_sha = manifest_obj.find("optimizer_sha256");
+  if (it_o_size != manifest_obj.end() && it_o_size->second.IsInt() &&
+      it_o_sha != manifest_obj.end() && it_o_sha->second.IsString() &&
+      !it_o_sha->second.GetString().empty() && it_o_size->second.GetInt() > 0) {
+    int64_t exp_optim_size = it_o_size->second.GetInt();
+    std::string exp_optim_sha = it_o_sha->second.GetString();
+
+    if (optim_path.empty() || !std::filesystem::exists(optim_path, ec) || ec) {
+      if (error_msg) *error_msg = "Optimizer file not found: " + optim_path;
+      return false;
+    }
+    uintmax_t actual_optim_size = std::filesystem::file_size(optim_path, ec);
+    if (ec || static_cast<int64_t>(actual_optim_size) != exp_optim_size) {
+      if (error_msg) {
+        *error_msg = absl::StrFormat("Optimizer file size mismatch. Manifest: %d, Actual: %d",
+                                     exp_optim_size, actual_optim_size);
+      }
+      return false;
+    }
+    std::string actual_optim_sha = open_spiel::ComputeFileSHA256(optim_path, &bytes_read);
+    if (actual_optim_sha != exp_optim_sha) {
+      if (error_msg) {
+        *error_msg = "Optimizer SHA-256 hash mismatch. Manifest: " + exp_optim_sha + ", Actual: " + actual_optim_sha;
+      }
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void RecoverInterruptedBundleIfNeeded(const std::string& model_path,
+                                      const std::string& optim_path,
+                                      const std::string& manifest_path) {
+  std::string manifest_bak = manifest_path + ".bak";
+  std::string model_bak = model_path + ".bak";
+  std::string optim_bak = optim_path.empty() ? "" : (optim_path + ".bak");
+
+  std::error_code ec;
+  bool any_bak = std::filesystem::exists(manifest_bak, ec) ||
+                 std::filesystem::exists(model_bak, ec) ||
+                 (!optim_bak.empty() && std::filesystem::exists(optim_bak, ec));
+  if (!any_bak) {
+    return;
+  }
+
+  std::string active_err;
+  bool active_ok = CheckBundleIntegrity(manifest_path, model_path, optim_path, &active_err);
+  if (active_ok) {
+    // Active bundle is fully committed and self-consistent!
+    // Never roll back a valid committed new generation merely because leftover backups exist.
+    // Clean up stale leftover .bak files.
+    if (std::filesystem::exists(manifest_bak, ec)) std::filesystem::remove(manifest_bak, ec);
+    if (std::filesystem::exists(model_bak, ec)) std::filesystem::remove(model_bak, ec);
+    if (!optim_bak.empty() && std::filesystem::exists(optim_bak, ec)) {
+      std::filesystem::remove(optim_bak, ec);
+    }
+    std::cout << "[RECOVERY] Fully committed active bundle verified; cleaned up stale .bak files.\n";
+    return;
+  }
+
+  // Active bundle is incomplete or mixed (e.g. interruption mid-publication).
+  // Determine backup sources. If a previous partial recovery already restored
+  // model or optimizer to the active path, allow that verified active file to serve
+  // as the source rather than refusing recovery because model.bak was consumed.
+  std::string model_src = std::filesystem::exists(model_bak, ec) ? model_bak : model_path;
+  std::string optim_src = (!optim_bak.empty() && std::filesystem::exists(optim_bak, ec)) ? optim_bak : optim_path;
+  std::string manifest_src = std::filesystem::exists(manifest_bak, ec) ? manifest_bak : manifest_path;
+
+  std::string backup_err;
+  bool backup_ok = CheckBundleIntegrity(manifest_src, model_src, optim_src, &backup_err);
+  if (!backup_ok) {
+    SpielFatalError(absl::StrFormat(
+        "Interrupted publication detected: active bundle is incomplete/corrupted (%s), "
+        "and backup bundle is also invalid or missing (%s). Cannot recover automatically.",
+        active_err, backup_err));
+  }
+
+  // Backup bundle is valid! Restore prior bundle without consuming source backups.
+  // We copy each artifact into place, verify the complete active bundle, and ONLY
+  // then delete the backups.
+  std::cout << "[RECOVERY] Interrupted publication detected: mixed active bundle restored from valid .bak files.\n";
+
+  auto safe_copy_restore = [&](const std::string& src, const std::string& dst, const std::string& label) {
+    if (src.empty() || dst.empty() || src == dst) return;
+    std::error_code eq_ec;
+    if (std::filesystem::exists(dst, eq_ec) && std::filesystem::equivalent(src, dst, eq_ec)) {
+      return;  // Already identical inode (e.g. hardlink)
+    }
+    std::error_code cp_ec;
+    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, cp_ec);
+    if (cp_ec) {
+      SpielFatalError("Failed to restore " + label + " from backup (" + src + " -> " + dst + "): " + cp_ec.message());
+    }
+  };
+
+  safe_copy_restore(model_src, model_path, "model");
+  safe_copy_restore(optim_src, optim_path, "optimizer");
+  safe_copy_restore(manifest_src, manifest_path, "manifest");
+
+  // Verify the newly restored active bundle before deleting any backups!
+  std::string restored_verify_err;
+  if (!CheckBundleIntegrity(manifest_path, model_path, optim_path, &restored_verify_err)) {
+    SpielFatalError("Restored active bundle failed integrity verification: " + restored_verify_err);
+  }
+
+  // Now that the restored active bundle is fully verified, clean up .bak and .tmp files.
+  if (std::filesystem::exists(model_bak, ec)) std::filesystem::remove(model_bak, ec);
+  if (!optim_bak.empty() && std::filesystem::exists(optim_bak, ec)) std::filesystem::remove(optim_bak, ec);
+  if (std::filesystem::exists(manifest_bak, ec)) std::filesystem::remove(manifest_bak, ec);
+
+  // Clean up any leftover .tmp files from the interrupted save
+  std::string model_tmp = model_path + ".tmp";
+  std::string optim_tmp = optim_path.empty() ? "" : (optim_path + ".tmp");
+  std::string manifest_tmp = manifest_path + ".tmp";
+  if (std::filesystem::exists(model_tmp, ec)) std::filesystem::remove(model_tmp, ec);
+  if (!optim_tmp.empty() && std::filesystem::exists(optim_tmp, ec)) std::filesystem::remove(optim_tmp, ec);
+  if (std::filesystem::exists(manifest_tmp, ec)) std::filesystem::remove(manifest_tmp, ec);
+}
+
 bool ParseAndValidateDualManifest(
     const std::string& manifest_path,
     std::string& actor_model_path,

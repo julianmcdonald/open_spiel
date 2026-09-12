@@ -10,6 +10,8 @@
 
 #include "dune_network.h"
 #include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
+#include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -153,6 +155,9 @@ void TestIncumbentMigration(const std::filesystem::path& output_dir) {
   for (const auto& item : restored->named_parameters()) {
     SPIEL_CHECK_TRUE(torch::equal(item.value(), saved[item.key()]));
   }
+  std::error_code ec;
+  std::filesystem::remove(model_path, ec);
+  std::filesystem::remove(output_dir / "identity_initial.json", ec);
   std::cout << "Incumbent migration, concurrent inference, and checkpoint reload passed; max raw-logit delta="
             << max_raw_delta << "\n";
 }
@@ -461,6 +466,8 @@ void TestVersionAwareScorerDeserialization(const std::filesystem::path& temp_dir
   }
   SPIEL_CHECK_TRUE(torch::equal(target_scorer_c->out_layer_ext->weight,
                                target_scorer_a->out_layer_ext->weight));
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
   std::cout << "Version-aware scorer deserialization: v3 full load succeeded.\n";
 }
 
@@ -470,7 +477,7 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
   // 1. Ambiguous 6215 checkpoint with kNone mode
   {
     auto m6215 = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kExpandedInformationStateSize, 2048, 2391, 8);
+        kExpandedInformationStateSize, 32, 2391, 1);
     const std::string p6215 = (temp_dir / "ambiguous_6215.pt").string();
     torch::save(m6215, p6215);
     std::ofstream jf((temp_dir / "ambiguous_6215.json").string());
@@ -481,7 +488,7 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
     open_spiel::SetErrorHandler(ThrowingErrorHandler);
     try {
       auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
-          kExpandedInformationStateSize, 2048, 2391, 8);
+          kExpandedInformationStateSize, 32, 2391, 1);
       LoadModelCheckpointRobust(load_target, p6215, torch::kCPU);
     } catch (const std::exception& e) {
       caught = true;
@@ -494,7 +501,7 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
   // 2. 9182 checkpoint without sidecar
   {
     auto m9182 = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
     const std::string p9182 = (temp_dir / "no_sidecar_9182.pt").string();
     torch::save(m9182, p9182);
 
@@ -502,7 +509,7 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
     open_spiel::SetErrorHandler(ThrowingErrorHandler);
     try {
       auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
-          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
       LoadModelCheckpointRobust(load_target, p9182, torch::kCPU);
     } catch (const std::exception& e) {
       caught = true;
@@ -512,39 +519,68 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
     SPIEL_CHECK_TRUE(caught);
   }
 
-  // 3. 9182 checkpoint without scorer
+  // 3a. In-memory 9182 constructor without scorer is permitted for value-only critic / internal use,
+  // but rejected when passed to an actor evaluator.
   {
-    auto m9182_noscorer = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, false);
+    auto m = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, false);
+    SPIEL_CHECK_FALSE(m->with_semantic_scorer_);
+    torch::Tensor x = torch::zeros({1, kFullPublicInformationStateSize});
+    auto out = m->forward(x);
+    SPIEL_CHECK_EQ(out.values.numel(), 1);
+
+    // But rejected when passed to an actor evaluator:
+    bool caught_actor = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      DuneNNEvaluator actor_eval(m, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught_actor = true;
+      std::cout << "Fail-closed check passed: 9182 without scorer rejected as actor: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_actor);
+  }
+
+  // 3b. 9182 checkpoint without scorer in archive rejected
+  {
     const std::string p9182_ns = (temp_dir / "no_scorer_9182.pt").string();
-    torch::save(m9182_noscorer, p9182_ns);
+    {
+      auto lin = torch::nn::Linear(kFullPublicInformationStateSize, 32);
+      torch::save(lin, p9182_ns);
+    }
     std::ofstream jf((temp_dir / "no_scorer_9182.json").string());
-    jf << "{\"market_appendix_mode\": \"full_public_information_v3\"}\n";
+    jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+       << "\"observation_dim\": 9182,"
+       << "\"feature_schema_sha256\": \""
+       << GetInformationStateSchema(dune_imperium::MarketAppendixMode::kFullPublicInformationV3).sha256 << "\"}\n";
     jf.close();
 
     bool caught = false;
     open_spiel::SetErrorHandler(ThrowingErrorHandler);
     try {
       auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
-          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
       LoadModelCheckpointRobust(load_target, p9182_ns, torch::kCPU);
     } catch (const std::exception& e) {
       caught = true;
-      std::cout << "Fail-closed check passed: 9182 without scorer rejected: " << e.what() << "\n";
+      std::cout << "Fail-closed check passed: 9182 without scorer archive rejected: " << e.what() << "\n";
     }
     open_spiel::SetErrorHandler(ExitingErrorHandler);
     SPIEL_CHECK_TRUE(caught);
   }
 
-  // 4. 9182 checkpoint with v2 scorer schema
+  // 4. 9182 checkpoint with v2 scorer schema rejected
   {
     auto m9182_v2 = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
     const std::string p9182_v2 = (temp_dir / "scorer_v2_9182.pt").string();
     torch::save(m9182_v2, p9182_v2);
     std::ofstream jf((temp_dir / "scorer_v2_9182.json").string());
     jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
        << "\"enable_semantic_scorer\": true,"
+       << "\"feature_schema_sha256\": \""
+       << GetInformationStateSchema(dune_imperium::MarketAppendixMode::kFullPublicInformationV3).sha256 << "\","
        << "\"semantic_descriptor_schema\": \"semantic_action_v2\"}\n";
     jf.close();
 
@@ -552,7 +588,7 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
     open_spiel::SetErrorHandler(ThrowingErrorHandler);
     try {
       auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
-          kFullPublicInformationStateSize, 2048, 2391, 8, false, false, 0, true);
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
       LoadModelCheckpointRobust(load_target, p9182_v2, torch::kCPU);
     } catch (const std::exception& e) {
       caught = true;
@@ -561,14 +597,142 @@ void TestFailClosedValidation(const std::filesystem::path& temp_dir) {
     open_spiel::SetErrorHandler(ExitingErrorHandler);
     SPIEL_CHECK_TRUE(caught);
   }
+
+  // 5. 6215 checkpoint missing feature_schema_sha256
+  {
+    auto m6215 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kExpandedInformationStateSize, 32, 2391, 1);
+    const std::string p6215_nohash = (temp_dir / "nohash_6215.pt").string();
+    torch::save(m6215, p6215_nohash);
+    std::ofstream jf((temp_dir / "nohash_6215.json").string());
+    jf << "{\"market_appendix_mode\": \"ordered_market\"}\n";
+    jf.close();
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kExpandedInformationStateSize, 32, 2391, 1);
+      LoadModelCheckpointRobust(load_target, p6215_nohash, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: 6215 missing feature_schema_sha256 rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+
+  // 6. Checkpoint with contradictory observation_dim
+  {
+    auto m6215 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kExpandedInformationStateSize, 32, 2391, 1);
+    const std::string p6215_baddim = (temp_dir / "baddim_6215.pt").string();
+    torch::save(m6215, p6215_baddim);
+    std::ofstream jf((temp_dir / "baddim_6215.json").string());
+    jf << "{\"market_appendix_mode\": \"ordered_market\","
+       << "\"feature_schema_sha256\": \""
+       << GetInformationStateSchema(dune_imperium::MarketAppendixMode::kOrderedMarket).sha256 << "\","
+       << "\"observation_dim\": 123}\n";
+    jf.close();
+
+    bool caught = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kExpandedInformationStateSize, 32, 2391, 1);
+      LoadModelCheckpointRobust(load_target, p6215_baddim, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught = true;
+      std::cout << "Fail-closed check passed: contradictory observation_dim rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught);
+  }
+
+  // 7. Bare relative checkpoint filename finds bare .json sidecar
+  {
+    const std::filesystem::path bare_dir = temp_dir / "bare_test";
+    std::filesystem::create_directories(bare_dir);
+    auto m6215 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kExpandedInformationStateSize, 32, 2391, 1);
+    torch::save(m6215, (bare_dir / "model.pt").string());
+    std::ofstream jf((bare_dir / "model.json").string());
+    jf << "{\"market_appendix_mode\": \"ordered_market\","
+       << "\"feature_schema_sha256\": \""
+       << GetInformationStateSchema(dune_imperium::MarketAppendixMode::kOrderedMarket).sha256 << "\","
+       << "\"observation_dim\": 6215}\n";
+    jf.close();
+
+    auto old_cwd = std::filesystem::current_path();
+    std::filesystem::current_path(bare_dir);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kExpandedInformationStateSize, 32, 2391, 1);
+      LoadModelCheckpointRobust(load_target, "model.pt", torch::kCPU);
+      SPIEL_CHECK_TRUE(load_target->market_appendix_mode_ ==
+                       dune_imperium::MarketAppendixMode::kOrderedMarket);
+      std::cout << "Bare relative checkpoint filename test passed: resolved model.json correctly.\n";
+    } catch (...) {
+      std::filesystem::current_path(old_cwd);
+      throw;
+    }
+    std::filesystem::current_path(old_cwd);
+  }
+
+  // 8. Evaluators reject 9182 model without active v3 scorer
+  {
+    auto m9182 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m9182->with_semantic_scorer_ = false;
+
+    // Test DuneNNEvaluator
+    bool caught_eval = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      DuneNNEvaluator eval(m9182, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught_eval = true;
+      std::cout << "DuneNNEvaluator 9182 without scorer rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_eval);
+
+    // Test BatchedEvaluator
+    bool caught_beval = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      BatchedEvaluator beval(m9182, 1, 10, torch::kCPU, nullptr);
+    } catch (const std::exception& e) {
+      caught_beval = true;
+      std::cout << "BatchedEvaluator 9182 without scorer rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_beval);
+
+    // Test DeterministicEvaluator
+    bool caught_deval = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      std::mutex m;
+      DeterministicEvaluator deval(m9182, torch::kCPU, &m);
+    } catch (const std::exception& e) {
+      caught_deval = true;
+      std::cout << "DeterministicEvaluator 9182 without scorer rejected: " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_deval);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
 }
 
 void TestPopulatedOptimizerMigration(const std::filesystem::path& temp_dir) {
   std::filesystem::create_directories(temp_dir);
 
   auto src_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      5580, 2048, 2391, 8, /*use_nonlinear=*/false, /*with_aux_heads=*/true);
-  auto src_opt = MakeOptimizer(src_model);
+      5580, 64, 2391, 1, /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+  auto src_opt = MakeDuneOptimizer(src_model);
 
   torch::Tensor dummy_input = torch::randn({2, 5580});
   auto out = src_model->forward(dummy_input);
@@ -580,9 +744,9 @@ void TestPopulatedOptimizerMigration(const std::filesystem::path& temp_dir) {
   torch::save(*src_opt, optim_path);
 
   auto target_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      kFullPublicInformationStateSize, 2048, 2391, 8, /*use_nonlinear=*/false,
+      kFullPublicInformationStateSize, 64, 2391, 1, /*use_nonlinear=*/false,
       /*with_aux_heads=*/true, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
-  auto target_opt = MakeOptimizer(target_model);
+  auto target_opt = MakeDuneOptimizer(target_model);
 
   bool migrated = LoadOptimizerCheckpointMigrating(
       target_model, *target_opt, optim_path, torch::kCPU);
@@ -594,7 +758,7 @@ void TestPopulatedOptimizerMigration(const std::filesystem::path& temp_dir) {
       target_opt->state()[input_w_key].get());
   SPIEL_CHECK_TRUE(adam_state != nullptr);
   SPIEL_CHECK_TRUE(adam_state->exp_avg().defined());
-  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 2048);
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 64);
   SPIEL_CHECK_EQ(adam_state->exp_avg().size(1), kFullPublicInformationStateSize);
 
   auto* src_adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
@@ -625,7 +789,106 @@ void TestPopulatedOptimizerMigration(const std::filesystem::path& temp_dir) {
   target_loss.backward();
   target_opt->step();
 
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
   std::cout << "Populated optimizer migration verification passed: moments expanded and target step succeeded.\n";
+}
+
+void TestOptimizerMigration6255To9182(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+
+  auto src_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      6255, 64, 2391, 1, /*use_nonlinear=*/false, /*with_aux_heads=*/true,
+      /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  auto src_opt = MakeDuneOptimizer(src_model);
+
+  torch::Tensor dummy_input = torch::randn({2, 6255});
+  auto out = src_model->forward(dummy_input);
+  torch::Tensor loss = out.logits.sum() + out.values.sum();
+  loss.backward();
+  src_opt->step();
+
+  const std::string optim_path = (temp_dir / "src_6255.optim.pt").string();
+  torch::save(*src_opt, optim_path);
+
+  auto target_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 64, 2391, 1, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/true, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  auto target_opt = MakeDuneOptimizer(target_model);
+
+  bool migrated = LoadOptimizerCheckpointMigrating(
+      target_model, *target_opt, optim_path, torch::kCPU);
+  SPIEL_CHECK_TRUE(migrated);
+
+  auto input_w_key = target_model->input_layer->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(target_opt->state().count(input_w_key), 0);
+  auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      target_opt->state()[input_w_key].get());
+  SPIEL_CHECK_TRUE(adam_state != nullptr);
+  SPIEL_CHECK_TRUE(adam_state->exp_avg().defined());
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 64);
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(1), kFullPublicInformationStateSize);
+
+  auto* src_adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      src_opt->state()[src_model->input_layer->weight.unsafeGetTensorImpl()].get());
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg().slice(1, 0, 6255),
+      src_adam_state->exp_avg()));
+
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg().slice(1, 6255, kFullPublicInformationStateSize).abs().sum().item<double>(), 0.0);
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg_sq().slice(1, 6255, kFullPublicInformationStateSize).abs().sum().item<double>(), 0.0);
+
+  // A full AdamW update on target_model succeeds without any shape mismatch error
+  target_model->train();
+  target_opt->zero_grad();
+  torch::Tensor target_input = torch::randn({2, kFullPublicInformationStateSize});
+  auto target_out = target_model->forward(target_input);
+  torch::Tensor target_loss = target_out.logits.sum() + target_out.values.sum();
+  target_loss.backward();
+  target_opt->step();
+
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
+  std::cout << "6255-to-9182 optimizer migration verification passed: moments expanded and target step succeeded.\n";
+}
+
+void TestBootstrappedBundleVerification(const std::filesystem::path& bundle_dir) {
+  const std::filesystem::path model_path = bundle_dir / "ppo_model_update_400.pt";
+  const std::filesystem::path optim_path = bundle_dir / "ppo_optimizer_update_400.pt";
+  SPIEL_CHECK_TRUE(std::filesystem::exists(model_path));
+  SPIEL_CHECK_TRUE(std::filesystem::exists(optim_path));
+
+  auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 2048, 2391, 8, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  LoadModelCheckpointRobust(model, model_path.string(), torch::kCPU);
+  SPIEL_CHECK_TRUE(model->market_appendix_mode_ == dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
+  SPIEL_CHECK_TRUE(model->with_semantic_scorer_);
+  SPIEL_CHECK_TRUE(model->semantic_scorer_->out_layer_ext->weight.defined());
+
+  // Verify actor evaluator accepts the loaded model
+  DuneNNEvaluator evaluator(model, torch::kCPU);
+
+  // Verify optimizer reload: already 9182, LoadOptimizerCheckpointMigrating returns false
+  auto opt = MakeDuneOptimizer(model);
+  bool needs_migration = LoadOptimizerCheckpointMigrating(
+      model, *opt, optim_path.string(), torch::kCPU);
+  SPIEL_CHECK_FALSE(needs_migration);
+
+  torch::load(*opt, optim_path.string(), torch::kCPU);
+  SPIEL_CHECK_EQ(opt->state().size(), 88);
+
+  // Verify step succeeds
+  model->train();
+  opt->zero_grad();
+  torch::Tensor x = torch::randn({2, kFullPublicInformationStateSize});
+  auto out = model->forward(x);
+  torch::Tensor loss = out.logits.sum() + out.values.sum();
+  loss.backward();
+  opt->step();
+  std::cout << "Real bootstrapped B400 bundle reload, evaluation, and update step passed successfully.\n";
 }
 
 }  // namespace
@@ -642,6 +905,13 @@ int main(int argc, char** argv) {
   open_spiel::TestVersionAwareScorerDeserialization(artifacts_dir / "version_aware");
   open_spiel::TestFailClosedValidation(artifacts_dir / "fail_closed");
   open_spiel::TestPopulatedOptimizerMigration(artifacts_dir / "optim_mig");
+  open_spiel::TestOptimizerMigration6255To9182(artifacts_dir / "optim_mig_6255");
+  if (argc > 2) {
+    const std::filesystem::path b400_dir(argv[2]);
+    open_spiel::TestBootstrappedBundleVerification(b400_dir);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(artifacts_dir, ec);
   return 0;
 }
 
