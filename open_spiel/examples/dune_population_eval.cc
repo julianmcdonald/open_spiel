@@ -43,6 +43,7 @@
 #include "dune_seed_utils.h"
 #include "dune_eval_action_selection.h"
 #include "dune_specimen_conversion.h"
+#include "dune_market_diagnostics.h"
 #include "open_spiel/utils/json.h"
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,17 @@ ABSL_FLAG(std::string, dump_logit_stats, "",
           "legal-centered logit statistics to this path (audit; off by default).");
 ABSL_FLAG(std::string, candidate_market_appendix_mode, "auto",
           "Market appendix mode for candidate: 'auto' (infer from model/manifest), 'none', 'zeros', or 'ordered_market'.");
+ABSL_FLAG(bool, record_market_diagnostics, false,
+          "If true, collect per-game and aggregate market purchase diagnostics.");
+ABSL_FLAG(std::string, market_diagnostics_json, "",
+          "Optional explicit path for market diagnostics JSON. Defaults to "
+          "<output_dir>/market_diagnostics.json if --record_market_diagnostics is true and --output_dir is set.");
+ABSL_FLAG(std::string, market_diagnostics_csv, "",
+          "Optional explicit path for market diagnostics CSV. Defaults to "
+          "<output_dir>/market_diagnostics.csv if --record_market_diagnostics is true and --output_dir is set.");
+ABSL_FLAG(std::string, market_diagnostics_games_jsonl, "",
+          "Optional explicit path for compact per-game market diagnostics JSONL. Defaults to "
+          "<output_dir>/market_diagnostics_games.jsonl if --record_market_diagnostics is true and --output_dir is set.");
 
 namespace open_spiel {
 namespace {
@@ -651,7 +663,9 @@ void WorkerThread(
     float candidate_logit_cap,
     float opponent_logit_cap,
     std::ofstream* dump_out,
-    std::vector<GameResult>& results) {
+    std::vector<GameResult>& results,
+    bool record_market_diagnostics,
+    std::vector<dune_market_diag::CompactPerGameMarketDiagnostics>* market_results) {
 
   // Pre-allocate observation buffers
   std::vector<float> cand_obs(candidate_input_dim, 0.0f);
@@ -717,6 +731,11 @@ void WorkerThread(
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
 
+    dune_market_diag::GameMarketTracker market_tracker;
+    if (record_market_diagnostics) {
+      market_tracker.InitGame(episode_id, model_player);
+    }
+
     // Phase-3: observe running VP at each round boundary via public accessors.
     const DuneImperiumState* dune_state =
         dynamic_cast<const DuneImperiumState*>(state.get());
@@ -766,6 +785,10 @@ void WorkerThread(
       if (legal_actions.empty()) {
         std::cerr << "Empty legal actions in episode " << episode_id << "!\n";
         break;
+      }
+
+      if (record_market_diagnostics && dune_state != nullptr && current_player == model_player) {
+        market_tracker.OnCandidateDecision(*dune_state, model_player, legal_actions);
       }
 
       Action chosen_action = -1;
@@ -856,7 +879,13 @@ void WorkerThread(
           current_player >= 0 && current_player < kNumPlayers) {
         ++specimen_conversions[current_player];
       }
+      if (record_market_diagnostics && dune_state != nullptr) {
+        market_tracker.BeforeApplyAction(*dune_state, current_player, model_player, chosen_action);
+      }
       state->ApplyAction(chosen_action);
+      if (record_market_diagnostics && dune_state != nullptr) {
+        market_tracker.AfterApplyAction(*dune_state, current_player, model_player, chosen_action);
+      }
     }
 
     // Phase-3: capture the final (terminal) round's VP snapshot.
@@ -1004,6 +1033,10 @@ void WorkerThread(
         gr.terminal_reason = "round_limit";
       }
     }
+
+    if (record_market_diagnostics && market_results != nullptr) {
+      (*market_results)[result_index] = market_tracker.GetData();
+    }
   }
 }
 
@@ -1038,6 +1071,21 @@ void RunEvaluation() {
   const double candidate_logit_cap = absl::GetFlag(FLAGS_candidate_logit_cap);
   const double opponent_logit_cap = absl::GetFlag(FLAGS_opponent_logit_cap);
   const std::string dump_logit_stats_path = absl::GetFlag(FLAGS_dump_logit_stats);
+  const bool record_market_diagnostics = absl::GetFlag(FLAGS_record_market_diagnostics);
+  std::string market_diag_json_path = absl::GetFlag(FLAGS_market_diagnostics_json);
+  std::string market_diag_csv_path = absl::GetFlag(FLAGS_market_diagnostics_csv);
+  std::string market_diag_games_path = absl::GetFlag(FLAGS_market_diagnostics_games_jsonl);
+  if (record_market_diagnostics && !output_dir.empty()) {
+    if (market_diag_json_path.empty()) {
+      market_diag_json_path = (std::filesystem::path(output_dir) / "market_diagnostics.json").string();
+    }
+    if (market_diag_csv_path.empty()) {
+      market_diag_csv_path = (std::filesystem::path(output_dir) / "market_diagnostics.csv").string();
+    }
+    if (market_diag_games_path.empty()) {
+      market_diag_games_path = (std::filesystem::path(output_dir) / "market_diagnostics_games.jsonl").string();
+    }
+  }
 
   if (model_checkpoint.empty()) {
     std::cerr << "Error: --model_checkpoint is required.\n";
@@ -1280,6 +1328,10 @@ void RunEvaluation() {
 
   // --- Pre-allocate results (indexed by episode_id for determinism) ---
   std::vector<GameResult> results(total_games);
+  std::vector<dune_market_diag::CompactPerGameMarketDiagnostics> market_results;
+  if (record_market_diagnostics) {
+    market_results.resize(total_games);
+  }
 
   auto start_time = std::chrono::steady_clock::now();
 
@@ -1299,12 +1351,42 @@ void RunEvaluation() {
         static_cast<float>(candidate_logit_cap),
         static_cast<float>(opponent_logit_cap),
         logit_dump_ptr,
-        std::ref(results));
+        std::ref(results),
+        record_market_diagnostics,
+        record_market_diagnostics ? &market_results : nullptr);
   }
   for (auto& th : threads) {
     if (th.joinable()) th.join();
   }
   if (logit_dump.is_open()) logit_dump.close();
+
+  if (record_market_diagnostics) {
+    auto report = dune_market_diag::MarketDiagnosticsReport::AggregateReport(market_results, total_games);
+    if (!market_diag_json_path.empty()) {
+      if (!report.WriteJson(market_diag_json_path)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics JSON to " + market_diag_json_path);
+      }
+      std::cout << "Market diagnostics JSON written to " << market_diag_json_path << "\n";
+    }
+    if (!market_diag_csv_path.empty()) {
+      if (!report.WriteCsv(market_diag_csv_path)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics CSV to " + market_diag_csv_path);
+      }
+      std::cout << "Market diagnostics CSV written to " << market_diag_csv_path << "\n";
+    }
+    if (!market_diag_games_path.empty()) {
+      if (!dune_market_diag::WritePerGameJsonl(market_diag_games_path, market_results)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics games JSONL to " + market_diag_games_path);
+      }
+      std::cout << "Market diagnostics games JSONL written to " << market_diag_games_path << "\n";
+
+      // Re-read and assert exact bit-for-bit reconciliation with in-memory aggregate report
+      auto read_games = dune_market_diag::ReadPerGameJsonl(market_diag_games_path);
+      auto recomputed_report = dune_market_diag::MarketDiagnosticsReport::AggregateReport(read_games, total_games);
+      dune_market_diag::VerifyReconciliation(report, recomputed_report);
+      std::cout << "Market diagnostics per-game reconciliation verified successfully (" << read_games.size() << " games).\n";
+    }
+  }
 
   auto end_time = std::chrono::steady_clock::now();
   double elapsed_secs =

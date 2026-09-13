@@ -445,6 +445,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_purchase_identity_network_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_purchase_identity_network_test ${TORCH_LIBRARIES})
   add_test(NAME dune_purchase_identity_network_test COMMAND dune_purchase_identity_network_test)
+
+  add_executable(dune_market_diagnostics_test
+    dune_market_diagnostics_test.cc
+    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_market_diagnostics_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_market_diagnostics_test COMMAND dune_market_diagnostics_test)
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
 endif()
