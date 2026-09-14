@@ -212,6 +212,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_benchmark dune_search_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_benchmark dune_search ${TORCH_LIBRARIES})
 
+  add_executable(dune_stage_a_probe dune_stage_a_probe.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_stage_a_probe dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_debug_replay dune_debug_replay.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_debug_replay dune_search ${TORCH_LIBRARIES})
+
   # dune_online_search_collector.cc carries the SHARED acceptance rule
   # (ComputeSearchAcceptance / SelectAcceptancePriors, WO-1 Phase 4) that the
   # offline teacher and the online collector both call.

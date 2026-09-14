@@ -968,6 +968,9 @@ struct CompactEvalResult {
     std::vector<Action> actions;
     std::vector<float> probabilities;
     float value = 0.0f;
+    int64_t physical_batch_id = -1;
+    int32_t physical_batch_size = -1;
+    int32_t physical_batch_row = -1;
 };
 
 struct LogitCapApplicationStats {
@@ -1298,16 +1301,21 @@ public:
                 AutocastGuard autocast_guard(c10::DeviceType::CUDA, rollout_amp_);
                 outputs = model_->forward(device_tensor_);
                 critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_tensor_) : outputs;
+                if (model_->with_semantic_scorer_ && model_->semantic_scorer_ &&
+                    action_data != nullptr && !action_data->empty()) {
+                    std::vector<const dune_semantic::CandidateActionData*> single_batch = {action_data};
+                    dune_semantic::ApplySemanticScorerBatch(
+                        model_->semantic_scorer_, outputs.trunk, single_batch, outputs.logits, device_);
+                }
             } else {
                 outputs = model_->forward(input_tensor_);
                 critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(input_tensor_) : outputs;
-            }
-
-            if (model_->with_semantic_scorer_ && model_->semantic_scorer_ &&
-                action_data != nullptr && !action_data->empty()) {
-                std::vector<const dune_semantic::CandidateActionData*> single_batch = {action_data};
-                dune_semantic::ApplySemanticScorerBatch(
-                    model_->semantic_scorer_, outputs.trunk, single_batch, outputs.logits, device_);
+                if (model_->with_semantic_scorer_ && model_->semantic_scorer_ &&
+                    action_data != nullptr && !action_data->empty()) {
+                    std::vector<const dune_semantic::CandidateActionData*> single_batch = {action_data};
+                    dune_semantic::ApplySemanticScorerBatch(
+                        model_->semantic_scorer_, outputs.trunk, single_batch, outputs.logits, device_);
+                }
             }
 
             // Blocking device->host copy INSIDE the lock drains the stream before
@@ -1633,6 +1641,9 @@ public:
                     total));
             }
             compact.value = full.value;
+            compact.physical_batch_id = full.physical_batch_id;
+            compact.physical_batch_size = full.physical_batch_size;
+            compact.physical_batch_row = full.physical_batch_row;
             return compact;
         }
         CheckEvalObsSize(obs.size(), model_input_dim_);
@@ -2282,13 +2293,23 @@ private:
                             request.legal_actions.size());
                     request.compact_dest->value = values[i];
                 }
-                if (emit_batch_membership_ && request.result_dest != nullptr) {
-                    request.result_dest->physical_batch_id =
-                        slot.membership_batch_id;
-                    request.result_dest->physical_batch_size =
-                        static_cast<int32_t>(slot.batch.size());
-                    request.result_dest->physical_batch_row =
-                        static_cast<int32_t>(i);
+                if (emit_batch_membership_) {
+                    if (request.result_dest != nullptr) {
+                        request.result_dest->physical_batch_id =
+                            slot.membership_batch_id;
+                        request.result_dest->physical_batch_size =
+                            static_cast<int32_t>(slot.batch.size());
+                        request.result_dest->physical_batch_row =
+                            static_cast<int32_t>(i);
+                    }
+                    if (request.compact_dest != nullptr) {
+                        request.compact_dest->physical_batch_id =
+                            slot.membership_batch_id;
+                        request.compact_dest->physical_batch_size =
+                            static_cast<int32_t>(slot.batch.size());
+                        request.compact_dest->physical_batch_row =
+                            static_cast<int32_t>(i);
+                    }
                 }
                 slot.batch[i].ready_flag->store(true,
                                                 std::memory_order_release);
@@ -2357,19 +2378,19 @@ private:
                                                  rollout_amp_);
                     outputs = model_->forward(device_obs);
                     critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
-                }
-                if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
-                    std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
-                    bool has_any_actions = false;
-                    for (size_t i = 0; i < batch_size; ++i) {
-                        batch_actions[i] = slot.batch[i].action_data;
-                        if (slot.batch[i].action_data != nullptr && !slot.batch[i].action_data->empty()) {
-                            has_any_actions = true;
+                    if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                        std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
+                        bool has_any_actions = false;
+                        for (size_t i = 0; i < batch_size; ++i) {
+                            batch_actions[i] = slot.batch[i].action_data;
+                            if (slot.batch[i].action_data != nullptr && !slot.batch[i].action_data->empty()) {
+                                has_any_actions = true;
+                            }
                         }
-                    }
-                    if (has_any_actions) {
-                        dune_semantic::ApplySemanticScorerBatch(
-                            model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                        if (has_any_actions) {
+                            dune_semantic::ApplySemanticScorerBatch(
+                                model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                        }
                     }
                 }
                 auto device_values = slot.device_values.narrow(
@@ -2746,15 +2767,10 @@ private:
                 std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
-                if (device_.is_cuda()) {
-                    AutocastGuard autocast_guard(c10::DeviceType::CUDA,
-                                                 rollout_amp_);
-                    outputs = model_->forward(device_obs);
-                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
-                } else {
-                    outputs = model_->forward(device_obs);
-                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
-                }
+                AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                             device_.is_cuda() && rollout_amp_);
+                outputs = model_->forward(device_obs);
+                critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
                 if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
                     std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
                     bool has_any_actions = false;
@@ -2877,6 +2893,14 @@ private:
                         batch[i].compact_dest->probabilities.push_back(static_cast<float>(prob));
                     }
                     batch[i].compact_dest->value = values_ptr[i];
+                    if (emit_batch_membership_) {
+                        batch[i].compact_dest->physical_batch_id =
+                            membership_batch_id;
+                        batch[i].compact_dest->physical_batch_size =
+                            static_cast<int32_t>(batch_size);
+                        batch[i].compact_dest->physical_batch_row =
+                            static_cast<int32_t>(i);
+                    }
                 }
 
                 // Set the atomic flag (fast spinning threads will catch this instantly)

@@ -74,11 +74,19 @@ class DuneNNEvaluator : public algorithms::Evaluator {
       torch::Device device,
       float logit_cap = 10.0f,
       dune_imperium::MarketAppendixMode market_mode =
-          dune_imperium::MarketAppendixMode::kNone)
+          dune_imperium::MarketAppendixMode::kNone,
+      bool rollout_amp = true,
+      bool allow_tf32 = false)
       : model_(model),
         device_(device),
         logit_cap_(logit_cap),
-        market_mode_(market_mode) {
+        market_mode_(market_mode),
+        rollout_amp_(rollout_amp),
+        allow_tf32_(allow_tf32) {
+    if (device_.is_cuda()) {
+      at::globalContext().setAllowTF32CuBLAS(allow_tf32_);
+      at::globalContext().setAllowTF32CuDNN(allow_tf32_);
+    }
     model_->eval(); // Guard against BatchNorm/Dropout updates
 
     obs_size_ = model_->input_layer->weight.size(1);
@@ -114,10 +122,13 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (model_ != nullptr) return model_->semantic_descriptor_schema_;
     return dune_semantic::kDescriptorSchemaVersionV3;
   }
+  std::vector<float> GetConsumedObservation(const State& state, Player player) const {
+    return ModelObservation(state, player);
+  }
 
   std::vector<double> Evaluate(const State& state) override {
     torch::InferenceMode guard; // Fast ungrad inference
-    AutocastGuard autocast_guard(device_.type(), device_.is_cuda()); // Match training precision
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda() && rollout_amp_); // Match training precision
 
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);
@@ -157,7 +168,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
   ActionsAndProbs Prior(const State& state) override {
     torch::InferenceMode guard;
-    AutocastGuard autocast_guard(device_.type(), device_.is_cuda());
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda() && rollout_amp_);
 
     if (state.IsTerminal()) {
       return {};
@@ -244,7 +255,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
   std::pair<ActionsAndProbs, std::vector<double>> PriorAndEvaluate(const State& state) override {
     torch::InferenceMode guard;
-    AutocastGuard autocast_guard(device_.type(), device_.is_cuda());
+    AutocastGuard autocast_guard(device_.type(), device_.is_cuda() && rollout_amp_);
 
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);
@@ -370,6 +381,8 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   float logit_cap_;
   int64_t obs_size_;
   dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
+  bool rollout_amp_{true};
+  bool allow_tf32_{false};
 };
 
 } // namespace open_spiel

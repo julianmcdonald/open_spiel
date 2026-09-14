@@ -43,6 +43,7 @@
 #include "dune_warmstart_helpers.h"  // ChooseHeuristicAcquisitionAction (swordmaster probe)
 #include "dune_split_evaluator.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
+#include "dune_market_diagnostics.h"
 #include <fstream>
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Path to load search agent model checkpoint.");
@@ -55,6 +56,13 @@ ABSL_FLAG(int, start_episode_id, 0, "Episode ID to start the range of games (for
 ABSL_FLAG(std::string, game_jsonl_path, "", "Path to write structured game-level JSONL outcomes.");
 ABSL_FLAG(std::string, search_jsonl_path, "", "Path to write structured search-level JSONL diagnostics.");
 ABSL_FLAG(std::string, aggregate_json_path, "", "Path to write structured aggregate JSON outcome.");
+ABSL_FLAG(bool, record_market_diagnostics, false, "Record full market diagnostics (cards seen/bought etc.).");
+ABSL_FLAG(std::string, market_diag_json_path, "", "Path to write aggregate market diagnostics JSON.");
+ABSL_FLAG(std::string, market_diag_csv_path, "", "Path to write aggregate market diagnostics CSV.");
+ABSL_FLAG(std::string, market_diag_games_path, "", "Path to write per-game market diagnostics JSONL.");
+ABSL_FLAG(std::string, candidate_decision_traces_path, "", "Path to write compact candidate decision traces JSONL.");
+ABSL_FLAG(bool, record_candidate_decision_traces, false, "Whether to record per-decision candidate search traces.");
+ABSL_FLAG(std::string, output_dir, "", "Directory for output artifacts (market diagnostics, games.jsonl, etc.).");
 ABSL_FLAG(int, threads, 8, "How many threads to run.");
 ABSL_FLAG(int, hidden_dim, 2048, "Search agent model hidden dimension.");
 ABSL_FLAG(int, num_blocks, 8, "Search agent model residual blocks count.");
@@ -129,6 +137,9 @@ ABSL_FLAG(int, corpus_workers, 14,
 ABSL_FLAG(std::string, corpus_root_jsonl_path, "",
           "WO-PERF-3: path to write per-root JSONL (selected action + full root "
           "visit vector) for direct/batched parity comparison.");
+ABSL_FLAG(std::string, corpus_controller, "session",
+          "Corpus driver search controller: 'session' (legacy DuneSearchSession) "
+          "or 'fresh' (fresh DunePUCTISMCTSBot with F03 Max-N config per root).");
 ABSL_FLAG(int, corpus_warmup_searches, 0,
           "WO-PERF-TIMING-BATCH: run this many discarded warm-up searches "
           "before timing and before batcher telemetry is armed. Each arm is a "
@@ -262,7 +273,7 @@ int GetTrueFinalVp(const dune_imperium::DuneImperiumState* dune_state, int p) {
 
 class DuneGreedyBot : public Bot {
  public:
-  DuneGreedyBot(std::unique_ptr<DuneNNEvaluator> evaluator, int seed, double temperature)
+  DuneGreedyBot(std::shared_ptr<open_spiel::algorithms::Evaluator> evaluator, int seed, double temperature)
       : evaluator_(std::move(evaluator)), rng_(seed), temperature_(temperature) {}
 
   Action Step(const State& state) override {
@@ -324,7 +335,7 @@ class DuneGreedyBot : public Bot {
     }
   }
 
-  std::unique_ptr<DuneNNEvaluator> evaluator_;
+  std::shared_ptr<open_spiel::algorithms::Evaluator> evaluator_;
   std::mt19937 rng_;
   double temperature_;
 };
@@ -491,6 +502,19 @@ std::string BudgetModeName(DuneSearchBudgetMode m) {
 // PF-2 Part A's phase mapping moved to dune_pf2_matched_fallback.h so the
 // field regression test exercises the same mapping this binary uses.
 
+std::string DuneDecisionRoleToString(open_spiel::DuneDecisionRole role) {
+  switch (role) {
+    case open_spiel::DuneDecisionRole::kForcedOrBookkeeping: return "kForcedOrBookkeeping";
+    case open_spiel::DuneDecisionRole::kLeaderSelection: return "kLeaderSelection";
+    case open_spiel::DuneDecisionRole::kAgentPrimary: return "kAgentPrimary";
+    case open_spiel::DuneDecisionRole::kAgentContinuation: return "kAgentContinuation";
+    case open_spiel::DuneDecisionRole::kPurchase: return "kPurchase";
+    case open_spiel::DuneDecisionRole::kCombatIntrigue: return "kCombatIntrigue";
+    case open_spiel::DuneDecisionRole::kOtherOptional: return "kOtherOptional";
+    default: return "kUnknown";
+  }
+}
+
 void WorkerThread(
     int thread_id,
     std::shared_ptr<const Game> game,
@@ -502,7 +526,11 @@ void WorkerThread(
     std::atomic<int>& completed_games,
     std::mutex& log_mutex,
     GameStats& global_stats,
-    std::mutex& stats_mutex) {
+    std::mutex& stats_mutex,
+    bool record_market_diagnostics = false,
+    std::vector<dune_market_diag::CompactPerGameMarketDiagnostics>* market_results = nullptr,
+    std::shared_ptr<open_spiel::BatchedEvaluator> search_coord = nullptr,
+    std::shared_ptr<open_spiel::BatchedEvaluator> opp_coord = nullptr) {
 
   torch::InferenceMode inference_guard;
 
@@ -571,7 +599,10 @@ void WorkerThread(
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
     // Create thread-local, bot-specific evaluator wrapping search models
     std::shared_ptr<open_spiel::algorithms::Evaluator> search_evaluator;
-    if (g_using_split_evaluator) {
+    if (search_coord != nullptr) {
+      search_evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(
+          search_coord, candidate_logit_cap);
+    } else if (g_using_split_evaluator) {
       auto policy_eval = std::make_shared<DuneNNEvaluator>(
           search_model, device, candidate_logit_cap);
       auto value_model_ptr = search_value_model ? search_value_model : search_model;
@@ -724,11 +755,25 @@ void WorkerThread(
         // 'single' legacy behavior, and 'mixed' with raw_policy opponents: both
         // resolve to the --opponent_checkpoint-driven bot. opponent_model is
         // null exactly when --opponent_checkpoint=random.
-        if (opponent_model != nullptr) {
-          auto local_opp_eval = std::make_unique<DuneNNEvaluator>(
+        if (opp_coord != nullptr) {
+          auto local_opp_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
+              opp_coord, opponent_logit_cap);
+          bots[p] = std::make_unique<DuneGreedyBot>(
+              local_opp_eval, static_cast<int>(seat_seed),
+              absl::GetFlag(FLAGS_external_opponent_temperature));
+          seat_provenance[p] = SeatControllerProvenance{
+              /*controller=*/"raw_policy",
+              /*checkpoint=*/absl::GetFlag(FLAGS_opponent_checkpoint).empty()
+                  ? absl::GetFlag(FLAGS_model_checkpoint)
+                  : absl::GetFlag(FLAGS_opponent_checkpoint),
+              /*checkpoint_sha256=*/g_opponent_ckpt_sha256,
+              /*max_simulations=*/-1, /*budget_mode=*/"none",
+              /*logit_cap=*/static_cast<double>(opponent_logit_cap)};
+        } else if (opponent_model != nullptr) {
+          auto local_opp_eval = std::make_shared<DuneNNEvaluator>(
               opponent_model, device, opponent_logit_cap);
           bots[p] = std::make_unique<DuneGreedyBot>(
-              std::move(local_opp_eval), static_cast<int>(seat_seed),
+              local_opp_eval, static_cast<int>(seat_seed),
               absl::GetFlag(FLAGS_external_opponent_temperature));
           seat_provenance[p] = SeatControllerProvenance{
               /*controller=*/"raw_policy",
@@ -750,6 +795,13 @@ void WorkerThread(
 
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
+    const auto* dune_state_for_diag =
+        dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+
+    dune_market_diag::GameMarketTracker market_tracker;
+    if (record_market_diagnostics) {
+      market_tracker.InitGame(g, search_seat);
+    }
 
     std::vector<int> game_role_counts(7, 0);
     bool in_search_turn = false;
@@ -876,7 +928,15 @@ void WorkerThread(
         continue;
       }
 
+      if (record_market_diagnostics && dune_state_for_diag != nullptr && current_player == search_seat) {
+        market_tracker.OnCandidateDecision(*dune_state_for_diag, search_seat, state->LegalActions());
+      }
+
       Action chosen_action = -1;
+      open_spiel::DuneDecisionRole role = open_spiel::DuneDecisionRole::kForcedOrBookkeeping;
+      bool search_this_role = false;
+      double step_duration = 0.0;
+      DuneSearchResult last_res;
 
       // Swordmaster probe (arm B): before the searched seat searches, force it
       // toward legal Swordmaster acquisition in the early rounds. Bypasses the
@@ -908,11 +968,10 @@ void WorkerThread(
         // own session, never a shared one.
         auto& cur_session = seat_sessions[current_player];
         bool has_active = cur_session ? cur_session->HasActiveSession() : false;
-        open_spiel::DuneDecisionRole role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, has_active);
+        role = open_spiel::ClassifyDuneDecisionRole(*state, current_player, has_active);
         game_role_counts[static_cast<int>(role)]++;
         bool is_strategic = (role == open_spiel::DuneDecisionRole::kAgentPrimary || role == open_spiel::DuneDecisionRole::kAgentContinuation);
         auto step_start = std::chrono::steady_clock::now();
-        DuneSearchResult last_res;
         // PF-2 Part B ordinal. Incremented here — once per candidate decision,
         // before either branch and before any seed derivation — so it counts
         // exactly what Path-B's search_count_ counts. Unused when the flag is
@@ -998,7 +1057,7 @@ void WorkerThread(
           // listed roles are searched; every other searched-seat decision plays the
           // raw-prior argmax, identical to the policy-only arm. This decomposes the
           // full-search arm into "policy-only + search at the listed roles".
-          const bool search_this_role =
+          search_this_role =
               fresh_search_roles.empty() || fresh_search_roles.count(role) > 0;
           if (search_this_role) {
             chosen_action = search_bot->Step(*state);
@@ -1013,6 +1072,16 @@ void WorkerThread(
             last_res.used_fallback = true;
             last_res.fallback_reason = "role_filtered_raw_prior";
             last_res.diagnostics.selected_action = chosen_action;
+            ActionsAndProbs prior = seat_evaluators[current_player]->Prior(*state);
+            Action prior_argmax = kInvalidAction;
+            double max_p = -1.0;
+            for (const auto& ap : prior) {
+              if (ap.second > max_p) {
+                max_p = ap.second;
+                prior_argmax = ap.first;
+              }
+            }
+            last_res.diagnostics.raw_reference_action = prior_argmax;
             last_res.diagnostics.decision_role = std::to_string(static_cast<int>(role));
           }
           // PF-2 Part A. Path B emits the session-populated diagnostic fields,
@@ -1032,7 +1101,7 @@ void WorkerThread(
               last_res.diagnostics, *state, static_cast<int>(role));
         }
         auto step_end = std::chrono::steady_clock::now();
-        double step_duration = std::chrono::duration<double>(step_end - step_start).count();
+        step_duration = std::chrono::duration<double>(step_end - step_start).count();
 
         // Update turn statistics
         if (role == open_spiel::DuneDecisionRole::kAgentPrimary) {
@@ -1117,6 +1186,7 @@ void WorkerThread(
               SearchDiagnostics diag = last_res.diagnostics;
               open_spiel::json::Object search_obj;
               search_obj["episode_id"] = static_cast<int64_t>(g);
+              search_obj["decision_ordinal"] = static_cast<int64_t>(matched_step_count);
               search_obj["game_seed"] = static_cast<int64_t>(game_seed);
               search_obj["search_seat"] = static_cast<int64_t>(search_seat);
               search_obj["player"] = static_cast<int64_t>(current_player);
@@ -1232,6 +1302,20 @@ void WorkerThread(
               search_obj["reset_reason"] = diag.reset_reason;
               search_obj["tree_node_count"] = static_cast<int64_t>(diag.tree_node_count);
               search_obj["legality_result"] = diag.legality_result;
+              search_obj["num_covered_actions"] = static_cast<int64_t>(diag.num_covered_actions);
+              search_obj["covered_prior_mass"] = diag.covered_prior_mass;
+              search_obj["mean_decision_depth"] = diag.mean_decision_depth;
+              search_obj["max_decision_depth"] = static_cast<int64_t>(diag.max_decision_depth);
+              search_obj["time_sample_root_ms"] = diag.time_sample_root_ms;
+              search_obj["time_nn_inference_ms"] = diag.time_nn_inference_ms;
+              search_obj["time_tree_engine_ms"] = diag.time_tree_engine_ms;
+              search_obj["time_other_overhead_ms"] = diag.time_other_overhead_ms;
+
+              open_spiel::json::Array hist_arr;
+              for (Action a : state->History()) {
+                hist_arr.push_back(static_cast<int64_t>(a));
+              }
+              search_obj["state_history"] = hist_arr;
 
               // --- WO-1 Phase 3: per-decision policy shape + budget health ---
               // Policy-shape stats are reported for TWO distributions, because
@@ -1315,6 +1399,66 @@ void WorkerThread(
         chosen_action = bots[current_player]->Step(*state);
       }
 
+      std::string cand_traces_path = absl::GetFlag(FLAGS_candidate_decision_traces_path);
+      if (!cand_traces_path.empty() && current_player == search_seat) {
+        Action raw_prior_argmax = kInvalidAction;
+        if (search_bot != nullptr && search_this_role) {
+          raw_prior_argmax = search_bot->GetRootRawPriorArgmax();
+        }
+        if (raw_prior_argmax == kInvalidAction && seat_sessions[current_player] != nullptr) {
+          raw_prior_argmax = last_res.diagnostics.raw_reference_action;
+        }
+        if (raw_prior_argmax == kInvalidAction && last_res.diagnostics.raw_reference_action != kInvalidAction) {
+          raw_prior_argmax = last_res.diagnostics.raw_reference_action;
+        }
+        if (raw_prior_argmax == kInvalidAction && !last_res.policy.empty()) {
+          double max_p = -1.0;
+          for (const auto& ap : last_res.policy) {
+            if (ap.second > max_p) {
+              max_p = ap.second;
+              raw_prior_argmax = ap.first;
+            }
+          }
+        }
+        if (raw_prior_argmax == kInvalidAction) {
+          auto legals = state->LegalActions();
+          if (legals.size() == 1) {
+            raw_prior_argmax = legals[0];
+          }
+        }
+
+        bool is_greedy_match = (raw_prior_argmax != kInvalidAction) && (chosen_action == raw_prior_argmax);
+        bool is_bypass = forced_swordmaster ||
+                         (last_res.simulations_completed == 0 &&
+                          (role == open_spiel::DuneDecisionRole::kForcedOrBookkeeping ||
+                           role == open_spiel::DuneDecisionRole::kLeaderSelection ||
+                           last_res.fallback_reason == "non_strategic_state" ||
+                           state->LegalActions().size() <= 1 ||
+                           !search_this_role));
+
+        open_spiel::json::Object trace_obj;
+        trace_obj["episode_id"] = static_cast<int64_t>(g);
+        trace_obj["decision_index"] = static_cast<int64_t>(matched_step_count);
+        trace_obj["seat"] = static_cast<int64_t>(current_player);
+        trace_obj["role"] = DuneDecisionRoleToString(role);
+        trace_obj["evaluator"] = seat_provenance[current_player].controller;
+        trace_obj["selected_action"] = static_cast<int64_t>(chosen_action);
+        trace_obj["raw_prior_argmax"] = static_cast<int64_t>(raw_prior_argmax);
+        trace_obj["is_greedy_match"] = is_greedy_match;
+        trace_obj["simulations_completed"] = static_cast<int64_t>(last_res.simulations_completed);
+        trace_obj["is_bypass"] = is_bypass;
+        trace_obj["fallback_occurred"] = last_res.used_fallback;
+        trace_obj["fallback_reason"] = last_res.fallback_reason;
+        trace_obj["timed_out"] = last_res.timeout_status;
+        trace_obj["wall_time_ms"] = step_duration * 1000.0;
+
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::ofstream trace_file(cand_traces_path, std::ios::app);
+        if (trace_file) {
+          trace_file << open_spiel::json::ToString(trace_obj, false) << "\n";
+        }
+      }
+
       // WO-1 Phase 3 addendum: count applied specimen->troop conversions per
       // seat, at application time, by engine action-ID range. Measurement only
       // -- no shaping is enabled anywhere by this counter.
@@ -1327,7 +1471,17 @@ void WorkerThread(
           current_player >= 0 && current_player < 4) {
         ++specimen_conversions[current_player];
       }
+      if (record_market_diagnostics && dune_state_for_diag != nullptr) {
+        market_tracker.BeforeApplyAction(*dune_state_for_diag, current_player, search_seat, chosen_action);
+      }
       state->ApplyAction(chosen_action);
+      if (record_market_diagnostics && dune_state_for_diag != nullptr) {
+        market_tracker.AfterApplyAction(*dune_state_for_diag, current_player, search_seat, chosen_action);
+      }
+    }
+
+    if (record_market_diagnostics && market_results != nullptr && offset < static_cast<int>(market_results->size())) {
+      (*market_results)[offset] = market_tracker.GetData();
     }
 
     // Capture the terminal round's VP snapshot (the loop exits before it).
@@ -1491,6 +1645,12 @@ void WorkerThread(
         game_obj["search_steps"] = static_cast<int64_t>(thread_stats.search_steps_count);
         game_obj["search_swordmasters"] = dune_state->HasSwordmaster(search_seat);
         game_obj["search_seat_leader"] = static_cast<int64_t>(dune_state->PlayerLeader(search_seat));
+        game_obj["candidate_leader"] = static_cast<int64_t>(dune_state->PlayerLeader(search_seat));
+        open_spiel::json::Array leaders_arr;
+        for (int p = 0; p < 4; ++p) {
+          leaders_arr.push_back(static_cast<int64_t>(dune_state->PlayerLeader(p)));
+        }
+        game_obj["leaders"] = leaders_arr;
         game_obj["search_seat_swordmaster_round"] =
             static_cast<int64_t>(sm_acquire_round_by_seat[search_seat]);
         // Same quantity for all four seats, seat-indexed (-1 = never acquired).
@@ -1850,8 +2010,10 @@ struct CorpusRootRecord {
   int corpus_idx = 0;
   Player player = 0;
   int round = 0;
+  uint64_t seed = 0;
   std::string category;
   std::vector<Action> history;
+  std::vector<Action> recorded_legals;
 };
 
 struct CorpusRootOutcome {
@@ -1863,14 +2025,22 @@ struct CorpusRootOutcome {
   Action raw_argmax_action = kInvalidAction;
   std::vector<Action> actions;
   std::vector<int> visit_counts;
+  std::vector<double> q_values;
+  std::vector<double> priors;
+  std::vector<double> raw_priors;
+  int num_covered_actions = 0;
+  double covered_prior_mass = 0.0;
+  bool used_fallback = false;
+  std::string fallback_reason = "none";
+  double root_value = 0.0;
   int total_root_visits = 0;
   int simulations_completed = 0;
   double elapsed_time_ms = 0.0;   // the SEARCH's own internal elapsed
-  // End-to-end wall time for this root: state reconstruction, both out-of-MCTS
-  // raw-prior calls, the search itself and the commit. This -- not
-  // elapsed_time_ms -- is the quantity the registered latency bound is stated
-  // against, because it is what a consumer of the search actually waits for.
   double root_wall_ms = 0.0;
+  double time_nn_inference_ms = 0.0;
+  double time_tree_engine_ms = 0.0;
+  double time_sample_root_ms = 0.0;
+  double time_other_overhead_ms = 0.0;
   bool populated = false;
 };
 
@@ -1941,10 +2111,34 @@ int RunCorpusRootBenchmark(
     cs.category = obj.at("category").GetString();
     cs.player = static_cast<Player>(obj.at("player").GetInt());
     cs.round = obj.at("round").GetInt();
+    auto seed_it = obj.find("seed");
+    if (seed_it != obj.end()) {
+      cs.seed = static_cast<uint64_t>(seed_it->second.GetInt());
+    }
+    auto legals_it = obj.find("legal_actions");
+    if (legals_it != obj.end()) {
+      for (const auto& a : legals_it->second.GetArray()) {
+        cs.recorded_legals.push_back(static_cast<Action>(a.GetInt()));
+      }
+    }
     for (const auto& a : obj.at("history").GetArray()) {
       cs.history.push_back(static_cast<Action>(a.GetInt()));
     }
     auto st = ReconstructCorpusRootState(game, cs.history);
+    // Native validation against recorded player and legal actions
+    SPIEL_CHECK_EQ(st->CurrentPlayer(), cs.player);
+    if (!cs.recorded_legals.empty()) {
+      std::vector<Action> state_legals = st->LegalActions();
+      std::sort(state_legals.begin(), state_legals.end());
+      std::vector<Action> rec_legals = cs.recorded_legals;
+      std::sort(rec_legals.begin(), rec_legals.end());
+      if (state_legals != rec_legals) {
+        SpielFatalError(absl::StrFormat(
+            "Native validation failed for root %d (corpus_idx %d): legal actions mismatch! Reconstructed has %d legals, recorded has %d legals.",
+            static_cast<int>(roots.size()), cs.corpus_idx,
+            state_legals.size(), rec_legals.size()));
+      }
+    }
     DuneDecisionRole role =
         ClassifyDuneDecisionRole(*st, st->CurrentPlayer(), false);
     if (role == expected_role) {
@@ -1957,6 +2151,8 @@ int RunCorpusRootBenchmark(
               << "' roots, requested " << root_count << ".\n";
     return 1;
   }
+  std::cout << "  native_validation: PASS (" << roots.size()
+            << " roots verified against recorded player and legal actions)\n";
 
   // WO-PERF-R3 (deliverable 2, WO-3 review F2 forward-fix): self-record the
   // selected root set so every run carries its own root-set identity. The
@@ -2039,6 +2235,14 @@ int RunCorpusRootBenchmark(
   // The temporary evaluator is therefore destroyed before the scored one is
   // constructed, which also releases its pinned staging buffers rather than
   // holding them while the scored evaluator allocates its own.
+  const std::string controller_mode_flag = absl::GetFlag(FLAGS_corpus_controller);
+  if (controller_mode_flag != "session" && controller_mode_flag != "fresh") {
+    std::cerr << "Error: --corpus_controller must be 'session' or 'fresh' (got '"
+              << controller_mode_flag << "').\n";
+    return 1;
+  }
+  const bool fresh_controller = (controller_mode_flag == "fresh");
+
   const int warmup_n = absl::GetFlag(FLAGS_corpus_warmup_searches);
   if (warmup_n > 0 && !roots.empty()) {
     torch::InferenceMode inference_guard;
@@ -2047,7 +2251,9 @@ int RunCorpusRootBenchmark(
     if (batched) {
       warm_batched = std::make_shared<open_spiel::BatchedEvaluator>(
           search_model, target, timeout_ms, device, &model_mutex,
-          /*logit_cap=*/0.0f);
+          candidate_logit_cap, /*device_synchronize=*/true,
+          /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+          /*rollout_amp=*/true, /*allow_tf32=*/false);
       wu_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
           warm_batched, candidate_logit_cap);
     } else {
@@ -2057,26 +2263,48 @@ int RunCorpusRootBenchmark(
     for (int w = 0; w < warmup_n; ++w) {
       const CorpusRootRecord& cs = roots[w % roots.size()];
       auto st = ReconstructCorpusRootState(game, cs.history);
-      // Same config the scored loop uses, with a DISJOINT seed base so warm-up
-      // never replays a scored root's search stream.
-      DuneSearchConfig wcfg;
-      wcfg.max_simulations = max_sims;
-      wcfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
-      wcfg.puct_c = puct_c;
-      wcfg.opponent_mode = SearchOpponentMode::kPolicy;
-      wcfg.opponent_temperature = 1.0;
-      wcfg.temperature = 0.0;
-      wcfg.utility_divisor = utility_divisor;
-      wcfg.seed = seed + 900000 + w;
-      wcfg.root_prior_temperature = prior_temp;
-      wcfg.fixed_session_limit = max_sims;
-      wcfg.fixed_continuation_reserve =
-          absl::GetFlag(FLAGS_fixed_continuation_reserve);
-      wcfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
-      wcfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
-      DuneSearchSession wsession(wcfg, wu_eval,
-                                 DuneSearchBudgetMode::kFixedSessionSimulations);
-      (void)wsession.Search(*st);
+      if (fresh_controller) {
+        DuneSearchConfig wcfg;
+        wcfg.max_simulations = max_sims;
+        wcfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+        wcfg.max_nodes = absl::GetFlag(FLAGS_max_nodes);
+        wcfg.puct_c = puct_c;
+        wcfg.opponent_mode = SearchOpponentMode::kMaxN;
+        wcfg.temperature = 0.0;
+        wcfg.opponent_temperature = 0.0;
+        wcfg.utility_divisor = utility_divisor;
+        wcfg.min_visit_threshold = 2;
+        wcfg.covered_prior_threshold = 0.50;
+        wcfg.seed = seed + 900000 + w;
+        wcfg.final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+        wcfg.dirichlet_epsilon = 0.0;
+        wcfg.use_observation_string = true;
+        wcfg.verbose_diagnostics = false;
+        wcfg.check_strategic_state = false;
+        wcfg.root_prior_temperature = prior_temp;
+        wcfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+        DunePUCTISMCTSBot wbot(wcfg, wu_eval);
+        (void)wbot.Step(*st);
+      } else {
+        DuneSearchConfig wcfg;
+        wcfg.max_simulations = max_sims;
+        wcfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+        wcfg.puct_c = puct_c;
+        wcfg.opponent_mode = SearchOpponentMode::kPolicy;
+        wcfg.opponent_temperature = 1.0;
+        wcfg.temperature = 0.0;
+        wcfg.utility_divisor = utility_divisor;
+        wcfg.seed = seed + 900000 + w;
+        wcfg.root_prior_temperature = prior_temp;
+        wcfg.fixed_session_limit = max_sims;
+        wcfg.fixed_continuation_reserve =
+            absl::GetFlag(FLAGS_fixed_continuation_reserve);
+        wcfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+        wcfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+        DuneSearchSession wsession(wcfg, wu_eval,
+                                   DuneSearchBudgetMode::kFixedSessionSimulations);
+        (void)wsession.Search(*st);
+      }
     }
     // Explicit teardown before the scored evaluator exists.
     wu_eval.reset();
@@ -2091,7 +2319,9 @@ int RunCorpusRootBenchmark(
   if (batched) {
     batched_eval = std::make_shared<open_spiel::BatchedEvaluator>(
         search_model, target, timeout_ms, device, &model_mutex,
-        /*logit_cap=*/0.0f);
+        candidate_logit_cap, /*device_synchronize=*/true,
+        /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+        /*rollout_amp=*/true, /*allow_tf32=*/false);
     // R2: the corpus driver is the one consumer that reads the detailed batcher
     // telemetry, so it alone arms the per-batch bookkeeping.
     batched_eval->EnableBatcherTelemetry();
@@ -2127,64 +2357,129 @@ int RunCorpusRootBenchmark(
       const CorpusRootRecord& cs = roots[idx];
       auto state = ReconstructCorpusRootState(game, cs.history);
 
-      // Out-of-MCTS raw prior #1 (pre-search). Mirrors the first of the two
-      // extra one-row raw-prior calls per root in the Phase-2 accounting.
-      ActionsAndProbs ppo_prior = evaluator->Prior(*state);
-      benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
-      Action a_raw = kInvalidAction;
-      double best_p = -1.0;
-      for (const auto& ap : ppo_prior) {
-        if (ap.second > best_p) { best_p = ap.second; a_raw = ap.first; }
+      if (fresh_controller) {
+        DuneSearchConfig cfg;
+        cfg.max_simulations = max_sims;
+        cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+        cfg.max_nodes = absl::GetFlag(FLAGS_max_nodes);
+        cfg.puct_c = puct_c;
+        cfg.opponent_mode = SearchOpponentMode::kMaxN;
+        cfg.temperature = 0.0;
+        cfg.opponent_temperature = 0.0;
+        cfg.utility_divisor = utility_divisor;
+        cfg.min_visit_threshold = 2;
+        cfg.covered_prior_threshold = 0.50;
+        cfg.seed = (cs.seed != 0) ? cs.seed : (seed + 200000 + 1000 * idx);
+        cfg.final_policy_type = DuneISMCTSFinalPolicyType::kNormalizedVisitCount;
+        cfg.dirichlet_epsilon = 0.0;
+        cfg.use_observation_string = true;
+        cfg.verbose_diagnostics = false;
+        cfg.check_strategic_state = false;
+        cfg.root_prior_temperature = prior_temp;
+        cfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+
+        DunePUCTISMCTSBot bot(cfg, evaluator);
+        Action chosen_action = bot.Step(*state);
+        DuneSearchResult sr = bot.GetLastSearchResult();
+        SPIEL_CHECK_EQ(sr.simulations_completed, max_sims);
+
+        CorpusRootOutcome oc;
+        oc.root_idx = idx;
+        oc.corpus_idx = cs.corpus_idx;
+        oc.player = cs.player;
+        oc.round = cs.round;
+        oc.selected_action = chosen_action;
+        oc.actions = sr.diagnostics.actions;
+        oc.visit_counts = sr.diagnostics.visit_counts;
+        oc.q_values = sr.diagnostics.q_values;
+        oc.priors = sr.diagnostics.priors;
+        oc.raw_priors = sr.diagnostics.raw_priors;
+        oc.total_root_visits = sr.diagnostics.total_root_visits;
+        oc.num_covered_actions = sr.diagnostics.num_covered_actions;
+        oc.covered_prior_mass = sr.diagnostics.covered_prior_mass;
+        oc.used_fallback = sr.used_fallback;
+        oc.fallback_reason = sr.fallback_reason;
+        oc.root_value = sr.diagnostics.root_value;
+        oc.simulations_completed = sr.simulations_completed;
+        oc.elapsed_time_ms = sr.elapsed_time_ms;
+        oc.time_nn_inference_ms = sr.diagnostics.time_nn_inference_ms;
+        oc.time_tree_engine_ms = sr.diagnostics.time_tree_engine_ms;
+        oc.time_sample_root_ms = sr.diagnostics.time_sample_root_ms;
+        oc.time_other_overhead_ms = sr.diagnostics.time_other_overhead_ms;
+
+        Action a_raw = kInvalidAction;
+        double best_p = -1.0;
+        for (size_t k = 0; k < oc.actions.size() && k < oc.raw_priors.size(); ++k) {
+          if (oc.raw_priors[k] > best_p) {
+            best_p = oc.raw_priors[k];
+            a_raw = oc.actions[k];
+          }
+        }
+        oc.raw_argmax_action = a_raw;
+        oc.root_wall_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - root_t0).count();
+        oc.populated = true;
+        outcomes[idx] = std::move(oc);
+      } else {
+        // Out-of-MCTS raw prior #1 (pre-search). Mirrors the first of the two
+        // extra one-row raw-prior calls per root in the Phase-2 accounting.
+        ActionsAndProbs ppo_prior = evaluator->Prior(*state);
+        benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
+        Action a_raw = kInvalidAction;
+        double best_p = -1.0;
+        for (const auto& ap : ppo_prior) {
+          if (ap.second > best_p) { best_p = ap.second; a_raw = ap.first; }
+        }
+
+        // Config mirrors dune_search_calibration.cc (the Phase-2 reference): the
+        // frozen policy-opponent workload at a fixed session simulation budget.
+        DuneSearchConfig cfg;
+        cfg.max_simulations = max_sims;
+        cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
+        cfg.puct_c = puct_c;
+        cfg.opponent_mode = SearchOpponentMode::kPolicy;
+        cfg.opponent_temperature = 1.0;
+        cfg.temperature = 0.0;
+        cfg.utility_divisor = utility_divisor;
+        cfg.seed = seed + 200000 + 1000 * idx;
+        cfg.root_prior_temperature = prior_temp;
+        cfg.fixed_session_limit = max_sims;
+        cfg.fixed_continuation_reserve =
+            absl::GetFlag(FLAGS_fixed_continuation_reserve);
+        cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
+        cfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
+
+        DuneSearchSession session(cfg, evaluator,
+                                  DuneSearchBudgetMode::kFixedSessionSimulations);
+        DuneSearchResult sr = session.Search(*state);
+
+        CorpusRootOutcome oc;
+        oc.root_idx = idx;
+        oc.corpus_idx = cs.corpus_idx;
+        oc.player = cs.player;
+        oc.round = cs.round;
+        oc.raw_argmax_action = a_raw;
+        oc.actions = sr.diagnostics.actions;
+        oc.visit_counts = sr.diagnostics.visit_counts;
+        oc.total_root_visits = sr.diagnostics.total_root_visits;
+        oc.simulations_completed = sr.simulations_completed;
+        oc.elapsed_time_ms = sr.elapsed_time_ms;
+
+        // Controller selection + commit. SelectControllerAction issues the second
+        // out-of-MCTS raw-prior call per root (dune_search_session.cc:679).
+        std::mt19937 step_rng(cfg.seed);
+        double r_val = absl::Uniform(step_rng, 0.0, 1.0);
+        ControllerDecision decision =
+            session.SelectControllerAction(*state, sr, r_val);
+        benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
+        DuneSearchResult committed = session.CommitAction(decision);
+        oc.selected_action = committed.diagnostics.selected_action;
+        oc.root_wall_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - root_t0).count();
+        oc.populated = true;
+
+        outcomes[idx] = std::move(oc);
       }
-
-      // Config mirrors dune_search_calibration.cc (the Phase-2 reference): the
-      // frozen policy-opponent workload at a fixed session simulation budget.
-      DuneSearchConfig cfg;
-      cfg.max_simulations = max_sims;
-      cfg.relative_time_budget_ms = std::numeric_limits<double>::infinity();
-      cfg.puct_c = puct_c;
-      cfg.opponent_mode = SearchOpponentMode::kPolicy;
-      cfg.opponent_temperature = 1.0;
-      cfg.temperature = 0.0;
-      cfg.utility_divisor = utility_divisor;
-      cfg.seed = seed + 200000 + 1000 * idx;
-      cfg.root_prior_temperature = prior_temp;
-      cfg.fixed_session_limit = max_sims;
-      cfg.fixed_continuation_reserve =
-          absl::GetFlag(FLAGS_fixed_continuation_reserve);
-      cfg.purchase_combat_budget = absl::GetFlag(FLAGS_purchase_combat_budget);
-      cfg.model_checkpoint_path = absl::GetFlag(FLAGS_model_checkpoint);
-
-      DuneSearchSession session(cfg, evaluator,
-                                DuneSearchBudgetMode::kFixedSessionSimulations);
-      DuneSearchResult sr = session.Search(*state);
-
-      CorpusRootOutcome oc;
-      oc.root_idx = idx;
-      oc.corpus_idx = cs.corpus_idx;
-      oc.player = cs.player;
-      oc.round = cs.round;
-      oc.raw_argmax_action = a_raw;
-      oc.actions = sr.diagnostics.actions;
-      oc.visit_counts = sr.diagnostics.visit_counts;
-      oc.total_root_visits = sr.diagnostics.total_root_visits;
-      oc.simulations_completed = sr.simulations_completed;
-      oc.elapsed_time_ms = sr.elapsed_time_ms;
-
-      // Controller selection + commit. SelectControllerAction issues the second
-      // out-of-MCTS raw-prior call per root (dune_search_session.cc:679).
-      std::mt19937 step_rng(cfg.seed);
-      double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-      ControllerDecision decision =
-          session.SelectControllerAction(*state, sr, r_val);
-      benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
-      DuneSearchResult committed = session.CommitAction(decision);
-      oc.selected_action = committed.diagnostics.selected_action;
-      oc.root_wall_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - root_t0).count();
-      oc.populated = true;
-
-      outcomes[idx] = std::move(oc);
     }
   };
 
@@ -2283,18 +2578,32 @@ int RunCorpusRootBenchmark(
         o["total_root_visits"] = static_cast<int64_t>(oc.total_root_visits);
         o["simulations_completed"] =
             static_cast<int64_t>(oc.simulations_completed);
-        // Latency payload. root_wall_ms is end-to-end for the root and is the
-        // quantity the registered latency bound is stated against;
-        // elapsed_time_ms is the search's own internal figure, kept for
-        // continuity with the existing exclusion list.
         o["root_wall_ms"] = oc.root_wall_ms;
         o["elapsed_time_ms"] = oc.elapsed_time_ms;
+        o["time_nn_inference_ms"] = oc.time_nn_inference_ms;
+        o["time_tree_engine_ms"] = oc.time_tree_engine_ms;
+        o["time_sample_root_ms"] = oc.time_sample_root_ms;
+        o["time_other_overhead_ms"] = oc.time_other_overhead_ms;
+        o["num_covered_actions"] = static_cast<int64_t>(oc.num_covered_actions);
+        o["covered_prior_mass"] = oc.covered_prior_mass;
+        o["used_fallback"] = oc.used_fallback;
+        o["fallback_reason"] = oc.fallback_reason;
+        o["root_value"] = oc.root_value;
         open_spiel::json::Array acts;
         for (Action a : oc.actions) acts.push_back(static_cast<int64_t>(a));
         o["actions"] = acts;
         open_spiel::json::Array vis;
         for (int v : oc.visit_counts) vis.push_back(static_cast<int64_t>(v));
         o["visit_counts"] = vis;
+        open_spiel::json::Array qvals;
+        for (double q : oc.q_values) qvals.push_back(q);
+        o["q_values"] = qvals;
+        open_spiel::json::Array priors;
+        for (double p : oc.priors) priors.push_back(p);
+        o["priors"] = priors;
+        open_spiel::json::Array raw_priors;
+        for (double p : oc.raw_priors) raw_priors.push_back(p);
+        o["raw_priors"] = raw_priors;
         out << open_spiel::json::ToString(o, /*wrap=*/false) << "\n";
       }
       std::cout << "\nWrote per-root JSONL to " << jsonl_path << "\n";
@@ -2756,23 +3065,150 @@ int main(int argc, char* argv[]) {
 
   std::cout << "\nStarting evaluation of " << total_games << " games using " << num_threads << " threads...\n\n";
 
+  const bool record_market_diagnostics = absl::GetFlag(FLAGS_record_market_diagnostics);
+  std::string output_dir = absl::GetFlag(FLAGS_output_dir);
+  if (!output_dir.empty()) {
+    std::filesystem::create_directories(output_dir);
+    if (absl::GetFlag(FLAGS_game_jsonl_path).empty()) {
+      absl::SetFlag(&FLAGS_game_jsonl_path, output_dir + "/games.jsonl");
+    }
+    if (absl::GetFlag(FLAGS_aggregate_json_path).empty()) {
+      absl::SetFlag(&FLAGS_aggregate_json_path, output_dir + "/aggregate.json");
+    }
+    if (absl::GetFlag(FLAGS_record_candidate_decision_traces) &&
+        absl::GetFlag(FLAGS_candidate_decision_traces_path).empty()) {
+      absl::SetFlag(&FLAGS_candidate_decision_traces_path, output_dir + "/candidate_decision_traces.jsonl");
+    }
+    if (record_market_diagnostics) {
+      if (absl::GetFlag(FLAGS_market_diag_json_path).empty()) {
+        absl::SetFlag(&FLAGS_market_diag_json_path, output_dir + "/market_diagnostics.json");
+      }
+      if (absl::GetFlag(FLAGS_market_diag_csv_path).empty()) {
+        absl::SetFlag(&FLAGS_market_diag_csv_path, output_dir + "/market_diagnostics.csv");
+      }
+      if (absl::GetFlag(FLAGS_market_diag_games_path).empty()) {
+        absl::SetFlag(&FLAGS_market_diag_games_path, output_dir + "/market_diagnostics_games.jsonl");
+      }
+    }
+  }
+
+  std::vector<open_spiel::dune_market_diag::CompactPerGameMarketDiagnostics> market_results;
+  if (record_market_diagnostics) {
+    market_results.resize(total_games);
+  }
+
   std::atomic<int> next_game_id{0};
   std::atomic<int> completed_games{0};
   std::mutex log_mutex;
   std::mutex stats_mutex;
   open_spiel::GameStats global_stats;
 
+  open_spiel::dune_market_diag::CompactPerGameMarketDiagnostics* market_results_data =
+      record_market_diagnostics ? market_results.data() : nullptr;
+  std::vector<open_spiel::dune_market_diag::CompactPerGameMarketDiagnostics>* market_results_ptr =
+      record_market_diagnostics ? &market_results : nullptr;
+
+  const std::string full_game_eval_mode = absl::GetFlag(FLAGS_evaluator_mode);
+  if (full_game_eval_mode != "direct" && full_game_eval_mode != "batched") {
+    std::cerr << "Error: --evaluator_mode must be 'direct' or 'batched' (got '"
+              << full_game_eval_mode << "')\n";
+    return 1;
+  }
+  const bool batched_mode = (full_game_eval_mode == "batched");
+
+  std::shared_ptr<open_spiel::BatchedEvaluator> search_coord = nullptr;
+  std::shared_ptr<open_spiel::BatchedEvaluator> opp_coord = nullptr;
+  std::shared_mutex search_coord_mutex;
+  std::shared_mutex opp_coord_mutex;
+
+  if (batched_mode) {
+    int batch_target = absl::GetFlag(FLAGS_batch_target_rows);
+    if (batch_target <= 0) batch_target = 16;
+    int timeout_ms = absl::GetFlag(FLAGS_batch_max_queue_wait_ms);
+    if (timeout_ms <= 0) timeout_ms = 2;
+
+    std::cout << "[Full Game] Initializing shared batched coordinators:\n"
+              << "  target_batch_size: " << batch_target << "\n"
+              << "  timeout_ms:        " << timeout_ms << " ms\n"
+              << "  rollout_amp:       true (BF16)\n"
+              << "  allow_tf32:        false\n";
+
+    search_coord = std::make_shared<open_spiel::BatchedEvaluator>(
+        search_model, batch_target, timeout_ms, device, &search_coord_mutex,
+        static_cast<float>(absl::GetFlag(FLAGS_candidate_logit_cap)),
+        /*device_synchronize=*/true, /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+        /*rollout_amp=*/true, /*allow_tf32=*/false);
+    search_coord->EnableBatcherTelemetry();
+
+    if (opponent_model != nullptr) {
+      opp_coord = std::make_shared<open_spiel::BatchedEvaluator>(
+          opponent_model, batch_target, timeout_ms, device, &opp_coord_mutex,
+          static_cast<float>(absl::GetFlag(FLAGS_opponent_logit_cap)),
+          /*device_synchronize=*/true, /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+          /*rollout_amp=*/true, /*allow_tf32=*/false);
+      opp_coord->EnableBatcherTelemetry();
+    }
+  }
+
   std::vector<std::thread> worker_threads;
   worker_threads.reserve(num_threads);
   for (int t = 0; t < num_threads; ++t) {
-    worker_threads.emplace_back(
-        open_spiel::WorkerThread, t, game, search_model, search_value_model, opponent_model,
-        std::ref(next_game_id), total_games, std::ref(completed_games),
-        std::ref(log_mutex), std::ref(global_stats), std::ref(stats_mutex));
+    worker_threads.emplace_back([&, t]() {
+      open_spiel::WorkerThread(
+          t, game, search_model, search_value_model, opponent_model,
+          next_game_id, total_games, completed_games,
+          log_mutex, global_stats, stats_mutex,
+          record_market_diagnostics, market_results_ptr,
+          search_coord, opp_coord);
+    });
   }
 
   for (auto& th : worker_threads) {
     if (th.joinable()) th.join();
+  }
+
+  if (batched_mode) {
+    if (search_coord != nullptr) {
+      auto s = search_coord->GetStats();
+      std::cout << "\nCandidate Shared Batcher Telemetry:\n"
+                << "  Total Requests:   " << s.requests << "\n"
+                << "  Physical Batches: " << s.batches << "\n"
+                << "  Avg Batch Size:   " << std::fixed << std::setprecision(2) << s.avg_batch_size << "\n"
+                << "  Max Batch Size:   " << s.max_batch_size << "\n";
+    }
+    if (opp_coord != nullptr) {
+      auto s = opp_coord->GetStats();
+      std::cout << "\nOpponent Shared Batcher Telemetry:\n"
+                << "  Total Requests:   " << s.requests << "\n"
+                << "  Physical Batches: " << s.batches << "\n"
+                << "  Avg Batch Size:   " << std::fixed << std::setprecision(2) << s.avg_batch_size << "\n"
+                << "  Max Batch Size:   " << s.max_batch_size << "\n";
+    }
+  }
+
+  if (record_market_diagnostics) {
+    auto report = open_spiel::dune_market_diag::MarketDiagnosticsReport::AggregateReport(market_results, total_games);
+    std::string diag_json = absl::GetFlag(FLAGS_market_diag_json_path);
+    if (!diag_json.empty()) {
+      if (!report.WriteJson(diag_json)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics JSON to " + diag_json);
+      }
+      std::cout << "Market diagnostics JSON written to " << diag_json << "\n";
+    }
+    std::string diag_csv = absl::GetFlag(FLAGS_market_diag_csv_path);
+    if (!diag_csv.empty()) {
+      if (!report.WriteCsv(diag_csv)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics CSV to " + diag_csv);
+      }
+      std::cout << "Market diagnostics CSV written to " << diag_csv << "\n";
+    }
+    std::string diag_games = absl::GetFlag(FLAGS_market_diag_games_path);
+    if (!diag_games.empty()) {
+      if (!open_spiel::dune_market_diag::WritePerGameJsonl(diag_games, market_results)) {
+        open_spiel::SpielFatalError("Failed writing market diagnostics games JSONL to " + diag_games);
+      }
+      std::cout << "Market diagnostics games JSONL written to " << diag_games << "\n";
+    }
   }
 
   // Print summary results
@@ -2944,6 +3380,29 @@ int main(int argc, char* argv[]) {
         absl::GetFlag(FLAGS_pi_continuation_simulations));
     agg_obj["pi_short_window_simulations"] = static_cast<int64_t>(
         absl::GetFlag(FLAGS_pi_short_window_simulations));
+    agg_obj["evaluator_mode"] = full_game_eval_mode;
+    if (batched_mode) {
+      agg_obj["batch_target_rows"] = static_cast<int64_t>(absl::GetFlag(FLAGS_batch_target_rows));
+      agg_obj["batch_max_queue_wait_ms"] = static_cast<int64_t>(absl::GetFlag(FLAGS_batch_max_queue_wait_ms));
+      if (search_coord != nullptr) {
+        auto s = search_coord->GetStats();
+        open_spiel::json::Object cs;
+        cs["requests"] = static_cast<int64_t>(s.requests);
+        cs["batches"] = static_cast<int64_t>(s.batches);
+        cs["avg_batch_size"] = s.avg_batch_size;
+        cs["max_batch_size"] = static_cast<int64_t>(s.max_batch_size);
+        agg_obj["candidate_batcher_stats"] = cs;
+      }
+      if (opp_coord != nullptr) {
+        auto s = opp_coord->GetStats();
+        open_spiel::json::Object os;
+        os["requests"] = static_cast<int64_t>(s.requests);
+        os["batches"] = static_cast<int64_t>(s.batches);
+        os["avg_batch_size"] = s.avg_batch_size;
+        os["max_batch_size"] = static_cast<int64_t>(s.max_batch_size);
+        agg_obj["opponent_batcher_stats"] = os;
+      }
+    }
     agg_obj["utility_divisor"] = absl::GetFlag(FLAGS_utility_divisor);
     agg_obj["elapsed_wall_time_s"] = total_wall_time;
     agg_obj["games_per_hour"] = total_games * 3600.0 / total_wall_time;

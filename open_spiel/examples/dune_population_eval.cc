@@ -196,6 +196,7 @@ struct GameResult {
   // engine on 212 of 1,600 seat values -- the defect that became the PWO-5
   // gate-3 STOP. Every seat here goes through the engine.
   std::array<int, kNumPlayers> final_scored_vp_all{};
+  std::array<int, kNumPlayers> player_leaders{};
   // Exactly representable only as a rational with denominator 3, so it is
   // carried as a double and SERIALIZED AT ROUND-TRIP PRECISION (%.17g). It is
   // never routed through open_spiel's JSON writer, which emits doubles as %f
@@ -945,6 +946,7 @@ void WorkerThread(
       long long opponent_sum = 0;
       for (int p = 0; p < kNumPlayers; ++p) {
         gr.final_scored_vp_all[p] = dune_state->FinalScoredVp(p);
+        gr.player_leaders[p] = dune_state->PlayerLeader(p);
         if (p != model_player) opponent_sum += gr.final_scored_vp_all[p];
       }
       // The mean of the THREE opponents, not the best of them.
@@ -954,6 +956,7 @@ void WorkerThread(
       gr.vp_margin_valid = true;
     } else {
       gr.final_scored_vp_all.fill(-1);
+      gr.player_leaders.fill(-1);
       gr.vp_margin = 0.0;
       gr.vp_margin_valid = false;
     }
@@ -1467,6 +1470,9 @@ void RunEvaluation() {
                 // --- WO-1 Phase 3: pace/tempo (new keys only; every key above
                 // is byte-identical to the pre-WO-1 emission) ---
                 << ",\"candidate_seat\":" << gr.seat
+                << ",\"candidate_leader\":"
+                << (gr.seat >= 0 && gr.seat < kNumPlayers ? gr.player_leaders[gr.seat] : -1)
+                << ",\"leaders\":" << JsonIntArray(gr.player_leaders)
                 << ",\"vp_end_by_round\":"
                 << JsonVpByRound(gr.rounds_captured, gr.vp_end_by_round)
                 << ",\"first_round_vp_ge_11\":"

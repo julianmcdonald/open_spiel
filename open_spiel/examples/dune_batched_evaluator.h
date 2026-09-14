@@ -47,6 +47,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     }
   }
 
+  std::vector<float> GetConsumedObservation(const State& state, Player player) const {
+    return ModelObservation(state, player);
+  }
+
   std::vector<double> Evaluate(const State& state) override {
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);
@@ -64,7 +68,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return values;
   }
 
-  ActionsAndProbs Prior(const State& state) override {
+  open_spiel::CompactEvalResult PriorWithDetails(const State& state) {
     if (state.IsTerminal()) {
       return {};
     }
@@ -83,9 +87,11 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       const std::string schema = batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
       dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
     }
-    open_spiel::CompactEvalResult result =
-        batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
+    return batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
+  }
 
+  ActionsAndProbs Prior(const State& state) override {
+    open_spiel::CompactEvalResult result = PriorWithDetails(state);
     ActionsAndProbs policy;
     policy.reserve(result.actions.size());
     for (size_t i = 0; i < result.actions.size(); ++i) {

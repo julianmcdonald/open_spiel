@@ -195,6 +195,29 @@ const DuneSearchResult& DunePUCTISMCTSBot::GetLastSearchResult() const {
   return last_search_result_;
 }
 
+Action DunePUCTISMCTSBot::GetRootRawPriorArgmax() const {
+  if (root_node_ != nullptr && !root_node_->child_info.empty()) {
+    Action best_action = kInvalidAction;
+    double max_prior = -1.0;
+    for (const auto& kv : root_node_->child_info) {
+      if (kv.second.raw_prior > max_prior) {
+        max_prior = kv.second.raw_prior;
+        best_action = kv.first;
+      }
+    }
+    if (best_action != kInvalidAction) return best_action;
+  }
+  Action best_action = kInvalidAction;
+  double max_prob = -1.0;
+  for (const auto& ap : last_search_result_.policy) {
+    if (ap.second > max_prob) {
+      max_prob = ap.second;
+      best_action = ap.first;
+    }
+  }
+  return best_action;
+}
+
 std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state) const {
   std::string obs = config_.use_observation_string ? state.ObservationString() : state.InformationStateString();
   std::vector<Action> actions = state.LegalActions();
@@ -277,7 +300,10 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
     return;
   }
   Player cur_player = state.CurrentPlayer();
+  auto t_inf_start = std::chrono::steady_clock::now();
   auto eval_res = evaluators_[cur_player]->PriorAndEvaluate(state);
+  auto t_inf_end = std::chrono::steady_clock::now();
+  accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
   inference_count_this_search_++;
   RecordSampledLeaf(state);
 
@@ -349,7 +375,10 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
       if (p == cur_player) {
         node->cached_values[p] = eval_res.second[p];
       } else {
+        auto t_inf_start = std::chrono::steady_clock::now();
         node->cached_values[p] = evaluators_[p]->Evaluate(state)[p];
+        auto t_inf_end = std::chrono::steady_clock::now();
+        accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
         inference_count_this_search_++;
       }
     }
@@ -386,11 +415,17 @@ void DunePUCTISMCTSBot::RecordSampledLeaf(const State& state) {
 std::vector<double> DunePUCTISMCTSBot::EvaluateCappedLeaf(
     const State& state, int depth, int decision_depth) {
   Player cur_player = state.CurrentPlayer();
+  auto t_inf_start = std::chrono::steady_clock::now();
   std::vector<double> values = evaluators_[cur_player]->Evaluate(state);
+  auto t_inf_end = std::chrono::steady_clock::now();
+  accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
   inference_count_this_search_++;
   for (int player = 0; player < state.NumPlayers(); ++player) {
     if (evaluators_[player] != evaluators_[cur_player]) {
+      auto t_inf_p_start = std::chrono::steady_clock::now();
       values[player] = evaluators_[player]->Evaluate(state)[player];
+      auto t_inf_p_end = std::chrono::steady_clock::now();
+      accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_p_end - t_inf_p_start).count();
       inference_count_this_search_++;
     }
   }
@@ -592,7 +627,10 @@ std::vector<double> DunePUCTISMCTSBot::RunSimulation(
     if (iter != opponent_prior_cache_.end()) {
       prior = iter->second;
     } else {
+      auto t_inf_start = std::chrono::steady_clock::now();
       prior = evaluators_[cur_player]->Prior(*state);
+      auto t_inf_end = std::chrono::steady_clock::now();
+      accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
       inference_count_this_search_++;
       opponent_prior_cache_[key] = prior;
     }
@@ -819,6 +857,10 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   int actual_max_sims = (max_sims >= 0) ? max_sims : config_.max_simulations;
   double actual_max_time_ms = (max_time_ms >= 0.0) ? max_time_ms : config_.relative_time_budget_ms;
 
+  accumulated_inference_time_ms_ = 0.0;
+  accumulated_sample_root_ms_ = 0.0;
+  accumulated_tree_engine_ms_ = 0.0;
+
   auto start_time = std::chrono::steady_clock::now();
   has_deadline_ = (actual_max_time_ms != std::numeric_limits<double>::infinity());
   if (has_deadline_) {
@@ -834,17 +876,28 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     result.simulations_completed = 0;
     result.elapsed_time_ms = 0.0;
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.time_sample_root_ms = 0.0;
+    result.diagnostics.time_nn_inference_ms = 0.0;
+    result.diagnostics.time_tree_engine_ms = 0.0;
+    result.diagnostics.time_other_overhead_ms = 0.0;
     last_search_result_ = result;
     return result;
   }
 
   if (config_.check_strategic_state && !IsStrategicState(state, state.CurrentPlayer())) {
+    auto t_inf_start = std::chrono::steady_clock::now();
     result.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    auto t_inf_end = std::chrono::steady_clock::now();
+    accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
     inference_count_this_search_++;
     result.simulations_completed = 0;
     result.elapsed_time_ms = 0.0;
     result.fallback_reason = "non_strategic_state";
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.time_sample_root_ms = 0.0;
+    result.diagnostics.time_nn_inference_ms = accumulated_inference_time_ms_;
+    result.diagnostics.time_tree_engine_ms = 0.0;
+    result.diagnostics.time_other_overhead_ms = 0.0;
     last_search_result_ = result;
     return result;
   }
@@ -861,7 +914,10 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     // action id". Degrade instead to the raw network prior on the true current
     // state (one inference, identical to the session-level policy-only
     // fallback) and set used_fallback so callers can see the search never ran.
+    auto t_inf_start = std::chrono::steady_clock::now();
     result.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    auto t_inf_end = std::chrono::steady_clock::now();
+    accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
     inference_count_this_search_++;
     result.simulations_completed = 0;
     result.elapsed_time_ms = check_elapsed_ms;
@@ -869,6 +925,10 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     result.used_fallback = true;
     result.fallback_reason = "timeout";
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.time_sample_root_ms = 0.0;
+    result.diagnostics.time_nn_inference_ms = accumulated_inference_time_ms_;
+    result.diagnostics.time_tree_engine_ms = 0.0;
+    result.diagnostics.time_other_overhead_ms = std::max(0.0, result.elapsed_time_ms - accumulated_inference_time_ms_);
     last_search_result_ = result;
     return result;
   }
@@ -1014,12 +1074,20 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
       break;
     }
 
-    auto sim_start = std::chrono::steady_clock::now();
+    auto t_sample_start = std::chrono::steady_clock::now();
     std::unique_ptr<State> sampled_root_state = SampleRootState(state, start_sim_index + sim);
+    auto t_sample_end = std::chrono::steady_clock::now();
+    accumulated_sample_root_ms_ += std::chrono::duration<double, std::milli>(t_sample_end - t_sample_start).count();
+
+    double inf_before_sim = accumulated_inference_time_ms_;
+    auto t_sim_start = std::chrono::steady_clock::now();
     std::vector<double> returns =
         RunSimulation(sampled_root_state.get(), 0, 0,
                       start_sim_index + sim);
-    auto sim_end = std::chrono::steady_clock::now();
+    auto t_sim_end = std::chrono::steady_clock::now();
+    double sim_wall_ms = std::chrono::duration<double, std::milli>(t_sim_end - t_sim_start).count();
+    double inf_in_sim_ms = accumulated_inference_time_ms_ - inf_before_sim;
+    accumulated_tree_engine_ms_ += std::max(0.0, sim_wall_ms - inf_in_sim_ms);
 
     if (returns.empty()) {
       result.timeout_status = true;
@@ -1027,7 +1095,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
       break;
     }
 
-    double sim_duration = std::chrono::duration<double, std::milli>(sim_end - sim_start).count();
+    double sim_duration = std::chrono::duration<double, std::milli>(t_sim_end - t_sample_start).count();
     max_sim_duration_ms = std::max(max_sim_duration_ms, sim_duration);
   }
 
@@ -1124,6 +1192,13 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   result.diagnostics.visit_counts_checkpoint = visit_counts_checkpoint;
   result.diagnostics.visit_counts_final = visit_counts_final;
   result.inference_count = inference_count_this_search_;
+
+  result.diagnostics.time_sample_root_ms = accumulated_sample_root_ms_;
+  result.diagnostics.time_nn_inference_ms = accumulated_inference_time_ms_;
+  result.diagnostics.time_tree_engine_ms = accumulated_tree_engine_ms_;
+  double explained_time = accumulated_sample_root_ms_ + accumulated_inference_time_ms_ + accumulated_tree_engine_ms_;
+  result.diagnostics.time_other_overhead_ms = std::max(0.0, result.elapsed_time_ms - explained_time);
+
   last_search_result_ = result;
   return result;
 }
@@ -1310,7 +1385,11 @@ SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int 
     diag.raw_priors.reserve(normalized_raw.size());
     for (const auto& ap : normalized_raw) diag.raw_priors.push_back(ap.second);
   } else {
+    auto t_inf_start = std::chrono::steady_clock::now();
     ActionsAndProbs raw_priors = evaluators_[state.CurrentPlayer()]->Prior(state);
+    auto t_inf_end = std::chrono::steady_clock::now();
+    accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
+    inference_count_this_search_++;
     absl::flat_hash_map<Action, double> prior_map;
     for (const auto& ap : raw_priors) {
       prior_map[ap.first] = ap.second;

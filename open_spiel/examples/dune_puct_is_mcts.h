@@ -216,6 +216,12 @@ struct SearchDiagnostics {
   // alone cannot always be replayed through a different hidden-world sample.
   std::vector<std::shared_ptr<State>> sampled_leaf_states;
 
+  // Diagnostic timing breakdown (ms)
+  double time_sample_root_ms = 0.0;
+  double time_nn_inference_ms = 0.0;
+  double time_tree_engine_ms = 0.0;
+  double time_other_overhead_ms = 0.0;
+
   // Telemetry fields
   std::string protocol_version = "v2";
   std::string session_id = "";
@@ -476,6 +482,7 @@ class DunePUCTISMCTSBot : public Bot {
   DuneSearchResult RunSearch(const State& state, int max_sims = -1, double max_time_ms = -1.0, int start_sim_index = 0);
   SearchDiagnostics GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action = kInvalidAction) const;
   const DuneSearchResult& GetLastSearchResult() const;
+  Action GetRootRawPriorArgmax() const;
 
   void Restart() override { Reset(); }
   void RestartAt(const State& state) override { Reset(); }
@@ -540,7 +547,10 @@ class DunePUCTISMCTSBot : public Bot {
   std::vector<std::shared_ptr<algorithms::Evaluator>> last_evaluators_;
 
   DuneSearchResult last_search_result_;
-  int inference_count_this_search_ = 0;
+  mutable int inference_count_this_search_ = 0;
+  mutable double accumulated_inference_time_ms_ = 0.0;
+  mutable double accumulated_sample_root_ms_ = 0.0;
+  mutable double accumulated_tree_engine_ms_ = 0.0;
   absl::flat_hash_map<std::pair<Player, std::string>, ActionsAndProbs> opponent_prior_cache_;
   absl::flat_hash_set<std::pair<Player, std::string>> visited_nodes_this_search_;
   bool in_session_ = false;
