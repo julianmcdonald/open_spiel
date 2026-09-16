@@ -9603,6 +9603,29 @@ int main() {
         2048, 8, manifest, err);
     CHECK_EQ(success, false);
     UTILS_CHECK(err.find("Configuration fingerprint mismatch") != std::string::npos);
+
+    // With permitted_transition_source_fingerprint matching stored ("conf123"):
+    CheckpointManifest trans_manifest;
+    std::string trans_err;
+    bool trans_ok = ParseAndValidateManifest(
+        manifest_file, model_file, optim_file, 42, 100, 2,
+        "new_target_config", "new_pre_precision", true, true, "label456",
+        2048, 8, trans_manifest, trans_err, /*current_legacy_config_fingerprint=*/"",
+        /*permitted_transition_source_fingerprint=*/"conf123");
+    CHECK_EQ(trans_ok, true);
+    CHECK_EQ(trans_manifest.reward_transition, true);
+    CHECK_EQ(trans_manifest.reward_transition_source_fingerprint, "conf123");
+
+    // With wrong permitted_transition_source_fingerprint ("mismatched_source"):
+    CheckpointManifest fail_manifest;
+    std::string fail_err;
+    bool fail_ok = ParseAndValidateManifest(
+        manifest_file, model_file, optim_file, 42, 100, 2,
+        "new_target_config", "new_pre_precision", true, true, "label456",
+        2048, 8, fail_manifest, fail_err, /*current_legacy_config_fingerprint=*/"",
+        /*permitted_transition_source_fingerprint=*/"wrong_source");
+    CHECK_EQ(fail_ok, false);
+    UTILS_CHECK(fail_err.find("Configuration fingerprint mismatch") != std::string::npos);
   } TEST_END();
 
   // -----------------------------------------------------------------------
@@ -9662,7 +9685,7 @@ int main() {
 
   TEST_BEGIN("Phase-timing contract lists 8 phases in order") {
     const std::string contract = PhaseTimingContract();
-    UTILS_CHECK(contract.find("\"schema\":\"phase_timing.v1\"") !=
+    UTILS_CHECK(contract.find("\"schema\":\"phase_timing.v2\"") !=
                 std::string::npos);
     CHECK_EQ(kPhaseTimingNumPhases, 8);
     const char* expected[8] = {"tensor_pack_h2d", "diag_prepass",
@@ -10432,6 +10455,190 @@ int main() {
       std::string hash2 = HashModelParams(m_train2);
       CHECK_EQ(hash1, hash2);
     }
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate compute_diagnostics gating and bit-exact parity") {
+    const int obs_size = 10;
+    const int action_dim = 4;
+    auto make_model = [&]() {
+      return std::make_shared<SharedDunePolicyValueNetImpl>(
+          obs_size, /*hidden_dim=*/32, /*action_dim=*/action_dim, /*num_blocks=*/1,
+          /*use_nonlinear=*/false);
+    };
+    auto copy_weights = [](std::shared_ptr<SharedDunePolicyValueNetImpl> src,
+                           std::shared_ptr<SharedDunePolicyValueNetImpl> dst) {
+      torch::NoGradGuard ng;
+      auto src_params = src->named_parameters();
+      auto dst_params = dst->named_parameters();
+      for (const auto& item : src_params) {
+        dst_params[item.key()].copy_(item.value());
+      }
+    };
+
+    std::vector<PpoTransition> batch;
+    for (int i = 0; i < 8; ++i) {
+      PpoTransition t;
+      t.episode_id = i;
+      t.player_id = i % 4;
+      t.action = i % action_dim;
+      t.legal_actions = {0, 1, 2, 3};
+      t.state = std::vector<float>(obs_size, 0.1f * (i + 1));
+      t.old_log_prob = -1.386f;
+      t.advantage = 0.5f;
+      t.return_value = 0.2f;
+      t.value = 0.1f;
+      batch.push_back(t);
+    }
+
+    auto m_diag = make_model();
+    auto m_prod = make_model();
+    copy_weights(m_diag, m_prod);
+    CHECK_EQ(HashModelParams(m_diag), HashModelParams(m_prod));
+
+    torch::optim::AdamW opt_diag(m_diag->parameters(), torch::optim::AdamWOptions(1e-3));
+    torch::optim::AdamW opt_prod(m_prod->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_target_kl, 100.0);
+
+    PpoUpdateStats stats_diag = TrainPpoUpdate(
+        m_diag, opt_diag, batch, obs_size, action_dim, torch::kCPU,
+        /*master=*/12345ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+        /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+        /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+        /*compute_diagnostics=*/true);
+
+    PpoUpdateStats stats_prod = TrainPpoUpdate(
+        m_prod, opt_prod, batch, obs_size, action_dim, torch::kCPU,
+        /*master=*/12345ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+        /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+        /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+        /*compute_diagnostics=*/false);
+
+    // Diagnostics differences:
+    UTILS_CHECK(!stats_diag.rollout_hash.empty());
+    CHECK_EQ(stats_prod.rollout_hash, std::string(""));
+    UTILS_CHECK(stats_diag.measured_transitions != -1);
+    CHECK_EQ(stats_prod.measured_transitions, int64_t{-1});
+    CHECK_EQ(stats_prod.policy_kl_before, 0.0);
+    CHECK_EQ(stats_prod.head_grad_norm_count, 0);
+    CHECK_EQ(stats_prod.policy_head_grad_norm_sum, 0.0);
+
+    // Training updates & statistics match:
+    CHECK_EQ(stats_diag.minibatches, stats_prod.minibatches);
+    CHECK_NEAR(stats_diag.policy_loss, stats_prod.policy_loss, 1e-6);
+    CHECK_NEAR(stats_diag.value_loss, stats_prod.value_loss, 1e-6);
+    CHECK_NEAR(stats_diag.entropy, stats_prod.entropy, 1e-6);
+    CHECK_NEAR(stats_diag.grad_norm_sum, stats_prod.grad_norm_sum, 1e-6);
+    CHECK_EQ(HashModelParams(m_diag), HashModelParams(m_prod));
+
+    // Verify bit-exact optimizer state parity (step, exp_avg, exp_avg_sq):
+    auto params_diag = m_diag->parameters();
+    auto params_prod = m_prod->parameters();
+    CHECK_EQ(params_diag.size(), params_prod.size());
+    for (size_t i = 0; i < params_diag.size(); ++i) {
+      auto* st_diag = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_diag.state()[params_diag[i].unsafeGetTensorImpl()].get());
+      auto* st_prod = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_prod.state()[params_prod[i].unsafeGetTensorImpl()].get());
+      UTILS_CHECK(st_diag != nullptr);
+      UTILS_CHECK(st_prod != nullptr);
+      CHECK_EQ(st_diag->step(), st_prod->step());
+      UTILS_CHECK(torch::equal(st_diag->exp_avg(), st_prod->exp_avg()));
+      UTILS_CHECK(torch::equal(st_diag->exp_avg_sq(), st_prod->exp_avg_sq()));
+    }
+
+    // Also verify separate actor critic:
+    auto actor1 = make_model();
+    auto actor2 = make_model();
+    auto critic1 = make_model();
+    auto critic2 = make_model();
+    copy_weights(actor1, actor2);
+    copy_weights(critic1, critic2);
+
+    torch::optim::AdamW opt_a1(actor1->parameters(), torch::optim::AdamWOptions(1e-3));
+    torch::optim::AdamW opt_a2(actor2->parameters(), torch::optim::AdamWOptions(1e-3));
+    torch::optim::AdamW opt_c1(critic1->parameters(), torch::optim::AdamWOptions(1e-3));
+    torch::optim::AdamW opt_c2(critic2->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    PpoUpdateStats sep_diag = TrainPpoUpdateSeparate(
+        actor1, opt_a1, critic1, opt_c1, batch, obs_size, action_dim, torch::kCPU,
+        12345ULL, 1, /*compute_diagnostics=*/true);
+    PpoUpdateStats sep_prod = TrainPpoUpdateSeparate(
+        actor2, opt_a2, critic2, opt_c2, batch, obs_size, action_dim, torch::kCPU,
+        12345ULL, 1, /*compute_diagnostics=*/false);
+
+    UTILS_CHECK(!sep_diag.rollout_hash.empty());
+    CHECK_EQ(sep_prod.rollout_hash, std::string(""));
+    CHECK_EQ(sep_prod.measured_transitions, int64_t{-1});
+    CHECK_EQ(sep_prod.head_grad_norm_count, 0);
+    CHECK_EQ(HashModelParams(actor1), HashModelParams(actor2));
+    CHECK_EQ(HashModelParams(critic1), HashModelParams(critic2));
+
+    auto params_a1 = actor1->parameters();
+    auto params_a2 = actor2->parameters();
+    for (size_t i = 0; i < params_a1.size(); ++i) {
+      auto* st1 = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_a1.state()[params_a1[i].unsafeGetTensorImpl()].get());
+      auto* st2 = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_a2.state()[params_a2[i].unsafeGetTensorImpl()].get());
+      if (st1 == nullptr) {
+        UTILS_CHECK(st2 == nullptr);
+      } else {
+        UTILS_CHECK(st2 != nullptr);
+        CHECK_EQ(st1->step(), st2->step());
+        UTILS_CHECK(torch::equal(st1->exp_avg(), st2->exp_avg()));
+        UTILS_CHECK(torch::equal(st1->exp_avg_sq(), st2->exp_avg_sq()));
+      }
+    }
+    auto params_c1 = critic1->parameters();
+    auto params_c2 = critic2->parameters();
+    for (size_t i = 0; i < params_c1.size(); ++i) {
+      auto* st1 = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_c1.state()[params_c1[i].unsafeGetTensorImpl()].get());
+      auto* st2 = dynamic_cast<torch::optim::AdamWParamState*>(
+          opt_c2.state()[params_c2[i].unsafeGetTensorImpl()].get());
+      if (st1 == nullptr) {
+        UTILS_CHECK(st2 == nullptr);
+      } else {
+        UTILS_CHECK(st2 != nullptr);
+        CHECK_EQ(st1->step(), st2->step());
+        UTILS_CHECK(torch::equal(st1->exp_avg(), st2->exp_avg()));
+        UTILS_CHECK(torch::equal(st1->exp_avg_sq(), st2->exp_avg_sq()));
+      }
+    }
+  } TEST_END();
+
+  TEST_BEGIN("WritePhaseTimingToPath direct writing and independent route") {
+    const std::string test_dir = "/tmp/test_phase_timing_direct_" + std::to_string(std::rand());
+    std::filesystem::create_directories(test_dir);
+    const std::string direct_sidecar = test_dir + "/my_timing.jsonl";
+
+    PpoUpdateStats stats;
+    stats.phase_timings.enabled = true;
+    stats.phase_timings.cuda = false;
+    stats.phase_timings.bracket_count = 5;
+    stats.phase_timings.rollout_hash_host_s = 0.123;
+    stats.phase_timings.total_host_attributed_s = 1.456;
+    stats.minibatches = 4;
+
+    WritePhaseTimingToPath(direct_sidecar, 42, stats, 2.0, "run-direct-uuid", "pfx");
+
+    std::ifstream in(direct_sidecar);
+    UTILS_CHECK(in.good());
+    std::string header_line, update_line;
+    UTILS_CHECK(static_cast<bool>(std::getline(in, header_line)));
+    UTILS_CHECK(static_cast<bool>(std::getline(in, update_line)));
+    UTILS_CHECK(header_line.find("\"record\":\"header\"") != std::string::npos);
+    UTILS_CHECK(update_line.find("\"record\":\"update\"") != std::string::npos);
+    UTILS_CHECK(update_line.find("\"update\":42") != std::string::npos);
+    UTILS_CHECK(update_line.find("\"rollout_hash_host_s\":") != std::string::npos);
+    UTILS_CHECK(update_line.find("\"minibatches\":4") != std::string::npos);
+
+    std::filesystem::remove_all(test_dir);
   } TEST_END();
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

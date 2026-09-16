@@ -1,18 +1,23 @@
 #ifndef OPEN_SPIEL_EXAMPLES_DUNE_SHA256_H_
 #define OPEN_SPIEL_EXAMPLES_DUNE_SHA256_H_
 
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
+#include <openssl/evp.h>
+
 #include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace open_spiel {
 
-class SHA256 {
+// Legacy scalar SHA-256 implementation retained as a bit-exact verification
+// reference and testing comparator.
+class ScalarSHA256 {
  public:
-  SHA256() { Reset(); }
+  ScalarSHA256() { Reset(); }
 
   void Reset() {
     state_[0] = 0x6a09e667;
@@ -38,28 +43,28 @@ class SHA256 {
     }
   }
 
+  void Update(const void* data, size_t len) {
+    Update(reinterpret_cast<const uint8_t*>(data), len);
+  }
+
   void Update(const std::string& str) {
     Update(reinterpret_cast<const uint8_t*>(str.data()), str.size());
   }
 
   std::string Final() {
     uint64_t bits = bit_count_;
-    // Pad with 0x80
     uint8_t pad = 0x80;
     Update(&pad, 1);
-    // Pad with 0x00 until we have 8 bytes remaining (56 bytes processed in block)
     while (buffer_len_ != 56) {
       uint8_t zero = 0x00;
       Update(&zero, 1);
     }
-    // Append bit count in big-endian
     uint8_t bits_be[8];
     for (int i = 0; i < 8; ++i) {
       bits_be[i] = static_cast<uint8_t>(bits >> (56 - i * 8));
     }
     Update(bits_be, 8);
 
-    // Format hex string
     std::ostringstream oss;
     for (int i = 0; i < 8; ++i) {
       oss << std::hex << std::setw(8) << std::setfill('0') << state_[i];
@@ -103,14 +108,8 @@ class SHA256 {
       w[i] = sigma1(w[i - 2]) + w[i - 7] + sigma0(w[i - 15]) + w[i - 16];
     }
 
-    uint32_t a = state[0];
-    uint32_t b = state[1];
-    uint32_t c = state[2];
-    uint32_t d = state[3];
-    uint32_t e = state[4];
-    uint32_t f = state[5];
-    uint32_t g = state[6];
-    uint32_t h = state[7];
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
 
     static const uint32_t K[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -126,30 +125,133 @@ class SHA256 {
     for (int i = 0; i < 64; ++i) {
       uint32_t t1 = h + Sigma1(e) + Ch(e, f, g) + K[i] + w[i];
       uint32_t t2 = Sigma0(a) + Maj(a, b, c);
-      h = g;
-      g = f;
-      f = e;
-      e = d + t1;
-      d = c;
-      c = b;
-      b = a;
-      a = t1 + t2;
+      h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
 
-    state[0] += a;
-    state[1] += b;
-    state[2] += c;
-    state[3] += d;
-    state[4] += e;
-    state[5] += f;
-    state[6] += g;
-    state[7] += h;
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
   }
 
   uint32_t state_[8];
   uint64_t bit_count_;
   uint8_t buffer_[64];
   size_t buffer_len_;
+};
+
+// High-performance OpenSSL EVP incremental SHA-256 hasher.
+// Automatically leverages platform-specific hardware acceleration (e.g. SHA-NI, AVX-512)
+// via OpenSSL's audited cryptographic runtime.
+class SHA256 {
+ public:
+  SHA256() : ctx_(EVP_MD_CTX_new()) {
+    if (!ctx_) {
+      throw std::runtime_error("EVP_MD_CTX_new failed");
+    }
+    Reset();
+  }
+
+  ~SHA256() {
+    if (ctx_) {
+      EVP_MD_CTX_free(ctx_);
+      ctx_ = nullptr;
+    }
+  }
+
+  SHA256(const SHA256& other) : ctx_(EVP_MD_CTX_new()) {
+    if (!ctx_) {
+      throw std::runtime_error("EVP_MD_CTX_new failed in copy constructor");
+    }
+    if (other.ctx_) {
+      if (EVP_MD_CTX_copy_ex(ctx_, other.ctx_) != 1) {
+        throw std::runtime_error("EVP_MD_CTX_copy_ex failed in copy constructor");
+      }
+    }
+  }
+
+  SHA256& operator=(const SHA256& other) {
+    if (this != &other) {
+      if (!ctx_) {
+        ctx_ = EVP_MD_CTX_new();
+        if (!ctx_) {
+          throw std::runtime_error("EVP_MD_CTX_new failed in copy assignment");
+        }
+      }
+      if (other.ctx_) {
+        if (EVP_MD_CTX_copy_ex(ctx_, other.ctx_) != 1) {
+          throw std::runtime_error("EVP_MD_CTX_copy_ex failed in copy assignment");
+        }
+      } else {
+        Reset();
+      }
+    }
+    return *this;
+  }
+
+  SHA256(SHA256&& other) noexcept : ctx_(other.ctx_) {
+    other.ctx_ = nullptr;
+  }
+
+  SHA256& operator=(SHA256&& other) noexcept {
+    if (this != &other) {
+      if (ctx_) {
+        EVP_MD_CTX_free(ctx_);
+      }
+      ctx_ = other.ctx_;
+      other.ctx_ = nullptr;
+    }
+    return *this;
+  }
+
+  void Reset() {
+    if (!ctx_) {
+      ctx_ = EVP_MD_CTX_new();
+      if (!ctx_) {
+        throw std::runtime_error("EVP_MD_CTX_new failed in Reset");
+      }
+    }
+    if (EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) != 1) {
+      throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
+  }
+
+  void Update(const void* data, size_t len) {
+    if (len == 0) return;
+    if (!ctx_) {
+      throw std::runtime_error("SHA256::Update called on uninitialized context");
+    }
+    if (EVP_DigestUpdate(ctx_, data, len) != 1) {
+      throw std::runtime_error("EVP_DigestUpdate failed");
+    }
+  }
+
+  void Update(const uint8_t* data, size_t len) {
+    Update(static_cast<const void*>(data), len);
+  }
+
+  void Update(const std::string& str) {
+    Update(str.data(), str.size());
+  }
+
+  std::string Final() {
+    if (!ctx_) {
+      throw std::runtime_error("SHA256::Final called on uninitialized context");
+    }
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    if (EVP_DigestFinal_ex(ctx_, md, &md_len) != 1) {
+      throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+    std::ostringstream oss;
+    for (unsigned int i = 0; i < md_len; ++i) {
+      oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(md[i]);
+    }
+    // Existing Final() contract: resets state after finalization.
+    Reset();
+    return oss.str();
+  }
+
+ private:
+  EVP_MD_CTX* ctx_;
 };
 
 inline std::string ComputeFileSHA256(const std::string& filepath, size_t* file_size_out = nullptr) {
@@ -162,12 +264,12 @@ inline std::string ComputeFileSHA256(const std::string& filepath, size_t* file_s
   size_t total_size = 0;
   while (ifs.read(chunk, sizeof(chunk))) {
     size_t count = ifs.gcount();
-    hasher.Update(reinterpret_cast<const uint8_t*>(chunk), count);
+    hasher.Update(chunk, count);
     total_size += count;
   }
   size_t remainder = ifs.gcount();
   if (remainder > 0) {
-    hasher.Update(reinterpret_cast<const uint8_t*>(chunk), remainder);
+    hasher.Update(chunk, remainder);
     total_size += remainder;
   }
   if (file_size_out) {

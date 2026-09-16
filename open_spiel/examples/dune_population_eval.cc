@@ -236,6 +236,16 @@ struct GameResult {
   std::string terminal_reason = "other";
   // Applied ConvertSpecimenToTroop actions per seat over the whole game.
   std::array<int, kNumPlayers> specimen_conversions{};
+  // Round 7 penalty telemetry per seat
+  std::array<bool, kNumPlayers> atomics_used{};
+  std::array<int, kNumPlayers> atomics_in_reveal{-1, -1, -1, -1};
+  std::array<int, kNumPlayers> atomics_persuasion{-1, -1, -1, -1};
+  std::array<int, kNumPlayers> atomics_round{-1, -1, -1, -1};
+  std::array<int, kNumPlayers> plot_plays{};
+  std::array<std::vector<int>, kNumPlayers> plot_pre_hand_sizes{};
+  std::array<int, kNumPlayers> research_col{};
+  std::array<int, kNumPlayers> research_row{};
+  std::array<std::vector<std::pair<int, int>>, kNumPlayers> research_paths{};
 };
 
 // ---------------------------------------------------------------------------
@@ -300,6 +310,43 @@ std::string JsonIntVector(const std::vector<int>& v) {
     s += std::to_string(v[i]);
   }
   return s + "]";
+}
+std::string JsonBoolArray(const std::array<bool, kNumPlayers>& v) {
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += (v[p] ? "true" : "false");
+  }
+  return s + "]";
+}
+std::string JsonNestedIntVector(const std::array<std::vector<int>, kNumPlayers>& v) {
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += "[";
+    for (size_t i = 0; i < v[p].size(); ++i) {
+      if (i) s += ",";
+      s += std::to_string(v[p][i]);
+    }
+    s += "]";
+  }
+  return s + "]";
+}
+std::string JsonResearchPaths(
+    const std::array<std::vector<std::pair<int, int>>, kNumPlayers>& v) {
+  std::string s = "[";
+  for (int p = 0; p < kNumPlayers; ++p) {
+    if (p) s += ",";
+    s += "[";
+    for (size_t i = 0; i < v[p].size(); ++i) {
+      if (i) s += ",";
+      s += "[" + std::to_string(v[p][i].first) + "," +
+           std::to_string(v[p][i].second) + "]";
+    }
+    s += "]";
+  }
+  s += "]";
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +790,18 @@ void WorkerThread(
     std::array<std::array<int, kNumPlayers>, kMaxRounds + 2> vp_at_round_end{};
     std::array<bool, kMaxRounds + 2> round_end_seen{};
     std::array<int, kNumPlayers> specimen_conversions{};
+    std::array<bool, kNumPlayers> atomics_used{};
+    std::array<int, kNumPlayers> atomics_in_reveal{-1, -1, -1, -1};
+    std::array<int, kNumPlayers> atomics_persuasion{-1, -1, -1, -1};
+    std::array<int, kNumPlayers> atomics_round{-1, -1, -1, -1};
+    std::array<int, kNumPlayers> plot_plays{};
+    std::array<std::vector<int>, kNumPlayers> plot_pre_hand_sizes{};
+    std::array<std::vector<std::pair<int, int>>, kNumPlayers> game_research_paths{};
+    for (int p = 0; p < kNumPlayers; ++p) {
+      int c = dune_state ? dune_state->GetResearchBottomColForTesting(p) : 0;
+      int r = dune_state ? dune_state->GetResearchBottomRowForTesting(p) : 0;
+      game_research_paths[p].push_back({c, r});
+    }
     int last_round = dune_state ? dune_state->GetCurrentRound() : -1;
     auto snapshot_round_ends = [&]() {
       if (!dune_state) return;
@@ -880,10 +939,32 @@ void WorkerThread(
           current_player >= 0 && current_player < kNumPlayers) {
         ++specimen_conversions[current_player];
       }
+      if (chosen_action == dune_imperium::kActionFamilyAtomics &&
+          current_player >= 0 && current_player < kNumPlayers && dune_state != nullptr) {
+        atomics_used[current_player] = true;
+        atomics_round[current_player] = dune_state->GetCurrentRound();
+        atomics_in_reveal[current_player] = dune_state->IsPlayerInRevealTurn(current_player) ? 1 : 0;
+        atomics_persuasion[current_player] = dune_state->PlayerPersuasion(current_player);
+      }
+      if (chosen_action >= 1600 && chosen_action <= 1699 &&
+          current_player >= 0 && current_player < kNumPlayers && dune_state != nullptr) {
+        ++plot_plays[current_player];
+        plot_pre_hand_sizes[current_player].push_back(dune_state->GetIntrigueHandForTesting(current_player).size());
+      }
       if (record_market_diagnostics && dune_state != nullptr) {
         market_tracker.BeforeApplyAction(*dune_state, current_player, model_player, chosen_action);
       }
       state->ApplyAction(chosen_action);
+      if (dune_state != nullptr) {
+        for (int p = 0; p < kNumPlayers; ++p) {
+          int cur_c = dune_state->GetResearchBottomColForTesting(p);
+          int cur_r = dune_state->GetResearchBottomRowForTesting(p);
+          if (cur_c != game_research_paths[p].back().first ||
+              cur_r != game_research_paths[p].back().second) {
+            game_research_paths[p].push_back({cur_c, cur_r});
+          }
+        }
+      }
       if (record_market_diagnostics && dune_state != nullptr) {
         market_tracker.AfterApplyAction(*dune_state, current_player, model_player, chosen_action);
       }
@@ -1015,6 +1096,19 @@ void WorkerThread(
       }
     }
     gr.specimen_conversions = specimen_conversions;
+    gr.atomics_used = atomics_used;
+    gr.atomics_in_reveal = atomics_in_reveal;
+    gr.atomics_persuasion = atomics_persuasion;
+    gr.atomics_round = atomics_round;
+    gr.plot_plays = plot_plays;
+    gr.plot_pre_hand_sizes = plot_pre_hand_sizes;
+    if (dune_state != nullptr) {
+      for (int p = 0; p < kNumPlayers; ++p) {
+        gr.research_col[p] = dune_state->GetResearchBottomColForTesting(p);
+        gr.research_row[p] = dune_state->GetResearchBottomRowForTesting(p);
+      }
+    }
+    gr.research_paths = game_research_paths;
     gr.terminal_threshold_set.clear();
     gr.candidate_in_terminal_threshold_set = false;
     gr.terminal_reason = "other";
@@ -1484,6 +1578,24 @@ void RunEvaluation() {
                 << ",\"terminal_reason\":\"" << gr.terminal_reason << "\""
                 << ",\"specimen_conversions\":"
                 << JsonIntArray(gr.specimen_conversions)
+                << ",\"atomics_used\":"
+                << JsonBoolArray(gr.atomics_used)
+                << ",\"atomics_in_reveal\":"
+                << JsonIntArrayWithNulls(gr.atomics_in_reveal)
+                << ",\"atomics_persuasion\":"
+                << JsonIntArrayWithNulls(gr.atomics_persuasion)
+                << ",\"atomics_round\":"
+                << JsonIntArrayWithNulls(gr.atomics_round)
+                << ",\"plot_plays\":"
+                << JsonIntArray(gr.plot_plays)
+                << ",\"plot_pre_hand_sizes\":"
+                << JsonNestedIntVector(gr.plot_pre_hand_sizes)
+                << ",\"research_col\":"
+                << JsonIntArray(gr.research_col)
+                << ",\"research_row\":"
+                << JsonIntArray(gr.research_row)
+                << ",\"research_paths\":"
+                << JsonResearchPaths(gr.research_paths)
                 << ",\"seed\":" << gr.chance_seed
                 << "}\n";
     }

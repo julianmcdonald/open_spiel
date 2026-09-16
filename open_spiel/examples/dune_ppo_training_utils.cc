@@ -96,22 +96,43 @@ float ApplySpecimenExchangeShaping(float reward, Action action,
   return reward - static_cast<float>(specimen_exchange_penalty) * reward_lambda;
 }
 
+float ApplyFamilyAtomicsShaping(float reward, Action action,
+                                bool is_own_reveal_turn, int remaining_persuasion,
+                                double family_atomics_penalty,
+                                float reward_lambda) {
+  if (family_atomics_penalty == 0.0) return reward;
+  if (action != dune_imperium::kActionFamilyAtomics) return reward;
+  if (is_own_reveal_turn && remaining_persuasion > 0) return reward;
+  return reward - static_cast<float>(family_atomics_penalty) * reward_lambda;
+}
+
+float ApplyPlotIntrigueShaping(float reward, Action action,
+                               int intrigue_hand_size_before_play,
+                               int exemption_threshold,
+                               double plot_intrigue_penalty,
+                               float reward_lambda) {
+  if (plot_intrigue_penalty == 0.0) return reward;
+  if (!IsPlotIntrigueAction(action)) return reward;
+  if (intrigue_hand_size_before_play >= exemption_threshold) return reward;
+  return reward - static_cast<float>(plot_intrigue_penalty) * reward_lambda;
+}
+
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch) {
-  std::string data;
+  open_spiel::SHA256 hasher;
   for (const auto& t : batch) {
-    data.append(reinterpret_cast<const char*>(&t.episode_id), sizeof(t.episode_id));
-    data.append(reinterpret_cast<const char*>(&t.player_id), sizeof(t.player_id));
-    data.append(reinterpret_cast<const char*>(&t.action), sizeof(t.action));
-    data.append(reinterpret_cast<const char*>(&t.old_log_prob), sizeof(t.old_log_prob));
-    data.append(reinterpret_cast<const char*>(&t.advantage), sizeof(t.advantage));
-    data.append(reinterpret_cast<const char*>(&t.return_value), sizeof(t.return_value));
-    data.append(reinterpret_cast<const char*>(&t.value), sizeof(t.value));
-    data.append(reinterpret_cast<const char*>(t.state.data()), t.state.size() * sizeof(float));
+    hasher.Update(&t.episode_id, sizeof(t.episode_id));
+    hasher.Update(&t.player_id, sizeof(t.player_id));
+    hasher.Update(&t.action, sizeof(t.action));
+    hasher.Update(&t.old_log_prob, sizeof(t.old_log_prob));
+    hasher.Update(&t.advantage, sizeof(t.advantage));
+    hasher.Update(&t.return_value, sizeof(t.return_value));
+    hasher.Update(&t.value, sizeof(t.value));
+    hasher.Update(t.state.data(), t.state.size() * sizeof(float));
     for (Action a : t.legal_actions) {
-      data.append(reinterpret_cast<const char*>(&a), sizeof(a));
+      hasher.Update(&a, sizeof(a));
     }
   }
-  return open_spiel::ComputeStringSHA256(data);
+  return hasher.Final();
 }
 
 std::string ComputePrePrecisionConfigFingerprint(
@@ -141,7 +162,8 @@ bool ValidatePpoPrecisionManifestCompatibility(
     const std::string& current_pre_precision_config_fingerprint,
     const std::string& current_legacy_config_fingerprint,
     bool current_rollout_amp, bool current_allow_tf32,
-    PpoPrecisionManifestCompatibility* out, std::string* error) {
+    PpoPrecisionManifestCompatibility* out, std::string* error,
+    const std::string& permitted_transition_source_fingerprint) {
   auto fail = [&](const std::string& message) {
     if (error != nullptr) *error = message;
     return false;
@@ -178,6 +200,12 @@ bool ValidatePpoPrecisionManifestCompatibility(
           out->allow_tf32 ? "true" : "false"));
     }
     if (stored_config_fingerprint != current_config_fingerprint) {
+      if (!permitted_transition_source_fingerprint.empty() &&
+          stored_config_fingerprint == permitted_transition_source_fingerprint) {
+        out->reward_transition = true;
+        out->reward_transition_source_fingerprint = stored_config_fingerprint;
+        return true;
+      }
       return fail(
           "Configuration fingerprint mismatch for precision-aware manifest.\n  Expected: " +
           stored_config_fingerprint + "\n  Got:      " +
@@ -192,6 +220,12 @@ bool ValidatePpoPrecisionManifestCompatibility(
         "default rollout_amp=true and allow_tf32=true");
   }
   out->legacy_precision_migration = true;
+  if (!permitted_transition_source_fingerprint.empty() &&
+      stored_config_fingerprint == permitted_transition_source_fingerprint) {
+    out->reward_transition = true;
+    out->reward_transition_source_fingerprint = stored_config_fingerprint;
+    return true;
+  }
   if (!current_pre_precision_config_fingerprint.empty() &&
       stored_config_fingerprint == current_pre_precision_config_fingerprint) {
     out->migration_source = "pre_precision_fingerprint";
@@ -227,7 +261,8 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               int current_num_blocks,
                               CheckpointManifest& out_manifest,
                               std::string& error_msg,
-                              const std::string& current_legacy_config_fingerprint) {
+                              const std::string& current_legacy_config_fingerprint,
+                              const std::string& permitted_transition_source_fingerprint) {
   if (!std::filesystem::exists(manifest_path)) {
     error_msg = "manifest file not found at: " + manifest_path;
     return false;
@@ -395,7 +430,8 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
           current_config_fingerprint,
           current_pre_precision_config_fingerprint,
           current_legacy_config_fingerprint, current_rollout_amp,
-          current_allow_tf32, &precision, &error_msg)) {
+          current_allow_tf32, &precision, &error_msg,
+          permitted_transition_source_fingerprint)) {
     return false;
   }
   out_manifest.precision_fields_present = precision.fields_present;
@@ -404,6 +440,9 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
   out_manifest.legacy_precision_migration =
       precision.legacy_precision_migration;
   out_manifest.precision_migration_source = precision.migration_source;
+  out_manifest.reward_transition = precision.reward_transition;
+  out_manifest.reward_transition_source_fingerprint =
+      precision.reward_transition_source_fingerprint;
   if (precision.legacy_precision_migration) {
     std::cout
         << "[precision-manifest] Accepted legacy-precision migration from "
@@ -1338,15 +1377,10 @@ PpoUpdateStats TrainPpoUpdate(
     double search_loss_coef, double abort_grad_norm_ratio,
     const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg,
     std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model,
-    double reverse_kl_coef) {
+    double reverse_kl_coef,
+    bool compute_diagnostics) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
-  stats.rollout_hash = ComputeRolloutHash(batch);
-
-  int64_t n = static_cast<int64_t>(batch.size());
-  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
-  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
-  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
 
   // WO-PERF-TIMING. Validated on EVERY path, including the default, so a typo
   // is fatal at the first update rather than silently timing nothing for a
@@ -1358,6 +1392,23 @@ PpoUpdateStats TrainPpoUpdate(
     SpielFatalError("Unknown --phase_timing_mode: '" + phase_timing_mode +
                     "' (expected 'off' or 'phases').");
   }
+
+  if (compute_diagnostics) {
+    const auto hash_start = std::chrono::steady_clock::now();
+    stats.rollout_hash = ComputeRolloutHash(batch);
+    if (phase_timing_on) {
+      stats.phase_timings.rollout_hash_host_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
+    }
+  } else {
+    stats.rollout_hash.clear();
+    stats.phase_timings.rollout_hash_host_s = 0.0;
+  }
+
+  int64_t n = static_cast<int64_t>(batch.size());
+  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
   // NOTE: the --pipeline incompatibility is enforced at startup in
   // dune_ppo_train.cc, where both flags are defined. It cannot live here --
   // FLAGS_pipeline is defined in the trainer's own TU, and six other targets
@@ -1482,87 +1533,15 @@ PpoUpdateStats TrainPpoUpdate(
   // transitions" (0). Full mode measures every update, so it stays true there.
   bool kl_measured_this_update = true;
 
-  phase_timer.Begin(kPhaseDiagPrepass);
-  if (!prepass_cadenced) {
-    double value_near_one_count = 0;
+  if (compute_diagnostics) {
+    phase_timer.Begin(kPhaseDiagPrepass);
+    if (!prepass_cadenced) {
+      double value_near_one_count = 0;
 
-    bool was_training = model->is_training();
-    model->eval();
-    {
-      torch::NoGradGuard no_grad;
-      for (int64_t start = 0; start < n; start += minibatch_size) {
-        int64_t end = std::min(start + minibatch_size, n);
-        torch::Tensor mb_states = states.narrow(0, start, end - start);
-        torch::Tensor mb_masks = masks.narrow(0, start, end - start);
-        torch::Tensor mb_actions = actions.narrow(0, start, end - start);
-        torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
-        torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
-
-        auto outputs = model->forward(mb_states);
-        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
-          std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
-          for (int64_t i = start; i < end; ++i) {
-            mb_cands[i - start] = &batch[i].candidate_data;
-          }
-          dune_semantic::ApplySemanticScorerBatch(
-              model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
-        }
-        if (!::absl::GetFlag(::FLAGS_train_value_only)) {
-          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-          torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
-          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-          torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
-
-          torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-          torch::Tensor ratio = torch::exp(log_ratio);
-          torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
-
-          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
-          if (masked_kl.numel() > 0) {
-            kl_before_sum += masked_kl.sum().item<double>();
-            kl_before_nontrivial_count += masked_kl.numel();
-          }
-        }
-
-        torch::Tensor mb_values = outputs.values.squeeze(1);
-        torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
-        value_near_one_count += mb_near_one.sum().item<double>();
-      }
-    }
-    if (was_training) {
-      model->train();
-    }
-    stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
-    stats.fraction_critic_near_1 = value_near_one_count / n;
-  } else {
-    // (1) Saturation exactly from the stored rollout-time values -- the same
-    // |v| >= 0.99f predicate the full mode applies to its replayed values,
-    // applied to PpoTransition.value (already copied into old_values_cpu).
-    int64_t stored_near_one_count = 0;
-    for (int64_t i = 0; i < n; ++i) {
-      if (std::abs(old_values_ptr[i]) >= 0.99f) ++stored_near_one_count;
-    }
-    stats.fraction_critic_near_1 = static_cast<double>(stored_near_one_count) / n;
-
-    // (2) The policy_kl_before canary, at startup/resume and on the cadence.
-    const int prepass_interval = ::absl::GetFlag(::FLAGS_diag_prepass_interval);
-    const bool first_update_for_model =
-        ConsumeFirstPrepassForModel(static_cast<const void*>(model.get()));
-    const bool measure_kl_now =
-        first_update_for_model ||
-        (prepass_interval > 0 && global_update % prepass_interval == 0);
-    kl_measured_this_update =
-        measure_kl_now && !::absl::GetFlag(::FLAGS_train_value_only);
-    if (kl_measured_this_update) {
       bool was_training = model->is_training();
       model->eval();
       {
         torch::NoGradGuard no_grad;
-        // Same autocast setup as rollout inference (dune_evaluator.h):
-        // BF16 on CUDA, disabled (plain FP32) on CPU. A NEW scope -- the
-        // PWO-5 section 7.5 cache-clearing guard, not a restructuring of the
-        // existing training autocast scopes below.
-        AutocastGuard autocast_guard(device.type(), device.is_cuda());
         for (int64_t start = 0; start < n; start += minibatch_size) {
           int64_t end = std::min(start + minibatch_size, n);
           torch::Tensor mb_states = states.narrow(0, start, end - start);
@@ -1580,52 +1559,128 @@ PpoUpdateStats TrainPpoUpdate(
             dune_semantic::ApplySemanticScorerBatch(
                 model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
           }
-          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-          torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
-          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-          torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+          if (!::absl::GetFlag(::FLAGS_train_value_only)) {
+            torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+            torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+            torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+            torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
 
-          torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-          torch::Tensor ratio = torch::exp(log_ratio);
-          torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+            torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+            torch::Tensor ratio = torch::exp(log_ratio);
+            torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
 
-          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
-          if (masked_kl.numel() > 0) {
-            kl_before_sum += masked_kl.sum().item<double>();
-            kl_before_nontrivial_count += masked_kl.numel();
+            torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+            if (masked_kl.numel() > 0) {
+              kl_before_sum += masked_kl.sum().item<double>();
+              kl_before_nontrivial_count += masked_kl.numel();
+            }
           }
+
+          torch::Tensor mb_values = outputs.values.squeeze(1);
+          torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
+          value_near_one_count += mb_near_one.sum().item<double>();
         }
       }
       if (was_training) {
         model->train();
       }
-    }
-    stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
-  }
-  phase_timer.End(kPhaseDiagPrepass);
-  stats.measured_transitions =
-      kl_measured_this_update ? kl_before_nontrivial_count : int64_t{-1};
+      stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
+      stats.fraction_critic_near_1 = value_near_one_count / n;
+    } else {
+      // (1) Saturation exactly from the stored rollout-time values -- the same
+      // |v| >= 0.99f predicate the full mode applies to its replayed values,
+      // applied to PpoTransition.value (already copied into old_values_cpu).
+      int64_t stored_near_one_count = 0;
+      for (int64_t i = 0; i < n; ++i) {
+        if (std::abs(old_values_ptr[i]) >= 0.99f) ++stored_near_one_count;
+      }
+      stats.fraction_critic_near_1 = static_cast<double>(stored_near_one_count) / n;
 
-  // 4. Return Calibration Diagnostics
-  std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
-  std::sort(returns_vec.begin(), returns_vec.end());
-  stats.return_min = returns_vec.front();
-  stats.return_max = returns_vec.back();
-  stats.return_p50 = returns_vec[n * 50 / 100];
-  stats.return_p95 = returns_vec[n * 95 / 100];
-  stats.return_p99 = returns_vec[n * 99 / 100];
+      // (2) The policy_kl_before canary, at startup/resume and on the cadence.
+      const int prepass_interval = ::absl::GetFlag(::FLAGS_diag_prepass_interval);
+      const bool first_update_for_model =
+          ConsumeFirstPrepassForModel(static_cast<const void*>(model.get()));
+      const bool measure_kl_now =
+          first_update_for_model ||
+          (prepass_interval > 0 && global_update % prepass_interval == 0);
+      kl_measured_this_update =
+          measure_kl_now && !::absl::GetFlag(::FLAGS_train_value_only);
+      if (kl_measured_this_update) {
+        bool was_training = model->is_training();
+        model->eval();
+        {
+          torch::NoGradGuard no_grad;
+          // Same autocast setup as rollout inference (dune_evaluator.h):
+          // BF16 on CUDA, disabled (plain FP32) on CPU. A NEW scope -- the
+          // PWO-5 section 7.5 cache-clearing guard, not a restructuring of the
+          // existing training autocast scopes below.
+          AutocastGuard autocast_guard(device.type(), device.is_cuda());
+          for (int64_t start = 0; start < n; start += minibatch_size) {
+            int64_t end = std::min(start + minibatch_size, n);
+            torch::Tensor mb_states = states.narrow(0, start, end - start);
+            torch::Tensor mb_masks = masks.narrow(0, start, end - start);
+            torch::Tensor mb_actions = actions.narrow(0, start, end - start);
+            torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
+            torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
 
-  std::vector<float> abs_returns_vec(n);
-  int64_t count_outside = 0;
-  for (int64_t i = 0; i < n; ++i) {
-    abs_returns_vec[i] = std::abs(returns_ptr[i]);
-    if (returns_ptr[i] < -1.0f || returns_ptr[i] > 1.0f) {
-      count_outside++;
+            auto outputs = model->forward(mb_states);
+            if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+              std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
+              for (int64_t i = start; i < end; ++i) {
+                mb_cands[i - start] = &batch[i].candidate_data;
+              }
+              dune_semantic::ApplySemanticScorerBatch(
+                  model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
+            }
+            torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+            torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+            torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+            torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+
+            torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+            torch::Tensor ratio = torch::exp(log_ratio);
+            torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+            torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+            if (masked_kl.numel() > 0) {
+              kl_before_sum += masked_kl.sum().item<double>();
+              kl_before_nontrivial_count += masked_kl.numel();
+            }
+          }
+        }
+        if (was_training) {
+          model->train();
+        }
+      }
+      stats.policy_kl_before = (kl_before_nontrivial_count > 0) ? (kl_before_sum / kl_before_nontrivial_count) : 0.0;
     }
+    phase_timer.End(kPhaseDiagPrepass);
+    stats.measured_transitions =
+        kl_measured_this_update ? kl_before_nontrivial_count : int64_t{-1};
+
+    // 4. Return Calibration Diagnostics
+    std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
+    std::sort(returns_vec.begin(), returns_vec.end());
+    stats.return_min = returns_vec.front();
+    stats.return_max = returns_vec.back();
+    stats.return_p50 = returns_vec[n * 50 / 100];
+    stats.return_p95 = returns_vec[n * 95 / 100];
+    stats.return_p99 = returns_vec[n * 99 / 100];
+
+    std::vector<float> abs_returns_vec(n);
+    int64_t count_outside = 0;
+    for (int64_t i = 0; i < n; ++i) {
+      abs_returns_vec[i] = std::abs(returns_ptr[i]);
+      if (returns_ptr[i] < -1.0f || returns_ptr[i] > 1.0f) {
+        count_outside++;
+      }
+    }
+    std::sort(abs_returns_vec.begin(), abs_returns_vec.end());
+    stats.abs_return_p99 = abs_returns_vec[n * 99 / 100];
+    stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
+  } else {
+    stats.measured_transitions = int64_t{-1};
   }
-  std::sort(abs_returns_vec.begin(), abs_returns_vec.end());
-  stats.abs_return_p99 = abs_returns_vec[n * 99 / 100];
-  stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
 
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
     // Populates phases 1-2 for a caller that wants them. NOTE: the only
@@ -1758,7 +1813,7 @@ PpoUpdateStats TrainPpoUpdate(
                     "' (expected 'per_param' or 'accumulated').");
   }
   torch::Tensor head_norm_accum;
-  if (grad_telemetry_accumulated) {
+  if (compute_diagnostics && grad_telemetry_accumulated) {
     head_norm_accum = torch::zeros(
         {6}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
   }
@@ -2201,6 +2256,7 @@ PpoUpdateStats TrainPpoUpdate(
         // "value_head", but a future head that did would have been captured by
         // the value branch. Testing the auxiliary names first makes the
         // classification independent of the other branches' patterns.
+      if (compute_diagnostics) {
         PhaseScope phase_scope_telemetry(&phase_timer, kPhaseGradTelemetry);
         if (!grad_telemetry_accumulated) {
           double policy_sq = 0.0, value_sq = 0.0, trunk_sq = 0.0;
@@ -2268,6 +2324,7 @@ PpoUpdateStats TrainPpoUpdate(
           stats.head_grad_norm_count += 1;
         }
       }
+    }
 
       phase_timer.Begin(kPhaseGradClip);
       double grad_norm =
@@ -2328,7 +2385,7 @@ PpoUpdateStats TrainPpoUpdate(
   // accumulated total into the zero-initialized sums is exact (0.0 + x == x),
   // so the resulting sums match per_param's minibatch-by-minibatch host
   // accumulation bit-for-bit on CPU.
-  if (grad_telemetry_accumulated && stats.head_grad_norm_count > 0) {
+  if (compute_diagnostics && grad_telemetry_accumulated && stats.head_grad_norm_count > 0) {
     torch::Tensor head_norms_cpu = head_norm_accum.to(torch::kCPU);
     auto head_norms = head_norms_cpu.accessor<double, 1>();
     stats.policy_head_grad_norm_sum += head_norms[0];
@@ -2423,6 +2480,8 @@ PpoUpdateStats TrainPpoUpdate(
   }
   // The single end-of-update synchronise and the one read of every event pair.
   phase_timer.Finalize(&stats.phase_timings);
+  stats.phase_timings.total_host_attributed_s +=
+      stats.phase_timings.rollout_hash_host_s;
   return stats;
 }
 
@@ -2433,15 +2492,10 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     torch::optim::AdamW& critic_optimizer,
     std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
-    uint64_t master, int global_update) {
+    uint64_t master, int global_update,
+    bool compute_diagnostics) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
-  stats.rollout_hash = ComputeRolloutHash(batch);
-
-  int64_t n = static_cast<int64_t>(batch.size());
-  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
-  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
-  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
 
   const std::string phase_timing_mode =
       ::absl::GetFlag(::FLAGS_phase_timing_mode);
@@ -2450,6 +2504,24 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     SpielFatalError("Unknown --phase_timing_mode: '" + phase_timing_mode +
                     "' (expected 'off' or 'phases').");
   }
+
+  if (compute_diagnostics) {
+    const auto hash_start = std::chrono::steady_clock::now();
+    stats.rollout_hash = ComputeRolloutHash(batch);
+    if (phase_timing_on) {
+      stats.phase_timings.rollout_hash_host_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
+    }
+  } else {
+    stats.rollout_hash.clear();
+    stats.phase_timings.rollout_hash_host_s = 0.0;
+  }
+
+  int64_t n = static_cast<int64_t>(batch.size());
+  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
+
   PhaseTimer phase_timer(phase_timing_on, device);
 
   phase_timer.Begin(kPhaseTensorPackH2D);
@@ -2530,89 +2602,93 @@ PpoUpdateStats TrainPpoUpdateSeparate(
   stats.nontrivial_transitions = nontrivial_count;
   stats.forced_transitions = n - nontrivial_count;
 
-  // 3. Prepass: Policy KL Before (from actor_model) and Critic Saturation (from critic_model)
-  phase_timer.Begin(kPhaseDiagPrepass);
-  {
-    bool was_training = actor_model->is_training();
-    bool critic_was_training = critic_model->is_training();
-    actor_model->eval();
-    critic_model->eval();
-    double kl_before_sum = 0.0;
-    int64_t kl_before_nontrivial_count = 0;
-    double value_near_one_count = 0.0;
+  if (compute_diagnostics) {
+    // 3. Prepass: Policy KL Before (from actor_model) and Critic Saturation (from critic_model)
+    phase_timer.Begin(kPhaseDiagPrepass);
     {
-      torch::NoGradGuard no_grad;
-      for (int64_t start = 0; start < n; start += minibatch_size) {
-        int64_t end = std::min(start + minibatch_size, n);
-        torch::Tensor mb_states = states.narrow(0, start, end - start);
-        torch::Tensor mb_masks = masks.narrow(0, start, end - start);
-        torch::Tensor mb_actions = actions.narrow(0, start, end - start);
-        torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
-        torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
-        auto outputs = actor_model->forward(mb_states);
-        if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
-          std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
-          for (int64_t i = start; i < end; ++i) {
-            mb_cands[i - start] = &batch[i].candidate_data;
+      bool was_training = actor_model->is_training();
+      bool critic_was_training = critic_model->is_training();
+      actor_model->eval();
+      critic_model->eval();
+      double kl_before_sum = 0.0;
+      int64_t kl_before_nontrivial_count = 0;
+      double value_near_one_count = 0.0;
+      {
+        torch::NoGradGuard no_grad;
+        for (int64_t start = 0; start < n; start += minibatch_size) {
+          int64_t end = std::min(start + minibatch_size, n);
+          torch::Tensor mb_states = states.narrow(0, start, end - start);
+          torch::Tensor mb_masks = masks.narrow(0, start, end - start);
+          torch::Tensor mb_actions = actions.narrow(0, start, end - start);
+          torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
+          torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+          auto outputs = actor_model->forward(mb_states);
+          if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
+            std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
+            for (int64_t i = start; i < end; ++i) {
+              mb_cands[i - start] = &batch[i].candidate_data;
+            }
+            dune_semantic::ApplySemanticScorerBatch(
+                actor_model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
           }
-          dune_semantic::ApplySemanticScorerBatch(
-              actor_model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
+          torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
+          torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
+          torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+          torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+
+          torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
+          torch::Tensor ratio = torch::exp(log_ratio);
+          torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+          if (masked_kl.numel() > 0) {
+            kl_before_sum += masked_kl.sum().item<double>();
+            kl_before_nontrivial_count += masked_kl.numel();
+          }
+
+          auto critic_outputs = critic_model->forward(mb_states);
+          torch::Tensor mb_values = critic_outputs.values.squeeze(1);
+          torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
+          value_near_one_count += mb_near_one.sum().item<double>();
         }
-        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, mb_masks, logit_cap);
-        torch::Tensor masked_logits = logits.masked_fill(mb_masks.logical_not(), -1e9f);
-        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
-        torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
+      }
+      if (was_training) {
+        actor_model->train();
+      }
+      if (critic_was_training) {
+        critic_model->train();
+      }
+      stats.policy_kl_before = (kl_before_nontrivial_count > 0)
+                                   ? (kl_before_sum / kl_before_nontrivial_count)
+                                   : 0.0;
+      stats.measured_transitions = kl_before_nontrivial_count;
+      stats.fraction_critic_near_1 = (n > 0) ? (value_near_one_count / n) : 0.0;
+    }
+    phase_timer.End(kPhaseDiagPrepass);
 
-        torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-        torch::Tensor ratio = torch::exp(log_ratio);
-        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+    // 4. Return Calibration Diagnostics
+    std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
+    std::sort(returns_vec.begin(), returns_vec.end());
+    stats.return_min = returns_vec.front();
+    stats.return_max = returns_vec.back();
+    stats.return_p50 = returns_vec[n * 50 / 100];
+    stats.return_p95 = returns_vec[n * 95 / 100];
+    stats.return_p99 = returns_vec[n * 99 / 100];
 
-        torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
-        if (masked_kl.numel() > 0) {
-          kl_before_sum += masked_kl.sum().item<double>();
-          kl_before_nontrivial_count += masked_kl.numel();
-        }
-
-        auto critic_outputs = critic_model->forward(mb_states);
-        torch::Tensor mb_values = critic_outputs.values.squeeze(1);
-        torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
-        value_near_one_count += mb_near_one.sum().item<double>();
+    std::vector<float> abs_returns_vec(n);
+    int64_t count_outside = 0;
+    for (int64_t i = 0; i < n; ++i) {
+      abs_returns_vec[i] = std::abs(returns_ptr[i]);
+      if (returns_ptr[i] < -1.0f || returns_ptr[i] > 1.0f) {
+        count_outside++;
       }
     }
-    if (was_training) {
-      actor_model->train();
-    }
-    if (critic_was_training) {
-      critic_model->train();
-    }
-    stats.policy_kl_before = (kl_before_nontrivial_count > 0)
-                                 ? (kl_before_sum / kl_before_nontrivial_count)
-                                 : 0.0;
-    stats.measured_transitions = kl_before_nontrivial_count;
-    stats.fraction_critic_near_1 = (n > 0) ? (value_near_one_count / n) : 0.0;
+    std::sort(abs_returns_vec.begin(), abs_returns_vec.end());
+    stats.abs_return_p99 = abs_returns_vec[n * 99 / 100];
+    stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
+  } else {
+    stats.measured_transitions = int64_t{-1};
   }
-  phase_timer.End(kPhaseDiagPrepass);
-
-  // 4. Return Calibration Diagnostics
-  std::vector<float> returns_vec(returns_ptr, returns_ptr + n);
-  std::sort(returns_vec.begin(), returns_vec.end());
-  stats.return_min = returns_vec.front();
-  stats.return_max = returns_vec.back();
-  stats.return_p50 = returns_vec[n * 50 / 100];
-  stats.return_p95 = returns_vec[n * 95 / 100];
-  stats.return_p99 = returns_vec[n * 99 / 100];
-
-  std::vector<float> abs_returns_vec(n);
-  int64_t count_outside = 0;
-  for (int64_t i = 0; i < n; ++i) {
-    abs_returns_vec[i] = std::abs(returns_ptr[i]);
-    if (returns_ptr[i] < -1.0f || returns_ptr[i] > 1.0f) {
-      count_outside++;
-    }
-  }
-  std::sort(abs_returns_vec.begin(), abs_returns_vec.end());
-  stats.abs_return_p99 = abs_returns_vec[n * 99 / 100];
-  stats.fraction_targets_outside_1 = static_cast<double>(count_outside) / n;
 
   if (absl::GetFlag(FLAGS_diagnostics_only)) {
     phase_timer.Finalize(&stats.phase_timings);
@@ -2780,7 +2856,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       phase_timer.End(kPhaseBackward);
 
       // Pre-clip gradient telemetry
-      {
+      if (compute_diagnostics) {
         PhaseScope phase_scope_telemetry(&phase_timer, kPhaseGradTelemetry);
         double policy_sq = 0.0, actor_trunk_sq = 0.0;
         for (const auto& named : actor_model->named_parameters()) {
@@ -2907,6 +2983,8 @@ PpoUpdateStats TrainPpoUpdateSeparate(
   }
 
   phase_timer.Finalize(&stats.phase_timings);
+  stats.phase_timings.total_host_attributed_s +=
+      stats.phase_timings.rollout_hash_host_s;
   return stats;
 }
 
@@ -3235,7 +3313,7 @@ std::string PhaseTimingPath(const std::string& diagnostics_path) {
 
 std::string PhaseTimingContract() {
   std::string s =
-      "{\"record\":\"header\",\"schema\":\"phase_timing.v1\","
+      "{\"record\":\"header\",\"schema\":\"phase_timing.v2\","
       "\"float_format\":\"%.17g\",\"phases\":[";
   for (int i = 0; i < kPhaseTimingNumPhases; ++i) {
     if (i) s += ",";
@@ -3282,12 +3360,11 @@ std::string JsonEscape(const std::string& in) {
   return out;
 }
 
-void WritePhaseTiming(const std::string& diagnostics_path, int update,
-                      const PpoUpdateStats& stats, double ppo_elapsed_s,
-                      const std::string& run_uuid,
-                      const std::string& run_prefix) {
+void WritePhaseTimingToPath(const std::string& path, int update,
+                            const PpoUpdateStats& stats, double ppo_elapsed_s,
+                            const std::string& run_uuid,
+                            const std::string& run_prefix) {
   if (!stats.phase_timings.enabled) return;
-  const std::string path = PhaseTimingPath(diagnostics_path);
   if (path.empty()) return;
 
   const std::string contract = PhaseTimingContract();
@@ -3365,6 +3442,8 @@ void WritePhaseTiming(const std::string& diagnostics_path, int update,
   out << ",\"total_attributed_s\":" << F17Finite(t.total_attributed_s, &nonfinite)
       << ",\"total_host_attributed_s\":"
       << F17Finite(t.total_host_attributed_s, &nonfinite)
+      << ",\"rollout_hash_host_s\":"
+      << F17Finite(t.rollout_hash_host_s, &nonfinite)
       << ",\"sync_s\":" << F17Finite(t.sync_s, &nonfinite)
       << ",\"ppo_elapsed_s\":" << F17Finite(ppo_elapsed_s, &nonfinite)
       << ",\"unattributed_host_s\":"
@@ -3381,6 +3460,16 @@ void WritePhaseTiming(const std::string& diagnostics_path, int update,
   if (out.fail()) {
     SpielFatalError("Failed to close phase-timing sidecar at: " + path);
   }
+}
+
+void WritePhaseTiming(const std::string& diagnostics_path, int update,
+                      const PpoUpdateStats& stats, double ppo_elapsed_s,
+                      const std::string& run_uuid,
+                      const std::string& run_prefix) {
+  if (!stats.phase_timings.enabled) return;
+  const std::string path = PhaseTimingPath(diagnostics_path);
+  if (path.empty()) return;
+  WritePhaseTimingToPath(path, update, stats, ppo_elapsed_s, run_uuid, run_prefix);
 }
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,

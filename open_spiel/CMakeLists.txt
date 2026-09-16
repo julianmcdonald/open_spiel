@@ -188,6 +188,8 @@ set(ABSL_PROPAGATE_CXX_STD ON)
 add_subdirectory (abseil-cpp)
 include_directories (abseil-cpp)
 
+find_package(OpenSSL REQUIRED)
+
 # Similarly for json
 add_subdirectory (json)
 include_directories (json/include)
@@ -216,6 +218,7 @@ link_libraries(open_spiel_core
   absl::str_format
   absl::strings
   absl::time
+  OpenSSL::Crypto
 )
 
 
@@ -333,6 +336,7 @@ if (BUILD_SHARED_LIB)
     absl::str_format
     absl::strings
     absl::time
+    OpenSSL::Crypto
     # Optionally link external dependencies, for example OrTools for solving
     # linear programs.
     ${ORTOOLS_LIBS}

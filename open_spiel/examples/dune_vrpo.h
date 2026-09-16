@@ -455,7 +455,7 @@ struct DuneVrpoQNetImpl : torch::nn::Module {
     if (!input.defined() || input.dim() != 2 || input.size(0) <= 0 ||
         input.size(1) != expected_input_dim) {
       return fail(absl::StrFormat(
-          "Q input width %d does not match declared schema %d",
+          "Q input shape/width %d does not match declared schema %d",
           input.defined() && input.dim() == 2 ? input.size(1) : -1,
           expected_input_dim));
     }

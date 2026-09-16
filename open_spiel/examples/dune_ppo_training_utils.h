@@ -119,8 +119,9 @@ struct PpoPhaseTimings {
   bool cuda = false;      // device_s came from CUDA events, not steady_clock
   double device_s[kPhaseTimingNumPhases] = {0, 0, 0, 0, 0, 0, 0, 0};
   double host_s[kPhaseTimingNumPhases] = {0, 0, 0, 0, 0, 0, 0, 0};
+  double rollout_hash_host_s = 0.0;
   double total_attributed_s = 0.0;       // sum(device_s)
-  double total_host_attributed_s = 0.0;  // sum(host_s)
+  double total_host_attributed_s = 0.0;  // sum(host_s) + rollout_hash_host_s
   // Cost of the single end-of-update synchronise, and NOTHING ELSE. It is not
   // the instrument's total perturbation: the per-bracket cudaEventRecord calls
   // execute INSIDE the brackets they delimit, and the elapsedTime readback loop
@@ -558,7 +559,8 @@ PpoUpdateStats TrainPpoUpdate(
     // Arm B: reverse-KL penalty to the policy that collected the rollout.
     // Detached collection snapshot; coefficient 0 => inert.
     std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model = nullptr,
-    double reverse_kl_coef = 0.0);
+    double reverse_kl_coef = 0.0,
+    bool compute_diagnostics = true);
 
 // Arm D: Fully separate actor and critic networks.
 // Actor parameters produce policy logits and entropy loss; critic parameters produce
@@ -571,7 +573,8 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     torch::optim::AdamW& critic_optimizer,
     std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
-    uint64_t master, int global_update);
+    uint64_t master, int global_update,
+    bool compute_diagnostics = true);
 
 
 // ---------------------------------------------------------------------------
@@ -648,6 +651,13 @@ void WritePhaseTiming(const std::string& diagnostics_path, int update,
                       const PpoUpdateStats& stats, double ppo_elapsed_s,
                       const std::string& run_uuid,
                       const std::string& run_prefix);
+
+// Direct version of WritePhaseTiming that writes to a specified sidecar file path,
+// independent of --diagnostics_path.
+void WritePhaseTimingToPath(const std::string& sidecar_path, int update,
+                            const PpoUpdateStats& stats, double ppo_elapsed_s,
+                            const std::string& run_uuid,
+                            const std::string& run_prefix);
 
 void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateStats& stats,
                       double conflict_vp_generated, double conflict_vp_attributed, double conflict_vp_unattributed,
@@ -733,6 +743,8 @@ struct CheckpointManifest {
   bool allow_tf32 = true;
   bool legacy_precision_migration = false;
   std::string precision_migration_source;
+  bool reward_transition = false;
+  std::string reward_transition_source_fingerprint;
 };
 
 // Fingerprint the exact pre-precision JSON object, or a copy extended with the
@@ -754,6 +766,8 @@ struct PpoPrecisionManifestCompatibility {
   bool allow_tf32 = true;
   bool legacy_precision_migration = false;
   std::string migration_source;
+  bool reward_transition = false;
+  std::string reward_transition_source_fingerprint;
 };
 
 // Fail-closed precision/fingerprint compatibility gate. A field-absent
@@ -766,7 +780,8 @@ bool ValidatePpoPrecisionManifestCompatibility(
     const std::string& current_pre_precision_config_fingerprint,
     const std::string& current_legacy_config_fingerprint,
     bool current_rollout_amp, bool current_allow_tf32,
-    PpoPrecisionManifestCompatibility* out, std::string* error);
+    PpoPrecisionManifestCompatibility* out, std::string* error,
+    const std::string& permitted_transition_source_fingerprint = "");
 
 // Deterministic contiguous partition of `num_examples` aux examples across
 // `num_minibatches` PPO minibatch steps in one epoch: base each, remainder to
@@ -840,7 +855,8 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               int current_num_blocks,
                               CheckpointManifest& out_manifest,
                               std::string& error_msg,
-                              const std::string& current_legacy_config_fingerprint = "");
+                              const std::string& current_legacy_config_fingerprint = "",
+                              const std::string& permitted_transition_source_fingerprint = "");
 
 // Verifies that manifest_path exists, is valid JSON, and that the referenced
 // model_path (and optional optim_path) match the file size and SHA256 recorded
@@ -1037,6 +1053,29 @@ inline bool AlignPriorToActions(const ActionsAndProbs& prior,
 float ApplySpecimenExchangeShaping(float reward, Action action,
                                    double specimen_exchange_penalty,
                                    float reward_lambda);
+
+// Family Atomics shaping helper:
+// Subtracts family_atomics_penalty * reward_lambda when action == kActionFamilyAtomics
+// unless is_own_reveal_turn is true AND remaining_persuasion > 0.
+float ApplyFamilyAtomicsShaping(float reward, Action action,
+                                bool is_own_reveal_turn, int remaining_persuasion,
+                                double family_atomics_penalty,
+                                float reward_lambda);
+
+// Returns true iff action is a plot intrigue card play action (IDs 1600-1699).
+inline bool IsPlotIntrigueAction(Action action) {
+  return action >= dune_imperium::kActionPlayIntriguePlotCard0 &&
+         action < dune_imperium::kActionPlayIntriguePlotCard0 + dune_imperium::kMaxIntrigueCards;
+}
+
+// Plot intrigue shaping helper:
+// Subtracts plot_intrigue_penalty * reward_lambda when action is a plot intrigue play action
+// unless intrigue_hand_size_before_play >= exemption_threshold (default 3).
+float ApplyPlotIntrigueShaping(float reward, Action action,
+                               int intrigue_hand_size_before_play,
+                               int exemption_threshold,
+                               double plot_intrigue_penalty,
+                               float reward_lambda);
 
 // True when both vectors carry the same action ids in the same order — the
 // invariant a label writer relies on when it stores prior[i]'s action id beside

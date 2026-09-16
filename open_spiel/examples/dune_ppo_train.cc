@@ -343,6 +343,19 @@ ABSL_FLAG(double, specimen_exchange_penalty, 0.0,
           "control arms so the search-distillation contrast stays a pure "
           "experiment. Typical 0.02 (terminal win utility is 2.25). Requires "
           "--allow_shaping.");
+ABSL_FLAG(double, family_atomics_penalty, 0.0,
+          "Magnitude of the negative shaping SUBTRACTED from a transition that "
+          "uses Family Atomics (ID 1591) when NOT in that player's own reveal turn "
+          "with remaining persuasion > 0. MUST BE >= 0. Typical 0.10. Requires "
+          "--allow_shaping.");
+ABSL_FLAG(double, plot_intrigue_penalty, 0.0,
+          "Magnitude of the negative shaping SUBTRACTED from a transition that "
+          "plays a plot intrigue card (IDs 1600-1699) when the player holds fewer "
+          "than plot_intrigue_exemption_threshold intrigue cards before playing. "
+          "MUST BE >= 0. Typical 0.01. Requires --allow_shaping.");
+ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3,
+          "Intrigue hand size threshold at or above which plot intrigue plays are "
+          "exempt from penalty. Default 3.");
 ABSL_FLAG(bool, allow_shaping, false,
           "Allow experimental reward shaping flags to be non-zero.");
 ABSL_FLAG(double, reward_scale, 4.0,
@@ -365,6 +378,12 @@ ABSL_FLAG(int, checkpoint_interval, 10,
           "Save rotating checkpoints every N PPO updates. <=0 disables.");
 ABSL_FLAG(bool, save_final_checkpoint, true,
           "Save final model and optimizer checkpoints.");
+ABSL_FLAG(bool, save_pilot_checkpoints, true,
+          "Save early pilot checkpoints at step 10, 25, 50.");
+ABSL_FLAG(bool, allow_reward_transition, false,
+          "Allow validated reward continuation transition from source checkpoint.");
+ABSL_FLAG(std::string, reward_transition_source_fingerprint, "",
+          "Expected source config fingerprint for reward continuation transition.");
 ABSL_FLAG(int, seed, 1, "Base random seed.");
 ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
@@ -665,6 +684,9 @@ ABSL_FLAG(uint64_t, start_env_steps, 0, "Fallback start environment steps for bo
 ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstrap mode.");
 ABSL_FLAG(std::string, diagnostics_path, "",
           "Path to write structured diagnostics JSON/CSV. Extension determines format.");
+ABSL_FLAG(std::string, phase_timing_path, "",
+          "Direct path for the phase-timing JSONL sidecar. If empty, derived from "
+          "--diagnostics_path or --run_prefix.");
 ABSL_DECLARE_FLAG(bool, train_value_only);
 // WO-PERF-TIMING: defined in dune_ppo_training_utils.cc beside the WO-PERF-1
 // flags. Read here only to enforce the --pipeline incompatibility at startup.
@@ -843,6 +865,16 @@ using open_spiel::SearchLabelRole;
 struct WorkerStats {
   uint64_t games = 0;
   uint64_t moves = 0;
+
+  // Reward penalties telemetry
+  uint64_t specimen_conversions = 0;
+  double specimen_penalty_deducted = 0.0;
+  uint64_t atomics_penalized = 0;
+  uint64_t atomics_exempt = 0;
+  double atomics_penalty_deducted = 0.0;
+  uint64_t plot_penalized = 0;
+  uint64_t plot_exempt = 0;
+  double plot_penalty_deducted = 0.0;
 
   // Natural SM Acquisitions
   uint64_t sm_acquisitions_by_seat[4] = {0};
@@ -1564,6 +1596,13 @@ std::string ComputeLegacyConfigFingerprint() {
     config_obj["leader_mass_only_coverage"] =
         absl::GetFlag(FLAGS_leader_mass_only_coverage);
   }
+  if (absl::GetFlag(FLAGS_family_atomics_penalty) != 0.0) {
+    config_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
+  }
+  if (absl::GetFlag(FLAGS_plot_intrigue_penalty) != 0.0) {
+    config_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
+    config_obj["plot_intrigue_exemption_threshold"] = absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold);
+  }
 
   std::string json_str = open_spiel::json::ToString(config_obj);
   return open_spiel::ComputeStringSHA256(json_str);
@@ -1686,6 +1725,13 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["enable_semantic_scorer"] = true;
     config_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
   }
+  if (absl::GetFlag(FLAGS_family_atomics_penalty) != 0.0) {
+    config_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
+  }
+  if (absl::GetFlag(FLAGS_plot_intrigue_penalty) != 0.0) {
+    config_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
+    config_obj["plot_intrigue_exemption_threshold"] = absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold);
+  }
 
   return config_obj;
 }
@@ -1696,8 +1742,9 @@ std::string ComputeCurrentPrePrecisionConfigFingerprint() {
 }
 
 std::string ComputeConfigFingerprint() {
+  auto obj = BuildPrePrecisionConfigFingerprintObject();
   return open_spiel::ComputePrecisionConfigFingerprint(
-      BuildPrePrecisionConfigFingerprintObject(),
+      obj,
       absl::GetFlag(FLAGS_rollout_amp),
       absl::GetFlag(FLAGS_allow_tf32));
 }
@@ -1789,6 +1836,95 @@ std::string GetSearchLabelFingerprint(const std::string& search_label_dir) {
     std::cerr << "Error reading search label manifest at " << manifest_path << ": " << e.what() << "\n";
   }
   return "";
+}
+
+std::string g_reward_transition_source_fingerprint = "";
+int64_t g_reward_transition_source_update = -1;
+
+std::string ValidateAndComputeRewardTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_reward_transition)) {
+    return "";
+  }
+  std::ifstream mfs(manifest_path);
+  if (!mfs) {
+    SpielFatalError("Could not open manifest file at: " + manifest_path);
+  }
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  auto get_double_or_default = [&](const std::string& k, double def) -> double {
+    auto it = manifest_obj.find(k);
+    if (it != manifest_obj.end() && it->second.IsDouble()) return it->second.GetDouble();
+    return def;
+  };
+  auto get_int_or_default = [&](const std::string& k, int64_t def) -> int64_t {
+    auto it = manifest_obj.find(k);
+    if (it != manifest_obj.end() && it->second.IsInt()) return it->second.GetInt();
+    return def;
+  };
+
+  double source_specimen = get_double_or_default("specimen_exchange_penalty", 0.0);
+  double source_family_atomics = get_double_or_default("family_atomics_penalty", 0.0);
+  double source_plot = get_double_or_default("plot_intrigue_penalty", 0.0);
+  int64_t source_plot_thresh = get_int_or_default("plot_intrigue_exemption_threshold", 0);
+
+  // Reconstruct source pre-precision config from current flags with source penalties substituted
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  source_config_obj["specimen_exchange_penalty"] = source_specimen;
+  if (source_family_atomics != 0.0) {
+    source_config_obj["family_atomics_penalty"] = source_family_atomics;
+  } else {
+    source_config_obj.erase("family_atomics_penalty");
+  }
+  if (source_plot != 0.0) {
+    source_config_obj["plot_intrigue_penalty"] = source_plot;
+    source_config_obj["plot_intrigue_exemption_threshold"] = source_plot_thresh;
+  } else {
+    source_config_obj.erase("plot_intrigue_penalty");
+    source_config_obj.erase("plot_intrigue_exemption_threshold");
+  }
+
+  std::string computed_source_fp = open_spiel::ComputePrecisionConfigFingerprint(
+      source_config_obj,
+      absl::GetFlag(FLAGS_rollout_amp),
+      absl::GetFlag(FLAGS_allow_tf32));
+
+  std::string expected_source_fp = absl::GetFlag(FLAGS_reward_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Reward transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Reward transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+
+  std::cout << absl::StrFormat(
+      "[reward-transition] Validated intentional reward continuation transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Specimen penalty:   %.4f -> %.4f\n"
+      "  Plot penalty:       %.4f -> %.4f\n"
+      "  Atomics penalty:    %.4f (unchanged)\n",
+      computed_source_fp, current_config_fingerprint,
+      source_specimen, absl::GetFlag(FLAGS_specimen_exchange_penalty),
+      source_plot, absl::GetFlag(FLAGS_plot_intrigue_penalty),
+      source_family_atomics) << std::endl;
+
+  return computed_source_fp;
 }
 
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
@@ -1892,6 +2028,16 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
       manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+    }
+    manifest_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    manifest_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
+    manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
+    manifest_obj["plot_intrigue_exemption_threshold"] = static_cast<int64_t>(absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold));
+    if (!g_reward_transition_source_fingerprint.empty()) {
+      manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
+      if (g_reward_transition_source_update >= 0) {
+        manifest_obj["reward_transition_source_update"] = g_reward_transition_source_update;
+      }
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
@@ -2005,6 +2151,12 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight);
     double specimen_exchange_penalty =
         absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    double family_atomics_penalty =
+        absl::GetFlag(FLAGS_family_atomics_penalty);
+    double plot_intrigue_penalty =
+        absl::GetFlag(FLAGS_plot_intrigue_penalty);
+    int plot_intrigue_exemption_threshold =
+        absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold);
     // PWO-5 section 14.1b. Hoisted per episode alongside the other flag reads,
     // so the canary measurement costs one bool test per decision when off.
     const bool emit_canary_columns =
@@ -2443,11 +2595,21 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      if (dune_state != nullptr) {
+      bool is_atomics_action = (action == dune_imperium::kActionFamilyAtomics);
+      bool atomics_exempt = false;
+      bool is_plot_intrigue_action = open_spiel::IsPlotIntrigueAction(action);
+      bool plot_intrigue_exempt = false;
+      if (dune_state != nullptr && current_player >= 0 && current_player < game.NumPlayers()) {
         pre_action_phase = dune_state->phase();
-        if (current_player >= 0 && current_player < game.NumPlayers()) {
-          pre_combat_strength[current_player] =
-              dune_imperium::CombatStrength(*dune_state, current_player);
+        pre_combat_strength[current_player] =
+            dune_imperium::CombatStrength(*dune_state, current_player);
+        if (is_atomics_action) {
+          atomics_exempt = dune_state->IsPlayerInRevealTurn(current_player) &&
+                           (dune_state->PlayerPersuasion(current_player) > 0);
+        }
+        if (is_plot_intrigue_action) {
+          int hand_size = static_cast<int>(dune_state->GetIntrigueHandForTesting(current_player).size());
+          plot_intrigue_exempt = (hand_size >= plot_intrigue_exemption_threshold);
         }
       }
 
@@ -2543,14 +2705,71 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         // PWO-5 gate 2 items (b)+(c): the range predicate and the subtraction
         // both moved into shared, unit-tested helpers. The sign is the point --
         // a POSITIVE penalty must DECREASE this reward.
-        if (specimen_exchange_penalty != 0.0 &&
-            current_player >= 0 && current_player < game.NumPlayers() &&
-            dune_shaping::IsSpecimenConversionAction(action)) {
-          int idx = last_transition_index[current_player];
-          if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-            (*trajectory)[idx].reward = ApplySpecimenExchangeShaping(
-                (*trajectory)[idx].reward, action, specimen_exchange_penalty,
-                reward_lambda);
+        // Specimen conversion shaping
+        if (dune_shaping::IsSpecimenConversionAction(action)) {
+          if (local_stats != nullptr) {
+            local_stats->specimen_conversions++;
+          }
+          if (specimen_exchange_penalty != 0.0 &&
+              current_player >= 0 && current_player < game.NumPlayers()) {
+            int idx = last_transition_index[current_player];
+            if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+              float before_rew = (*trajectory)[idx].reward;
+              (*trajectory)[idx].reward = ApplySpecimenExchangeShaping(
+                  before_rew, action, specimen_exchange_penalty,
+                  reward_lambda);
+              if (local_stats != nullptr) {
+                local_stats->specimen_penalty_deducted += (before_rew - (*trajectory)[idx].reward);
+              }
+            }
+          }
+        }
+
+        // Family Atomics shaping
+        if (is_atomics_action) {
+          if (atomics_exempt) {
+            if (local_stats != nullptr) {
+              local_stats->atomics_exempt++;
+            }
+          } else {
+            if (local_stats != nullptr) {
+              local_stats->atomics_penalized++;
+            }
+            if (family_atomics_penalty != 0.0 &&
+                current_player >= 0 && current_player < game.NumPlayers()) {
+              int idx = last_transition_index[current_player];
+              if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+                float penalty_amount = static_cast<float>(family_atomics_penalty) * reward_lambda;
+                (*trajectory)[idx].reward -= penalty_amount;
+                if (local_stats != nullptr) {
+                  local_stats->atomics_penalty_deducted += penalty_amount;
+                }
+              }
+            }
+          }
+        }
+
+        // Plot Intrigue shaping
+        if (is_plot_intrigue_action) {
+          if (plot_intrigue_exempt) {
+            if (local_stats != nullptr) {
+              local_stats->plot_exempt++;
+            }
+          } else {
+            if (local_stats != nullptr) {
+              local_stats->plot_penalized++;
+            }
+            if (plot_intrigue_penalty != 0.0 &&
+                current_player >= 0 && current_player < game.NumPlayers()) {
+              int idx = last_transition_index[current_player];
+              if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+                float penalty_amount = static_cast<float>(plot_intrigue_penalty) * reward_lambda;
+                (*trajectory)[idx].reward -= penalty_amount;
+                if (local_stats != nullptr) {
+                  local_stats->plot_penalty_deducted += penalty_amount;
+                }
+              }
+            }
           }
         }
 
@@ -2760,6 +2979,16 @@ struct CollectResult {
   uint64_t moves = 0;
   double elapsed_seconds = 0.0;
 
+  // Reward penalties telemetry
+  uint64_t specimen_conversions = 0;
+  double specimen_penalty_deducted = 0.0;
+  uint64_t atomics_penalized = 0;
+  uint64_t atomics_exempt = 0;
+  double atomics_penalty_deducted = 0.0;
+  uint64_t plot_penalized = 0;
+  uint64_t plot_exempt = 0;
+  double plot_penalty_deducted = 0.0;
+
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
   uint64_t sm_acquisitions_by_round[11] = {0};
@@ -2943,6 +3172,15 @@ CollectResult CollectRollout(const Game* game,
   for (const auto& stats : worker_stats) {
     result.games += stats.games;
     result.moves += stats.moves;
+
+    result.specimen_conversions += stats.specimen_conversions;
+    result.specimen_penalty_deducted += stats.specimen_penalty_deducted;
+    result.atomics_penalized += stats.atomics_penalized;
+    result.atomics_exempt += stats.atomics_exempt;
+    result.atomics_penalty_deducted += stats.atomics_penalty_deducted;
+    result.plot_penalized += stats.plot_penalized;
+    result.plot_exempt += stats.plot_exempt;
+    result.plot_penalty_deducted += stats.plot_penalty_deducted;
 
     for (int i = 0; i < 4; ++i) result.sm_acquisitions_by_seat[i] += stats.sm_acquisitions_by_seat[i];
     for (int i = 0; i < 14; ++i) result.sm_acquisitions_by_leader[i] += stats.sm_acquisitions_by_leader[i];
@@ -6498,10 +6736,30 @@ int main(int argc, char** argv) {
               << std::endl;
     return -1;
   }
+  if (absl::GetFlag(FLAGS_family_atomics_penalty) < 0.0) {
+    std::cerr << "Fatal: --family_atomics_penalty="
+              << absl::GetFlag(FLAGS_family_atomics_penalty)
+              << " is NEGATIVE. This flag is a MAGNITUDE THAT IS SUBTRACTED "
+                 "from the reward, so a negative value is a BONUS. "
+                 "Pass a value >= 0; 0.0 disables the term."
+              << std::endl;
+    return -1;
+  }
+  if (absl::GetFlag(FLAGS_plot_intrigue_penalty) < 0.0) {
+    std::cerr << "Fatal: --plot_intrigue_penalty="
+              << absl::GetFlag(FLAGS_plot_intrigue_penalty)
+              << " is NEGATIVE. This flag is a MAGNITUDE THAT IS SUBTRACTED "
+                 "from the reward, so a negative value is a BONUS. "
+                 "Pass a value >= 0; 0.0 disables the term."
+              << std::endl;
+    return -1;
+  }
   if (absl::GetFlag(FLAGS_shaped_reward_weight) != 0.0 ||
       absl::GetFlag(FLAGS_tleilaxu_breadcrumb_weight) != 0.0 ||
       absl::GetFlag(FLAGS_tleilaxu_level7_breadcrumb_weight) != 0.0 ||
-      absl::GetFlag(FLAGS_specimen_exchange_penalty) != 0.0) {
+      absl::GetFlag(FLAGS_specimen_exchange_penalty) != 0.0 ||
+      absl::GetFlag(FLAGS_family_atomics_penalty) != 0.0 ||
+      absl::GetFlag(FLAGS_plot_intrigue_penalty) != 0.0) {
     if (!absl::GetFlag(FLAGS_allow_shaping)) {
       std::cerr << "Fatal: Reward shaping weights are non-zero but --allow_shaping is not set. "
                 << "To run with reward shaping, pass --allow_shaping=true." << std::endl;
@@ -8495,6 +8753,12 @@ int main(int argc, char** argv) {
     // Automatic recovery from interrupted publication:
     open_spiel::RecoverInterruptedBundleIfNeeded(model_path, optim_path, manifest_path);
 
+    std::string permitted_transition_source_fingerprint =
+        ValidateAndComputeRewardTransitionFingerprint(manifest_path, config_fingerprint);
+    if (!permitted_transition_source_fingerprint.empty()) {
+      g_reward_transition_source_fingerprint = permitted_transition_source_fingerprint;
+    }
+
     // Legacy fingerprints predate critic-remediation flags and therefore
     // cannot prove which parameters or data source were active. Never use
     // that compatibility escape hatch for value-only resumes.
@@ -8511,8 +8775,12 @@ int main(int argc, char** argv) {
                                   search_label_fingerprint,
                                   absl::GetFlag(FLAGS_hidden_dim),
                                   absl::GetFlag(FLAGS_num_blocks),
-                                  manifest, err, legacy_fingerprint)) {
+                                  manifest, err, legacy_fingerprint,
+                                  permitted_transition_source_fingerprint)) {
       SpielFatalError(err);
+    }
+    if (!permitted_transition_source_fingerprint.empty()) {
+      g_reward_transition_source_update = manifest.global_update;
     }
 
     // Verify market_appendix_mode matches the current run's flag
@@ -9276,6 +9544,11 @@ int main(int argc, char** argv) {
     } else {
       open_spiel::CheckpointManifest shared_manifest;
       std::string err;
+      std::string permitted_transition_source_fingerprint =
+          ValidateAndComputeRewardTransitionFingerprint(manifest_path, config_fingerprint);
+      if (!permitted_transition_source_fingerprint.empty()) {
+        g_reward_transition_source_fingerprint = permitted_transition_source_fingerprint;
+      }
       std::string legacy_fingerprint = absl::GetFlag(FLAGS_train_value_only)
           ? ""
           : ComputeLegacyConfigFingerprint();
@@ -9290,8 +9563,12 @@ int main(int argc, char** argv) {
               search_label_fingerprint,
               absl::GetFlag(FLAGS_hidden_dim),
               absl::GetFlag(FLAGS_num_blocks),
-              shared_manifest, err, legacy_fingerprint)) {
+              shared_manifest, err, legacy_fingerprint,
+              permitted_transition_source_fingerprint)) {
         SpielFatalError("Study resume shared validation failed: " + err);
+      }
+      if (!permitted_transition_source_fingerprint.empty()) {
+        g_reward_transition_source_update = shared_manifest.global_update;
       }
 
       // Verify market_appendix_mode and feature_schema match the current run's flags
@@ -11850,14 +12127,15 @@ int main(int argc, char** argv) {
             ? open_spiel::TrainPpoUpdateSeparate(
                   training_model, *optimizer, training_critic, *critic_optimizer,
                   current_collect.rollout, obs_size, action_size, device, master,
-                  start_update)
+                  start_update, /*compute_diagnostics=*/true)
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, start_update, anchor_model,
                   /*search_examples=*/{}, /*search_loss_coef=*/0.0,
                   /*abort_grad_norm_ratio=*/0.0,
                   open_spiel::Pwo5AuxBatch(), open_spiel::Pwo5AuxConfig(),
-                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef));
+                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
+                  /*compute_diagnostics=*/true);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -12015,19 +12293,22 @@ int main(int argc, char** argv) {
       pwo5_batch.valid = true;
     }
 
+    const bool compute_diagnostics = !absl::GetFlag(FLAGS_diagnostics_path).empty();
+
     open_spiel::PpoUpdateStats stats =
         (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr)
             ? open_spiel::TrainPpoUpdateSeparate(
                   training_model, *optimizer, training_critic, *critic_optimizer,
                   current_collect.rollout, obs_size, action_size, device, master,
-                  update)
+                  update, compute_diagnostics)
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, update, anchor_model,
                   current_collect.aux_examples, this_search_coef,
                   online_search_collection ? aux_abort_ratio : 0.0,
                   pwo5_batch, pwo5_cfg,
-                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef));
+                  collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
+                  compute_diagnostics);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
@@ -12100,13 +12381,26 @@ int main(int argc, char** argv) {
             diagnostics_path, update, stats, run_uuid, config_fingerprint,
             static_cast<uint64_t>(absl::GetFlag(FLAGS_seed)));
       }
-      // WO-PERF-TIMING. Path DERIVED from --diagnostics_path (no new path
-      // flag), and self-gated: WritePhaseTiming returns immediately unless
-      // --phase_timing_mode=phases armed the timer. `ppo_elapsed` is carried in
-      // so the sidecar records the figure its attribution is compared against.
-      open_spiel::WritePhaseTiming(diagnostics_path, update, stats, ppo_elapsed,
-                                   run_uuid,
-                                   absl::GetFlag(FLAGS_run_prefix));
+    }
+
+    // WO-PERF-TIMING. Sidecar written independently of --diagnostics_path so
+    // production runs with diagnostics disabled can be accurately profiled.
+    std::string sidecar_timing_path = absl::GetFlag(FLAGS_phase_timing_path);
+    if (sidecar_timing_path.empty()) {
+      if (!diagnostics_path.empty()) {
+        sidecar_timing_path = open_spiel::PhaseTimingPath(diagnostics_path);
+      } else if (absl::GetFlag(FLAGS_phase_timing_mode) == "phases") {
+        std::string run_pfx = absl::GetFlag(FLAGS_run_prefix);
+        if (!run_pfx.empty()) {
+          std::filesystem::path p(run_pfx);
+          sidecar_timing_path = (p.parent_path() / "phase_timing.jsonl").string();
+        }
+      }
+    }
+    if (!sidecar_timing_path.empty()) {
+      open_spiel::WritePhaseTimingToPath(sidecar_timing_path, update, stats,
+                                         ppo_elapsed, run_uuid,
+                                         absl::GetFlag(FLAGS_run_prefix));
     }
 
     // --- Search auxiliary distillation steps ---
@@ -12298,6 +12592,33 @@ int main(int argc, char** argv) {
             current_collect.sm_acquisitions_by_leader[4], current_collect.sm_acquisitions_by_leader[6],
             total_acquisitions - current_collect.sm_acquisitions_by_leader[4] - current_collect.sm_acquisitions_by_leader[6]);
       }
+
+      const double specimen_exchange_penalty = absl::GetFlag(FLAGS_specimen_exchange_penalty);
+      const double family_atomics_penalty = absl::GetFlag(FLAGS_family_atomics_penalty);
+      const double plot_intrigue_penalty = absl::GetFlag(FLAGS_plot_intrigue_penalty);
+      const int plot_intrigue_exemption_threshold = absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold);
+
+      if (specimen_exchange_penalty != 0.0 || family_atomics_penalty != 0.0 || plot_intrigue_penalty != 0.0 ||
+          current_collect.specimen_conversions > 0 || current_collect.atomics_penalized > 0 ||
+          current_collect.atomics_exempt > 0 || current_collect.plot_penalized > 0 || current_collect.plot_exempt > 0) {
+        std::cout << absl::StrFormat(
+            "  [Penalty Telemetry] Specimen: %d conv, -%.4f ded (coef=%.4f, mult=%.2f) | "
+            "Atomics: %d pen, %d exempt, -%.4f ded (coef=%.4f, mult=%.2f) | "
+            "Plot: %d pen, %d exempt, -%.4f ded (coef=%.4f, thresh=%d, mult=%.2f)\n",
+            current_collect.specimen_conversions,
+            current_collect.specimen_penalty_deducted,
+            specimen_exchange_penalty, reward_lambda,
+            current_collect.atomics_penalized,
+            current_collect.atomics_exempt,
+            current_collect.atomics_penalty_deducted,
+            family_atomics_penalty, reward_lambda,
+            current_collect.plot_penalized,
+            current_collect.plot_exempt,
+            current_collect.plot_penalty_deducted,
+            plot_intrigue_penalty,
+            plot_intrigue_exemption_threshold,
+            reward_lambda);
+      }
     }
 
     if (search_lambda > 0.0 && search_buffer.Size() > 0) {
@@ -12312,7 +12633,8 @@ int main(int argc, char** argv) {
 
     int checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
     int training_step = update - start_update + 1;
-    bool is_pilot_update = (training_step == 10 || training_step == 25 || training_step == 50);
+    bool is_pilot_update = absl::GetFlag(FLAGS_save_pilot_checkpoints) &&
+        (training_step == 10 || training_step == 25 || training_step == 50);
     if (is_pilot_update || (checkpoint_interval > 0 && update % checkpoint_interval == 0)) {
       std::string prefix = absl::GetFlag(FLAGS_run_prefix);
       if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
