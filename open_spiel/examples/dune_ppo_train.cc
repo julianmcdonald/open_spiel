@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_split.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
+#include "open_spiel/games/dune_imperium/dune_card_telemetry.h"
 
 #include "open_spiel/games/dune_imperium/dune_imperium_util.h"
 #include "open_spiel/spiel.h"
@@ -403,6 +405,13 @@ ABSL_FLAG(int, start_update_override, -1,
           "Explicit override for start_update counter (e.g. 201 for study updates).");
 ABSL_FLAG(int, study_updates, -1,
           "Number of study updates to run from start_update (e.g. 400).");
+
+ABSL_FLAG(std::string, cutoff_timestamp, "",
+          "Timezone-aware ISO-8601 cutoff timestamp string (e.g. 2026-09-20T08:00:00+10:00).");
+ABSL_FLAG(double, cutoff_epoch, 0.0,
+          "Cutoff timestamp as unix epoch seconds.");
+ABSL_FLAG(std::string, card_telemetry_path, "",
+          "Path to JSON file where cumulative two-card tracking counters are saved.");
 
 
 ABSL_FLAG(std::string, search_label_dir, "",
@@ -864,9 +873,21 @@ using open_spiel::SearchLabelBuffer;
 using open_spiel::SearchLabelFileEntry;
 using open_spiel::SearchLabelRole;
 
+using dune_imperium::CardMetrics;
+using dune_imperium::SaveCardTelemetry;
+using dune_imperium::LoadCardTelemetry;
+
+static std::atomic<bool> g_stop_requested{false};
+inline void SignalHandler(int signum) {
+  g_stop_requested.store(true, std::memory_order_relaxed);
+}
+
 struct WorkerStats {
   uint64_t games = 0;
   uint64_t moves = 0;
+
+  CardMetrics card11_metrics;
+  CardMetrics card13_metrics;
 
   // Reward penalties telemetry
   uint64_t specimen_conversions = 0;
@@ -2143,14 +2164,43 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     std::vector<bool> had_swordmaster(game.NumPlayers(), false);
     std::vector<int> prev_conflict_vp(game.NumPlayers(), 0);
     std::vector<int> prev_total_vp(game.NumPlayers(), 0);
+    std::vector<int> prev_hand_sb(game.NumPlayers(), 0);
+    std::vector<int> prev_hand_sh(game.NumPlayers(), 0);
     if (dune_state != nullptr) {
       for (int p = 0; p < game.NumPlayers(); ++p) {
         current_tleilaxu[p] = dune_state->GetTleilaxuTrackForTesting(p);
         had_swordmaster[p] = dune_state->HasSwordmaster(p);
         prev_conflict_vp[p] = dune_state->ConflictVpDelta(p);
         prev_total_vp[p] = dune_state->GetPlayerVp(p);
+        const auto& hand = dune_state->GetPlayerHandForTesting(p);
+        for (int c : hand) {
+          if (c == dune_imperium::kCardScientificBreakthrough) ++prev_hand_sb[p];
+          if (c == dune_imperium::kCardStitchedHorror) ++prev_hand_sh[p];
+        }
       }
     }
+
+    auto check_hand_draws = [&]() {
+      if (dune_state != nullptr && local_stats != nullptr) {
+        for (int p = 0; p < game.NumPlayers(); ++p) {
+          int count_sb = 0;
+          int count_sh = 0;
+          const auto& hand = dune_state->GetPlayerHandForTesting(p);
+          for (int c : hand) {
+            if (c == dune_imperium::kCardScientificBreakthrough) ++count_sb;
+            if (c == dune_imperium::kCardStitchedHorror) ++count_sh;
+          }
+          if (count_sb > prev_hand_sb[p]) {
+            local_stats->card11_metrics.draws_into_hand += (count_sb - prev_hand_sb[p]);
+          }
+          if (count_sh > prev_hand_sh[p]) {
+            local_stats->card13_metrics.draws_into_hand += (count_sh - prev_hand_sh[p]);
+          }
+          prev_hand_sb[p] = count_sb;
+          prev_hand_sh[p] = count_sh;
+        }
+      }
+    };
 
     CombatCreditAccumulator combat_accumulator;
     std::vector<int> last_transition_index(game.NumPlayers(), -1);
@@ -2186,6 +2236,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     int game_length = 0;
     int counterfactual_samples = 0;
     std::vector<CounterfactualPending> pending_cf;
+    bool pending_horror_trash[4] = {false, false, false, false};
     while (!state->IsTerminal()) {
       ++game_length;
       if (game_length > 5000) {
@@ -2200,6 +2251,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                     ? outcomes.front().first
                     : SampleAction(outcomes, chance_rng).first;
         state->ApplyAction(action);
+        check_hand_draws();
         continue;
       }
 
@@ -2215,6 +2267,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
           }
         }
         state->ApplyActions(joint_action);
+        check_hand_draws();
         continue;
       }
 
@@ -2454,16 +2507,159 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         canary_measure_this_decision = false;
       }
 
+      std::vector<double> legal_probabilities;
       std::optional<std::vector<double>> vrpo_legal_probabilities;
-      if (vrpo_episode != nullptr && is_learner) vrpo_legal_probabilities.emplace();
       const PolicyDistributionSample policy_sample =
           SamplePolicyDistribution(&policy_rng[current_player], logits,
                                    actions,
-                                   vrpo_legal_probabilities.has_value()
-                                       ? &*vrpo_legal_probabilities
-                                       : nullptr);
+                                   &legal_probabilities);
+      if (vrpo_episode != nullptr && is_learner) {
+        vrpo_legal_probabilities = legal_probabilities;
+      }
       Action action = policy_sample.action;
       float old_log_prob = policy_sample.chosen_log_probability;
+
+      // Two-card tracking: Scientific Breakthrough (Tleilaxu 11 / Card 118) and Stitched Horror (Tleilaxu 13 / Card 120)
+      if (dune_state != nullptr && local_stats != nullptr) {
+        const auto& tleilaxu_row = dune_state->GetTleilaxuRowForTesting();
+        int row_card_0 = (tleilaxu_row.size() > 0) ? tleilaxu_row[0] : dune_imperium::kInvalidCard;
+        int row_card_1 = (tleilaxu_row.size() > 1) ? tleilaxu_row[1] : dune_imperium::kInvalidCard;
+
+        // Constants:
+        // kActionTleilaxuAcquire0 = 90 (Reclaimed Forces)
+        // kActionTleilaxuAcquire0 + 1 = 91 (Slot 0)
+        // kActionTleilaxuAcquire0 + 2 = 92 (Slot 1)
+        const Action action_buy_0 = dune_imperium::kActionTleilaxuAcquire0 + 1; // 91
+        const Action action_buy_1 = dune_imperium::kActionTleilaxuAcquire0 + 2; // 92
+
+        int buy_idx_0 = -1;
+        int buy_idx_1 = -1;
+        for (size_t idx = 0; idx < actions.size(); ++idx) {
+          if (actions[idx] == action_buy_0) buy_idx_0 = static_cast<int>(idx);
+          if (actions[idx] == action_buy_1) buy_idx_1 = static_cast<int>(idx);
+        }
+
+        auto process_card_opp = [&](int target_tleilaxu_id, int slot, int action_idx, Action buy_action) {
+          auto& card_stats = (target_tleilaxu_id == 11)
+                                 ? local_stats->card11_metrics
+                                 : local_stats->card13_metrics;
+          card_stats.legal_opportunities++;
+          if (slot == 0) card_stats.legal_opps_slot0++;
+          else card_stats.legal_opps_slot1++;
+
+          if (action_idx >= 0 && static_cast<size_t>(action_idx) < legal_probabilities.size()) {
+            card_stats.sum_purchase_probs += legal_probabilities[action_idx];
+          }
+          if (action == buy_action) {
+            card_stats.purchases_taken++;
+          }
+        };
+
+        if (buy_idx_0 >= 0) {
+          if (row_card_0 == 11) {
+            process_card_opp(11, 0, buy_idx_0, action_buy_0);
+          } else if (row_card_0 == 13) {
+            process_card_opp(13, 0, buy_idx_0, action_buy_0);
+          }
+        }
+        if (buy_idx_1 >= 0) {
+          if (row_card_1 == 11) {
+            process_card_opp(11, 1, buy_idx_1, action_buy_1);
+          } else if (row_card_1 == 13) {
+            process_card_opp(13, 1, buy_idx_1, action_buy_1);
+          }
+        }
+
+        // Breakthrough marker & play diagnostics
+        if (action >= dune_imperium::kActionSelectAgentCard0 &&
+            action < dune_imperium::kActionSelectAgentCard0 + 200) {
+          int card = action - dune_imperium::kActionSelectAgentCard0;
+          if (card == dune_imperium::kCardScientificBreakthrough) {
+            local_stats->card11_metrics.plays++;
+            if (dune_state != nullptr && dune_state->HasSecondGeneticMarker(current_player)) {
+              local_stats->card11_metrics.plays_with_second_marker++;
+            } else {
+              local_stats->card11_metrics.plays_without_second_marker++;
+            }
+          }
+          if (card == dune_imperium::kCardStitchedHorror) local_stats->card13_metrics.plays++;
+        }
+        if (action >= dune_imperium::kActionSelectGraftPartner0 &&
+            action < dune_imperium::kActionSelectGraftPartner0 + 200) {
+          int card = action - dune_imperium::kActionSelectGraftPartner0;
+          if (card == dune_imperium::kCardScientificBreakthrough) {
+            local_stats->card11_metrics.plays++;
+            if (dune_state != nullptr && dune_state->HasSecondGeneticMarker(current_player)) {
+              local_stats->card11_metrics.plays_with_second_marker++;
+            } else {
+              local_stats->card11_metrics.plays_without_second_marker++;
+            }
+          }
+          if (card == dune_imperium::kCardStitchedHorror) local_stats->card13_metrics.plays++;
+        }
+
+        // Check if Breakthrough trash-for-VP was offered in legal actions
+        for (Action a : actions) {
+          if (a == dune_imperium::kActionAgentRewardScientificBreakthroughTrash) {
+            local_stats->card11_metrics.trash_for_vp_offered++;
+            break;
+          }
+        }
+
+        // Breakthrough resolved/skipped
+        if (action == dune_imperium::kActionAgentRewardScientificBreakthroughTrash) {
+          local_stats->card11_metrics.trash_for_vp_resolved++;
+          local_stats->card11_metrics.special_effects_resolved++;
+        }
+        if (action == dune_imperium::kActionAgentRewardScientificBreakthroughSkip) {
+          local_stats->card11_metrics.trash_for_vp_skipped++;
+        }
+
+        // Stitched Horror reward choices
+        if (action == dune_imperium::kActionStitchedHorror01) {
+          local_stats->card13_metrics.choice_01_water_troop++;
+        } else if (action == dune_imperium::kActionStitchedHorror02) {
+          local_stats->card13_metrics.choice_02_water_trash++;
+          pending_horror_trash[current_player] = true;
+        } else if (action == dune_imperium::kActionStitchedHorror03) {
+          local_stats->card13_metrics.choice_03_water_scarab++;
+        } else if (action == dune_imperium::kActionStitchedHorror12) {
+          local_stats->card13_metrics.choice_12_troop_trash++;
+          pending_horror_trash[current_player] = true;
+        } else if (action == dune_imperium::kActionStitchedHorror13) {
+          local_stats->card13_metrics.choice_13_troop_scarab++;
+        } else if (action == dune_imperium::kActionStitchedHorror23) {
+          local_stats->card13_metrics.choice_23_scarab_trash++;
+          pending_horror_trash[current_player] = true;
+        }
+
+        // Stitched Horror trash resolution: strictly track ONLY when pending_horror_trash[current_player] is true!
+        if (pending_horror_trash[current_player]) {
+          if (action >= dune_imperium::kActionTrashInPlayCard0 &&
+              action < dune_imperium::kActionTrashInPlayCard0 + 200) {
+            local_stats->card13_metrics.in_play_trash_resolved++;
+            local_stats->card13_metrics.special_effects_resolved++;
+            pending_horror_trash[current_player] = false;
+          } else if (action >= dune_imperium::kActionTrashHandCard0 &&
+                     action < dune_imperium::kActionTrashHandCard0 + 200) {
+            local_stats->card13_metrics.hand_trash_resolved++;
+            local_stats->card13_metrics.special_effects_resolved++;
+            pending_horror_trash[current_player] = false;
+          } else if (action >= dune_imperium::kActionTrashDiscardCard0 &&
+                     action < dune_imperium::kActionTrashDiscardCard0 + 200) {
+            local_stats->card13_metrics.discard_trash_resolved++;
+            local_stats->card13_metrics.special_effects_resolved++;
+            pending_horror_trash[current_player] = false;
+          } else if (action == dune_imperium::kActionTrashSkip) {
+            local_stats->card13_metrics.trash_skipped++;
+            pending_horror_trash[current_player] = false;
+          } else if (action != dune_imperium::kActionStitchedHorror02 &&
+                     action != dune_imperium::kActionStitchedHorror12 &&
+                     action != dune_imperium::kActionStitchedHorror23) {
+            pending_horror_trash[current_player] = false;
+          }
+        }
+      }
       if (parity_capture) {
         const std::vector<int64_t> legal_ids(actions.begin(), actions.end());
         std::string validation_error;
@@ -2652,6 +2848,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
       state->ApplyAction(action);
       total_env_steps->fetch_add(1, std::memory_order_relaxed);
+      check_hand_draws();
 
       if (dune_state != nullptr) {
         for (int p = 0; p < game.NumPlayers(); ++p) {
@@ -2993,6 +3190,9 @@ struct CollectResult {
   uint64_t moves = 0;
   double elapsed_seconds = 0.0;
 
+  CardMetrics card11_metrics;
+  CardMetrics card13_metrics;
+
   // Reward penalties telemetry
   uint64_t specimen_conversions = 0;
   double specimen_penalty_deducted = 0.0;
@@ -3244,6 +3444,9 @@ CollectResult CollectRollout(const Game* game,
     result.canary_maxprob_sum += stats.canary_maxprob_sum;
     result.canary_sat_ge_cap += stats.canary_sat_ge_cap;
     result.canary_sat_logits += stats.canary_sat_logits;
+
+    result.card11_metrics += stats.card11_metrics;
+    result.card13_metrics += stats.card13_metrics;
   }
 
   // Verify shaped reward conservation invariant
@@ -6338,6 +6541,8 @@ int main(int argc, char** argv) {
   }
   const std::string parity_command_line = parity_command_line_stream.str();
   absl::ParseCommandLine(argc, argv);
+  std::signal(SIGTERM, open_spiel::SignalHandler);
+  std::signal(SIGINT, open_spiel::SignalHandler);
   const auto vrpo_schedule_process_start =
       std::chrono::steady_clock::now();
   const open_spiel::VrpoScheduleRunDeadline vrpo_schedule_deadline =
@@ -12196,6 +12401,18 @@ int main(int argc, char** argv) {
   total_games += current_collect.games;
   total_moves += current_collect.moves;
 
+  open_spiel::CardMetrics cum_card11;
+  open_spiel::CardMetrics cum_card13;
+  const std::string card_telemetry_path = absl::GetFlag(FLAGS_card_telemetry_path);
+  if (!card_telemetry_path.empty()) {
+    open_spiel::LoadCardTelemetry(card_telemetry_path, &cum_card11, &cum_card13, start_update - 1);
+  }
+
+  const std::string cutoff_str = absl::GetFlag(FLAGS_cutoff_timestamp);
+  double cutoff_epoch = absl::GetFlag(FLAGS_cutoff_epoch);
+  int last_completed_update = start_update - 1;
+  bool final_checkpoint_saved = false;
+
   // Phase 18B: aux examples for the first update, from the same frozen snapshot
   // the pre-loop rollout used (sequential, main thread).
   run_aux_collection(start_update, current_collect);
@@ -12690,11 +12907,16 @@ int main(int argc, char** argv) {
           avg_search_kl, avg_search_grad, avg_ppo_grad, ratio, stats.explained_variance);
     }
 
+    cum_card11 += current_collect.card11_metrics;
+    cum_card13 += current_collect.card13_metrics;
+
     int checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
     int training_step = update - start_update + 1;
     bool is_pilot_update = absl::GetFlag(FLAGS_save_pilot_checkpoints) &&
         (training_step == 10 || training_step == 25 || training_step == 50);
-    if (is_pilot_update || (checkpoint_interval > 0 && update % checkpoint_interval == 0)) {
+    bool is_target_end = (update == target_end_update);
+    bool is_checkpoint = is_pilot_update || (checkpoint_interval > 0 && update % checkpoint_interval == 0) || is_target_end;
+    if (is_checkpoint) {
       std::string prefix = absl::GetFlag(FLAGS_run_prefix);
       if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
         std::string actor_model_path = absl::StrCat(prefix, "_actor_model_update_", update, ".pt");
@@ -12722,6 +12944,9 @@ int main(int argc, char** argv) {
                                    run_uuid,
                                    online_search_collection ? &aux_ckpt : nullptr);
       }
+      if (!card_telemetry_path.empty()) {
+        open_spiel::SaveCardTelemetry(card_telemetry_path, update, cum_card11, cum_card13, /*is_checkpoint=*/true);
+      }
     }
 
     for (size_t opp_i = 0; opp_i < opponent_models.size(); ++opp_i) {
@@ -12729,6 +12954,98 @@ int main(int argc, char** argv) {
       if (current_hash != opponent_hashes_before[opp_i]) {
         SpielFatalError(absl::StrFormat("CRITICAL ERROR: Opponent model %d mutated during training!", opp_i));
       }
+    }
+
+    if (!card_telemetry_path.empty()) {
+      open_spiel::SaveCardTelemetry(card_telemetry_path, update, cum_card11, cum_card13, /*is_checkpoint=*/false);
+    }
+
+    last_completed_update = update;
+
+    bool cutoff_reached = false;
+    if (cutoff_epoch > 0.0) {
+      double now_epoch = std::chrono::duration<double>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      if (now_epoch >= cutoff_epoch) {
+        cutoff_reached = true;
+      }
+    }
+    if (open_spiel::g_stop_requested.load(std::memory_order_relaxed)) {
+      cutoff_reached = true;
+    }
+
+    if (cutoff_reached) {
+      std::cout << absl::StrFormat(
+          "\n[dune_ppo_train] Stopping endpoint reached at update %d (cutoff=%s, epoch=%.1f, g_stop=%d).\n",
+          update, cutoff_str, cutoff_epoch, open_spiel::g_stop_requested.load()) << std::flush;
+
+      if (have_bg) {
+        bg_collect_thread.join();
+        have_bg = false;
+      }
+
+      int interval = absl::GetFlag(FLAGS_checkpoint_interval);
+      if (interval <= 0 || update % interval != 0) {
+        std::string prefix = absl::GetFlag(FLAGS_run_prefix);
+        if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
+          std::string actor_model_path = absl::StrCat(prefix, "_actor_model_update_", update, ".pt");
+          std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_update_", update, ".pt");
+          std::string critic_model_path = absl::StrCat(prefix, "_critic_model_update_", update, ".pt");
+          std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_update_", update, ".pt");
+          open_spiel::SaveDualCheckpoint(
+              training_model, *optimizer, training_critic, *critic_optimizer,
+              actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+              update, update, total_env_steps.load(), next_episode_id.load(),
+              master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+              search_label_fingerprint, run_uuid,
+              absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+        } else {
+          std::string model_path = absl::StrCat(prefix, "_model_update_", update, ".pt");
+          std::string optim_path = absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
+          open_spiel::OnlineCollectionState aux_ckpt = build_aux_state();
+          open_spiel::SaveCheckpoint(training_model, *optimizer, model_path,
+                                     optim_path, update, update,
+                                     total_env_steps.load(), next_episode_id.load(),
+                                     master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                     config_fingerprint, search_label_fingerprint,
+                                     run_uuid,
+                                     online_search_collection ? &aux_ckpt : nullptr);
+        }
+      }
+
+      if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
+        std::string prefix = absl::GetFlag(FLAGS_run_prefix);
+        if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
+          std::string actor_model_path = absl::StrCat(prefix, "_actor_model_final.pt");
+          std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_final.pt");
+          std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
+          std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
+          open_spiel::SaveDualCheckpoint(
+              training_model, *optimizer, training_critic, *critic_optimizer,
+              actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+              update, update, total_env_steps.load(), next_episode_id.load(),
+              master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+              search_label_fingerprint, run_uuid,
+              absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+        } else {
+          std::string model_path = absl::StrCat(prefix, "_model_final.pt");
+          std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+          open_spiel::OnlineCollectionState aux_final = build_aux_state();
+          open_spiel::SaveCheckpoint(training_model, *optimizer,
+                                     model_path, optim_path,
+                                     update, update,
+                                     total_env_steps.load(), next_episode_id.load(),
+                                     master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                     config_fingerprint, search_label_fingerprint,
+                                     run_uuid,
+                                     online_search_collection ? &aux_final : nullptr);
+        }
+        final_checkpoint_saved = true;
+      }
+      if (!card_telemetry_path.empty()) {
+        open_spiel::SaveCardTelemetry(card_telemetry_path, update, cum_card11, cum_card13, /*is_checkpoint=*/true);
+      }
+      break;
     }
 
     // Advance to next rollout.
@@ -12764,7 +13081,7 @@ int main(int argc, char** argv) {
       eval_stats.avg_batch_size,
       static_cast<unsigned long long>(eval_stats.max_batch_size));
 
-  if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
+  if (absl::GetFlag(FLAGS_save_final_checkpoint) && !final_checkpoint_saved && last_completed_update >= start_update) {
     std::string prefix = absl::GetFlag(FLAGS_run_prefix);
     if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
       std::string actor_model_path = absl::StrCat(prefix, "_actor_model_final.pt");
@@ -12774,7 +13091,7 @@ int main(int argc, char** argv) {
       open_spiel::SaveDualCheckpoint(
           training_model, *optimizer, training_critic, *critic_optimizer,
           actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
-          target_end_update, target_end_update, total_env_steps.load(), next_episode_id.load(),
+          last_completed_update, last_completed_update, total_env_steps.load(), next_episode_id.load(),
           master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
           search_label_fingerprint, run_uuid,
           absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
@@ -12784,13 +13101,16 @@ int main(int argc, char** argv) {
       open_spiel::OnlineCollectionState aux_final = build_aux_state();
       open_spiel::SaveCheckpoint(training_model, *optimizer,
                                  model_path, optim_path,
-                                 target_end_update, target_end_update,
+                                 last_completed_update, last_completed_update,
                                  total_env_steps.load(), next_episode_id.load(),
                                  master, absl::GetFlag(FLAGS_seed_scheme_version),
                                  config_fingerprint, search_label_fingerprint,
                                  run_uuid,
                                  online_search_collection ? &aux_final : nullptr);
     }
+  }
+  if (!card_telemetry_path.empty() && last_completed_update >= start_update) {
+    open_spiel::SaveCardTelemetry(card_telemetry_path, last_completed_update, cum_card11, cum_card13, /*is_checkpoint=*/true);
   }
   return 0;
 #endif
