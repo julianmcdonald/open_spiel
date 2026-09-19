@@ -230,6 +230,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_diagnose dune_diagnose.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_diagnose ${TORCH_LIBRARIES})
 
+  add_executable(dune_two_card_exposure_diagnostic dune_two_card_exposure_diagnostic.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_two_card_exposure_diagnostic dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_create_corpus dune_create_corpus.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_create_corpus dune_search ${TORCH_LIBRARIES})
 

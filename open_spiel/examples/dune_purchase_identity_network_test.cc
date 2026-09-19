@@ -891,6 +891,44 @@ void TestBootstrappedBundleVerification(const std::filesystem::path& bundle_dir)
   std::cout << "Real bootstrapped B400 bundle reload, evaluation, and update step passed successfully.\n";
 }
 
+void TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors() {
+  auto game = LoadGame("dune_imperium(enable_immortality=true)");
+  auto state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    state->ApplyAction(state->ChanceOutcomes().front().first);
+  }
+  auto* impl = dynamic_cast<DuneImperiumState*>(state.get());
+  SPIEL_CHECK_TRUE(impl != nullptr);
+  impl->SetPhaseForTesting(GamePhase::kRevealTurns);
+  impl->SetCurrentPlayerForTesting(0);
+  impl->SetSpecimensForTesting(0, 10);
+
+  for (bool swap_slots : {false, true}) {
+    if (!swap_slots) {
+      impl->SetTleilaxuRowForTesting({11, 13});
+    } else {
+      impl->SetTleilaxuRowForTesting({13, 11});
+    }
+
+    const auto legal = impl->LegalActions();
+    SPIEL_CHECK_TRUE(std::find(legal.begin(), legal.end(), kActionTleilaxuAcquire0 + 1) != legal.end());
+    SPIEL_CHECK_TRUE(std::find(legal.begin(), legal.end(), kActionTleilaxuAcquire0 + 2) != legal.end());
+
+    dune_semantic::CandidateActionData cand_data;
+    dune_semantic::ExtractCandidateDescriptors(*impl, legal, &cand_data);
+
+    for (size_t i = 0; i < cand_data.actions.size(); ++i) {
+      if (cand_data.actions[i] == kActionTleilaxuAcquire0 + 1 ||
+          cand_data.actions[i] == kActionTleilaxuAcquire0 + 2) {
+        SPIEL_CHECK_EQ(cand_data.supported[i], 0);
+        SPIEL_CHECK_TRUE(cand_data.roles[i] == dune_semantic::ActionRole::kUnsupported);
+        SPIEL_CHECK_FLOAT_EQ(cand_data.features[i * dune_semantic::kSemanticFeatDim + 0], 1.0f);
+      }
+    }
+  }
+  std::cout << "PASS: TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -901,6 +939,7 @@ int main(int argc, char** argv) {
   open_spiel::TestInputMigration();
   open_spiel::TestIncumbentMigration(artifacts_dir);
   open_spiel::TestEvaluatorSemanticScoring();
+  open_spiel::TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors();
   open_spiel::TestSemanticDualHeadMigrationAndStagedGradients(artifacts_dir);
   open_spiel::TestVersionAwareScorerDeserialization(artifacts_dir / "version_aware");
   open_spiel::TestFailClosedValidation(artifacts_dir / "fail_closed");
