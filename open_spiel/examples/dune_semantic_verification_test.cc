@@ -42,7 +42,6 @@ ABSL_FLAG(double, value_coef, 0.5, "");
 ABSL_FLAG(double, logit_cap, 10.0, "");
 ABSL_FLAG(double, target_kl, 0.0, "");
 ABSL_FLAG(bool, train_amp, false, "");
-ABSL_FLAG(bool, rollout_amp, false, "");
 ABSL_FLAG(bool, allow_tf32, false, "");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
@@ -177,6 +176,7 @@ inline std::unique_ptr<State> AdvanceToAgentTurns(
 
 int main(int argc, char** argv) {
   std::cout << "=== Running Dune Semantic Action Scorer Verification Tests ===\n";
+  absl::SetFlag(&FLAGS_rollout_amp, false);
 
   torch::Device device(torch::kCPU);
   const char* force_cuda = std::getenv("DUNE_VERIFY_CUDA");

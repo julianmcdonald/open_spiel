@@ -81,7 +81,6 @@ ABSL_FLAG(double, value_coef, 0.5, "");
 ABSL_FLAG(double, logit_cap, 10.0, "");
 ABSL_FLAG(double, target_kl, 0.0, "");
 ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(bool, rollout_amp, true, "");
 ABSL_FLAG(bool, allow_tf32, true, "");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
@@ -1208,11 +1207,12 @@ void TestDiagnosticsCsvSchemaGate() {
 // A3 assertion can recompute the saturation fraction from the SAME stored
 // values the implementation used.
 static PpoUpdateStats RunPrepassFixture(int global_update,
-                                        std::vector<float>* out_values = nullptr) {
+                                        std::vector<float>* out_values = nullptr,
+                                        torch::Device device = torch::kCPU) {
   const int64_t obs = 12, act = 5;
   torch::manual_seed(0x9E4F1);
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs, 32, act, 2);
-  model->to(torch::kCPU);
+  model->to(device);
   torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
   std::vector<PpoTransition> batch(8);
   for (int i = 0; i < 8; ++i) {
@@ -1253,7 +1253,7 @@ static PpoUpdateStats RunPrepassFixture(int global_update,
   absl::SetFlag(&FLAGS_diagnostics_only, false);
   absl::SetFlag(&FLAGS_train_value_only, false);
   torch::manual_seed(31337);
-  return TrainPpoUpdate(model, opt, batch, obs, act, torch::kCPU,
+  return TrainPpoUpdate(model, opt, batch, obs, act, device,
                         /*master=*/11, global_update);
 }
 
@@ -1289,16 +1289,19 @@ void TestDiagPrepassCadenced() {
     // Off-cadence update: the KL is NOT measured, and that is distinguishable
     // from a measured KL of zero by measured_transitions == -1 (A2; the R2
     // sentinel — 0 is reserved for "measured over zero nontrivial
-    // transitions", e.g. an all-forced rollout).
+    // transitions", e.g. an all-forced rollout). Expensive hashes are also
+    // skipped and explicitly marked as "unmeasured".
     PpoUpdateStats skipped = RunPrepassFixture(/*global_update=*/8);
     CHECK_EQ(skipped.measured_transitions, int64_t{-1});
     UTILS_CHECK(skipped.policy_kl_before == 0.0);
+    CHECK_EQ(skipped.rollout_hash, std::string("unmeasured"));
     // The saturation metric is unconditional in cadenced mode.
     UTILS_CHECK(skipped.fraction_critic_near_1 == first.fraction_critic_near_1);
 
     // On-cadence update (50 % 25 == 0): measured again.
     PpoUpdateStats on_cadence = RunPrepassFixture(/*global_update=*/50);
     CHECK_EQ(on_cadence.measured_transitions, on_cadence.nontrivial_transitions);
+    UTILS_CHECK(!on_cadence.rollout_hash.empty() && on_cadence.rollout_hash != "unmeasured");
 
     // The v6 column: present, LAST, and carrying the value -- in cadenced
     // mode. Header and row stay the same width.
@@ -1314,6 +1317,7 @@ void TestDiagPrepassCadenced() {
     UTILS_CHECK(header.back() == "measured_transitions");
     // R2 sentinel: an unmeasured update serializes as -1, never 0.
     CHECK_EQ(row.back(), std::string("-1"));
+    CHECK_EQ(row[5], std::string("unmeasured"));
     std::filesystem::remove(csv_path);
 
     // Back to defaults: the v4 header shape is untouched in full mode.
@@ -1321,6 +1325,191 @@ void TestDiagPrepassCadenced() {
     CHECK_EQ(SplitCsvRow(DiagnosticsCsvHeader(false)).size(),
              static_cast<size_t>(69));
     ResetDiagPrepassStateForTesting();
+  } TEST_END();
+}
+
+void TestDiagPrepassCudaPrecision() {
+  TEST_BEGIN("Cadenced prepass: CUDA FP32 precision matches full mode exactly when rollout_amp=false") {
+    if (!torch::cuda::is_available()) {
+      std::cout << "[CUDA unavailable, skipping CUDA precision test] ";
+      return;
+    }
+    torch::Device cuda_device(torch::kCUDA);
+
+    // Baseline full mode on CUDA (runs in pure FP32).
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "full");
+    absl::SetFlag(&FLAGS_rollout_amp, false);
+    PpoUpdateStats full_stats = RunPrepassFixture(/*global_update=*/1, /*out_values=*/nullptr, cuda_device);
+    CHECK_EQ(full_stats.measured_transitions, full_stats.nontrivial_transitions);
+    UTILS_CHECK(full_stats.policy_kl_before > 0.0);
+
+    // Cadenced mode on CUDA with rollout_amp=false.
+    // Must execute in exact FP32 and produce identical policy_kl_before to full mode.
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "cadenced");
+    absl::SetFlag(&FLAGS_diag_prepass_interval, 25);
+    absl::SetFlag(&FLAGS_rollout_amp, false);
+    ResetDiagPrepassStateForTesting();
+    PpoUpdateStats cadenced_stats = RunPrepassFixture(/*global_update=*/1, /*out_values=*/nullptr, cuda_device);
+    CHECK_EQ(cadenced_stats.measured_transitions, cadenced_stats.nontrivial_transitions);
+    CHECK_EQ(cadenced_stats.policy_kl_before, full_stats.policy_kl_before);
+
+    // Now test with rollout_amp=true on CUDA: AutocastGuard enables BF16.
+    // Due to BF16 rounding, KL will differ slightly, confirming rollout_amp is actively honored.
+    absl::SetFlag(&FLAGS_rollout_amp, true);
+    ResetDiagPrepassStateForTesting();
+    PpoUpdateStats cadenced_bf16_stats = RunPrepassFixture(/*global_update=*/1, /*out_values=*/nullptr, cuda_device);
+    CHECK_EQ(cadenced_bf16_stats.measured_transitions, cadenced_bf16_stats.nontrivial_transitions);
+    UTILS_CHECK(cadenced_bf16_stats.policy_kl_before > 0.0);
+
+    // Restore default
+    absl::SetFlag(&FLAGS_rollout_amp, true);
+    absl::SetFlag(&FLAGS_diag_prepass_mode, "full");
+    ResetDiagPrepassStateForTesting();
+  } TEST_END();
+}
+
+void TestPackedMinibatchAlignment() {
+  TEST_BEGIN("Packed minibatch alignment at staging boundary including partial tail and candidate rejection") {
+    const int64_t obs_size = 8, action_dim = 6;
+    const int64_t total_transitions = 5;
+    const int64_t mb_size = 4;
+    std::vector<PpoTransition> batch(total_transitions);
+    for (int i = 0; i < total_transitions; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.15f * (i + 1));
+      batch[i].legal_actions = {0, 1, static_cast<Action>(2 + (i % 3))};
+      batch[i].action = batch[i].legal_actions[0];
+      batch[i].old_log_prob = -1.2f;
+      batch[i].reward = 0.1f * i;
+      batch[i].value = 0.2f * i;
+      batch[i].advantage = 0.05f * i;
+      batch[i].return_value = 0.25f * i;
+      batch[i].episode_id = 500 + i;
+
+      auto& cd = batch[i].candidate_data;
+      cd.actions = batch[i].legal_actions;
+      cd.features.resize(cd.actions.size() * dune_semantic::kSemanticFeatDim, 0.5f);
+      cd.card_ids.resize(cd.actions.size(), 10 + i);
+      cd.space_ids.resize(cd.actions.size(), 20 + i);
+      cd.supported.resize(cd.actions.size(), 1);
+      cd.roles.resize(cd.actions.size(), dune_semantic::ActionRole::kBoardSpace);
+    }
+
+    std::vector<float> staging_states(mb_size * obs_size, 0.0f);
+    std::unique_ptr<bool[]> staging_masks = std::make_unique<bool[]>(mb_size * action_dim);
+    std::vector<int64_t> staging_actions(mb_size, 0);
+    std::vector<const dune_semantic::CandidateActionData*> mb_cands;
+
+    // Test Minibatch 1: size 4 (indices 0, 1, 2, 3)
+    int64_t mb1_indices[4] = {0, 1, 2, 3};
+    mb_cands.resize(4);
+    for (int i = 0; i < 4; ++i) {
+      int64_t idx = mb1_indices[i];
+      std::memcpy(staging_states.data() + i * obs_size, batch[idx].state.data(), obs_size * sizeof(float));
+      std::memset(staging_masks.get() + i * action_dim, 0, action_dim * sizeof(bool));
+      for (Action a : batch[idx].legal_actions) staging_masks[i * action_dim + a] = true;
+      staging_actions[i] = batch[idx].action;
+      mb_cands[i] = &batch[idx].candidate_data;
+    }
+
+    std::string err;
+    UTILS_CHECK(VerifyPackedMinibatchAlignment(
+        batch, mb1_indices, 0, 4, obs_size, action_dim,
+        staging_states.data(), staging_masks.get(), staging_actions.data(),
+        mb_cands, &err));
+
+    // Test Minibatch 2: size 1 (partial tail, index 4)
+    int64_t mb2_indices[1] = {4};
+    mb_cands.resize(1);
+    std::memcpy(staging_states.data(), batch[4].state.data(), obs_size * sizeof(float));
+    std::memset(staging_masks.get(), 0, action_dim * sizeof(bool));
+    for (Action a : batch[4].legal_actions) staging_masks[a] = true;
+    staging_actions[0] = batch[4].action;
+    mb_cands[0] = &batch[4].candidate_data;
+
+    UTILS_CHECK(VerifyPackedMinibatchAlignment(
+        batch, mb2_indices, 0, 1, obs_size, action_dim,
+        staging_states.data(), staging_masks.get(), staging_actions.data(),
+        mb_cands, &err));
+
+    // Repack Minibatch 1 to test candidate swap and negative cases
+    mb_cands.resize(4);
+    for (int i = 0; i < 4; ++i) {
+      int64_t idx = mb1_indices[i];
+      std::memcpy(staging_states.data() + i * obs_size, batch[idx].state.data(), obs_size * sizeof(float));
+      std::memset(staging_masks.get() + i * action_dim, 0, action_dim * sizeof(bool));
+      for (Action a : batch[idx].legal_actions) staging_masks[i * action_dim + a] = true;
+      staging_actions[i] = batch[idx].action;
+      mb_cands[i] = &batch[idx].candidate_data;
+    }
+
+    // Deliberately swap candidate rows in Minibatch 1: swap row 0 and row 1
+    std::swap(mb_cands[0], mb_cands[1]);
+    UTILS_CHECK(!VerifyPackedMinibatchAlignment(
+        batch, mb1_indices, 0, 4, obs_size, action_dim,
+        staging_states.data(), staging_masks.get(), staging_actions.data(),
+        mb_cands, &err));
+    UTILS_CHECK(err.find("candidate pointer mismatch") != std::string::npos);
+    std::swap(mb_cands[0], mb_cands[1]); // restore
+
+    // Deliberately corrupt state observation in staging buffer
+    staging_states[0] += 1.0f;
+    UTILS_CHECK(!VerifyPackedMinibatchAlignment(
+        batch, mb1_indices, 0, 4, obs_size, action_dim,
+        staging_states.data(), staging_masks.get(), staging_actions.data(),
+        mb_cands, &err));
+    UTILS_CHECK(err.find("state mismatch") != std::string::npos);
+    staging_states[0] = batch[0].state[0]; // exact bit restore
+
+    // Deliberately corrupt action in staging buffer
+    staging_actions[0] ^= 1;
+    UTILS_CHECK(!VerifyPackedMinibatchAlignment(
+        batch, mb1_indices, 0, 4, obs_size, action_dim,
+        staging_states.data(), staging_masks.get(), staging_actions.data(),
+        mb_cands, &err));
+    UTILS_CHECK(err.find("action mismatch") != std::string::npos);
+  } TEST_END();
+}
+
+void TestRolloutCandidateVerification() {
+  TEST_BEGIN("Rollout candidate alignment and semantic candidate digest verification") {
+    const int64_t obs_size = 8;
+    std::vector<PpoTransition> batch(3);
+    for (int i = 0; i < 3; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.2f * (i + 1));
+      batch[i].legal_actions = {0, 1};
+      batch[i].action = 0;
+      batch[i].old_log_prob = -0.7f;
+      batch[i].reward = 1.0f;
+      batch[i].value = 0.5f;
+      batch[i].advantage = 0.1f;
+      batch[i].return_value = 0.6f;
+      batch[i].episode_id = 700 + i;
+
+      auto& cd = batch[i].candidate_data;
+      cd.actions = {0, 1};
+      cd.features.resize(cd.actions.size() * dune_semantic::kSemanticFeatDim, 0.1f * (i + 1));
+      cd.card_ids = {1, 2};
+      cd.space_ids = {10, 20};
+      cd.supported = {1, 1};
+      cd.roles = {dune_semantic::ActionRole::kBoardSpace, dune_semantic::ActionRole::kPrimaryCard};
+    }
+
+    std::string err;
+    UTILS_CHECK(VerifyRolloutCandidateAlignment(batch, &err));
+    std::string digest1 = ComputeRolloutSemanticDigest(batch);
+    CHECK_EQ(digest1.size(), size_t{64});
+
+    // Identical batch gives identical digest
+    std::string digest2 = ComputeRolloutSemanticDigest(batch);
+    CHECK_EQ(digest1, digest2);
+
+    // Mutating any candidate field changes the digest and causes alignment failure
+    batch[0].candidate_data.actions[0] = 5; // Mismatch with legal_actions[0] == 0
+    UTILS_CHECK(!VerifyRolloutCandidateAlignment(batch, &err));
+    UTILS_CHECK(err.find("action mismatch") != std::string::npos);
+
+    std::string digest_mutated = ComputeRolloutSemanticDigest(batch);
+    UTILS_CHECK(digest_mutated != digest1);
   } TEST_END();
 }
 
@@ -9187,6 +9376,9 @@ int main() {
   TestDiagnosticsPersistAuxMetrics();
   TestDiagnosticsCsvSchemaGate();
   TestDiagPrepassCadenced();
+  TestDiagPrepassCudaPrecision();
+  TestPackedMinibatchAlignment();
+  TestRolloutCandidateVerification();
   TestGradTelemetryAccumulatedParity();
   TestRawPpoNumericalParityMathAndDefaultInertness();
   TestRawPpoNumericalParityV3CaptureAndClassification();
@@ -10639,6 +10831,83 @@ int main() {
     UTILS_CHECK(update_line.find("\"minibatches\":4") != std::string::npos);
 
     std::filesystem::remove_all(test_dir);
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate reusable buffers: legal mask zeroing across minibatches") {
+    const int64_t obs_size = 16, action_dim = 10;
+    torch::manual_seed(12345);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model->to(torch::kCPU);
+    torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    // Batch of 4 transitions with minibatch_size = 2.
+    // Minibatch 1 (trans 0, 1): many legal actions {0, 1, 2, 3, 4, 5, 6, 7}.
+    // Minibatch 2 (trans 2, 3): single legal action {0} only.
+    std::vector<PpoTransition> batch(4);
+    for (int i = 0; i < 4; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.2f * (i + 1));
+      batch[i].action = 0;
+      batch[i].old_log_prob = -1.0f;
+      batch[i].reward = 0.5f;
+      batch[i].value = 0.5f;
+      batch[i].advantage = 0.5f;
+      batch[i].return_value = 0.5f;
+      batch[i].episode_id = i + 1;
+    }
+    batch[0].legal_actions = {0, 1, 2, 3, 4, 5, 6, 7};
+    batch[1].legal_actions = {0, 1, 2, 3, 4, 5, 6, 7};
+    batch[2].legal_actions = {0};
+    batch[3].legal_actions = {0};
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+
+    PpoUpdateStats stats = TrainPpoUpdate(
+        model, optimizer, batch, obs_size, action_dim, torch::kCPU,
+        /*master=*/999, /*global_update=*/1);
+
+    UTILS_CHECK(std::isfinite(stats.policy_loss));
+    UTILS_CHECK(std::isfinite(stats.value_loss));
+    UTILS_CHECK(stats.minibatches == 4); // 2 epochs * 2 minibatches
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate reusable buffers: partial minibatch tail processing") {
+    const int64_t obs_size = 16, action_dim = 8;
+    torch::manual_seed(54321);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model->to(torch::kCPU);
+    torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    // Batch of 5 transitions with minibatch_size = 4 (partial tail = 1 row)
+    std::vector<PpoTransition> batch(5);
+    for (int i = 0; i < 5; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.1f * (i + 1));
+      batch[i].legal_actions = {0, 1, 2};
+      batch[i].action = i % 3;
+      batch[i].old_log_prob = -1.0986f;
+      batch[i].reward = 0.1f * (i + 1);
+      batch[i].value = 0.2f * (i + 1);
+      batch[i].advantage = 0.05f * (i + 1);
+      batch[i].return_value = 0.25f * (i + 1);
+      batch[i].episode_id = 100 + i;
+    }
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+
+    PpoUpdateStats stats = TrainPpoUpdate(
+        model, optimizer, batch, obs_size, action_dim, torch::kCPU,
+        /*master=*/888, /*global_update=*/1);
+
+    // 1 epoch * ceil(5/4) = 2 minibatches (one of size 4, one of size 1)
+    UTILS_CHECK(stats.minibatches == 2);
+    UTILS_CHECK(stats.total_transitions == 5);
+    UTILS_CHECK(std::isfinite(stats.policy_loss));
+    UTILS_CHECK(std::isfinite(stats.value_loss));
+    UTILS_CHECK(std::isfinite(stats.explained_variance));
   } TEST_END();
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

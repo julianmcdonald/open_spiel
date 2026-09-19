@@ -21,7 +21,10 @@
 #include <optional>
 #include "dune_network.h"
 #include "dune_online_search_collector.h"  // SearchTrainingExample (18B combined opt)
+#include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #endif
+
+ABSL_DECLARE_FLAG(bool, rollout_amp);
 
 namespace open_spiel {
 
@@ -413,6 +416,24 @@ struct PpoUpdateStats {
 };
 
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch);
+std::string ComputeRolloutSemanticDigest(const std::vector<PpoTransition>& batch);
+
+bool VerifyRolloutCandidateAlignment(
+    const std::vector<PpoTransition>& batch,
+    std::string* error_msg = nullptr);
+
+bool VerifyPackedMinibatchAlignment(
+    const std::vector<PpoTransition>& batch,
+    const int64_t* mb_indices,
+    int64_t start_seq,
+    int64_t mb_len,
+    int64_t obs_size,
+    int64_t action_dim,
+    const float* staging_states_ptr,
+    const bool* staging_masks_ptr,
+    const int64_t* staging_actions_ptr,
+    const std::vector<const dune_semantic::CandidateActionData*>& mb_cands,
+    std::string* error_msg = nullptr);
 
 torch::Tensor LegalLogitMean(const torch::Tensor& logits,
                              const torch::Tensor& legal_mask);
@@ -1097,6 +1118,53 @@ std::vector<double> ComputeTerminalReturns(
     const State& state,
     const std::string& reward_mode,
     double round7_speed_bonus);
+
+// Formats double with round-trip precision (17 significant decimal digits)
+inline std::string FormatDoubleRoundTrip(double v) {
+  if (std::isnan(v)) return "\"nan\"";
+  if (std::isinf(v)) return v > 0 ? "\"inf\"" : "\"-inf\"";
+  return absl::StrFormat("%.17g", v);
+}
+
+// Verification sidecar serializer with IEEE-754 round-trip precision and epoch KLs.
+inline std::string SerializeVerificationSidecarRecord(
+    int64_t update,
+    int64_t transitions,
+    const std::string& semantic_digest,
+    const std::string& rollout_hash,
+    double policy_kl_before,
+    const std::vector<double>& epoch_kls,
+    int64_t measured_transitions,
+    double fraction_critic_near_1,
+    int minibatches,
+    double policy_loss,
+    double value_loss,
+    double explained_variance,
+    bool early_stopped,
+    int64_t kl_early_stop_epoch) {
+  std::string out = "{";
+  absl::StrAppend(&out, "\"update\": ", update, ", ");
+  absl::StrAppend(&out, "\"transitions\": ", transitions, ", ");
+  absl::StrAppend(&out, "\"semantic_candidate_digest\": \"", semantic_digest, "\", ");
+  absl::StrAppend(&out, "\"rollout_hash\": \"", rollout_hash, "\", ");
+  absl::StrAppend(&out, "\"policy_kl_before\": ", FormatDoubleRoundTrip(policy_kl_before), ", ");
+  absl::StrAppend(&out, "\"epoch_kls\": [");
+  for (size_t i = 0; i < epoch_kls.size(); ++i) {
+    if (i > 0) absl::StrAppend(&out, ", ");
+    absl::StrAppend(&out, FormatDoubleRoundTrip(epoch_kls[i]));
+  }
+  absl::StrAppend(&out, "], ");
+  absl::StrAppend(&out, "\"measured_transitions\": ", measured_transitions, ", ");
+  absl::StrAppend(&out, "\"fraction_critic_near_1\": ", FormatDoubleRoundTrip(fraction_critic_near_1), ", ");
+  absl::StrAppend(&out, "\"minibatches\": ", minibatches, ", ");
+  absl::StrAppend(&out, "\"policy_loss\": ", FormatDoubleRoundTrip(policy_loss), ", ");
+  absl::StrAppend(&out, "\"value_loss\": ", FormatDoubleRoundTrip(value_loss), ", ");
+  absl::StrAppend(&out, "\"explained_variance\": ", FormatDoubleRoundTrip(explained_variance), ", ");
+  absl::StrAppend(&out, "\"early_stopped\": ", early_stopped ? "true" : "false", ", ");
+  absl::StrAppend(&out, "\"kl_early_stop_epoch\": ", kl_early_stop_epoch);
+  absl::StrAppend(&out, "}");
+  return out;
+}
 
 } // namespace open_spiel
 

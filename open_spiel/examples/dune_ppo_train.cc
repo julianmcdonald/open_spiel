@@ -104,9 +104,9 @@ ABSL_FLAG(int, num_blocks, 8, "Network residual block count.");
 ABSL_FLAG(double, logit_cap, 10.0,
           "Smooth tanh cap on legal-centered policy logits. <=0 disables.");
 ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
-ABSL_FLAG(bool, rollout_amp, true,
-          "Use CUDA BF16 autocast for BatchedEvaluator rollout inference. "
-          "Default true preserves the historical rollout path.");
+ABSL_FLAG(std::string, verification_sidecar_path, "",
+          "Direct path for verification sidecar JSONL. Records full-precision KLs "
+          "and complete input digests.");
 ABSL_FLAG(bool, allow_tf32, true,
           "Allow TF32 for CUDA CuBLAS/CuDNN. Default true preserves the "
           "historical runtime policy.");
@@ -384,6 +384,8 @@ ABSL_FLAG(bool, allow_reward_transition, false,
           "Allow validated reward continuation transition from source checkpoint.");
 ABSL_FLAG(std::string, reward_transition_source_fingerprint, "",
           "Expected source config fingerprint for reward continuation transition.");
+ABSL_FLAG(int64_t, reward_transition_source_rollout_games, 0,
+          "Expected source rollout_games when transitioning configuration.");
 ABSL_FLAG(int, seed, 1, "Base random seed.");
 ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
@@ -1875,6 +1877,11 @@ std::string ValidateAndComputeRewardTransitionFingerprint(
   double source_plot = get_double_or_default("plot_intrigue_penalty", 0.0);
   int64_t source_plot_thresh = get_int_or_default("plot_intrigue_exemption_threshold", 0);
 
+  int64_t source_rollout_games = absl::GetFlag(FLAGS_reward_transition_source_rollout_games);
+  if (source_rollout_games <= 0) {
+    source_rollout_games = get_int_or_default("rollout_games", 0);
+  }
+
   // Reconstruct source pre-precision config from current flags with source penalties substituted
   auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
   source_config_obj["specimen_exchange_penalty"] = source_specimen;
@@ -1889,6 +1896,9 @@ std::string ValidateAndComputeRewardTransitionFingerprint(
   } else {
     source_config_obj.erase("plot_intrigue_penalty");
     source_config_obj.erase("plot_intrigue_exemption_threshold");
+  }
+  if (source_rollout_games > 0) {
+    source_config_obj["rollout_games"] = source_rollout_games;
   }
 
   std::string computed_source_fp = open_spiel::ComputePrecisionConfigFingerprint(
@@ -1918,11 +1928,14 @@ std::string ValidateAndComputeRewardTransitionFingerprint(
       "  Target fingerprint: %s\n"
       "  Specimen penalty:   %.4f -> %.4f\n"
       "  Plot penalty:       %.4f -> %.4f\n"
-      "  Atomics penalty:    %.4f (unchanged)\n",
+      "  Atomics penalty:    %.4f (unchanged)\n"
+      "  Rollout games:      %d -> %d\n",
       computed_source_fp, current_config_fingerprint,
       source_specimen, absl::GetFlag(FLAGS_specimen_exchange_penalty),
       source_plot, absl::GetFlag(FLAGS_plot_intrigue_penalty),
-      source_family_atomics) << std::endl;
+      source_family_atomics,
+      source_rollout_games > 0 ? source_rollout_games : absl::GetFlag(FLAGS_rollout_games),
+      absl::GetFlag(FLAGS_rollout_games)) << std::endl;
 
   return computed_source_fp;
 }
@@ -2033,6 +2046,7 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
     manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
     manifest_obj["plot_intrigue_exemption_threshold"] = static_cast<int64_t>(absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold));
+    manifest_obj["rollout_games"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
     if (!g_reward_transition_source_fingerprint.empty()) {
       manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
       if (g_reward_transition_source_update >= 0) {
@@ -12153,6 +12167,28 @@ int main(int argc, char** argv) {
                                    val_kl,
                                    absl::GetFlag(FLAGS_emit_canary_columns));
     }
+    std::string verification_sidecar_path = absl::GetFlag(FLAGS_verification_sidecar_path);
+    if (!verification_sidecar_path.empty()) {
+      std::string semantic_digest = open_spiel::ComputeRolloutSemanticDigest(current_collect.rollout);
+      std::ofstream v_file(verification_sidecar_path, std::ios::app);
+      if (v_file.is_open()) {
+        v_file << open_spiel::SerializeVerificationSidecarRecord(
+            static_cast<int64_t>(start_update),
+            static_cast<int64_t>(current_collect.rollout.size()),
+            semantic_digest,
+            stats.rollout_hash,
+            stats.policy_kl_before,
+            stats.epoch_kls,
+            stats.measured_transitions,
+            stats.fraction_critic_near_1,
+            stats.minibatches,
+            stats.policy_loss,
+            stats.value_loss,
+            stats.explained_variance,
+            stats.early_stopped,
+            static_cast<int64_t>(stats.kl_early_stop_epoch)) << "\n";
+      }
+    }
     std::cout << "Diagnostics-only run complete. Exiting.\n";
     exit(0);
   }
@@ -12401,6 +12437,29 @@ int main(int argc, char** argv) {
       open_spiel::WritePhaseTimingToPath(sidecar_timing_path, update, stats,
                                          ppo_elapsed, run_uuid,
                                          absl::GetFlag(FLAGS_run_prefix));
+    }
+
+    std::string verification_sidecar_path = absl::GetFlag(FLAGS_verification_sidecar_path);
+    if (!verification_sidecar_path.empty()) {
+      std::string semantic_digest = open_spiel::ComputeRolloutSemanticDigest(current_collect.rollout);
+      std::ofstream v_file(verification_sidecar_path, std::ios::app);
+      if (v_file.is_open()) {
+        v_file << open_spiel::SerializeVerificationSidecarRecord(
+            static_cast<int64_t>(update),
+            static_cast<int64_t>(current_collect.rollout.size()),
+            semantic_digest,
+            stats.rollout_hash,
+            stats.policy_kl_before,
+            stats.epoch_kls,
+            stats.measured_transitions,
+            stats.fraction_critic_near_1,
+            stats.minibatches,
+            stats.policy_loss,
+            stats.value_loss,
+            stats.explained_variance,
+            stats.early_stopped,
+            static_cast<int64_t>(stats.kl_early_stop_epoch)) << "\n";
+      }
     }
 
     // --- Search auxiliary distillation steps ---

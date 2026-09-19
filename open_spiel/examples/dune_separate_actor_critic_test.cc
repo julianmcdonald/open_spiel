@@ -40,7 +40,6 @@ ABSL_FLAG(double, value_coef, 0.5, "");
 ABSL_FLAG(double, logit_cap, 10.0, "");
 ABSL_FLAG(double, target_kl, 0.0, "");
 ABSL_FLAG(bool, train_amp, false, "");
-ABSL_FLAG(bool, rollout_amp, false, "");
 ABSL_FLAG(bool, allow_tf32, false, "");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
@@ -776,6 +775,7 @@ void TestUnit8_CliArgumentSmokeValidation() {
 
 int main() {
   std::cout << "=== dune_separate_actor_critic_test ===" << std::endl;
+  absl::SetFlag(&FLAGS_rollout_amp, false);
   open_spiel::TestUnit1_U200ParityOnCpu();
   open_spiel::TestUnit2_StrictGradientAndParameterIsolation();
   open_spiel::TestUnit3_RolloutValueRouting();
