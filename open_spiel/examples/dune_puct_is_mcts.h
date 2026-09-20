@@ -11,6 +11,7 @@
 #include "open_spiel/algorithms/mcts.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_bots.h"
+#include "open_spiel/spiel_utils.h"
 
 namespace open_spiel {
 
@@ -19,6 +20,31 @@ enum class DuneISMCTSFinalPolicyType {
   kMaxVisitCount,
   kMaxValue,
 };
+
+enum class DuneActionSelectionMode {
+  kHistoricalSample = 0,
+  kPreserveRawGreedy = 1,
+};
+
+inline std::string DuneActionSelectionModeToString(DuneActionSelectionMode mode) {
+  switch (mode) {
+    case DuneActionSelectionMode::kHistoricalSample:
+      return "historical_sample";
+    case DuneActionSelectionMode::kPreserveRawGreedy:
+      return "preserve_raw_greedy";
+  }
+  return "unknown";
+}
+
+inline DuneActionSelectionMode ParseDuneActionSelectionMode(const std::string& str) {
+  if (str == "preserve_raw_greedy") {
+    return DuneActionSelectionMode::kPreserveRawGreedy;
+  }
+  if (str == "historical_sample") {
+    return DuneActionSelectionMode::kHistoricalSample;
+  }
+  SpielFatalError("Unknown action_selection_mode: " + str);
+}
 
 // ---------------------------------------------------------------------------
 // Reusable Types outside example binaries
@@ -170,6 +196,12 @@ struct DuneSearchConfig {
   // threshold and the min-visit definition are unchanged; only the generic
   // three-covered-actions clause is dropped, and only at Leader roots.
   bool leader_mass_only_coverage = false;
+
+  // Final-action selection mode. kHistoricalSample preserves historical F03
+  // sampling behavior. kPreserveRawGreedy enforces the raw-greedy incumbent
+  // whenever search is unused (bypassed or rejected) at temperature zero.
+  DuneActionSelectionMode action_selection_mode =
+      DuneActionSelectionMode::kHistoricalSample;
 };
 
 struct SearchDiagnostics {
@@ -269,6 +301,16 @@ struct SearchDiagnostics {
   Action stability_checkpoint_action = -1;
   bool stability_checkpoint_reached = false;
   bool stability_agreement = false;
+
+  // Decision boundary provenance and raw-prior incumbent preservation
+  Action incumbent_action = kInvalidAction;
+  double raw_prior_max_prob = 0.0;
+  double raw_prior_selected_prob = 0.0;
+  std::string raw_prior_max_prob_hex = "";
+  std::string raw_prior_selected_prob_hex = "";
+  std::string selection_mode = "historical_sample";
+  std::string selection_reason = "none";
+  bool search_accepted = false;
 
   // PWO-3 (docs/PWO3_REGISTRATION.md section 4.2). TELEMETRY ONLY: recorded at
   // checkpoints already visited by the loop, drawing no RNG and mutating no tree
@@ -484,6 +526,20 @@ class DunePUCTISMCTSBot : public Bot {
   const DuneSearchResult& GetLastSearchResult() const;
   Action GetRootRawPriorArgmax() const;
 
+  struct ControllerSelection {
+    Action selected_action = kInvalidAction;
+    Action incumbent_action = kInvalidAction;
+    double raw_prior_max_prob = 0.0;
+    double raw_prior_selected_prob = 0.0;
+    std::string raw_prior_max_prob_hex = "";
+    std::string raw_prior_selected_prob_hex = "";
+    std::string selection_mode = "historical_sample";
+    std::string selection_reason = "none";
+    bool search_accepted = false;
+  };
+
+  ControllerSelection SelectAction(const State& state, const DuneSearchResult& res);
+
   void Restart() override { Reset(); }
   void RestartAt(const State& state) override { Reset(); }
 
@@ -492,6 +548,9 @@ class DunePUCTISMCTSBot : public Bot {
 
   std::pair<Player, std::string> GetStateKey(const State& state) const;
   const absl::flat_hash_map<std::pair<Player, std::string>, DuneISMCTSNode*>& nodes() const { return nodes_; }
+
+  int GetSearchCount() const { return search_count_; }
+  void SetSearchCount(int c) { search_count_ = c; }
 
  private:
   void Reset();
@@ -516,6 +575,13 @@ class DunePUCTISMCTSBot : public Bot {
   // Dirichlet noise. This is the policy every starvation path degrades to.
   ActionsAndProbs FilterAndNormalizeRawPriors(DuneISMCTSNode* node, const std::vector<Action>& legal_actions) const;
   ActionsAndProbs GetFinalPolicy(const State& state, DuneISMCTSNode* node) const;
+
+  Action ComputeIncumbentFromNode(
+      DuneISMCTSNode* node, const std::vector<Action>& legal_actions,
+      double* max_prob_out = nullptr) const;
+  Action ComputeIncumbentFromPriors(
+      const ActionsAndProbs& priors, const std::vector<Action>& legal_actions,
+      double* max_prob_out = nullptr) const;
 
   std::mt19937 rng_;
   DuneSearchConfig config_;

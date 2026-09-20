@@ -10,6 +10,8 @@
 
 #include "open_spiel/abseil-cpp/absl/random/discrete_distribution.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -195,27 +197,73 @@ const DuneSearchResult& DunePUCTISMCTSBot::GetLastSearchResult() const {
   return last_search_result_;
 }
 
-Action DunePUCTISMCTSBot::GetRootRawPriorArgmax() const {
-  if (root_node_ != nullptr && !root_node_->child_info.empty()) {
-    Action best_action = kInvalidAction;
-    double max_prior = -1.0;
-    for (const auto& kv : root_node_->child_info) {
-      if (kv.second.raw_prior > max_prior) {
-        max_prior = kv.second.raw_prior;
-        best_action = kv.first;
-      }
-    }
-    if (best_action != kInvalidAction) return best_action;
+Action DunePUCTISMCTSBot::ComputeIncumbentFromNode(
+    DuneISMCTSNode* node, const std::vector<Action>& legal_actions,
+    double* max_prob_out) const {
+  if (legal_actions.empty()) {
+    if (max_prob_out) *max_prob_out = 0.0;
+    return kInvalidAction;
   }
-  Action best_action = kInvalidAction;
+  Action best_action = legal_actions.front();
   double max_prob = -1.0;
-  for (const auto& ap : last_search_result_.policy) {
-    if (ap.second > max_prob) {
-      max_prob = ap.second;
-      best_action = ap.first;
+  if (node != nullptr && node->child_info.count(best_action)) {
+    max_prob = node->child_info.at(best_action).raw_prior;
+  }
+  SPIEL_CHECK_TRUE(std::isfinite(max_prob));
+  for (size_t i = 1; i < legal_actions.size(); ++i) {
+    Action a = legal_actions[i];
+    double p = 0.0;
+    if (node != nullptr && node->child_info.count(a)) {
+      p = node->child_info.at(a).raw_prior;
+    }
+    SPIEL_CHECK_TRUE(std::isfinite(p));
+    if (p > max_prob) {
+      max_prob = p;
+      best_action = a;
     }
   }
+  if (max_prob_out) *max_prob_out = max_prob;
   return best_action;
+}
+
+Action DunePUCTISMCTSBot::ComputeIncumbentFromPriors(
+    const ActionsAndProbs& priors, const std::vector<Action>& legal_actions,
+    double* max_prob_out) const {
+  if (legal_actions.empty()) {
+    if (max_prob_out) *max_prob_out = 0.0;
+    return kInvalidAction;
+  }
+  absl::flat_hash_map<Action, double> prob_map;
+  for (const auto& ap : priors) prob_map[ap.first] = ap.second;
+  Action best_action = legal_actions.front();
+  double max_prob = prob_map.count(best_action) ? prob_map[best_action] : 0.0;
+  SPIEL_CHECK_TRUE(std::isfinite(max_prob));
+  for (size_t i = 1; i < legal_actions.size(); ++i) {
+    Action a = legal_actions[i];
+    double p = prob_map.count(a) ? prob_map[a] : 0.0;
+    SPIEL_CHECK_TRUE(std::isfinite(p));
+    if (p > max_prob) {
+      max_prob = p;
+      best_action = a;
+    }
+  }
+  if (max_prob_out) *max_prob_out = max_prob;
+  return best_action;
+}
+
+Action DunePUCTISMCTSBot::GetRootRawPriorArgmax() const {
+  if (last_search_result_.diagnostics.incumbent_action != kInvalidAction) {
+    return last_search_result_.diagnostics.incumbent_action;
+  }
+  if (root_node_ != nullptr && !root_node_->child_info.empty()) {
+    return ComputeIncumbentFromNode(
+        root_node_, last_search_result_.diagnostics.actions, nullptr);
+  }
+  if (!last_search_result_.policy.empty()) {
+    return ComputeIncumbentFromPriors(
+        last_search_result_.policy, last_search_result_.diagnostics.actions, nullptr);
+  }
+  return kInvalidAction;
 }
 
 std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state) const {
@@ -808,6 +856,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   root_samples_.clear();
   opponent_prior_cache_.clear();
   inference_count_this_search_ = 0;
+  root_node_ = nullptr;
   if (start_sim_index == 0) {
     current_search_leaf_histories_.clear();
     current_search_sampled_leaf_states_.clear();
@@ -876,6 +925,12 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     result.simulations_completed = 0;
     result.elapsed_time_ms = 0.0;
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.actions = legal_actions;
+    result.diagnostics.priors = {1.0};
+    result.diagnostics.raw_priors = {1.0};
+    result.diagnostics.incumbent_action = legal_actions[0];
+    result.diagnostics.raw_prior_max_prob = 1.0;
+    result.diagnostics.raw_prior_max_prob_hex = absl::StrFormat("%a", 1.0);
     result.diagnostics.time_sample_root_ms = 0.0;
     result.diagnostics.time_nn_inference_ms = 0.0;
     result.diagnostics.time_tree_engine_ms = 0.0;
@@ -894,6 +949,18 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     result.elapsed_time_ms = 0.0;
     result.fallback_reason = "non_strategic_state";
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.actions = legal_actions;
+    result.diagnostics.priors.reserve(result.policy.size());
+    result.diagnostics.raw_priors.reserve(result.policy.size());
+    for (const auto& ap : result.policy) {
+      result.diagnostics.priors.push_back(ap.second);
+      result.diagnostics.raw_priors.push_back(ap.second);
+    }
+    double max_prob = 0.0;
+    result.diagnostics.incumbent_action =
+        ComputeIncumbentFromPriors(result.policy, legal_actions, &max_prob);
+    result.diagnostics.raw_prior_max_prob = max_prob;
+    result.diagnostics.raw_prior_max_prob_hex = absl::StrFormat("%a", max_prob);
     result.diagnostics.time_sample_root_ms = 0.0;
     result.diagnostics.time_nn_inference_ms = accumulated_inference_time_ms_;
     result.diagnostics.time_tree_engine_ms = 0.0;
@@ -925,6 +992,18 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     result.used_fallback = true;
     result.fallback_reason = "timeout";
     result.inference_count = inference_count_this_search_;
+    result.diagnostics.actions = legal_actions;
+    result.diagnostics.priors.reserve(result.policy.size());
+    result.diagnostics.raw_priors.reserve(result.policy.size());
+    for (const auto& ap : result.policy) {
+      result.diagnostics.priors.push_back(ap.second);
+      result.diagnostics.raw_priors.push_back(ap.second);
+    }
+    double max_prob = 0.0;
+    result.diagnostics.incumbent_action =
+        ComputeIncumbentFromPriors(result.policy, legal_actions, &max_prob);
+    result.diagnostics.raw_prior_max_prob = max_prob;
+    result.diagnostics.raw_prior_max_prob_hex = absl::StrFormat("%a", max_prob);
     result.diagnostics.time_sample_root_ms = 0.0;
     result.diagnostics.time_nn_inference_ms = accumulated_inference_time_ms_;
     result.diagnostics.time_tree_engine_ms = 0.0;
@@ -1167,6 +1246,11 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   Action final_proposed_action = GetRootArgmaxAction(root_node_, legal_actions);
 
   result.diagnostics = GetRootDiagnostics(state, min_visits);
+  double max_raw_prob = 0.0;
+  result.diagnostics.incumbent_action =
+      ComputeIncumbentFromNode(root_node_, legal_actions, &max_raw_prob);
+  result.diagnostics.raw_prior_max_prob = max_raw_prob;
+  result.diagnostics.raw_prior_max_prob_hex = absl::StrFormat("%a", max_raw_prob);
   result.diagnostics.max_sim_duration_ms = max_sim_duration_ms;
   result.diagnostics.leaf_histories = current_search_leaf_histories_;
   result.diagnostics.sampled_leaf_states = current_search_sampled_leaf_states_;
@@ -1300,13 +1384,129 @@ ActionsAndProbs DunePUCTISMCTSBot::GetFinalPolicy(const State& state, DuneISMCTS
   return policy;
 }
 
-Action DunePUCTISMCTSBot::Step(const State& state) {
-  DuneSearchResult res = RunSearch(state);
+DunePUCTISMCTSBot::ControllerSelection DunePUCTISMCTSBot::SelectAction(
+    const State& state, const DuneSearchResult& res) {
+  ControllerSelection sel;
+  sel.selection_mode = DuneActionSelectionModeToString(config_.action_selection_mode);
+
+  std::vector<Action> legal_actions = state.LegalActions();
+  if (legal_actions.empty()) {
+    sel.selected_action = kInvalidAction;
+    sel.incumbent_action = kInvalidAction;
+    sel.selection_reason = "no_legal_actions";
+    return sel;
+  }
+
+  // 1. Advance search counter and draw step RNG identically to historical progression
   search_count_++;
   uint64_t step_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, search_count_);
   std::mt19937 step_rng(step_seed);
   double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-  return SampleAction(res.policy, r_val).first;
+
+  // 2. Identify incumbent action and maximum raw prior probability from the current decision
+  Action incumbent = res.diagnostics.incumbent_action;
+  double max_raw_prob = res.diagnostics.raw_prior_max_prob;
+  if (incumbent == kInvalidAction) {
+    if (legal_actions.size() == 1) {
+      incumbent = legal_actions[0];
+      max_raw_prob = 1.0;
+    } else if (root_node_ != nullptr && !root_node_->child_info.empty()) {
+      incumbent = ComputeIncumbentFromNode(root_node_, legal_actions, &max_raw_prob);
+    } else if (!res.policy.empty()) {
+      incumbent = ComputeIncumbentFromPriors(res.policy, legal_actions, &max_raw_prob);
+    } else {
+      ActionsAndProbs raw_eval = evaluators_[state.CurrentPlayer()]->Prior(state);
+      incumbent = ComputeIncumbentFromPriors(raw_eval, legal_actions, &max_raw_prob);
+    }
+  }
+
+  sel.incumbent_action = incumbent;
+  sel.raw_prior_max_prob = max_raw_prob;
+  sel.raw_prior_max_prob_hex = absl::StrFormat("%a", max_raw_prob);
+
+  // 3. Search acceptance classification
+  bool is_forced = (legal_actions.size() <= 1);
+  bool search_accepted = (!is_forced &&
+                          !res.used_fallback &&
+                          res.fallback_reason == "none" &&
+                          res.simulations_completed > 0 &&
+                          !res.timeout_status);
+  sel.search_accepted = search_accepted;
+
+  // 4. Selection reason
+  if (is_forced) {
+    sel.selection_reason = "forced_single_action";
+  } else if (search_accepted) {
+    sel.selection_reason = "accepted_search";
+  } else if (res.fallback_reason == "non_strategic_state") {
+    sel.selection_reason = "bypass_non_strategic";
+  } else if (res.fallback_reason == "low_coverage") {
+    sel.selection_reason = "fallback_low_coverage";
+  } else if (res.fallback_reason == "zero_visits") {
+    sel.selection_reason = "fallback_zero_visits";
+  } else if (res.fallback_reason == "timeout" || res.timeout_status) {
+    sel.selection_reason = "fallback_timeout";
+  } else if (res.fallback_reason == "max_nodes") {
+    sel.selection_reason = "fallback_max_nodes";
+  } else {
+    sel.selection_reason = absl::StrCat("fallback_", res.fallback_reason);
+  }
+
+  // 5. Final action selection
+  if (config_.action_selection_mode == DuneActionSelectionMode::kHistoricalSample) {
+    sel.selected_action = SampleAction(res.policy, r_val).first;
+  } else {
+    // kPreserveRawGreedy
+    if (config_.temperature > 0.0) {
+      sel.selected_action = SampleAction(res.policy, r_val).first;
+    } else {
+      // temperature == 0.0
+      if (search_accepted) {
+        sel.selected_action = SampleAction(res.policy, r_val).first;
+      } else {
+        // Fallback / bypass: return exact raw-greedy incumbent action
+        sel.selected_action = incumbent;
+      }
+    }
+  }
+
+  // 6. Selected raw probability
+  if (sel.selected_action == incumbent) {
+    sel.raw_prior_selected_prob = max_raw_prob;
+  } else {
+    double sel_p = 0.0;
+    if (root_node_ != nullptr && root_node_->child_info.count(sel.selected_action)) {
+      sel_p = root_node_->child_info.at(sel.selected_action).raw_prior;
+    } else {
+      for (const auto& ap : res.policy) {
+        if (ap.first == sel.selected_action) {
+          sel_p = ap.second;
+          break;
+        }
+      }
+    }
+    sel.raw_prior_selected_prob = sel_p;
+  }
+  sel.raw_prior_selected_prob_hex = absl::StrFormat("%a", sel.raw_prior_selected_prob);
+
+  // 7. Update diagnostics on last_search_result_
+  last_search_result_.diagnostics.selected_action = sel.selected_action;
+  last_search_result_.diagnostics.incumbent_action = sel.incumbent_action;
+  last_search_result_.diagnostics.raw_prior_max_prob = sel.raw_prior_max_prob;
+  last_search_result_.diagnostics.raw_prior_selected_prob = sel.raw_prior_selected_prob;
+  last_search_result_.diagnostics.raw_prior_max_prob_hex = sel.raw_prior_max_prob_hex;
+  last_search_result_.diagnostics.raw_prior_selected_prob_hex = sel.raw_prior_selected_prob_hex;
+  last_search_result_.diagnostics.selection_mode = sel.selection_mode;
+  last_search_result_.diagnostics.selection_reason = sel.selection_reason;
+  last_search_result_.diagnostics.search_accepted = sel.search_accepted;
+
+  return sel;
+}
+
+Action DunePUCTISMCTSBot::Step(const State& state) {
+  DuneSearchResult res = RunSearch(state);
+  ControllerSelection sel = SelectAction(state, res);
+  return sel.selected_action;
 }
 
 ActionsAndProbs DunePUCTISMCTSBot::GetPolicy(const State& state) {
@@ -1315,12 +1515,8 @@ ActionsAndProbs DunePUCTISMCTSBot::GetPolicy(const State& state) {
 
 std::pair<ActionsAndProbs, Action> DunePUCTISMCTSBot::StepWithPolicy(const State& state) {
   DuneSearchResult res = RunSearch(state);
-  search_count_++;
-  uint64_t step_seed = dune_seed::Combine(config_.seed, dune_seed::kStreamBlueprint, search_count_);
-  std::mt19937 step_rng(step_seed);
-  double r_val = absl::Uniform(step_rng, 0.0, 1.0);
-  Action sampled_action = SampleAction(res.policy, r_val).first;
-  return {res.policy, sampled_action};
+  ControllerSelection sel = SelectAction(state, res);
+  return {res.policy, sel.selected_action};
 }
 
 SearchDiagnostics DunePUCTISMCTSBot::GetRootDiagnostics(const State& state, int min_visit_threshold, Action chosen_action) const {

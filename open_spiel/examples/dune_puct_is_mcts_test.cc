@@ -77,6 +77,16 @@ struct TestBotAccessor {
                                             const std::vector<Action>& legals) {
     return b.FilterAndNormalizeRawPriors(node, legals);
   }
+  static DunePUCTISMCTSBot::ControllerSelection RunSelectAction(
+      DunePUCTISMCTSBot& b, const State& s, const DuneSearchResult& res) {
+    return b.SelectAction(s, res);
+  }
+  static int GetSearchCount(const DunePUCTISMCTSBot& b) {
+    return b.search_count_;
+  }
+  static void SetSearchCount(DunePUCTISMCTSBot& b, int c) {
+    b.search_count_ = c;
+  }
 };
 
 namespace {
@@ -4185,6 +4195,447 @@ void TestTemperatureLogDomainAndDepthZeroGuards() {
   std::cout << "TestTemperatureLogDomainAndDepthZeroGuards Passed!\n\n";
 }
 
+void TestPreserveRawGreedyActionSelection() {
+  std::cout << "Running TestPreserveRawGreedyActionSelection...\n";
+
+  // 0. ParseDuneActionSelectionMode validation and unknown mode rejection
+  {
+    assert(ParseDuneActionSelectionMode("preserve_raw_greedy") ==
+           DuneActionSelectionMode::kPreserveRawGreedy);
+    assert(ParseDuneActionSelectionMode("historical_sample") ==
+           DuneActionSelectionMode::kHistoricalSample);
+    bool caught = false;
+    SetErrorHandler([](const std::string& msg) {
+      throw std::runtime_error(msg);
+    });
+    try {
+      ParseDuneActionSelectionMode("invalid_mode_string");
+    } catch (const std::runtime_error&) {
+      caught = true;
+    }
+    SetErrorHandler([](const std::string& err) {
+      std::cerr << "SpielFatalError: " << err << std::endl;
+      std::exit(1);
+    });
+    assert(caught);
+  }
+
+  // 1. Unwanted selection reproduction: nonuniform priors and seed choosing nonmaximum action
+  {
+    SkewedPriorFixture f;
+    const std::vector<Action>& legals = f.legal_actions;
+    assert(legals.size() >= 2);
+
+    ActionsAndProbs priors = {{legals[0], 0.85}, {legals[1], 0.15}};
+    auto eval = std::make_shared<MockEvaluator>(priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+
+    // Find a seed where absl::Uniform(step_rng, 0.0, 1.0) > 0.85 for search_count_ = 1
+    uint64_t target_seed = 0;
+    for (uint64_t s = 1; s < 1000; ++s) {
+      uint64_t step_seed = dune_seed::Combine(s, dune_seed::kStreamBlueprint, 1);
+      std::mt19937 step_rng(step_seed);
+      double r = absl::Uniform(step_rng, 0.0, 1.0);
+      if (r > 0.85) {
+        target_seed = s;
+        break;
+      }
+    }
+    assert(target_seed > 0);
+
+    // Historical mode with temperature 0.0: reproduces the unwanted selection of legals[1]
+    {
+      DuneSearchConfig config;
+      config.seed = target_seed;
+      config.temperature = 0.0;
+      config.check_strategic_state = false;
+      config.max_simulations = 0;
+      config.action_selection_mode = DuneActionSelectionMode::kHistoricalSample;
+      DunePUCTISMCTSBot hist_bot(config, eval);
+      Action hist_act = hist_bot.Step(*f.state);
+      assert(hist_act == legals[1]);
+      assert(hist_act != legals[0]);
+    }
+
+    // Corrected mode (kPreserveRawGreedy) with temperature 0.0: MUST select legals[0] (exact incumbent)
+    {
+      DuneSearchConfig config;
+      config.seed = target_seed;
+      config.temperature = 0.0;
+      config.check_strategic_state = false;
+      config.max_simulations = 0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot corr_bot(config, eval);
+      Action corr_act = corr_bot.Step(*f.state);
+      assert(corr_act == legals[0]);
+      const auto& diag = corr_bot.GetLastSearchResult().diagnostics;
+      assert(diag.selected_action == legals[0]);
+      assert(diag.incumbent_action == legals[0]);
+      assert(diag.search_accepted == false);
+      assert(diag.selection_mode == "preserve_raw_greedy");
+      assert(diag.selection_reason == "fallback_low_coverage");
+      assert(diag.raw_prior_selected_prob == diag.raw_prior_max_prob);
+    }
+  }
+
+  // 2. Non-strategic bypass with multiple actions and used_fallback=false
+  {
+    std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+    std::unique_ptr<State> state = game->NewInitialState();
+    while (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    }
+    assert(!IsStrategicState(*state, state->CurrentPlayer()));
+    const std::vector<Action> legals = state->LegalActions();
+    assert(legals.size() > 1);
+
+    ActionsAndProbs priors;
+    for (size_t i = 0; i < legals.size(); ++i) {
+      double p = (i == 2) ? 0.60 : (0.40 / (legals.size() - 1));
+      priors.push_back({legals[i], p});
+    }
+    auto eval = std::make_shared<MockEvaluator>(priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+
+    DuneSearchConfig config;
+    config.temperature = 0.0;
+    config.check_strategic_state = true;
+    config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+    DunePUCTISMCTSBot bot(config, eval);
+
+    Action act = bot.Step(*state);
+    const auto& res = bot.GetLastSearchResult();
+    assert(res.fallback_reason == "non_strategic_state");
+    assert(res.used_fallback == false);
+    assert(res.simulations_completed == 0);
+    assert(act == legals[2]);
+    assert(res.diagnostics.incumbent_action == legals[2]);
+    assert(res.diagnostics.selected_action == legals[2]);
+    assert(res.diagnostics.selection_reason == "bypass_non_strategic");
+    assert(res.diagnostics.search_accepted == false);
+    assert(res.diagnostics.raw_prior_selected_prob == res.diagnostics.raw_prior_max_prob);
+  }
+
+  // 3. Low-coverage fallback with concentrated priors
+  {
+    SkewedPriorFixture f;
+    const std::vector<Action>& legals = f.legal_actions;
+    assert(legals.size() >= 3);
+
+    ActionsAndProbs priors;
+    for (size_t i = 0; i < legals.size(); ++i) {
+      priors.push_back({legals[i], (i == 1) ? 0.99 : 0.01 / (legals.size() - 1)});
+    }
+    auto eval = std::make_shared<MockEvaluator>(priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+
+    DuneSearchConfig config;
+    config.temperature = 0.0;
+    config.check_strategic_state = false;
+    config.min_visit_threshold = 2;
+    config.covered_prior_threshold = 0.50;
+    config.max_simulations = 3;
+    config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+    DunePUCTISMCTSBot bot(config, eval);
+
+    Action act = bot.Step(*f.state);
+    const auto& res = bot.GetLastSearchResult();
+    assert(res.used_fallback == true);
+    assert(res.fallback_reason == "low_coverage");
+    assert(act == legals[1]);
+    assert(res.diagnostics.incumbent_action == legals[1]);
+    assert(res.diagnostics.selection_reason == "fallback_low_coverage");
+    assert(res.diagnostics.search_accepted == false);
+  }
+
+  // 4. Forced action, zero visits, and budget failure fallback paths
+  {
+    SkewedPriorFixture f;
+    // Timeout fallback:
+    {
+      DuneSearchConfig config;
+      config.temperature = 0.0;
+      config.relative_time_budget_ms = 0.0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot bot(config, f.evaluator);
+      Action act = bot.Step(*f.state);
+      const auto& res = bot.GetLastSearchResult();
+      assert(res.timeout_status == true);
+      assert(res.diagnostics.search_accepted == false);
+      assert(res.diagnostics.selection_reason == "fallback_timeout");
+      assert(act == res.diagnostics.incumbent_action);
+    }
+    // Max nodes fallback:
+    {
+      DuneSearchConfig config;
+      config.temperature = 0.0;
+      config.check_strategic_state = false;
+      config.max_nodes = 0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot bot(config, f.evaluator);
+      Action act = bot.Step(*f.state);
+      const auto& res = bot.GetLastSearchResult();
+      assert(res.diagnostics.search_accepted == false);
+      assert(act == res.diagnostics.incumbent_action);
+    }
+    // Zero visits fallback:
+    {
+      DuneSearchConfig config;
+      config.temperature = 0.0;
+      config.check_strategic_state = false;
+      config.max_simulations = 0;
+      config.leader_mass_only_coverage = true;
+      config.covered_prior_threshold = 0.0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot bot(config, f.evaluator);
+      Action act = bot.Step(*f.state);
+      const auto& res = bot.GetLastSearchResult();
+      assert(res.diagnostics.search_accepted == false);
+      assert(res.diagnostics.selection_reason == "fallback_zero_visits");
+      assert(act == res.diagnostics.incumbent_action);
+    }
+  }
+
+  // 5. Genuine exact tie and near-tie rounding to the same six-decimal text
+  {
+    SkewedPriorFixture f;
+    const std::vector<Action>& legals = f.legal_actions;
+    assert(legals.size() >= 2);
+
+    // Exact tie: legals[0] and legals[1] have exact 0.5000000000000000
+    {
+      ActionsAndProbs tie_priors = {{legals[0], 0.5}, {legals[1], 0.5}};
+      auto tie_eval = std::make_shared<MockEvaluator>(tie_priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+      DuneSearchConfig config;
+      config.temperature = 0.0;
+      config.max_simulations = 0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot bot(config, tie_eval);
+      Action act = bot.Step(*f.state);
+      // First action in legal_actions order MUST win exact tie:
+      assert(act == legals[0]);
+      const auto& diag = bot.GetLastSearchResult().diagnostics;
+      assert(diag.incumbent_action == legals[0]);
+    }
+
+    // Near-tie: legals[0] has 0.49999996, legals[1] has 0.50000004
+    // Both round to 0.500000 in six-decimal text, but legals[1] is strictly greater in IEEE double!
+    {
+      ActionsAndProbs near_tie_priors = {{legals[0], 0.49999996}, {legals[1], 0.50000004}};
+      auto near_eval = std::make_shared<MockEvaluator>(near_tie_priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+      DuneSearchConfig config;
+      config.temperature = 0.0;
+      config.max_simulations = 0;
+      config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+      DunePUCTISMCTSBot bot(config, near_eval);
+      Action act = bot.Step(*f.state);
+      assert(act == legals[1]);
+      const auto& diag = bot.GetLastSearchResult().diagnostics;
+      assert(diag.incumbent_action == legals[1]);
+      assert(diag.raw_prior_max_prob == 0.50000004);
+      assert(!diag.raw_prior_max_prob_hex.empty());
+    }
+  }
+
+  // 6. Consecutive decisions with different priors on a single live bot (rejecting stale-root incumbents)
+  {
+    std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+    std::unique_ptr<State> state1 = game->NewInitialState();
+    while (state1->IsChanceNode()) {
+      state1->ApplyAction(state1->ChanceOutcomes().front().first);
+    }
+    const std::vector<Action> legals1 = state1->LegalActions();
+    assert(legals1.size() >= 2);
+
+    // Prior 1 favors legals1[0] heavily
+    ActionsAndProbs priors1;
+    for (size_t i = 0; i < legals1.size(); ++i) {
+      priors1.push_back({legals1[i], (i == 0) ? 0.90 : 0.10 / (legals1.size() - 1)});
+    }
+
+    // Advance state1 to get a distinct state2 with a different observation
+    Action act1 = legals1[0];
+    std::unique_ptr<State> state2 = state1->Clone();
+    state2->ApplyAction(act1);
+    while (state2->IsChanceNode()) {
+      state2->ApplyAction(state2->ChanceOutcomes().front().first);
+    }
+    const std::vector<Action> legals2 = state2->LegalActions();
+    assert(legals2.size() >= 2);
+
+    // Prior 2 favors legals2[1] heavily (distinct action and different argmax)
+    Action target_incumbent2 = legals2[1];
+    ActionsAndProbs priors2;
+    for (size_t i = 0; i < legals2.size(); ++i) {
+      priors2.push_back({legals2[i], (legals2[i] == target_incumbent2) ? 0.85 : 0.15 / (legals2.size() - 1)});
+    }
+
+    // Dynamic evaluator returning state-specific priors based on observation
+    class StateKeyedMockEvaluator : public algorithms::Evaluator {
+     public:
+      std::string s1_obs;
+      std::string s2_obs;
+      ActionsAndProbs p1;
+      ActionsAndProbs p2;
+      std::vector<double> vals{0.5, 0.5, 0.5, 0.5};
+
+      StateKeyedMockEvaluator(std::string obs1, std::string obs2,
+                              ActionsAndProbs p1_in, ActionsAndProbs p2_in)
+          : s1_obs(std::move(obs1)), s2_obs(std::move(obs2)),
+            p1(std::move(p1_in)), p2(std::move(p2_in)) {}
+
+      std::vector<double> Evaluate(const State& state) override { return vals; }
+      ActionsAndProbs Prior(const State& state) override {
+        std::string obs = state.ObservationString();
+        if (obs == s1_obs) {
+          return p1;
+        }
+        if (obs == s2_obs) {
+          return p2;
+        }
+        std::vector<Action> legals = state.LegalActions();
+        ActionsAndProbs res;
+        if (!legals.empty()) {
+          double p = 1.0 / legals.size();
+          for (Action a : legals) {
+            res.push_back({a, p});
+          }
+        }
+        return res;
+      }
+    };
+
+    auto dynamic_eval = std::make_shared<StateKeyedMockEvaluator>(
+        state1->ObservationString(), state2->ObservationString(), priors1, priors2);
+
+    DuneSearchConfig config;
+    config.temperature = 0.0;
+    config.check_strategic_state = false;
+    config.max_simulations = 8;
+    config.min_visit_threshold = 0;
+    config.covered_prior_threshold = 0.0;
+    config.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+    DunePUCTISMCTSBot bot(config, dynamic_eval);
+
+    // Decision 1 on live bot: search runs on state1, expanding a root node where raw argmax is legals1[0]
+    Action chosen1 = bot.Step(*state1);
+    assert(chosen1 == legals1[0]);
+    assert(bot.GetRootRawPriorArgmax() == legals1[0]);
+    assert(bot.GetLastSearchResult().diagnostics.incumbent_action == legals1[0]);
+
+    // Decision 2 on the SAME live bot: state2 has different observation and priors favoring legals2[1] != legals1[0].
+    // Configure an early-return path (deadline / budget expiry), ensuring root_node_ is not overwritten
+    // and verifying that stale-root incumbent data from state1 is NOT used.
+    bot.GetConfig().relative_time_budget_ms = 0.0001;
+    Action chosen2 = bot.Step(*state2);
+    const DuneSearchResult res2 = bot.GetLastSearchResult();
+    assert(res2.used_fallback);
+    assert(res2.fallback_reason == "timeout");
+    assert(res2.simulations_completed == 0);
+    assert(chosen2 == target_incumbent2);
+    assert(bot.GetRootRawPriorArgmax() == target_incumbent2);
+    assert(res2.diagnostics.incumbent_action == target_incumbent2);
+    assert(res2.diagnostics.raw_prior_max_prob == 0.85);
+    assert(res2.diagnostics.selection_reason == "fallback_timeout");
+  }
+
+  // 7. Accepted search with an action different from raw greedy
+  {
+    SkewedPriorFixture f;
+    const std::vector<Action>& legals = f.legal_actions;
+    assert(legals.size() >= 3);
+
+    ActionsAndProbs priors = {
+        {legals[0], 0.80}, {legals[1], 0.10}, {legals[2], 0.10}};
+    for (size_t i = 3; i < legals.size(); ++i) priors.push_back({legals[i], 0.0});
+
+    auto eval = std::make_shared<MockEvaluator>(
+        priors, std::vector<double>{0.5, 0.5, 0.5, 0.5});
+
+    DuneSearchResult res;
+    res.used_fallback = false;
+    res.fallback_reason = "none";
+    res.simulations_completed = 200;
+    res.policy = {{legals[0], 0.15}, {legals[1], 0.85}};
+    res.diagnostics.actions = legals;
+    res.diagnostics.raw_priors = {0.80, 0.10, 0.10};
+    res.diagnostics.incumbent_action = legals[0];
+    res.diagnostics.raw_prior_max_prob = 0.80;
+
+    uint64_t seed = 42;
+    DuneSearchConfig config_hist;
+    config_hist.seed = seed;
+    config_hist.temperature = 0.0;
+    config_hist.action_selection_mode = DuneActionSelectionMode::kHistoricalSample;
+    DunePUCTISMCTSBot bot_hist(config_hist, eval);
+    auto sel_hist = TestBotAccessor::RunSelectAction(bot_hist, *f.state, res);
+
+    DuneSearchConfig config_corr;
+    config_corr.seed = seed;
+    config_corr.temperature = 0.0;
+    config_corr.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+    DunePUCTISMCTSBot bot_corr(config_corr, eval);
+    auto sel_corr = TestBotAccessor::RunSelectAction(bot_corr, *f.state, res);
+
+    assert(sel_corr.search_accepted == true);
+    assert(sel_corr.selection_reason == "accepted_search");
+    assert(sel_corr.selected_action == sel_hist.selected_action);
+  }
+
+  // 8. Step() and StepWithPolicy() consistency
+  {
+    SkewedPriorFixture f;
+    uint64_t seed = 12345;
+    for (auto mode : {DuneActionSelectionMode::kHistoricalSample,
+                      DuneActionSelectionMode::kPreserveRawGreedy}) {
+      DuneSearchConfig c1;
+      c1.seed = seed;
+      c1.temperature = 0.0;
+      c1.action_selection_mode = mode;
+      DunePUCTISMCTSBot b1(c1, f.evaluator);
+
+      DuneSearchConfig c2;
+      c2.seed = seed;
+      c2.temperature = 0.0;
+      c2.action_selection_mode = mode;
+      DunePUCTISMCTSBot b2(c2, f.evaluator);
+
+      Action act = b1.Step(*f.state);
+      auto pair = b2.StepWithPolicy(*f.state);
+      assert(act == pair.second);
+      assert(b1.GetLastSearchResult().diagnostics.selected_action ==
+             b2.GetLastSearchResult().diagnostics.selected_action);
+      assert(b1.GetLastSearchResult().diagnostics.selection_reason ==
+             b2.GetLastSearchResult().diagnostics.selection_reason);
+    }
+  }
+
+  // 9. Historical mode and positive-temperature behavior with fixed seeds and RNG progression
+  {
+    SkewedPriorFixture f;
+    uint64_t seed = 54321;
+    DuneSearchConfig c_hist;
+    c_hist.seed = seed;
+    c_hist.temperature = 1.0;
+    c_hist.action_selection_mode = DuneActionSelectionMode::kHistoricalSample;
+    DunePUCTISMCTSBot b_hist(c_hist, f.evaluator);
+
+    DuneSearchConfig c_corr;
+    c_corr.seed = seed;
+    c_corr.temperature = 1.0;
+    c_corr.action_selection_mode = DuneActionSelectionMode::kPreserveRawGreedy;
+    DunePUCTISMCTSBot b_corr(c_corr, f.evaluator);
+
+    for (int step = 0; step < 5; ++step) {
+      Action a_hist = b_hist.Step(*f.state);
+      Action a_corr = b_corr.Step(*f.state);
+      assert(a_hist == a_corr);
+      assert(TestBotAccessor::GetSearchCount(b_hist) ==
+             TestBotAccessor::GetSearchCount(b_corr));
+      assert(TestBotAccessor::GetSearchCount(b_hist) == step + 1);
+    }
+  }
+
+  std::cout << "TestPreserveRawGreedyActionSelection Passed!\n\n";
+}
+
 }  // namespace
 
 } // namespace open_spiel
@@ -4244,6 +4695,7 @@ int main() {
   // WO-16 (search finding 8)
   open_spiel::TestTrainingFullFastSeedComponents();
   open_spiel::TestTemperatureLogDomainAndDepthZeroGuards();
+  open_spiel::TestPreserveRawGreedyActionSelection();
   std::cout << "All Dune PUCT IS-MCTS tests completed successfully!\n";
   return 0;
 }

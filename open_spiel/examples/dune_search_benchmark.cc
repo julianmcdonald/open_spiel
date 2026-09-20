@@ -223,6 +223,9 @@ ABSL_FLAG(int, conservative_meaningful_visit_threshold, 10, "Minimum visits requ
 ABSL_FLAG(double, conservative_q_margin_threshold, 0.03, "Q margin threshold for MCTS to override raw");
 ABSL_FLAG(double, conservative_stability_checkpoint_fraction, 0.5, "Fraction of budget at which to check stability");
 ABSL_FLAG(bool, conservative_continuation_overrides_disabled, true, "Disable overrides during continuation decisions");
+ABSL_FLAG(std::string, action_selection_mode, "historical_sample",
+          "Final-action selection mode for fresh search bot: 'historical_sample' "
+          "(default F03 behavior) or 'preserve_raw_greedy' (preserves raw greedy U21328 on bypass/fallback).");
 
 // --- WO-1 Phase 2: seat controller topology -------------------------------
 // Historically this binary supported exactly ONE searched seat (search_seat =
@@ -718,6 +721,8 @@ void WorkerThread(
         config.conservative_q_margin_threshold = absl::GetFlag(FLAGS_conservative_q_margin_threshold);
         config.conservative_stability_checkpoint_fraction = absl::GetFlag(FLAGS_conservative_stability_checkpoint_fraction);
         config.conservative_continuation_overrides_disabled = absl::GetFlag(FLAGS_conservative_continuation_overrides_disabled);
+        config.action_selection_mode =
+            ParseDuneActionSelectionMode(absl::GetFlag(FLAGS_action_selection_mode));
         DuneSearchBudgetMode budget_mode =
             absl::GetFlag(FLAGS_policy_only)
                 ? DuneSearchBudgetMode::kPolicyOnly
@@ -1064,9 +1069,16 @@ void WorkerThread(
             last_res = search_bot->GetLastSearchResult();
             last_res.diagnostics.selected_action = chosen_action;
           } else {
-            chosen_action = SelectRawPriorAction(
-                *seat_evaluators[current_player], *state,
-                absl::GetFlag(FLAGS_temperature), game_rng);
+            DuneActionSelectionMode sel_mode =
+                ParseDuneActionSelectionMode(absl::GetFlag(FLAGS_action_selection_mode));
+            double temp = absl::GetFlag(FLAGS_temperature);
+            if (sel_mode == DuneActionSelectionMode::kPreserveRawGreedy && temp == 0.0) {
+              chosen_action = SelectRawPriorAction(
+                  *seat_evaluators[current_player], *state, 0.0, game_rng);
+            } else {
+              chosen_action = SelectRawPriorAction(
+                  *seat_evaluators[current_player], *state, temp, game_rng);
+            }
             last_res = DuneSearchResult();
             last_res.simulations_completed = 0;
             last_res.used_fallback = true;
@@ -1075,14 +1087,28 @@ void WorkerThread(
             ActionsAndProbs prior = seat_evaluators[current_player]->Prior(*state);
             Action prior_argmax = kInvalidAction;
             double max_p = -1.0;
+            double chosen_p = 0.0;
             for (const auto& ap : prior) {
               if (ap.second > max_p) {
                 max_p = ap.second;
                 prior_argmax = ap.first;
               }
+              if (ap.first == chosen_action) {
+                chosen_p = ap.second;
+              }
             }
             last_res.diagnostics.raw_reference_action = prior_argmax;
             last_res.diagnostics.decision_role = std::to_string(static_cast<int>(role));
+            last_res.diagnostics.incumbent_action = prior_argmax;
+            last_res.diagnostics.raw_prior_max_prob = (max_p >= 0.0) ? max_p : 0.0;
+            last_res.diagnostics.raw_prior_selected_prob = chosen_p;
+            last_res.diagnostics.raw_prior_max_prob_hex =
+                absl::StrFormat("%a", last_res.diagnostics.raw_prior_max_prob);
+            last_res.diagnostics.raw_prior_selected_prob_hex =
+                absl::StrFormat("%a", chosen_p);
+            last_res.diagnostics.selection_mode = DuneActionSelectionModeToString(sel_mode);
+            last_res.diagnostics.selection_reason = "role_filter_bypass";
+            last_res.diagnostics.search_accepted = false;
           }
           // PF-2 Part A. Path B emits the session-populated diagnostic fields,
           // but only dune_search_session.cc:501 ever writes them, so on the
@@ -1200,6 +1226,14 @@ void WorkerThread(
               search_obj["timeout_status"] = last_res.timeout_status;
               search_obj["used_fallback"] = last_res.used_fallback;
               search_obj["fallback_reason"] = last_res.fallback_reason;
+              search_obj["selection_mode"] = diag.selection_mode;
+              search_obj["selection_reason"] = diag.selection_reason;
+              search_obj["search_accepted"] = diag.search_accepted;
+              search_obj["incumbent_action"] = static_cast<int64_t>(diag.incumbent_action);
+              search_obj["raw_prior_max_prob"] = diag.raw_prior_max_prob;
+              search_obj["raw_prior_selected_prob"] = diag.raw_prior_selected_prob;
+              search_obj["raw_prior_max_prob_hex"] = diag.raw_prior_max_prob_hex;
+              search_obj["raw_prior_selected_prob_hex"] = diag.raw_prior_selected_prob_hex;
               search_obj["elapsed_time_ms"] = last_res.elapsed_time_ms;
               search_obj["action_chosen"] = static_cast<int64_t>(chosen_action);
               const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
@@ -1450,6 +1484,14 @@ void WorkerThread(
         trace_obj["fallback_occurred"] = last_res.used_fallback;
         trace_obj["fallback_reason"] = last_res.fallback_reason;
         trace_obj["timed_out"] = last_res.timeout_status;
+        trace_obj["selection_mode"] = last_res.diagnostics.selection_mode;
+        trace_obj["selection_reason"] = last_res.diagnostics.selection_reason;
+        trace_obj["search_accepted"] = last_res.diagnostics.search_accepted;
+        trace_obj["incumbent_action"] = static_cast<int64_t>(last_res.diagnostics.incumbent_action);
+        trace_obj["raw_prior_max_prob"] = last_res.diagnostics.raw_prior_max_prob;
+        trace_obj["raw_prior_selected_prob"] = last_res.diagnostics.raw_prior_selected_prob;
+        trace_obj["raw_prior_max_prob_hex"] = last_res.diagnostics.raw_prior_max_prob_hex;
+        trace_obj["raw_prior_selected_prob_hex"] = last_res.diagnostics.raw_prior_selected_prob_hex;
         trace_obj["wall_time_ms"] = step_duration * 1000.0;
 
         std::lock_guard<std::mutex> lock(log_mutex);
