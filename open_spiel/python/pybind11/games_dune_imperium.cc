@@ -236,10 +236,16 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("tsmf"), py::arg("al"))
 
       // --- Getters (sync validation) ---
-      .def("get_player_hand", &DuneImperiumState::GetPlayerHandForTesting,
+      .def("get_player_hand",
+           static_cast<const std::vector<int>& (DuneImperiumState::*)(
+               open_spiel::Player) const>(
+               &DuneImperiumState::GetPlayerHandForTesting),
            py::arg("player"), py::return_value_policy::reference_internal)
       .def("get_player_draw_deck",
-           &DuneImperiumState::GetPlayerDrawDeckForTesting, py::arg("player"),
+           static_cast<const std::vector<int>& (DuneImperiumState::*)(
+               open_spiel::Player) const>(
+               &DuneImperiumState::GetPlayerDrawDeckForTesting),
+           py::arg("player"),
            py::return_value_policy::reference_internal)
       .def("get_player_discard", &DuneImperiumState::GetPlayerDiscardForTesting,
            py::arg("player"), py::return_value_policy::reference_internal)

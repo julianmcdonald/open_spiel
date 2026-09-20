@@ -63,7 +63,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_pi_concurrent_test
     dune_search_pi_concurrent_test.cc dune_search_pi_concurrent.cc
     dune_search_pi.cc dune_ppo_training_utils.cc
-    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_online_search_collector.cc dune_search_pi_scratch.cc
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_concurrent_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_concurrent_test COMMAND dune_search_pi_concurrent_test)
 
