@@ -264,6 +264,42 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_native_verification_test dune_native_verification_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_native_verification_test ${TORCH_LIBRARIES})
 
+  add_executable(dune_test_time_adaptation_readiness_test
+    dune_test_time_adaptation_readiness_test.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_test_time_adaptation_readiness_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_test_time_adaptation_readiness_test COMMAND dune_test_time_adaptation_readiness_test)
+  set_tests_properties(dune_test_time_adaptation_readiness_test PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/..")
+
+  add_executable(dune_test_time_adaptation_runner
+    dune_test_time_adaptation_runner.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_test_time_adaptation_runner dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_rollout_search_tournament
+    dune_rollout_search_tournament.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_rollout_search_tournament dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_compound_search_tournament
+    dune_compound_search_tournament.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_compound_search_tournament dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_compound_turn_search_test
+    dune_compound_turn_search_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_compound_turn_search_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_compound_turn_search_test COMMAND dune_compound_turn_search_test)
+
   add_executable(dune_action_value_study_test dune_action_value_study_test.cc ${OPEN_SPIEL_OBJECTS})
   target_compile_definitions(dune_action_value_study_test PRIVATE ACTION_VALUE_TEST_STANDALONE)
   target_link_libraries(dune_action_value_study_test dune_search ${TORCH_LIBRARIES})

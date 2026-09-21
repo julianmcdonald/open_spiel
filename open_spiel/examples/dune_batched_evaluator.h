@@ -92,6 +92,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
 
   ActionsAndProbs Prior(const State& state) override {
     open_spiel::CompactEvalResult result = PriorWithDetails(state);
+    if (!result.ok || result.probabilities.empty()) {
+      return {};
+    }
     ActionsAndProbs policy;
     policy.reserve(result.actions.size());
     for (size_t i = 0; i < result.actions.size(); ++i) {

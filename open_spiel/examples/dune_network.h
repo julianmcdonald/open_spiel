@@ -956,6 +956,8 @@ struct AutocastGuard {
 struct EvalResult {
     std::vector<float> logits;
     float value;
+    bool ok = true;
+    bool budget_exhausted = false;
     // Opt-in physical-batch membership for read-only numerical diagnostics.
     // Default sentinels preserve every existing evaluator consumer and make an
     // uninstrumented result mechanically distinguishable from batch 0/row 0.
@@ -968,6 +970,8 @@ struct CompactEvalResult {
     std::vector<Action> actions;
     std::vector<float> probabilities;
     float value = 0.0f;
+    bool ok = true;
+    bool budget_exhausted = false;
     int64_t physical_batch_id = -1;
     int32_t physical_batch_size = -1;
     int32_t physical_batch_row = -1;
@@ -1504,6 +1508,14 @@ public:
         return dune_semantic::kDescriptorSchemaVersionV3;
     }
 
+    void SetDispatchBudgetHook(
+        std::function<bool(size_t batch_size)> hook,
+        std::function<void(size_t rows)> on_rejection_hook = nullptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        dispatch_budget_hook_ = std::move(hook);
+        dispatch_rejection_hook_ = std::move(on_rejection_hook);
+    }
+
     EvalResult Evaluate(const std::vector<float>& obs) override {
         return EvaluateWithActions(obs, nullptr);
     }
@@ -1619,6 +1631,11 @@ public:
         if (!device_.is_cuda() || device_synchronize_) {
             EvalResult full = EvaluateWithActions(obs, action_data);
             CompactEvalResult compact;
+            if (!full.ok) {
+                compact.ok = false;
+                compact.budget_exhausted = full.budget_exhausted;
+                return compact;
+            }
             compact.actions = legal_actions;
             std::vector<float> logits = full.logits;
             const LogitCapApplicationStats cap_stats =
@@ -2024,6 +2041,8 @@ private:
     std::atomic<uint64_t> total_requests_{0};
     std::atomic<uint64_t> max_batch_size_seen_{0};
     std::atomic<int64_t> next_membership_batch_id_{0};
+    std::function<bool(size_t batch_size)> dispatch_budget_hook_{nullptr};
+    std::function<void(size_t rows)> dispatch_rejection_hook_{nullptr};
 
     // --- WO-PERF-3 telemetry (additive; does not influence dispatch) ---------
     std::atomic<uint64_t> next_group_id_{1};
@@ -2481,6 +2500,32 @@ private:
             bool timeout_flush = false;
             std::vector<Request> batch = take_batch(&timeout_flush);
             if (batch.empty()) break;
+            if (dispatch_budget_hook_) {
+                if (!dispatch_budget_hook_(batch.size())) {
+                    if (dispatch_rejection_hook_) {
+                        dispatch_rejection_hook_(batch.size());
+                    }
+                    for (auto& req : batch) {
+                        if (req.result_dest) {
+                            req.result_dest->ok = false;
+                            req.result_dest->budget_exhausted = true;
+                            req.result_dest->logits.clear();
+                        }
+                        if (req.compact_dest) {
+                            req.compact_dest->ok = false;
+                            req.compact_dest->budget_exhausted = true;
+                            req.compact_dest->actions.clear();
+                            req.compact_dest->probabilities.clear();
+                        }
+                        if (req.ready_flag) req.ready_flag->store(true, std::memory_order_release);
+                    }
+                    {
+                        std::lock_guard<std::mutex> park_lock(park_mutex_);
+                    }
+                    park_cv_.notify_all();
+                    continue;
+                }
+            }
             const int slot_index = next_slot;
             AsyncBatchSlot& slot = slots[slot_index];
             if (slot.pending) finish_slot(slot);
@@ -2622,6 +2667,33 @@ private:
             }
 
             if (batch.empty()) continue;
+
+            if (dispatch_budget_hook_) {
+                if (!dispatch_budget_hook_(batch.size())) {
+                    if (dispatch_rejection_hook_) {
+                        dispatch_rejection_hook_(batch.size());
+                    }
+                    for (auto& req : batch) {
+                        if (req.result_dest) {
+                            req.result_dest->ok = false;
+                            req.result_dest->budget_exhausted = true;
+                            req.result_dest->logits.clear();
+                        }
+                        if (req.compact_dest) {
+                            req.compact_dest->ok = false;
+                            req.compact_dest->budget_exhausted = true;
+                            req.compact_dest->actions.clear();
+                            req.compact_dest->probabilities.clear();
+                        }
+                        if (req.ready_flag) req.ready_flag->store(true, std::memory_order_release);
+                    }
+                    {
+                        std::lock_guard<std::mutex> park_lock(park_mutex_);
+                    }
+                    park_cv_.notify_all();
+                    continue;
+                }
+            }
 
             size_t batch_size = batch.size();
             const int64_t membership_batch_id = emit_batch_membership_
