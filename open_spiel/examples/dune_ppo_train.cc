@@ -65,6 +65,7 @@
 #include "dune_search_routing.h"
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "dune_opponent_pool.h"
+#include "dune_compound_turn_search.h"
 #include "open_spiel/utils/json.h"
 #endif
 
@@ -481,6 +482,38 @@ ABSL_FLAG(double, swordmaster_grant_fraction, 0.0,
 ABSL_FLAG(int, swordmaster_grant_round, 2,
           "Round at which a selected game's Swordmaster grant fires.");
 
+// --- Search-in-Training (TT-RL in training auxiliary supervision) ----------
+ABSL_FLAG(bool, search_in_training, false,
+          "Enable online compound search supervision during PPO training.");
+ABSL_FLAG(std::string, search_teacher_checkpoint, "",
+          "Path to frozen teacher model checkpoint for compound search supervision.");
+ABSL_FLAG(int, search_budget_per_update, 32,
+          "Number of learner decision roots to evaluate with search per PPO update.");
+ABSL_FLAG(double, search_loss_lambda, 0.10,
+          "Loss coefficient lambda for auxiliary search target cross-entropy.");
+ABSL_FLAG(int, search_rollouts_per_action, 32,
+          "Number of rollouts per candidate action in compound search.");
+ABSL_FLAG(int, search_top_k, 3,
+          "Number of top candidate actions evaluated by compound search.");
+ABSL_FLAG(double, search_override_margin, 0.15,
+          "Minimum utility margin required for search to override policy.");
+ABSL_FLAG(double, search_blend_eta, 0.80,
+          "Blend parameter eta for search target: (1-eta)*mu + eta*q_search.");
+ABSL_FLAG(double, search_temperature, 0.50,
+          "Softmax temperature for candidate utilities in search target.");
+ABSL_FLAG(int, search_threads, 32,
+          "Worker thread concurrency for search supervision.");
+ABSL_FLAG(int, search_num_evaluators, 8,
+          "Number of parallel BatchedEvaluator coordinators for frozen teacher.");
+ABSL_FLAG(int, search_target_batch_size, 128,
+          "GPU evaluator target batch size for search supervision.");
+ABSL_FLAG(bool, search_full_turn_supervision, false,
+          "When true, search takes over the entire compound turn from start to kActionEndTurn; "
+          "when false, search supervises an isolated single decision.");
+ABSL_FLAG(bool, search_high_stakes_only, true,
+          "When true, filter learner decisions to high-stakes strategic states (Agent Placement, "
+          "Combat Deployment, Reveal Purchase) matching tournament controller.");
+
 // --- Agent-turn search policy iteration (search-PI) -----------------------
 //
 // A RUN-SCOPED mode: a run is either ordinary PPO or search-PI, never both and
@@ -885,6 +918,7 @@ inline void SignalHandler(int signum) {
 struct WorkerStats {
   uint64_t games = 0;
   uint64_t moves = 0;
+  uint64_t search_eligible_decisions = 0;
 
   CardMetrics card11_metrics;
   CardMetrics card13_metrics;
@@ -2131,7 +2165,10 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   float reward_lambda,
                   WorkerStats* local_stats,
                   VrpoCapturedEpisode* vrpo_episode,
-                  const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators) {
+                  const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
+                  std::vector<open_spiel::dune_imperium::SearchSnapshot>* local_snapshots = nullptr,
+                  uint64_t* decision_count = nullptr,
+                  std::mt19937_64* reservoir_rng = nullptr) {
 
   if (vrpo_episode != nullptr) {
     *vrpo_episode = VrpoCapturedEpisode{};
@@ -2237,6 +2274,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     int counterfactual_samples = 0;
     std::vector<CounterfactualPending> pending_cf;
     bool pending_horror_trash[4] = {false, false, false, false};
+    Player last_player = kInvalidPlayer;
+    Action last_action = kInvalidAction;
     while (!state->IsTerminal()) {
       ++game_length;
       if (game_length > 5000) {
@@ -2518,6 +2557,68 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
       Action action = policy_sample.action;
       float old_log_prob = policy_sample.chosen_log_probability;
+
+      // Search-in-Training reservoir sampling for eligible learner decisions
+      const bool is_turn_start = (current_player != last_player ||
+                                  last_action == dune_imperium::kActionEndTurn ||
+                                  last_player == kInvalidPlayer);
+      const bool search_full_turn = absl::GetFlag(FLAGS_search_full_turn_supervision);
+      const bool high_stakes_only = absl::GetFlag(FLAGS_search_high_stakes_only);
+      bool passes_stakes = true;
+      if (high_stakes_only) {
+        passes_stakes = dune_imperium::IsHighStakesStrategicState(*state, current_player);
+      }
+      const bool eligible_decision = search_full_turn
+          ? (is_turn_start && is_learner && actions.size() > 1 && passes_stakes)
+          : (is_learner && actions.size() > 1 && passes_stakes);
+
+      if (eligible_decision && local_stats != nullptr) {
+        local_stats->search_eligible_decisions++;
+      }
+
+      if (local_snapshots != nullptr && decision_count != nullptr && reservoir_rng != nullptr &&
+          eligible_decision) {
+        (*decision_count)++;
+        uint64_t m = *decision_count;
+        int budget = absl::GetFlag(FLAGS_search_budget_per_update);
+        if (local_snapshots->size() < static_cast<size_t>(budget)) {
+          open_spiel::dune_imperium::SearchSnapshot snap;
+          snap.sim_state = state->Clone();
+          snap.player = current_player;
+          snap.observation = obs;
+          snap.legal_actions = actions;
+          snap.chosen_action = action;
+          snap.behavior_log_prob = old_log_prob;
+          snap.root_id = (episode_id << 16) | static_cast<uint64_t>(trajectory ? trajectory->size() : 0);
+          snap.candidate_data = cand_data;
+          snap.raw_policy.reserve(actions.size());
+          for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+            double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+            snap.raw_policy.push_back({actions[a_idx], p});
+          }
+          local_snapshots->push_back(std::move(snap));
+        } else {
+          std::uniform_int_distribution<uint64_t> dist(0, m - 1);
+          uint64_t r_idx = dist(*reservoir_rng);
+          if (r_idx < static_cast<uint64_t>(budget)) {
+            open_spiel::dune_imperium::SearchSnapshot snap;
+            snap.sim_state = state->Clone();
+            snap.player = current_player;
+            snap.observation = obs;
+            snap.legal_actions = actions;
+            snap.chosen_action = action;
+            snap.behavior_log_prob = old_log_prob;
+            snap.root_id = (episode_id << 16) | static_cast<uint64_t>(trajectory ? trajectory->size() : 0);
+            snap.candidate_data = cand_data;
+            snap.raw_policy.reserve(actions.size());
+            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+              double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+              snap.raw_policy.push_back({actions[a_idx], p});
+            }
+            (*local_snapshots)[r_idx] = std::move(snap);
+          }
+        }
+      }
 
       // Two-card tracking: Scientific Breakthrough (Tleilaxu 11 / Card 118) and Stitched Horror (Tleilaxu 13 / Card 120)
       if (dune_state != nullptr && local_stats != nullptr) {
@@ -2847,6 +2948,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
 
       state->ApplyAction(action);
+      last_player = current_player;
+      last_action = action;
       total_env_steps->fetch_add(1, std::memory_order_relaxed);
       check_hand_draws();
 
@@ -3148,9 +3251,17 @@ void RolloutWorker(int thread_id, const Game* game,
                     int rollout_games,
                     float reward_lambda,
                     VrpoCapturedEpisodeBuffer* vrpo_buffer,
-                    const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators) {
+                    const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
+                    std::vector<open_spiel::dune_imperium::SearchSnapshot>* local_snapshots = nullptr,
+                    int global_update = 0) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
+  uint64_t search_decision_count = 0;
+  std::mt19937_64 search_rng;
+  if (local_snapshots != nullptr) {
+    uint64_t search_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, /*stream=*/0x53454152ULL + thread_id);
+    search_rng = std::mt19937_64(search_seed);
+  }
   while (true) {
     if (rollout_games == 0 && stop_collection->load(std::memory_order_relaxed)) {
       break;
@@ -3164,7 +3275,10 @@ void RolloutWorker(int thread_id, const Game* game,
     int moves = PpoSimulation(master, episode_id, *game, evaluator, obs_size, &trajectory,
                               total_env_steps, reward_lambda, &local_stats,
                               vrpo_buffer != nullptr ? &vrpo_episode : nullptr,
-                              opponent_evaluators);
+                              opponent_evaluators,
+                              local_snapshots,
+                              local_snapshots != nullptr ? &search_decision_count : nullptr,
+                              local_snapshots != nullptr ? &search_rng : nullptr);
     if (vrpo_buffer != nullptr) {
       std::string publish_error;
       if (!vrpo_buffer->PublishValidated(std::move(vrpo_episode),
@@ -3249,6 +3363,10 @@ struct CollectResult {
   // TrainPpoUpdate. Empty unless --online_search_collection.
   std::vector<open_spiel::SearchTrainingExample> aux_examples;
   open_spiel::OnlineSearchCollectionStats aux_stats;
+
+  // Search-in-Training: reservoir-sampled decision snapshots visited by the learner
+  std::vector<open_spiel::dune_imperium::SearchSnapshot> search_snapshots;
+  uint64_t search_eligible_decisions = 0;
 };
 
 // Phase A: folds the rollout-side pre-cap |z| canaries into the update's stats
@@ -3351,13 +3469,18 @@ CollectResult CollectRollout(const Game* game,
                              int rollout_games,
                              float reward_lambda,
                              VrpoCapturedEpisodeBuffer* vrpo_buffer = nullptr,
-                             const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators = {}) {
+                             const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators = {},
+                             int global_update = 0) {
   CollectResult result;
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
   std::vector<WorkerStats> worker_stats(num_threads);
   std::vector<std::thread> workers;
   workers.reserve(num_threads);
+
+  const bool search_in_training = absl::GetFlag(FLAGS_search_in_training);
+  std::vector<std::vector<open_spiel::dune_imperium::SearchSnapshot>> worker_snapshots(
+      search_in_training ? num_threads : 0);
 
   uint64_t actual_start_ep = next_episode_id->load();
   std::atomic<uint64_t> local_episode_id{actual_start_ep};
@@ -3368,9 +3491,31 @@ CollectResult CollectRollout(const Game* game,
                          &rollout_buffer, &stop_collection, total_env_steps,
                          &worker_stats, &local_episode_id, actual_start_ep,
                          rollout_games, reward_lambda, vrpo_buffer,
-                         std::cref(opponent_evaluators));
+                         std::cref(opponent_evaluators),
+                         search_in_training ? &worker_snapshots[i] : nullptr,
+                         global_update);
   }
   for (auto& worker : workers) worker.join();
+
+  if (search_in_training) {
+    std::vector<open_spiel::dune_imperium::SearchSnapshot> all_candidates;
+    for (int i = 0; i < num_threads; ++i) {
+      for (auto& s : worker_snapshots[i]) {
+        all_candidates.push_back(std::move(s));
+      }
+    }
+    int budget = absl::GetFlag(FLAGS_search_budget_per_update);
+    if (static_cast<int>(all_candidates.size()) <= budget) {
+      result.search_snapshots = std::move(all_candidates);
+    } else {
+      uint64_t master_rseed = dune_seed::DeriveSeed(
+          absl::GetFlag(FLAGS_seed), dune_seed::kDomainTrain, global_update, /*stream=*/0x53454152ULL);
+      std::mt19937_64 master_rng(master_rseed);
+      std::shuffle(all_candidates.begin(), all_candidates.end(), master_rng);
+      all_candidates.resize(budget);
+      result.search_snapshots = std::move(all_candidates);
+    }
+  }
 
   if (rollout_games > 0) {
     next_episode_id->store(actual_start_ep + rollout_games);
@@ -3386,6 +3531,7 @@ CollectResult CollectRollout(const Game* game,
   for (const auto& stats : worker_stats) {
     result.games += stats.games;
     result.moves += stats.moves;
+    result.search_eligible_decisions += stats.search_eligible_decisions;
 
     result.specimen_conversions += stats.specimen_conversions;
     result.specimen_penalty_deducted += stats.specimen_penalty_deducted;
@@ -7760,6 +7906,7 @@ int main(int argc, char** argv) {
   }
 
   std::unique_ptr<torch::optim::AdamW> optimizer;
+  std::unique_ptr<torch::optim::AdamW> search_aux_optimizer;
   bool optimizer_constructed = false;
   if (!vrpo_one_update && !vrpo_schedule_screen && !vrpo_ppo_pilot &&
       !vrpo_ppo_continuation && !vrpo_q_warmup && !vrpo_q_offline &&
@@ -11504,6 +11651,61 @@ int main(int argc, char** argv) {
     search_buffer.LoadFromDirectory(search_label_dir);
   }
 
+  // Search-in-Training: teacher evaluator pool
+  std::vector<std::shared_ptr<SharedDunePolicyValueNetImpl>> search_teacher_models;
+  std::vector<std::unique_ptr<std::shared_mutex>> search_teacher_mutexes;
+  std::vector<std::shared_ptr<open_spiel::BatchedEvaluator>> search_teacher_coords;
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> search_teacher_evaluators;
+
+  if (absl::GetFlag(FLAGS_search_in_training)) {
+    if (absl::GetFlag(FLAGS_online_search_collection)) {
+      SpielFatalError("--search_in_training and --online_search_collection are mutually exclusive.");
+    }
+    if (absl::GetFlag(FLAGS_search_pi_mode)) {
+      SpielFatalError("--search_in_training and --search_pi_mode are mutually exclusive.");
+    }
+    const std::string teacher_ckpt = absl::GetFlag(FLAGS_search_teacher_checkpoint);
+    const int num_evals = absl::GetFlag(FLAGS_search_num_evaluators);
+    const int target_batch = absl::GetFlag(FLAGS_search_target_batch_size);
+    std::cout << "[SEARCH-IN-TRAINING] Initializing " << num_evals
+              << " teacher evaluators (target batch " << target_batch
+              << ") from " << (teacher_ckpt.empty() ? "training_model snapshot" : teacher_ckpt) << std::endl;
+    search_teacher_models.resize(num_evals);
+    search_teacher_mutexes.reserve(num_evals);
+    search_teacher_coords.resize(num_evals);
+    search_teacher_evaluators.resize(num_evals);
+
+    for (int e = 0; e < num_evals; ++e) {
+      search_teacher_models[e] = std::make_shared<SharedDunePolicyValueNetImpl>(
+          obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+          absl::GetFlag(FLAGS_num_blocks), /*use_nonlinear=*/false,
+          /*with_aux_heads=*/false, /*head_init_seed=*/0,
+          /*with_semantic_scorer=*/true);
+      search_teacher_models[e]->to(device);
+      if (!teacher_ckpt.empty()) {
+        torch::load(search_teacher_models[e], teacher_ckpt, device);
+      } else {
+        CopyModelWeights(training_model, search_teacher_models[e]);
+      }
+      search_teacher_models[e]->eval();
+
+      search_teacher_mutexes.push_back(std::make_unique<std::shared_mutex>());
+      search_teacher_coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
+          search_teacher_models[e], target_batch, /*timeout_ms=*/1, device,
+          search_teacher_mutexes.back().get(), 10.0f,
+          /*device_synchronize=*/false, /*high_priority_stream=*/true,
+          /*emit_batch_membership=*/false,
+          /*rollout_amp=*/(device.is_cuda() && absl::GetFlag(FLAGS_train_amp)),
+          /*allow_tf32=*/absl::GetFlag(FLAGS_allow_tf32));
+      search_teacher_evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(
+          search_teacher_coords[e], 10.0f);
+    }
+    absl::SetFlag(&FLAGS_aux_full_batch_presentation, true);
+    if (absl::GetFlag(FLAGS_aux_value_coef) < 0.0) {
+      absl::SetFlag(&FLAGS_aux_value_coef, 0.0);
+    }
+  }
+
   int rollout_games = absl::GetFlag(FLAGS_rollout_games);
 
   std::string initial_non_value_hash = "";
@@ -11556,7 +11758,8 @@ int main(int argc, char** argv) {
        vrpo_ppo_pilot || vrpo_ppo_continuation || vrpo_q_warmup)
           ? &vrpo_capture_buffer
           : nullptr,
-      opponent_evaluators);
+      opponent_evaluators,
+      /*global_update=*/start_update);
   if (vrpo_schedule_screen || vrpo_ppo_pilot || vrpo_ppo_continuation ||
       vrpo_q_warmup) {
     std::string deadline_error;
@@ -12443,7 +12646,8 @@ int main(int argc, char** argv) {
       bg_collect_thread = std::thread([&, next_reward_lambda]() {
         next_collect = open_spiel::CollectRollout(
             game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-            rollout_games, next_reward_lambda, nullptr, opponent_evaluators);
+            rollout_games, next_reward_lambda, nullptr, opponent_evaluators,
+            /*global_update=*/update + 1);
         // Phase 18B: aux for the NEXT update, from the same frozen snapshot, run
         // sequentially AFTER the rollout (design: collect PPO first, then aux).
         run_aux_collection(update + 1, next_collect);
@@ -12451,11 +12655,32 @@ int main(int argc, char** argv) {
     }
 
     auto ppo_start = std::chrono::high_resolution_clock::now();
+    open_spiel::dune_imperium::SearchSupervisionResult search_sup_res;
+    if (absl::GetFlag(FLAGS_search_in_training) &&
+        !absl::GetFlag(FLAGS_search_aux_decoupled) &&
+        !current_collect.search_snapshots.empty()) {
+      uint64_t search_seed = dune_seed::DeriveSeed(
+          master, dune_seed::kDomainTrain, update, /*stream=*/0x53555045ULL);
+      search_sup_res = open_spiel::dune_imperium::BatchCompoundSearchSupervision(
+          current_collect.search_snapshots,
+          search_teacher_evaluators,
+          absl::GetFlag(FLAGS_search_top_k),
+          absl::GetFlag(FLAGS_search_rollouts_per_action),
+          absl::GetFlag(FLAGS_search_override_margin),
+          absl::GetFlag(FLAGS_search_temperature),
+          absl::GetFlag(FLAGS_search_blend_eta),
+          search_seed,
+          absl::GetFlag(FLAGS_search_threads),
+          absl::GetFlag(FLAGS_search_full_turn_supervision));
+      current_collect.aux_examples = std::move(search_sup_res.examples);
+    }
     const double this_search_coef =
-        online_search_collection
-            ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
-                                                  aux_search_loss_warmup)
-            : 0.0;
+        absl::GetFlag(FLAGS_search_in_training)
+            ? absl::GetFlag(FLAGS_search_loss_lambda)
+            : (online_search_collection
+                   ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
+                                                         aux_search_loss_warmup)
+                   : 0.0);
     // --- PWO-5 section 8.6: draw this update's auxiliary batch. ----------
     //
     // ONE draw per update (aux = 0), on its own RNG stream. Reusing
@@ -12600,6 +12825,100 @@ int main(int argc, char** argv) {
     // Fold this consumed update's collection into the persisted cumulative
     // counters / hash chain / resume cursor (main thread only).
     account_aux_consumed(current_collect);
+
+    // Decoupled Standalone Auxiliary Search Supervision Phase (PPG-style)
+    if (absl::GetFlag(FLAGS_search_in_training) &&
+        absl::GetFlag(FLAGS_search_aux_decoupled) &&
+        !current_collect.search_snapshots.empty()) {
+      // 1. Freeze post-PPO updated learner and synchronize to search teacher models (Correction 1)
+      for (size_t e = 0; e < search_teacher_models.size(); ++e) {
+        CopyModelWeights(training_model, search_teacher_models[e]);
+      }
+
+      // 2. Generate search targets using post-PPO snapshot and its no-search continuation (Correction 1 & 4)
+      uint64_t search_seed = dune_seed::DeriveSeed(
+          master, dune_seed::kDomainTrain, update, /*stream=*/0x53555045ULL);
+      search_sup_res = open_spiel::dune_imperium::BatchCompoundSearchSupervision(
+          current_collect.search_snapshots,
+          search_teacher_evaluators,
+          absl::GetFlag(FLAGS_search_top_k),
+          absl::GetFlag(FLAGS_search_rollouts_per_action),
+          absl::GetFlag(FLAGS_search_override_margin),
+          absl::GetFlag(FLAGS_search_temperature),
+          absl::GetFlag(FLAGS_search_blend_eta),
+          search_seed,
+          absl::GetFlag(FLAGS_search_threads),
+          absl::GetFlag(FLAGS_search_full_turn_supervision),
+          /*use_mpo_target=*/true,
+          absl::GetFlag(FLAGS_search_target_max_kl));
+
+      // 3. Subsample reference rollout transitions for rollout KL ceiling and critic probe (Correction 2 & 3)
+      std::vector<open_spiel::PpoTransition> ref_rollout_sample;
+      const size_t sample_size = std::min<size_t>(256, current_collect.rollout.size());
+      if (sample_size > 0) {
+        ref_rollout_sample.reserve(sample_size);
+        size_t stride = std::max<size_t>(1, current_collect.rollout.size() / sample_size);
+        for (size_t i = 0; i < current_collect.rollout.size() && ref_rollout_sample.size() < sample_size; i += stride) {
+          ref_rollout_sample.push_back(current_collect.rollout[i]);
+        }
+      }
+
+      // Deliberately reset auxiliary optimizer state every phase so uninterrupted and resumed runs implement identical rules
+      if (search_aux_optimizer == nullptr) {
+        std::vector<torch::Tensor> aux_trainable_params;
+        for (auto& p : training_model->parameters()) {
+          if (p.requires_grad()) {
+            aux_trainable_params.push_back(p);
+          }
+        }
+        std::vector<torch::optim::OptimizerParamGroup> groups;
+        groups.emplace_back(aux_trainable_params);
+        search_aux_optimizer = std::make_unique<torch::optim::AdamW>(
+            groups, torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate)).eps(1e-5));
+        static_cast<torch::optim::AdamWOptions&>(
+            search_aux_optimizer->param_groups()[0].options())
+            .weight_decay(0.0);
+      } else {
+        search_aux_optimizer->state().clear();
+      }
+
+      // 4. Run bounded auxiliary optimization phase with isolated aux optimizer, step rejection and state rollback
+      open_spiel::SearchAuxPhaseResult aux_res = open_spiel::TrainSearchAuxiliaryPhase(
+          training_model, *search_aux_optimizer,
+          search_sup_res.examples,
+          obs_size, action_size, device,
+          absl::GetFlag(FLAGS_search_aux_steps),
+          absl::GetFlag(FLAGS_search_aux_batch_size),
+          absl::GetFlag(FLAGS_search_aux_target_kl),
+          this_search_coef,
+          ref_rollout_sample);
+
+      // 5. Update stats and log telemetry
+      stats.aux_examples_used = static_cast<int>(search_sup_res.examples.size());
+      stats.aux_search_loss_coef = this_search_coef;
+      stats.aux_ce = aux_res.final_aux_ce;
+      stats.aux_grad_norm_mean = aux_res.mean_aux_grad_norm;
+
+      std::cout << absl::StrFormat(
+          "[SEARCH-AUX] update %d: %d/%d steps accepted (rejected_on_kl=%d, rejected_nonfinite=%d, phase_rejected=%d, null_skipped=%d) | ce=%.4f "
+          "| kl_searched=%.6f kl_rollout=%.6f (ceil=%.4f) | val_immut=%d | critic_shift_mse=%.6f\n",
+          update, aux_res.steps_accepted, aux_res.steps_budgeted,
+          aux_res.step_rejected_on_kl ? 1 : 0,
+          aux_res.step_rejected_nonfinite ? 1 : 0,
+          aux_res.phase_rejected ? 1 : 0,
+          aux_res.null_supervision_skipped ? 1 : 0,
+          aux_res.final_aux_ce,
+          aux_res.cumulative_kl_searched, aux_res.cumulative_kl_rollout,
+          absl::GetFlag(FLAGS_search_aux_target_kl),
+          aux_res.value_head_immutable ? 1 : 0, aux_res.critic_probe_mse_shift);
+
+      if (aux_res.step_rejected_nonfinite) {
+        std::cerr << absl::StrFormat(
+            "ABORT[SEARCH-AUX-NONFINITE]: update %d search auxiliary phase encountered nonfinite loss, gradient, or parameter values!\n",
+            update);
+        SpielFatalError(absl::StrFormat("Search auxiliary phase nonfinite invariant violation at update %d", update));
+      }
+    }
 
     if (absl::GetFlag(FLAGS_train_value_only)) {
       std::string current_non_value_hash = HashNonValueParameters(training_model);
@@ -12840,6 +13159,31 @@ int main(int argc, char** argv) {
           static_cast<int>(cst.swordmaster_organic_games));
     }
 
+    if (absl::GetFlag(FLAGS_search_in_training)) {
+      std::cout << absl::StrFormat(
+          "  [Search-in-Training] eligible_decisions=%lu selected_roots=%d used_by_optimizer=%d (%.2f%% eligible, %.4f%% transitions) | "
+          "turns=%d decisions=%d overrides=%d (%.1f%%) fallbacks=%d | "
+          "time=%.2fs (%.2f turns/s) | lambda=%.4f aux_ce=%.4f\n",
+          current_collect.search_eligible_decisions,
+          search_sup_res.roots_evaluated,
+          stats.aux_examples_used,
+          current_collect.search_eligible_decisions > 0
+              ? (100.0 * search_sup_res.roots_evaluated / current_collect.search_eligible_decisions)
+              : 0.0,
+          current_collect.rollout.size() > 0
+              ? (100.0 * search_sup_res.roots_evaluated / current_collect.rollout.size())
+              : 0.0,
+          search_sup_res.roots_evaluated,
+          search_sup_res.total_decisions_evaluated,
+          search_sup_res.overrides,
+          search_sup_res.mean_override_rate * 100.0,
+          search_sup_res.fallbacks_to_mu,
+          search_sup_res.elapsed_seconds,
+          search_sup_res.elapsed_seconds > 0.0 ? search_sup_res.roots_evaluated / search_sup_res.elapsed_seconds : 0.0,
+          this_search_coef,
+          stats.aux_ce);
+    }
+
     std::cout << absl::StrFormat(
         "  [Conflict VP Stats] Generated: %.2f | Attributed: %.2f | Unattributed: %.2f\n",
         current_collect.conflict_vp_generated,
@@ -13057,7 +13401,8 @@ int main(int argc, char** argv) {
                                                      absl::GetFlag(FLAGS_shaping_decay_env_steps));
       current_collect = open_spiel::CollectRollout(
           game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
-          rollout_games, next_reward_lambda, nullptr, opponent_evaluators);
+          rollout_games, next_reward_lambda, nullptr, opponent_evaluators,
+          /*global_update=*/update + 1);
       total_games += current_collect.games;
       total_moves += current_collect.moves;
       // Phase 18B (non-pipelined path): aux for the next update, same snapshot.

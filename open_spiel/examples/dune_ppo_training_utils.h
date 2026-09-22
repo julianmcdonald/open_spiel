@@ -25,6 +25,13 @@
 #endif
 
 ABSL_DECLARE_FLAG(bool, rollout_amp);
+ABSL_DECLARE_FLAG(bool, aux_full_batch_presentation);
+ABSL_DECLARE_FLAG(double, aux_value_coef);
+ABSL_DECLARE_FLAG(bool, search_aux_decoupled);
+ABSL_DECLARE_FLAG(int, search_aux_steps);
+ABSL_DECLARE_FLAG(int, search_aux_batch_size);
+ABSL_DECLARE_FLAG(double, search_aux_target_kl);
+ABSL_DECLARE_FLAG(double, search_target_max_kl);
 
 namespace open_spiel {
 
@@ -405,6 +412,7 @@ struct PpoUpdateStats {
   double ppo_grad_norm_mean = 0.0;    // per-update mean unclipped ppo-only grad norm
   double aux_ppo_norm_ratio = 0.0;    // aux_grad_norm_mean / ppo_grad_norm_mean
   bool aux_ratio_abort = false;       // ratio exceeded abort_grad_norm_ratio (caller aborts)
+  int64_t aux_total_presentations = 0; // realized auxiliary presentations across minibatches
 
   // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
   double reverse_kl = 0.0;
@@ -597,6 +605,38 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     uint64_t master, int global_update,
     bool compute_diagnostics = true);
 
+// Decoupled Standalone Auxiliary Search Supervision Phase (PPG-style)
+// Explicit step budget, strict KL ceiling with rollback on violation,
+// bitwise immutable value-head parameters, and critic probe shift tracking.
+struct SearchAuxPhaseResult {
+  int steps_budgeted = 0;
+  int steps_accepted = 0;
+  double final_aux_ce = 0.0;
+  double cumulative_kl_searched = 0.0;
+  double cumulative_kl_rollout = 0.0;
+  double mean_aux_grad_norm = 0.0;
+  bool step_rejected_on_kl = false;
+  bool step_rejected_nonfinite = false;
+  bool phase_rejected = false;
+  bool null_supervision_skipped = false;
+  bool value_head_immutable = true;
+  double critic_probe_mse_shift = 0.0;
+  double max_prob_movement = 0.0;
+  int64_t optimizer_states_before = 0;
+  int64_t optimizer_states_after = 0;
+};
+
+SearchAuxPhaseResult TrainSearchAuxiliaryPhase(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer,
+    const std::vector<SearchTrainingExample>& search_examples,
+    int64_t obs_size, int64_t action_dim,
+    torch::Device device,
+    int max_steps = 4,
+    int batch_size = 64,
+    double max_cumulative_kl = 0.01,
+    double search_loss_coef = 0.10,
+    const std::vector<PpoTransition>& reference_rollout_sample = {});
 
 // ---------------------------------------------------------------------------
 // PWO-5 head telemetry sidecar (amendment 1 ruling 6).

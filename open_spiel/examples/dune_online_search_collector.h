@@ -22,6 +22,7 @@
 
 #include "open_spiel/spiel.h"
 #include "dune_search_routing.h"  // DuneDecisionRole, carried on each label
+#include "dune_semantic_action_scorer.h"
 
 namespace open_spiel {
 
@@ -139,6 +140,9 @@ struct SearchTrainingExample {
   // Leader row is indistinguishable from any other and silently lands in
   // `OtherOption` in retained-label accounting, diagnostics and analysis.
   DuneDecisionRole role = DuneDecisionRole::kOtherOptional;
+
+  // Candidate action descriptors for the deployed semantic action scorer.
+  dune_semantic::CandidateActionData candidate_data;
 };
 
 // Frozen 18B collection configuration. Defaults encode the baseline/uncapped

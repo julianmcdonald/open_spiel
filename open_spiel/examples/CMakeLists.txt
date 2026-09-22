@@ -300,6 +300,32 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_compound_turn_search_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_compound_turn_search_test COMMAND dune_compound_turn_search_test)
 
+  add_executable(dune_search_aux_offline_test
+    dune_search_aux_offline_test.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_search_aux_offline_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_search_aux_offline_test COMMAND dune_search_aux_offline_test)
+
+  add_executable(dune_compound_search_benchmark
+    dune_compound_search_benchmark.cc
+    dune_ppo_training_utils.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_compound_search_benchmark dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_continuation_diagnostic_preflight_test
+    dune_continuation_diagnostic_preflight_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_continuation_diagnostic_preflight_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_continuation_diagnostic_preflight_test COMMAND dune_continuation_diagnostic_preflight_test)
+
+  add_executable(dune_continuation_diagnostic
+    dune_continuation_diagnostic.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_continuation_diagnostic dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_action_value_study_test dune_action_value_study_test.cc ${OPEN_SPIEL_OBJECTS})
   target_compile_definitions(dune_action_value_study_test PRIVATE ACTION_VALUE_TEST_STANDALONE)
   target_link_libraries(dune_action_value_study_test dune_search ${TORCH_LIBRARIES})

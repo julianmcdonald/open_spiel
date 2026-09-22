@@ -13,6 +13,7 @@
 #include <cmath>
 #include <iomanip>
 #include <algorithm>
+#include <filesystem>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -75,6 +76,31 @@ ABSL_FLAG(uint64_t, master_seed, 20260921, "Master random seed.");
 ABSL_FLAG(std::string, output_json,
           "/home/warcr/projects/dune_drl/docs/experiment_records/compound_search_100_games_receipt.json",
           "Path to write structured tournament results JSON.");
+ABSL_FLAG(std::string, trajectory_meta_jsonl, "",
+          "Path to write trajectory metadata JSONL.");
+ABSL_FLAG(std::string, trajectory_obs_bin, "",
+          "Path to write raw float32 observation binary matching trajectory decisions.");
+ABSL_FLAG(double, softmax_temperature, 0.5,
+          "Temperature for search target distribution over candidate utilities.");
+ABSL_FLAG(double, eta_blend, 0.80,
+          "Blend parameter for search target: (1-eta)*mu + eta*q_search.");
+
+struct RecordedDecision {
+  int game_id = 0;
+  int decision_ordinal = 0;
+  int search_seat = 0;
+  int round = 0;
+  std::string phase;
+  bool is_searched = false;
+  std::string decision_role;  // "fresh_search", "continuation", "preservation"
+  bool is_forced = false;
+  int chosen_action = 0;
+  std::vector<int> legal_actions;
+  std::vector<float> observation;
+  std::vector<std::pair<int, float>> mu;
+  std::vector<std::pair<int, float>> q_search;
+  std::vector<std::pair<int, float>> q_blend;
+};
 
 struct GameOutcome {
   int game_id = 0;
@@ -93,28 +119,25 @@ struct GameOutcome {
   int total_new_info_resets = 0;
   int ending_round = 0;
   double duration_seconds = 0.0;
+  std::vector<RecordedDecision> decisions_trace;
 };
 
-// Check for high-stakes decision points: Agent Placement, Combat Deployment, Reveal Purchase
-inline bool IsHighStakesStrategicState(const State& state, Player searched_player) {
-  if (state.CurrentPlayer() != searched_player) return false;
-  std::vector<Action> legal_actions = state.LegalActions();
-  if (legal_actions.size() < 2) return false;
+using open_spiel::dune_imperium::IsHighStakesStrategicState;
 
-  const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
-  if (!dune_state) return false;
-
-  for (Action a : legal_actions) {
-    std::string s = dune_state->ActionToString(searched_player, a);
-    if (s.rfind("PlaceAgent", 0) == 0 ||
-        s.rfind("SelectAgentCard", 0) == 0 ||
-        s.rfind("Deploy ", 0) == 0 ||
-        s.rfind("CombatCommit", 0) == 0 ||
-        s.rfind("Buy", 0) == 0) {
-      return true;
-    }
+inline const char* GetGamePhaseString(GamePhase phase) {
+  switch (phase) {
+    case GamePhase::kLeaderOfferChance: return "leader_offer_chance";
+    case GamePhase::kLeaderDraft: return "leader_draft";
+    case GamePhase::kDeal: return "deal";
+    case GamePhase::kRoundStart: return "round_start";
+    case GamePhase::kAgentTurns: return "agent_turns";
+    case GamePhase::kRevealTurns: return "reveal_turns";
+    case GamePhase::kCombat: return "combat";
+    case GamePhase::kMakers: return "makers";
+    case GamePhase::kRecall: return "recall";
+    case GamePhase::kTerminal: return "terminal";
+    default: return "unknown";
   }
-  return false;
 }
 
 // Play a single full game using compound turn search
@@ -129,7 +152,10 @@ GameOutcome PlayCompoundTournamentGame(
     double min_override_margin,
     TreeReuseMode reuse_mode,
     bool high_stakes_only,
-    uint64_t game_seed) {
+    uint64_t game_seed,
+    double softmax_temperature = 0.5,
+    double eta_blend = 0.80,
+    bool record_trajectories = false) {
   auto start_time = std::chrono::steady_clock::now();
   std::unique_ptr<State> state = game->NewInitialState();
   std::mt19937 chance_rng(game_seed);
@@ -145,6 +171,7 @@ GameOutcome PlayCompoundTournamentGame(
 
   TurnSearchTree turn_tree;
   Player last_player = kInvalidPlayer;
+  GameOutcome outcome;
 
   while (!state->IsTerminal()) {
     if (state->IsChanceNode()) {
@@ -185,6 +212,28 @@ GameOutcome PlayCompoundTournamentGame(
           ? IsHighStakesStrategicState(*state, cur)
           : (IsStrategicState(*state, cur) && legals.size() > 1);
 
+      std::vector<float> obs_tensor;
+      if (record_trajectories) {
+        obs_tensor = greedy_evaluator->GetConsumedObservation(*state, cur);
+      }
+
+      ActionsAndProbs raw_prior = greedy_evaluator->Prior(*state);
+      std::vector<std::pair<Action, double>> mu_legal;
+      mu_legal.reserve(legals.size());
+      for (Action a : legals) {
+        double p = 0.0;
+        for (const auto& ap : raw_prior) {
+          if (ap.first == a) { p = ap.second; break; }
+        }
+        mu_legal.push_back({a, p});
+      }
+
+      bool is_forced = (legals.size() <= 1);
+      bool is_searched = false;
+      std::string decision_role = "preservation";
+      std::vector<std::pair<Action, double>> q_search_target;
+      std::vector<std::pair<Action, double>> q_blend_target;
+
       if (should_search && legals.size() > 1) {
         searches++;
         uint64_t dseed = dune_seed::DeriveSeed(game_seed, cur, search_seed_counter++);
@@ -195,9 +244,62 @@ GameOutcome PlayCompoundTournamentGame(
         if (s_res.overridden) overrides++;
         reused_rollouts += s_res.prior_rollouts_reused;
         new_rollouts += s_res.new_rollouts_executed;
+
+        is_searched = true;
+        decision_role = "fresh_search";
+        q_search_target = ComputeSoftmaxTarget(s_res.candidate_utilities, legals, softmax_temperature);
+        q_blend_target = BlendTargets(mu_legal, q_search_target, eta_blend);
+      } else if (turn_tree.current_node() != nullptr && !turn_tree.current_node()->children.empty()) {
+        std::vector<std::pair<Action, double>> continuation_cands;
+        for (Action a : legals) {
+          if (turn_tree.HasPriorData(a)) {
+            continuation_cands.push_back({a, turn_tree.GetMeanUtility(a)});
+          }
+        }
+        if (!continuation_cands.empty()) {
+          is_searched = true;
+          decision_role = "continuation";
+          q_search_target = ComputeSoftmaxTarget(continuation_cands, legals, softmax_temperature);
+          q_blend_target = BlendTargets(mu_legal, q_search_target, eta_blend);
+
+          double best_u = -1e9;
+          Action best_a = PickGreedyAction(raw_prior, legals);
+          for (const auto& cu : continuation_cands) {
+            if (cu.second > best_u) {
+              best_u = cu.second;
+              best_a = cu.first;
+            }
+          }
+          chosen_action = best_a;
+        } else {
+          chosen_action = PickGreedyAction(raw_prior, legals);
+          q_search_target = mu_legal;
+          q_blend_target = mu_legal;
+        }
       } else {
-        ActionsAndProbs prior = greedy_evaluator->Prior(*state);
-        chosen_action = PickGreedyAction(prior, legals);
+        chosen_action = PickGreedyAction(raw_prior, legals);
+        q_search_target = mu_legal;
+        q_blend_target = mu_legal;
+      }
+
+      if (record_trajectories) {
+        RecordedDecision dec;
+        dec.game_id = game_id;
+        dec.decision_ordinal = decisions - 1;
+        dec.search_seat = cur;
+        const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+        dec.round = dune_s ? dune_s->GetCurrentRound() : 1;
+        dec.phase = dune_s ? GetGamePhaseString(dune_s->phase()) : "UNKNOWN";
+        dec.is_searched = is_searched;
+        dec.decision_role = decision_role;
+        dec.is_forced = is_forced;
+        dec.chosen_action = chosen_action;
+        for (Action a : legals) dec.legal_actions.push_back(a);
+        dec.observation = std::move(obs_tensor);
+        for (const auto& p : mu_legal) dec.mu.push_back({p.first, static_cast<float>(p.second)});
+        for (const auto& p : q_search_target) dec.q_search.push_back({p.first, static_cast<float>(p.second)});
+        for (const auto& p : q_blend_target) dec.q_blend.push_back({p.first, static_cast<float>(p.second)});
+        outcome.decisions_trace.push_back(std::move(dec));
       }
 
       // Advance search tree along chosen real action
@@ -232,7 +334,6 @@ GameOutcome PlayCompoundTournamentGame(
   auto end_time = std::chrono::steady_clock::now();
   double elapsed = std::chrono::duration<double>(end_time - start_time).count();
 
-  GameOutcome outcome;
   outcome.game_id = game_id;
   outcome.search_seat = search_seat;
   outcome.final_returns = state->Returns();
@@ -290,6 +391,11 @@ int main(int argc, char** argv) {
   const int default_search_seat = absl::GetFlag(FLAGS_search_seat);
   const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
   const std::string output_json_path = absl::GetFlag(FLAGS_output_json);
+  const std::string trajectory_meta_path = absl::GetFlag(FLAGS_trajectory_meta_jsonl);
+  const std::string trajectory_obs_path = absl::GetFlag(FLAGS_trajectory_obs_bin);
+  const double softmax_temp = absl::GetFlag(FLAGS_softmax_temperature);
+  const double eta_blend = absl::GetFlag(FLAGS_eta_blend);
+  const bool record_trajectories = !trajectory_meta_path.empty() && !trajectory_obs_path.empty();
 
   TreeReuseMode reuse_mode = (reuse_mode_str == "additive")
       ? TreeReuseMode::kAdditive
@@ -368,7 +474,8 @@ int main(int argc, char** argv) {
 
       GameOutcome res = PlayCompoundTournamentGame(
           g, s_seat, game, evaluators, thread_id, top_k, rollouts_per_action,
-          min_override_margin, reuse_mode, high_stakes_only, gseed);
+          min_override_margin, reuse_mode, high_stakes_only, gseed,
+          softmax_temp, eta_blend, record_trajectories);
 
       outcomes[g] = res;
 
@@ -533,6 +640,66 @@ int main(int argc, char** argv) {
     games_arr.push_back(json::Value(g_obj));
   }
   root["games"] = json::Value(games_arr);
+
+  if (record_trajectories) {
+    std::filesystem::create_directories(std::filesystem::path(trajectory_meta_path).parent_path());
+    std::filesystem::create_directories(std::filesystem::path(trajectory_obs_path).parent_path());
+    std::ofstream obs_file(trajectory_obs_path, std::ios::binary);
+    std::ofstream meta_file(trajectory_meta_path);
+    int total_decisions_written = 0;
+
+    for (const auto& out : outcomes) {
+      for (const auto& dec : out.decisions_trace) {
+        if (!dec.observation.empty()) {
+          obs_file.write(reinterpret_cast<const char*>(dec.observation.data()),
+                         dec.observation.size() * sizeof(float));
+        }
+
+        json::Object dec_obj;
+        dec_obj["game_id"] = json::Value(static_cast<int64_t>(dec.game_id));
+        dec_obj["decision_ordinal"] = json::Value(static_cast<int64_t>(dec.decision_ordinal));
+        dec_obj["search_seat"] = json::Value(static_cast<int64_t>(dec.search_seat));
+        dec_obj["round"] = json::Value(static_cast<int64_t>(dec.round));
+        dec_obj["phase"] = json::Value(dec.phase);
+        dec_obj["is_searched"] = json::Value(dec.is_searched);
+        dec_obj["decision_role"] = json::Value(dec.decision_role);
+        dec_obj["is_forced"] = json::Value(dec.is_forced);
+        dec_obj["chosen_action"] = json::Value(static_cast<int64_t>(dec.chosen_action));
+
+        json::Array legals_arr;
+        for (int a : dec.legal_actions) legals_arr.push_back(json::Value(static_cast<int64_t>(a)));
+        dec_obj["legal_actions"] = json::Value(legals_arr);
+
+        json::Object mu_obj;
+        for (const auto& p : dec.mu) mu_obj[std::to_string(p.first)] = json::Value(static_cast<double>(p.second));
+        dec_obj["mu"] = json::Value(mu_obj);
+
+        json::Object qs_obj;
+        for (const auto& p : dec.q_search) qs_obj[std::to_string(p.first)] = json::Value(static_cast<double>(p.second));
+        dec_obj["q_search"] = json::Value(qs_obj);
+
+        json::Object qb_obj;
+        for (const auto& p : dec.q_blend) qb_obj[std::to_string(p.first)] = json::Value(static_cast<double>(p.second));
+        dec_obj["q_blend"] = json::Value(qb_obj);
+
+        dec_obj["search_won"] = json::Value(out.search_won);
+        dec_obj["search_utility"] = json::Value(out.search_utility);
+        dec_obj["search_vp"] = json::Value(static_cast<int64_t>(out.search_vp));
+
+        json::Array rets_arr;
+        for (double r : out.final_returns) rets_arr.push_back(json::Value(r));
+        dec_obj["final_returns"] = json::Value(rets_arr);
+
+        meta_file << json::ToString(dec_obj) << "\n";
+        total_decisions_written++;
+      }
+    }
+    obs_file.close();
+    meta_file.close();
+    std::cout << "[TRAJECTORY] Successfully wrote " << total_decisions_written
+              << " decisions to " << trajectory_meta_path
+              << " and observations to " << trajectory_obs_path << "\n";
+  }
 
   std::ofstream out_file(output_json_path);
   if (out_file.is_open()) {

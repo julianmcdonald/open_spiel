@@ -68,6 +68,7 @@ ABSL_FLAG(bool, high_stakes_only, true,
           "Only search on high-stakes strategic turns (Agent placement, combat deploy, card buy).");
 ABSL_FLAG(bool, rotate_seat, true, "Whether to rotate the searching agent's seat across games.");
 ABSL_FLAG(int, search_seat, 0, "Fixed search seat if rotate_seat is false.");
+ABSL_FLAG(int, game_offset, 0, "Initial game index offset (for resuming or extending tournaments).");
 ABSL_FLAG(uint64_t, master_seed, 20260921, "Master random seed.");
 ABSL_FLAG(std::string, output_json,
           "/home/warcr/projects/dune_drl/docs/experiment_records/rollout_search_100_games_receipt.json",
@@ -427,6 +428,7 @@ int main(int argc, char** argv) {
   const bool high_stakes_only = absl::GetFlag(FLAGS_high_stakes_only);
   const bool rotate_seat = absl::GetFlag(FLAGS_rotate_seat);
   const int default_search_seat = absl::GetFlag(FLAGS_search_seat);
+  const int game_offset = absl::GetFlag(FLAGS_game_offset);
   const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
   const std::string output_json_path = absl::GetFlag(FLAGS_output_json);
 
@@ -491,8 +493,9 @@ int main(int argc, char** argv) {
 
   auto worker = [&](int thread_id) {
     while (true) {
-      int g = next_game_idx.fetch_add(1);
-      if (g >= total_games) break;
+      int local_idx = next_game_idx.fetch_add(1);
+      if (local_idx >= total_games) break;
+      int g = local_idx + game_offset;
 
       int s_seat = rotate_seat ? (g % 4) : default_search_seat;
       uint64_t gseed = dune_seed::DeriveSeed(master_seed, dune_seed::kStreamSearchSampling, g);
@@ -501,7 +504,7 @@ int main(int argc, char** argv) {
           g, s_seat, game, evaluators, thread_id, top_k, rollouts_per_action,
           min_override_margin, high_stakes_only, gseed);
 
-      outcomes[g] = res;
+      outcomes[local_idx] = res;
 
       int done = completed_games.fetch_add(1) + 1;
       if (res.search_won) search_wins.fetch_add(1);

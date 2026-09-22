@@ -51,6 +51,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return ModelObservation(state, player);
   }
 
+  std::string SemanticDescriptorSchema() const {
+    return batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
+  }
+
   std::vector<double> Evaluate(const State& state) override {
     int num_players = state.NumPlayers();
     std::vector<double> values(num_players, 0.0);

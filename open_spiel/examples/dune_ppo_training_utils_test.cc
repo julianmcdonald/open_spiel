@@ -10910,6 +10910,83 @@ int main() {
     UTILS_CHECK(std::isfinite(stats.explained_variance));
   } TEST_END();
 
+  TEST_BEGIN("TrainSearchAuxiliaryPhase: value head immutability and step rollback") {
+    const int64_t obs_size = 16, action_dim = 8;
+    torch::manual_seed(999);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model->to(torch::kCPU);
+    torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    // Populate Adam optimizer state with nonzero steps and moments
+    for (auto& group : optimizer.param_groups()) {
+      for (auto& p : group.params()) {
+        auto key = p.unsafeGetTensorImpl();
+        auto st = std::make_unique<torch::optim::AdamWParamState>();
+        st->step(10);
+        st->exp_avg(torch::ones_like(p) * 0.01f);
+        st->exp_avg_sq(torch::ones_like(p) * 0.02f);
+        optimizer.state()[key] = std::move(st);
+      }
+    }
+
+    // Save initial value head parameters
+    std::vector<torch::Tensor> v_params_before;
+    for (const auto& p : model->value_head->parameters()) {
+      v_params_before.push_back(p.detach().clone());
+    }
+
+    // Create 4 synthetic search examples
+    std::vector<SearchTrainingExample> aux_examples(4);
+    for (int i = 0; i < 4; ++i) {
+      aux_examples[i].observation = std::vector<float>(obs_size, 0.2f * (i + 1));
+      aux_examples[i].legal_actions = {0, 1, 2, 3};
+      // Shift target probability to action 3
+      aux_examples[i].normalized_visits = {0.1, 0.1, 0.1, 0.7};
+    }
+
+    // Test A: Normal execution with generous KL ceiling
+    auto res = TrainSearchAuxiliaryPhase(
+        model, optimizer, aux_examples, obs_size, action_dim, torch::kCPU,
+        /*max_steps=*/4, /*batch_size=*/2, /*max_cumulative_kl=*/1.0,
+        /*search_loss_coef=*/0.10);
+
+    UTILS_CHECK(res.steps_accepted == 4);
+    UTILS_CHECK(res.step_rejected_on_kl == false);
+    UTILS_CHECK(res.value_head_immutable == true);
+
+    // Verify bitwise parameter equality on value head
+    size_t vi = 0;
+    for (const auto& p : model->value_head->parameters()) {
+      UTILS_CHECK(torch::equal(p, v_params_before[vi++]));
+    }
+
+    // Test B: Strict KL ceiling (1e-8) triggers step 0 rejection and complete rollback
+    auto tight_zero_res = TrainSearchAuxiliaryPhase(
+        model, optimizer, aux_examples, obs_size, action_dim, torch::kCPU,
+        /*max_steps=*/4, /*batch_size=*/2, /*max_cumulative_kl=*/1e-8,
+        /*search_loss_coef=*/0.50);
+
+    UTILS_CHECK(tight_zero_res.step_rejected_on_kl == true);
+    UTILS_CHECK(tight_zero_res.steps_accepted == 0);
+    UTILS_CHECK(tight_zero_res.value_head_immutable == true);
+
+    // Test C: Partial acceptance (1e-6) allows step 0 but rejects step 1
+    auto tight_one_res = TrainSearchAuxiliaryPhase(
+        model, optimizer, aux_examples, obs_size, action_dim, torch::kCPU,
+        /*max_steps=*/4, /*batch_size=*/2, /*max_cumulative_kl=*/1e-6,
+        /*search_loss_coef=*/0.50);
+
+    UTILS_CHECK(tight_one_res.step_rejected_on_kl == true);
+    UTILS_CHECK(tight_one_res.steps_accepted == 1);
+    UTILS_CHECK(tight_one_res.value_head_immutable == true);
+
+    // Verify value head is still 100% bitwise identical after rollback
+    vi = 0;
+    for (const auto& p : model->value_head->parameters()) {
+      UTILS_CHECK(torch::equal(p, v_params_before[vi++]));
+    }
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

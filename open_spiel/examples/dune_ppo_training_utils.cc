@@ -40,6 +40,13 @@ ABSL_DECLARE_FLAG(bool, diagnostics_only);
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
 ABSL_FLAG(bool, verify_packing_alignment, false, "Verify packing alignment at the minibatch staging boundary.");
+ABSL_FLAG(double, aux_value_coef, -1.0, "Coefficient for auxiliary value regression loss. Default -1.0 uses PPO value_coef; set 0.0 to disable auxiliary search-value regression.");
+ABSL_FLAG(bool, aux_full_batch_presentation, false, "When true, presents all search auxiliary examples at every PPO minibatch step rather than slicing across minibatches.");
+ABSL_FLAG(bool, search_aux_decoupled, false, "When true, runs search auxiliary supervision as a standalone, bounded phase after PPO rather than per-minibatch.");
+ABSL_FLAG(int, search_aux_steps, 4, "Number of auxiliary optimizer steps in the decoupled phase.");
+ABSL_FLAG(int, search_aux_batch_size, 64, "Minibatch size for decoupled auxiliary optimizer steps.");
+ABSL_FLAG(double, search_aux_target_kl, 0.01, "Cumulative KL ceiling from post-PPO reference policy; steps exceeding this are rejected.");
+ABSL_FLAG(double, search_target_max_kl, 0.05, "Maximum KL ceiling for MPO target distribution.");
 // --- WO-PERF-1 (2026-08-14): diagnostics-only performance flags. Both
 // defaults reproduce today's behavior bit-for-bit; neither statistic has any
 // consumer outside diagnostics (PPO Phase-0 findings, 2026-07-29).
@@ -1881,11 +1888,13 @@ PpoUpdateStats TrainPpoUpdate(
   // value-only mode, whose whole point is a frozen policy). When INACTIVE every
   // line below is skipped and the update is numerically identical to today.
   const bool aux_active = !search_examples.empty() && search_loss_coef > 0.0 &&
-                          !::absl::GetFlag(::FLAGS_train_value_only);
+                          !::absl::GetFlag(::FLAGS_train_value_only) &&
+                          !::absl::GetFlag(::FLAGS_search_aux_decoupled);
   stats.aux_search_loss_coef = search_loss_coef;
   const int64_t aux_n =
       aux_active ? static_cast<int64_t>(search_examples.size()) : 0;
   torch::Tensor aux_states, aux_masks, aux_targets, aux_values;
+  std::vector<const dune_semantic::CandidateActionData*> all_aux_cands;
   std::vector<int64_t> aux_slice_start, aux_slice_len;  // by minibatch index/epoch
   double aux_ce_sum = 0.0, aux_vmse_sum = 0.0;
   int64_t aux_slice_uses = 0;                 // (epoch,minibatch) slices actually run
@@ -1921,6 +1930,15 @@ PpoUpdateStats TrainPpoUpdate(
         }
       }
       vp[i] = static_cast<float>(ex.value_target);
+    }
+    all_aux_cands.assign(aux_n, nullptr);
+    if (model->with_semantic_scorer_) {
+      for (int64_t i = 0; i < aux_n; ++i) {
+        if (search_examples[i].candidate_data.empty()) {
+          open_spiel::SpielFatalError("TrainPpoUpdateSeparate: semantic scorer is enabled but candidate descriptors are missing or empty on search examples.");
+        }
+        all_aux_cands[i] = &search_examples[i].candidate_data;
+      }
     }
     aux_states = s.to(device);
     aux_masks = m.to(device);
@@ -2204,18 +2222,47 @@ PpoUpdateStats TrainPpoUpdate(
       bool this_mb_has_aux = false;
       double this_aux_norm = 0.0;
       if (aux_active) {
-        const int64_t as = aux_slice_start[mb_index];
-        const int64_t al = aux_slice_len[mb_index];
-        if (al > 0) {
+        torch::Tensor a_states, a_masks, a_targets, a_values;
+        int64_t as = 0;
+        int64_t al = 0;
+        if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
           this_mb_has_aux = true;
-          torch::Tensor a_states = aux_states.narrow(0, as, al);
-          torch::Tensor a_masks = aux_masks.narrow(0, as, al);
-          torch::Tensor a_targets = aux_targets.narrow(0, as, al);
-          torch::Tensor a_values = aux_values.narrow(0, as, al);
+          a_states = aux_states;
+          a_masks = aux_masks;
+          a_targets = aux_targets;
+          a_values = aux_values;
+          al = aux_n;
+        } else {
+          as = aux_slice_start[mb_index];
+          al = aux_slice_len[mb_index];
+          if (al > 0) {
+            this_mb_has_aux = true;
+            a_states = aux_states.narrow(0, as, al);
+            a_masks = aux_masks.narrow(0, as, al);
+            a_targets = aux_targets.narrow(0, as, al);
+            a_values = aux_values.narrow(0, as, al);
+          }
+        }
+        if (this_mb_has_aux) {
+          std::vector<const dune_semantic::CandidateActionData*> a_cands;
+          if (model->with_semantic_scorer_) {
+            if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
+              a_cands = all_aux_cands;
+            } else {
+              a_cands.reserve(al);
+              for (int64_t k = 0; k < al; ++k) {
+                a_cands.push_back(all_aux_cands[as + k]);
+              }
+            }
+          }
           torch::Tensor scaled_aux;
           double ce_val = 0.0, vmse_val = 0.0;
           auto compute_aux = [&]() {
             auto ao = model->forward(a_states);
+            if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+              dune_semantic::ApplySemanticScorerBatch(
+                  model->semantic_scorer_, ao.trunk, a_cands, ao.logits, device);
+            }
             torch::Tensor alogits =
                 CenterAndCapLogitsTensor(ao.logits, a_masks, logit_cap);
             torch::Tensor amasked =
@@ -2228,8 +2275,10 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor vmse = (av - a_values).pow(2).mean();
             ce_val = ce.item<double>();
             vmse_val = vmse.item<double>();
+            double aux_v_coef = ::absl::GetFlag(::FLAGS_aux_value_coef);
+            if (aux_v_coef < 0.0) aux_v_coef = value_coef;
             scaled_aux =
-                static_cast<float>(search_loss_coef) * (ce + value_coef * vmse);
+                static_cast<float>(search_loss_coef) * (ce + static_cast<float>(aux_v_coef) * vmse);
           };
           if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
             AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
@@ -2252,6 +2301,7 @@ PpoUpdateStats TrainPpoUpdate(
           this_aux_norm = std::sqrt(aux_sq);
           aux_ce_sum += ce_val;
           aux_vmse_sum += vmse_val;
+          stats.aux_total_presentations += a_states.size(0);
           ++aux_slice_uses;
         }
       }
@@ -3984,6 +4034,472 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
       SpielFatalError("Failed to close diagnostics JSONL file at: " + filepath);
     }
   }
+}
+
+SearchAuxPhaseResult TrainSearchAuxiliaryPhase(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    torch::optim::AdamW& optimizer,
+    const std::vector<SearchTrainingExample>& search_examples,
+    int64_t obs_size, int64_t action_dim,
+    torch::Device device,
+    int max_steps,
+    int batch_size,
+    double max_cumulative_kl,
+    double search_loss_coef,
+    const std::vector<PpoTransition>& reference_rollout_sample) {
+  SearchAuxPhaseResult res;
+  res.steps_budgeted = max_steps;
+  res.optimizer_states_before = static_cast<int64_t>(optimizer.state().size());
+  res.optimizer_states_after = res.optimizer_states_before;
+  // Explicitly enforce zero weight decay on auxiliary optimizer
+  for (auto& group : optimizer.param_groups()) {
+    static_cast<torch::optim::AdamWOptions&>(group.options()).weight_decay(0.0);
+  }
+  if (!model || search_examples.empty() || max_steps <= 0 || search_loss_coef <= 0.0) {
+    return res;
+  }
+
+  // 1. Mandatory Semantic-Policy Parity Validation
+  const int64_t aux_n = static_cast<int64_t>(search_examples.size());
+  std::vector<const dune_semantic::CandidateActionData*> aux_cands(aux_n, nullptr);
+  if (model->with_semantic_scorer_) {
+    for (int64_t i = 0; i < aux_n; ++i) {
+      if (search_examples[i].candidate_data.empty()) {
+        open_spiel::SpielFatalError(
+            "TrainSearchAuxiliaryPhase: semantic scorer is enabled but candidate descriptors "
+            "are missing or empty on search examples.");
+      }
+      aux_cands[i] = &search_examples[i].candidate_data;
+    }
+  }
+
+  const int64_t r_n = static_cast<int64_t>(reference_rollout_sample.size());
+  std::vector<const dune_semantic::CandidateActionData*> ref_cands(r_n, nullptr);
+  if (model->with_semantic_scorer_ && r_n > 0) {
+    for (int64_t i = 0; i < r_n; ++i) {
+      if (reference_rollout_sample[i].candidate_data.empty()) {
+        open_spiel::SpielFatalError(
+            "TrainSearchAuxiliaryPhase: semantic scorer is enabled but candidate descriptors "
+            "are missing or empty on reference rollout sample.");
+      }
+      ref_cands[i] = &reference_rollout_sample[i].candidate_data;
+    }
+  }
+
+  // 2. Snapshot initial value head parameters to test bitwise immutability (Correction 3)
+  std::vector<torch::Tensor> initial_value_params;
+  for (const auto& p : model->value_head->parameters()) {
+    initial_value_params.push_back(p.detach().clone());
+  }
+  if (model->use_nonlinear_value_head_ && model->value_head2) {
+    for (const auto& p : model->value_head2->parameters()) {
+      initial_value_params.push_back(p.detach().clone());
+    }
+  }
+
+  // 3. Pre-pack search tensors
+  auto af = torch::TensorOptions().dtype(torch::kFloat32);
+  auto ab = torch::TensorOptions().dtype(torch::kBool);
+  torch::Tensor s = torch::zeros({aux_n, obs_size}, af);
+  torch::Tensor m = torch::zeros({aux_n, action_dim}, ab);
+  torch::Tensor t = torch::zeros({aux_n, action_dim}, af);
+  float* sp = s.data_ptr<float>();
+  bool* mp = m.data_ptr<bool>();
+  float* tp = t.data_ptr<float>();
+
+  for (int64_t i = 0; i < aux_n; ++i) {
+    const SearchTrainingExample& ex = search_examples[i];
+    int64_t copy = std::min<int64_t>(obs_size, static_cast<int64_t>(ex.observation.size()));
+    if (copy > 0) {
+      std::memcpy(sp + i * obs_size, ex.observation.data(), copy * sizeof(float));
+    }
+    for (size_t j = 0; j < ex.legal_actions.size(); ++j) {
+      Action a = ex.legal_actions[j];
+      if (a >= 0 && a < action_dim) {
+        mp[i * action_dim + a] = true;
+        tp[i * action_dim + a] = static_cast<float>(
+            (j < ex.normalized_visits.size()) ? ex.normalized_visits[j] : 0.0);
+      }
+    }
+  }
+
+  torch::Tensor aux_states = s.to(device);
+  torch::Tensor aux_masks = m.to(device);
+  torch::Tensor aux_targets = t.to(device);
+
+  // 4. Pre-compute reference log-probs using the full deployed semantic policy
+  torch::Tensor ref_alogp;
+  {
+    torch::NoGradGuard no_grad;
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+    auto ref_ao = model->forward(aux_states);
+    if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+      dune_semantic::ApplySemanticScorerBatch(
+          model->semantic_scorer_, ref_ao.trunk, aux_cands, ref_ao.logits, device);
+    }
+    torch::Tensor ref_alogits = CenterAndCapLogitsTensor(ref_ao.logits, aux_masks, 10.0);
+    torch::Tensor ref_amasked = ref_alogits.masked_fill(aux_masks.logical_not(), -1e9f);
+    ref_alogp = torch::log_softmax(ref_amasked, -1).detach();
+  }
+
+  // Pre-pack reference rollout sample if provided
+  torch::Tensor ref_rollout_states, ref_rollout_masks, ref_rollout_alogp, ref_rollout_values;
+  if (!reference_rollout_sample.empty()) {
+    torch::Tensor rs = torch::zeros({r_n, obs_size}, af);
+    torch::Tensor rm = torch::zeros({r_n, action_dim}, ab);
+    float* rsp = rs.data_ptr<float>();
+    bool* rmp = rm.data_ptr<bool>();
+    for (int64_t i = 0; i < r_n; ++i) {
+      const auto& tr = reference_rollout_sample[i];
+      int64_t c = std::min<int64_t>(obs_size, static_cast<int64_t>(tr.state.size()));
+      if (c > 0) std::memcpy(rsp + i * obs_size, tr.state.data(), c * sizeof(float));
+      for (Action a : tr.legal_actions) {
+        if (a >= 0 && a < action_dim) rmp[i * action_dim + a] = true;
+      }
+    }
+    ref_rollout_states = rs.to(device);
+    ref_rollout_masks = rm.to(device);
+    torch::NoGradGuard no_grad;
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+    auto r_ao = model->forward(ref_rollout_states);
+    if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+      dune_semantic::ApplySemanticScorerBatch(
+          model->semantic_scorer_, r_ao.trunk, ref_cands, r_ao.logits, device);
+    }
+    torch::Tensor r_logits = CenterAndCapLogitsTensor(r_ao.logits, ref_rollout_masks, 10.0);
+    torch::Tensor r_masked = r_logits.masked_fill(ref_rollout_masks.logical_not(), -1e9f);
+    ref_rollout_alogp = torch::log_softmax(r_masked, -1).detach();
+    ref_rollout_values = r_ao.values.squeeze(1).detach();
+  }
+
+  // 5. Explicit Null Supervision Detection: skip optimization if target is identical to reference
+  {
+    torch::NoGradGuard no_grad;
+    torch::Tensor ref_probs = torch::exp(ref_alogp).masked_fill(aux_masks.logical_not(), 0.0f);
+    double target_diff = (ref_probs - aux_targets).abs().max().item<double>();
+    if (target_diff < 1e-5) {
+      res.null_supervision_skipped = true;
+      res.steps_accepted = 0;
+      res.final_aux_ce = -(aux_targets * ref_alogp).sum(-1).mean().item<double>();
+      res.cumulative_kl_searched = 0.0;
+      res.cumulative_kl_rollout = 0.0;
+      res.mean_aux_grad_norm = 0.0;
+      res.value_head_immutable = true;
+      res.critic_probe_mse_shift = 0.0;
+      res.max_prob_movement = 0.0;
+      res.optimizer_states_after = static_cast<int64_t>(optimizer.state().size());
+      return res;
+    }
+  }
+
+  // Optimizer snapshot structure preserving full AdamW state
+  struct OptParamState {
+    int64_t step = 0;
+    torch::Tensor exp_avg;
+    torch::Tensor exp_avg_sq;
+    torch::Tensor max_exp_avg_sq;
+  };
+
+  auto SnapshotOptState = [](torch::optim::AdamW& opt) {
+    std::unordered_map<void*, OptParamState> backup;
+    for (auto& group : opt.param_groups()) {
+      for (auto& param : group.params()) {
+        auto key = param.unsafeGetTensorImpl();
+        auto it = opt.state().find(key);
+        if (it != opt.state().end()) {
+          auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(it->second.get());
+          if (adam_state) {
+            OptParamState st;
+            st.step = adam_state->step();
+            st.exp_avg = adam_state->exp_avg().clone();
+            st.exp_avg_sq = adam_state->exp_avg_sq().clone();
+            if (adam_state->max_exp_avg_sq().defined()) {
+              st.max_exp_avg_sq = adam_state->max_exp_avg_sq().clone();
+            }
+            backup[key] = std::move(st);
+          }
+        }
+      }
+    }
+    return backup;
+  };
+
+  auto RestoreOptState = [](torch::optim::AdamW& opt, const std::unordered_map<void*, OptParamState>& backup) {
+    // Remove newly created states
+    std::vector<void*> keys_to_remove;
+    for (const auto& kv : opt.state()) {
+      if (backup.find(kv.first) == backup.end()) {
+        keys_to_remove.push_back(kv.first);
+      }
+    }
+    for (void* k : keys_to_remove) {
+      opt.state().erase(k);
+    }
+    // Restore values for pre-existing keys
+    for (const auto& pair : backup) {
+      auto it = opt.state().find(pair.first);
+      if (it != opt.state().end()) {
+        auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(it->second.get());
+        if (adam_state) {
+          adam_state->step(pair.second.step);
+          adam_state->exp_avg().copy_(pair.second.exp_avg);
+          adam_state->exp_avg_sq().copy_(pair.second.exp_avg_sq);
+          if (pair.second.max_exp_avg_sq.defined() && adam_state->max_exp_avg_sq().defined()) {
+            adam_state->max_exp_avg_sq().copy_(pair.second.max_exp_avg_sq);
+          }
+        }
+      }
+    }
+  };
+
+  auto SnapshotModel = [](const std::shared_ptr<SharedDunePolicyValueNetImpl>& m) {
+    std::vector<torch::Tensor> backup;
+    for (const auto& p : m->parameters()) {
+      backup.push_back(p.detach().clone());
+    }
+    return backup;
+  };
+
+  auto RestoreModel = [](const std::shared_ptr<SharedDunePolicyValueNetImpl>& m, const std::vector<torch::Tensor>& backup) {
+    size_t p_idx = 0;
+    for (auto& p : m->parameters()) {
+      p.data().copy_(backup[p_idx++]);
+    }
+  };
+
+  // 6. Bounded optimizer step loop (at most max_steps accepted steps)
+  double grad_norm_accum = 0.0;
+  int grad_norm_count = 0;
+  int mb_size = (batch_size > 0 && batch_size < aux_n) ? batch_size : aux_n;
+
+  for (int step = 0; step < max_steps; ++step) {
+    // Snapshot model parameters and optimizer state before this step
+    auto step_model_backup = SnapshotModel(model);
+    auto step_opt_backup = SnapshotOptState(optimizer);
+
+    // Slice minibatch
+    int64_t start_idx = (step * mb_size) % aux_n;
+    int64_t cur_len = std::min<int64_t>(mb_size, aux_n - start_idx);
+    torch::Tensor mb_s = (cur_len == aux_n) ? aux_states : aux_states.narrow(0, start_idx, cur_len);
+    torch::Tensor mb_m = (cur_len == aux_n) ? aux_masks : aux_masks.narrow(0, start_idx, cur_len);
+    torch::Tensor mb_t = (cur_len == aux_n) ? aux_targets : aux_targets.narrow(0, start_idx, cur_len);
+    std::vector<const dune_semantic::CandidateActionData*> mb_cands;
+    if (model->with_semantic_scorer_) {
+      mb_cands.reserve(cur_len);
+      for (int64_t k = 0; k < cur_len; ++k) {
+        mb_cands.push_back(aux_cands[start_idx + k]);
+      }
+    }
+
+    optimizer.zero_grad();
+    torch::Tensor alogp;
+    torch::Tensor ce;
+    torch::Tensor loss;
+    {
+      AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+      auto ao = model->forward(mb_s);
+      if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+        dune_semantic::ApplySemanticScorerBatch(
+            model->semantic_scorer_, ao.trunk, mb_cands, ao.logits, device);
+      }
+      torch::Tensor alogits = CenterAndCapLogitsTensor(ao.logits, mb_m, 10.0);
+      torch::Tensor amasked = alogits.masked_fill(mb_m.logical_not(), -1e9f);
+      alogp = torch::log_softmax(amasked, -1);
+      ce = -(mb_t * alogp).sum(-1).mean();
+      loss = static_cast<float>(search_loss_coef) * ce;
+    }
+
+    if (!torch::isfinite(loss).item<bool>()) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_nonfinite = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    loss.backward();
+
+    // Zero out any value head gradients (Correction 3)
+    for (auto& p : model->value_head->parameters()) {
+      if (p.grad().defined()) p.grad().zero_();
+    }
+    if (model->use_nonlinear_value_head_ && model->value_head2) {
+      for (auto& p : model->value_head2->parameters()) {
+        if (p.grad().defined()) p.grad().zero_();
+      }
+    }
+
+    double g_norm = torch::nn::utils::clip_grad_norm_(model->parameters(), 0.5);
+    if (!std::isfinite(g_norm)) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_nonfinite = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    bool grads_finite = true;
+    for (const auto& p : model->parameters()) {
+      if (p.grad().defined() && !torch::isfinite(p.grad()).all().item<bool>()) {
+        grads_finite = false;
+        break;
+      }
+    }
+    if (!grads_finite) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_nonfinite = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    grad_norm_accum += g_norm;
+    ++grad_norm_count;
+
+    optimizer.step();
+
+    // Parameter finiteness guard
+    bool params_finite = true;
+    for (const auto& p : model->parameters()) {
+      if (!torch::isfinite(p).all().item<bool>()) {
+        params_finite = false;
+        break;
+      }
+    }
+    if (!params_finite) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_nonfinite = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    // Restore value head parameters bitwise (Correction 3)
+    size_t vi = 0;
+    for (auto& p : model->value_head->parameters()) {
+      p.data().copy_(initial_value_params[vi++]);
+    }
+    if (model->use_nonlinear_value_head_ && model->value_head2) {
+      for (auto& p : model->value_head2->parameters()) {
+        p.data().copy_(initial_value_params[vi++]);
+      }
+    }
+
+    // Measure cumulative KL with deployed semantic policy (Correction 2)
+    double cand_kl_searched = 0.0;
+    double cand_kl_rollout = 0.0;
+    bool kl_finite = true;
+    {
+      torch::NoGradGuard no_grad;
+      AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+      auto cand_ao = model->forward(aux_states);
+      if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+        dune_semantic::ApplySemanticScorerBatch(
+            model->semantic_scorer_, cand_ao.trunk, aux_cands, cand_ao.logits, device);
+      }
+      torch::Tensor c_logits = CenterAndCapLogitsTensor(cand_ao.logits, aux_masks, 10.0);
+      torch::Tensor c_masked = c_logits.masked_fill(aux_masks.logical_not(), -1e9f);
+      torch::Tensor c_logp = torch::log_softmax(c_masked, -1);
+      torch::Tensor p_ref = torch::exp(ref_alogp).masked_fill(aux_masks.logical_not(), 0.0f);
+      torch::Tensor diff = (ref_alogp - c_logp).masked_fill(aux_masks.logical_not(), 0.0f);
+      torch::Tensor kl_t = (p_ref * diff).sum(-1).mean();
+      double r_s_kl = kl_t.item<double>();
+      if (!std::isfinite(r_s_kl)) {
+        kl_finite = false;
+      } else {
+        cand_kl_searched = std::max(0.0, r_s_kl);
+      }
+
+      if (kl_finite && ref_rollout_states.defined() && ref_rollout_states.size(0) > 0) {
+        auto r_cand_ao = model->forward(ref_rollout_states);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, r_cand_ao.trunk, ref_cands, r_cand_ao.logits, device);
+        }
+        torch::Tensor r_c_logits = CenterAndCapLogitsTensor(r_cand_ao.logits, ref_rollout_masks, 10.0);
+        torch::Tensor r_c_masked = r_c_logits.masked_fill(ref_rollout_masks.logical_not(), -1e9f);
+        torch::Tensor r_c_logp = torch::log_softmax(r_c_masked, -1);
+        torch::Tensor r_p_ref = torch::exp(ref_rollout_alogp).masked_fill(ref_rollout_masks.logical_not(), 0.0f);
+        torch::Tensor r_diff = (ref_rollout_alogp - r_c_logp).masked_fill(ref_rollout_masks.logical_not(), 0.0f);
+        torch::Tensor r_kl_t = (r_p_ref * r_diff).sum(-1).mean();
+        double r_r_kl = r_kl_t.item<double>();
+        if (!std::isfinite(r_r_kl)) {
+          kl_finite = false;
+        } else {
+          cand_kl_rollout = std::max(0.0, r_r_kl);
+        }
+      }
+    }
+
+    if (!kl_finite) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_nonfinite = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    // Strict KL ceiling check: reject step and rollback to state before this step
+    if (max_cumulative_kl > 0.0 &&
+        (cand_kl_searched > max_cumulative_kl || cand_kl_rollout > max_cumulative_kl)) {
+      RestoreModel(model, step_model_backup);
+      RestoreOptState(optimizer, step_opt_backup);
+      res.step_rejected_on_kl = true;
+      if (res.steps_accepted == 0) res.phase_rejected = true;
+      break;
+    }
+
+    // Step accepted!
+    res.steps_accepted++;
+    res.cumulative_kl_searched = cand_kl_searched;
+    res.cumulative_kl_rollout = cand_kl_rollout;
+    res.final_aux_ce = ce.item<double>();
+  }
+
+  if (grad_norm_count > 0) {
+    res.mean_aux_grad_norm = grad_norm_accum / grad_norm_count;
+  }
+  res.optimizer_states_after = static_cast<int64_t>(optimizer.state().size());
+
+  // 7. Measure maximum probability movement
+  {
+    torch::NoGradGuard no_grad;
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+    auto final_ao = model->forward(aux_states);
+    if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+      dune_semantic::ApplySemanticScorerBatch(
+          model->semantic_scorer_, final_ao.trunk, aux_cands, final_ao.logits, device);
+    }
+    torch::Tensor final_logits = CenterAndCapLogitsTensor(final_ao.logits, aux_masks, 10.0);
+    torch::Tensor final_masked = final_logits.masked_fill(aux_masks.logical_not(), -1e9f);
+    torch::Tensor final_probs = torch::softmax(final_masked, -1);
+    torch::Tensor ref_probs = torch::exp(ref_alogp).masked_fill(aux_masks.logical_not(), 0.0f);
+    res.max_prob_movement = (final_probs - ref_probs).abs().max().item<double>();
+  }
+
+  // 8. Final post-phase value head immutability assert (Correction 3)
+  bool val_immut = true;
+  size_t v_idx = 0;
+  for (const auto& p : model->value_head->parameters()) {
+    if (!torch::equal(p, initial_value_params[v_idx++])) val_immut = false;
+  }
+  if (model->use_nonlinear_value_head_ && model->value_head2) {
+    for (const auto& p : model->value_head2->parameters()) {
+      if (!torch::equal(p, initial_value_params[v_idx++])) val_immut = false;
+    }
+  }
+  res.value_head_immutable = val_immut;
+
+  // 9. Measure critic probe MSE shift from shared trunk update (Correction 3)
+  if (ref_rollout_states.defined() && ref_rollout_states.size(0) > 0) {
+    torch::NoGradGuard no_grad;
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+    auto final_ao = model->forward(ref_rollout_states);
+    auto v_final = final_ao.values.squeeze(1);
+    res.critic_probe_mse_shift = (v_final - ref_rollout_values).pow(2).mean().item<double>();
+  }
+
+  return res;
 }
 std::vector<double> ComputeTerminalReturns(
     const State& state,
