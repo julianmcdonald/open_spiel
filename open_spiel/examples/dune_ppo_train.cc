@@ -389,6 +389,12 @@ ABSL_FLAG(std::string, reward_transition_source_fingerprint, "",
           "Expected source config fingerprint for reward continuation transition.");
 ABSL_FLAG(int64_t, reward_transition_source_rollout_games, 0,
           "Expected source rollout_games when transitioning configuration.");
+ABSL_FLAG(bool, allow_gae_transition, false,
+          "Allow intentional transition of gae_lambda from a verified parent checkpoint.");
+ABSL_FLAG(double, gae_transition_source_lambda, 1.0,
+          "Expected source gae_lambda in parent manifest for transition.");
+ABSL_FLAG(std::string, gae_transition_source_fingerprint, "",
+          "Expected source config fingerprint for GAE lambda transition.");
 ABSL_FLAG(int, seed, 1, "Base random seed.");
 ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
@@ -1897,6 +1903,8 @@ std::string GetSearchLabelFingerprint(const std::string& search_label_dir) {
 
 std::string g_reward_transition_source_fingerprint = "";
 int64_t g_reward_transition_source_update = -1;
+std::string g_gae_transition_source_fingerprint = "";
+int64_t g_gae_transition_source_update = -1;
 
 std::string ValidateAndComputeRewardTransitionFingerprint(
     const std::string& manifest_path,
@@ -1991,6 +1999,63 @@ std::string ValidateAndComputeRewardTransitionFingerprint(
       source_family_atomics,
       source_rollout_games > 0 ? source_rollout_games : absl::GetFlag(FLAGS_rollout_games),
       absl::GetFlag(FLAGS_rollout_games)) << std::endl;
+
+  return computed_source_fp;
+}
+
+std::string ValidateAndComputeGaeTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_gae_transition)) {
+    return "";
+  }
+  std::ifstream mfs(manifest_path);
+  if (!mfs) {
+    SpielFatalError("Could not open manifest file at: " + manifest_path);
+  }
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  double source_lambda = absl::GetFlag(FLAGS_gae_transition_source_lambda);
+
+  // Reconstruct source pre-precision config from current flags with source lambda substituted
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  source_config_obj["gae_lambda"] = source_lambda;
+
+  std::string computed_source_fp = open_spiel::ComputePrecisionConfigFingerprint(
+      source_config_obj,
+      absl::GetFlag(FLAGS_rollout_amp),
+      absl::GetFlag(FLAGS_allow_tf32));
+
+  std::string expected_source_fp = absl::GetFlag(FLAGS_gae_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "GAE transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "GAE transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_gae_transition permits ONLY gae_lambda to differ from the parent manifest. All other settings must match exactly.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+
+  std::cout << absl::StrFormat(
+      "[gae-transition] Validated intentional GAE lambda continuation transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  GAE lambda:         %.4f -> %.4f\n",
+      computed_source_fp, current_config_fingerprint,
+      source_lambda, absl::GetFlag(FLAGS_gae_lambda)) << std::endl;
 
   return computed_source_fp;
 }
@@ -2106,6 +2171,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
       if (g_reward_transition_source_update >= 0) {
         manifest_obj["reward_transition_source_update"] = g_reward_transition_source_update;
+      }
+    }
+    if (!g_gae_transition_source_fingerprint.empty()) {
+      manifest_obj["gae_transition_source_fingerprint"] = g_gae_transition_source_fingerprint;
+      if (g_gae_transition_source_update >= 0) {
+        manifest_obj["gae_transition_source_update"] = g_gae_transition_source_update;
       }
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
@@ -9123,6 +9194,12 @@ int main(int argc, char** argv) {
         ValidateAndComputeRewardTransitionFingerprint(manifest_path, config_fingerprint);
     if (!permitted_transition_source_fingerprint.empty()) {
       g_reward_transition_source_fingerprint = permitted_transition_source_fingerprint;
+    } else {
+      permitted_transition_source_fingerprint =
+          ValidateAndComputeGaeTransitionFingerprint(manifest_path, config_fingerprint);
+      if (!permitted_transition_source_fingerprint.empty()) {
+        g_gae_transition_source_fingerprint = permitted_transition_source_fingerprint;
+      }
     }
 
     // Legacy fingerprints predate critic-remediation flags and therefore
@@ -9146,7 +9223,12 @@ int main(int argc, char** argv) {
       SpielFatalError(err);
     }
     if (!permitted_transition_source_fingerprint.empty()) {
-      g_reward_transition_source_update = manifest.global_update;
+      if (!g_reward_transition_source_fingerprint.empty()) {
+        g_reward_transition_source_update = manifest.global_update;
+      }
+      if (!g_gae_transition_source_fingerprint.empty()) {
+        g_gae_transition_source_update = manifest.global_update;
+      }
     }
 
     // Verify market_appendix_mode matches the current run's flag
@@ -9914,6 +9996,12 @@ int main(int argc, char** argv) {
           ValidateAndComputeRewardTransitionFingerprint(manifest_path, config_fingerprint);
       if (!permitted_transition_source_fingerprint.empty()) {
         g_reward_transition_source_fingerprint = permitted_transition_source_fingerprint;
+      } else {
+        permitted_transition_source_fingerprint =
+            ValidateAndComputeGaeTransitionFingerprint(manifest_path, config_fingerprint);
+        if (!permitted_transition_source_fingerprint.empty()) {
+          g_gae_transition_source_fingerprint = permitted_transition_source_fingerprint;
+        }
       }
       std::string legacy_fingerprint = absl::GetFlag(FLAGS_train_value_only)
           ? ""
