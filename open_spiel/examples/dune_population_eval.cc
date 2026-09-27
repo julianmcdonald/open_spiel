@@ -124,6 +124,8 @@ ABSL_FLAG(std::string, market_diagnostics_csv, "",
 ABSL_FLAG(std::string, market_diagnostics_games_jsonl, "",
           "Optional explicit path for compact per-game market diagnostics JSONL. Defaults to "
           "<output_dir>/market_diagnostics_games.jsonl if --record_market_diagnostics is true and --output_dir is set.");
+ABSL_FLAG(int, trace_episode, -1,
+          "If >= 0, print detailed action-by-action trace and VP breakdown for this episode ID (-2 for all).");
 
 namespace open_spiel {
 namespace {
@@ -803,6 +805,22 @@ void WorkerThread(
       game_research_paths[p].push_back({c, r});
     }
     int last_round = dune_state ? dune_state->GetCurrentRound() : -1;
+    const int trace_ep = absl::GetFlag(FLAGS_trace_episode);
+    const bool trace_this = (trace_ep >= 0 && episode_id == trace_ep) || (trace_ep == -2);
+
+    if (trace_this) {
+      std::cout << "\n======================================================\n";
+      std::cout << ">>> START TRACE FOR EPISODE " << episode_id << " <<<\n";
+      std::cout << "Candidate Seat: " << model_player << "\n";
+      std::cout << "Leaders: ";
+      if (dune_state) {
+        for (int p = 0; p < kNumPlayers; ++p) {
+          std::cout << "P" << p << "=" << dune_state->PlayerLeader(p) << " ";
+        }
+      }
+      std::cout << "\n======================================================\n";
+    }
+
     auto snapshot_round_ends = [&]() {
       if (!dune_state) return;
       int cur = dune_state->GetCurrentRound();
@@ -812,6 +830,28 @@ void WorkerThread(
             vp_at_round_end[last_round][p] = dune_state->GetPlayerVp(p);
           }
           round_end_seen[last_round] = true;
+          if (trace_this) {
+            std::cout << "\n--- [ROUND " << last_round << " COMPLETED] ---\n";
+            for (int p = 0; p < kNumPlayers; ++p) {
+              std::cout << "  P" << p << (p == model_player ? " (CANDIDATE)" : "            ")
+                        << ": VP=" << dune_state->GetPlayerVp(p)
+                        << " | Solari=" << dune_state->GetPlayerSolariForTesting(p)
+                        << " Spice=" << dune_state->GetPlayerSpiceForTesting(p)
+                        << " Water=" << dune_state->GetPlayerWaterForTesting(p)
+                        << " Garrison=" << dune_state->GetPlayerTroopsForTesting(p)
+                        << " Combat=" << dune_state->TroopsInCombat(p)
+                        << " | Influence: [Emp=" << dune_state->GetPlayerInfluenceForTesting(p, dune_imperium::Faction::kEmperor)
+                        << " Guild=" << dune_state->GetPlayerInfluenceForTesting(p, dune_imperium::Faction::kSpacingGuild)
+                        << " BG=" << dune_state->GetPlayerInfluenceForTesting(p, dune_imperium::Faction::kBeneGesserit)
+                        << " Frem=" << dune_state->GetPlayerInfluenceForTesting(p, dune_imperium::Faction::kFremen) << "]"
+                        << " | Alliances: [";
+              for (int f = 0; f < 4; ++f) {
+                if (dune_state->GetAllianceOwnerForTesting(f) == p) std::cout << " F" << f;
+              }
+              std::cout << " ]\n";
+            }
+            std::cout << "------------------------------------\n\n";
+          }
         }
         ++last_round;
       }
@@ -835,6 +875,10 @@ void WorkerThread(
           action = outcomes.front().first;
         } else {
           action = SampleAction(outcomes, chance_rng).first;
+        }
+        if (trace_this) {
+          std::cout << "[R" << (dune_state ? dune_state->GetCurrentRound() : -1)
+                    << " CHANCE] " << state->ActionToString(kChancePlayerId, action) << "\n";
         }
         state->ApplyAction(action);
         continue;
@@ -954,7 +998,32 @@ void WorkerThread(
       if (record_market_diagnostics && dune_state != nullptr) {
         market_tracker.BeforeApplyAction(*dune_state, current_player, model_player, chosen_action);
       }
+      int prev_vp[kNumPlayers];
+      for (int p = 0; p < kNumPlayers; ++p) {
+        prev_vp[p] = dune_state ? dune_state->GetPlayerVp(p) : 0;
+      }
       state->ApplyAction(chosen_action);
+      if (trace_this) {
+        std::cout << "[R" << (dune_state ? dune_state->GetCurrentRound() : -1)
+                  << " P" << current_player << (current_player == model_player ? " (CANDIDATE)" : "") << "] "
+                  << state->ActionToString(current_player, chosen_action) << "\n";
+        if (dune_state) {
+          for (int p = 0; p < kNumPlayers; ++p) {
+            int cur_v = dune_state->GetPlayerVp(p);
+            if (cur_v != prev_vp[p]) {
+              std::cout << "   >>> VP CHANGE for P" << p << (p == model_player ? " (CANDIDATE)" : "")
+                        << ": " << prev_vp[p] << " -> " << cur_v
+                        << " (delta " << (cur_v >= prev_vp[p] ? "+" : "") << (cur_v - prev_vp[p]) << ")\n";
+              const auto& events = dune_state->GetVpEvents(p);
+              if (!events.empty()) {
+                const auto& ev = events.back();
+                std::cout << "       Source: " << dune_imperium::VpSourceName(ev.source)
+                          << " (Round " << ev.round << ", delta " << static_cast<int>(ev.delta) << ")\n";
+              }
+            }
+          }
+        }
+      }
       if (dune_state != nullptr) {
         for (int p = 0; p < kNumPlayers; ++p) {
           int cur_c = dune_state->GetResearchBottomColForTesting(p);
@@ -972,6 +1041,29 @@ void WorkerThread(
 
     // Phase-3: capture the final (terminal) round's VP snapshot.
     snapshot_round_ends();
+
+    if (trace_this && dune_state) {
+      std::cout << "\n======================================================\n";
+      std::cout << ">>> FINAL GAME STATE & VP ATTRIBUTION FOR EPISODE " << episode_id << " <<<\n";
+      std::cout << "======================================================\n";
+      for (int p = 0; p < kNumPlayers; ++p) {
+        std::cout << "\n--- PLAYER " << p << (p == model_player ? " (CANDIDATE)" : " (OPPONENT)")
+                  << " | Leader: " << dune_state->PlayerLeader(p)
+                  << " | FinalScoredVp: " << dune_state->FinalScoredVp(p)
+                  << " | TrackVp: " << dune_state->GetPlayerVp(p) << " ---\n";
+        const auto& evs = dune_state->GetVpEvents(p);
+        int run_vp = 0;
+        for (size_t i = 0; i < evs.size(); ++i) {
+          run_vp += evs[i].delta;
+          std::cout << "  Event #" << (i + 1)
+                    << ": Round " << evs[i].round
+                    << " | Delta: " << (evs[i].delta >= 0 ? "+" : "") << static_cast<int>(evs[i].delta)
+                    << " | Total: " << run_vp
+                    << " | Source: " << dune_imperium::VpSourceName(evs[i].source) << "\n";
+        }
+      }
+      std::cout << "======================================================\n\n";
+    }
 
     // --- Collect results ---
     std::vector<double> returns = state->Returns();
