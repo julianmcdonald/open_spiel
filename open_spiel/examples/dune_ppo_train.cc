@@ -395,6 +395,12 @@ ABSL_FLAG(double, gae_transition_source_lambda, 1.0,
           "Expected source gae_lambda in parent manifest for transition.");
 ABSL_FLAG(std::string, gae_transition_source_fingerprint, "",
           "Expected source config fingerprint for GAE lambda transition.");
+ABSL_FLAG(bool, allow_learning_rate_transition, false,
+          "Allow intentional transition of learning_rate from a verified parent checkpoint.");
+ABSL_FLAG(double, learning_rate_transition_source_lr, 1e-5,
+          "Expected source learning_rate in parent manifest for transition.");
+ABSL_FLAG(std::string, learning_rate_transition_source_fingerprint, "",
+          "Expected source config fingerprint for learning rate transition.");
 ABSL_FLAG(int, seed, 1, "Base random seed.");
 ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
@@ -1905,6 +1911,8 @@ std::string g_reward_transition_source_fingerprint = "";
 int64_t g_reward_transition_source_update = -1;
 std::string g_gae_transition_source_fingerprint = "";
 int64_t g_gae_transition_source_update = -1;
+std::string g_learning_rate_transition_source_fingerprint = "";
+int64_t g_learning_rate_transition_source_update = -1;
 
 std::string ValidateAndComputeRewardTransitionFingerprint(
     const std::string& manifest_path,
@@ -2060,6 +2068,63 @@ std::string ValidateAndComputeGaeTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeLearningRateTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_learning_rate_transition)) {
+    return "";
+  }
+  std::ifstream mfs(manifest_path);
+  if (!mfs) {
+    SpielFatalError("Could not open manifest file at: " + manifest_path);
+  }
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  double source_lr = absl::GetFlag(FLAGS_learning_rate_transition_source_lr);
+
+  // Reconstruct source pre-precision config from current flags with source learning rate substituted
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  source_config_obj["learning_rate"] = source_lr;
+
+  std::string computed_source_fp = open_spiel::ComputePrecisionConfigFingerprint(
+      source_config_obj,
+      absl::GetFlag(FLAGS_rollout_amp),
+      absl::GetFlag(FLAGS_allow_tf32));
+
+  std::string expected_source_fp = absl::GetFlag(FLAGS_learning_rate_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Learning rate transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Learning rate transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_learning_rate_transition permits ONLY learning_rate to differ from the parent manifest. All other settings must match exactly.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+
+  std::cout << absl::StrFormat(
+      "[lr-transition] Validated intentional learning rate continuation transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Learning rate:      %.4e -> %.4e\n",
+      computed_source_fp, current_config_fingerprint,
+      source_lr, absl::GetFlag(FLAGS_learning_rate)) << std::endl;
+
+  return computed_source_fp;
+}
+
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     torch::optim::AdamW& optimizer,
                     const std::string& model_path,
@@ -2177,6 +2242,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["gae_transition_source_fingerprint"] = g_gae_transition_source_fingerprint;
       if (g_gae_transition_source_update >= 0) {
         manifest_obj["gae_transition_source_update"] = g_gae_transition_source_update;
+      }
+    }
+    if (!g_learning_rate_transition_source_fingerprint.empty()) {
+      manifest_obj["learning_rate_transition_source_fingerprint"] = g_learning_rate_transition_source_fingerprint;
+      if (g_learning_rate_transition_source_update >= 0) {
+        manifest_obj["learning_rate_transition_source_update"] = g_learning_rate_transition_source_update;
       }
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
@@ -9199,6 +9270,12 @@ int main(int argc, char** argv) {
           ValidateAndComputeGaeTransitionFingerprint(manifest_path, config_fingerprint);
       if (!permitted_transition_source_fingerprint.empty()) {
         g_gae_transition_source_fingerprint = permitted_transition_source_fingerprint;
+      } else {
+        permitted_transition_source_fingerprint =
+            ValidateAndComputeLearningRateTransitionFingerprint(manifest_path, config_fingerprint);
+        if (!permitted_transition_source_fingerprint.empty()) {
+          g_learning_rate_transition_source_fingerprint = permitted_transition_source_fingerprint;
+        }
       }
     }
 
@@ -9228,6 +9305,9 @@ int main(int argc, char** argv) {
       }
       if (!g_gae_transition_source_fingerprint.empty()) {
         g_gae_transition_source_update = manifest.global_update;
+      }
+      if (!g_learning_rate_transition_source_fingerprint.empty()) {
+        g_learning_rate_transition_source_update = manifest.global_update;
       }
     }
 
@@ -9460,6 +9540,19 @@ int main(int argc, char** argv) {
                           : g == 1 ? absl::GetFlag(FLAGS_weight_decay)
                                    : 0.0);
     }
+    for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+      const auto& options =
+          static_cast<const torch::optim::AdamWOptions&>(
+              optimizer->param_groups()[g].options());
+      if (std::abs(options.lr() - absl::GetFlag(FLAGS_learning_rate)) > 1e-12) {
+        SpielFatalError(absl::StrFormat(
+            "Optimizer parameter group %zu effective learning rate mismatch: expected %.6e, got %.6e",
+            g, absl::GetFlag(FLAGS_learning_rate), options.lr()));
+      }
+    }
+    std::cout << absl::StrFormat(
+        "[INFO] Verified effective learning rate in all %zu optimizer parameter groups: %.6e\n",
+        optimizer->param_groups().size(), absl::GetFlag(FLAGS_learning_rate));
     for (auto& pair : optimizer->state()) {
       if (auto* state =
               dynamic_cast<torch::optim::AdamWParamState*>(pair.second.get())) {
@@ -10001,6 +10094,12 @@ int main(int argc, char** argv) {
             ValidateAndComputeGaeTransitionFingerprint(manifest_path, config_fingerprint);
         if (!permitted_transition_source_fingerprint.empty()) {
           g_gae_transition_source_fingerprint = permitted_transition_source_fingerprint;
+        } else {
+          permitted_transition_source_fingerprint =
+              ValidateAndComputeLearningRateTransitionFingerprint(manifest_path, config_fingerprint);
+          if (!permitted_transition_source_fingerprint.empty()) {
+            g_learning_rate_transition_source_fingerprint = permitted_transition_source_fingerprint;
+          }
         }
       }
       std::string legacy_fingerprint = absl::GetFlag(FLAGS_train_value_only)
