@@ -407,6 +407,12 @@ ABSL_FLAG(double, target_kl_transition_source_target_kl, 0.01,
           "Expected source target_kl in parent manifest for transition.");
 ABSL_FLAG(std::string, target_kl_transition_source_fingerprint, "",
           "Expected source config fingerprint for target_kl transition.");
+ABSL_FLAG(bool, allow_single_learner_transition, false,
+          "Allow intentional transition into single learner mode from a verified self-play parent checkpoint.");
+ABSL_FLAG(std::string, single_learner_transition_source_fingerprint, "",
+          "Expected source config fingerprint for single learner transition.");
+ABSL_FLAG(int64_t, single_learner_transition_source_rollout_games, 256,
+          "Expected source rollout_games when transitioning into single learner mode.");
 ABSL_FLAG(int, seed, 1, "Base random seed.");
 ABSL_FLAG(bool, pipeline, false,
           "Overlap next rollout collection with current PPO training. "
@@ -951,6 +957,9 @@ struct WorkerStats {
   uint64_t plot_exempt = 0;
   double plot_penalty_deducted = 0.0;
 
+  // D2 purchase exploration
+  uint64_t forced_buys = 0;
+
   // Natural SM Acquisitions
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
@@ -1153,271 +1162,6 @@ std::string HashAllModelState(
 // Numerical exactness: the trunk/policy/value tensors are `copy_`d from the
 // loaded temp model, which is a bitwise copy of the same dtype and shape. This
 // is what makes section 7.3's bitwise legacy-inference parity gate passable.
-dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
-    const std::string& checkpoint_path, int input_dim) {
-  if (input_dim == dune_imperium::kLegacyInformationStateSize) {
-    return dune_imperium::MarketAppendixMode::kNone;
-  }
-  SPIEL_CHECK_TRUE(dune_imperium::IsExtendedInformationStateSize(input_dim));
-  std::filesystem::path metadata_path(checkpoint_path);
-  metadata_path.replace_extension(".json");
-  std::ifstream input(metadata_path);
-  if (!input) SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
-  const std::string content((std::istreambuf_iterator<char>(input)), {});
-  const auto metadata = open_spiel::json::FromString(content);
-  if (!metadata || !metadata->IsObject()) {
-    SpielFatalError("Invalid card-slot checkpoint metadata: " + metadata_path.string());
-  }
-  const auto& object = metadata->GetObject();
-  auto mode_entry = object.find("market_appendix_mode");
-  auto dim_entry = object.find("observation_dim");
-  auto hash_entry = object.find("feature_schema_sha256");
-  if (mode_entry == object.end() || !mode_entry->second.IsString() ||
-      dim_entry == object.end() || !dim_entry->second.IsInt() ||
-      hash_entry == object.end() || !hash_entry->second.IsString()) {
-    SpielFatalError("Incomplete card-slot checkpoint schema: " + metadata_path.string());
-  }
-  const auto mode = dune_imperium::ParseMarketAppendixMode(mode_entry->second.GetString());
-  const auto schema = dune_imperium::GetInformationStateSchema(mode);
-  SPIEL_CHECK_EQ(schema.size, input_dim);
-  SPIEL_CHECK_EQ(dim_entry->second.GetInt(), input_dim);
-  SPIEL_CHECK_EQ(hash_entry->second.GetString(), std::string(schema.sha256));
-  return mode;
-}
-
-bool LoadModelCheckpointMigrating(
-    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
-    const std::string& path, torch::Device device) {
-  int64_t input_dim = model->input_layer->weight.size(1);
-  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
-  int64_t action_dim = model->policy_head->weight.size(0);
-  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
-  const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
-  if (CheckpointHasSemanticScorer(path) && !model->with_semantic_scorer_) {
-    SpielFatalError("Model loading must preserve the source scorer; checkpoint at " + path +
-                    " has a semantic scorer but model was not configured with --enable_semantic_scorer=true.");
-  }
-
-  std::filesystem::path metadata_path(path);
-  metadata_path.replace_extension(".json");
-  std::string source_schema = dune_semantic::kDescriptorSchemaVersionV2;
-  if (std::filesystem::exists(metadata_path)) {
-    std::ifstream input(metadata_path);
-    if (input) {
-      const std::string content((std::istreambuf_iterator<char>(input)), {});
-      const auto metadata = open_spiel::json::FromString(content);
-      if (metadata && metadata->IsObject()) {
-        const auto& object = metadata->GetObject();
-        auto schema_entry = object.find("semantic_descriptor_schema");
-        if (schema_entry != object.end() && schema_entry->second.IsString()) {
-          source_schema = schema_entry->second.GetString();
-          if (source_schema != dune_semantic::kDescriptorSchemaVersionV2 &&
-              source_schema != dune_semantic::kDescriptorSchemaVersionV3) {
-            SpielFatalError("Mismatched or invalid semantic_descriptor_schema in metadata: " + metadata_path.string());
-          }
-        }
-      }
-    }
-  }
-
-  int64_t ckpt_input_dim = input_dim;
-  {
-    torch::serialize::InputArchive archive;
-    archive.load_from(path, torch::kCPU);
-    torch::serialize::InputArchive in_archive;
-    if (archive.try_read("input_layer", in_archive)) {
-      torch::Tensor w;
-      if (in_archive.try_read("weight", w)) {
-        ckpt_input_dim = w.size(1);
-      }
-    }
-  }
-
-  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      ckpt_input_dim, hidden_dim, action_dim, num_blocks, use_nonlinear,
-      /*with_aux_heads=*/false);
-  temp_model->to(device);
-  torch::load(temp_model, path, device);
-
-  torch::NoGradGuard no_grad;
-  // Trunk.
-  if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
-    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
-    CopyInputToFullPublicInformation(model->input_layer->weight,
-                                     temp_model->input_layer->weight, source_mode);
-    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
-  } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
-    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
-    CopyInputToOrderedCardSlots(model->input_layer->weight,
-                               temp_model->input_layer->weight, source_mode);
-    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
-  } else if (input_dim == dune_imperium::kExpandedInformationStateSize) {
-    if (ckpt_input_dim == input_dim) {
-      model->input_layer->weight.copy_(temp_model->input_layer->weight);
-    } else if (ckpt_input_dim == 5580) {
-      model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
-      model->input_layer->weight.slice(1, 5580, 6215).zero_();
-    } else {
-      SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
-                                      ckpt_input_dim, input_dim));
-    }
-    const std::string flag_mode_str = absl::GetFlag(FLAGS_market_appendix_mode);
-    if (flag_mode_str != "none") {
-      model->market_appendix_mode_ = dune_imperium::ParseMarketAppendixMode(flag_mode_str);
-    } else {
-      model->market_appendix_mode_ = ReadCheckpointInputMode(path, ckpt_input_dim);
-    }
-    if (model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kZeros &&
-        model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kOrderedMarket) {
-      SpielFatalError("Ambiguous 6,215 model requires explicit market_appendix_mode ('zeros' or 'ordered_market')");
-    }
-  } else {
-    SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
-                                    ckpt_input_dim, input_dim));
-  }
-  if (model->with_semantic_scorer_) {
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
-  }
-  if (model->input_layer->bias.defined() &&
-      temp_model->input_layer->bias.defined()) {
-    model->input_layer->bias.copy_(temp_model->input_layer->bias);
-  }
-  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
-    auto source_params = temp_model->res_blocks[i]->parameters();
-    auto target_params = model->res_blocks[i]->parameters();
-    for (size_t j = 0; j < source_params.size(); ++j) {
-      target_params[j].copy_(source_params[j]);
-    }
-    auto source_buffers = temp_model->res_blocks[i]->buffers();
-    auto target_buffers = model->res_blocks[i]->buffers();
-    for (size_t j = 0; j < source_buffers.size(); ++j) {
-      target_buffers[j].copy_(source_buffers[j]);
-    }
-  }
-  // Policy head.
-  model->policy_head->weight.copy_(temp_model->policy_head->weight);
-  if (model->policy_head->bias.defined() &&
-      temp_model->policy_head->bias.defined()) {
-    model->policy_head->bias.copy_(temp_model->policy_head->bias);
-  }
-  // Value head(s). Unlike the nonlinear partial-copy path below, the migration
-  // DOES carry the value head across: section 7.2 requires the value head load
-  // "without numerical change", and a fresh critic here would silently restart
-  // the value function at update 0 of every arm.
-  model->value_head->weight.copy_(temp_model->value_head->weight);
-  if (model->value_head->bias.defined() &&
-      temp_model->value_head->bias.defined()) {
-    model->value_head->bias.copy_(temp_model->value_head->bias);
-  }
-  if (use_nonlinear) {
-    model->value_head2->weight.copy_(temp_model->value_head2->weight);
-    if (model->value_head2->bias.defined() &&
-        temp_model->value_head2->bias.defined()) {
-      model->value_head2->bias.copy_(temp_model->value_head2->bias);
-    }
-  }
-
-  // Now the heads, if and only if this checkpoint already has them.
-  bool migrated = true;
-  if (model->has_aux_heads_) {
-    torch::serialize::InputArchive archive;
-    archive.load_from(path, device);
-    torch::serialize::InputArchive head_archive;
-    if (archive.try_read("final_vp_head", head_archive)) {
-      // Post-migration checkpoint: load all three normally.
-      model->final_vp_head->load(head_archive);
-      torch::serialize::InputArchive a2, a3;
-      if (!archive.try_read("terminal_round_head", a2) ||
-          !archive.try_read("next_own_action_head", a3)) {
-        SpielFatalError(
-            "PWO-5 migration: the checkpoint at " + path +
-            " carries final_vp_head but not all three auxiliary heads. A "
-            "partially migrated checkpoint is a STOP, not something to repair "
-            "silently -- section 17.5 item 4.");
-      }
-      model->terminal_round_head->load(a2);
-      model->next_own_action_head->load(a3);
-      migrated = false;  // it was ALREADY migrated
-    } else {
-      std::cout << "[PWO-5] MIGRATION: " << path
-                << " predates the auxiliary heads. Trunk, policy head and "
-                   "value head loaded without numerical change; the three "
-                   "heads keep their deterministic init from "
-                   "kHeadInitConstant=" << absl::GetFlag(FLAGS_head_init_constant)
-                << "." << std::endl;
-    }
-  }
-  if (model->with_semantic_scorer_) {
-    torch::serialize::InputArchive archive;
-    archive.load_from(path, device);
-    torch::serialize::InputArchive scorer_archive;
-    if (archive.try_read("semantic_scorer", scorer_archive)) {
-      model->semantic_scorer_->Load(scorer_archive, source_schema);
-      std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path
-                << " (schema: " << source_schema << ")" << std::endl;
-    } else {
-      std::cout << "[SEMANTIC SCORER] Checkpoint does not contain semantic_scorer; keeping zero-init scorer." << std::endl;
-    }
-  }
-  return migrated;
-}
-
-void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
-                         const std::string& path, torch::Device device) {
-  // PWO-5 & Semantic Scorer: when the model carries auxiliary heads or a semantic scorer,
-  // the migrating loader is the only correct path -- a plain torch::load would demand
-  // tensors the base checkpoint does not have and would abort the run.
-  if (model->has_aux_heads_ || model->with_semantic_scorer_ ||
-      CheckpointHasSemanticScorer(path) ||
-      dune_imperium::IsExtendedInformationStateSize(model->input_layer->weight.size(1))) {
-    LoadModelCheckpointMigrating(model, path, device);
-    return;
-  }
-  if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
-    const int64_t expected_input_dim = model->input_layer->weight.size(1);
-    torch::load(model, path, device);
-    SPIEL_CHECK_EQ(model->input_layer->weight.size(1), expected_input_dim);
-    return;
-  }
-  int64_t input_dim = model->input_layer->weight.size(1);
-  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
-  int64_t action_dim = model->policy_head->weight.size(0);
-  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
-
-  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
-      input_dim, hidden_dim, action_dim, num_blocks, /*use_nonlinear=*/false);
-  temp_model->to(device);
-
-  std::cout << "[INFO] Loading standard checkpoint for partial weight copy (nonlinear model)..." << std::endl;
-  torch::load(temp_model, path, device);
-
-  torch::NoGradGuard no_grad;
-  model->input_layer->weight.copy_(temp_model->input_layer->weight);
-  if (model->input_layer->bias.defined() && temp_model->input_layer->bias.defined()) {
-    model->input_layer->bias.copy_(temp_model->input_layer->bias);
-  }
-  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
-    auto& target_block = model->res_blocks[i];
-    auto& source_block = temp_model->res_blocks[i];
-    auto source_params = source_block->parameters();
-    auto target_params = target_block->parameters();
-    for (size_t j = 0; j < source_params.size(); ++j) {
-      target_params[j].copy_(source_params[j]);
-    }
-    auto source_buffers = source_block->buffers();
-    auto target_buffers = target_block->buffers();
-    for (size_t j = 0; j < source_buffers.size(); ++j) {
-      target_buffers[j].copy_(source_buffers[j]);
-    }
-  }
-  model->policy_head->weight.copy_(temp_model->policy_head->weight);
-  if (model->policy_head->bias.defined() && temp_model->policy_head->bias.defined()) {
-    model->policy_head->bias.copy_(temp_model->policy_head->bias);
-  }
-  std::cout << "[INFO] Partial weight copy completed successfully." << std::endl;
-}
 
 void SetOptimizerLearningRate(torch::optim::Optimizer& optimizer, double lr) {
   for (auto& group : optimizer.param_groups()) {
@@ -1913,15 +1657,6 @@ std::string GetSearchLabelFingerprint(const std::string& search_label_dir) {
   return "";
 }
 
-std::string g_reward_transition_source_fingerprint = "";
-int64_t g_reward_transition_source_update = -1;
-std::string g_gae_transition_source_fingerprint = "";
-int64_t g_gae_transition_source_update = -1;
-std::string g_learning_rate_transition_source_fingerprint = "";
-int64_t g_learning_rate_transition_source_update = -1;
-std::string g_target_kl_transition_source_fingerprint = "";
-int64_t g_target_kl_transition_source_update = -1;
-
 std::string ValidateAndComputeRewardTransitionFingerprint(
     const std::string& manifest_path,
     const std::string& current_config_fingerprint) {
@@ -2177,6 +1912,56 @@ std::string ValidateAndComputeTargetKlTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeSingleLearnerTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_single_learner_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  int64_t source_rollout_games = absl::GetFlag(FLAGS_single_learner_transition_source_rollout_games);
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  source_config_obj.erase("single_learner_training");
+  source_config_obj.erase("training_opponent_pool");
+  source_config_obj["rollout_games"] = source_rollout_games;
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_single_learner_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Single-learner transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Single-learner transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_single_learner_transition permits single_learner_training and rollout_games to differ from parent manifest.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+  std::cout << absl::StrFormat(
+      "[single-learner-transition] Validated intentional single learner continuation transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Rollout games:      %d -> %d\n",
+      computed_source_fp, current_config_fingerprint,
+      source_rollout_games, absl::GetFlag(FLAGS_rollout_games)) << std::endl;
+  return computed_source_fp;
+}
+
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     torch::optim::AdamW& optimizer,
                     const std::string& model_path,
@@ -2308,6 +2093,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
         manifest_obj["target_kl_transition_source_update"] = g_target_kl_transition_source_update;
       }
     }
+    if (!g_single_learner_transition_source_fingerprint.empty()) {
+      manifest_obj["single_learner_transition_source_fingerprint"] = g_single_learner_transition_source_fingerprint;
+      if (g_single_learner_transition_source_update >= 0) {
+        manifest_obj["single_learner_transition_source_update"] = g_single_learner_transition_source_update;
+      }
+    }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
       manifest_obj["pwo5"] = json::Value(g_pwo5_manifest_fields);
@@ -2385,6 +2176,34 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
   for (int p = 0; p < 4; ++p) {
     uint64_t seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamPolicyPlayer0 + p);
     policy_rng[p] = dune_seed::MakeRng64(seed);
+  }
+
+  bool do_purchase_exploration = false;
+  int purchase_exploration_seat = -1;
+  int forced_round_1 = -1;
+  int forced_round_2 = -1;
+  bool forced_round_1_done = false;
+  bool forced_round_2_done = false;
+  std::mt19937_64 explore_rng;
+  if (absl::GetFlag(FLAGS_purchase_exploration)) {
+    uint64_t seed = dune_seed::DeriveSeed(
+        master, dune_seed::kDomainTrain, episode_id,
+        dune_seed::kStreamPurchaseExploration);
+    explore_rng = dune_seed::MakeRng64(seed);
+    std::uniform_real_distribution<double> p_dist(0.0, 1.0);
+    if (p_dist(explore_rng) < 0.10) {
+      do_purchase_exploration = true;
+      if (single_learner) {
+        purchase_exploration_seat = learner_seat;
+      } else {
+        std::uniform_int_distribution<int> seat_dist(0, game.NumPlayers() - 1);
+        purchase_exploration_seat = seat_dist(explore_rng);
+      }
+      std::vector<int> rounds_pool = {1, 2, 3, 4, 5, 6};
+      std::shuffle(rounds_pool.begin(), rounds_pool.end(), explore_rng);
+      forced_round_1 = rounds_pool[0];
+      forced_round_2 = rounds_pool[1];
+    }
   }
 
   while (true) {
@@ -2757,6 +2576,42 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
       Action action = policy_sample.action;
       float old_log_prob = policy_sample.chosen_log_probability;
+
+      bool is_forced_buy = false;
+      if (do_purchase_exploration && current_player == purchase_exploration_seat &&
+          dune_state != nullptr && dune_state->IsPlayerInRevealTurn(current_player)) {
+        int cur_round = dune_state->GetCurrentRound();
+        bool round_eligible = (cur_round == forced_round_1 && !forced_round_1_done) ||
+                              (cur_round == forced_round_2 && !forced_round_2_done);
+        if (round_eligible) {
+          std::vector<Action> legal_acquisitions;
+          for (Action a : actions) {
+            if (open_spiel::IsAcquisitionAction(a)) {
+              legal_acquisitions.push_back(a);
+            }
+          }
+          if (legal_acquisitions.size() >= 2) {
+            std::uniform_int_distribution<size_t> buy_dist(0, legal_acquisitions.size() - 1);
+            action = legal_acquisitions[buy_dist(explore_rng)];
+            is_forced_buy = true;
+            if (cur_round == forced_round_1) forced_round_1_done = true;
+            else if (cur_round == forced_round_2) forced_round_2_done = true;
+
+            for (size_t act_i = 0; act_i < actions.size(); ++act_i) {
+              if (actions[act_i] == action) {
+                if (act_i < legal_probabilities.size()) {
+                  old_log_prob = static_cast<float>(
+                      std::log(std::max(1e-12, legal_probabilities[act_i])));
+                }
+                break;
+              }
+            }
+            if (local_stats != nullptr) {
+              ++local_stats->forced_buys;
+            }
+          }
+        }
+      }
 
       // Search-in-Training reservoir sampling for eligible learner decisions
       const bool is_turn_start = (current_player != last_player ||
@@ -3147,6 +3002,19 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         vrpo_episode->rows.push_back(std::move(captured));
       }
 
+      std::vector<uint16_t> pre_action_privileged_appendix;
+      if (absl::GetFlag(FLAGS_privileged_critic) && is_learner && dune_state != nullptr) {
+        const auto central = dune_state->VrpoCentralCriticTensor(current_player);
+        SPIEL_CHECK_EQ(central.size(), 9012);
+        constexpr size_t kAppendixOffset = 5580;
+        constexpr size_t kAppendixSize = 3432;
+        pre_action_privileged_appendix.resize(kAppendixSize);
+        for (size_t k = 0; k < kAppendixSize; ++k) {
+          pre_action_privileged_appendix[k] =
+              open_spiel::FloatToFp16(central[kAppendixOffset + k]);
+        }
+      }
+
       state->ApplyAction(action);
       last_player = current_player;
       last_action = action;
@@ -3191,6 +3059,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.behavior_physical_batch_size = result.physical_batch_size;
         transition.behavior_physical_batch_row = result.physical_batch_row;
         transition.candidate_data = std::move(cand_data);
+        transition.mask_policy_loss = false;
+        transition.privileged_appendix = std::move(pre_action_privileged_appendix);
         trajectory->push_back(std::move(transition));
 
         if (current_player >= 0 && current_player < game.NumPlayers()) {
@@ -3415,6 +3285,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
       reward = std::clamp(reward / reward_scale, -1.0f, 1.0f);
+      it->reward = reward;
 
       float delta = reward + static_cast<float>(gamma) * last_value[p] -
                     it->value;
@@ -3516,6 +3387,9 @@ struct CollectResult {
   uint64_t plot_penalized = 0;
   uint64_t plot_exempt = 0;
   double plot_penalty_deducted = 0.0;
+
+  // D2 purchase exploration
+  uint64_t forced_buys = 0;
 
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
@@ -3741,6 +3615,7 @@ CollectResult CollectRollout(const Game* game,
     result.plot_penalized += stats.plot_penalized;
     result.plot_exempt += stats.plot_exempt;
     result.plot_penalty_deducted += stats.plot_penalty_deducted;
+    result.forced_buys += stats.forced_buys;
 
     for (int i = 0; i < 4; ++i) result.sm_acquisitions_by_seat[i] += stats.sm_acquisitions_by_seat[i];
     for (int i = 0; i < 14; ++i) result.sm_acquisitions_by_leader[i] += stats.sm_acquisitions_by_leader[i];
@@ -7955,13 +7830,20 @@ int main(int argc, char** argv) {
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> inference_critic = nullptr;
   std::unique_ptr<torch::optim::AdamW> critic_optimizer = nullptr;
   if (absl::GetFlag(FLAGS_separate_actor_critic)) {
+    if (absl::GetFlag(FLAGS_sample_counterfactual_states)) {
+      SpielFatalError("--separate_actor_critic cannot be combined with --sample_counterfactual_states");
+    }
+    const int64_t critic_obs_size =
+        absl::GetFlag(FLAGS_privileged_critic)
+            ? (obs_size + open_spiel::kPrivilegedCriticAppendixSize)
+            : obs_size;
     training_critic =
         std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            critic_obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
             absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
     inference_critic =
         std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-            obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+            critic_obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
             absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
     training_critic->to(device);
     inference_critic->to(device);
@@ -9338,6 +9220,12 @@ int main(int argc, char** argv) {
               ValidateAndComputeTargetKlTransitionFingerprint(manifest_path, config_fingerprint);
           if (!permitted_transition_source_fingerprint.empty()) {
             g_target_kl_transition_source_fingerprint = permitted_transition_source_fingerprint;
+          } else {
+            permitted_transition_source_fingerprint =
+                ValidateAndComputeSingleLearnerTransitionFingerprint(manifest_path, config_fingerprint);
+            if (!permitted_transition_source_fingerprint.empty()) {
+              g_single_learner_transition_source_fingerprint = permitted_transition_source_fingerprint;
+            }
           }
         }
       }
@@ -9375,6 +9263,9 @@ int main(int argc, char** argv) {
       }
       if (!g_target_kl_transition_source_fingerprint.empty()) {
         g_target_kl_transition_source_update = manifest.global_update;
+      }
+      if (!g_single_learner_transition_source_fingerprint.empty()) {
+        g_single_learner_transition_source_update = manifest.global_update;
       }
     }
 
@@ -9572,6 +9463,34 @@ int main(int argc, char** argv) {
         }
         std::cout << "[INFO] Loaded anchor model for policy KL penalty.\n";
       }
+      if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
+        std::string critic_path = absl::GetFlag(FLAGS_critic_checkpoint);
+        if (critic_path.empty()) {
+          std::string sibling_critic = (std::filesystem::path(model_path).parent_path() /
+              ("ppo_critic_model_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+          if (std::filesystem::exists(sibling_critic)) {
+            critic_path = sibling_critic;
+          } else {
+            critic_path = model_path;
+          }
+        }
+        if (!std::filesystem::exists(critic_path)) {
+          SpielFatalError("Critic checkpoint not found: " + critic_path);
+        }
+        LoadModelCheckpoint(training_critic, critic_path, device, /*allow_skip_semantic_scorer=*/true);
+        std::cout << "[INFO] Loaded critic checkpoint from " << critic_path << "\n";
+
+        for (auto& item : training_model->named_parameters()) {
+          if (item.key().find("value_head") != std::string::npos) {
+            item.value().set_requires_grad(false);
+          }
+        }
+        for (auto& item : training_critic->named_parameters()) {
+          if (item.key().rfind("policy_head", 0) == 0) {
+            item.value().set_requires_grad(false);
+          }
+        }
+      }
       if (absl::GetFlag(FLAGS_search_pi_mode)) {
         // See the bootstrap path: this mode owns a separate optimizer and
         // loads it itself, and only from its own lineage.
@@ -9586,6 +9505,22 @@ int main(int argc, char** argv) {
                 training_model, *optimizer, optim_path, device)) {
           torch::load(*optimizer, optim_path, device);
         }
+        if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
+          std::string critic_opt_path = absl::GetFlag(FLAGS_critic_optim_checkpoint);
+          if (critic_opt_path.empty()) {
+            std::string sibling_opt = (std::filesystem::path(optim_path).parent_path() /
+                ("ppo_critic_optimizer_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+            if (std::filesystem::exists(sibling_opt)) {
+              critic_opt_path = sibling_opt;
+            }
+          }
+          if (!critic_opt_path.empty() && std::filesystem::exists(critic_opt_path)) {
+            torch::load(*critic_optimizer, critic_opt_path, device);
+            std::cout << "[INFO] Loaded critic optimizer from " << critic_opt_path << "\n";
+          } else {
+            std::cout << "[INFO] Starting fresh critic optimizer for separate actor-critic.\n";
+          }
+        }
       } else {
         std::cout << "[INFO] train_value_only is true: keeping fresh value-only optimizer. Skipping optimizer checkpoint load.\n";
       }
@@ -9594,6 +9529,9 @@ int main(int argc, char** argv) {
     }
 
     open_spiel::SetOptimizerLearningRate(*optimizer, absl::GetFlag(FLAGS_learning_rate));
+    if (critic_optimizer != nullptr) {
+      open_spiel::SetOptimizerLearningRate(*critic_optimizer, absl::GetFlag(FLAGS_learning_rate));
+    }
     for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
       auto& options =
           static_cast<torch::optim::AdamWOptions&>(
@@ -9627,6 +9565,18 @@ int main(int argc, char** argv) {
         if (state->exp_avg_sq().defined()) state->exp_avg_sq() = state->exp_avg_sq().to(device);
         if (state->max_exp_avg_sq().defined()) {
           state->max_exp_avg_sq() = state->max_exp_avg_sq().to(device);
+        }
+      }
+    }
+    if (critic_optimizer != nullptr) {
+      for (auto& pair : critic_optimizer->state()) {
+        if (auto* state =
+                dynamic_cast<torch::optim::AdamWParamState*>(pair.second.get())) {
+          if (state->exp_avg().defined()) state->exp_avg() = state->exp_avg().to(device);
+          if (state->exp_avg_sq().defined()) state->exp_avg_sq() = state->exp_avg_sq().to(device);
+          if (state->max_exp_avg_sq().defined()) {
+            state->max_exp_avg_sq() = state->max_exp_avg_sq().to(device);
+          }
         }
       }
     }
@@ -10166,6 +10116,18 @@ int main(int argc, char** argv) {
               ValidateAndComputeLearningRateTransitionFingerprint(manifest_path, config_fingerprint);
           if (!permitted_transition_source_fingerprint.empty()) {
             g_learning_rate_transition_source_fingerprint = permitted_transition_source_fingerprint;
+          } else {
+            permitted_transition_source_fingerprint =
+                ValidateAndComputeTargetKlTransitionFingerprint(manifest_path, config_fingerprint);
+            if (!permitted_transition_source_fingerprint.empty()) {
+              g_target_kl_transition_source_fingerprint = permitted_transition_source_fingerprint;
+            } else {
+              permitted_transition_source_fingerprint =
+                  ValidateAndComputeSingleLearnerTransitionFingerprint(manifest_path, config_fingerprint);
+              if (!permitted_transition_source_fingerprint.empty()) {
+                g_single_learner_transition_source_fingerprint = permitted_transition_source_fingerprint;
+              }
+            }
           }
         }
       }
@@ -10188,7 +10150,21 @@ int main(int argc, char** argv) {
         SpielFatalError("Study resume shared validation failed: " + err);
       }
       if (!permitted_transition_source_fingerprint.empty()) {
-        g_reward_transition_source_update = shared_manifest.global_update;
+        if (!g_reward_transition_source_fingerprint.empty()) {
+          g_reward_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_gae_transition_source_fingerprint.empty()) {
+          g_gae_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_learning_rate_transition_source_fingerprint.empty()) {
+          g_learning_rate_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_target_kl_transition_source_fingerprint.empty()) {
+          g_target_kl_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_single_learner_transition_source_fingerprint.empty()) {
+          g_single_learner_transition_source_update = shared_manifest.global_update;
+        }
       }
 
       // Verify market_appendix_mode and feature_schema match the current run's flags
@@ -10277,7 +10253,8 @@ int main(int argc, char** argv) {
   if (absl::GetFlag(FLAGS_deterministic_rollout_eval)) {
     evaluator = std::make_shared<open_spiel::DeterministicEvaluator>(
         inference_model, device, &eval_mutex, &sync_mutex,
-        absl::GetFlag(FLAGS_separate_actor_critic) ? inference_critic : nullptr);
+        (absl::GetFlag(FLAGS_separate_actor_critic) && !absl::GetFlag(FLAGS_privileged_critic))
+            ? inference_critic : nullptr);
   } else {
     evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
         inference_model, absl::GetFlag(FLAGS_eval_batch_size),
@@ -12803,7 +12780,9 @@ int main(int argc, char** argv) {
             ? open_spiel::TrainPpoUpdateSeparate(
                   training_model, *optimizer, training_critic, *critic_optimizer,
                   current_collect.rollout, obs_size, action_size, device, master,
-                  start_update, /*compute_diagnostics=*/true)
+                  start_update, /*compute_diagnostics=*/true,
+                  absl::GetFlag(FLAGS_gamma),
+                  (absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gae_lambda)))
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, start_update, anchor_model,
@@ -12813,6 +12792,7 @@ int main(int argc, char** argv) {
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
                   /*compute_diagnostics=*/true);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+    stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
@@ -13032,7 +13012,9 @@ int main(int argc, char** argv) {
             ? open_spiel::TrainPpoUpdateSeparate(
                   training_model, *optimizer, training_critic, *critic_optimizer,
                   current_collect.rollout, obs_size, action_size, device, master,
-                  update, compute_diagnostics)
+                  update, compute_diagnostics,
+                  absl::GetFlag(FLAGS_gamma),
+                  (absl::GetFlag(FLAGS_train_value_only) ? 1.0 : absl::GetFlag(FLAGS_gae_lambda)))
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, update, anchor_model,
@@ -13042,6 +13024,7 @@ int main(int argc, char** argv) {
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
                   compute_diagnostics);
     stats.episode_ids_unique = current_collect.episode_ids_unique;
+    stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
 
@@ -13493,6 +13476,9 @@ int main(int argc, char** argv) {
             plot_intrigue_exemption_threshold,
             reward_lambda);
       }
+      if (absl::GetFlag(FLAGS_purchase_exploration) || current_collect.forced_buys > 0) {
+        std::cout << absl::StrFormat("  [Purchase Exploration] Forced buys: %d\n", current_collect.forced_buys);
+      }
     }
 
     if (search_lambda > 0.0 && search_buffer.Size() > 0) {
@@ -13517,8 +13503,8 @@ int main(int argc, char** argv) {
     if (is_checkpoint) {
       std::string prefix = absl::GetFlag(FLAGS_run_prefix);
       if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
-        std::string actor_model_path = absl::StrCat(prefix, "_actor_model_update_", update, ".pt");
-        std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_update_", update, ".pt");
+        std::string actor_model_path = absl::StrCat(prefix, "_model_update_", update, ".pt");
+        std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
         std::string critic_model_path = absl::StrCat(prefix, "_critic_model_update_", update, ".pt");
         std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_update_", update, ".pt");
         open_spiel::SaveDualCheckpoint(
@@ -13586,8 +13572,8 @@ int main(int argc, char** argv) {
       if (interval <= 0 || update % interval != 0) {
         std::string prefix = absl::GetFlag(FLAGS_run_prefix);
         if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
-          std::string actor_model_path = absl::StrCat(prefix, "_actor_model_update_", update, ".pt");
-          std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_update_", update, ".pt");
+          std::string actor_model_path = absl::StrCat(prefix, "_model_update_", update, ".pt");
+          std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
           std::string critic_model_path = absl::StrCat(prefix, "_critic_model_update_", update, ".pt");
           std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_update_", update, ".pt");
           open_spiel::SaveDualCheckpoint(
@@ -13614,8 +13600,8 @@ int main(int argc, char** argv) {
       if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
         std::string prefix = absl::GetFlag(FLAGS_run_prefix);
         if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
-          std::string actor_model_path = absl::StrCat(prefix, "_actor_model_final.pt");
-          std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_final.pt");
+          std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
+          std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
           std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
           std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
           open_spiel::SaveDualCheckpoint(
@@ -13683,8 +13669,8 @@ int main(int argc, char** argv) {
   if (absl::GetFlag(FLAGS_save_final_checkpoint) && !final_checkpoint_saved && last_completed_update >= start_update) {
     std::string prefix = absl::GetFlag(FLAGS_run_prefix);
     if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
-      std::string actor_model_path = absl::StrCat(prefix, "_actor_model_final.pt");
-      std::string actor_optim_path = absl::StrCat(prefix, "_actor_optimizer_final.pt");
+      std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
+      std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
       std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
       std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
       open_spiel::SaveDualCheckpoint(

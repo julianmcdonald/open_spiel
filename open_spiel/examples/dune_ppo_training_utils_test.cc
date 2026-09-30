@@ -86,6 +86,20 @@ ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
+ABSL_FLAG(int, hidden_dim, 2048, "");
+ABSL_FLAG(int, num_blocks, 8, "");
+ABSL_FLAG(int, seed_scheme_version, 2, "");
+ABSL_FLAG(std::string, model_checkpoint, "", "");
+ABSL_FLAG(std::string, optim_checkpoint, "", "");
+ABSL_FLAG(bool, nonlinear_value_head, false, "");
+ABSL_FLAG(std::string, market_appendix_mode, "full_public_information_v3", "");
+ABSL_FLAG(double, head_init_constant, 0.0, "");
+ABSL_FLAG(bool, enable_semantic_scorer, true, "");
+ABSL_FLAG(double, specimen_exchange_penalty, 0.0, "");
+ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
+ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
+ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
+ABSL_FLAG(int, rollout_games, 256, "");
 ABSL_DECLARE_FLAG(bool, train_value_only);
 // WO-PERF-1 flags (defined in dune_ppo_training_utils.cc).
 ABSL_DECLARE_FLAG(std::string, diag_prepass_mode);
@@ -10670,7 +10684,7 @@ int main() {
     std::vector<PpoTransition> batch;
     for (int i = 0; i < 8; ++i) {
       PpoTransition t;
-      t.episode_id = i;
+      t.episode_id = i + 1;
       t.player_id = i % 4;
       t.action = i % action_dim;
       t.legal_actions = {0, 1, 2, 3};

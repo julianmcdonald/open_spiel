@@ -15,6 +15,7 @@
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
+#include <c10/util/Half.h>
 #include <c10/core/Event.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
 #include <chrono>
@@ -32,8 +33,26 @@ ABSL_DECLARE_FLAG(int, search_aux_steps);
 ABSL_DECLARE_FLAG(int, search_aux_batch_size);
 ABSL_DECLARE_FLAG(double, search_aux_target_kl);
 ABSL_DECLARE_FLAG(double, search_target_max_kl);
+ABSL_DECLARE_FLAG(bool, critic_keeps_training);
+ABSL_DECLARE_FLAG(bool, privileged_critic);
+ABSL_DECLARE_FLAG(bool, purchase_exploration);
+ABSL_DECLARE_FLAG(double, logit_penalty_coef);
+
+extern std::string g_reward_transition_source_fingerprint;
+extern int64_t g_reward_transition_source_update;
+extern std::string g_gae_transition_source_fingerprint;
+extern int64_t g_gae_transition_source_update;
+extern std::string g_learning_rate_transition_source_fingerprint;
+extern int64_t g_learning_rate_transition_source_update;
+extern std::string g_target_kl_transition_source_fingerprint;
+extern int64_t g_target_kl_transition_source_update;
+extern std::string g_single_learner_transition_source_fingerprint;
+extern int64_t g_single_learner_transition_source_update;
 
 namespace open_spiel {
+
+inline constexpr int kPrivilegedCriticAppendixSize = 3432;
+inline constexpr int kPrivilegedCriticInformationStateSize = 12614;
 
 // Define PpoTransition here so it is shared.
 struct PpoTransition {
@@ -61,9 +80,31 @@ struct PpoTransition {
   int32_t behavior_physical_batch_row = -1;
   // Candidate action descriptors for the semantic action scorer.
   dune_semantic::CandidateActionData candidate_data;
+  // Excludes this row from policy and entropy losses (used for D2 purchase exploration)
+  bool mask_policy_loss = false;
+  // Compact fp16 storage for privileged central critic features (3,432 floats, A2)
+  std::vector<uint16_t> privileged_appendix;
 };
 
+inline bool IsAcquisitionAction(Action a) {
+  if (a >= dune_imperium::kActionBuyImperiumRow0 && a < dune_imperium::kActionBuyImperiumRow0 + 8) return true;
+  if (a >= dune_imperium::kActionBuyHelenaReserve0 && a < dune_imperium::kActionBuyHelenaReserve0 + 8) return true;
+  if (a == dune_imperium::kActionBuyReserveArrakisLiaison) return true;
+  if (a == dune_imperium::kActionBuyReserveTheSpiceMustFlow) return true;
+  if (a >= dune_imperium::kActionTechAcquire0 && a < dune_imperium::kActionTechAcquireSkip) return true;
+  if (a >= dune_imperium::kActionTleilaxuAcquire0 && a < dune_imperium::kActionTleilaxuAcquireSkip) return true;
+  if (a >= dune_imperium::kActionTechAcquireWithSolari0 && a < dune_imperium::kActionTechAcquireWithSolariSkip) return true;
+  return false;
+}
+
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+
+inline uint16_t FloatToFp16(float f) {
+  return c10::Half(f).x;
+}
+inline float Fp16ToFloat(uint16_t h) {
+  return static_cast<float>(c10::Half(h, c10::Half::from_bits()));
+}
 
 // Summary of PRE-cap legal-centered |z| over one update's rollout decisions.
 //
@@ -248,6 +289,7 @@ struct PpoUpdateStats {
   PrecapAbszStats precap_absz_primary;       // DuneDecisionRole::kAgentPrimary
   PrecapAbszStats precap_absz_continuation;  // DuneDecisionRole::kAgentContinuation
   PrecapAbszStats precap_absz_purchase;      // DuneDecisionRole::kPurchase
+  int64_t forced_buys = 0;                   // Purchase exploration forced buy count (D2)
 
   // Mean of the unclipped per-minibatch gradient norms over this update.
   // Distinct from the WO-17 column `ppo_grad_norm_mean`, which is the
@@ -603,7 +645,9 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
     uint64_t master, int global_update,
-    bool compute_diagnostics = true);
+    bool compute_diagnostics = true,
+    double gamma = 1.0,
+    double gae_lambda = 1.0);
 
 // Decoupled Standalone Auxiliary Search Supervision Phase (PPG-style)
 // Explicit step budget, strict KL ceiling with rollback on violation,
@@ -1024,6 +1068,19 @@ void SaveDualCheckpoint(
     const std::string& run_uuid,
     const std::string& input_model_to_protect = "",
     const std::string& input_optim_to_protect = "");
+
+dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
+    const std::string& checkpoint_path, int input_dim);
+
+bool LoadModelCheckpointMigrating(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    const std::string& path, torch::Device device,
+    bool allow_skip_semantic_scorer = false);
+
+void LoadModelCheckpoint(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    const std::string& path, torch::Device device,
+    bool allow_skip_semantic_scorer = false);
 
 inline uint32_t Fnv1a(const uint8_t* data, size_t size) {
   uint32_t hash = 2166136261U;

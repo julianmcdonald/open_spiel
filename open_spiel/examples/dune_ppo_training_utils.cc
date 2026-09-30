@@ -37,6 +37,30 @@ ABSL_DECLARE_FLAG(double, target_kl);
 ABSL_DECLARE_FLAG(bool, train_amp);
 ABSL_DECLARE_FLAG(double, grad_clip_norm);
 ABSL_DECLARE_FLAG(bool, diagnostics_only);
+ABSL_DECLARE_FLAG(int, hidden_dim);
+ABSL_DECLARE_FLAG(int, num_blocks);
+ABSL_DECLARE_FLAG(bool, nonlinear_value_head);
+ABSL_DECLARE_FLAG(std::string, market_appendix_mode);
+ABSL_DECLARE_FLAG(double, head_init_constant);
+ABSL_DECLARE_FLAG(bool, allow_tf32);
+ABSL_DECLARE_FLAG(bool, enable_semantic_scorer);
+ABSL_DECLARE_FLAG(double, specimen_exchange_penalty);
+ABSL_DECLARE_FLAG(double, family_atomics_penalty);
+ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);
+ABSL_DECLARE_FLAG(int, plot_intrigue_exemption_threshold);
+ABSL_DECLARE_FLAG(int, rollout_games);
+
+std::string g_reward_transition_source_fingerprint = "";
+int64_t g_reward_transition_source_update = -1;
+std::string g_gae_transition_source_fingerprint = "";
+int64_t g_gae_transition_source_update = -1;
+std::string g_learning_rate_transition_source_fingerprint = "";
+int64_t g_learning_rate_transition_source_update = -1;
+std::string g_target_kl_transition_source_fingerprint = "";
+int64_t g_target_kl_transition_source_update = -1;
+std::string g_single_learner_transition_source_fingerprint = "";
+int64_t g_single_learner_transition_source_update = -1;
+
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
 ABSL_FLAG(bool, verify_packing_alignment, false, "Verify packing alignment at the minibatch staging boundary.");
@@ -47,6 +71,14 @@ ABSL_FLAG(int, search_aux_steps, 4, "Number of auxiliary optimizer steps in the 
 ABSL_FLAG(int, search_aux_batch_size, 64, "Minibatch size for decoupled auxiliary optimizer steps.");
 ABSL_FLAG(double, search_aux_target_kl, 0.01, "Cumulative KL ceiling from post-PPO reference policy; steps exceeding this are rejected.");
 ABSL_FLAG(double, search_target_max_kl, 0.05, "Maximum KL ceiling for MPO target distribution.");
+ABSL_FLAG(bool, critic_keeps_training, false,
+          "In separate actor-critic PPO, continue training critic after actor KL early stop.");
+ABSL_FLAG(bool, privileged_critic, false,
+          "Feed privileged opponent features to central critic in separate actor-critic.");
+ABSL_FLAG(bool, purchase_exploration, false,
+          "Explore reveal purchases in selected training games.");
+ABSL_FLAG(double, logit_penalty_coef, 0.0,
+          "Coefficient for precap logit penalty on nontrivial decisions.");
 // --- WO-PERF-1 (2026-08-14): diagnostics-only performance flags. Both
 // defaults reproduce today's behavior bit-for-bit; neither statistic has any
 // consumer outside diagnostics (PPO Phase-0 findings, 2026-07-29).
@@ -1134,12 +1166,6 @@ void SaveDualCheckpoint(
     json::Object manifest_obj;
     manifest_obj["schema_version"] = static_cast<int64_t>(2);
     manifest_obj["checkpoint_uuid"] = checkpoint_uuid;
-    manifest_obj["architecture"] = "separate_actor_critic";
-    manifest_obj["separate_actor_critic"] = true;
-    manifest_obj["value_head_status"] = "actor_value_head_detached_and_stale";
-    manifest_obj["evaluation_role"] = "actor_only_no_value_head";
-    manifest_obj["warning"] =
-        "CRITICAL: Value head in this actor checkpoint is detached and was never updated after U200. Evaluators requiring leaf values must load the paired critic checkpoint, not this actor.";
     manifest_obj["global_update"] = static_cast<int64_t>(global_update);
     manifest_obj["target_end_update"] = static_cast<int64_t>(target_end_update);
     manifest_obj["total_env_steps"] = static_cast<int64_t>(total_env_steps);
@@ -1147,6 +1173,9 @@ void SaveDualCheckpoint(
     manifest_obj["base_seed"] = static_cast<int64_t>(base_seed);
     manifest_obj["seed_scheme_version"] = static_cast<int64_t>(seed_scheme_version);
     manifest_obj["config_fingerprint"] = config_fingerprint;
+    WritePpoPrecisionManifestFields(
+        manifest_obj, absl::GetFlag(FLAGS_rollout_amp),
+        absl::GetFlag(FLAGS_allow_tf32));
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = run_uuid;
 
@@ -1157,15 +1186,73 @@ void SaveDualCheckpoint(
     manifest_obj["optimizer_file_size"] = static_cast<int64_t>(actor_opt_size);
     manifest_obj["optimizer_sha256"] = actor_opt_hash;
 
+    manifest_obj["hidden_dim"] = static_cast<int64_t>(actor_model->input_layer->weight.size(0));
+    manifest_obj["num_blocks"] = static_cast<int64_t>(actor_model->res_blocks.size());
+    manifest_obj["observation_dim"] = static_cast<int64_t>(actor_model->input_layer->weight.size(1));
+    manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
+    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
+      const auto schema = dune_imperium::GetInformationStateSchema(
+          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
+      if (static_cast<int64_t>(actor_model->input_layer->weight.size(1)) == schema.size) {
+        manifest_obj["feature_schema_label"] = std::string(schema.label);
+        manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
+      }
+    }
+    manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
+    if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
+      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+    }
+    manifest_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
+    manifest_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
+    manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
+    manifest_obj["plot_intrigue_exemption_threshold"] = static_cast<int64_t>(absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold));
+    manifest_obj["rollout_games"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
+
+    if (!g_reward_transition_source_fingerprint.empty()) {
+      manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
+      if (g_reward_transition_source_update >= 0) {
+        manifest_obj["reward_transition_source_update"] = g_reward_transition_source_update;
+      }
+    }
+    if (!g_gae_transition_source_fingerprint.empty()) {
+      manifest_obj["gae_transition_source_fingerprint"] = g_gae_transition_source_fingerprint;
+      if (g_gae_transition_source_update >= 0) {
+        manifest_obj["gae_transition_source_update"] = g_gae_transition_source_update;
+      }
+    }
+    if (!g_learning_rate_transition_source_fingerprint.empty()) {
+      manifest_obj["learning_rate_transition_source_fingerprint"] = g_learning_rate_transition_source_fingerprint;
+      if (g_learning_rate_transition_source_update >= 0) {
+        manifest_obj["learning_rate_transition_source_update"] = g_learning_rate_transition_source_update;
+      }
+    }
+    if (!g_target_kl_transition_source_fingerprint.empty()) {
+      manifest_obj["target_kl_transition_source_fingerprint"] = g_target_kl_transition_source_fingerprint;
+      if (g_target_kl_transition_source_update >= 0) {
+        manifest_obj["target_kl_transition_source_update"] = g_target_kl_transition_source_update;
+      }
+    }
+    if (!g_single_learner_transition_source_fingerprint.empty()) {
+      manifest_obj["single_learner_transition_source_fingerprint"] = g_single_learner_transition_source_fingerprint;
+      if (g_single_learner_transition_source_update >= 0) {
+        manifest_obj["single_learner_transition_source_update"] = g_single_learner_transition_source_update;
+      }
+    }
+
+    manifest_obj["architecture"] = "separate_actor_critic";
+    manifest_obj["separate_actor_critic"] = true;
+    manifest_obj["value_head_status"] = "actor_value_head_detached_and_stale";
+    manifest_obj["evaluation_role"] = "actor_only_no_value_head";
+    manifest_obj["warning"] =
+        "CRITICAL: Value head in this actor checkpoint is detached and was never updated after U200. Evaluators requiring leaf values must load the paired critic checkpoint, not this actor.";
+
     manifest_obj["critic_model_filename"] = std::filesystem::path(critic_model_path).filename().string();
     manifest_obj["critic_model_file_size"] = static_cast<int64_t>(critic_size);
     manifest_obj["critic_model_sha256"] = critic_hash;
     manifest_obj["critic_optimizer_filename"] = std::filesystem::path(critic_optim_path).filename().string();
     manifest_obj["critic_optimizer_file_size"] = static_cast<int64_t>(critic_opt_size);
     manifest_obj["critic_optimizer_sha256"] = critic_opt_hash;
-
-    manifest_obj["hidden_dim"] = static_cast<int64_t>(actor_model->input_layer->weight.size(0));
-    manifest_obj["num_blocks"] = static_cast<int64_t>(actor_model->res_blocks.size());
+    manifest_obj["critic_observation_dim"] = static_cast<int64_t>(critic_model->input_layer->weight.size(1));
 
     {
       std::ofstream ofs(manifest_tmp);
@@ -1211,6 +1298,285 @@ std::vector<std::pair<int64_t, int64_t>> ComputeAuxSlices(
     cursor += len;
   }
   return out;
+}
+
+dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
+    const std::string& checkpoint_path, int input_dim) {
+  if (input_dim == dune_imperium::kLegacyInformationStateSize) {
+    return dune_imperium::MarketAppendixMode::kNone;
+  }
+  SPIEL_CHECK_TRUE(dune_imperium::IsExtendedInformationStateSize(input_dim));
+  std::filesystem::path metadata_path(checkpoint_path);
+  metadata_path.replace_extension(".json");
+  std::ifstream input(metadata_path);
+  if (!input) SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
+  const std::string content((std::istreambuf_iterator<char>(input)), {});
+  const auto metadata = open_spiel::json::FromString(content);
+  if (!metadata || !metadata->IsObject()) {
+    SpielFatalError("Invalid card-slot checkpoint metadata: " + metadata_path.string());
+  }
+  const auto& object = metadata->GetObject();
+  auto mode_entry = object.find("market_appendix_mode");
+  auto dim_entry = object.find("observation_dim");
+  auto hash_entry = object.find("feature_schema_sha256");
+  if (mode_entry == object.end() || !mode_entry->second.IsString() ||
+      dim_entry == object.end() || !dim_entry->second.IsInt() ||
+      hash_entry == object.end() || !hash_entry->second.IsString()) {
+    SpielFatalError("Incomplete card-slot checkpoint schema: " + metadata_path.string());
+  }
+  const auto mode = dune_imperium::ParseMarketAppendixMode(mode_entry->second.GetString());
+  const auto schema = dune_imperium::GetInformationStateSchema(mode);
+  SPIEL_CHECK_EQ(schema.size, input_dim);
+  SPIEL_CHECK_EQ(dim_entry->second.GetInt(), input_dim);
+  SPIEL_CHECK_EQ(hash_entry->second.GetString(), std::string(schema.sha256));
+  return mode;
+}
+
+bool LoadModelCheckpointMigrating(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    const std::string& path, torch::Device device,
+    bool allow_skip_semantic_scorer) {
+  int64_t input_dim = model->input_layer->weight.size(1);
+  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+  int64_t action_dim = model->policy_head->weight.size(0);
+  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
+  if (CheckpointHasSemanticScorer(path) && !model->with_semantic_scorer_ &&
+      !allow_skip_semantic_scorer) {
+    SpielFatalError("Model loading must preserve the source scorer; checkpoint at " + path +
+                    " has a semantic scorer but model was not configured with --enable_semantic_scorer=true.");
+  }
+
+  std::filesystem::path metadata_path(path);
+  metadata_path.replace_extension(".json");
+  std::string source_schema = dune_semantic::kDescriptorSchemaVersionV2;
+  if (std::filesystem::exists(metadata_path)) {
+    std::ifstream input(metadata_path);
+    if (input) {
+      const std::string content((std::istreambuf_iterator<char>(input)), {});
+      const auto metadata = open_spiel::json::FromString(content);
+      if (metadata && metadata->IsObject()) {
+        const auto& object = metadata->GetObject();
+        auto schema_entry = object.find("semantic_descriptor_schema");
+        if (schema_entry != object.end() && schema_entry->second.IsString()) {
+          source_schema = schema_entry->second.GetString();
+          if (source_schema != dune_semantic::kDescriptorSchemaVersionV2 &&
+              source_schema != dune_semantic::kDescriptorSchemaVersionV3) {
+            SpielFatalError("Mismatched or invalid semantic_descriptor_schema in metadata: " + metadata_path.string());
+          }
+        }
+      }
+    }
+  }
+
+  int64_t ckpt_input_dim = input_dim;
+  {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, torch::kCPU);
+    torch::serialize::InputArchive in_archive;
+    if (archive.try_read("input_layer", in_archive)) {
+      torch::Tensor w;
+      if (in_archive.try_read("weight", w)) {
+        ckpt_input_dim = w.size(1);
+      }
+    }
+  }
+
+  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      ckpt_input_dim, hidden_dim, action_dim, num_blocks, use_nonlinear,
+      /*with_aux_heads=*/false);
+  temp_model->to(device);
+  torch::load(temp_model, path, device);
+
+  torch::NoGradGuard no_grad;
+  // Trunk.
+  if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
+    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
+    CopyInputToFullPublicInformation(model->input_layer->weight,
+                                     temp_model->input_layer->weight, source_mode);
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
+    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
+    CopyInputToOrderedCardSlots(model->input_layer->weight,
+                               temp_model->input_layer->weight, source_mode);
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  } else if (input_dim == dune_imperium::kExpandedInformationStateSize) {
+    if (ckpt_input_dim == input_dim) {
+      model->input_layer->weight.copy_(temp_model->input_layer->weight);
+    } else if (ckpt_input_dim == 5580) {
+      model->input_layer->weight.slice(1, 0, 5580).copy_(temp_model->input_layer->weight);
+      model->input_layer->weight.slice(1, 5580, 6215).zero_();
+    } else {
+      SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
+                                      ckpt_input_dim, input_dim));
+    }
+    const std::string flag_mode_str = absl::GetFlag(FLAGS_market_appendix_mode);
+    if (flag_mode_str != "none") {
+      model->market_appendix_mode_ = dune_imperium::ParseMarketAppendixMode(flag_mode_str);
+    } else {
+      model->market_appendix_mode_ = ReadCheckpointInputMode(path, ckpt_input_dim);
+    }
+    if (model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kZeros &&
+        model->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kOrderedMarket) {
+      SpielFatalError("Ambiguous 6,215 model requires explicit market_appendix_mode ('zeros' or 'ordered_market')");
+    }
+  } else if (input_dim == open_spiel::kPrivilegedCriticInformationStateSize) {
+    if (ckpt_input_dim == input_dim) {
+      model->input_layer->weight.copy_(temp_model->input_layer->weight);
+    } else if (ckpt_input_dim == dune_imperium::kFullPublicInformationStateSize) {
+      // Step 3b (A2): Privileged critic: copy all 9,182 weights and zero the 3,432 new features.
+      model->input_layer->weight.slice(1, 0, dune_imperium::kFullPublicInformationStateSize)
+          .copy_(temp_model->input_layer->weight);
+      model->input_layer->weight.slice(1, dune_imperium::kFullPublicInformationStateSize,
+                                       open_spiel::kPrivilegedCriticInformationStateSize).zero_();
+    } else {
+      SpielFatalError(absl::StrFormat("Unsupported privileged critic input migration: ckpt=%d -> target=%d",
+                                      ckpt_input_dim, input_dim));
+    }
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  } else {
+    SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
+                                    ckpt_input_dim, input_dim));
+  }
+  if (model->with_semantic_scorer_) {
+    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  }
+  if (model->input_layer->bias.defined() &&
+      temp_model->input_layer->bias.defined()) {
+    model->input_layer->bias.copy_(temp_model->input_layer->bias);
+  }
+  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+    auto source_params = temp_model->res_blocks[i]->parameters();
+    auto target_params = model->res_blocks[i]->parameters();
+    for (size_t j = 0; j < source_params.size(); ++j) {
+      target_params[j].copy_(source_params[j]);
+    }
+    auto source_buffers = temp_model->res_blocks[i]->buffers();
+    auto target_buffers = model->res_blocks[i]->buffers();
+    for (size_t j = 0; j < source_buffers.size(); ++j) {
+      target_buffers[j].copy_(source_buffers[j]);
+    }
+  }
+  // Policy head.
+  model->policy_head->weight.copy_(temp_model->policy_head->weight);
+  if (model->policy_head->bias.defined() &&
+      temp_model->policy_head->bias.defined()) {
+    model->policy_head->bias.copy_(temp_model->policy_head->bias);
+  }
+  // Value head(s).
+  model->value_head->weight.copy_(temp_model->value_head->weight);
+  if (model->value_head->bias.defined() &&
+      temp_model->value_head->bias.defined()) {
+    model->value_head->bias.copy_(temp_model->value_head->bias);
+  }
+  if (use_nonlinear) {
+    model->value_head2->weight.copy_(temp_model->value_head2->weight);
+    if (model->value_head2->bias.defined() &&
+        temp_model->value_head2->bias.defined()) {
+      model->value_head2->bias.copy_(temp_model->value_head2->bias);
+    }
+  }
+
+  // Auxiliary heads.
+  bool migrated = true;
+  if (model->has_aux_heads_) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive head_archive;
+    if (archive.try_read("final_vp_head", head_archive)) {
+      model->final_vp_head->load(head_archive);
+      torch::serialize::InputArchive a2, a3;
+      if (!archive.try_read("terminal_round_head", a2) ||
+          !archive.try_read("next_own_action_head", a3)) {
+        SpielFatalError(
+            "PWO-5 migration: the checkpoint at " + path +
+            " carries final_vp_head but not all three auxiliary heads. A "
+            "partially migrated checkpoint is a STOP, not something to repair "
+            "silently -- section 17.5 item 4.");
+      }
+      model->terminal_round_head->load(a2);
+      model->next_own_action_head->load(a3);
+      migrated = false;
+    } else {
+      std::cout << "[PWO-5] MIGRATION: " << path
+                << " predates the auxiliary heads. Trunk, policy head and "
+                   "value head loaded without numerical change; the three "
+                   "heads keep their deterministic init from "
+                   "kHeadInitConstant=" << absl::GetFlag(FLAGS_head_init_constant)
+                << "." << std::endl;
+    }
+  }
+  if (model->with_semantic_scorer_) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive scorer_archive;
+    if (archive.try_read("semantic_scorer", scorer_archive)) {
+      model->semantic_scorer_->Load(scorer_archive, source_schema);
+      std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path
+                << " (schema: " << source_schema << ")" << std::endl;
+    } else {
+      std::cout << "[SEMANTIC SCORER] Checkpoint does not contain semantic_scorer; keeping zero-init scorer." << std::endl;
+    }
+  }
+  return migrated;
+}
+
+void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+                         const std::string& path, torch::Device device,
+                         bool allow_skip_semantic_scorer) {
+  if (model->has_aux_heads_ || model->with_semantic_scorer_ ||
+      CheckpointHasSemanticScorer(path) ||
+      dune_imperium::IsExtendedInformationStateSize(model->input_layer->weight.size(1)) ||
+      model->input_layer->weight.size(1) == open_spiel::kPrivilegedCriticInformationStateSize ||
+      allow_skip_semantic_scorer) {
+    LoadModelCheckpointMigrating(model, path, device, allow_skip_semantic_scorer);
+    return;
+  }
+  if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
+    const int64_t expected_input_dim = model->input_layer->weight.size(1);
+    torch::load(model, path, device);
+    SPIEL_CHECK_EQ(model->input_layer->weight.size(1), expected_input_dim);
+    return;
+  }
+  int64_t input_dim = model->input_layer->weight.size(1);
+  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
+  int64_t action_dim = model->policy_head->weight.size(0);
+  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+
+  auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      input_dim, hidden_dim, action_dim, num_blocks, /*use_nonlinear=*/false);
+  temp_model->to(device);
+
+  std::cout << "[INFO] Loading standard checkpoint for partial weight copy (nonlinear model)..." << std::endl;
+  torch::load(temp_model, path, device);
+
+  torch::NoGradGuard no_grad;
+  model->input_layer->weight.copy_(temp_model->input_layer->weight);
+  if (model->input_layer->bias.defined() && temp_model->input_layer->bias.defined()) {
+    model->input_layer->bias.copy_(temp_model->input_layer->bias);
+  }
+  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+    auto& target_block = model->res_blocks[i];
+    auto& source_block = temp_model->res_blocks[i];
+    auto source_params = source_block->parameters();
+    auto target_params = target_block->parameters();
+    for (size_t j = 0; j < source_params.size(); ++j) {
+      target_params[j].copy_(source_params[j]);
+    }
+    auto source_buffers = source_block->buffers();
+    auto target_buffers = target_block->buffers();
+    for (size_t j = 0; j < source_buffers.size(); ++j) {
+      target_buffers[j].copy_(source_buffers[j]);
+    }
+  }
+  model->policy_head->weight.copy_(temp_model->policy_head->weight);
+  if (model->policy_head->bias.defined() && temp_model->policy_head->bias.defined()) {
+    model->policy_head->bias.copy_(temp_model->policy_head->bias);
+  }
+  std::cout << "[INFO] Partial weight copy completed successfully." << std::endl;
 }
 
 void WriteOnlineCollectionState(json::Object& manifest_obj,
@@ -1641,7 +2007,7 @@ PpoUpdateStats TrainPpoUpdate(
       }
       staging_actions_ptr[i] = transition.action;
       staging_old_log_probs_ptr[i] = transition.old_log_prob;
-      staging_nontrivial_ptr[i] = (transition.legal_actions.size() > 1);
+      staging_nontrivial_ptr[i] = (transition.legal_actions.size() > 1 && !transition.mask_policy_loss);
       if (out_cands) {
         (*out_cands)[i] = &transition.candidate_data;
       }
@@ -2727,7 +3093,9 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     std::vector<PpoTransition>& batch,
     int64_t obs_size, int64_t action_dim, torch::Device device,
     uint64_t master, int global_update,
-    bool compute_diagnostics) {
+    bool compute_diagnostics,
+    double gamma,
+    double gae_lambda) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
 
@@ -2770,57 +3138,60 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     stats.phase_timings.rollout_hash_host_s = 0.0;
   }
 
-  int64_t n = static_cast<int64_t>(batch.size());
-  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
-  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
-  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
+  std::unordered_set<uint64_t> checked_episodes;
+  uint64_t cur_ep = std::numeric_limits<uint64_t>::max();
+  for (size_t i = 0; i < batch.size(); ++i) {
+    SPIEL_CHECK_GE(batch[i].player_id, 0);
+    SPIEL_CHECK_LT(batch[i].player_id, 4);
+    SPIEL_CHECK_GT(batch[i].episode_id, 0);
+    if (batch[i].episode_id != cur_ep) {
+      SPIEL_CHECK_EQ(checked_episodes.count(batch[i].episode_id), 0);
+      checked_episodes.insert(batch[i].episode_id);
+      cur_ep = batch[i].episode_id;
+    }
+  }
+
+  const int64_t critic_obs_size = critic_model->input_layer->weight.size(1);
+  const bool is_privileged = (critic_obs_size > obs_size);
 
   PhaseTimer phase_timer(phase_timing_on, device);
 
-  phase_timer.Begin(kPhaseTensorPackH2D);
-  torch::Tensor states_cpu = torch::empty({n, obs_size}, cpu_float);
-  torch::Tensor masks_cpu = torch::zeros({n, action_dim}, cpu_bool);
-  torch::Tensor actions_cpu = torch::empty({n}, cpu_long);
-  torch::Tensor old_log_probs_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor advantages_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor returns_cpu = torch::empty({n}, cpu_float);
-  torch::Tensor old_values_cpu = torch::empty({n}, cpu_float);
-
-  float* states_ptr = states_cpu.data_ptr<float>();
-  bool* masks_ptr = masks_cpu.data_ptr<bool>();
-  int64_t* actions_ptr = actions_cpu.data_ptr<int64_t>();
-  float* old_log_probs_ptr = old_log_probs_cpu.data_ptr<float>();
-  float* advantages_ptr = advantages_cpu.data_ptr<float>();
-  float* returns_ptr = returns_cpu.data_ptr<float>();
-  float* old_values_ptr = old_values_cpu.data_ptr<float>();
-
-  for (int64_t i = 0; i < n; ++i) {
-    const PpoTransition& transition = batch[i];
-    std::memcpy(states_ptr + i * obs_size, transition.state.data(),
-                obs_size * sizeof(float));
-    for (Action action : transition.legal_actions) {
-      if (action >= 0 && action < action_dim) {
-        masks_ptr[i * action_dim + action] = true;
-      }
-    }
-    actions_ptr[i] = transition.action;
-    old_log_probs_ptr[i] = transition.old_log_prob;
-    advantages_ptr[i] = transition.advantage;
-    returns_ptr[i] = transition.return_value;
-    old_values_ptr[i] = transition.value;
-  }
-
-  torch::Tensor states = states_cpu.to(device);
-  torch::Tensor masks = masks_cpu.to(device);
-  torch::Tensor actions = actions_cpu.to(device);
-  torch::Tensor old_log_probs = old_log_probs_cpu.to(device);
-  torch::Tensor advantages = advantages_cpu.to(device);
-  torch::Tensor returns = returns_cpu.to(device);
-  torch::Tensor old_values = old_values_cpu.to(device);
-  phase_timer.End(kPhaseTensorPackH2D);
+  const int64_t n = static_cast<int64_t>(batch.size());
+  auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+  auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+  auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
+  auto cpu_fp16 = torch::TensorOptions().dtype(torch::kFloat16);
 
   int64_t minibatch_size =
       std::min<int64_t>(::absl::GetFlag(::FLAGS_ppo_minibatch_size), n);
+  int64_t max_mb = minibatch_size > 0 ? minibatch_size : 2048;
+
+  // Pre-allocate reusable CPU staging tensors sized to the active minibatch capacity.
+  torch::Tensor staging_states_cpu = torch::empty({max_mb, obs_size}, cpu_float);
+  torch::Tensor staging_appendix_cpu;
+  if (is_privileged) {
+    staging_appendix_cpu = torch::empty({max_mb, open_spiel::kPrivilegedCriticAppendixSize}, cpu_fp16);
+  }
+  torch::Tensor staging_masks_cpu = torch::empty({max_mb, action_dim}, cpu_bool);
+  torch::Tensor staging_actions_cpu = torch::empty({max_mb}, cpu_long);
+  torch::Tensor staging_old_log_probs_cpu = torch::empty({max_mb}, cpu_float);
+  torch::Tensor staging_advantages_cpu = torch::empty({max_mb}, cpu_float);
+  torch::Tensor staging_returns_cpu = torch::empty({max_mb}, cpu_float);
+  torch::Tensor staging_old_values_cpu = torch::empty({max_mb}, cpu_float);
+  torch::Tensor staging_nontrivial_cpu = torch::empty({max_mb}, cpu_bool);
+  torch::Tensor staging_policy_mask_cpu = torch::empty({max_mb}, cpu_bool);
+
+  float* staging_states_ptr = staging_states_cpu.data_ptr<float>();
+  c10::Half* staging_appendix_ptr = is_privileged ? reinterpret_cast<c10::Half*>(staging_appendix_cpu.data_ptr()) : nullptr;
+  bool* staging_masks_ptr = staging_masks_cpu.data_ptr<bool>();
+  int64_t* staging_actions_ptr = staging_actions_cpu.data_ptr<int64_t>();
+  float* staging_old_log_probs_ptr = staging_old_log_probs_cpu.data_ptr<float>();
+  float* staging_advantages_ptr = staging_advantages_cpu.data_ptr<float>();
+  float* staging_returns_ptr = staging_returns_cpu.data_ptr<float>();
+  float* staging_old_values_ptr = staging_old_values_cpu.data_ptr<float>();
+  bool* staging_nontrivial_ptr = staging_nontrivial_cpu.data_ptr<bool>();
+  bool* staging_policy_mask_ptr = staging_policy_mask_cpu.data_ptr<bool>();
+
   int update_epochs = std::max(1, ::absl::GetFlag(::FLAGS_ppo_update_epochs));
   float clip_epsilon = static_cast<float>(::absl::GetFlag(::FLAGS_ppo_clip_epsilon));
   bool normalize_advantages = ::absl::GetFlag(::FLAGS_normalize_advantages);
@@ -2829,6 +3200,163 @@ PpoUpdateStats TrainPpoUpdateSeparate(
   float value_coef = static_cast<float>(::absl::GetFlag(::FLAGS_value_coef));
   float logit_cap = static_cast<float>(::absl::GetFlag(::FLAGS_logit_cap));
   double target_kl = ::absl::GetFlag(::FLAGS_target_kl);
+
+  phase_timer.Begin(kPhaseTensorPackH2D);
+  // Recompute every row's value with the training critic (eval mode, no grad) using CPU staging
+  torch::Tensor recomputed_values_cpu = torch::empty({n}, cpu_float);
+  float* recomputed_values_ptr = recomputed_values_cpu.data_ptr<float>();
+  {
+    torch::NoGradGuard no_grad;
+    bool critic_was_training = critic_model->is_training();
+    critic_model->eval();
+    int64_t eval_mb = max_mb;
+    for (int64_t start_idx = 0; start_idx < n; start_idx += eval_mb) {
+      int64_t mb_len = std::min(eval_mb, n - start_idx);
+      for (int64_t i = 0; i < mb_len; ++i) {
+        int64_t idx = start_idx + i;
+        std::memcpy(staging_states_ptr + i * obs_size, batch[idx].state.data(),
+                    obs_size * sizeof(float));
+        if (is_privileged) {
+          if (!batch[idx].privileged_appendix.empty()) {
+            const size_t copy_len = std::min<size_t>(open_spiel::kPrivilegedCriticAppendixSize,
+                                                     batch[idx].privileged_appendix.size());
+            for (size_t k = 0; k < copy_len; ++k) {
+              staging_appendix_ptr[i * open_spiel::kPrivilegedCriticAppendixSize + k] =
+                  c10::Half(batch[idx].privileged_appendix[k], c10::Half::from_bits());
+            }
+          } else {
+            std::memset(staging_appendix_ptr + i * open_spiel::kPrivilegedCriticAppendixSize, 0,
+                        open_spiel::kPrivilegedCriticAppendixSize * sizeof(c10::Half));
+          }
+        }
+      }
+      torch::Tensor mb_states = staging_states_cpu.narrow(0, 0, mb_len).to(device);
+      torch::Tensor mb_critic_in;
+      if (is_privileged) {
+        torch::Tensor mb_app = staging_appendix_cpu.narrow(0, 0, mb_len).to(device).to(torch::kFloat32);
+        mb_critic_in = torch::cat({mb_states, mb_app}, 1);
+      } else {
+        mb_critic_in = mb_states;
+      }
+      auto critic_out = critic_model->forward(mb_critic_in);
+      torch::Tensor mb_vals = critic_out.values.squeeze(1).to(torch::kCPU);
+      std::memcpy(recomputed_values_ptr + start_idx, mb_vals.data_ptr<float>(), mb_len * sizeof(float));
+    }
+    if (critic_was_training) {
+      critic_model->train();
+    }
+  }
+
+  // Assign recomputed values to batch and recompute GAE backwards per (episode, player) from batch[i].reward
+  for (int64_t i = 0; i < n; ++i) {
+    batch[i].value = recomputed_values_ptr[i];
+  }
+
+  int64_t ep_start = 0;
+  while (ep_start < n) {
+    uint64_t ep_id = batch[ep_start].episode_id;
+    int64_t ep_end = ep_start + 1;
+    while (ep_end < n && batch[ep_end].episode_id == ep_id) {
+      ++ep_end;
+    }
+
+    std::vector<float> last_value(4, 0.0f);
+    std::vector<float> last_gae(4, 0.0f);
+
+    for (int64_t i = ep_end - 1; i >= ep_start; --i) {
+      int p = batch[i].player_id;
+      if (p < 0 || p >= 4) continue;
+      float reward = batch[i].reward;
+      float delta = reward + static_cast<float>(gamma) * last_value[p] - batch[i].value;
+      float advantage = delta + static_cast<float>(gamma * gae_lambda) * last_gae[p];
+      batch[i].advantage = advantage;
+      batch[i].return_value = advantage + batch[i].value;
+      last_value[p] = batch[i].value;
+      last_gae[p] = advantage;
+    }
+
+    ep_start = ep_end;
+  }
+
+  torch::Tensor returns_cpu = torch::empty({n}, cpu_float);
+  float* returns_ptr = returns_cpu.data_ptr<float>();
+  for (int64_t i = 0; i < n; ++i) {
+    returns_ptr[i] = batch[i].return_value;
+  }
+  torch::Tensor old_values_cpu = recomputed_values_cpu;
+  phase_timer.End(kPhaseTensorPackH2D);
+
+  auto stage_and_upload = [&](const int64_t* mb_indices, int64_t start_seq,
+                              int64_t mb_len, bool full_ppo_fields,
+                              torch::Tensor& out_states,
+                              torch::Tensor& out_critic_states,
+                              torch::Tensor& out_masks,
+                              torch::Tensor& out_actions,
+                              torch::Tensor& out_old_log_probs,
+                              torch::Tensor& out_nontrivial,
+                              torch::Tensor& out_policy_mask,
+                              std::vector<const dune_semantic::CandidateActionData*>* out_cands,
+                              torch::Tensor* out_advantages = nullptr,
+                              torch::Tensor* out_returns = nullptr,
+                              torch::Tensor* out_old_values = nullptr) {
+    std::memset(staging_masks_ptr, 0, mb_len * action_dim * sizeof(bool));
+    if (out_cands) out_cands->resize(mb_len);
+
+    for (int64_t i = 0; i < mb_len; ++i) {
+      int64_t idx = mb_indices ? mb_indices[i] : (start_seq + i);
+      const PpoTransition& transition = batch[idx];
+      std::memcpy(staging_states_ptr + i * obs_size, transition.state.data(),
+                  obs_size * sizeof(float));
+      if (is_privileged) {
+        if (!transition.privileged_appendix.empty()) {
+          const size_t copy_len = std::min<size_t>(open_spiel::kPrivilegedCriticAppendixSize,
+                                                   transition.privileged_appendix.size());
+          for (size_t k = 0; k < copy_len; ++k) {
+            staging_appendix_ptr[i * open_spiel::kPrivilegedCriticAppendixSize + k] =
+                c10::Half(transition.privileged_appendix[k], c10::Half::from_bits());
+          }
+        } else {
+          std::memset(staging_appendix_ptr + i * open_spiel::kPrivilegedCriticAppendixSize, 0,
+                      open_spiel::kPrivilegedCriticAppendixSize * sizeof(c10::Half));
+        }
+      }
+      for (Action action : transition.legal_actions) {
+        if (action >= 0 && action < action_dim) {
+          staging_masks_ptr[i * action_dim + action] = true;
+        }
+      }
+      staging_actions_ptr[i] = transition.action;
+      staging_old_log_probs_ptr[i] = transition.old_log_prob;
+      staging_nontrivial_ptr[i] = (transition.legal_actions.size() > 1);
+      staging_policy_mask_ptr[i] = (transition.legal_actions.size() > 1 && !transition.mask_policy_loss);
+      if (out_cands) {
+        (*out_cands)[i] = &transition.candidate_data;
+      }
+      if (full_ppo_fields) {
+        staging_advantages_ptr[i] = transition.advantage;
+        staging_returns_ptr[i] = transition.return_value;
+        staging_old_values_ptr[i] = transition.value;
+      }
+    }
+
+    out_states = staging_states_cpu.narrow(0, 0, mb_len).to(device);
+    if (is_privileged) {
+      torch::Tensor mb_app = staging_appendix_cpu.narrow(0, 0, mb_len).to(device).to(torch::kFloat32);
+      out_critic_states = torch::cat({out_states, mb_app}, 1);
+    } else {
+      out_critic_states = out_states;
+    }
+    out_masks = staging_masks_cpu.narrow(0, 0, mb_len).to(device);
+    out_actions = staging_actions_cpu.narrow(0, 0, mb_len).to(device);
+    out_old_log_probs = staging_old_log_probs_cpu.narrow(0, 0, mb_len).to(device);
+    out_nontrivial = staging_nontrivial_cpu.narrow(0, 0, mb_len).to(device);
+    out_policy_mask = staging_policy_mask_cpu.narrow(0, 0, mb_len).to(device);
+    if (full_ppo_fields) {
+      if (out_advantages) *out_advantages = staging_advantages_cpu.narrow(0, 0, mb_len).to(device);
+      if (out_returns) *out_returns = staging_returns_cpu.narrow(0, 0, mb_len).to(device);
+      if (out_old_values) *out_old_values = staging_old_values_cpu.narrow(0, 0, mb_len).to(device);
+    }
+  };
 
   // 1. Episode-ID Uniqueness
   std::unordered_set<uint64_t> seen_episodes;
@@ -2849,8 +3377,12 @@ PpoUpdateStats TrainPpoUpdateSeparate(
   stats.episode_ids_unique = episode_ids_unique;
 
   // 2. Nontrivial Mask and Transition Counts
-  torch::Tensor nontrivial_mask = (masks.sum(1) > 1);
-  int64_t nontrivial_count = nontrivial_mask.sum().item<int64_t>();
+  int64_t nontrivial_count = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    if (batch[i].legal_actions.size() > 1) {
+      nontrivial_count++;
+    }
+  }
   stats.total_transitions = n;
   stats.nontrivial_transitions = nontrivial_count;
   stats.forced_transitions = n - nontrivial_count;
@@ -2870,17 +3402,15 @@ PpoUpdateStats TrainPpoUpdateSeparate(
         torch::NoGradGuard no_grad;
         for (int64_t start = 0; start < n; start += minibatch_size) {
           int64_t end = std::min(start + minibatch_size, n);
-          torch::Tensor mb_states = states.narrow(0, start, end - start);
-          torch::Tensor mb_masks = masks.narrow(0, start, end - start);
-          torch::Tensor mb_actions = actions.narrow(0, start, end - start);
-          torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
-          torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+          int64_t mb_len = end - start;
+          torch::Tensor mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs, mb_nontrivial, mb_policy_mask;
+          std::vector<const dune_semantic::CandidateActionData*> mb_cands;
+          stage_and_upload(/*mb_indices=*/nullptr, start, mb_len, /*full_ppo_fields=*/false,
+                           mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs,
+                           mb_nontrivial, mb_policy_mask,
+                           (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) ? &mb_cands : nullptr);
           auto outputs = actor_model->forward(mb_states);
           if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
-            std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
-            for (int64_t i = start; i < end; ++i) {
-              mb_cands[i - start] = &batch[i].candidate_data;
-            }
             dune_semantic::ApplySemanticScorerBatch(
                 actor_model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
           }
@@ -2893,13 +3423,13 @@ PpoUpdateStats TrainPpoUpdateSeparate(
           torch::Tensor ratio = torch::exp(log_ratio);
           torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
 
-          torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+          torch::Tensor masked_kl = approx_kl.masked_select(mb_policy_mask);
           if (masked_kl.numel() > 0) {
             kl_before_sum += masked_kl.sum().item<double>();
             kl_before_nontrivial_count += masked_kl.numel();
           }
 
-          auto critic_outputs = critic_model->forward(mb_states);
+          auto critic_outputs = critic_model->forward(mb_critic_states);
           torch::Tensor mb_values = critic_outputs.values.squeeze(1);
           torch::Tensor mb_near_one = mb_values.abs() >= 0.99f;
           value_near_one_count += mb_near_one.sum().item<double>();
@@ -2919,7 +3449,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     } else {
       int64_t stored_near_one_count = 0;
       for (int64_t i = 0; i < n; ++i) {
-        if (std::abs(old_values_ptr[i]) >= 0.99f) ++stored_near_one_count;
+        if (std::abs(recomputed_values_ptr[i]) >= 0.99f) ++stored_near_one_count;
       }
       stats.fraction_critic_near_1 = (n > 0) ? (static_cast<double>(stored_near_one_count) / n) : 0.0;
 
@@ -2935,17 +3465,15 @@ PpoUpdateStats TrainPpoUpdateSeparate(
               device.type(), device.is_cuda() && ::absl::GetFlag(::FLAGS_rollout_amp));
           for (int64_t start = 0; start < n; start += minibatch_size) {
             int64_t end = std::min(start + minibatch_size, n);
-            torch::Tensor mb_states = states.narrow(0, start, end - start);
-            torch::Tensor mb_masks = masks.narrow(0, start, end - start);
-            torch::Tensor mb_actions = actions.narrow(0, start, end - start);
-            torch::Tensor mb_old_log_probs = old_log_probs.narrow(0, start, end - start);
-            torch::Tensor mb_nontrivial = nontrivial_mask.narrow(0, start, end - start);
+            int64_t mb_len = end - start;
+            torch::Tensor mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs, mb_nontrivial, mb_policy_mask;
+            std::vector<const dune_semantic::CandidateActionData*> mb_cands;
+            stage_and_upload(/*mb_indices=*/nullptr, start, mb_len, /*full_ppo_fields=*/false,
+                             mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs,
+                             mb_nontrivial, mb_policy_mask,
+                             (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) ? &mb_cands : nullptr);
             auto outputs = actor_model->forward(mb_states);
             if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
-              std::vector<const dune_semantic::CandidateActionData*> mb_cands(end - start);
-              for (int64_t i = start; i < end; ++i) {
-                mb_cands[i - start] = &batch[i].candidate_data;
-              }
               dune_semantic::ApplySemanticScorerBatch(
                   actor_model->semantic_scorer_, outputs.trunk, mb_cands, outputs.logits, device);
             }
@@ -2958,7 +3486,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
             torch::Tensor ratio = torch::exp(log_ratio);
             torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
 
-            torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
+            torch::Tensor masked_kl = approx_kl.masked_select(mb_policy_mask);
             if (masked_kl.numel() > 0) {
               kl_before_sum += masked_kl.sum().item<double>();
               kl_before_nontrivial_count += masked_kl.numel();
@@ -3018,45 +3546,42 @@ PpoUpdateStats TrainPpoUpdateSeparate(
   double value_loss_sum = 0.0;
   double value_clip_frac_sum = 0.0;
 
+  bool actor_early_stopped = false;
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(
         master, dune_seed::kDomainTrain, global_update, epoch,
         dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
-    torch::Tensor permutation =
+    torch::Tensor permutation_cpu =
         torch::randperm(n, gen,
                         torch::TensorOptions()
                             .device(torch::kCPU)
-                            .dtype(torch::kInt64))
-            .to(device);
+                            .dtype(torch::kInt64));
+    const int64_t* perm_ptr = permutation_cpu.data_ptr<int64_t>();
 
     double epoch_kl_sum = 0.0;
     int64_t epoch_kl_nontrivial_count = 0;
 
     for (int64_t start = 0; start < n; start += minibatch_size) {
       int64_t end = std::min(start + minibatch_size, n);
-      torch::Tensor mb_idx = permutation.narrow(0, start, end - start);
+      const int64_t mb_len = end - start;
+      const int64_t* mb_indices = perm_ptr + start;
 
-      torch::Tensor mb_states = states.index_select(0, mb_idx);
-      torch::Tensor mb_masks = masks.index_select(0, mb_idx);
-      torch::Tensor mb_actions = actions.index_select(0, mb_idx);
-      torch::Tensor mb_old_log_probs = old_log_probs.index_select(0, mb_idx);
-      torch::Tensor mb_advantages = advantages.index_select(0, mb_idx);
-      torch::Tensor mb_returns = returns.index_select(0, mb_idx);
-      torch::Tensor mb_old_values = old_values.index_select(0, mb_idx);
-      torch::Tensor mb_nontrivial = nontrivial_mask.index_select(0, mb_idx);
+      phase_timer.Begin(kPhaseTensorPackH2D);
+      torch::Tensor mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs, mb_nontrivial, mb_policy_mask;
+      torch::Tensor mb_advantages, mb_returns, mb_old_values;
       std::vector<const dune_semantic::CandidateActionData*> mb_candidate_actions;
-      if (actor_model->with_semantic_scorer_) {
-        const int64_t mb_len = end - start;
-        mb_candidate_actions.resize(mb_len);
-        torch::Tensor mb_idx_cpu = mb_idx.to(torch::kCPU);
-        const int64_t* mb_indices = mb_idx_cpu.data_ptr<int64_t>();
-        for (int64_t i = 0; i < mb_len; ++i) {
-          mb_candidate_actions[i] = &batch[mb_indices[i]].candidate_data;
-        }
-      }
+
+      stage_and_upload(mb_indices, /*start_seq=*/0, mb_len, /*full_ppo_fields=*/true,
+                       mb_states, mb_critic_states, mb_masks, mb_actions, mb_old_log_probs,
+                       mb_nontrivial, mb_policy_mask,
+                       actor_model->with_semantic_scorer_ ? &mb_candidate_actions : nullptr,
+                       &mb_advantages, &mb_returns, &mb_old_values);
+      phase_timer.End(kPhaseTensorPackH2D);
 
       int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
+      int64_t mb_num_policy = mb_policy_mask.sum().item<int64_t>();
 
       actor_optimizer.zero_grad();
       critic_optimizer.zero_grad();
@@ -3066,7 +3591,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       torch::Tensor value_clip_frac_t;
 
       auto compute_critic_loss = [&]() {
-        auto critic_outputs = critic_model->forward(mb_states);
+        auto critic_outputs = critic_model->forward(mb_critic_states);
         torch::Tensor new_values = critic_outputs.values.squeeze(1);
         if (clip_value_loss) {
           value_clip_frac_t =
@@ -3089,6 +3614,20 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       torch::Tensor policy_loss, entropy, approx_kl, clip_fraction;
 
       auto compute_actor_loss = [&]() {
+        if (actor_early_stopped) {
+          policy_loss = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          entropy = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          approx_kl = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          clip_fraction = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          actor_loss = torch::tensor(
+              0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+          return;
+        }
+
         auto actor_outputs = actor_model->forward(mb_states);
         if (actor_model->with_semantic_scorer_ && actor_model->semantic_scorer_) {
           dune_semantic::ApplySemanticScorerBatch(
@@ -3108,9 +3647,9 @@ PpoUpdateStats TrainPpoUpdateSeparate(
 
         torch::Tensor mb_adv = mb_advantages;
         if (normalize_advantages) {
-          if (mb_num_nontrivial > 1) {
+          if (mb_num_policy > 1) {
             torch::Tensor nontrivial_adv =
-                mb_advantages.masked_select(mb_nontrivial);
+                mb_advantages.masked_select(mb_policy_mask);
             torch::Tensor mean = nontrivial_adv.mean();
             torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
             mb_adv = (mb_advantages - mean) / std;
@@ -3123,17 +3662,29 @@ PpoUpdateStats TrainPpoUpdateSeparate(
             -mb_adv * ratio.clamp(1.0f - clip_epsilon, 1.0f + clip_epsilon);
         torch::Tensor pg_loss = torch::max(pg_loss1, pg_loss2);
 
-        if (mb_num_nontrivial > 0) {
-          policy_loss = pg_loss.masked_select(mb_nontrivial).mean();
+        if (mb_num_policy > 0) {
+          policy_loss = pg_loss.masked_select(mb_policy_mask).mean();
           entropy =
-              -(probs * log_probs).sum(-1).masked_select(mb_nontrivial).mean();
+              -(probs * log_probs).sum(-1).masked_select(mb_policy_mask).mean();
           approx_kl =
-              ((ratio - 1.0f) - log_ratio).masked_select(mb_nontrivial).mean();
+              ((ratio - 1.0f) - log_ratio).masked_select(mb_policy_mask).mean();
           clip_fraction = ((ratio - 1.0f).abs() > clip_epsilon)
                               .to(torch::kFloat32)
-                              .masked_select(mb_nontrivial)
+                              .masked_select(mb_policy_mask)
                               .mean();
           actor_loss = policy_loss - entropy_coef * entropy;
+          double logit_penalty_c = ::absl::GetFlag(::FLAGS_logit_penalty_coef);
+          if (logit_penalty_c > 0.0) {
+            torch::Tensor masked_raw = actor_outputs.logits.masked_fill(mb_masks.logical_not(), 0.0f);
+            torch::Tensor legal_counts = mb_masks.sum(-1, /*keepdim=*/true).clamp_min(1);
+            torch::Tensor legal_means = masked_raw.sum(-1, /*keepdim=*/true) / legal_counts;
+            torch::Tensor z = (actor_outputs.logits - legal_means).abs();
+            torch::Tensor pen = torch::relu(z - 20.0f).pow(2);
+            torch::Tensor masked_pen = pen.masked_select(mb_masks);
+            if (masked_pen.numel() > 0) {
+              actor_loss = actor_loss + static_cast<float>(logit_penalty_c) * masked_pen.mean();
+            }
+          }
         } else {
           policy_loss = torch::tensor(
               0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -3161,7 +3712,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
 
       phase_timer.Begin(kPhaseBackward);
       critic_loss.backward();
-      if (mb_num_nontrivial > 0) {
+      if (!actor_early_stopped && mb_num_policy > 0) {
         actor_loss.backward();
       }
       phase_timer.End(kPhaseBackward);
@@ -3170,14 +3721,16 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       if (compute_diagnostics) {
         PhaseScope phase_scope_telemetry(&phase_timer, kPhaseGradTelemetry);
         double policy_sq = 0.0, actor_trunk_sq = 0.0;
-        for (const auto& named : actor_model->named_parameters()) {
-          const torch::Tensor& g = named.value().grad();
-          if (!g.defined()) continue;
-          const double sq = g.pow(2).sum().item<double>();
-          if (named.key().rfind("policy_head", 0) == 0) {
-            policy_sq += sq;
-          } else {
-            actor_trunk_sq += sq;
+        if (!actor_early_stopped) {
+          for (const auto& named : actor_model->named_parameters()) {
+            const torch::Tensor& g = named.value().grad();
+            if (!g.defined()) continue;
+            const double sq = g.pow(2).sum().item<double>();
+            if (named.key().rfind("policy_head", 0) == 0) {
+              policy_sq += sq;
+            } else {
+              actor_trunk_sq += sq;
+            }
           }
         }
 
@@ -3202,11 +3755,13 @@ PpoUpdateStats TrainPpoUpdateSeparate(
 
       // Joint global gradient clipping over the union of active parameters
       std::vector<torch::Tensor> active_params;
-      for (const auto& p : actor_model->parameters()) {
-        if (p.requires_grad()) active_params.push_back(p);
+      if (!actor_early_stopped) {
+        for (const auto& p : actor_model->parameters()) {
+          if (p.requires_grad() && p.grad().defined()) active_params.push_back(p);
+        }
       }
       for (const auto& p : critic_model->parameters()) {
-        if (p.requires_grad()) active_params.push_back(p);
+        if (p.requires_grad() && p.grad().defined()) active_params.push_back(p);
       }
 
       phase_timer.Begin(kPhaseGradClip);
@@ -3224,7 +3779,9 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       if (grad_norm > stats.grad_norm_max) stats.grad_norm_max = grad_norm;
 
       phase_timer.Begin(kPhaseOptimizerStep);
-      actor_optimizer.step();
+      if (!actor_early_stopped) {
+        actor_optimizer.step();
+      }
       critic_optimizer.step();
       phase_timer.End(kPhaseOptimizerStep);
 
@@ -3236,23 +3793,26 @@ PpoUpdateStats TrainPpoUpdateSeparate(
       }
       stats.minibatches += 1;
 
-      if (mb_num_nontrivial > 0) {
-        weighted_policy_loss_sum += policy_loss.item<double>() * mb_num_nontrivial;
-        weighted_entropy_sum += entropy.item<double>() * mb_num_nontrivial;
-        weighted_kl_sum += kl * mb_num_nontrivial;
+      if (!actor_early_stopped && mb_num_policy > 0) {
+        weighted_policy_loss_sum += policy_loss.item<double>() * mb_num_policy;
+        weighted_entropy_sum += entropy.item<double>() * mb_num_policy;
+        weighted_kl_sum += kl * mb_num_policy;
         weighted_clip_fraction_sum +=
-            clip_fraction.item<double>() * mb_num_nontrivial;
-        total_nontrivial_count += mb_num_nontrivial;
+            clip_fraction.item<double>() * mb_num_policy;
+        total_nontrivial_count += mb_num_policy;
 
-        epoch_kl_sum += kl * mb_num_nontrivial;
-        epoch_kl_nontrivial_count += mb_num_nontrivial;
+        epoch_kl_sum += kl * mb_num_policy;
+        epoch_kl_nontrivial_count += mb_num_policy;
       }
       phase_timer.End(kPhaseScalarReads);
 
-      if (target_kl > 0.0 && kl > target_kl) {
+      if (!actor_early_stopped && target_kl > 0.0 && kl > target_kl) {
         stats.early_stopped = true;
         stats.kl_early_stop_epoch = epoch;
-        break;
+        actor_early_stopped = true;
+        if (!::absl::GetFlag(::FLAGS_critic_keeps_training)) {
+          break;
+        }
       }
     }
 
@@ -3261,7 +3821,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
                        : 0.0;
     stats.epoch_kls.push_back(ep_kl);
 
-    if (stats.early_stopped) break;
+    if (stats.early_stopped && !::absl::GetFlag(::FLAGS_critic_keeps_training)) break;
   }
 
   if (stats.minibatches > 0) {
@@ -3412,6 +3972,9 @@ std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
   if (emit_canary_columns) header += kDiagnosticsCsvHeaderV5Suffix;
   if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
     header += kDiagnosticsCsvHeaderV6Suffix;
+  }
+  if (::absl::GetFlag(::FLAGS_purchase_exploration)) {
+    header += ",forced_buys";
   }
   return header;
 }
@@ -3926,6 +4489,9 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     // (matching DiagnosticsCsvHeader's gate so header and rows never diverge).
     if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
       ofs << "," << stats.measured_transitions;
+    }
+    if (::absl::GetFlag(::FLAGS_purchase_exploration)) {
+      ofs << "," << stats.forced_buys;
     }
     ofs << "\n";
     ofs.flush();

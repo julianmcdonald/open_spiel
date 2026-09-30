@@ -248,6 +248,9 @@ struct GameResult {
   std::array<int, kNumPlayers> research_col{};
   std::array<int, kNumPlayers> research_row{};
   std::array<std::vector<std::pair<int, int>>, kNumPlayers> research_paths{};
+  // Step 3e: reveals taken while player still had an agent to place, and solari at each round end
+  std::array<int, kNumPlayers> reveals_with_agents_remaining{};
+  std::array<std::array<int, kNumPlayers>, kMaxRounds> solari_end_by_round{};
 };
 
 // ---------------------------------------------------------------------------
@@ -790,6 +793,8 @@ void WorkerThread(
     const DuneImperiumState* dune_state =
         dynamic_cast<const DuneImperiumState*>(state.get());
     std::array<std::array<int, kNumPlayers>, kMaxRounds + 2> vp_at_round_end{};
+    std::array<std::array<int, kNumPlayers>, kMaxRounds + 2> solari_at_round_end{};
+    std::array<int, kNumPlayers> reveals_with_agents_remaining{};
     std::array<bool, kMaxRounds + 2> round_end_seen{};
     std::array<int, kNumPlayers> specimen_conversions{};
     std::array<bool, kNumPlayers> atomics_used{};
@@ -828,6 +833,7 @@ void WorkerThread(
         if (last_round >= 1 && last_round <= kMaxRounds) {
           for (int p = 0; p < kNumPlayers; ++p) {
             vp_at_round_end[last_round][p] = dune_state->GetPlayerVp(p);
+            solari_at_round_end[last_round][p] = dune_state->GetPlayerSolariForTesting(p);
           }
           round_end_seen[last_round] = true;
           if (trace_this) {
@@ -994,6 +1000,12 @@ void WorkerThread(
           current_player >= 0 && current_player < kNumPlayers && dune_state != nullptr) {
         ++plot_plays[current_player];
         plot_pre_hand_sizes[current_player].push_back(dune_state->GetIntrigueHandForTesting(current_player).size());
+      }
+      if (chosen_action == dune_imperium::kActionReveal &&
+          current_player >= 0 && current_player < kNumPlayers && dune_state != nullptr) {
+        if (dune_state->GetPlayerAgentsRemainingForTesting(current_player) > 0) {
+          ++reveals_with_agents_remaining[current_player];
+        }
       }
       if (record_market_diagnostics && dune_state != nullptr) {
         market_tracker.BeforeApplyAction(*dune_state, current_player, model_player, chosen_action);
@@ -1176,6 +1188,7 @@ void WorkerThread(
     for (int rd = 1; rd <= kMaxRounds; ++rd) {
       if (!round_end_seen[rd]) break;
       gr.vp_end_by_round[rd - 1] = vp_at_round_end[rd];
+      gr.solari_end_by_round[rd - 1] = solari_at_round_end[rd];
       gr.rounds_captured = rd;
     }
     for (int p = 0; p < kNumPlayers; ++p) {
@@ -1187,6 +1200,7 @@ void WorkerThread(
         }
       }
     }
+    gr.reveals_with_agents_remaining = reveals_with_agents_remaining;
     gr.specimen_conversions = specimen_conversions;
     gr.atomics_used = atomics_used;
     gr.atomics_in_reveal = atomics_in_reveal;
@@ -1688,6 +1702,10 @@ void RunEvaluation() {
                 << JsonIntArray(gr.research_row)
                 << ",\"research_paths\":"
                 << JsonResearchPaths(gr.research_paths)
+                << ",\"reveals_with_agents_remaining\":"
+                << JsonIntArray(gr.reveals_with_agents_remaining)
+                << ",\"solari_end_by_round\":"
+                << JsonVpByRound(gr.rounds_captured, gr.solari_end_by_round)
                 << ",\"seed\":" << gr.chance_seed
                 << "}\n";
     }

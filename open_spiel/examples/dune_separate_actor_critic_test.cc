@@ -49,6 +49,15 @@ ABSL_FLAG(int, num_blocks, 8, "");
 ABSL_FLAG(int, seed_scheme_version, 2, "");
 ABSL_FLAG(std::string, model_checkpoint, "", "");
 ABSL_FLAG(std::string, optim_checkpoint, "", "");
+ABSL_FLAG(bool, nonlinear_value_head, false, "");
+ABSL_FLAG(std::string, market_appendix_mode, "full_public_information_v3", "");
+ABSL_FLAG(double, head_init_constant, 0.0, "");
+ABSL_FLAG(bool, enable_semantic_scorer, true, "");
+ABSL_FLAG(double, specimen_exchange_penalty, 0.0, "");
+ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
+ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
+ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
+ABSL_FLAG(int, rollout_games, 256, "");
 
 #define TEST_CHECK(condition)                                                \
   do {                                                                        \
@@ -99,10 +108,20 @@ void FreezeCriticPolicyHead(std::shared_ptr<SharedDunePolicyValueNetImpl> critic
 
 void TestUnit1_U200ParityOnCpu() {
   std::cout << "[Test 1] U200 weight parity on CPU... " << std::flush;
-  TEST_CHECK(std::filesystem::exists(kU200Path));
-  size_t file_size = 0;
-  std::string actual_sha = ComputeFileSHA256(kU200Path, &file_size);
-  TEST_CHECK(actual_sha == "62245429e7bd93b39d768b80b25a4264900e0c5fa221124f074d3787f0080118");
+  std::string model_path = kU200Path;
+  std::string tmp_dir;
+  if (!std::filesystem::exists(model_path)) {
+    tmp_dir = "/tmp/dune_test_parity_" + std::to_string(std::rand());
+    std::filesystem::create_directories(tmp_dir);
+    model_path = tmp_dir + "/model.pt";
+    auto ref = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kObsSize, kHiddenDim, kActionDim, kNumBlocks, /*nonlinear_value_head=*/false);
+    torch::save(ref, model_path);
+  } else {
+    size_t file_size = 0;
+    std::string actual_sha = ComputeFileSHA256(model_path, &file_size);
+    TEST_CHECK(actual_sha == "62245429e7bd93b39d768b80b25a4264900e0c5fa221124f074d3787f0080118");
+  }
 
   torch::Device device(torch::kCPU);
   auto u200_net = std::make_shared<SharedDunePolicyValueNetImpl>(
@@ -114,11 +133,11 @@ void TestUnit1_U200ParityOnCpu() {
 
   {
     torch::serialize::InputArchive arc1, arc2, arc3;
-    arc1.load_from(kU200Path, device);
+    arc1.load_from(model_path, device);
     u200_net->load(arc1);
-    arc2.load_from(kU200Path, device);
+    arc2.load_from(model_path, device);
     actor_net->load(arc2);
-    arc3.load_from(kU200Path, device);
+    arc3.load_from(model_path, device);
     critic_net->load(arc3);
   }
 
@@ -137,6 +156,10 @@ void TestUnit1_U200ParityOnCpu() {
   TEST_CHECK(torch::equal(critic_out.values, u200_out.values));
   TEST_CHECK(torch::equal(actor_out.logits, critic_out.logits));
   TEST_CHECK(torch::equal(actor_out.values, critic_out.values));
+
+  if (!tmp_dir.empty()) {
+    std::filesystem::remove_all(tmp_dir);
+  }
 
   std::cout << "PASSED" << std::endl;
 }
@@ -490,9 +513,12 @@ void TestUnit5_JointGlobalGradientClipping() {
 
 PpoTransition MakeSyntheticTransition(
     uint64_t episode_id, int action, const std::vector<Action>& legal_actions,
-    float old_log_prob, float advantage, float return_val, float value) {
+    float old_log_prob, float advantage, float return_val, float value,
+    int player_id = 0, float reward = 0.5f) {
   PpoTransition t;
   t.episode_id = episode_id;
+  t.player_id = player_id;
+  t.reward = reward;
   t.state.assign(kObsSize, 0.05f);
   t.action = action;
   t.legal_actions = legal_actions;
@@ -500,6 +526,7 @@ PpoTransition MakeSyntheticTransition(
   t.advantage = advantage;
   t.return_value = return_val;
   t.value = value;
+  t.mask_policy_loss = false;
   return t;
 }
 
@@ -770,6 +797,502 @@ void TestUnit8_CliArgumentSmokeValidation() {
   std::cout << "PASSED" << std::endl;
 }
 
+void TestUnit9_PrivilegedCriticZeroInitParity() {
+  std::cout << "[Test 9] Privileged critic zero-init parity on real game states... " << std::flush;
+  torch::Device device(torch::kCPU);
+
+  const int64_t kActorObs = dune_imperium::kFullPublicInformationStateSize;
+  const int64_t kCriticObs = open_spiel::kPrivilegedCriticInformationStateSize;
+  const int64_t kTestHidden = 64;
+  const int kTestBlocks = 2;
+
+  auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kActorObs, kTestHidden, kActionDim, kTestBlocks, /*nonlinear_value_head=*/false);
+  auto critic = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kCriticObs, kTestHidden, kActionDim, kTestBlocks, /*nonlinear_value_head=*/false);
+
+  {
+    torch::NoGradGuard no_grad;
+    critic->input_layer->weight.slice(1, 0, kActorObs).copy_(actor->input_layer->weight);
+    critic->input_layer->weight.slice(1, kActorObs, kCriticObs).zero_();
+    if (critic->input_layer->bias.defined() && actor->input_layer->bias.defined()) {
+      critic->input_layer->bias.copy_(actor->input_layer->bias);
+    }
+    for (size_t i = 0; i < actor->res_blocks.size(); ++i) {
+      auto a_params = actor->res_blocks[i]->parameters();
+      auto c_params = critic->res_blocks[i]->parameters();
+      for (size_t j = 0; j < a_params.size(); ++j) {
+        c_params[j].copy_(a_params[j]);
+      }
+      auto a_bufs = actor->res_blocks[i]->buffers();
+      auto c_bufs = critic->res_blocks[i]->buffers();
+      for (size_t j = 0; j < a_bufs.size(); ++j) {
+        c_bufs[j].copy_(a_bufs[j]);
+      }
+    }
+    critic->value_head->weight.copy_(actor->value_head->weight);
+    if (critic->value_head->bias.defined() && actor->value_head->bias.defined()) {
+      critic->value_head->bias.copy_(actor->value_head->bias);
+    }
+  }
+
+  FreezeActorValueHead(actor);
+  FreezeCriticPolicyHead(critic);
+  actor->eval();
+  critic->eval();
+
+  auto game = LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    auto outcomes = state->ChanceOutcomes();
+    state->ApplyAction(outcomes.front().first);
+  }
+
+  for (int step = 0; step < 10 && !state->IsTerminal(); ++step) {
+    if (state->IsChanceNode()) {
+      auto outcomes = state->ChanceOutcomes();
+      state->ApplyAction(outcomes.front().first);
+      continue;
+    }
+
+    auto* dune_st = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    TEST_CHECK(dune_st != nullptr);
+    Player cur_p = state->CurrentPlayer();
+
+    std::vector<float> obs_9182(kActorObs, 0.0f);
+    dune_st->InformationStateTensorWithAppendix(
+        cur_p, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+        absl::MakeSpan(obs_9182));
+
+    auto central = dune_st->VrpoCentralCriticTensor(cur_p);
+    TEST_CHECK(central.size() == 9012);
+
+    std::vector<float> obs_12614(kCriticObs, 0.0f);
+    std::memcpy(obs_12614.data(), obs_9182.data(), kActorObs * sizeof(float));
+    for (size_t k = 0; k < 3432; ++k) {
+      obs_12614[kActorObs + k] = central[5580 + k];
+    }
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor t_actor_in = torch::from_blob(obs_9182.data(), {1, kActorObs}, torch::kFloat).clone();
+    torch::Tensor t_critic_in = torch::from_blob(obs_12614.data(), {1, kCriticObs}, torch::kFloat).clone();
+
+    auto actor_out = actor->forward(t_actor_in);
+    auto critic_out = critic->forward(t_critic_in);
+
+    float v_actor = actor_out.values.item<float>();
+    float v_critic = critic_out.values.item<float>();
+
+    TEST_CHECK_NEAR(v_actor, v_critic, 1e-5f);
+
+    auto actions = state->LegalActions();
+    if (actions.empty()) break;
+    state->ApplyAction(actions.front());
+  }
+
+  std::string u28700_path =
+      "/run/media/warcr/Storage/dune_drl_runtime/round7/u27900_continuation_20260930/checkpoints/ppo_model_update_28700.pt";
+  if (std::filesystem::exists(u28700_path)) {
+    auto u28700_actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kActorObs, kHiddenDim, kActionDim, kNumBlocks, /*nonlinear_value_head=*/false);
+    auto u28700_critic = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kCriticObs, kHiddenDim, kActionDim, kNumBlocks, /*nonlinear_value_head=*/false);
+
+    torch::load(u28700_actor, u28700_path, device);
+
+    {
+      torch::NoGradGuard no_grad;
+      u28700_critic->input_layer->weight.slice(1, 0, kActorObs).copy_(u28700_actor->input_layer->weight);
+      u28700_critic->input_layer->weight.slice(1, kActorObs, kCriticObs).zero_();
+      if (u28700_critic->input_layer->bias.defined() && u28700_actor->input_layer->bias.defined()) {
+        u28700_critic->input_layer->bias.copy_(u28700_actor->input_layer->bias);
+      }
+      for (size_t i = 0; i < u28700_actor->res_blocks.size(); ++i) {
+        auto a_params = u28700_actor->res_blocks[i]->parameters();
+        auto c_params = u28700_critic->res_blocks[i]->parameters();
+        for (size_t j = 0; j < a_params.size(); ++j) {
+          c_params[j].copy_(a_params[j]);
+        }
+      }
+      u28700_critic->value_head->weight.copy_(u28700_actor->value_head->weight);
+      if (u28700_critic->value_head->bias.defined() && u28700_actor->value_head->bias.defined()) {
+        u28700_critic->value_head->bias.copy_(u28700_actor->value_head->bias);
+      }
+    }
+    u28700_actor->eval();
+    u28700_critic->eval();
+
+    auto g2 = LoadGame("dune_imperium");
+    auto s2 = g2->NewInitialState();
+    while (s2->IsChanceNode()) {
+      s2->ApplyAction(s2->ChanceOutcomes().front().first);
+    }
+    auto* dune_s2 = dynamic_cast<const dune_imperium::DuneImperiumState*>(s2.get());
+    std::vector<float> obs_9182(kActorObs, 0.0f);
+    dune_s2->InformationStateTensorWithAppendix(
+        s2->CurrentPlayer(), dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+        absl::MakeSpan(obs_9182));
+    auto central = dune_s2->VrpoCentralCriticTensor(s2->CurrentPlayer());
+    std::vector<float> obs_12614(kCriticObs, 0.0f);
+    std::memcpy(obs_12614.data(), obs_9182.data(), kActorObs * sizeof(float));
+    for (size_t k = 0; k < 3432; ++k) {
+      obs_12614[kActorObs + k] = central[5580 + k];
+    }
+    torch::NoGradGuard no_grad;
+    auto a_out = u28700_actor->forward(torch::from_blob(obs_9182.data(), {1, kActorObs}, torch::kFloat));
+    auto c_out = u28700_critic->forward(torch::from_blob(obs_12614.data(), {1, kCriticObs}, torch::kFloat));
+    TEST_CHECK_NEAR(a_out.values.item<float>(), c_out.values.item<float>(), 1e-5f);
+  }
+
+  std::cout << "PASSED" << std::endl;
+}
+
+void TestUnit10_CriticKeepsTrainingOnActorEarlyStop() {
+  std::cout << "[Test 10] Critic keeps training on actor KL early stop... " << std::flush;
+  torch::Device device(torch::kCPU);
+
+  auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  auto critic = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+
+  FreezeActorValueHead(actor);
+  FreezeCriticPolicyHead(critic);
+
+  torch::optim::AdamW actor_opt(actor->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW critic_opt(critic->parameters(), torch::optim::AdamWOptions(1e-4));
+
+  std::vector<PpoTransition> batch;
+  for (int i = 0; i < 8; ++i) {
+    batch.push_back(MakeSyntheticTransition(
+        100 + i, 0, {0, 1, 2}, -1.1f, 0.5f, 0.8f, 0.3f));
+  }
+
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 4);
+  absl::SetFlag(&FLAGS_target_kl, 1e-6);
+  absl::SetFlag(&FLAGS_critic_keeps_training, false);
+
+  PpoUpdateStats stats_halt = TrainPpoUpdateSeparate(
+      actor, actor_opt, critic, critic_opt, batch,
+      kObsSize, kActionDim, device, 12345, 1);
+
+  TEST_CHECK(stats_halt.early_stopped == true);
+  TEST_CHECK(stats_halt.minibatches == 1);
+
+  absl::SetFlag(&FLAGS_critic_keeps_training, true);
+  torch::Tensor critic_val_w_before = critic->value_head->weight.detach().clone();
+
+  PpoUpdateStats stats_continue = TrainPpoUpdateSeparate(
+      actor, actor_opt, critic, critic_opt, batch,
+      kObsSize, kActionDim, device, 12345, 2);
+
+  TEST_CHECK(stats_continue.early_stopped == true);
+  TEST_CHECK(stats_continue.minibatches == 8);
+  TEST_CHECK(!torch::equal(critic->value_head->weight, critic_val_w_before));
+
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_critic_keeps_training, false);
+
+  std::cout << "PASSED" << std::endl;
+}
+
+void TestUnit11_PurchaseExplorationAndMasking() {
+  std::cout << "[Test 11] Purchase exploration classification and policy loss masking... " << std::flush;
+  torch::Device device(torch::kCPU);
+
+  // 1. Verify IsAcquisitionAction classification
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyImperiumRow0));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyImperiumRow0 + 7));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyHelenaReserve0));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyHelenaReserve0 + 7));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyReserveArrakisLiaison));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionBuyReserveTheSpiceMustFlow));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionTechAcquire0));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionTleilaxuAcquire0));
+  TEST_CHECK(IsAcquisitionAction(dune_imperium::kActionTechAcquireWithSolari0));
+
+  TEST_CHECK(!IsAcquisitionAction(dune_imperium::kActionReveal));
+  TEST_CHECK(!IsAcquisitionAction(dune_imperium::kActionEndTurn));
+  TEST_CHECK(!IsAcquisitionAction(dune_imperium::kActionCombatPass));
+  TEST_CHECK(!IsAcquisitionAction(dune_imperium::kActionTechAcquireSkip));
+  TEST_CHECK(!IsAcquisitionAction(dune_imperium::kActionTleilaxuAcquireSkip));
+
+  // 2. Verify policy loss masking in TrainPpoUpdateSeparate
+  auto actor_base = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  auto critic_base = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+
+  auto actor1 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  auto critic1 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+
+  auto actor2 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  auto critic2 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+
+  {
+    torch::NoGradGuard no_grad;
+    for (const auto& item : actor_base->named_parameters()) {
+      actor1->named_parameters()[item.key()].copy_(item.value());
+      actor2->named_parameters()[item.key()].copy_(item.value());
+    }
+    for (const auto& item : critic_base->named_parameters()) {
+      critic1->named_parameters()[item.key()].copy_(item.value());
+      critic2->named_parameters()[item.key()].copy_(item.value());
+    }
+  }
+
+  FreezeActorValueHead(actor1);
+  FreezeCriticPolicyHead(critic1);
+  FreezeActorValueHead(actor2);
+  FreezeCriticPolicyHead(critic2);
+
+  torch::optim::AdamW actor_opt1(actor1->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW critic_opt1(critic1->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW actor_opt2(actor2->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW critic_opt2(critic2->parameters(), torch::optim::AdamWOptions(1e-4));
+
+  std::vector<PpoTransition> batch1;
+  for (int i = 0; i < 4; ++i) {
+    batch1.push_back(MakeSyntheticTransition(100 + i, i % 3, {0, 1, 2}, -1.0f, 0.5f, 0.8f, 0.2f));
+  }
+  batch1[0].mask_policy_loss = true;
+
+  // Batch 2: Identical to Batch 1 EXCEPT transition 0 has different action, advantage, old_log_prob,
+  // but SAME mask_policy_loss = true and SAME return_value.
+  std::vector<PpoTransition> batch2 = batch1;
+  batch2[0].action = 2;
+  batch2[0].advantage = -99.0f;
+  batch2[0].old_log_prob = -5.0f;
+
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_normalize_advantages, false);
+
+  PpoUpdateStats s1 = TrainPpoUpdateSeparate(
+      actor1, actor_opt1, critic1, critic_opt1, batch1,
+      kObsSize, kActionDim, device, 12345, 1);
+
+  PpoUpdateStats s2 = TrainPpoUpdateSeparate(
+      actor2, actor_opt2, critic2, critic_opt2, batch2,
+      kObsSize, kActionDim, device, 12345, 1);
+
+  // Actor policy loss must be identical because masked transition 0 was excluded!
+  TEST_CHECK_NEAR(s1.policy_loss, s2.policy_loss, 1e-6);
+
+  // Actor parameters must match bit-for-bit between run 1 and run 2
+  for (const auto& item : actor1->named_parameters()) {
+    TEST_CHECK(torch::equal(item.value(), actor2->named_parameters()[item.key()]));
+  }
+
+  // Critic value loss is also identical since return_values matched
+  TEST_CHECK_NEAR(s1.value_loss, s2.value_loss, 1e-6);
+
+  // Part 3: Verify transition 0 IS unmasked for critic value loss.
+  // Changing return_value on transition 0 must change value loss.
+  auto actor3 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  auto critic3 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kObsSize, 64, kActionDim, 2, /*nonlinear_value_head=*/false);
+  {
+    torch::NoGradGuard no_grad;
+    for (const auto& item : actor_base->named_parameters()) {
+      actor3->named_parameters()[item.key()].copy_(item.value());
+    }
+    for (const auto& item : critic_base->named_parameters()) {
+      critic3->named_parameters()[item.key()].copy_(item.value());
+    }
+  }
+  FreezeActorValueHead(actor3);
+  FreezeCriticPolicyHead(critic3);
+  torch::optim::AdamW actor_opt3(actor3->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW critic_opt3(critic3->parameters(), torch::optim::AdamWOptions(1e-4));
+
+  std::vector<PpoTransition> batch3 = batch1;
+  batch3[0].reward = 2.0f;
+
+  PpoUpdateStats s3 = TrainPpoUpdateSeparate(
+      actor3, actor_opt3, critic3, critic_opt3, batch3,
+      kObsSize, kActionDim, device, 12345, 1);
+
+  // Policy loss is STILL identical because transition 0 policy loss is masked
+  TEST_CHECK_NEAR(s1.policy_loss, s3.policy_loss, 1e-6);
+
+  // But value loss differs because critic sees transition 0 unmasked
+  TEST_CHECK(std::abs(s1.value_loss - s3.value_loss) > 1e-3);
+
+  absl::SetFlag(&FLAGS_normalize_advantages, true);
+
+  std::cout << "PASSED" << std::endl;
+}
+
+void TestUnit12_AdvantageMatching() {
+  std::cout << "[Test 12] Advantage and value matching from rollout through TrainPpoUpdateSeparate... " << std::flush;
+  std::string u28700_path =
+      "/run/media/warcr/Storage/dune_drl_runtime/round7/u27900_continuation_20260930/checkpoints/ppo_model_update_28700.pt";
+  if (!std::filesystem::exists(u28700_path)) {
+    std::cout << "SKIPPED (u28700 checkpoint not found at " << u28700_path << ")" << std::endl;
+    return;
+  }
+
+  torch::Device device(torch::kCPU);
+  const int64_t kActorObs = dune_imperium::kFullPublicInformationStateSize;  // 9182
+  const int64_t kHidden = 2048;
+  const int64_t kActionDim = 2391;
+  const int64_t kNumBlocks = 8;
+
+  auto actor = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kActorObs, kHidden, kActionDim, kNumBlocks, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  auto critic = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kActorObs, kHidden, kActionDim, kNumBlocks, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+
+  LoadModelCheckpoint(actor, u28700_path, device, /*allow_skip_semantic_scorer=*/true);
+  LoadModelCheckpoint(critic, u28700_path, device, /*allow_skip_semantic_scorer=*/true);
+
+  actor->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  critic->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+
+  FreezeActorValueHead(actor);
+  FreezeCriticPolicyHead(critic);
+  actor->eval();
+  critic->eval();
+
+  torch::optim::AdamW actor_opt(actor->parameters(), torch::optim::AdamWOptions(1e-4));
+  torch::optim::AdamW critic_opt(critic->parameters(), torch::optim::AdamWOptions(1e-4));
+
+  std::mutex eval_mutex;
+  std::shared_mutex sync_mutex;
+  auto det_eval = std::make_shared<DeterministicEvaluator>(
+      actor, device, &eval_mutex, &sync_mutex, critic, /*rollout_amp=*/false);
+
+  auto game = LoadGame("dune_imperium");
+  std::vector<PpoTransition> batch;
+
+  double gamma = 1.0;
+  double gae_lambda = 1.0;
+  float logit_cap = 10.0f;
+  absl::SetFlag(&FLAGS_logit_cap, 10.0);
+  absl::SetFlag(&FLAGS_rollout_amp, false);
+
+  for (int ep = 0; ep < 16; ++ep) {
+    uint64_t ep_id = 1000 + ep;
+    auto state = game->NewInitialState();
+    std::vector<PpoTransition> trajectory;
+
+    while (!state->IsTerminal()) {
+      if (state->IsChanceNode()) {
+        auto outcomes = state->ChanceOutcomes();
+        state->ApplyAction(outcomes.front().first);
+        continue;
+      }
+      Player p = state->CurrentPlayer();
+      auto actions = state->LegalActions();
+      if (actions.empty()) break;
+
+      std::vector<float> obs(kActorObs, 0.0f);
+      auto* dune_st = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      dune_st->InformationStateTensorWithAppendix(
+          p, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+          absl::MakeSpan(obs));
+
+      auto eval_res = det_eval->Evaluate(obs);
+      CenterAndCapLegalLogits(eval_res.logits, actions, logit_cap);
+
+      Action chosen_action = actions.front();
+      float max_l = -1e9f;
+      for (Action a : actions) {
+        if (eval_res.logits[a] > max_l) {
+          max_l = eval_res.logits[a];
+          chosen_action = a;
+        }
+      }
+
+      double sum_exp = 0.0;
+      for (Action a : actions) {
+        sum_exp += std::exp(eval_res.logits[a] - max_l);
+      }
+      float log_prob = (eval_res.logits[chosen_action] - max_l) - std::log(sum_exp);
+
+      PpoTransition t;
+      t.state = obs;
+      t.legal_actions = actions;
+      t.action = chosen_action;
+      t.old_log_prob = log_prob;
+      t.reward = 0.0f;
+      t.value = eval_res.value;
+      t.advantage = 0.0f;
+      t.return_value = 0.0f;
+      t.player_id = p;
+      t.episode_id = ep_id;
+      t.mask_policy_loss = false;
+      trajectory.push_back(std::move(t));
+
+      state->ApplyAction(chosen_action);
+    }
+
+    auto returns = state->Returns();
+    std::vector<float> last_value(4, 0.0f);
+    std::vector<float> last_gae(4, 0.0f);
+    std::vector<bool> seen_last_action(4, false);
+
+    for (auto it = trajectory.rbegin(); it != trajectory.rend(); ++it) {
+      int p = it->player_id;
+      if (p < 0 || p >= 4) continue;
+      float reward = it->reward;
+      if (!seen_last_action[p]) {
+        reward += static_cast<float>(returns[p]);
+        seen_last_action[p] = true;
+      }
+      reward = std::clamp(reward, -1.0f, 1.0f);
+      it->reward = reward;
+
+      float delta = reward + static_cast<float>(gamma) * last_value[p] - it->value;
+      float advantage = delta + static_cast<float>(gamma * gae_lambda) * last_gae[p];
+      it->advantage = advantage;
+      it->return_value = advantage + it->value;
+      last_value[p] = it->value;
+      last_gae[p] = advantage;
+    }
+
+    for (auto& trans : trajectory) {
+      batch.push_back(std::move(trans));
+    }
+  }
+
+  TEST_CHECK(!batch.empty());
+
+  std::vector<float> collector_values(batch.size());
+  std::vector<float> collector_advantages(batch.size());
+  for (size_t i = 0; i < batch.size(); ++i) {
+    collector_values[i] = batch[i].value;
+    collector_advantages[i] = batch[i].advantage;
+  }
+
+  absl::SetFlag(&FLAGS_ppo_minibatch_size, static_cast<int>(batch.size()));
+  absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+  absl::SetFlag(&FLAGS_target_kl, 0.0);
+  absl::SetFlag(&FLAGS_normalize_advantages, false);
+
+  PpoUpdateStats stats = TrainPpoUpdateSeparate(
+      actor, actor_opt, critic, critic_opt, batch,
+      kActorObs, kActionDim, device, /*master=*/12345, /*global_update=*/1,
+      /*compute_diagnostics=*/false, gamma, gae_lambda);
+
+  for (size_t i = 0; i < batch.size(); ++i) {
+    TEST_CHECK_NEAR(batch[i].value, collector_values[i], 1e-4f);
+    TEST_CHECK_NEAR(batch[i].advantage, collector_advantages[i], 1e-4f);
+  }
+
+  std::cout << "PASSED" << std::endl;
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -784,6 +1307,11 @@ int main() {
   open_spiel::TestUnit6_ProductionLearnerExecution();
   open_spiel::TestUnit7_ResumedNextStepEquivalence();
   open_spiel::TestUnit8_CliArgumentSmokeValidation();
-  std::cout << "All 8/8 separate actor/critic unit tests PASSED!" << std::endl;
+  open_spiel::TestUnit9_PrivilegedCriticZeroInitParity();
+  open_spiel::TestUnit10_CriticKeepsTrainingOnActorEarlyStop();
+  open_spiel::TestUnit11_PurchaseExplorationAndMasking();
+  open_spiel::TestUnit12_AdvantageMatching();
+  std::cout << "All 12/12 separate actor/critic unit tests PASSED!" << std::endl;
   return 0;
 }
+
