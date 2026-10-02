@@ -30,6 +30,7 @@ ABSL_DECLARE_FLAG(bool, aux_full_batch_presentation);
 ABSL_DECLARE_FLAG(double, aux_value_coef);
 ABSL_DECLARE_FLAG(bool, search_aux_decoupled);
 ABSL_DECLARE_FLAG(int, search_aux_steps);
+ABSL_DECLARE_FLAG(int, search_aux_epochs);
 ABSL_DECLARE_FLAG(int, search_aux_batch_size);
 ABSL_DECLARE_FLAG(double, search_aux_target_kl);
 ABSL_DECLARE_FLAG(double, search_target_max_kl);
@@ -37,6 +38,11 @@ ABSL_DECLARE_FLAG(bool, critic_keeps_training);
 ABSL_DECLARE_FLAG(bool, privileged_critic);
 ABSL_DECLARE_FLAG(bool, purchase_exploration);
 ABSL_DECLARE_FLAG(double, logit_penalty_coef);
+ABSL_DECLARE_FLAG(bool, search_aux_anchoring);
+ABSL_DECLARE_FLAG(double, search_aux_beta);
+ABSL_DECLARE_FLAG(double, search_aux_alpha);
+ABSL_DECLARE_FLAG(double, search_aux_rail_kl_target);
+ABSL_DECLARE_FLAG(bool, search_research_diagnostic);
 
 extern std::string g_reward_transition_source_fingerprint;
 extern int64_t g_reward_transition_source_update;
@@ -84,6 +90,11 @@ struct PpoTransition {
   bool mask_policy_loss = false;
   // Compact fp16 storage for privileged central critic features (3,432 floats, A2)
   std::vector<uint16_t> privileged_appendix;
+  // High stakes strategic state flag for rail/anchor partitioning
+  bool is_high_stakes = false;
+  // Monte Carlo return (lambda=1, gamma=1) and trajectory third (0=first, 1=mid, 2=last) for value calibration
+  float mc_return = 0.0f;
+  int trajectory_third = -1;
 };
 
 inline bool IsAcquisitionAction(Action a) {
@@ -655,19 +666,40 @@ PpoUpdateStats TrainPpoUpdateSeparate(
 struct SearchAuxPhaseResult {
   int steps_budgeted = 0;
   int steps_accepted = 0;
+  int accepted_override_presentations = 0;
+  double initial_aux_ce = 0.0;
   double final_aux_ce = 0.0;
+  double override_kl = 0.0;
   double cumulative_kl_searched = 0.0;
   double cumulative_kl_rollout = 0.0;
+  double rail_kl_total = 0.0;
+  double rail_kl_agreement = 0.0;
+  double rail_kl_non_high_stakes = 0.0;
+  double delta_entropy_rail = 0.0;
+  double delta_entropy_high_stakes = 0.0;
   double mean_aux_grad_norm = 0.0;
+  double mean_override_ce_loss = 0.0;
+  double mean_anchor_kl_loss = 0.0;
+  double mean_anchor_value_mse_loss = 0.0;
   bool step_rejected_on_kl = false;
   bool step_rejected_nonfinite = false;
   bool phase_rejected = false;
   bool null_supervision_skipped = false;
   bool value_head_immutable = true;
   double critic_probe_mse_shift = 0.0;
+  double critic_probe_mse_shift_anchors = 0.0;
+  double critic_probe_mse_shift_rail = 0.0;
   double max_prob_movement = 0.0;
   int64_t optimizer_states_before = 0;
   int64_t optimizer_states_after = 0;
+};
+
+struct SearchAuxAnchoringConfig {
+  bool enabled = false;
+  double beta = 1.0;
+  double alpha = 1.0;
+  double rail_kl_target = 0.001;
+  int anchor_sample_size = 256;
 };
 
 SearchAuxPhaseResult TrainSearchAuxiliaryPhase(
@@ -676,11 +708,38 @@ SearchAuxPhaseResult TrainSearchAuxiliaryPhase(
     const std::vector<SearchTrainingExample>& search_examples,
     int64_t obs_size, int64_t action_dim,
     torch::Device device,
-    int max_steps = 4,
+    int max_steps = 0,
     int batch_size = 64,
     double max_cumulative_kl = 0.01,
     double search_loss_coef = 0.10,
-    const std::vector<PpoTransition>& reference_rollout_sample = {});
+    const std::vector<PpoTransition>& reference_rollout_sample = {},
+    uint64_t aux_seed = 0,
+    int epochs = 1,
+    const std::vector<SearchTrainingExample>& agreement_examples = {},
+    const std::vector<PpoTransition>& all_rollout_transitions = {},
+    const SearchAuxAnchoringConfig& anchoring_config = {});
+
+struct SearchExamplesMetrics {
+  double mean_ce = 0.0;
+  double mean_p_search_move = 0.0;
+  double greedy_agreement_pct = 0.0;
+  int64_t count = 0;
+};
+
+// Evaluate cross-entropy, mean probability on search move, and greedy agreement
+// on search training examples (for survival check, multi-update retention, and fresh-state check)
+SearchExamplesMetrics EvaluateSearchExamplesMetrics(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const std::vector<SearchTrainingExample>& examples,
+    int64_t obs_size, int64_t action_dim,
+    torch::Device device);
+
+// Evaluate cross-entropy of policy on search training examples (for survival check)
+double EvaluateSearchExamplesCrossEntropy(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    const std::vector<SearchTrainingExample>& examples,
+    int64_t obs_size, int64_t action_dim,
+    torch::Device device);
 
 // ---------------------------------------------------------------------------
 // PWO-5 head telemetry sidecar (amendment 1 ruling 6).

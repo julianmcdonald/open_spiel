@@ -558,6 +558,196 @@ int main() {
         tree.GetMeanUtility(candidate_action));
   }
 
+  // Test 8: Parity between BatchCompoundSearchSupervision (pairing=true, truncation=true)
+  // and direct CompoundRolloutSearchDecision on identical states and seeds.
+  {
+    std::cout << "Running Test 8: Parity between BatchCompoundSearchSupervision and CompoundRolloutSearchDecision...\n";
+    std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+
+    auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
+        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+    std::shared_mutex mutex;
+    auto coord = std::make_shared<BatchedEvaluator>(
+        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+    auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
+
+    const std::vector<uint64_t> test_seeds = {42ULL, 12345ULL, 20261002ULL};
+    const int top_k = 3;
+    const int rollouts_per_action = 16;
+    const double min_margin = 0.05;
+
+    for (uint64_t seed : test_seeds) {
+      std::unique_ptr<State> state = game->NewInitialState();
+      std::mt19937_64 rng(seed);
+      while (state->IsChanceNode()) {
+        auto outcomes = state->ChanceOutcomes();
+        double u = std::generate_canonical<double, 53>(rng);
+        Action ca = open_spiel::SampleAction(outcomes, u).first;
+        state->ApplyAction(ca);
+      }
+      Player current_player = state->CurrentPlayer();
+
+      // 1. Direct CompoundRolloutSearchDecision
+      uint64_t root_seed = dune_seed::DeriveSeed(seed, 0);
+      auto direct_res = CompoundRolloutSearchDecision(
+          *state,
+          current_player,
+          /*turn_tree=*/nullptr,
+          evaluators,
+          top_k,
+          rollouts_per_action,
+          min_margin,
+          TreeReuseMode::kTargetFill,
+          root_seed,
+          SearchPairingMode::kPaired,
+          SearchTruncationMode::kNextRoundSearchPlayer);
+
+      // 2. BatchCompoundSearchSupervision
+      SearchSnapshot snap;
+      snap.sim_state = state->Clone();
+      snap.player = current_player;
+      snap.observation = nn_eval->GetConsumedObservation(*state, current_player);
+      snap.legal_actions = state->LegalActions();
+
+      std::vector<SearchSnapshot> snapshots;
+      snapshots.push_back(std::move(snap));
+
+      auto batch_res = BatchCompoundSearchSupervision(
+          snapshots, evaluators,
+          top_k, rollouts_per_action, min_margin,
+          /*softmax_temperature=*/0.50, /*eta_blend=*/0.80,
+          /*search_seed=*/seed,
+          /*num_workers=*/1,
+          /*full_turn_supervision=*/false,
+          /*use_mpo_target=*/true,
+          /*max_target_kl=*/0.05,
+          SearchPairingMode::kPaired,
+          SearchTruncationMode::kNextRoundSearchPlayer);
+
+      SPIEL_CHECK_EQ(batch_res.roots_evaluated, 1);
+      SPIEL_CHECK_EQ(batch_res.examples.size(), 1);
+      SPIEL_CHECK_EQ(direct_res.overridden ? 1 : 0, batch_res.overrides);
+
+      // Verify elementwise equality against ComputeMpoRelativeTarget within 1e-9
+      ActionsAndProbs raw_prior = evaluators[0]->Prior(*state);
+      std::vector<std::pair<Action, double>> raw_policy;
+      for (const auto& ap : raw_prior) {
+        raw_policy.push_back({ap.first, ap.second});
+      }
+      std::vector<double> expected_mpo = ComputeMpoRelativeTarget(
+          raw_policy, snapshots[0].legal_actions, direct_res.candidate_utilities,
+          /*base_temperature=*/0.50, /*max_target_kl=*/0.05);
+
+      SPIEL_CHECK_EQ(batch_res.examples[0].normalized_visits.size(), expected_mpo.size());
+      for (size_t i = 0; i < expected_mpo.size(); ++i) {
+        SPIEL_CHECK_LT(std::abs(batch_res.examples[0].normalized_visits[i] - expected_mpo[i]), 1e-7);
+      }
+
+      // Negative control: the same batch call with kUnpaired must give a different target
+      SearchSnapshot unpaired_snap;
+      unpaired_snap.sim_state = state->Clone();
+      unpaired_snap.player = current_player;
+      unpaired_snap.observation = nn_eval->GetConsumedObservation(*state, current_player);
+      unpaired_snap.legal_actions = state->LegalActions();
+      std::vector<SearchSnapshot> unpaired_snapshots;
+      unpaired_snapshots.push_back(std::move(unpaired_snap));
+
+      auto unpaired_res = BatchCompoundSearchSupervision(
+          unpaired_snapshots, evaluators,
+          top_k, rollouts_per_action, min_margin,
+          /*softmax_temperature=*/0.50, /*eta_blend=*/0.80,
+          /*search_seed=*/seed,
+          /*num_workers=*/1,
+          /*full_turn_supervision=*/false,
+          /*use_mpo_target=*/true,
+          /*max_target_kl=*/0.05,
+          SearchPairingMode::kUnpaired,
+          SearchTruncationMode::kNextRoundSearchPlayer);
+
+      SPIEL_CHECK_EQ(unpaired_res.examples.size(), 1);
+      double max_unpaired_diff = 0.0;
+      for (size_t i = 0; i < expected_mpo.size(); ++i) {
+        max_unpaired_diff = std::max(
+            max_unpaired_diff,
+            std::abs(unpaired_res.examples[0].normalized_visits[i] - batch_res.examples[0].normalized_visits[i]));
+      }
+      SPIEL_CHECK_GT(max_unpaired_diff, 1e-5);
+
+      std::cout << absl::StrFormat(
+          "  Seed %llu parity verified: target elementwise match < 1e-7, negative control diff=%.4f, overridden=%d, candidates=%d\n",
+          static_cast<unsigned long long>(seed), max_unpaired_diff,
+          direct_res.overridden ? 1 : 0,
+          static_cast<int>(direct_res.candidate_utilities.size()));
+    }
+  }
+
+  // Test 9: Override-Gated target mode and ComputeOverrideGatedTarget
+  {
+    std::cout << "Running Test 9: Override-Gated target mode and ComputeOverrideGatedTarget...\n";
+    std::vector<Action> legals = {10, 20, 30};
+    std::vector<std::pair<Action, double>> raw_policy = {{10, 0.70}, {20, 0.20}, {30, 0.10}};
+    Action best_action = 30;
+    double eta = 0.50;
+
+    std::vector<double> gated_target = ComputeOverrideGatedTarget(raw_policy, legals, best_action, eta);
+    SPIEL_CHECK_EQ(gated_target.size(), 3);
+    // Action 10: 0.5 * 0.70 = 0.35
+    SPIEL_CHECK_FLOAT_EQ(gated_target[0], 0.35);
+    // Action 20: 0.5 * 0.20 = 0.10
+    SPIEL_CHECK_FLOAT_EQ(gated_target[1], 0.10);
+    // Action 30: 0.5 * 0.10 + 0.5 * 1.0 = 0.55
+    SPIEL_CHECK_FLOAT_EQ(gated_target[2], 0.55);
+
+    double sum = gated_target[0] + gated_target[1] + gated_target[2];
+    SPIEL_CHECK_FLOAT_EQ(sum, 1.0);
+
+    // Test BatchCompoundSearchSupervision in override_gated mode
+    std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+    auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
+        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+    std::shared_mutex mutex;
+    auto coord = std::make_shared<BatchedEvaluator>(
+        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+    auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
+
+    std::unique_ptr<State> state = game->NewInitialState();
+    std::mt19937_64 rng(42ULL);
+    while (state->IsChanceNode()) {
+      auto outcomes = state->ChanceOutcomes();
+      double u = std::generate_canonical<double, 53>(rng);
+      Action a = open_spiel::SampleAction(outcomes, u).first;
+      state->ApplyAction(a);
+    }
+    Player current_player = state->CurrentPlayer();
+
+    SearchSnapshot snap;
+    snap.sim_state = state->Clone();
+    snap.player = current_player;
+    snap.observation = nn_eval->GetConsumedObservation(*state, current_player);
+    snap.legal_actions = state->LegalActions();
+    std::vector<SearchSnapshot> snapshots;
+    snapshots.push_back(std::move(snap));
+
+    // Force margin = 100.0 so no override occurs -> example must be dropped
+    auto gated_res_no_override = BatchCompoundSearchSupervision(
+        snapshots, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/16, /*min_override_margin=*/100.0,
+        /*softmax_temperature=*/0.50, /*eta_blend=*/0.80,
+        /*search_seed=*/42ULL, /*num_workers=*/1, /*full_turn_supervision=*/false,
+        /*use_mpo_target=*/true, /*max_target_kl=*/0.05,
+        SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
+        /*target_mode=*/"override_gated", /*override_eta=*/0.50);
+
+    SPIEL_CHECK_EQ(gated_res_no_override.roots_evaluated, 1);
+    SPIEL_CHECK_EQ(gated_res_no_override.total_decisions_evaluated, 1);
+    SPIEL_CHECK_EQ(gated_res_no_override.overrides, 0);
+    SPIEL_CHECK_EQ(gated_res_no_override.examples.size(), 0);
+
+    std::cout << "  Override-gated target: verified formula, sum=1.0, non-override dropping verified.\n";
+  }
+
   std::cout << "All TurnSearchTree and CompoundTurnSearch unit tests PASSED successfully!\n";
   return 0;
 }

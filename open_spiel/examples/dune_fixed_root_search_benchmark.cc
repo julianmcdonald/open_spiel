@@ -39,6 +39,16 @@ ABSL_FLAG(int, target_batch_size, 128, "Evaluator batch size.");
 ABSL_FLAG(int, top_k_actions, 3, "Number of top candidates.");
 ABSL_FLAG(double, min_override_margin, 0.15, "Override margin threshold in utility units.");
 ABSL_FLAG(uint64_t, master_seed, 20261001ULL, "Master seed for domain-separated derivation.");
+ABSL_FLAG(std::string, replay_trajectory_jsonl, "",
+          "Path to recorded tournament trajectory_meta.jsonl for held-out policy cross-entropy evaluation.");
+ABSL_FLAG(std::string, replay_obs_bin, "",
+          "Path to recorded tournament trajectory_obs.bin matching replay_trajectory_jsonl.");
+ABSL_FLAG(int, max_roots, -1, "Maximum number of roots to benchmark (-1 for all).");
+ABSL_FLAG(bool, leaf_check_only, false, "Run only V2_16_Paired vs Ref512 for leaf check.");
+ABSL_FLAG(bool, rollout_amp, false, "Use AMP in evaluator rollouts (default false).");
+ABSL_FLAG(bool, allow_tf32, false, "Allow TF32 in evaluator (default false).");
+ABSL_FLAG(double, temperature, 1.0, "Temperature applied to capped logits in replay mode.");
+ABSL_FLAG(bool, dump_per_state, false, "Dump per-state candidate probabilities and entropy in output JSON.");
 
 namespace benchmark_domains {
 constexpr uint64_t kDomainV0_Run1        = 0x0501;
@@ -278,6 +288,479 @@ bool LoadBenchmarkCheckpoint(
   return completed_roots > 0;
 }
 
+int RunHeldOutReplayEvaluation(
+    const std::string& model_path,
+    const std::string& trajectory_jsonl_path,
+    const std::string& obs_bin_path,
+    const std::string& output_json_path) {
+  std::cout << "================================================================================\n";
+  std::cout << "HELD-OUT TRAJECTORY REPLAY POLICY EVALUATION\n";
+  std::cout << "================================================================================\n";
+  std::cout << "Model checkpoint:       " << model_path << "\n";
+  std::cout << "Replay trajectory meta: " << trajectory_jsonl_path << "\n";
+  std::cout << "Replay observation bin: " << obs_bin_path << "\n";
+  if (!output_json_path.empty()) {
+    std::cout << "Output JSON receipt:    " << output_json_path << "\n";
+  }
+
+  // Load Game
+  std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame("dune_imperium");
+
+  // Open observation binary file
+  std::ifstream obs_file(obs_bin_path, std::ios::binary);
+  if (!obs_file.is_open()) {
+    open_spiel::SpielFatalError("Failed to open observation binary: " + obs_bin_path);
+  }
+  const size_t obs_elem_count = open_spiel::dune_imperium::kFullPublicInformationStateSize;
+  const size_t obs_byte_stride = obs_elem_count * sizeof(float);
+
+  // Open trajectory JSONL
+  std::ifstream meta_file(trajectory_jsonl_path);
+  if (!meta_file.is_open()) {
+    open_spiel::SpielFatalError("Failed to open trajectory meta jsonl: " + trajectory_jsonl_path);
+  }
+
+  // Setup Device & Model Evaluator
+  torch::Device device(torch::kCUDA, 0);
+  if (!torch::cuda::is_available()) {
+    device = torch::Device(torch::kCPU);
+  }
+  std::cout << "[DEVICE] Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+
+  auto model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 8,
+      /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
+      /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  model->to(device);
+  torch::load(model, model_path, device);
+  model->eval();
+
+  std::shared_mutex model_mutex;
+  auto coord = std::make_shared<open_spiel::BatchedEvaluator>(
+      model, 64, /*timeout_ms=*/1, device, &model_mutex, 10.0f,
+      /*device_synchronize=*/false, /*high_priority_stream=*/true,
+      /*emit_batch_membership=*/false, /*rollout_amp=*/true, /*allow_tf32=*/true);
+  auto evaluator = std::make_shared<open_spiel::BatchedNNEvaluator>(coord, 10.0f);
+  std::cout << "[MODEL] Successfully initialized policy evaluator with semantic scoring.\n";
+
+  struct SubgroupMetrics {
+    int64_t count = 0;
+    int64_t greedy_changed_count = 0;
+    int64_t greedy_agree_search_count = 0;
+    double sum_prob_search_move = 0.0;
+    double sum_max_p_diff_mu = 0.0;
+    double sum_policy_entropy = 0.0;
+    int64_t value_covered_count = 0;
+    double sum_value_diff = 0.0;
+    double sum_ce = 0.0;
+  };
+
+  SubgroupMetrics ovr_stats;
+  SubgroupMetrics non_ovr_stats;
+
+  std::string line;
+  int64_t total_rows_read = 0;
+  int64_t fresh_search_decisions = 0;
+  double total_ce_all = 0.0;
+  int64_t top1_matches = 0;
+  double total_max_prob_diff = 0.0;
+
+  // Track breakdown by round
+  std::unordered_map<int, double> round_ce_sum;
+  std::unordered_map<int, int64_t> round_dec_count;
+
+  std::vector<float> obs_buffer(obs_elem_count);
+  open_spiel::json::Array dumped_decisions;
+
+  while (std::getline(meta_file, line)) {
+    if (line.empty()) continue;
+    ++total_rows_read;
+    auto json_opt = open_spiel::json::FromString(line);
+    if (!json_opt || !json_opt->IsObject()) continue;
+    const auto& obj = json_opt->GetObject();
+
+    // Filter strictly to decision_role == "fresh_search"
+    std::string decision_role = "";
+    auto it_role = obj.find("decision_role");
+    if (it_role != obj.end() && it_role->second.IsString()) {
+      decision_role = it_role->second.GetString();
+    }
+    if (decision_role != "fresh_search") continue;
+
+    int search_seat = static_cast<int>(obj.at("search_seat").GetInt());
+    int round = static_cast<int>(obj.at("round").GetInt());
+    int64_t obs_row = obj.at("obs_row").GetInt();
+
+    // Parse legal_actions
+    std::vector<Action> legal_actions;
+    if (obj.find("legal_actions") != obj.end() && obj.at("legal_actions").IsArray()) {
+      for (const auto& a_val : obj.at("legal_actions").GetArray()) {
+        legal_actions.push_back(static_cast<Action>(a_val.GetInt()));
+      }
+    }
+    if (legal_actions.empty()) continue;
+
+    // Parse recorded mu (U28700 raw prior)
+    std::vector<std::pair<Action, double>> raw_policy;
+    std::unordered_map<Action, double> mu_map;
+    Action argmax_mu = -1;
+    double max_mu = -1.0;
+    if (obj.find("mu") != obj.end() && obj.at("mu").IsObject()) {
+      for (const auto& kv : obj.at("mu").GetObject()) {
+        Action a = static_cast<Action>(std::stoi(kv.first));
+        double prob = kv.second.GetDouble();
+        raw_policy.push_back({a, prob});
+        mu_map[a] = prob;
+        if (prob > max_mu) {
+          max_mu = prob;
+          argmax_mu = a;
+        }
+      }
+    }
+    if (raw_policy.empty() || argmax_mu == -1) continue;
+
+    // Parse candidate_utilities
+    std::vector<std::pair<Action, double>> candidate_utilities;
+    std::unordered_map<Action, double> cand_util_map;
+    if (obj.find("candidate_utilities") != obj.end() && obj.at("candidate_utilities").IsArray()) {
+      for (const auto& item : obj.at("candidate_utilities").GetArray()) {
+        if (item.IsArray() && item.GetArray().size() >= 2) {
+          Action a = static_cast<Action>(item.GetArray()[0].GetInt());
+          double u = item.GetArray()[1].GetDouble();
+          candidate_utilities.push_back({a, u});
+          cand_util_map[a] = u;
+        }
+      }
+    }
+    if (candidate_utilities.empty()) continue;
+
+    // Build target with ComputeMpoRelativeTarget(mu, legal_actions, candidate_utilities, 0.50, 0.05)
+    std::vector<double> target_dist = ComputeMpoRelativeTarget(
+        raw_policy, legal_actions, candidate_utilities, /*base_temperature=*/0.50, /*max_target_kl=*/0.05);
+    if (target_dist.size() != legal_actions.size()) continue;
+
+    // Recompute override states from candidate_utilities with the 0.15 rule (best candidate beats raw by >= 0.15)
+    double raw_u = obj.at("raw_mean_utility").GetDouble();
+    Action raw_a = static_cast<Action>(obj.at("raw_action").GetInt());
+    Action best_cand_action = raw_a;
+    double best_cand_utility = -1e9;
+    for (const auto& cu : candidate_utilities) {
+      if (cu.second > best_cand_utility) {
+        best_cand_utility = cu.second;
+        best_cand_action = cu.first;
+      }
+    }
+    bool is_override = (best_cand_action != raw_a) && (best_cand_utility >= raw_u + 0.15);
+
+    // Read observation from disk
+    obs_file.seekg(obs_row * obs_byte_stride, std::ios::beg);
+    obs_file.read(reinterpret_cast<char*>(obs_buffer.data()), obs_byte_stride);
+    if (!obs_file) {
+      open_spiel::SpielFatalError(absl::StrFormat("Failed to read obs row %d from %s", obs_row, obs_bin_path));
+    }
+
+    // Replay state from action history
+    std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+    if (obj.find("action_history") != obj.end() && obj.at("action_history").IsArray()) {
+      for (const auto& a_val : obj.at("action_history").GetArray()) {
+        state->ApplyAction(static_cast<Action>(a_val.GetInt()));
+      }
+    }
+    if (state->CurrentPlayer() != search_seat) {
+      open_spiel::SpielFatalError(absl::StrFormat(
+          "Trajectory replay seat mismatch at row %lld: state->CurrentPlayer()=%d, search_seat=%d",
+          static_cast<long long>(obs_row), state->CurrentPlayer(), search_seat));
+    }
+
+    // Verify observation consistency between disk and replayed state
+    std::vector<float> recomputed_obs = evaluator->GetConsumedObservation(*state, search_seat);
+    float obs_diff = 0.0f;
+    for (size_t k = 0; k < obs_elem_count; ++k) {
+      obs_diff = std::max(obs_diff, std::abs(recomputed_obs[k] - obs_buffer[k]));
+    }
+    if (obs_diff > 1e-4f) {
+      open_spiel::SpielFatalError(absl::StrFormat(
+          "Observation mismatch at row %lld: max diff = %f",
+          static_cast<long long>(obs_row), obs_diff));
+    }
+
+    // Query policy via model and apply temperature to capped logits
+    dune_semantic::CandidateActionData cand_data;
+    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    if (dune != nullptr) {
+      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
+    }
+    open_spiel::EvalResult full = coord->EvaluateWithActions(recomputed_obs, &cand_data);
+    std::vector<float> capped_logits = full.logits;
+    open_spiel::CenterAndCapLegalLogitsWithStats(capped_logits, legal_actions, 10.0f);
+
+    double temp = absl::GetFlag(FLAGS_temperature);
+    if (temp <= 0.0) temp = 1.0;
+
+    double max_l = -1e9;
+    for (Action a : legal_actions) {
+      double l = static_cast<double>(capped_logits[a]) / temp;
+      if (l > max_l) max_l = l;
+    }
+    double sum_exp = 0.0;
+    for (Action a : legal_actions) {
+      sum_exp += std::exp(static_cast<double>(capped_logits[a]) / temp - max_l);
+    }
+    std::unordered_map<Action, double> model_probs;
+    Action model_argmax = -1;
+    double max_p = -1.0;
+    double policy_entropy = 0.0;
+    for (Action a : legal_actions) {
+      double p = std::exp(static_cast<double>(capped_logits[a]) / temp - max_l) / sum_exp;
+      model_probs[a] = p;
+      if (p > max_p) {
+        max_p = p;
+        model_argmax = a;
+      }
+      if (p > 1e-15) {
+        policy_entropy -= p * std::log(p);
+      }
+    }
+
+    if (absl::GetFlag(FLAGS_dump_per_state)) {
+      open_spiel::json::Object dec_obj;
+      dec_obj["obs_row"] = open_spiel::json::Value(static_cast<int64_t>(obs_row));
+      dec_obj["is_override"] = open_spiel::json::Value(is_override);
+      dec_obj["entropy"] = open_spiel::json::Value(policy_entropy);
+      dec_obj["model_argmax"] = open_spiel::json::Value(static_cast<int64_t>(model_argmax));
+      dec_obj["argmax_mu"] = open_spiel::json::Value(static_cast<int64_t>(argmax_mu));
+      dec_obj["raw_action"] = open_spiel::json::Value(static_cast<int64_t>(raw_a));
+      dec_obj["best_cand_action"] = open_spiel::json::Value(static_cast<int64_t>(best_cand_action));
+
+      open_spiel::json::Array cand_arr;
+      open_spiel::json::Array cand_probs_arr;
+      open_spiel::json::Array cand_logits_arr;
+      for (const auto& cu : candidate_utilities) {
+        Action ca = cu.first;
+        cand_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(ca)));
+        cand_probs_arr.push_back(open_spiel::json::Value(model_probs[ca]));
+        cand_logits_arr.push_back(open_spiel::json::Value(static_cast<double>(capped_logits[ca])));
+      }
+      dec_obj["candidate_actions"] = open_spiel::json::Value(cand_arr);
+      dec_obj["candidate_probs"] = open_spiel::json::Value(cand_probs_arr);
+      dec_obj["candidate_capped_logits"] = open_spiel::json::Value(cand_logits_arr);
+      dumped_decisions.push_back(open_spiel::json::Value(dec_obj));
+    }
+
+    // max |p - mu| over legal actions
+    double max_p_diff_mu = 0.0;
+    for (Action a : legal_actions) {
+      double p_val = model_probs.count(a) ? model_probs[a] : 0.0;
+      double mu_val = mu_map.count(a) ? mu_map[a] : 0.0;
+      max_p_diff_mu = std::max(max_p_diff_mu, std::abs(p_val - mu_val));
+    }
+
+    // Value of changed choices:
+    // where the student's greedy move differs from argmax(mu) and both are among recorded candidates,
+    // utility difference = cand_util_map[model_argmax] - cand_util_map[argmax_mu].
+    bool val_covered = false;
+    double val_diff = 0.0;
+    if (model_argmax != argmax_mu &&
+        cand_util_map.count(model_argmax) &&
+        cand_util_map.count(argmax_mu)) {
+      val_covered = true;
+      val_diff = cand_util_map[model_argmax] - cand_util_map[argmax_mu];
+    }
+
+    // Compute cross-entropy against MPO relative target
+    double ce = 0.0;
+    Action target_argmax = -1;
+    double max_q = -1.0;
+    double max_movement = 0.0;
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      Action a = legal_actions[i];
+      double q = target_dist[i];
+      if (q > max_q) {
+        max_q = q;
+        target_argmax = a;
+      }
+      double p = model_probs.count(a) ? model_probs[a] : 0.0;
+      ce -= q * std::log(std::max(p, 1e-12));
+      max_movement = std::max(max_movement, std::abs(p - q));
+    }
+
+    total_ce_all += ce;
+    if (model_argmax == target_argmax) {
+      ++top1_matches;
+    }
+    total_max_prob_diff += max_movement;
+    round_ce_sum[round] += ce;
+    round_dec_count[round]++;
+    ++fresh_search_decisions;
+
+    SubgroupMetrics& g = is_override ? ovr_stats : non_ovr_stats;
+    g.count++;
+    if (model_argmax != argmax_mu) {
+      g.greedy_changed_count++;
+    }
+    g.sum_max_p_diff_mu += max_p_diff_mu;
+    g.sum_policy_entropy += policy_entropy;
+    if (val_covered) {
+      g.value_covered_count++;
+      g.sum_value_diff += val_diff;
+    }
+    g.sum_ce += ce;
+
+    if (is_override) {
+      if (model_argmax == best_cand_action) {
+        g.greedy_agree_search_count++;
+      }
+      double teacher_prob = model_probs.count(best_cand_action) ? model_probs[best_cand_action] : 0.0;
+      g.sum_prob_search_move += teacher_prob;
+    }
+  }
+
+  if (fresh_search_decisions == 0) {
+    std::cerr << "WARNING: No fresh_search decisions found in " << trajectory_jsonl_path << "\n";
+    return 1;
+  }
+
+  double mean_ce_all = total_ce_all / fresh_search_decisions;
+  double top1_acc = 100.0 * static_cast<double>(top1_matches) / fresh_search_decisions;
+  double mean_max_diff = total_max_prob_diff / fresh_search_decisions;
+
+  // Override metrics
+  double ovr_greedy_change_rate = (ovr_stats.count > 0) ? (100.0 * ovr_stats.greedy_changed_count / ovr_stats.count) : 0.0;
+  double ovr_greedy_agree_search = (ovr_stats.count > 0) ? (100.0 * ovr_stats.greedy_agree_search_count / ovr_stats.count) : 0.0;
+  double ovr_mean_prob_search = (ovr_stats.count > 0) ? (ovr_stats.sum_prob_search_move / ovr_stats.count) : 0.0;
+  double ovr_mean_max_p_diff = (ovr_stats.count > 0) ? (ovr_stats.sum_max_p_diff_mu / ovr_stats.count) : 0.0;
+  double ovr_mean_entropy = (ovr_stats.count > 0) ? (ovr_stats.sum_policy_entropy / ovr_stats.count) : 0.0;
+  double ovr_val_changed_diff = (ovr_stats.value_covered_count > 0) ? (ovr_stats.sum_value_diff / ovr_stats.value_covered_count) : 0.0;
+  double mean_ce_override = (ovr_stats.count > 0) ? (ovr_stats.sum_ce / ovr_stats.count) : 0.0;
+  double override_pct = 100.0 * static_cast<double>(ovr_stats.count) / fresh_search_decisions;
+
+  // Non-override metrics
+  double non_ovr_greedy_change_rate = (non_ovr_stats.count > 0) ? (100.0 * non_ovr_stats.greedy_changed_count / non_ovr_stats.count) : 0.0;
+  double non_ovr_mean_max_p_diff = (non_ovr_stats.count > 0) ? (non_ovr_stats.sum_max_p_diff_mu / non_ovr_stats.count) : 0.0;
+  double non_ovr_mean_entropy = (non_ovr_stats.count > 0) ? (non_ovr_stats.sum_policy_entropy / non_ovr_stats.count) : 0.0;
+  double non_ovr_val_changed_diff = (non_ovr_stats.value_covered_count > 0) ? (non_ovr_stats.sum_value_diff / non_ovr_stats.value_covered_count) : 0.0;
+  double mean_ce_non_override = (non_ovr_stats.count > 0) ? (non_ovr_stats.sum_ce / non_ovr_stats.count) : 0.0;
+
+  std::cout << "================================================================================\n";
+  std::cout << "HELD-OUT EVALUATION AGAINST RECORDED U28700 PRIOR (mu)\n";
+  std::cout << "================================================================================\n";
+  std::cout << absl::StrFormat("Total fresh_search decisions evaluated: %lld\n\n",
+                               static_cast<long long>(fresh_search_decisions));
+
+  std::cout << absl::StrFormat("--- OVERRIDE STATES (N = %lld, %.2f%%) ---\n",
+                               static_cast<long long>(ovr_stats.count), override_pct);
+  std::cout << absl::StrFormat("  Greedy change rate [argmax(p) != argmax(mu)]:       %6.2f%% (%lld / %lld)\n",
+                               ovr_greedy_change_rate, static_cast<long long>(ovr_stats.greedy_changed_count), static_cast<long long>(ovr_stats.count));
+  std::cout << absl::StrFormat("  Greedy agreement with search move:                  %6.2f%% (%lld / %lld)\n",
+                               ovr_greedy_agree_search, static_cast<long long>(ovr_stats.greedy_agree_search_count), static_cast<long long>(ovr_stats.count));
+  std::cout << absl::StrFormat("  Mean probability on search move:                    %6.4f (U28700 baseline: 0.0887)\n",
+                               ovr_mean_prob_search);
+  std::cout << absl::StrFormat("  Mean max |p - mu|:                                  %6.4f\n",
+                               ovr_mean_max_p_diff);
+  std::cout << absl::StrFormat("  Mean policy entropy:                                %6.4f\n",
+                               ovr_mean_entropy);
+  std::cout << absl::StrFormat("  Value of changed choices (mean utility diff):       %+6.4f ladder units (N=%lld covered)\n",
+                               ovr_val_changed_diff, static_cast<long long>(ovr_stats.value_covered_count));
+  std::cout << absl::StrFormat("  Mean CE (MPO target):                               %6.4f\n\n",
+                               mean_ce_override);
+
+  std::cout << absl::StrFormat("--- NON-OVERRIDE STATES (N = %lld, %.2f%%) ---\n",
+                               static_cast<long long>(non_ovr_stats.count), 100.0 - override_pct);
+  std::cout << absl::StrFormat("  Greedy change rate [argmax(p) != argmax(mu)]:       %6.2f%% (%lld / %lld)\n",
+                               non_ovr_greedy_change_rate, static_cast<long long>(non_ovr_stats.greedy_changed_count), static_cast<long long>(non_ovr_stats.count));
+  std::cout << absl::StrFormat("  Mean max |p - mu|:                                  %6.4f\n",
+                               non_ovr_mean_max_p_diff);
+  std::cout << absl::StrFormat("  Mean policy entropy:                                %6.4f\n",
+                               non_ovr_mean_entropy);
+  std::cout << absl::StrFormat("  Value of changed choices (mean utility diff):       %+6.4f ladder units (N=%lld covered)\n",
+                               non_ovr_val_changed_diff, static_cast<long long>(non_ovr_stats.value_covered_count));
+  std::cout << absl::StrFormat("  Mean CE (MPO target):                               %6.4f\n",
+                               mean_ce_non_override);
+  std::cout << "--------------------------------------------------------------------------------\n";
+  std::cout << absl::StrFormat("  All States Mean CE:                                 %6.4f\n", mean_ce_all);
+  std::cout << absl::StrFormat("  All States MPO Target Top-1 Match:                  %6.2f%%\n", top1_acc);
+  std::cout << absl::StrFormat("  All States Mean Max Prob Movement (vs MPO target):  %6.4f\n", mean_max_diff);
+  std::cout << "--------------------------------------------------------------------------------\n";
+  std::cout << "Per-Round Cross-Entropy (All States):\n";
+  for (int r = 1; r <= 10; ++r) {
+    if (round_dec_count.count(r) && round_dec_count[r] > 0) {
+      std::cout << absl::StrFormat("  Round %2d: CE = %.4f (%lld decisions)\n",
+                                   r, round_ce_sum[r] / round_dec_count[r],
+                                   static_cast<long long>(round_dec_count[r]));
+    }
+  }
+  std::cout << "================================================================================\n";
+
+  if (!output_json_path.empty()) {
+    open_spiel::json::Object out_obj;
+    out_obj["model_checkpoint"] = open_spiel::json::Value(model_path);
+    out_obj["trajectory_meta_jsonl"] = open_spiel::json::Value(trajectory_jsonl_path);
+    out_obj["trajectory_obs_bin"] = open_spiel::json::Value(obs_bin_path);
+    out_obj["fresh_search_decisions"] = open_spiel::json::Value(fresh_search_decisions);
+
+    // Override subgroup
+    open_spiel::json::Object ovr_json;
+    ovr_json["count"] = open_spiel::json::Value(ovr_stats.count);
+    ovr_json["override_pct"] = open_spiel::json::Value(override_pct);
+    ovr_json["greedy_change_rate_pct"] = open_spiel::json::Value(ovr_greedy_change_rate);
+    ovr_json["greedy_agree_search_pct"] = open_spiel::json::Value(ovr_greedy_agree_search);
+    ovr_json["mean_prob_search_move"] = open_spiel::json::Value(ovr_mean_prob_search);
+    ovr_json["mean_max_p_diff_mu"] = open_spiel::json::Value(ovr_mean_max_p_diff);
+    ovr_json["mean_policy_entropy"] = open_spiel::json::Value(ovr_mean_entropy);
+    ovr_json["value_changed_utility_diff"] = open_spiel::json::Value(ovr_val_changed_diff);
+    ovr_json["value_changed_count_covered"] = open_spiel::json::Value(ovr_stats.value_covered_count);
+    ovr_json["mean_cross_entropy"] = open_spiel::json::Value(mean_ce_override);
+    out_obj["override_states"] = open_spiel::json::Value(ovr_json);
+
+    // Non-override subgroup
+    open_spiel::json::Object non_ovr_json;
+    non_ovr_json["count"] = open_spiel::json::Value(non_ovr_stats.count);
+    non_ovr_json["pct"] = open_spiel::json::Value(100.0 - override_pct);
+    non_ovr_json["greedy_change_rate_pct"] = open_spiel::json::Value(non_ovr_greedy_change_rate);
+    non_ovr_json["mean_max_p_diff_mu"] = open_spiel::json::Value(non_ovr_mean_max_p_diff);
+    non_ovr_json["mean_policy_entropy"] = open_spiel::json::Value(non_ovr_mean_entropy);
+    non_ovr_json["value_changed_utility_diff"] = open_spiel::json::Value(non_ovr_val_changed_diff);
+    non_ovr_json["value_changed_count_covered"] = open_spiel::json::Value(non_ovr_stats.value_covered_count);
+    non_ovr_json["mean_cross_entropy"] = open_spiel::json::Value(mean_ce_non_override);
+    out_obj["non_override_states"] = open_spiel::json::Value(non_ovr_json);
+
+    out_obj["temperature"] = open_spiel::json::Value(absl::GetFlag(FLAGS_temperature));
+    out_obj["mean_policy_entropy_non_override"] = open_spiel::json::Value(non_ovr_mean_entropy);
+    out_obj["mean_policy_entropy_override"] = open_spiel::json::Value(ovr_mean_entropy);
+    if (absl::GetFlag(FLAGS_dump_per_state)) {
+      out_obj["decisions"] = open_spiel::json::Value(dumped_decisions);
+    }
+
+    // Legacy fields for backward compatibility
+    out_obj["override_decisions"] = open_spiel::json::Value(ovr_stats.count);
+    out_obj["override_pct"] = open_spiel::json::Value(override_pct);
+    out_obj["mean_teacher_prob_override"] = open_spiel::json::Value(ovr_mean_prob_search);
+    out_obj["mean_cross_entropy_all"] = open_spiel::json::Value(mean_ce_all);
+    out_obj["mean_cross_entropy_override"] = open_spiel::json::Value(mean_ce_override);
+    out_obj["top1_accuracy_pct"] = open_spiel::json::Value(top1_acc);
+    out_obj["mean_max_prob_diff"] = open_spiel::json::Value(mean_max_diff);
+
+    open_spiel::json::Object rounds_obj;
+    for (const auto& kv : round_dec_count) {
+      open_spiel::json::Object r_info;
+      r_info["count"] = open_spiel::json::Value(kv.second);
+      r_info["mean_ce"] = open_spiel::json::Value(round_ce_sum[kv.first] / kv.second);
+      rounds_obj[std::to_string(kv.first)] = open_spiel::json::Value(r_info);
+    }
+    out_obj["round_breakdown"] = open_spiel::json::Value(rounds_obj);
+
+    std::ofstream out_file(output_json_path);
+    if (out_file.is_open()) {
+      out_file << open_spiel::json::ToString(open_spiel::json::Value(out_obj)) << "\n";
+      out_file.close();
+      std::cout << "[OUTPUT] Saved receipt to: " << output_json_path << "\n";
+    }
+  }
+
+  return 0;
+}
+
+
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
@@ -290,6 +773,20 @@ int main(int argc, char** argv) {
   const int top_k = absl::GetFlag(FLAGS_top_k_actions);
   const double min_override_margin = absl::GetFlag(FLAGS_min_override_margin);
   const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
+
+  // Dispatch to held-out trajectory replay mode if --replay_trajectory_jsonl is provided
+  if (!absl::GetFlag(FLAGS_replay_trajectory_jsonl).empty()) {
+    std::string traj_meta = absl::GetFlag(FLAGS_replay_trajectory_jsonl);
+    std::string traj_obs = absl::GetFlag(FLAGS_replay_obs_bin);
+    if (traj_obs.empty()) {
+      traj_obs = absl::GetFlag(FLAGS_obs_binary);
+    }
+    if (model_path.empty() || traj_meta.empty() || traj_obs.empty()) {
+      std::cerr << "Usage for replay: dune_fixed_root_search_benchmark --model_checkpoint=... --replay_trajectory_jsonl=... --replay_obs_bin=... [--output_json=...]\n";
+      return 1;
+    }
+    return RunHeldOutReplayEvaluation(model_path, traj_meta, traj_obs, output_path);
+  }
 
   if (model_path.empty() || roots_path.empty() || obs_path.empty() || output_path.empty()) {
     std::cerr << "Usage: dune_fixed_root_search_benchmark --model_checkpoint=... --sampled_roots_json=... --obs_binary=... --output_json=...\n";
@@ -369,7 +866,13 @@ int main(int argc, char** argv) {
     }
     sampled_roots.push_back(std::move(sr));
   }
-  std::cout << "[LOAD] Loaded " << sampled_roots.size() << " sampled roots for benchmark.\n";
+  if (absl::GetFlag(FLAGS_max_roots) > 0 &&
+      static_cast<size_t>(absl::GetFlag(FLAGS_max_roots)) < sampled_roots.size()) {
+    sampled_roots.resize(absl::GetFlag(FLAGS_max_roots));
+    std::cout << "[LOAD] Trimmed to " << sampled_roots.size() << " roots (--max_roots flag).\n";
+  } else {
+    std::cout << "[LOAD] Loaded " << sampled_roots.size() << " sampled roots for benchmark.\n";
+  }
 
   // Initialize Torch Device & Evaluators
   torch::Device device(torch::kCUDA, 0);
@@ -396,7 +899,9 @@ int main(int argc, char** argv) {
     coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
         models[e], target_batch_size, /*timeout_ms=*/1, device, model_mutexes[e].get(), 10.0f,
         /*device_synchronize=*/false, /*high_priority_stream=*/true,
-        /*emit_batch_membership=*/false, /*rollout_amp=*/true, /*allow_tf32=*/true);
+        /*emit_batch_membership=*/false,
+        /*rollout_amp=*/absl::GetFlag(FLAGS_rollout_amp),
+        /*allow_tf32=*/absl::GetFlag(FLAGS_allow_tf32));
     evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(coords[e], 10.0f);
   }
   std::cout << "[MODEL] Successfully initialized " << num_evals << " evaluator coordinators.\n";
@@ -456,18 +961,26 @@ int main(int argc, char** argv) {
   std::cout << "[VERIFY] All " << sampled_roots.size() << " root observations verified bit-for-bit against binary!\n";
 
   // Configure Variants
-  std::vector<VariantConfig> variants = {
-      {"V0_Run1", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run1},
-      {"V0_Run2", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run2},
-      {"V1", 64, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV1},
-      {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Paired},
-      {"V2_16_Unpaired", 16, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Unpaired},
-      {"V2_32_Paired", 32, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Paired},
-      {"V2_32_Unpaired", 32, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Unpaired},
-      {"V2_64_Paired", 64, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Paired},
-      {"V2_64_Unpaired", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Unpaired},
-      {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainRef512}
-  };
+  std::vector<VariantConfig> variants;
+  if (absl::GetFlag(FLAGS_leaf_check_only)) {
+    variants = {
+        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Paired},
+        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainRef512}
+    };
+  } else {
+    variants = {
+        {"V0_Run1", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run1},
+        {"V0_Run2", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run2},
+        {"V1", 64, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV1},
+        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Paired},
+        {"V2_16_Unpaired", 16, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Unpaired},
+        {"V2_32_Paired", 32, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Paired},
+        {"V2_32_Unpaired", 32, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Unpaired},
+        {"V2_64_Paired", 64, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Paired},
+        {"V2_64_Unpaired", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Unpaired},
+        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainRef512}
+    };
+  }
 
   std::cout << "\n[BENCHMARK] Executing " << variants.size() << " variants across " << sampled_roots.size() << " roots...\n";
 
@@ -533,6 +1046,57 @@ int main(int argc, char** argv) {
       open_spiel::json::Object temp_summary;
       SaveBenchmarkReceipt(checkpoint_path, temp_summary, sampled_roots, variants, all_results, {}, r_idx + 1);
     }
+  }
+
+  // If leaf_check_only, compute and report V2_16_Paired vs Ref512 correlation and exit
+  if (absl::GetFlag(FLAGS_leaf_check_only)) {
+    std::vector<double> critic_x;
+    std::vector<double> critic_y;
+    for (size_t r_idx = 0; r_idx < sampled_roots.size(); ++r_idx) {
+      const auto& root = sampled_roots[r_idx];
+      Action raw_a = static_cast<Action>(root.raw_action);
+      const auto& v2_res = all_results[r_idx][0];
+      const auto& ref_res = all_results[r_idx][1];
+
+      std::unordered_map<Action, double> v2_cand_utils;
+      for (const auto& cu : v2_res.candidate_utilities) v2_cand_utils[cu.first] = cu.second;
+      double q_v2_raw = v2_cand_utils.count(raw_a) ? v2_cand_utils[raw_a] : v2_res.raw_mean_utility;
+
+      std::unordered_map<Action, double> ref_cand_utils;
+      for (const auto& cu : ref_res.candidate_utilities) ref_cand_utils[cu.first] = cu.second;
+      double q_ref_raw = ref_cand_utils.count(raw_a) ? ref_cand_utils[raw_a] : ref_res.raw_mean_utility;
+
+      for (const auto& cu : v2_cand_utils) {
+        Action c = cu.first;
+        if (c == raw_a || !ref_cand_utils.count(c)) continue;
+        critic_x.push_back(cu.second - q_v2_raw);
+        critic_y.push_back(ref_cand_utils[c] - q_ref_raw);
+      }
+    }
+    double v2_ref_corr = 0.0;
+    if (critic_x.size() >= 2) {
+      double mx = std::accumulate(critic_x.begin(), critic_x.end(), 0.0) / critic_x.size();
+      double my = std::accumulate(critic_y.begin(), critic_y.end(), 0.0) / critic_y.size();
+      double cov = 0.0, vx = 0.0, vy = 0.0;
+      for (size_t i = 0; i < critic_x.size(); ++i) {
+        cov += (critic_x[i] - mx) * (critic_y[i] - my);
+        vx += (critic_x[i] - mx) * (critic_x[i] - mx);
+        vy += (critic_y[i] - my) * (critic_y[i] - my);
+      }
+      double denom = std::sqrt(vx * vy);
+      v2_ref_corr = (denom > 1e-12) ? (cov / denom) : 0.0;
+    }
+    std::cout << "\n====================================================================================================\n";
+    std::cout << absl::StrFormat(
+        "LEAF CHECK (N=%zu roots, N=%zu candidate pairs): V2_16_Paired vs Ref512 correlation = %.4f (U28700 baseline: ~0.8)\n",
+        sampled_roots.size(), critic_x.size(), v2_ref_corr);
+    std::cout << "====================================================================================================\n";
+    open_spiel::json::Object leaf_out_json;
+    leaf_out_json["leaf_check_v2_ref_correlation"] = open_spiel::json::Value(v2_ref_corr);
+    leaf_out_json["leaf_check_candidate_pairs"] = open_spiel::json::Value(static_cast<int64_t>(critic_x.size()));
+    SaveBenchmarkReceipt(output_path, leaf_out_json, sampled_roots, variants, all_results, {}, sampled_roots.size());
+    std::remove(checkpoint_path.c_str());
+    return 0;
   }
 
   std::cout << "[BENCHMARK] All roots evaluated! Analyzing true gain against Ref512...\n\n";
@@ -643,6 +1207,7 @@ int main(int argc, char** argv) {
   // Save complete main sweep immediately so results are preserved before recheck begins
   SaveBenchmarkReceipt(output_path, root_out_json, sampled_roots, variants, all_results, {}, sampled_roots.size());
   std::cout << "[RECEIPT] Saved complete main sweep (all variants across all roots) to " << output_path << "\n";
+
 
   // 1,024-Rollout Re-check Pass on Disagreement Roots
   std::vector<int> disagreement_root_indices;

@@ -18,6 +18,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <deque>
+#include <numeric>
 #include <sstream>
 #include <iomanip>
 
@@ -537,6 +539,16 @@ ABSL_FLAG(bool, search_full_turn_supervision, false,
 ABSL_FLAG(bool, search_high_stakes_only, true,
           "When true, filter learner decisions to high-stakes strategic states (Agent Placement, "
           "Combat Deployment, Reveal Purchase) matching tournament controller.");
+ABSL_FLAG(bool, search_pairing, false,
+          "Use paired common random number rollouts across search candidates.");
+ABSL_FLAG(bool, search_truncation, false,
+          "Truncate search rollouts at the searcher's first decision of the next round instead of rolling out to terminal.");
+ABSL_FLAG(bool, search_teacher_amp, false,
+          "When true, enables CUDA BF16 AMP and TF32 on search teacher evaluators only.");
+ABSL_FLAG(std::string, search_target_mode, "mpo",
+          "Search target mode: 'mpo' (default) or 'override_gated'.");
+ABSL_FLAG(double, search_override_eta, 0.50,
+          "Blend weight on onehot(best_candidate) in override_gated target mode.");
 
 // --- Agent-turn search policy iteration (search-PI) -----------------------
 //
@@ -959,6 +971,11 @@ struct WorkerStats {
 
   // D2 purchase exploration
   uint64_t forced_buys = 0;
+
+  // High-stakes sanity check counters
+  uint64_t nontrivial_transitions = 0;
+  uint64_t high_stakes_pre_transitions = 0;
+  uint64_t high_stakes_post_transitions = 0;
 
   // Natural SM Acquisitions
   uint64_t sm_acquisitions_by_seat[4] = {0};
@@ -3015,11 +3032,21 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
+      bool pre_action_is_high_stakes = false;
+      if (is_learner) {
+        pre_action_is_high_stakes = dune_imperium::IsHighStakesStrategicState(*state, current_player);
+      }
+
       state->ApplyAction(action);
       last_player = current_player;
       last_action = action;
       total_env_steps->fetch_add(1, std::memory_order_relaxed);
       check_hand_draws();
+
+      bool post_action_is_high_stakes = false;
+      if (is_learner) {
+        post_action_is_high_stakes = dune_imperium::IsHighStakesStrategicState(*state, current_player);
+      }
 
       if (dune_state != nullptr) {
         for (int p = 0; p < game.NumPlayers(); ++p) {
@@ -3039,6 +3066,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
 
       if (is_learner) {
+        size_t n_actions = actions.size();
         PpoTransition transition;
         transition.state = std::move(obs);
         transition.legal_actions = std::move(actions);
@@ -3061,7 +3089,14 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.candidate_data = std::move(cand_data);
         transition.mask_policy_loss = false;
         transition.privileged_appendix = std::move(pre_action_privileged_appendix);
+        transition.is_high_stakes = pre_action_is_high_stakes;
         trajectory->push_back(std::move(transition));
+
+        if (n_actions > 1 && local_stats != nullptr) {
+          local_stats->nontrivial_transitions++;
+          if (pre_action_is_high_stakes) local_stats->high_stakes_pre_transitions++;
+          if (post_action_is_high_stakes) local_stats->high_stakes_post_transitions++;
+        }
 
         if (current_player >= 0 && current_player < game.NumPlayers()) {
           last_transition_index[current_player] = static_cast<int>(trajectory->size() - 1);
@@ -3267,6 +3302,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     std::vector<float> last_value(game.NumPlayers(), 0.0f);
     std::vector<float> last_gae(game.NumPlayers(), 0.0f);
     std::vector<bool> seen_last_action(game.NumPlayers(), false);
+    std::vector<float> running_mc_return(game.NumPlayers(), 0.0f);
 
     for (auto it = trajectory->rbegin(); it != trajectory->rend(); ++it) {
       if (it->player_id < 0 || it->player_id >= game.NumPlayers()) continue;
@@ -3287,6 +3323,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       reward = std::clamp(reward / reward_scale, -1.0f, 1.0f);
       it->reward = reward;
 
+      running_mc_return[p] += reward;
+      it->mc_return = running_mc_return[p];
+
       float delta = reward + static_cast<float>(gamma) * last_value[p] -
                     it->value;
       float advantage =
@@ -3295,6 +3334,30 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       it->return_value = advantage + it->value;
       last_value[p] = it->value;
       last_gae[p] = advantage;
+    }
+
+    std::vector<std::vector<size_t>> player_trans_indices(game.NumPlayers());
+    for (size_t idx = 0; idx < trajectory->size(); ++idx) {
+      int p = (*trajectory)[idx].player_id;
+      if (p >= 0 && p < game.NumPlayers()) {
+        player_trans_indices[p].push_back(idx);
+      }
+    }
+    for (int p = 0; p < game.NumPlayers(); ++p) {
+      const size_t n_p = player_trans_indices[p].size();
+      if (n_p == 0) continue;
+      for (size_t i = 0; i < n_p; ++i) {
+        size_t idx = player_trans_indices[p][i];
+        int third = 0;
+        if (i * 3 < n_p) {
+          third = 0;
+        } else if (i * 3 < 2 * n_p) {
+          third = 1;
+        } else {
+          third = 2;
+        }
+        (*trajectory)[idx].trajectory_third = third;
+      }
     }
 
     for (auto& cf : pending_cf) {
@@ -3390,6 +3453,11 @@ struct CollectResult {
 
   // D2 purchase exploration
   uint64_t forced_buys = 0;
+
+  // High-stakes sanity check counters
+  uint64_t nontrivial_transitions = 0;
+  uint64_t high_stakes_pre_transitions = 0;
+  uint64_t high_stakes_post_transitions = 0;
 
   uint64_t sm_acquisitions_by_seat[4] = {0};
   uint64_t sm_acquisitions_by_leader[14] = {0};
@@ -3616,6 +3684,9 @@ CollectResult CollectRollout(const Game* game,
     result.plot_exempt += stats.plot_exempt;
     result.plot_penalty_deducted += stats.plot_penalty_deducted;
     result.forced_buys += stats.forced_buys;
+    result.nontrivial_transitions += stats.nontrivial_transitions;
+    result.high_stakes_pre_transitions += stats.high_stakes_pre_transitions;
+    result.high_stakes_post_transitions += stats.high_stakes_post_transitions;
 
     for (int i = 0; i < 4; ++i) result.sm_acquisitions_by_seat[i] += stats.sm_acquisitions_by_seat[i];
     for (int i = 0; i < 14; ++i) result.sm_acquisitions_by_leader[i] += stats.sm_acquisitions_by_leader[i];
@@ -11913,7 +11984,7 @@ int main(int argc, char** argv) {
           /*with_aux_heads=*/false, /*head_init_seed=*/0,
           /*with_semantic_scorer=*/true);
       search_teacher_models[e]->to(device);
-      if (!teacher_ckpt.empty()) {
+      if (!teacher_ckpt.empty() && teacher_ckpt != "None") {
         torch::load(search_teacher_models[e], teacher_ckpt, device);
       } else {
         CopyModelWeights(training_model, search_teacher_models[e]);
@@ -11921,13 +11992,15 @@ int main(int argc, char** argv) {
       search_teacher_models[e]->eval();
 
       search_teacher_mutexes.push_back(std::make_unique<std::shared_mutex>());
+      bool teacher_amp = (device.is_cuda() && (absl::GetFlag(FLAGS_search_teacher_amp) || absl::GetFlag(FLAGS_train_amp)));
+      bool teacher_tf32 = absl::GetFlag(FLAGS_search_teacher_amp) || absl::GetFlag(FLAGS_allow_tf32);
       search_teacher_coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
           search_teacher_models[e], target_batch, /*timeout_ms=*/1, device,
           search_teacher_mutexes.back().get(), 10.0f,
           /*device_synchronize=*/false, /*high_priority_stream=*/true,
           /*emit_batch_membership=*/false,
-          /*rollout_amp=*/(device.is_cuda() && absl::GetFlag(FLAGS_train_amp)),
-          /*allow_tf32=*/absl::GetFlag(FLAGS_allow_tf32));
+          /*rollout_amp=*/teacher_amp,
+          /*allow_tf32=*/teacher_tf32);
       search_teacher_evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(
           search_teacher_coords[e], 10.0f);
     }
@@ -12854,6 +12927,14 @@ int main(int argc, char** argv) {
   // the pre-loop rollout used (sequential, main thread).
   run_aux_collection(start_update, current_collect);
 
+  struct KeptLabelsRecord {
+    int update_id = 0;
+    std::vector<open_spiel::SearchTrainingExample> examples;
+    double ce_before = 0.0;
+    double ce_after = 0.0;
+  };
+  std::deque<KeptLabelsRecord> kept_labels_history_25u;
+
   for (int update = start_update; update <= target_end_update; ++update) {
     if (absl::GetFlag(FLAGS_anneal_lr)) {
       double frac = 1.0 - static_cast<double>(update - 1) /
@@ -12888,6 +12969,13 @@ int main(int argc, char** argv) {
       });
     }
 
+    const auto pairing_mode = absl::GetFlag(FLAGS_search_pairing)
+        ? open_spiel::dune_imperium::SearchPairingMode::kPaired
+        : open_spiel::dune_imperium::SearchPairingMode::kUnpaired;
+    const auto truncation_mode = absl::GetFlag(FLAGS_search_truncation)
+        ? open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer
+        : open_spiel::dune_imperium::SearchTruncationMode::kTerminal;
+
     auto ppo_start = std::chrono::high_resolution_clock::now();
     open_spiel::dune_imperium::SearchSupervisionResult search_sup_res;
     if (absl::GetFlag(FLAGS_search_in_training) &&
@@ -12905,7 +12993,13 @@ int main(int argc, char** argv) {
           absl::GetFlag(FLAGS_search_blend_eta),
           search_seed,
           absl::GetFlag(FLAGS_search_threads),
-          absl::GetFlag(FLAGS_search_full_turn_supervision));
+          absl::GetFlag(FLAGS_search_full_turn_supervision),
+          /*use_mpo_target=*/true,
+          /*max_target_kl=*/0.05,
+          pairing_mode,
+          truncation_mode,
+          absl::GetFlag(FLAGS_search_target_mode),
+          absl::GetFlag(FLAGS_search_override_eta));
       current_collect.aux_examples = std::move(search_sup_res.examples);
     }
     const double this_search_coef =
@@ -13063,10 +13157,72 @@ int main(int argc, char** argv) {
     // counters / hash chain / resume cursor (main thread only).
     account_aux_consumed(current_collect);
 
+    double hs_pre_share = (current_collect.nontrivial_transitions > 0)
+        ? (static_cast<double>(current_collect.high_stakes_pre_transitions) / current_collect.nontrivial_transitions)
+        : 0.0;
+    double hs_post_share = (current_collect.nontrivial_transitions > 0)
+        ? (static_cast<double>(current_collect.high_stakes_post_transitions) / current_collect.nontrivial_transitions)
+        : 0.0;
+    std::cout << absl::StrFormat(
+        "[HIGH-STAKES-SHARE] update %d: nontrivial=%ld | pre_action (fixed)=%.4f (%ld) | post_action (buggy)=%.4f (%ld)\n",
+        update, current_collect.nontrivial_transitions,
+        hs_pre_share, current_collect.high_stakes_pre_transitions,
+        hs_post_share, current_collect.high_stakes_post_transitions);
+
+    {
+      int64_t n_total = 0;
+      double sum_err = 0.0;
+      double sum_sq_err = 0.0;
+      int64_t n_thirds[3] = {0, 0, 0};
+      double sum_err_thirds[3] = {0.0, 0.0, 0.0};
+
+      for (const auto& t : current_collect.rollout) {
+        if (t.trajectory_third >= 0 && t.trajectory_third < 3) {
+          double v_diff = static_cast<double>(t.value) - static_cast<double>(t.mc_return);
+          sum_err += v_diff;
+          sum_sq_err += v_diff * v_diff;
+          n_total++;
+          n_thirds[t.trajectory_third]++;
+          sum_err_thirds[t.trajectory_third] += v_diff;
+        }
+      }
+
+      double mean_err = n_total > 0 ? (sum_err / n_total) : 0.0;
+      double rmse = n_total > 0 ? std::sqrt(sum_sq_err / n_total) : 0.0;
+      double mean_first = n_thirds[0] > 0 ? (sum_err_thirds[0] / n_thirds[0]) : 0.0;
+      double mean_mid = n_thirds[1] > 0 ? (sum_err_thirds[1] / n_thirds[1]) : 0.0;
+      double mean_last = n_thirds[2] > 0 ? (sum_err_thirds[2] / n_thirds[2]) : 0.0;
+
+      std::cout << absl::StrFormat(
+          "[VALUE-CALIBRATION] update %d: n=%ld, mean(V-G_MC)=%.4f, rmse=%.4f | first_third=%.4f (n=%ld), mid_third=%.4f (n=%ld), last_third=%.4f (n=%ld)\n",
+          update, n_total, mean_err, rmse, mean_first, n_thirds[0], mean_mid, n_thirds[1], mean_last, n_thirds[2]);
+    }
+
     // Decoupled Standalone Auxiliary Search Supervision Phase (PPG-style)
     if (absl::GetFlag(FLAGS_search_in_training) &&
         absl::GetFlag(FLAGS_search_aux_decoupled) &&
         !current_collect.search_snapshots.empty()) {
+      // Evaluate multi-update retention for kept-label sets from updates u-1, u-10, u-25
+      for (int lag : {1, 10, 25}) {
+        int target_u = update - lag;
+        for (const auto& rec : kept_labels_history_25u) {
+          if (rec.update_id == target_u && !rec.examples.empty()) {
+            auto m = open_spiel::EvaluateSearchExamplesMetrics(
+                training_model, rec.examples, obs_size, action_size, device);
+            double ce_before = rec.ce_before;
+            double ce_after = rec.ce_after;
+            double ce_now = m.mean_ce;
+            double p_search = m.mean_p_search_move;
+            double denom = ce_before - ce_after;
+            double retention = (std::abs(denom) > 1e-6) ? ((ce_before - ce_now) / denom) : 1.0;
+            std::cout << absl::StrFormat(
+                "[SEARCH-RETENTION] update %d: lag %du (target update %d, N=%zu): P(search)=%.4f, CE=%.4f (CE_before=%.4f, CE_after=%.4f), retention=%.2f%%\n",
+                update, lag, target_u, rec.examples.size(), p_search, ce_now, ce_before, ce_after, retention * 100.0);
+            break;
+          }
+        }
+      }
+
       // 1. Freeze post-PPO updated learner and synchronize to search teacher models (Correction 1)
       for (size_t e = 0; e < search_teacher_models.size(); ++e) {
         CopyModelWeights(training_model, search_teacher_models[e]);
@@ -13087,7 +13243,77 @@ int main(int argc, char** argv) {
           absl::GetFlag(FLAGS_search_threads),
           absl::GetFlag(FLAGS_search_full_turn_supervision),
           /*use_mpo_target=*/true,
-          absl::GetFlag(FLAGS_search_target_max_kl));
+          absl::GetFlag(FLAGS_search_target_max_kl),
+          pairing_mode,
+          truncation_mode,
+          absl::GetFlag(FLAGS_search_target_mode),
+          absl::GetFlag(FLAGS_search_override_eta));
+
+      std::cout << absl::StrFormat(
+          "[SEARCH-SUPERVISION] update %d: states_searched=%d, override_labels_kept=%d (%.2f%%), mean_target_prob_search_move=%.4f (elapsed=%.2fs)\n",
+          update, search_sup_res.total_decisions_evaluated,
+          static_cast<int>(search_sup_res.examples.size()),
+          search_sup_res.total_decisions_evaluated > 0
+              ? (100.0 * search_sup_res.examples.size() / search_sup_res.total_decisions_evaluated)
+              : 0.0,
+          search_sup_res.mean_target_prob_search_move,
+          search_sup_res.elapsed_seconds);
+
+      if (absl::GetFlag(FLAGS_search_research_diagnostic) && !search_sup_res.examples.empty()) {
+        std::vector<const open_spiel::SearchTrainingExample*> diag_cands;
+        for (const auto& ex : search_sup_res.examples) {
+          if (ex.state_snapshot && ex.raw_action != open_spiel::kInvalidAction && ex.best_action != open_spiel::kInvalidAction) {
+            diag_cands.push_back(&ex);
+          }
+        }
+        if (!diag_cands.empty()) {
+          std::mt19937_64 diag_rng(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, update, 0x52455352ULL));
+          std::shuffle(diag_cands.begin(), diag_cands.end(), diag_rng);
+          size_t n_diag = std::min<size_t>(16, diag_cands.size());
+          int original_still_best_count = 0;
+          int still_beats_margin_count = 0;
+          double sum_advantage_best_over_raw = 0.0;
+          for (size_t di = 0; di < n_diag; ++di) {
+            const auto* ex = diag_cands[di];
+            uint64_t sample_seed = diag_rng();
+            auto res_res = open_spiel::dune_imperium::CompoundRolloutSearchDecision(
+                *ex->state_snapshot,
+                ex->player,
+                /*turn_tree=*/nullptr,
+                search_teacher_evaluators,
+                absl::GetFlag(FLAGS_search_top_k),
+                absl::GetFlag(FLAGS_search_rollouts_per_action),
+                absl::GetFlag(FLAGS_search_override_margin),
+                open_spiel::dune_imperium::TreeReuseMode::kTargetFill,
+                sample_seed,
+                pairing_mode,
+                truncation_mode);
+
+            double raw_u = res_res.raw_mean_utility;
+            double best_u = raw_u;
+            for (const auto& cu : res_res.candidate_utilities) {
+              if (cu.first == ex->best_action) {
+                best_u = cu.second;
+                break;
+              }
+            }
+            double adv = best_u - raw_u;
+            sum_advantage_best_over_raw += adv;
+            if (res_res.action == ex->best_action) {
+              original_still_best_count++;
+            }
+            if (adv >= absl::GetFlag(FLAGS_search_override_margin) - 1e-6) {
+              still_beats_margin_count++;
+            }
+          }
+          double share_still_best = 100.0 * original_still_best_count / n_diag;
+          double share_still_margin = 100.0 * still_beats_margin_count / n_diag;
+          double mean_adv = sum_advantage_best_over_raw / n_diag;
+          std::cout << absl::StrFormat(
+              "[SEARCH-RESEARCH-DIAG] update %d: evaluated %zu override labels | original best still best=%.1f%%, still beats raw by >= margin=%.1f%%, mean re-searched advantage=%.4f\n",
+              update, n_diag, share_still_best, share_still_margin, mean_adv);
+        }
+      }
 
       // 3. Subsample reference rollout transitions for rollout KL ceiling and critic probe (Correction 2 & 3)
       std::vector<open_spiel::PpoTransition> ref_rollout_sample;
@@ -13120,15 +13346,42 @@ int main(int argc, char** argv) {
       }
 
       // 4. Run bounded auxiliary optimization phase with isolated aux optimizer, step rejection and state rollback
+      const uint64_t aux_phase_seed = dune_seed::DeriveSeed(
+          master, dune_seed::kDomainTrain, update, /*stream=*/0x41555850ULL);
+      int aux_steps = absl::GetFlag(FLAGS_search_aux_steps);
+      if (absl::GetFlag(FLAGS_search_aux_epochs) > 1 && aux_steps == 4) {
+        aux_steps = 0;
+      }
+      // Fresh-state check: before aux phase, log student's mean P(search move) and greedy agreement on new kept labels
+      if (!search_sup_res.examples.empty()) {
+        auto fresh_m = open_spiel::EvaluateSearchExamplesMetrics(
+            training_model, search_sup_res.examples, obs_size, action_size, device);
+        std::cout << absl::StrFormat(
+            "[SEARCH-FRESH-CHECK] update %d: fresh kept-labels N=%zu, mean P(search)=%.4f, greedy agreement=%.2f%%, CE=%.4f\n",
+            update, search_sup_res.examples.size(),
+            fresh_m.mean_p_search_move, fresh_m.greedy_agreement_pct, fresh_m.mean_ce);
+      }
+
+      open_spiel::SearchAuxAnchoringConfig anchoring_config;
+      anchoring_config.enabled = absl::GetFlag(FLAGS_search_aux_anchoring);
+      anchoring_config.beta = absl::GetFlag(FLAGS_search_aux_beta);
+      anchoring_config.alpha = absl::GetFlag(FLAGS_search_aux_alpha);
+      anchoring_config.rail_kl_target = absl::GetFlag(FLAGS_search_aux_rail_kl_target);
+
       open_spiel::SearchAuxPhaseResult aux_res = open_spiel::TrainSearchAuxiliaryPhase(
           training_model, *search_aux_optimizer,
           search_sup_res.examples,
           obs_size, action_size, device,
-          absl::GetFlag(FLAGS_search_aux_steps),
+          aux_steps,
           absl::GetFlag(FLAGS_search_aux_batch_size),
           absl::GetFlag(FLAGS_search_aux_target_kl),
           this_search_coef,
-          ref_rollout_sample);
+          ref_rollout_sample,
+          aux_phase_seed,
+          absl::GetFlag(FLAGS_search_aux_epochs),
+          search_sup_res.agreement_examples,
+          current_collect.rollout,
+          anchoring_config);
 
       // 5. Update stats and log telemetry
       stats.aux_examples_used = static_cast<int>(search_sup_res.examples.size());
@@ -13136,18 +13389,52 @@ int main(int argc, char** argv) {
       stats.aux_ce = aux_res.final_aux_ce;
       stats.aux_grad_norm_mean = aux_res.mean_aux_grad_norm;
 
+      double this_aux_gain = aux_res.initial_aux_ce - aux_res.final_aux_ce;
       std::cout << absl::StrFormat(
-          "[SEARCH-AUX] update %d: %d/%d steps accepted (rejected_on_kl=%d, rejected_nonfinite=%d, phase_rejected=%d, null_skipped=%d) | ce=%.4f "
+          "[SEARCH-AUX] update %d: %d/%d steps accepted (rejected_on_kl=%d, rejected_nonfinite=%d, phase_rejected=%d, null_skipped=%d) "
+          "| ce_before=%.4f ce_after=%.4f (aux_gain=%.4f) "
           "| kl_searched=%.6f kl_rollout=%.6f (ceil=%.4f) | val_immut=%d | critic_shift_mse=%.6f\n",
           update, aux_res.steps_accepted, aux_res.steps_budgeted,
           aux_res.step_rejected_on_kl ? 1 : 0,
           aux_res.step_rejected_nonfinite ? 1 : 0,
           aux_res.phase_rejected ? 1 : 0,
           aux_res.null_supervision_skipped ? 1 : 0,
-          aux_res.final_aux_ce,
+          aux_res.initial_aux_ce, aux_res.final_aux_ce, this_aux_gain,
           aux_res.cumulative_kl_searched, aux_res.cumulative_kl_rollout,
           absl::GetFlag(FLAGS_search_aux_target_kl),
           aux_res.value_head_immutable ? 1 : 0, aux_res.critic_probe_mse_shift);
+
+      if (anchoring_config.enabled) {
+        std::cout << absl::StrFormat(
+            "[SEARCH-AUX-ANCHORED] update %d: %d/%d steps accepted, %d override presentations "
+            "| override CE %.4f -> %.4f (gain=%.4f), override KL=%.6f "
+            "| rail KL=%.6f (agr=%.6f, non_hs=%.6f, target=%.4f) "
+            "| delta entropy: rail=%.6f, hs=%.6f "
+            "| critic shift MSE: anchors=%.6f, rail=%.6f "
+            "| loss terms: CE=%.4f, beta*KL=%.4f, alpha*MSE=%.4f\n",
+            update, aux_res.steps_accepted, aux_res.steps_budgeted,
+            aux_res.accepted_override_presentations,
+            aux_res.initial_aux_ce, aux_res.final_aux_ce, this_aux_gain,
+            aux_res.override_kl,
+            aux_res.rail_kl_total, aux_res.rail_kl_agreement, aux_res.rail_kl_non_high_stakes,
+            anchoring_config.rail_kl_target,
+            aux_res.delta_entropy_rail, aux_res.delta_entropy_high_stakes,
+            aux_res.critic_probe_mse_shift_anchors, aux_res.critic_probe_mse_shift_rail,
+            aux_res.mean_override_ce_loss, aux_res.mean_anchor_kl_loss, aux_res.mean_anchor_value_mse_loss);
+      }
+
+
+      if (!search_sup_res.examples.empty()) {
+        KeptLabelsRecord rec;
+        rec.update_id = update;
+        rec.examples = search_sup_res.examples;
+        rec.ce_before = aux_res.initial_aux_ce;
+        rec.ce_after = aux_res.final_aux_ce;
+        kept_labels_history_25u.push_back(std::move(rec));
+        while (kept_labels_history_25u.size() > 25) {
+          kept_labels_history_25u.pop_front();
+        }
+      }
 
       if (aux_res.step_rejected_nonfinite) {
         std::cerr << absl::StrFormat(

@@ -143,6 +143,11 @@ struct SearchTrainingExample {
 
   // Candidate action descriptors for the deployed semantic action scorer.
   dune_semantic::CandidateActionData candidate_data;
+
+  // Diagnostic state snapshot for re-search telemetry (opt-in)
+  std::shared_ptr<State> state_snapshot = nullptr;
+  Action raw_action = kInvalidAction;
+  Action best_action = kInvalidAction;
 };
 
 // Frozen 18B collection configuration. Defaults encode the baseline/uncapped

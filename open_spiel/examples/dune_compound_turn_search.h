@@ -513,6 +513,37 @@ inline std::vector<std::pair<Action, double>> BlendTargets(
   return blended;
 }
 
+// Override-gated target: (1 - eta) * prior + eta * onehot(best_candidate)
+inline std::vector<double> ComputeOverrideGatedTarget(
+    const std::vector<std::pair<Action, double>>& raw_policy,
+    const std::vector<Action>& legal_actions,
+    Action best_candidate,
+    double override_eta) {
+  std::vector<double> target(legal_actions.size(), 0.0);
+  double prior_sum = 0.0;
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    Action a = legal_actions[i];
+    double p = 0.0;
+    for (const auto& ap : raw_policy) {
+      if (ap.first == a) { p = ap.second; break; }
+    }
+    target[i] = p;
+    prior_sum += p;
+  }
+  if (prior_sum > 1e-12) {
+    for (double& p : target) p /= prior_sum;
+  } else {
+    std::fill(target.begin(), target.end(), 1.0 / legal_actions.size());
+  }
+
+  for (size_t i = 0; i < legal_actions.size(); ++i) {
+    Action a = legal_actions[i];
+    double onehot = (a == best_candidate) ? 1.0 : 0.0;
+    target[i] = (1.0 - override_eta) * target[i] + override_eta * onehot;
+  }
+  return target;
+}
+
 // Check if state_after gained new private information (card drawn or intrigue drawn)
 // compared to state_before for player.
 inline bool HasNewInformation(
@@ -756,12 +787,14 @@ inline std::vector<float> ExtractObservationTensor(
 
 struct SearchSupervisionResult {
   std::vector<open_spiel::SearchTrainingExample> examples;
+  std::vector<open_spiel::SearchTrainingExample> agreement_examples;
   int roots_evaluated = 0;
   int overrides = 0;
   int fallbacks_to_mu = 0;
   double elapsed_seconds = 0.0;
   double mean_override_rate = 0.0;
   int total_decisions_evaluated = 0;
+  double mean_target_prob_search_move = 0.0;
 };
 
 inline SearchSupervisionResult BatchCompoundSearchSupervision(
@@ -776,7 +809,11 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
     int num_workers = 1,
     bool full_turn_supervision = true,
     bool use_mpo_target = true,
-    double max_target_kl = 0.05) {
+    double max_target_kl = 0.05,
+    SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
+    const std::string& target_mode = "mpo",
+    double override_eta = 0.50) {
   auto start_time = std::chrono::steady_clock::now();
   SearchSupervisionResult result;
   if (snapshots.empty() || evaluators.empty()) return result;
@@ -787,7 +824,9 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
     int fallbacks = 0;
     int rollouts = 0;
     int decisions_evaluated = 0;
+    double target_prob_search_move_sum = 0.0;
     std::vector<open_spiel::SearchTrainingExample> examples;
+    std::vector<open_spiel::SearchTrainingExample> agreement_examples;
   };
   std::vector<TurnResult> turn_results(snapshots.size());
 
@@ -816,7 +855,9 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
           rollouts_per_action,
           min_override_margin,
           TreeReuseMode::kTargetFill,
-          root_seed);
+          root_seed,
+          pairing_mode,
+          truncation_mode);
 
       std::vector<std::pair<Action, double>> mu;
       if (!use_mpo_target && !snap.raw_policy.empty()) {
@@ -838,33 +879,77 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
 
       bool fell_back = false;
       std::vector<double> target_dist;
-      if (use_mpo_target) {
+      bool keep_example = true;
+      double target_prob_search_move = 0.0;
+
+      if (target_mode == "override_gated") {
+        if (search_res.overridden) {
+          target_dist = ComputeOverrideGatedTarget(
+              mu, snap.legal_actions, search_res.action, override_eta);
+          for (size_t i = 0; i < snap.legal_actions.size(); ++i) {
+            if (snap.legal_actions[i] == search_res.action) {
+              target_prob_search_move = target_dist[i];
+              break;
+            }
+          }
+        } else {
+          // Drop non-override states from auxiliary training set; collect as agreement state
+          keep_example = false;
+          open_spiel::SearchTrainingExample agr_ex;
+          agr_ex.observation = snap.observation;
+          agr_ex.player = snap.player;
+          agr_ex.legal_actions = snap.legal_actions;
+          agr_ex.candidate_data = snap.candidate_data;
+          tr.agreement_examples.push_back(std::move(agr_ex));
+        }
+      } else if (use_mpo_target) {
         double r_kl = 0.0;
         double r_tau = softmax_temperature;
         target_dist = ComputeMpoRelativeTarget(
             mu, snap.legal_actions, search_res.candidate_utilities,
             softmax_temperature, max_target_kl, &r_kl, &r_tau);
+        for (size_t i = 0; i < snap.legal_actions.size(); ++i) {
+          if (snap.legal_actions[i] == search_res.action) {
+            target_prob_search_move = target_dist[i];
+            break;
+          }
+        }
       } else {
         target_dist = ComputeFallbackAlignedTarget(
             mu, snap.legal_actions, search_res, raw_action,
             softmax_temperature, eta_blend, &fell_back);
+        for (size_t i = 0; i < snap.legal_actions.size(); ++i) {
+          if (snap.legal_actions[i] == search_res.action) {
+            target_prob_search_move = target_dist[i];
+            break;
+          }
+        }
       }
-
-      open_spiel::SearchTrainingExample ex;
-      ex.observation = snap.observation;
-      ex.player = snap.player;
-      ex.legal_actions = snap.legal_actions;
-      ex.normalized_visits = std::move(target_dist);
-      ex.value_target = 0.0;
-      ex.value_target_attached = false;
-      ex.simulations_completed = search_res.new_rollouts_executed;
-      ex.candidate_data = snap.candidate_data;
 
       tr.decisions_evaluated = 1;
       tr.rollouts = search_res.new_rollouts_executed;
       if (search_res.overridden) tr.overrides = 1;
       if (fell_back) tr.fallbacks = 1;
-      tr.examples.push_back(std::move(ex));
+
+      if (keep_example) {
+        open_spiel::SearchTrainingExample ex;
+        ex.observation = snap.observation;
+        ex.player = snap.player;
+        ex.legal_actions = snap.legal_actions;
+        ex.normalized_visits = std::move(target_dist);
+        ex.value_target = 0.0;
+        ex.value_target_attached = false;
+        ex.simulations_completed = search_res.new_rollouts_executed;
+        ex.candidate_data = snap.candidate_data;
+        ex.raw_action = raw_action;
+        ex.best_action = search_res.action;
+        if (snap.sim_state) {
+          ex.state_snapshot = snap.sim_state->Clone();
+        }
+
+        tr.target_prob_search_move_sum += target_prob_search_move;
+        tr.examples.push_back(std::move(ex));
+      }
       return;
     }
 
@@ -926,7 +1011,9 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
           rollouts_per_action,
           min_override_margin,
           TreeReuseMode::kTargetFill,
-          step_seed);
+          step_seed,
+          pairing_mode,
+          truncation_mode);
 
       // Raw policy prior mu for fallback target / reference policy
       std::vector<std::pair<Action, double>> mu;
@@ -949,44 +1036,98 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
 
       bool fell_back = false;
       std::vector<double> target_dist;
-      if (use_mpo_target) {
+      bool keep_example = true;
+      double target_prob_search_move = 0.0;
+
+      if (target_mode == "override_gated") {
+        if (search_res.overridden) {
+          target_dist = ComputeOverrideGatedTarget(
+              mu, current_legals, search_res.action, override_eta);
+          for (size_t i = 0; i < current_legals.size(); ++i) {
+            if (current_legals[i] == search_res.action) {
+              target_prob_search_move = target_dist[i];
+              break;
+            }
+          }
+        } else {
+          keep_example = false;
+          open_spiel::SearchTrainingExample agr_ex;
+          if (intra_step == 1 && !snap.observation.empty()) {
+            agr_ex.observation = snap.observation;
+            agr_ex.candidate_data = snap.candidate_data;
+          } else {
+            agr_ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player);
+            const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(snap.sim_state.get());
+            if (dune_s) {
+              const std::string cand_schema = (!evaluators.empty() && evaluators.front())
+                                                  ? evaluators.front()->SemanticDescriptorSchema()
+                                                  : dune_semantic::kDescriptorSchemaVersion;
+              dune_semantic::ExtractCandidateDescriptors(*dune_s, current_legals, &agr_ex.candidate_data, cand_schema);
+            }
+          }
+          agr_ex.player = snap.player;
+          agr_ex.legal_actions = current_legals;
+          tr.agreement_examples.push_back(std::move(agr_ex));
+        }
+      } else if (use_mpo_target) {
         double r_kl = 0.0;
         double r_tau = softmax_temperature;
         target_dist = ComputeMpoRelativeTarget(
             mu, current_legals, search_res.candidate_utilities,
             softmax_temperature, max_target_kl, &r_kl, &r_tau);
+        for (size_t i = 0; i < current_legals.size(); ++i) {
+          if (current_legals[i] == search_res.action) {
+            target_prob_search_move = target_dist[i];
+            break;
+          }
+        }
       } else {
         target_dist = ComputeFallbackAlignedTarget(
             mu, current_legals, search_res, raw_action,
             softmax_temperature, eta_blend, &fell_back);
-      }
-
-      open_spiel::SearchTrainingExample ex;
-      if (intra_step == 1 && !snap.observation.empty()) {
-        ex.observation = snap.observation;
-        ex.candidate_data = snap.candidate_data;
-      } else {
-        ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player);
-        const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(snap.sim_state.get());
-        if (dune_s) {
-          const std::string cand_schema = (!evaluators.empty() && evaluators.front())
-                                              ? evaluators.front()->SemanticDescriptorSchema()
-                                              : dune_semantic::kDescriptorSchemaVersion;
-          dune_semantic::ExtractCandidateDescriptors(*dune_s, current_legals, &ex.candidate_data, cand_schema);
+        for (size_t i = 0; i < current_legals.size(); ++i) {
+          if (current_legals[i] == search_res.action) {
+            target_prob_search_move = target_dist[i];
+            break;
+          }
         }
       }
-      ex.player = snap.player;
-      ex.legal_actions = current_legals;
-      ex.normalized_visits = std::move(target_dist);
-      ex.value_target = 0.0;
-      ex.value_target_attached = false;
-      ex.simulations_completed = search_res.new_rollouts_executed;
+
+      if (keep_example) {
+        open_spiel::SearchTrainingExample ex;
+        if (intra_step == 1 && !snap.observation.empty()) {
+          ex.observation = snap.observation;
+          ex.candidate_data = snap.candidate_data;
+        } else {
+          ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player);
+          const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(snap.sim_state.get());
+          if (dune_s) {
+            const std::string cand_schema = (!evaluators.empty() && evaluators.front())
+                                                ? evaluators.front()->SemanticDescriptorSchema()
+                                                : dune_semantic::kDescriptorSchemaVersion;
+            dune_semantic::ExtractCandidateDescriptors(*dune_s, current_legals, &ex.candidate_data, cand_schema);
+          }
+        }
+        ex.player = snap.player;
+        ex.legal_actions = current_legals;
+        ex.normalized_visits = std::move(target_dist);
+        ex.value_target = 0.0;
+        ex.value_target_attached = false;
+        ex.simulations_completed = search_res.new_rollouts_executed;
+        ex.raw_action = raw_action;
+        ex.best_action = search_res.action;
+        if (snap.sim_state) {
+          ex.state_snapshot = snap.sim_state->Clone();
+        }
+
+        tr.target_prob_search_move_sum += target_prob_search_move;
+        tr.examples.push_back(std::move(ex));
+      }
 
       tr.decisions_evaluated++;
       tr.rollouts += search_res.new_rollouts_executed;
       if (search_res.overridden) tr.overrides++;
       if (fell_back) tr.fallbacks++;
-      tr.examples.push_back(std::move(ex));
 
       Action chosen_action = search_res.action;
       turn_tree.Advance(chosen_action);
@@ -1032,14 +1173,19 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
     }
   }
 
+  double total_target_prob_search_move = 0.0;
   for (size_t r_idx = 0; r_idx < snapshots.size(); ++r_idx) {
     if (!turn_results[r_idx].valid) continue;
     result.roots_evaluated++;
     result.overrides += turn_results[r_idx].overrides;
     result.fallbacks_to_mu += turn_results[r_idx].fallbacks;
     result.total_decisions_evaluated += turn_results[r_idx].decisions_evaluated;
+    total_target_prob_search_move += turn_results[r_idx].target_prob_search_move_sum;
     for (auto& ex : turn_results[r_idx].examples) {
       result.examples.push_back(std::move(ex));
+    }
+    for (auto& ex : turn_results[r_idx].agreement_examples) {
+      result.agreement_examples.push_back(std::move(ex));
     }
   }
 
@@ -1047,6 +1193,9 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
   result.elapsed_seconds = std::chrono::duration<double>(end_time - start_time).count();
   if (result.total_decisions_evaluated > 0) {
     result.mean_override_rate = static_cast<double>(result.overrides) / result.total_decisions_evaluated;
+  }
+  if (!result.examples.empty()) {
+    result.mean_target_prob_search_move = total_target_prob_search_move / result.examples.size();
   }
   return result;
 }
