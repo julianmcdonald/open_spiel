@@ -84,6 +84,10 @@ ABSL_FLAG(double, softmax_temperature, 0.5,
           "Temperature for search target distribution over candidate utilities.");
 ABSL_FLAG(double, eta_blend, 0.80,
           "Blend parameter for search target: (1-eta)*mu + eta*q_search.");
+ABSL_FLAG(std::string, pairing_mode, "unpaired",
+          "Pairing mode: 'unpaired' or 'paired'.");
+ABSL_FLAG(std::string, truncation_mode, "terminal",
+          "Truncation mode: 'terminal' or 'truncated'.");
 
 struct RecordedDecision {
   int game_id = 0;
@@ -94,7 +98,16 @@ struct RecordedDecision {
   bool is_searched = false;
   std::string decision_role;  // "fresh_search", "continuation", "preservation"
   bool is_forced = false;
+  bool is_eligible = false;
+  bool overridden = false;
   int chosen_action = 0;
+  int raw_action = 0;
+  int greedy_raw_action = 0;
+  double raw_mean_utility = 0.0;
+  double chosen_mean_utility = 0.0;
+  std::vector<std::pair<int, double>> candidate_utilities;
+  int obs_row = 0;
+  std::vector<int64_t> action_history;
   std::vector<int> legal_actions;
   std::vector<float> observation;
   std::vector<std::pair<int, float>> mu;
@@ -153,6 +166,8 @@ GameOutcome PlayCompoundTournamentGame(
     TreeReuseMode reuse_mode,
     bool high_stakes_only,
     uint64_t game_seed,
+    SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
     double softmax_temperature = 0.5,
     double eta_blend = 0.80,
     bool record_trajectories = false) {
@@ -215,6 +230,10 @@ GameOutcome PlayCompoundTournamentGame(
       std::vector<float> obs_tensor;
       if (record_trajectories) {
         obs_tensor = greedy_evaluator->GetConsumedObservation(*state, cur);
+        if (obs_tensor.empty()) {
+          open_spiel::SpielFatalError("Observation is empty for recorded decision in game " +
+                                      std::to_string(game_id) + " seat " + std::to_string(cur));
+        }
       }
 
       ActionsAndProbs raw_prior = greedy_evaluator->Prior(*state);
@@ -228,8 +247,16 @@ GameOutcome PlayCompoundTournamentGame(
         mu_legal.push_back({a, p});
       }
 
+      Action greedy_raw_action = PickGreedyAction(raw_prior, legals);
+      Action raw_action = greedy_raw_action;
+      double raw_mean_u = 0.0;
+      double chosen_mean_u = 0.0;
+      std::vector<std::pair<int, double>> candidate_utilities_recorded;
+
       bool is_forced = (legals.size() <= 1);
+      bool is_eligible = should_search && (legals.size() > 1);
       bool is_searched = false;
+      bool overridden = false;
       std::string decision_role = "preservation";
       std::vector<std::pair<Action, double>> q_search_target;
       std::vector<std::pair<Action, double>> q_blend_target;
@@ -239,14 +266,25 @@ GameOutcome PlayCompoundTournamentGame(
         uint64_t dseed = dune_seed::DeriveSeed(game_seed, cur, search_seed_counter++);
         auto s_res = CompoundRolloutSearchDecision(
             *state, cur, &turn_tree, evaluators, top_k, rollouts_per_action,
-            min_override_margin, reuse_mode, dseed);
+            min_override_margin, reuse_mode, dseed, pairing_mode, truncation_mode);
         chosen_action = s_res.action;
+        overridden = s_res.overridden;
         if (s_res.overridden) overrides++;
         reused_rollouts += s_res.prior_rollouts_reused;
         new_rollouts += s_res.new_rollouts_executed;
 
         is_searched = true;
         decision_role = "fresh_search";
+        raw_mean_u = s_res.raw_mean_utility;
+        chosen_mean_u = s_res.chosen_mean_utility;
+        for (const auto& p : s_res.candidate_utilities) {
+          candidate_utilities_recorded.push_back({p.first, p.second});
+        }
+        // Per user requirement 2: For fresh searches, set raw_action = candidate_utilities[0].action
+        if (!s_res.candidate_utilities.empty()) {
+          raw_action = s_res.candidate_utilities[0].first;
+        }
+
         q_search_target = ComputeSoftmaxTarget(s_res.candidate_utilities, legals, softmax_temperature);
         q_blend_target = BlendTargets(mu_legal, q_search_target, eta_blend);
       } else if (turn_tree.current_node() != nullptr && !turn_tree.current_node()->children.empty()) {
@@ -263,7 +301,7 @@ GameOutcome PlayCompoundTournamentGame(
           q_blend_target = BlendTargets(mu_legal, q_search_target, eta_blend);
 
           double best_u = -1e9;
-          Action best_a = PickGreedyAction(raw_prior, legals);
+          Action best_a = raw_action;
           for (const auto& cu : continuation_cands) {
             if (cu.second > best_u) {
               best_u = cu.second;
@@ -271,13 +309,16 @@ GameOutcome PlayCompoundTournamentGame(
             }
           }
           chosen_action = best_a;
+          overridden = (chosen_action != raw_action);
         } else {
-          chosen_action = PickGreedyAction(raw_prior, legals);
+          chosen_action = raw_action;
+          overridden = false;
           q_search_target = mu_legal;
           q_blend_target = mu_legal;
         }
       } else {
-        chosen_action = PickGreedyAction(raw_prior, legals);
+        chosen_action = raw_action;
+        overridden = false;
         q_search_target = mu_legal;
         q_blend_target = mu_legal;
       }
@@ -293,7 +334,15 @@ GameOutcome PlayCompoundTournamentGame(
         dec.is_searched = is_searched;
         dec.decision_role = decision_role;
         dec.is_forced = is_forced;
+        dec.is_eligible = is_eligible;
+        dec.overridden = overridden;
         dec.chosen_action = chosen_action;
+        dec.raw_action = raw_action;
+        dec.greedy_raw_action = greedy_raw_action;
+        dec.raw_mean_utility = raw_mean_u;
+        dec.chosen_mean_utility = chosen_mean_u;
+        dec.candidate_utilities = std::move(candidate_utilities_recorded);
+        dec.action_history = state->History();
         for (Action a : legals) dec.legal_actions.push_back(a);
         dec.observation = std::move(obs_tensor);
         for (const auto& p : mu_legal) dec.mu.push_back({p.first, static_cast<float>(p.second)});
@@ -464,6 +513,14 @@ int main(int argc, char** argv) {
 
   auto tournament_start = std::chrono::steady_clock::now();
 
+  std::string pairing_str = absl::GetFlag(FLAGS_pairing_mode);
+  SearchPairingMode pairing_mode = (pairing_str == "paired")
+      ? SearchPairingMode::kPaired : SearchPairingMode::kUnpaired;
+
+  std::string truncation_str = absl::GetFlag(FLAGS_truncation_mode);
+  SearchTruncationMode truncation_mode = (truncation_str == "truncated")
+      ? SearchTruncationMode::kNextRoundSearchPlayer : SearchTruncationMode::kTerminal;
+
   auto worker = [&](int thread_id) {
     while (true) {
       int g = next_game_idx.fetch_add(1);
@@ -475,6 +532,7 @@ int main(int argc, char** argv) {
       GameOutcome res = PlayCompoundTournamentGame(
           g, s_seat, game, evaluators, thread_id, top_k, rollouts_per_action,
           min_override_margin, reuse_mode, high_stakes_only, gseed,
+          pairing_mode, truncation_mode,
           softmax_temp, eta_blend, record_trajectories);
 
       outcomes[g] = res;
@@ -575,10 +633,16 @@ int main(int argc, char** argv) {
             << std::setprecision(2) << (total_wall_time / 60.0) << " min)\n";
   std::cout << "Throughput:                " << std::setprecision(2) << (total_games / (total_wall_time / 60.0))
             << " games/min (" << std::setprecision(1) << (total_wall_time / total_games) << "s/game)\n";
+  uint64_t total_net_evals = open_spiel::GetTotalNetworkEvaluations();
+  std::cout << "Total Network Evaluations: " << total_net_evals << " ("
+            << std::setprecision(1) << (total_wall_time > 0 ? (static_cast<double>(total_net_evals) / total_wall_time) : 0.0) << " evals/s)\n";
   std::cout << "Total Searches Triggered:  " << total_searches_all << " (avg "
             << std::setprecision(1) << (static_cast<double>(total_searches_all) / total_games) << " / game)\n";
   std::cout << "Total Policy Overrides:    " << total_overrides_all << " ("
             << std::setprecision(1) << (100.0 * total_overrides_all / total_searches_all) << "% override rate)\n";
+  std::cout << "Pairing Mode:              " << pairing_str << "\n";
+  std::cout << "Truncation Mode:           " << truncation_str << "\n";
+  std::cout << "Rollouts Per Action:       " << rollouts_per_action << "\n";
   std::cout << "================================================================================\n";
   std::cout << "Per-Seat Performance:\n";
   for (int s = 0; s < 4; ++s) {
@@ -594,7 +658,11 @@ int main(int argc, char** argv) {
   json::Object root;
   root["tournament_type"] = json::Value("compound_turn_search");
   root["model_checkpoint"] = json::Value(model_path);
+  root["game_string"] = json::Value(game->ToString());
   root["total_games"] = json::Value(static_cast<int64_t>(total_games));
+  root["rollouts_per_action"] = json::Value(static_cast<int64_t>(rollouts_per_action));
+  root["pairing_mode"] = json::Value(pairing_str);
+  root["truncation_mode"] = json::Value(truncation_str);
   root["win_rate"] = json::Value(win_rate);
   root["total_wins"] = json::Value(static_cast<int64_t>(total_wins));
   root["mean_utility"] = json::Value(mean_util);
@@ -608,6 +676,8 @@ int main(int argc, char** argv) {
   root["total_overrides"] = json::Value(static_cast<int64_t>(total_overrides_all));
   root["override_rate_pct"] = json::Value(100.0 * total_overrides_all / total_searches_all);
   root["total_wall_time_seconds"] = json::Value(total_wall_time);
+  root["total_network_evaluations"] = json::Value(static_cast<int64_t>(total_net_evals));
+  root["measured_evals_per_second"] = json::Value(total_wall_time > 0 ? (static_cast<double>(total_net_evals) / total_wall_time) : 0.0);
 
   json::Array seat_stats;
   for (int s = 0; s < 4; ++s) {
@@ -647,28 +717,51 @@ int main(int argc, char** argv) {
     std::ofstream obs_file(trajectory_obs_path, std::ios::binary);
     std::ofstream meta_file(trajectory_meta_path);
     int total_decisions_written = 0;
+    int total_obs_written = 0;
 
     for (const auto& out : outcomes) {
       for (const auto& dec : out.decisions_trace) {
-        if (!dec.observation.empty()) {
-          obs_file.write(reinterpret_cast<const char*>(dec.observation.data()),
-                         dec.observation.size() * sizeof(float));
+        if (dec.observation.empty()) {
+          open_spiel::SpielFatalError("Observation is empty for recorded decision in trajectory!");
         }
+        obs_file.write(reinterpret_cast<const char*>(dec.observation.data()),
+                       dec.observation.size() * sizeof(float));
+        int64_t current_obs_row = total_obs_written++;
 
         json::Object dec_obj;
         dec_obj["game_id"] = json::Value(static_cast<int64_t>(dec.game_id));
         dec_obj["decision_ordinal"] = json::Value(static_cast<int64_t>(dec.decision_ordinal));
+        dec_obj["obs_row"] = json::Value(current_obs_row);
         dec_obj["search_seat"] = json::Value(static_cast<int64_t>(dec.search_seat));
         dec_obj["round"] = json::Value(static_cast<int64_t>(dec.round));
         dec_obj["phase"] = json::Value(dec.phase);
+        dec_obj["is_eligible"] = json::Value(dec.is_eligible);
         dec_obj["is_searched"] = json::Value(dec.is_searched);
         dec_obj["decision_role"] = json::Value(dec.decision_role);
         dec_obj["is_forced"] = json::Value(dec.is_forced);
+        dec_obj["overridden"] = json::Value(dec.overridden);
         dec_obj["chosen_action"] = json::Value(static_cast<int64_t>(dec.chosen_action));
+        dec_obj["raw_action"] = json::Value(static_cast<int64_t>(dec.raw_action));
+        dec_obj["greedy_raw_action"] = json::Value(static_cast<int64_t>(dec.greedy_raw_action));
+        dec_obj["raw_mean_utility"] = json::Value(dec.raw_mean_utility);
+        dec_obj["chosen_mean_utility"] = json::Value(dec.chosen_mean_utility);
+
+        json::Array cand_utils_arr;
+        for (const auto& cu : dec.candidate_utilities) {
+          json::Array pair_arr;
+          pair_arr.push_back(json::Value(static_cast<int64_t>(cu.first)));
+          pair_arr.push_back(json::Value(cu.second));
+          cand_utils_arr.push_back(json::Value(pair_arr));
+        }
+        dec_obj["candidate_utilities"] = json::Value(cand_utils_arr);
 
         json::Array legals_arr;
         for (int a : dec.legal_actions) legals_arr.push_back(json::Value(static_cast<int64_t>(a)));
         dec_obj["legal_actions"] = json::Value(legals_arr);
+
+        json::Array hist_arr;
+        for (int64_t a : dec.action_history) hist_arr.push_back(json::Value(a));
+        dec_obj["action_history"] = json::Value(hist_arr);
 
         json::Object mu_obj;
         for (const auto& p : dec.mu) mu_obj[std::to_string(p.first)] = json::Value(static_cast<double>(p.second));

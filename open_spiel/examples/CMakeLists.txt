@@ -289,10 +289,13 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_compound_search_tournament
     dune_compound_search_tournament.cc
-    dune_ppo_training_utils.cc
-    dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_compound_search_tournament dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_fixed_root_search_benchmark
+    dune_fixed_root_search_benchmark.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_fixed_root_search_benchmark dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_compound_turn_search_test
     dune_compound_turn_search_test.cc

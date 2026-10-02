@@ -12,6 +12,16 @@
 
 namespace open_spiel {
 
+inline std::atomic<uint64_t> g_total_network_evaluations{0};
+
+inline uint64_t GetTotalNetworkEvaluations() {
+  return g_total_network_evaluations.load(std::memory_order_relaxed);
+}
+
+inline void ResetTotalNetworkEvaluations() {
+  g_total_network_evaluations.store(0, std::memory_order_relaxed);
+}
+
 class BatchedNNEvaluator : public algorithms::Evaluator {
  public:
   BatchedNNEvaluator(
@@ -63,6 +73,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     for (int p = 0; p < num_players; ++p) {
       observations.push_back(ModelObservation(state, p));
     }
+    g_total_network_evaluations.fetch_add(num_players, std::memory_order_relaxed);
     auto results = batched_eval_->EvaluateBatchValues(observations);
     for (int p = 0; p < num_players; ++p) {
       double val = results[p].value;
@@ -70,6 +81,16 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       DuneNNEvaluator::RecordLeafValue(val);
     }
     return values;
+  }
+
+  double EvaluatePlayerValue(const State& state, Player player) {
+    if (!batched_eval_) return 0.0;
+    std::vector<std::vector<float>> observations = {ModelObservation(state, player)};
+    g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
+    auto results = batched_eval_->EvaluateBatchValues(observations);
+    double val = results.empty() ? 0.0 : results[0].value;
+    DuneNNEvaluator::RecordLeafValue(val);
+    return val;
   }
 
   open_spiel::CompactEvalResult PriorWithDetails(const State& state) {
@@ -91,6 +112,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       const std::string schema = batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
       dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
     }
+    g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
     return batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
   }
 
@@ -135,6 +157,7 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
       }
     }
+    g_total_network_evaluations.fetch_add(num_players, std::memory_order_relaxed);
     auto value_and_prior = batched_eval_->EvaluateBatchValuesWithCompactPrior(
         observations, static_cast<size_t>(current_player),
         legal_actions, &cand_data);

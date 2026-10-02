@@ -517,6 +517,47 @@ int main() {
                                  res.total_decisions_evaluated);
   }
 
+  // Test 7: V2 leaf units, scaling (4.0x), and override margin behavior
+  {
+    std::cout << "Running Test 7: V2 leaf units, scaling (4.0x), and override margin behavior...\n";
+    TurnSearchTree tree;
+    const double min_override_margin = 0.15;
+    Action raw_action = 10;
+    Action candidate_action = 25;
+
+    // Base raw action has mean utility 0.0
+    tree.RecordRollout(raw_action, {111}, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(tree.GetMeanUtility(raw_action), 0.0);
+
+    // Value head at cutoff outputs scaled return v = 0.05
+    double raw_value_head_output = 0.05;
+    double unscaled_u = raw_value_head_output;
+
+    // Call named helper TruncatedLeafUtility(value) which scales by kValueToLadderScale = 4.0
+    double scaled_u = TruncatedLeafUtility(raw_value_head_output);
+
+    // Override decision:
+    // With kValueToLadderScale = 4.0: scaled_u = 0.20 > 0.0 + 0.15 -> override triggers!
+    // If kValueToLadderScale were changed to 1.0: scaled_u = 0.05 < 0.0 + 0.15 -> this check FAILS!
+    bool override_scaled = (scaled_u > tree.GetMeanUtility(raw_action) + min_override_margin);
+    SPIEL_CHECK_TRUE(override_scaled);
+
+    // Case C: Terminal leaf vs Truncated leaf equivalence
+    // Terminal rollout returning ladder return +0.20
+    tree.RecordRollout(candidate_action, {111}, 0.20);
+    // Truncated rollout with value head 0.05 scaled via TruncatedLeafUtility
+    tree.RecordRollout(candidate_action, {111}, scaled_u);
+    // Both produce exact same mean utility on ladder scale
+    SPIEL_CHECK_FLOAT_EQ(tree.GetMeanUtility(candidate_action), 0.20);
+
+    std::cout << absl::StrFormat(
+        "  Verified V2 leaf scale: unscaled (%.2f) fails override (< %.2f margin), "
+        "scaled 4.0x (%.2f) triggers override (> %.2f margin); "
+        "truncated and terminal leaves match at %.2f utility.\n",
+        unscaled_u, min_override_margin, scaled_u, min_override_margin,
+        tree.GetMeanUtility(candidate_action));
+  }
+
   std::cout << "All TurnSearchTree and CompoundTurnSearch unit tests PASSED successfully!\n";
   return 0;
 }

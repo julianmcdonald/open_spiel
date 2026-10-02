@@ -127,24 +127,48 @@ class TurnSearchTree {
   TurnSearchNode* current_node_ = nullptr;
 };
 
+// Search candidate pairing mode across rollouts
+enum class SearchPairingMode {
+  kUnpaired,  // Candidate-independent world/rollout seeds (default today)
+  kPaired     // Shared world/rollout seeds across candidates
+};
+
+// Search rollout truncation mode
+enum class SearchTruncationMode {
+  kTerminal,               // Full rollout until game is terminal (default today)
+  kNextRoundSearchPlayer   // Cut off at search player's first decision in subsequent round
+};
+
+// Conversion scale from value head predicted return to ladder game returns
+inline constexpr double kValueToLadderScale = 4.0;
+
+// Converts a value head prediction (scaled return [-0.25, +0.25]) to raw ladder utility units [-1.0, +1.0]
+inline double TruncatedLeafUtility(double value_head_prediction) {
+  return value_head_prediction * kValueToLadderScale;
+}
+
 // Result of a rollout tracking both terminal utility and the actions taken within the active turn.
 struct RolloutTrajectory {
   double terminal_utility = 0.0;
   std::vector<Action> intra_turn_actions;
 };
 
-// Simulate a rollout to terminal while recording any actions taken by search_player
-// in the active agent turn before kActionEndTurn.
+// Simulate a rollout to terminal or truncation cutoff while recording any actions
+// taken by search_player in the active agent turn before kActionEndTurn.
 inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     State* sim_state,
     Player search_player,
     BatchedNNEvaluator* evaluator,
-    uint64_t rollout_seed) {
+    uint64_t rollout_seed,
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal) {
   std::mt19937 rng(rollout_seed);
   int steps = 0;
   const int max_steps = 2500;
   std::vector<Action> intra_turn_actions;
   bool active_turn = true;
+
+  const auto* dune_init = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
+  int start_round = dune_init ? dune_init->GetCurrentRound() : 1;
 
   while (!sim_state->IsTerminal() && steps < max_steps) {
     steps++;
@@ -157,6 +181,16 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     }
 
     Player cur = sim_state->CurrentPlayer();
+    const auto* cur_dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
+    int cur_round = cur_dune ? cur_dune->GetCurrentRound() : 1;
+
+    // Truncation check: search player's first decision in the subsequent round
+    if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer &&
+        cur == search_player && cur_round > start_round) {
+      double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
+      return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions)};
+    }
+
     std::vector<Action> legals = sim_state->LegalActions();
     if (legals.empty()) break;
 
@@ -164,7 +198,7 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     if (legals.size() == 1) {
       a = legals.front();
     } else {
-      ActionsAndProbs prior = evaluator->Prior(*sim_state);
+      ActionsAndProbs prior = evaluator ? evaluator->Prior(*sim_state) : ActionsAndProbs{};
       // Pick greedy action
       double best_p = -1.0;
       a = legals.front();
@@ -194,6 +228,13 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     sim_state->ApplyAction(a);
   }
 
+  // In kNextRoundSearchPlayer mode, if loop exits without terminal, evaluate value head
+  if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer && !sim_state->IsTerminal()) {
+    double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
+    return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions)};
+  }
+
+  // Original fallback: exactly as before for kTerminal mode (and terminal rollouts)
   std::vector<double> ret = sim_state->Returns();
   double u = (static_cast<size_t>(search_player) < ret.size()) ? ret[search_player] : 0.0;
   return {u, std::move(intra_turn_actions)};
@@ -263,6 +304,7 @@ struct CompoundSearchDecisionResult {
   int prior_rollouts_reused = 0;
   int new_rollouts_executed = 0;
   std::vector<std::pair<Action, double>> candidate_utilities = {};
+  std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities = {};
 };
 
 // Intra-turn compound rollout search decision with tree preservation
@@ -275,17 +317,19 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     int rollouts_per_action,
     double min_override_margin,
     TreeReuseMode reuse_mode,
-    uint64_t decision_seed) {
+    uint64_t decision_seed,
+    SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal) {
   std::vector<Action> legal_actions = state.LegalActions();
-  if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0};
-  if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0};
+  if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
+  if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0, {}, {}};
 
   ActionsAndProbs raw_prior = evaluators.front()->Prior(state);
   Action raw_action = PickGreedyAction(raw_prior, legal_actions);
 
   std::vector<Action> candidates = GetTopKActions(raw_prior, legal_actions, top_k);
   if (candidates.size() <= 1) {
-    return {raw_action, false, 0.0, 0.0, 0, 0};
+    return {raw_action, false, 0.0, 0.0, 0, 0, {}, {}};
   }
 
   // Ensure candidate 0 is always the baseline raw_action
@@ -305,6 +349,7 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
 
   struct RolloutTask {
     size_t c_idx;
+    int rollout_idx;
     Action action;
     std::unique_ptr<State> sim_state;
     uint64_t wseed;
@@ -326,7 +371,11 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     }
 
     for (int r = 0; r < needed_rollouts; ++r) {
-      uint64_t wseed = dune_seed::DeriveSeed(decision_seed, c_idx, r);
+      // In paired mode, all candidates share the exact same world seed for rollout r.
+      // In unpaired mode, world seed depends on candidate index c_idx.
+      uint64_t wseed = (pairing_mode == SearchPairingMode::kPaired)
+          ? dune_seed::DeriveSeed(decision_seed, r)
+          : dune_seed::DeriveSeed(decision_seed, c_idx, r);
       std::unique_ptr<State> sim_state = nullptr;
 
       if (dune) {
@@ -341,7 +390,7 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
       }
 
       sim_state->ApplyAction(cand_a);
-      tasks.push_back({c_idx, cand_a, std::move(sim_state), wseed + 999});
+      tasks.push_back({c_idx, r, cand_a, std::move(sim_state), wseed + 999});
     }
   }
 
@@ -349,6 +398,9 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
 
   TurnSearchTree local_tree;
   TurnSearchTree* active_tree = (turn_tree != nullptr) ? turn_tree : &local_tree;
+
+  std::vector<std::vector<double>> per_candidate_rollouts(
+      candidates.size(), std::vector<double>(rollouts_per_action, 0.0));
 
   // Concurrently step all rollouts if any are needed
   if (!tasks.empty()) {
@@ -361,14 +413,20 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
       auto* active_evaluator = evaluators[i % evaluators.size()].get();
       futures.push_back(std::async(
           std::launch::async,
-          [s_ptr, search_player, active_evaluator, s_seed]() {
-            return SimulateRolloutWithTurnTrajectory(s_ptr, search_player, active_evaluator, s_seed);
+          [s_ptr, search_player, active_evaluator, s_seed, truncation_mode]() {
+            return SimulateRolloutWithTurnTrajectory(
+                s_ptr, search_player, active_evaluator, s_seed, truncation_mode);
           }));
     }
 
     for (size_t i = 0; i < futures.size(); ++i) {
       RolloutTrajectory traj = futures[i].get();
       active_tree->RecordRollout(tasks[i].action, traj.intra_turn_actions, traj.terminal_utility);
+      if (tasks[i].c_idx < per_candidate_rollouts.size() &&
+          tasks[i].rollout_idx >= 0 &&
+          static_cast<size_t>(tasks[i].rollout_idx) < per_candidate_rollouts[tasks[i].c_idx].size()) {
+        per_candidate_rollouts[tasks[i].c_idx][tasks[i].rollout_idx] = traj.terminal_utility;
+      }
     }
   }
 
@@ -396,7 +454,13 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     candidate_utilities.push_back({cand_a, mean_u});
   }
 
-  return {best_action, overridden, raw_mean_u, best_mean_u, prior_rollouts_reused, new_rollouts_executed, candidate_utilities};
+  std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
+  candidate_rollout_utilities.reserve(candidates.size());
+  for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
+    candidate_rollout_utilities.push_back({candidates[c_idx], per_candidate_rollouts[c_idx]});
+  }
+
+  return {best_action, overridden, raw_mean_u, best_mean_u, prior_rollouts_reused, new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
 }
 
 // Compute softmax target distribution over evaluated actions at temperature T
