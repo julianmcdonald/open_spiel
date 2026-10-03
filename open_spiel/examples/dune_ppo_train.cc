@@ -31,6 +31,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/flags/reflection.h"
@@ -13780,6 +13784,14 @@ int main(int argc, char** argv) {
 
     cum_card11 += current_collect.card11_metrics;
     cum_card13 += current_collect.card13_metrics;
+
+    // Release completed trajectories before saving or collecting their replacement.
+    // Otherwise the next CollectRollout runs while the previous rollout is still live.
+    current_collect = open_spiel::CollectResult{};
+#if defined(__GLIBC__)
+    // Worker arenas retain freed trajectory pages across updates unless trimmed.
+    malloc_trim(0);
+#endif
 
     int checkpoint_interval = absl::GetFlag(FLAGS_checkpoint_interval);
     int training_step = update - start_update + 1;
