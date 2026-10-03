@@ -90,6 +90,10 @@ ABSL_FLAG(int, rollout_games, 0,
 ABSL_FLAG(int, ppo_minibatch_size, 2048, "PPO minibatch size.");
 ABSL_FLAG(int, ppo_update_epochs, 4, "PPO epochs per rollout batch.");
 ABSL_FLAG(double, learning_rate, 2.5e-4, "AdamW learning rate.");
+ABSL_FLAG(double, new_block_lr, 0.0,
+          "AdamW learning rate for newly appended residual blocks (<=0 disables).");
+ABSL_FLAG(int, new_block_first_index, 8,
+          "0-indexed first residual block belonging to new_block_lr group (e.g. 8 for res9-res12).");
 ABSL_FLAG(bool, anneal_lr, true, "Linearly anneal learning rate over updates.");
 ABSL_FLAG(double, gamma, 1.0, "Discount factor.");
 ABSL_FLAG(double, gae_lambda, 1.0, "GAE lambda.");
@@ -1184,10 +1188,105 @@ std::string HashAllModelState(
 // loaded temp model, which is a bitwise copy of the same dtype and shape. This
 // is what makes section 7.3's bitwise legacy-inference parity gate passable.
 
-void SetOptimizerLearningRate(torch::optim::Optimizer& optimizer, double lr) {
-  for (auto& group : optimizer.param_groups()) {
-    auto& options = static_cast<torch::optim::AdamWOptions&>(group.options());
-    options.lr(lr);
+inline double GetExpectedGroupLearningRate(size_t group_idx, size_t total_groups, double base_lr, double new_block_lr) {
+  if (new_block_lr > 0.0 && total_groups >= 3 && group_idx == total_groups - 1) {
+    return new_block_lr;
+  }
+  return base_lr;
+}
+
+void SetOptimizerLearningRate(torch::optim::Optimizer& optimizer, double lr, double new_block_lr = 0.0) {
+  const size_t total_groups = optimizer.param_groups().size();
+  for (size_t g = 0; g < total_groups; ++g) {
+    auto& options = static_cast<torch::optim::AdamWOptions&>(optimizer.param_groups()[g].options());
+    double exp_lr = GetExpectedGroupLearningRate(g, total_groups, lr, new_block_lr);
+    options.lr(exp_lr);
+  }
+}
+
+std::string SummarizeParamNames(const std::vector<std::string>& names) {
+  if (names.empty()) return "(none)";
+  int input_count = 0;
+  int value_count = 0;
+  int policy_count = 0;
+  int scorer_count = 0;
+  int aux_count = 0;
+  std::map<int, int> res_counts;
+  std::vector<std::string> other;
+
+  for (const auto& name : names) {
+    if (name.rfind("input_layer", 0) == 0) {
+      ++input_count;
+    } else if (name.rfind("policy_head", 0) == 0) {
+      ++policy_count;
+    } else if (name.rfind("value_head", 0) == 0) {
+      ++value_count;
+    } else if (name.rfind("semantic_scorer", 0) == 0) {
+      ++scorer_count;
+    } else if (name.rfind("final_vp", 0) == 0 ||
+               name.rfind("terminal_round", 0) == 0 ||
+               name.rfind("next_own_action", 0) == 0) {
+      ++aux_count;
+    } else if (name.rfind("res", 0) == 0) {
+      size_t dot_pos = name.find('.');
+      int blk_idx = 0;
+      if (dot_pos != std::string::npos && dot_pos > 3) {
+        blk_idx = std::atoi(name.substr(3, dot_pos - 3).c_str());
+      }
+      res_counts[blk_idx]++;
+    } else {
+      other.push_back(name);
+    }
+  }
+
+  std::vector<std::string> parts;
+  if (policy_count > 0) parts.push_back(absl::StrFormat("policy_head.* (%d)", policy_count));
+  if (input_count > 0) parts.push_back(absl::StrFormat("input_layer.* (%d)", input_count));
+  if (!res_counts.empty()) {
+    int min_blk = res_counts.begin()->first;
+    int max_blk = res_counts.rbegin()->first;
+    int total_res = 0;
+    for (const auto& p : res_counts) total_res += p.second;
+    if (min_blk == max_blk) {
+      parts.push_back(absl::StrFormat("res%d.* (%d)", min_blk, total_res));
+    } else {
+      parts.push_back(absl::StrFormat("res%d-res%d.* (%d)", min_blk, max_blk, total_res));
+    }
+  }
+  if (value_count > 0) parts.push_back(absl::StrFormat("value_head.* (%d)", value_count));
+  if (scorer_count > 0) parts.push_back(absl::StrFormat("semantic_scorer.* (%d)", scorer_count));
+  if (aux_count > 0) parts.push_back(absl::StrFormat("aux_heads.* (%d)", aux_count));
+  for (const auto& o : other) parts.push_back(o);
+
+  return absl::StrJoin(parts, ", ");
+}
+
+void PrintOptimizerGroupSummary(
+    const torch::optim::Optimizer& optimizer,
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model) {
+  std::unordered_map<const c10::TensorImpl*, std::string> tensor_to_name;
+  for (const auto& pair : model->named_parameters()) {
+    tensor_to_name[pair.value().unsafeGetTensorImpl()] = pair.key();
+  }
+
+  const size_t num_groups = optimizer.param_groups().size();
+  std::cout << "[OPTIMIZER LOAD] Parameter groups configuration (" << num_groups << " groups):\n";
+  for (size_t g = 0; g < num_groups; ++g) {
+    const auto& group = optimizer.param_groups()[g];
+    const auto& options = static_cast<const torch::optim::AdamWOptions&>(group.options());
+    std::vector<std::string> param_names;
+    for (const auto& p : group.params()) {
+      auto it = tensor_to_name.find(p.unsafeGetTensorImpl());
+      if (it != tensor_to_name.end()) {
+        param_names.push_back(it->second);
+      } else {
+        param_names.push_back("unknown_param");
+      }
+    }
+    std::string summary = SummarizeParamNames(param_names);
+    std::cout << absl::StrFormat(
+        "  Group %zu: lr=%.6e, weight_decay=%.6e, tensors=%zu, params=[%s]\n",
+        g, options.lr(), options.weight_decay(), group.params().size(), summary);
   }
 }
 
@@ -1214,16 +1313,20 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
   std::vector<torch::Tensor> other_params;
   // PWO-5 section 7.4: the three auxiliary heads sit in their OWN parameter
   // group with weight_decay = 0.0, IN ALL SIX ARMS.
-  //
-  // This is not tidiness. In a head-off arm (T, P) the coefficients are exactly
-  // zero and the loss terms are not constructed, so the head parameters receive
-  // no gradient -- but AdamW's DECOUPLED weight decay does not need a gradient
-  // to move a parameter. Left in the default group at --weight_decay, a
-  // head-off arm's head tensors would shrink on every step and would silently
-  // diverge from a head-on arm's initial values, breaking both the section 9
-  // "same tensors, same keys, same order" match and section 15.2 gate 7's
-  // bitwise-equal-to-initial check.
   std::vector<torch::Tensor> aux_head_params;
+  std::vector<torch::Tensor> new_block_params;
+
+  const double new_block_lr = absl::GetFlag(FLAGS_new_block_lr);
+  const int new_block_first_idx = absl::GetFlag(FLAGS_new_block_first_index);
+  std::vector<torch::Tensor> new_block_params_set;
+  if (new_block_lr > 0.0) {
+    for (int b = new_block_first_idx; b < static_cast<int>(model->res_blocks.size()); ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        new_block_params_set.push_back(p);
+      }
+    }
+  }
+
   auto policy_params_set = model->policy_head->parameters();
   std::vector<torch::Tensor> aux_params_set;
   if (model->has_aux_heads_) {
@@ -1246,23 +1349,34 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
         break;
       }
     }
+    bool is_new_block = false;
+    for (auto& nb_param : new_block_params_set) {
+      if (param.is_same(nb_param)) {
+        is_new_block = true;
+        break;
+      }
+    }
     if (is_policy) {
       policy_params.push_back(param);
     } else if (is_aux) {
       aux_head_params.push_back(param);
+    } else if (is_new_block) {
+      new_block_params.push_back(param);
     } else {
       other_params.push_back(param);
     }
   }
 
-  // Group order is part of the checkpoint contract (section 9: "same
-  // param_groups, same order"), and the post-load re-assertion below indexes by
-  // it. Order: 0 = policy, 1 = everything else, 2 = the auxiliary heads.
+  // Group order: 0 = policy, 1 = other (trunk/value/scorer), 2 = aux heads (if present),
+  // new blocks group APPENDED LAST if new_block_lr > 0.
   std::vector<torch::optim::OptimizerParamGroup> groups;
   groups.emplace_back(policy_params);
   groups.emplace_back(other_params);
   if (model->has_aux_heads_) {
     groups.emplace_back(aux_head_params);
+  }
+  if (new_block_lr > 0.0) {
+    groups.emplace_back(new_block_params);
   }
   auto optimizer = std::make_unique<torch::optim::AdamW>(
       groups, torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate))
@@ -1277,6 +1391,13 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
     static_cast<torch::optim::AdamWOptions&>(
         optimizer->param_groups()[2].options())
         .weight_decay(0.0);  // section 7.4 -- hard zero, never a flag
+  }
+  if (new_block_lr > 0.0) {
+    const size_t nb_idx = optimizer->param_groups().size() - 1;
+    auto& nb_options = static_cast<torch::optim::AdamWOptions&>(
+        optimizer->param_groups()[nb_idx].options());
+    nb_options.lr(new_block_lr);
+    nb_options.weight_decay(0.0);
   }
   return optimizer;
 }
@@ -9603,7 +9724,8 @@ int main(int argc, char** argv) {
       SpielFatalError("LibTorch load failed: " + std::string(e.msg()));
     }
 
-    open_spiel::SetOptimizerLearningRate(*optimizer, absl::GetFlag(FLAGS_learning_rate));
+    open_spiel::SetOptimizerLearningRate(
+        *optimizer, absl::GetFlag(FLAGS_learning_rate), absl::GetFlag(FLAGS_new_block_lr));
     if (critic_optimizer != nullptr) {
       open_spiel::SetOptimizerLearningRate(*critic_optimizer, absl::GetFlag(FLAGS_learning_rate));
     }
@@ -9624,15 +9746,20 @@ int main(int argc, char** argv) {
       const auto& options =
           static_cast<const torch::optim::AdamWOptions&>(
               optimizer->param_groups()[g].options());
-      if (std::abs(options.lr() - absl::GetFlag(FLAGS_learning_rate)) > 1e-12) {
+      const double expected_lr = GetExpectedGroupLearningRate(
+          g, optimizer->param_groups().size(),
+          absl::GetFlag(FLAGS_learning_rate),
+          absl::GetFlag(FLAGS_new_block_lr));
+      if (std::abs(options.lr() - expected_lr) > 1e-12) {
         SpielFatalError(absl::StrFormat(
             "Optimizer parameter group %zu effective learning rate mismatch: expected %.6e, got %.6e",
-            g, absl::GetFlag(FLAGS_learning_rate), options.lr()));
+            g, expected_lr, options.lr()));
       }
     }
     std::cout << absl::StrFormat(
-        "[INFO] Verified effective learning rate in all %zu optimizer parameter groups: %.6e\n",
-        optimizer->param_groups().size(), absl::GetFlag(FLAGS_learning_rate));
+        "[INFO] Verified effective learning rate in all %zu optimizer parameter groups\n",
+        optimizer->param_groups().size());
+    PrintOptimizerGroupSummary(*optimizer, training_model);
     for (auto& pair : optimizer->state()) {
       if (auto* state =
               dynamic_cast<torch::optim::AdamWParamState*>(pair.second.get())) {
@@ -9729,6 +9856,34 @@ int main(int argc, char** argv) {
 
     torch::save(training_model, model_tmp);
     if (optimizer) {
+      open_spiel::SetOptimizerLearningRate(
+          *optimizer, absl::GetFlag(FLAGS_learning_rate), absl::GetFlag(FLAGS_new_block_lr));
+      for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+        auto& options =
+            static_cast<torch::optim::AdamWOptions&>(
+                optimizer->param_groups()[g].options());
+        options.weight_decay(g == 0 ? absl::GetFlag(FLAGS_policy_weight_decay)
+                            : g == 1 ? absl::GetFlag(FLAGS_weight_decay)
+                                     : 0.0);
+      }
+      for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+        const auto& options =
+            static_cast<const torch::optim::AdamWOptions&>(
+                optimizer->param_groups()[g].options());
+        const double expected_lr = GetExpectedGroupLearningRate(
+            g, optimizer->param_groups().size(),
+            absl::GetFlag(FLAGS_learning_rate),
+            absl::GetFlag(FLAGS_new_block_lr));
+        if (std::abs(options.lr() - expected_lr) > 1e-12) {
+          SpielFatalError(absl::StrFormat(
+              "Optimizer parameter group %zu effective learning rate mismatch during bootstrap: expected %.6e, got %.6e",
+              g, expected_lr, options.lr()));
+        }
+      }
+      std::cout << absl::StrFormat(
+          "[INFO] Verified effective learning rate in all %zu optimizer parameter groups during bootstrap\n",
+          optimizer->param_groups().size());
+      PrintOptimizerGroupSummary(*optimizer, training_model);
       torch::save(*optimizer, optim_tmp);
     }
 

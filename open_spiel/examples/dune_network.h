@@ -670,6 +670,9 @@ inline bool LoadOptimizerCheckpointMigrating(
   }
 
   if (groups_match && input_dim_matches && params_match) {
+    std::cout << "[INFO] Optimizer checkpoint layout matches target model ("
+              << ckpt_num_groups << " groups, " << total_ckpt_params
+              << " parameters). Taking direct torch::load path (no migration).\n";
     return false;
   }
 
@@ -689,7 +692,8 @@ inline bool LoadOptimizerCheckpointMigrating(
   const size_t policy_params_count = model->policy_head->bias.defined() ? 2 : 1;
   const size_t aux_params_count = 6;
 
-  bool source_has_aux = (ckpt_num_groups >= 3);
+  bool source_has_aux = (ckpt_num_groups >= 3 && group_param_counts.size() > 2 &&
+                          group_param_counts[2] == static_cast<int64_t>(aux_params_count));
   bool source_has_scorer = false;
   bool source_has_scorer_ext = false;
 
