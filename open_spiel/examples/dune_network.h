@@ -673,9 +673,19 @@ inline bool LoadOptimizerCheckpointMigrating(
     return false;
   }
 
-  const int num_blocks = static_cast<int>(model->res_blocks.size());
+  const int dst_num_blocks = static_cast<int>(model->res_blocks.size());
   const bool use_nonlinear = model->use_nonlinear_value_head_;
-  const size_t base_torso_params = 2 + (num_blocks * 8) + (use_nonlinear ? 4 : 2);
+  int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
+
+  // Explicit 8->12 migration path: build source layout from source block count
+  int src_num_blocks = dst_num_blocks;
+  if (dst_num_blocks == 12 && (ckpt_torso_params == 86 || ckpt_torso_params == 84 || ckpt_torso_params == 68)) {
+    src_num_blocks = 8;
+  } else if (dst_num_blocks != 8 && (ckpt_torso_params == 86 || ckpt_torso_params == 84 || ckpt_torso_params == 68)) {
+    src_num_blocks = 8;
+  }
+
+  const size_t base_torso_params = 2 + (src_num_blocks * 8) + (use_nonlinear ? 4 : 2);
   const size_t policy_params_count = model->policy_head->bias.defined() ? 2 : 1;
   const size_t aux_params_count = 6;
 
@@ -683,7 +693,6 @@ inline bool LoadOptimizerCheckpointMigrating(
   bool source_has_scorer = false;
   bool source_has_scorer_ext = false;
 
-  int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
   if (ckpt_torso_params >= static_cast<int64_t>(base_torso_params + 18)) {
     source_has_scorer = true;
     source_has_scorer_ext = true;
@@ -708,7 +717,7 @@ inline bool LoadOptimizerCheckpointMigrating(
     src_other_params.push_back(torch::zeros_like(model->input_layer->bias, device));
   }
 
-  for (size_t b = 0; b < model->res_blocks.size(); ++b) {
+  for (int b = 0; b < src_num_blocks; ++b) {
     for (auto& p : model->res_blocks[b]->parameters()) {
       src_other_params.push_back(torch::zeros_like(p, device));
     }
@@ -821,7 +830,7 @@ inline bool LoadOptimizerCheckpointMigrating(
   }
 
   size_t src_res_idx = 1 + (model->input_layer->bias.defined() ? 1 : 0);
-  for (size_t b = 0; b < model->res_blocks.size(); ++b) {
+  for (int b = 0; b < src_num_blocks; ++b) {
     for (auto& p : model->res_blocks[b]->parameters()) {
       move_state(src_other_params[src_res_idx++], p);
     }
