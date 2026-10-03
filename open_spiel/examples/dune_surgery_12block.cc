@@ -39,6 +39,8 @@ ABSL_FLAG(std::string, test_obs_bin,
           "Path to stored observation binary for B3 identity verification.");
 ABSL_FLAG(int, test_states_count, 1024,
           "Number of stored states to verify in B3 identity check (>= 1000).");
+ABSL_FLAG(std::string, check_optimizer, "",
+          "Optional path to post-bootstrap optimizer file to verify against surgery output.");
 
 namespace {
 
@@ -416,7 +418,62 @@ int main(int argc, char** argv) {
   torch::optim::AdamW opt8(src_groups, torch::optim::AdamWOptions(5e-6).eps(1e-5));
   torch::load(opt8, src_opt_path, device);
 
+  std::cout << "\n[B2 TEST STAGE (a)] Verifying in-memory optimizer moments...\n";
   VerifyB2OptimizerMoments(model8, opt8, model12, opt12);
+
+  // 7b. Verify B2 Optimizer Moments Post-Serialization (Bootstrap Path)
+  std::cout << "\n[B2 TEST STAGE (b)] Verifying post-serialization optimizer reload via bootstrap path...\n";
+  auto model12_loaded = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 12,
+      /*nonlinear=*/false, /*aux=*/false, /*seed=*/0, /*scorer=*/true);
+  open_spiel::LoadModelCheckpointRobust(model12_loaded, dst_model_path, device);
+
+  std::vector<torch::Tensor> loaded_pol_params;
+  loaded_pol_params.push_back(model12_loaded->policy_head->weight);
+  if (model12_loaded->policy_head->bias.defined()) loaded_pol_params.push_back(model12_loaded->policy_head->bias);
+
+  std::vector<torch::Tensor> loaded_tor_params;
+  loaded_tor_params.push_back(model12_loaded->input_layer->weight);
+  if (model12_loaded->input_layer->bias.defined()) loaded_tor_params.push_back(model12_loaded->input_layer->bias);
+  for (int b = 0; b < 12; ++b) {
+    for (auto& p : model12_loaded->res_blocks[b]->parameters()) loaded_tor_params.push_back(p);
+  }
+  for (auto& p : model12_loaded->value_head->parameters()) loaded_tor_params.push_back(p);
+  if (model12_loaded->with_semantic_scorer_ && model12_loaded->semantic_scorer_) {
+    auto add_mod_params_loaded = [&](auto& mod) {
+      for (auto& p : mod->parameters()) loaded_tor_params.push_back(p);
+    };
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->card_embedding);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->space_embedding);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->desc_proj);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->desc_ln);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->trunk_proj);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->trunk_ln);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->mlp1);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->mlp1_ln);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->out_layer);
+    add_mod_params_loaded(model12_loaded->semantic_scorer_->out_layer_ext);
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> loaded_groups;
+  loaded_groups.emplace_back(loaded_pol_params);
+  loaded_groups.emplace_back(loaded_tor_params);
+  torch::optim::AdamW opt12_loaded(loaded_groups, torch::optim::AdamWOptions(5e-6).eps(1e-5));
+
+  std::string opt_to_check = dst_opt_path;
+  std::string flag_check_opt = absl::GetFlag(FLAGS_check_optimizer);
+  if (!flag_check_opt.empty()) {
+    opt_to_check = flag_check_opt;
+  }
+  std::cout << "[B2 TEST STAGE (b)] Loading optimizer from: " << opt_to_check << "\n";
+
+  // Replicate exact bootstrap startup logic in dune_ppo_train.cc:
+  if (!open_spiel::LoadOptimizerCheckpointMigrating(model12_loaded, opt12_loaded, opt_to_check, device, 5e-6)) {
+    torch::load(opt12_loaded, opt_to_check, device);
+  }
+
+  VerifyB2OptimizerMoments(model8, opt8, model12_loaded, opt12_loaded);
+  std::cout << "[B2 TEST PASS] Post-serialization bootstrap reload verified bit-exact on " << opt_to_check << "!\n";
 
   // 8. Verify B3 Identity Checks
   std::string obs_bin = absl::GetFlag(FLAGS_test_obs_bin);

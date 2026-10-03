@@ -51,6 +51,8 @@ ABSL_FLAG(int, target_batch_size, 64, "GPU evaluator batch size.");
 ABSL_FLAG(uint64_t, master_seed, 20261003ULL, "Master seed.");
 ABSL_FLAG(uint64_t, discovery_start_seed, 0ULL, "Episode offset for discovery games.");
 ABSL_FLAG(uint64_t, confirmation_start_seed, 100000ULL, "Episode offset for confirmation games.");
+ABSL_FLAG(bool, confirmation_only, false,
+          "Run only confirmation set using existing roots_confirmation.json.");
 
 namespace {
 
@@ -101,6 +103,53 @@ struct RootRecord {
   double sech2_sh = 0.0;
 };
 
+struct WorldRolloutRecord {
+  int world_idx = 0;
+  Action action = kInvalidAction;
+  double return_val = 0.0;
+  bool is_terminal = false;
+  std::string exit_reason; // "terminal", "step_cap_reached", "empty_legals"
+  int steps = 0;
+  int final_vp = 0;
+  bool resample_fallback = false;
+  bool sb_played = false;
+  bool sh_played = false;
+  bool sb_trashed_for_vp = false;
+  std::unordered_map<std::string, int> vp_by_source;
+};
+
+struct AuditCounters {
+  std::atomic<size_t> total_simulations{0};
+  std::atomic<size_t> terminal_exits{0};
+  std::atomic<size_t> step_cap_exits{0};
+  std::atomic<size_t> empty_legals_exits{0};
+  std::atomic<size_t> total_resample_calls{0};
+  std::atomic<size_t> resample_fallbacks{0};
+
+  std::atomic<size_t> sb_rollouts{0};
+  std::atomic<size_t> sb_played_rollouts{0};
+  std::atomic<size_t> sb_trash_vp_rollouts{0};
+
+  std::atomic<size_t> sh_rollouts{0};
+  std::atomic<size_t> sh_played_rollouts{0};
+
+  std::atomic<size_t> rf_rollouts{0};
+  std::atomic<size_t> rf_played_rollouts{0};
+
+  std::unordered_map<std::string, double> sum_vp_greedy;
+  std::unordered_map<std::string, double> sum_vp_sb;
+  std::unordered_map<std::string, double> sum_vp_sh;
+  std::unordered_map<std::string, double> sum_vp_rf;
+  double sum_final_vp_greedy = 0.0;
+  double sum_final_vp_sb = 0.0;
+  double sum_final_vp_sh = 0.0;
+  double sum_final_vp_rf = 0.0;
+  size_t count_eval_sb = 0;
+  size_t count_eval_sh = 0;
+  size_t count_eval_rf = 0;
+  size_t count_eval_greedy = 0;
+};
+
 struct PerRootRolloutResult {
   int root_id = 0;
   int round = 0;
@@ -129,6 +178,7 @@ struct PerRootRolloutResult {
   double q_rf = 0.0;
 
   std::unordered_map<Action, std::vector<double>> raw_rollout_returns;
+  std::unordered_map<Action, std::vector<WorldRolloutRecord>> detailed_world_rollouts;
 };
 
 struct SummaryStats {
@@ -238,14 +288,29 @@ class SimpleThreadPool {
   bool stop_;
 };
 
-inline double SimulateGreedyRollout(
+struct RolloutOutcome {
+  double ret = 0.0;
+  bool is_terminal = false;
+  std::string exit_reason; // "terminal", "step_cap_reached", "empty_legals"
+  int steps = 0;
+  int final_vp = 0;
+  bool sb_played = false;
+  bool sh_played = false;
+  bool sb_trashed_for_vp = false;
+  std::unordered_map<std::string, int> vp_by_source;
+};
+
+inline RolloutOutcome SimulateGreedyRollout(
     open_spiel::State* sim_state,
     open_spiel::Player search_player,
     open_spiel::BatchedNNEvaluator* evaluator,
     uint64_t seed) {
+  RolloutOutcome outcome;
   std::mt19937 rng(seed);
   int steps = 0;
   const int max_steps = 2500;
+  const auto* dune_sim = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(sim_state);
+
   while (!sim_state->IsTerminal() && steps < max_steps) {
     steps++;
     if (sim_state->IsChanceNode()) {
@@ -256,27 +321,63 @@ inline double SimulateGreedyRollout(
       continue;
     }
     std::vector<open_spiel::Action> legals = sim_state->LegalActions();
-    if (legals.empty()) break;
+    if (legals.empty()) {
+      outcome.exit_reason = "empty_legals";
+      break;
+    }
     if (legals.size() == 1) {
       sim_state->ApplyAction(legals.front());
-      continue;
+    } else {
+      open_spiel::ActionsAndProbs prior = evaluator->Prior(*sim_state);
+      open_spiel::Action a = legals.front();
+      double best_p = -1.0;
+      for (const auto& ap : prior) {
+        if (ap.second > best_p) {
+          best_p = ap.second;
+          a = ap.first;
+        }
+      }
+      sim_state->ApplyAction(a);
     }
-    open_spiel::ActionsAndProbs prior = evaluator->Prior(*sim_state);
-    open_spiel::Action a = legals.front();
-    double best_p = -1.0;
-    for (const auto& ap : prior) {
-      if (ap.second > best_p) {
-        best_p = ap.second;
-        a = ap.first;
+    if (dune_sim) {
+      for (int c : dune_sim->GetPlayedAgentCardsForTesting(search_player)) {
+        if (c == kScientificBreakthroughCardId) outcome.sb_played = true;
+        if (c == kStitchedHorrorCardId) outcome.sh_played = true;
+      }
+      for (int c : dune_sim->GetRevealedCardsForTesting(search_player)) {
+        if (c == kScientificBreakthroughCardId) outcome.sb_played = true;
+        if (c == kStitchedHorrorCardId) outcome.sh_played = true;
       }
     }
-    sim_state->ApplyAction(a);
   }
+
+  outcome.steps = steps;
+  if (sim_state->IsTerminal()) {
+    outcome.is_terminal = true;
+    outcome.exit_reason = "terminal";
+  } else if (outcome.exit_reason.empty()) {
+    outcome.exit_reason = "step_cap_reached";
+  }
+
   std::vector<double> ret = sim_state->Returns();
   if (static_cast<size_t>(search_player) < ret.size()) {
-    return ret[search_player];
+    outcome.ret = ret[search_player];
   }
-  return 0.0;
+
+  if (dune_sim) {
+    outcome.final_vp = dune_sim->GetPlayerVp(search_player);
+    const auto& events = dune_sim->GetVpEvents(search_player);
+    for (const auto& ev : events) {
+      std::string s_name = open_spiel::dune_imperium::VpSourceName(ev.source);
+      outcome.vp_by_source[s_name] += ev.delta;
+      if (ev.source == open_spiel::dune_imperium::VpSource::kScientificBreakthrough) {
+        outcome.sb_trashed_for_vp = true;
+        outcome.sb_played = true;
+      }
+    }
+  }
+
+  return outcome;
 }
 
 // Evaluate raw logits & logit diagnostics at a root
@@ -745,7 +846,8 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
     int rollouts_per_candidate,
     int num_threads,
     uint64_t master_seed,
-    const std::string& set_name) {
+    const std::string& set_name,
+    AuditCounters& audit) {
   std::cout << "\n======================================================================\n";
   std::cout << "[PAIRED ROLLOUTS] Running " << rollouts_per_candidate << " rollouts/candidate on "
             << roots.size() << " roots (" << set_name << " set, " << num_threads << " worker threads)\n";
@@ -787,6 +889,7 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
     // Prepare return storage: map Action -> vector<double>(rollouts_per_candidate)
     for (Action c : candidates) {
       res.raw_rollout_returns[c].assign(rollouts_per_candidate, 0.0);
+      res.detailed_world_rollouts[c].assign(rollouts_per_candidate, WorldRolloutRecord());
     }
 
     // Replay state from action history
@@ -807,7 +910,7 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
     size_t r_idx = job_idx / rollouts_per_candidate;
     int r = static_cast<int>(job_idx % rollouts_per_candidate);
 
-    pool.Enqueue([r_idx, r, &roots, &root_states, &root_candidates, &results, &evaluators,
+    pool.Enqueue([r_idx, r, &roots, &root_states, &root_candidates, &results, &evaluators, &audit,
                   master_seed, &completed_jobs, total_jobs, t_start]() {
       const auto& root = roots[r_idx];
       const auto* dune_root = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(root_states[r_idx].get());
@@ -820,8 +923,15 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
       auto rng_func = [&wrng]() {
         return std::generate_canonical<double, 53>(wrng);
       };
+
+      audit.total_resample_calls.fetch_add(1, std::memory_order_relaxed);
       std::unique_ptr<open_spiel::State> world = dune_root->ResampleFromInfostate(root.search_seat, rng_func);
-      if (!world) world = root_states[r_idx]->Clone();
+      bool fallback = false;
+      if (!world) {
+        audit.resample_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        world = root_states[r_idx]->Clone();
+        fallback = true;
+      }
 
       size_t eval_idx = (r_idx * 256 + r) % evaluators.size();
       auto* active_eval = evaluators[eval_idx].get();
@@ -829,8 +939,43 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
       for (Action c : candidates) {
         std::unique_ptr<open_spiel::State> sim = world->Clone();
         sim->ApplyAction(c);
-        double ret = SimulateGreedyRollout(sim.get(), root.search_seat, active_eval, wseed + 999);
-        res_ptr->raw_rollout_returns[c][r] = ret;
+        RolloutOutcome outcome = SimulateGreedyRollout(sim.get(), root.search_seat, active_eval, wseed + 999);
+        res_ptr->raw_rollout_returns[c][r] = outcome.ret;
+
+        WorldRolloutRecord wrec;
+        wrec.world_idx = r;
+        wrec.action = c;
+        wrec.return_val = outcome.ret;
+        wrec.is_terminal = outcome.is_terminal;
+        wrec.exit_reason = outcome.exit_reason;
+        wrec.steps = outcome.steps;
+        wrec.final_vp = outcome.final_vp;
+        wrec.resample_fallback = fallback;
+        wrec.sb_played = outcome.sb_played;
+        wrec.sh_played = outcome.sh_played;
+        wrec.sb_trashed_for_vp = outcome.sb_trashed_for_vp;
+        wrec.vp_by_source = outcome.vp_by_source;
+        res_ptr->detailed_world_rollouts[c][r] = wrec;
+
+        audit.total_simulations.fetch_add(1, std::memory_order_relaxed);
+        if (outcome.is_terminal) {
+          audit.terminal_exits.fetch_add(1, std::memory_order_relaxed);
+        } else if (outcome.exit_reason == "step_cap_reached") {
+          audit.step_cap_exits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          audit.empty_legals_exits.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (c == root.sb_action && root.sb_legal) {
+          audit.sb_rollouts.fetch_add(1, std::memory_order_relaxed);
+          if (outcome.sb_played) audit.sb_played_rollouts.fetch_add(1, std::memory_order_relaxed);
+          if (outcome.sb_trashed_for_vp) audit.sb_trash_vp_rollouts.fetch_add(1, std::memory_order_relaxed);
+        } else if (c == root.sh_action && root.sh_legal) {
+          audit.sh_rollouts.fetch_add(1, std::memory_order_relaxed);
+          if (outcome.sh_played) audit.sh_played_rollouts.fetch_add(1, std::memory_order_relaxed);
+        } else if (c == root.rf_action && root.rf_legal) {
+          audit.rf_rollouts.fetch_add(1, std::memory_order_relaxed);
+        }
       }
 
       size_t done = completed_jobs.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -893,6 +1038,42 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
         compute_paired_diff(res.sh_action, res.rf_action, res.sh_gap_vs_rf, res.sh_se_vs_rf);
       }
     }
+
+    // Accumulate mechanism VP statistics across rollouts
+    for (int r = 0; r < rollouts_per_candidate; ++r) {
+      if (res.detailed_world_rollouts.count(root.greedy_choice)) {
+        const auto& w_gr = res.detailed_world_rollouts.at(root.greedy_choice)[r];
+        audit.sum_final_vp_greedy += w_gr.final_vp;
+        audit.count_eval_greedy++;
+        for (const auto& [src, delta] : w_gr.vp_by_source) {
+          audit.sum_vp_greedy[src] += delta;
+        }
+      }
+      if (root.sb_legal && res.detailed_world_rollouts.count(root.sb_action)) {
+        const auto& w_sb = res.detailed_world_rollouts.at(root.sb_action)[r];
+        audit.sum_final_vp_sb += w_sb.final_vp;
+        audit.count_eval_sb++;
+        for (const auto& [src, delta] : w_sb.vp_by_source) {
+          audit.sum_vp_sb[src] += delta;
+        }
+      }
+      if (root.sh_legal && res.detailed_world_rollouts.count(root.sh_action)) {
+        const auto& w_sh = res.detailed_world_rollouts.at(root.sh_action)[r];
+        audit.sum_final_vp_sh += w_sh.final_vp;
+        audit.count_eval_sh++;
+        for (const auto& [src, delta] : w_sh.vp_by_source) {
+          audit.sum_vp_sh[src] += delta;
+        }
+      }
+      if (root.rf_legal && res.detailed_world_rollouts.count(root.rf_action)) {
+        const auto& w_rf = res.detailed_world_rollouts.at(root.rf_action)[r];
+        audit.sum_final_vp_rf += w_rf.final_vp;
+        audit.count_eval_rf++;
+        for (const auto& [src, delta] : w_rf.vp_by_source) {
+          audit.sum_vp_rf[src] += delta;
+        }
+      }
+    }
   }
 
   return results;
@@ -901,7 +1082,9 @@ std::vector<PerRootRolloutResult> RunPairedRolloutsForRoots(
 // Compute aggregate report table (mean gap, 95% CI, fraction >= 0.15)
 open_spiel::json::Object SummarizeRolloutMetrics(
     const std::vector<PerRootRolloutResult>& results,
-    const std::string& set_name) {
+    const AuditCounters& audit,
+    const std::string& set_name,
+    const std::string& out_dir) {
   std::cout << "\n======================================================================\n";
   std::cout << "SUMMARY RESULTS: PAIRED ROLLOUT GAPS (" << set_name << ")\n";
   std::cout << "======================================================================\n";
@@ -998,6 +1181,177 @@ open_spiel::json::Object SummarizeRolloutMetrics(
   slices_arr.push_back(open_spiel::json::Value(format_slice("SH vs Reclaimed Forces", "All", all.sh_gaps_vs_rf)));
 
   summary_json["slices"] = open_spiel::json::Value(slices_arr);
+
+  // Rollout Audit Output
+  std::cout << "\n----------------------------------------------------------------------\n";
+  std::cout << "ROLLOUT AUDIT & VALIDITY (" << set_name << "):\n";
+  std::cout << "----------------------------------------------------------------------\n";
+  size_t total_sims = audit.total_simulations.load();
+  size_t term_exits = audit.terminal_exits.load();
+  size_t cap_exits = audit.step_cap_exits.load();
+  size_t empty_exits = audit.empty_legals_exits.load();
+  size_t total_resamples = audit.total_resample_calls.load();
+  size_t fallbacks = audit.resample_fallbacks.load();
+  double fallback_pct = total_resamples > 0 ? (100.0 * fallbacks / total_resamples) : 0.0;
+
+  std::cout << absl::StrFormat("  Total Simulations:        %zu\n", total_sims);
+  std::cout << absl::StrFormat("  Terminal Exits:           %zu (%5.2f%%)\n", term_exits, total_sims > 0 ? (100.0 * term_exits / total_sims) : 0.0);
+  std::cout << absl::StrFormat("  Step-Cap Exits (2500):    %zu\n", cap_exits);
+  std::cout << absl::StrFormat("  Empty Legal Exits:        %zu\n", empty_exits);
+  std::cout << absl::StrFormat("  Infostate Resamples:      %zu\n", total_resamples);
+  std::cout << absl::StrFormat("  True-State Fallbacks:     %zu (%5.2f%%)\n", fallbacks, fallback_pct);
+
+  open_spiel::json::Object audit_json;
+  audit_json["total_simulations"] = open_spiel::json::Value(static_cast<int64_t>(total_sims));
+  audit_json["terminal_exits"] = open_spiel::json::Value(static_cast<int64_t>(term_exits));
+  audit_json["step_cap_exits"] = open_spiel::json::Value(static_cast<int64_t>(cap_exits));
+  audit_json["empty_legals_exits"] = open_spiel::json::Value(static_cast<int64_t>(empty_exits));
+  audit_json["total_resample_calls"] = open_spiel::json::Value(static_cast<int64_t>(total_resamples));
+  audit_json["resample_fallbacks"] = open_spiel::json::Value(static_cast<int64_t>(fallbacks));
+  audit_json["resample_fallback_rate"] = open_spiel::json::Value(fallback_pct / 100.0);
+  summary_json["rollout_audit"] = open_spiel::json::Value(audit_json);
+
+  // Mechanism Tracking Output
+  std::cout << "\n----------------------------------------------------------------------\n";
+  std::cout << "MECHANISM TRACKING (" << set_name << "):\n";
+  std::cout << "----------------------------------------------------------------------\n";
+  open_spiel::json::Object mech_json;
+
+  size_t sb_n = audit.sb_rollouts.load();
+  size_t sb_play_n = audit.sb_played_rollouts.load();
+  size_t sb_trash_n = audit.sb_trash_vp_rollouts.load();
+  double sb_play_rate = sb_n > 0 ? (static_cast<double>(sb_play_n) / sb_n) : 0.0;
+  double sb_trash_rate = sb_n > 0 ? (static_cast<double>(sb_trash_n) / sb_n) : 0.0;
+  double mean_vp_sb = audit.count_eval_sb > 0 ? (audit.sum_final_vp_sb / audit.count_eval_sb) : 0.0;
+  double mean_vp_greedy = audit.count_eval_greedy > 0 ? (audit.sum_final_vp_greedy / audit.count_eval_greedy) : 0.0;
+
+  std::cout << "  Scientific Breakthrough (ID 11):\n";
+  std::cout << absl::StrFormat("    Card Played Rate:       %5.1f%% (%zu / %zu)\n", sb_play_rate * 100.0, sb_play_n, sb_n);
+  std::cout << absl::StrFormat("    Self-Trash for VP Rate: %5.1f%% (%zu / %zu)\n", sb_trash_rate * 100.0, sb_trash_n, sb_n);
+  std::cout << absl::StrFormat("    Mean Final VP:          %.3f (vs Greedy %.3f, Delta %+.3f)\n", mean_vp_sb, mean_vp_greedy, mean_vp_sb - mean_vp_greedy);
+  std::cout << "    VP Delta Breakdown by Source (SB vs Greedy):\n";
+
+  open_spiel::json::Object sb_mech;
+  sb_mech["total_rollouts"] = open_spiel::json::Value(static_cast<int64_t>(sb_n));
+  sb_mech["card_play_rate"] = open_spiel::json::Value(sb_play_rate);
+  sb_mech["trash_for_vp_rate"] = open_spiel::json::Value(sb_trash_rate);
+  sb_mech["mean_final_vp"] = open_spiel::json::Value(mean_vp_sb);
+  sb_mech["mean_final_vp_greedy"] = open_spiel::json::Value(mean_vp_greedy);
+  sb_mech["mean_final_vp_delta"] = open_spiel::json::Value(mean_vp_sb - mean_vp_greedy);
+
+  open_spiel::json::Object sb_vp_deltas;
+  std::set<std::string> all_sources;
+  for (const auto& [src, _] : audit.sum_vp_sb) all_sources.insert(src);
+  for (const auto& [src, _] : audit.sum_vp_greedy) all_sources.insert(src);
+  for (const auto& [src, _] : audit.sum_vp_sh) all_sources.insert(src);
+  for (const auto& [src, _] : audit.sum_vp_rf) all_sources.insert(src);
+
+  for (const auto& src : all_sources) {
+    double v_sb = (audit.count_eval_sb > 0 && audit.sum_vp_sb.count(src)) ? (audit.sum_vp_sb.at(src) / audit.count_eval_sb) : 0.0;
+    double v_gr = (audit.count_eval_greedy > 0 && audit.sum_vp_greedy.count(src)) ? (audit.sum_vp_greedy.at(src) / audit.count_eval_greedy) : 0.0;
+    double delta = v_sb - v_gr;
+    if (std::abs(delta) >= 0.005) {
+      std::cout << absl::StrFormat("      %-25s: %+.3f VP\n", src.c_str(), delta);
+      sb_vp_deltas[src] = open_spiel::json::Value(delta);
+    }
+  }
+  sb_mech["vp_delta_by_source"] = open_spiel::json::Value(sb_vp_deltas);
+  mech_json["scientific_breakthrough"] = open_spiel::json::Value(sb_mech);
+
+  size_t sh_n = audit.sh_rollouts.load();
+  size_t sh_play_n = audit.sh_played_rollouts.load();
+  double sh_play_rate = sh_n > 0 ? (static_cast<double>(sh_play_n) / sh_n) : 0.0;
+  double mean_vp_sh = audit.count_eval_sh > 0 ? (audit.sum_final_vp_sh / audit.count_eval_sh) : 0.0;
+
+  std::cout << "  Stitched Horror (ID 13):\n";
+  std::cout << absl::StrFormat("    Card Played Rate:       %5.1f%% (%zu / %zu)\n", sh_play_rate * 100.0, sh_play_n, sh_n);
+  std::cout << absl::StrFormat("    Mean Final VP:          %.3f (vs Greedy %.3f, Delta %+.3f)\n", mean_vp_sh, mean_vp_greedy, mean_vp_sh - mean_vp_greedy);
+  std::cout << "    VP Delta Breakdown by Source (SH vs Greedy):\n";
+
+  open_spiel::json::Object sh_mech;
+  sh_mech["total_rollouts"] = open_spiel::json::Value(static_cast<int64_t>(sh_n));
+  sh_mech["card_play_rate"] = open_spiel::json::Value(sh_play_rate);
+  sh_mech["mean_final_vp"] = open_spiel::json::Value(mean_vp_sh);
+  sh_mech["mean_final_vp_greedy"] = open_spiel::json::Value(mean_vp_greedy);
+  sh_mech["mean_final_vp_delta"] = open_spiel::json::Value(mean_vp_sh - mean_vp_greedy);
+
+  open_spiel::json::Object sh_vp_deltas;
+  for (const auto& src : all_sources) {
+    double v_sh = (audit.count_eval_sh > 0 && audit.sum_vp_sh.count(src)) ? (audit.sum_vp_sh.at(src) / audit.count_eval_sh) : 0.0;
+    double v_gr = (audit.count_eval_greedy > 0 && audit.sum_vp_greedy.count(src)) ? (audit.sum_vp_greedy.at(src) / audit.count_eval_greedy) : 0.0;
+    double delta = v_sh - v_gr;
+    if (std::abs(delta) >= 0.005) {
+      std::cout << absl::StrFormat("      %-25s: %+.3f VP\n", src.c_str(), delta);
+      sh_vp_deltas[src] = open_spiel::json::Value(delta);
+    }
+  }
+  sh_mech["vp_delta_by_source"] = open_spiel::json::Value(sh_vp_deltas);
+  mech_json["stitched_horror"] = open_spiel::json::Value(sh_mech);
+
+  summary_json["mechanism_tracking"] = open_spiel::json::Value(mech_json);
+
+  // Persist detailed per-world rollout records to disk
+  if (!out_dir.empty()) {
+    std::string det_path = out_dir + "/a4_rollouts_" + set_name + "_detailed.json";
+    open_spiel::json::Array det_arr;
+    for (const auto& res : results) {
+      open_spiel::json::Object r_obj;
+      r_obj["root_id"] = open_spiel::json::Value(static_cast<int64_t>(res.root_id));
+      r_obj["round"] = open_spiel::json::Value(static_cast<int64_t>(res.round));
+      r_obj["round_band"] = open_spiel::json::Value(res.round_band);
+      r_obj["greedy_choice"] = open_spiel::json::Value(static_cast<int64_t>(res.greedy_choice));
+      r_obj["q_greedy"] = open_spiel::json::Value(res.q_greedy);
+      r_obj["sb_legal"] = open_spiel::json::Value(res.sb_legal);
+      if (res.sb_legal) {
+        r_obj["sb_action"] = open_spiel::json::Value(static_cast<int64_t>(res.sb_action));
+        r_obj["q_sb"] = open_spiel::json::Value(res.q_sb);
+        r_obj["sb_gap_vs_greedy"] = open_spiel::json::Value(res.sb_gap_vs_greedy);
+      }
+      r_obj["sh_legal"] = open_spiel::json::Value(res.sh_legal);
+      if (res.sh_legal) {
+        r_obj["sh_action"] = open_spiel::json::Value(static_cast<int64_t>(res.sh_action));
+        r_obj["q_sh"] = open_spiel::json::Value(res.q_sh);
+        r_obj["sh_gap_vs_greedy"] = open_spiel::json::Value(res.sh_gap_vs_greedy);
+      }
+      r_obj["rf_legal"] = open_spiel::json::Value(res.rf_legal);
+      if (res.rf_legal) {
+        r_obj["rf_action"] = open_spiel::json::Value(static_cast<int64_t>(res.rf_action));
+        r_obj["q_rf"] = open_spiel::json::Value(res.q_rf);
+      }
+
+      open_spiel::json::Object worlds_obj;
+      for (const auto& [act, wlist] : res.detailed_world_rollouts) {
+        open_spiel::json::Array w_arr;
+        for (const auto& w : wlist) {
+          open_spiel::json::Object w_item;
+          w_item["world_idx"] = open_spiel::json::Value(static_cast<int64_t>(w.world_idx));
+          w_item["return"] = open_spiel::json::Value(w.return_val);
+          w_item["is_terminal"] = open_spiel::json::Value(w.is_terminal);
+          w_item["exit_reason"] = open_spiel::json::Value(w.exit_reason);
+          w_item["steps"] = open_spiel::json::Value(static_cast<int64_t>(w.steps));
+          w_item["final_vp"] = open_spiel::json::Value(static_cast<int64_t>(w.final_vp));
+          w_item["resample_fallback"] = open_spiel::json::Value(w.resample_fallback);
+          w_item["sb_played"] = open_spiel::json::Value(w.sb_played);
+          w_item["sh_played"] = open_spiel::json::Value(w.sh_played);
+          w_item["sb_trashed_for_vp"] = open_spiel::json::Value(w.sb_trashed_for_vp);
+          open_spiel::json::Object vps_obj;
+          for (const auto& [src, delta] : w.vp_by_source) {
+            vps_obj[src] = open_spiel::json::Value(static_cast<int64_t>(delta));
+          }
+          w_item["vp_by_source"] = open_spiel::json::Value(vps_obj);
+          w_arr.push_back(open_spiel::json::Value(w_item));
+        }
+        worlds_obj[std::to_string(act)] = open_spiel::json::Value(w_arr);
+      }
+      r_obj["worlds"] = open_spiel::json::Value(worlds_obj);
+      det_arr.push_back(open_spiel::json::Value(r_obj));
+    }
+    std::ofstream det_f(det_path);
+    det_f << open_spiel::json::ToString(open_spiel::json::Value(det_arr));
+    det_f.close();
+    std::cout << "[DETAILS PERSISTED] Detailed per-world rollouts saved to: " << det_path << "\n";
+  }
+
   return summary_json;
 }
 
@@ -1075,6 +1429,45 @@ int main(int argc, char** argv) {
     evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(coords[e], 10.0f);
   }
 
+  if (absl::GetFlag(FLAGS_confirmation_only)) {
+    std::cout << "\n======================================================================\n";
+    std::cout << "[CONFIRMATION ONLY MODE] Running Instrumented Rollouts on Confirmation Roots\n";
+    std::cout << "======================================================================\n";
+    std::string conf_json_path = out_dir + "/roots_confirmation.json";
+    if (!std::filesystem::exists(conf_json_path)) {
+      open_spiel::SpielFatalError("roots_confirmation.json does not exist in " + out_dir);
+    }
+    std::vector<RootRecord> confirmation_roots = LoadRootsFromJsonFile(conf_json_path);
+
+    AuditCounters conf_audit;
+    std::vector<PerRootRolloutResult> confirmation_rollouts = RunPairedRolloutsForRoots(
+        game, evaluators, confirmation_roots, num_rollouts, num_threads, master_seed + 1000, "confirmation", conf_audit);
+
+    open_spiel::json::Object conf_summary_json = SummarizeRolloutMetrics(confirmation_rollouts, conf_audit, "confirmation", out_dir);
+    std::string a4_summary_path = out_dir + "/a4_rollouts_confirmation.json";
+    std::ofstream a4_f(a4_summary_path);
+    a4_f << open_spiel::json::ToString(open_spiel::json::Value(conf_summary_json));
+    a4_f.close();
+
+    // Update receipt if exists
+    std::string receipt_path = out_dir + "/tleilaxu_card_check_receipt.json";
+    if (std::filesystem::exists(receipt_path)) {
+      std::ifstream rf_in(receipt_path);
+      std::stringstream ss;
+      ss << rf_in.rdbuf();
+      auto r_val = open_spiel::json::FromString(ss.str());
+      if (r_val.has_value()) {
+        auto r_obj = r_val.value().GetObject();
+        r_obj["a4_confirmation_summary"] = open_spiel::json::Value(conf_summary_json);
+        std::ofstream rf_out(receipt_path);
+        rf_out << open_spiel::json::ToString(open_spiel::json::Value(r_obj));
+        rf_out.close();
+      }
+    }
+    std::cout << "\n[CONFIRMATION COMPLETE] Master receipt updated: " << receipt_path << "\n";
+    return 0;
+  }
+
   // A1: Collect Discovery and Confirmation Roots (load if already exist)
   std::vector<RootRecord> discovery_roots;
   std::string disc_json_path = out_dir + "/roots_discovery.json";
@@ -1106,10 +1499,11 @@ int main(int argc, char** argv) {
   a2_f.close();
 
   // A3: Paired Rollouts on Discovery Set
+  AuditCounters disc_audit;
   std::vector<PerRootRolloutResult> discovery_rollouts = RunPairedRolloutsForRoots(
-      game, evaluators, discovery_roots, num_rollouts, num_threads, master_seed, "discovery");
+      game, evaluators, discovery_roots, num_rollouts, num_threads, master_seed, "discovery", disc_audit);
 
-  open_spiel::json::Object disc_summary_json = SummarizeRolloutMetrics(discovery_rollouts, "discovery");
+  open_spiel::json::Object disc_summary_json = SummarizeRolloutMetrics(discovery_rollouts, disc_audit, "discovery", out_dir);
   std::string a3_summary_path = out_dir + "/a3_rollouts_discovery.json";
   std::ofstream a3_f(a3_summary_path);
   a3_f << open_spiel::json::ToString(open_spiel::json::Value(disc_summary_json));
@@ -1134,10 +1528,11 @@ int main(int argc, char** argv) {
     std::cout << "\n======================================================================\n";
     std::cout << "[A4 CONFIRMATION] Running Confirmation Paired Rollouts...\n";
     std::cout << "======================================================================\n";
+    AuditCounters conf_audit;
     std::vector<PerRootRolloutResult> confirmation_rollouts = RunPairedRolloutsForRoots(
-        game, evaluators, confirmation_roots, num_rollouts, num_threads, master_seed + 1000, "confirmation");
+        game, evaluators, confirmation_roots, num_rollouts, num_threads, master_seed + 1000, "confirmation", conf_audit);
 
-    conf_summary_json = SummarizeRolloutMetrics(confirmation_rollouts, "confirmation");
+    conf_summary_json = SummarizeRolloutMetrics(confirmation_rollouts, conf_audit, "confirmation", out_dir);
     std::string a4_summary_path = out_dir + "/a4_rollouts_confirmation.json";
     std::ofstream a4_f(a4_summary_path);
     a4_f << open_spiel::json::ToString(open_spiel::json::Value(conf_summary_json));
