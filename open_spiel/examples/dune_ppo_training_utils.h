@@ -95,6 +95,10 @@ struct PpoTransition {
   // Monte Carlo return (lambda=1, gamma=1) and trajectory third (0=first, 1=mid, 2=last) for value calibration
   float mc_return = 0.0f;
   int trajectory_third = -1;
+  // Targeted buy exploration
+  int targeted_buy_card = 0;
+  int targeted_buy_round = 0;
+  bool targeted_buy_forced = false;
 };
 
 inline bool IsAcquisitionAction(Action a) {

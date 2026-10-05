@@ -72,12 +72,19 @@
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "dune_opponent_pool.h"
 #include "dune_compound_turn_search.h"
+#include "dune_targeted_buy.h"
 #include "open_spiel/utils/json.h"
 #endif
 
 ABSL_FLAG(std::string, game, "dune_imperium", "The OpenSpiel game to train.");
 ABSL_FLAG(bool, single_learner_training, false,
           "Enable single-seat rotating learner collection for opponent-pool study.");
+ABSL_FLAG(bool, targeted_buy_exploration, false,
+          "Enable targeted-buy exploration for Scientific Breakthrough and Stitched Horror.");
+ABSL_FLAG(int, targeted_buy_quota_per_card, 8,
+          "Targeted buy quota per card per update (default 8 distinct games).");
+ABSL_FLAG(int, targeted_buy_max_round, 6,
+          "Maximum round for targeted buy exploration (default 6, inclusive).");
 ABSL_FLAG(std::string, training_opponent_pool, "",
           "Comma-separated list of frozen opponent checkpoint paths for training pool.");
 ABSL_FLAG(int, threads, 64, "Rollout worker threads.");
@@ -966,6 +973,7 @@ struct WorkerStats {
 
   CardMetrics card11_metrics;
   CardMetrics card13_metrics;
+  open_spiel::dune_targeted_buy::TargetedBuyTelemetry targeted_buy_telemetry;
 
   // Reward penalties telemetry
   uint64_t specimen_conversions = 0;
@@ -2348,6 +2356,10 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     }
   }
 
+  const int designated_explore_seat = single_learner ? learner_seat : static_cast<int>(episode_id % 4);
+  bool episode_forced_card11 = false;
+  bool episode_forced_card13 = false;
+
   while (true) {
     std::unique_ptr<State> state = game.NewInitialState();
     bool provides_info_state_tensor =
@@ -2750,6 +2762,79 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
             }
             if (local_stats != nullptr) {
               ++local_stats->forced_buys;
+            }
+          }
+        }
+      }
+
+      int targeted_buy_card_id = 0;
+      bool is_targeted_forced_buy = false;
+      if (dune_state != nullptr) {
+        int cur_round = dune_state->GetCurrentRound();
+        Action buy_act_11 = open_spiel::kInvalidAction;
+        int slot_11 = -1;
+        bool legal_11 = open_spiel::dune_targeted_buy::FindLegalTleilaxuBuyAction(
+            *dune_state, actions, open_spiel::dune_targeted_buy::kScientificBreakthroughTleilaxuId, &slot_11, &buy_act_11);
+
+        Action buy_act_13 = open_spiel::kInvalidAction;
+        int slot_13 = -1;
+        bool legal_13 = open_spiel::dune_targeted_buy::FindLegalTleilaxuBuyAction(
+            *dune_state, actions, open_spiel::dune_targeted_buy::kStitchedHorrorTleilaxuId, &slot_13, &buy_act_13);
+
+        auto forcing_decision = open_spiel::dune_targeted_buy::DecideTargetedForcedBuy(
+            open_spiel::dune_targeted_buy::g_targeted_buy_tracker,
+            *dune_state,
+            current_player,
+            designated_explore_seat,
+            cur_round,
+            actions,
+            legal_probabilities,
+            episode_forced_card11,
+            episode_forced_card13,
+            policy_rng[current_player]);
+
+        if (forcing_decision.forced) {
+          action = forcing_decision.forced_action;
+          is_forced_buy = true;
+          is_targeted_forced_buy = true;
+          targeted_buy_card_id = forcing_decision.forced_card_tleilaxu_id;
+          old_log_prob = forcing_decision.old_log_prob;
+        }
+
+        if (local_stats != nullptr && current_player == designated_explore_seat) {
+          int r_idx = std::clamp(cur_round, 1, 10);
+          if (legal_11 && (!is_targeted_forced_buy || targeted_buy_card_id != open_spiel::dune_targeted_buy::kScientificBreakthroughTleilaxuId)) {
+            double p11 = 0.0;
+            for (size_t act_i = 0; act_i < actions.size(); ++act_i) {
+              if (actions[act_i] == buy_act_11 && act_i < legal_probabilities.size()) {
+                p11 = legal_probabilities[act_i];
+                break;
+              }
+            }
+            local_stats->targeted_buy_telemetry.unforced_opps[0][r_idx]++;
+            local_stats->targeted_buy_telemetry.unforced_sum_prob[0][r_idx] += p11;
+            if (action == buy_act_11) {
+              local_stats->targeted_buy_telemetry.unforced_buys[0][r_idx]++;
+              if (!is_targeted_forced_buy) {
+                targeted_buy_card_id = open_spiel::dune_targeted_buy::kScientificBreakthroughTleilaxuId;
+              }
+            }
+          }
+          if (legal_13 && (!is_targeted_forced_buy || targeted_buy_card_id != open_spiel::dune_targeted_buy::kStitchedHorrorTleilaxuId)) {
+            double p13 = 0.0;
+            for (size_t act_i = 0; act_i < actions.size(); ++act_i) {
+              if (actions[act_i] == buy_act_13 && act_i < legal_probabilities.size()) {
+                p13 = legal_probabilities[act_i];
+                break;
+              }
+            }
+            local_stats->targeted_buy_telemetry.unforced_opps[1][r_idx]++;
+            local_stats->targeted_buy_telemetry.unforced_sum_prob[1][r_idx] += p13;
+            if (action == buy_act_13) {
+              local_stats->targeted_buy_telemetry.unforced_buys[1][r_idx]++;
+              if (!is_targeted_forced_buy) {
+                targeted_buy_card_id = open_spiel::dune_targeted_buy::kStitchedHorrorTleilaxuId;
+              }
             }
           }
         }
@@ -3213,6 +3298,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.behavior_physical_batch_row = result.physical_batch_row;
         transition.candidate_data = std::move(cand_data);
         transition.mask_policy_loss = false;
+        transition.targeted_buy_card = targeted_buy_card_id;
+        transition.targeted_buy_round = (dune_state != nullptr) ? dune_state->GetCurrentRound() : 0;
+        transition.targeted_buy_forced = is_targeted_forced_buy;
         transition.privileged_appendix = std::move(pre_action_privileged_appendix);
         transition.is_high_stakes = pre_action_is_high_stakes;
         trajectory->push_back(std::move(transition));
@@ -3459,6 +3547,17 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       it->return_value = advantage + it->value;
       last_value[p] = it->value;
       last_gae[p] = advantage;
+
+      if (local_stats != nullptr && it->targeted_buy_card > 0) {
+        int c_idx = (it->targeted_buy_card == open_spiel::dune_targeted_buy::kScientificBreakthroughTleilaxuId) ? 0 : 1;
+        int r_idx = std::clamp(it->targeted_buy_round, 1, 10);
+        if (it->targeted_buy_forced) {
+          local_stats->targeted_buy_telemetry.forced_buys[c_idx][r_idx]++;
+          local_stats->targeted_buy_telemetry.forced_sum_adv[c_idx][r_idx] += advantage;
+        } else {
+          local_stats->targeted_buy_telemetry.unforced_sum_adv[c_idx][r_idx] += advantage;
+        }
+      }
     }
 
     std::vector<std::vector<size_t>> player_trans_indices(game.NumPlayers());
@@ -3565,6 +3664,13 @@ struct CollectResult {
 
   CardMetrics card11_metrics;
   CardMetrics card13_metrics;
+  open_spiel::dune_targeted_buy::TargetedBuyTelemetry targeted_buy_telemetry;
+  int targeted_buy_achieved_card11 = 0;
+  int targeted_buy_achieved_card13 = 0;
+  int targeted_buy_designated_opps_card11 = 0;
+  int targeted_buy_designated_opps_card13 = 0;
+  int targeted_buy_total_opps_card11 = 0;
+  int targeted_buy_total_opps_card13 = 0;
 
   // Reward penalties telemetry
   uint64_t specimen_conversions = 0;
@@ -3739,6 +3845,11 @@ CollectResult CollectRollout(const Game* game,
                              const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators = {},
                              int global_update = 0) {
   CollectResult result;
+  open_spiel::dune_targeted_buy::g_targeted_buy_tracker.Reset(
+      absl::GetFlag(FLAGS_targeted_buy_exploration),
+      absl::GetFlag(FLAGS_targeted_buy_quota_per_card),
+      absl::GetFlag(FLAGS_targeted_buy_quota_per_card),
+      absl::GetFlag(FLAGS_targeted_buy_max_round));
   PpoRolloutBuffer rollout_buffer;
   std::atomic<bool> stop_collection{false};
   std::vector<WorkerStats> worker_stats(num_threads);
@@ -3864,7 +3975,15 @@ CollectResult CollectRollout(const Game* game,
 
     result.card11_metrics += stats.card11_metrics;
     result.card13_metrics += stats.card13_metrics;
+    result.targeted_buy_telemetry += stats.targeted_buy_telemetry;
   }
+
+  result.targeted_buy_achieved_card11 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.achieved_games_card11.load(std::memory_order_relaxed);
+  result.targeted_buy_achieved_card13 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.achieved_games_card13.load(std::memory_order_relaxed);
+  result.targeted_buy_designated_opps_card11 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.designated_opps_card11.load(std::memory_order_relaxed);
+  result.targeted_buy_designated_opps_card13 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.designated_opps_card13.load(std::memory_order_relaxed);
+  result.targeted_buy_total_opps_card11 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.total_opps_card11.load(std::memory_order_relaxed);
+  result.targeted_buy_total_opps_card13 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.total_opps_card13.load(std::memory_order_relaxed);
 
   // Verify shaped reward conservation invariant
   if (std::abs(result.conflict_vp_generated - (result.conflict_vp_attributed + result.conflict_vp_unattributed)) > 1e-4) {
@@ -13925,6 +14044,40 @@ int main(int argc, char** argv) {
       if (absl::GetFlag(FLAGS_purchase_exploration) || current_collect.forced_buys > 0) {
         std::cout << absl::StrFormat("  [Purchase Exploration] Forced buys: %d\n", current_collect.forced_buys);
       }
+      if (absl::GetFlag(FLAGS_targeted_buy_exploration) ||
+          current_collect.targeted_buy_achieved_card11 > 0 ||
+          current_collect.targeted_buy_achieved_card13 > 0 ||
+          current_collect.targeted_buy_designated_opps_card11 > 0 ||
+          current_collect.targeted_buy_designated_opps_card13 > 0) {
+        std::cout << absl::StrFormat(
+            "  [Targeted Buy Exploration] Biased exploration active (policy log-prob retained)\n"
+            "    Scientific Breakthrough (Tleilaxu 11 / Card 118): Quota: %d/%d distinct games | Designated Opps (R<=%d): %d | Total Opps: %d\n"
+            "    Stitched Horror         (Tleilaxu 13 / Card 120): Quota: %d/%d distinct games | Designated Opps (R<=%d): %d | Total Opps: %d\n",
+            current_collect.targeted_buy_achieved_card11, absl::GetFlag(FLAGS_targeted_buy_quota_per_card),
+            absl::GetFlag(FLAGS_targeted_buy_max_round), current_collect.targeted_buy_designated_opps_card11,
+            current_collect.targeted_buy_total_opps_card11,
+            current_collect.targeted_buy_achieved_card13, absl::GetFlag(FLAGS_targeted_buy_quota_per_card),
+            absl::GetFlag(FLAGS_targeted_buy_max_round), current_collect.targeted_buy_designated_opps_card13,
+            current_collect.targeted_buy_total_opps_card13);
+
+        std::cout << "    Breakdown by Card and Round:\n";
+        for (int c = 0; c < 2; ++c) {
+          std::string card_name = (c == 0) ? "Scientific Breakthrough" : "Stitched Horror";
+          for (int r = 1; r <= 6; ++r) {
+            uint64_t u_opps = current_collect.targeted_buy_telemetry.unforced_opps[c][r];
+            double u_prob = (u_opps > 0) ? (current_collect.targeted_buy_telemetry.unforced_sum_prob[c][r] / u_opps) : 0.0;
+            uint64_t u_buys = current_collect.targeted_buy_telemetry.unforced_buys[c][r];
+            double u_adv = (u_buys > 0) ? (current_collect.targeted_buy_telemetry.unforced_sum_adv[c][r] / u_buys) : 0.0;
+            uint64_t f_buys = current_collect.targeted_buy_telemetry.forced_buys[c][r];
+            double f_adv = (f_buys > 0) ? (current_collect.targeted_buy_telemetry.forced_sum_adv[c][r] / f_buys) : 0.0;
+            if (u_opps > 0 || f_buys > 0) {
+              std::cout << absl::StrFormat(
+                  "      [%s R%d] Unforced: %d opps, avg_prob=%.4f, %d buys, avg_adv=%+.4f | Forced: %d buys, avg_adv=%+.4f\n",
+                  card_name, r, u_opps, u_prob, u_buys, u_adv, f_buys, f_adv);
+            }
+          }
+        }
+      }
     }
 
     if (search_lambda > 0.0 && search_buffer.Size() > 0) {
@@ -14000,11 +14153,12 @@ int main(int argc, char** argv) {
 
     last_completed_update = update;
 
+    int interval = absl::GetFlag(FLAGS_checkpoint_interval);
     bool cutoff_reached = false;
     if (cutoff_epoch > 0.0) {
       double now_epoch = std::chrono::duration<double>(
           std::chrono::system_clock::now().time_since_epoch()).count();
-      if (now_epoch >= cutoff_epoch) {
+      if (now_epoch >= cutoff_epoch && (interval <= 0 || update % interval == 0)) {
         cutoff_reached = true;
       }
     }

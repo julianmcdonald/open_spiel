@@ -384,6 +384,10 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetTopdeckAcquireForTesting, py::arg("player"))
       .def("get_reveal_done", &DuneImperiumState::GetRevealDoneForTesting,
            py::arg("player"))
+      .def("get_pending_armand_reveal_trash_active",
+           &DuneImperiumState::GetPendingArmandRevealTrashActive)
+      .def("get_pending_armand_reveal_trash_player",
+           &DuneImperiumState::GetPendingArmandRevealTrashPlayer)
       .def("get_played_agent_cards",
            &DuneImperiumState::GetPlayedAgentCardsForTesting, py::arg("player"),
            py::return_value_policy::reference_internal)

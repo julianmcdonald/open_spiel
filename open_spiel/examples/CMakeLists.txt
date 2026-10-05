@@ -502,6 +502,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_test(NAME dune_eval_action_selection_test
            COMMAND dune_eval_action_selection_test)
 
+  add_executable(dune_targeted_buy_test dune_targeted_buy_test.cc
+    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_targeted_buy_test ${TORCH_LIBRARIES})
+  add_test(NAME dune_targeted_buy_test COMMAND dune_targeted_buy_test)
+
+
   add_executable(dune_offline_utils_test dune_offline_utils_test.cc
     ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_utils_test ${TORCH_LIBRARIES})
