@@ -1058,6 +1058,51 @@ void TestSamplePolicyDistributionWrapperParity() {
   } TEST_END();
 }
 
+void TestRandomTrainingLeaderDraft() {
+  TEST_BEGIN("Training drafts sample uniformly and retain policy learning probabilities") {
+    const bool saved = absl::GetFlag(FLAGS_random_leader_draft);
+    UTILS_CHECK(saved);
+    auto game = LoadGame("dune_imperium");
+    auto state = game->NewInitialState();
+    while (state->IsChanceNode()) {
+      state->ApplyAction(state->ChanceOutcomes().front().first);
+    }
+    auto* dune = dynamic_cast<DuneImperiumState*>(state.get());
+    UTILS_CHECK(dune != nullptr);
+    CHECK_EQ(static_cast<int>(dune->phase()), static_cast<int>(GamePhase::kLeaderDraft));
+    const auto legal = state->LegalActions();
+    UTILS_CHECK(legal.size() > 1);
+    std::vector<float> logits(game->NumDistinctActions(), -10.0f);
+    logits[legal.front()] = 10.0f;
+    std::vector<int> counts(legal.size(), 0);
+    std::mt19937_64 rng(12345);
+    for (int i = 0; i < 12000; ++i) {
+      std::vector<double> probs;
+      const auto sample = SampleTrainingPolicyDistribution(*state, &rng, logits, legal, &probs);
+      ++counts[sample.chosen_index];
+      CHECK_EQ(sample.action, legal[sample.chosen_index]);
+      CHECK_NEAR(sample.chosen_log_probability, std::log(probs[sample.chosen_index]), 1e-6);
+    }
+    const double expected = 12000.0 / legal.size();
+    for (int count : counts) UTILS_CHECK(std::abs(count - expected) < expected * 0.1);
+
+    // Flag-off drafting and all post-draft choices preserve policy and RNG parity.
+    for (bool enabled : {false, true}) {
+      absl::SetFlag(&FLAGS_random_leader_draft, enabled);
+      if (enabled) dune->SetPhaseForTesting(GamePhase::kAgentTurns);
+      std::mt19937_64 train_rng(987), play_rng(987);
+      std::vector<double> train_probs, play_probs;
+      const auto train = SampleTrainingPolicyDistribution(*state, &train_rng, logits, legal, &train_probs);
+      const auto play = SamplePolicyDistribution(&play_rng, logits, legal, &play_probs);
+      CHECK_EQ(train.action, play.action);
+      CHECK_EQ(train.chosen_log_probability, play.chosen_log_probability);
+      UTILS_CHECK(train_probs == play_probs);
+      CHECK_EQ(train_rng(), play_rng());
+    }
+    absl::SetFlag(&FLAGS_random_leader_draft, saved);
+  } TEST_END();
+}
+
 // PPO finding 2: the [18B Aux] metrics existed only on stdout.
 static PpoUpdateStats MakeAuxDiagnosticsStats() {
   PpoUpdateStats stats;
@@ -9387,6 +9432,7 @@ int main() {
   TestSamplePolicyActionDefaultCapParity();
   TestSamplePolicyActionTinyProbabilityNotFloored();
   TestSamplePolicyDistributionWrapperParity();
+  TestRandomTrainingLeaderDraft();
   TestDiagnosticsPersistAuxMetrics();
   TestDiagnosticsCsvSchemaGate();
   TestDiagPrepassCadenced();

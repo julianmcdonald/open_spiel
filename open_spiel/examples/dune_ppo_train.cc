@@ -2219,6 +2219,7 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
     manifest_obj["plot_intrigue_exemption_threshold"] = static_cast<int64_t>(absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold));
     manifest_obj["rollout_games"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
+    manifest_obj["random_leader_draft"] = absl::GetFlag(FLAGS_random_leader_draft);
     if (!g_reward_transition_source_fingerprint.empty()) {
       manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
       if (g_reward_transition_source_update >= 0) {
@@ -2722,9 +2723,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       std::vector<double> legal_probabilities;
       std::optional<std::vector<double>> vrpo_legal_probabilities;
       const PolicyDistributionSample policy_sample =
-          SamplePolicyDistribution(&policy_rng[current_player], logits,
-                                   actions,
-                                   &legal_probabilities);
+          SampleTrainingPolicyDistribution(*state, &policy_rng[current_player],
+                                           logits, actions, &legal_probabilities);
       if (vrpo_episode != nullptr && is_learner) {
         vrpo_legal_probabilities = legal_probabilities;
       }
@@ -10053,6 +10053,7 @@ int main(int argc, char** argv) {
       manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
     }
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
+    manifest_obj["random_leader_draft"] = absl::GetFlag(FLAGS_random_leader_draft);
     // PWO-5 Appendix A.1 note 3: the same block the checkpoint writer emits, so
     // the bootstrap manifest an arm resumes FROM already carries the contract.
     if (g_pwo5_manifest_active) {

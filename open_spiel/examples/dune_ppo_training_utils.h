@@ -37,6 +37,7 @@ ABSL_DECLARE_FLAG(double, search_target_max_kl);
 ABSL_DECLARE_FLAG(bool, critic_keeps_training);
 ABSL_DECLARE_FLAG(bool, privileged_critic);
 ABSL_DECLARE_FLAG(bool, purchase_exploration);
+ABSL_DECLARE_FLAG(bool, random_leader_draft);
 ABSL_DECLARE_FLAG(double, logit_penalty_coef);
 ABSL_DECLARE_FLAG(bool, search_aux_anchoring);
 ABSL_DECLARE_FLAG(double, search_aux_beta);
@@ -59,6 +60,13 @@ namespace open_spiel {
 
 inline constexpr int kPrivilegedCriticAppendixSize = 3432;
 inline constexpr int kPrivilegedCriticInformationStateSize = 12614;
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+PolicyDistributionSample SampleTrainingPolicyDistribution(
+    const State& state, std::mt19937_64* rng,
+    const std::vector<float>& logits, const std::vector<Action>& legal_actions,
+    std::vector<double>* legal_probabilities);
+#endif
 
 // Define PpoTransition here so it is shared.
 struct PpoTransition {

@@ -78,6 +78,10 @@ ABSL_FLAG(bool, privileged_critic, false,
           "Feed privileged opponent features to central critic in separate actor-critic.");
 ABSL_FLAG(bool, purchase_exploration, false,
           "Explore reveal purchases in selected training games.");
+ABSL_FLAG(bool, random_leader_draft, true,
+          "Uniformly sample legal leaders during PPO training, retaining the "
+          "policy log probability for outcome-based draft learning. "
+          "This is biased exploration; evaluation and play are unaffected.");
 ABSL_FLAG(double, logit_penalty_coef, 0.0,
           "Coefficient for precap logit penalty on nontrivial decisions.");
 ABSL_FLAG(bool, search_aux_anchoring, false,
@@ -131,6 +135,29 @@ ABSL_FLAG(std::string, phase_timing_mode, "off",
 #endif
 
 namespace open_spiel {
+
+#ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+PolicyDistributionSample SampleTrainingPolicyDistribution(
+    const State& state, std::mt19937_64* rng,
+    const std::vector<float>& logits, const std::vector<Action>& legal_actions,
+    std::vector<double>* legal_probabilities) {
+  auto sample = SamplePolicyDistribution(rng, logits, legal_actions,
+                                        legal_probabilities);
+  const auto* dune_state =
+      dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  if (absl::GetFlag(FLAGS_random_leader_draft) && dune_state != nullptr &&
+      dune_state->phase() == dune_imperium::GamePhase::kLeaderDraft) {
+    std::uniform_int_distribution<size_t> pick(0, legal_actions.size() - 1);
+    sample.chosen_index = pick(*rng);
+    sample.action = legal_actions[sample.chosen_index];
+    // Match forced-buy exploration: learn preferences from outcomes without
+    // training the draft policy toward the uniform behavior distribution.
+    sample.chosen_log_probability = static_cast<float>(
+        std::log((*legal_probabilities)[sample.chosen_index]));
+  }
+  return sample;
+}
+#endif
 
 // PWO-5 gate 2 item (b). The term is SUBTRACTED, so a positive penalty lowers
 // the reward. The range predicate is the shared 741-752 one, never an inline
@@ -1218,6 +1245,7 @@ void SaveDualCheckpoint(
     manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
     manifest_obj["plot_intrigue_exemption_threshold"] = static_cast<int64_t>(absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold));
     manifest_obj["rollout_games"] = static_cast<int64_t>(absl::GetFlag(FLAGS_rollout_games));
+    manifest_obj["random_leader_draft"] = absl::GetFlag(FLAGS_random_leader_draft);
 
     if (!g_reward_transition_source_fingerprint.empty()) {
       manifest_obj["reward_transition_source_fingerprint"] = g_reward_transition_source_fingerprint;
