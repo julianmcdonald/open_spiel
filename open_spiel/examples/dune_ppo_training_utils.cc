@@ -1,6 +1,7 @@
 #include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
 #include "dune_search_routing.h"  // DuneDecisionRole, for the PWO-5 canary role order
+#include "dune_targeted_buy.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/utils/json.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -2465,6 +2466,80 @@ PpoUpdateStats TrainPpoUpdate(
   }
   double weighted_reverse_kl_sum = 0.0;
 
+  // Step 3 update-path telemetry: collect forced row indices and pre-update log probabilities.
+  std::vector<size_t> forced_indices;
+  for (size_t i = 0; i < batch.size(); ++i) {
+    if (batch[i].targeted_buy_forced) {
+      forced_indices.push_back(i);
+    }
+  }
+
+  auto compute_forced_log_probs = [&](const std::vector<size_t>& indices) -> std::vector<float> {
+    const int64_t num_forced = static_cast<int64_t>(indices.size());
+    if (num_forced == 0) return {};
+
+    auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32);
+    auto cpu_bool = torch::TensorOptions().dtype(torch::kBool);
+    auto cpu_long = torch::TensorOptions().dtype(torch::kInt64);
+
+    torch::Tensor f_states = torch::empty({num_forced, obs_size}, cpu_float);
+    torch::Tensor f_masks = torch::zeros({num_forced, action_dim}, cpu_bool);
+    torch::Tensor f_actions = torch::empty({num_forced}, cpu_long);
+
+    float* f_states_ptr = f_states.data_ptr<float>();
+    bool* f_masks_ptr = f_masks.data_ptr<bool>();
+    int64_t* f_actions_ptr = f_actions.data_ptr<int64_t>();
+
+    std::vector<const dune_semantic::CandidateActionData*> f_candidate_actions(num_forced, nullptr);
+
+    for (int64_t i = 0; i < num_forced; ++i) {
+      const auto& trans = batch[indices[i]];
+      std::memcpy(f_states_ptr + i * obs_size, trans.state.data(), obs_size * sizeof(float));
+      for (Action a : trans.legal_actions) {
+        if (a >= 0 && a < action_dim) {
+          f_masks_ptr[i * action_dim + a] = true;
+        }
+      }
+      f_actions_ptr[i] = trans.action;
+      f_candidate_actions[i] = &trans.candidate_data;
+    }
+
+    torch::Tensor dev_states = f_states.to(device);
+    torch::Tensor dev_masks = f_masks.to(device);
+    torch::Tensor dev_actions = f_actions.to(device);
+
+    torch::NoGradGuard no_grad;
+    bool was_training = model->is_training();
+    model->eval();
+
+    AutocastGuard autocast_guard(c10::DeviceType::CUDA, device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp));
+
+    auto outputs = model->forward(dev_states);
+    if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+      dune_semantic::ApplySemanticScorerBatch(
+          model->semantic_scorer_, outputs.trunk, f_candidate_actions, outputs.logits, device);
+    }
+
+    torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, dev_masks, logit_cap);
+    torch::Tensor masked_logits = logits.masked_fill(dev_masks.logical_not(), -1e9f);
+    torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+    torch::Tensor selected_log_probs =
+        log_probs.gather(1, dev_actions.unsqueeze(1)).squeeze(1).to(torch::kCPU);
+
+    if (was_training) {
+      model->train();
+    }
+
+    std::vector<float> result(num_forced);
+    std::memcpy(result.data(), selected_log_probs.data_ptr<float>(), num_forced * sizeof(float));
+    return result;
+  };
+
+  std::vector<float> log_pi_before;
+  if (!forced_indices.empty()) {
+    log_pi_before = compute_forced_log_probs(forced_indices);
+  }
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
@@ -2803,6 +2878,22 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor mean = nontrivial_adv.mean();
             torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
             mb_adv = (mb_advantages - mean) / std;
+
+            float mb_mean_val = mean.item<float>();
+            float mb_std_val = std.item<float>();
+            for (int64_t i = 0; i < mb_len; ++i) {
+              auto& trans = batch[mb_indices[i]];
+              if (trans.targeted_buy_forced) {
+                if (epoch == 0) {
+                  trans.norm_advantage = (trans.advantage - mb_mean_val) / mb_std_val;
+                }
+                open_spiel::dune_targeted_buy::RecordForcedNormalization(
+                    global_update, epoch, mb_index,
+                    trans.targeted_buy_card, trans.targeted_buy_round,
+                    trans.gae_advantage, trans.advantage, trans.mc_return, trans.value,
+                    mb_mean_val, mb_std_val);
+              }
+            }
           }
         }
         mb_adv = mb_adv.detach();
@@ -3018,6 +3109,26 @@ PpoUpdateStats TrainPpoUpdate(
     stats.epoch_kls.push_back(ep_kl);
 
     if (stats.early_stopped) break;
+  }
+
+  // Step 3 update-path telemetry: evaluate post-update log probabilities and record telemetry.
+  if (!forced_indices.empty()) {
+    std::vector<float> log_pi_after = compute_forced_log_probs(forced_indices);
+    for (size_t i = 0; i < forced_indices.size(); ++i) {
+      const auto& trans = batch[forced_indices[i]];
+      float lp_before = log_pi_before[i];
+      float lp_after = log_pi_after[i];
+      float ratio_pre = std::exp(lp_before - trans.old_log_prob);
+      float adv_used_raw = trans.advantage;
+      float adv_used_norm = trans.norm_advantage;
+      float gae_adv = trans.gae_advantage;
+      float full_return_minus_val = trans.mc_return - trans.value;
+
+      open_spiel::dune_targeted_buy::RecordForcedUpdateTelemetry(
+          global_update, trans.targeted_buy_card, trans.targeted_buy_round,
+          trans.old_log_prob, lp_before, lp_after, ratio_pre,
+          adv_used_raw, adv_used_norm, gae_adv, full_return_minus_val);
+    }
   }
 
   // WO-PERF-1 Part B: the one host readback per update. Adding the whole
@@ -3605,6 +3716,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     for (int64_t start = 0; start < n; start += minibatch_size) {
       int64_t end = std::min(start + minibatch_size, n);
       const int64_t mb_len = end - start;
+      const int64_t mb_index = start / minibatch_size;
       const int64_t* mb_indices = perm_ptr + start;
 
       phase_timer.Begin(kPhaseTensorPackH2D);
@@ -3692,6 +3804,22 @@ PpoUpdateStats TrainPpoUpdateSeparate(
             torch::Tensor mean = nontrivial_adv.mean();
             torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
             mb_adv = (mb_advantages - mean) / std;
+
+            float mb_mean_val = mean.item<float>();
+            float mb_std_val = std.item<float>();
+            for (int64_t i = 0; i < mb_len; ++i) {
+              auto& trans = batch[mb_indices[i]];
+              if (trans.targeted_buy_forced) {
+                if (epoch == 0) {
+                  trans.norm_advantage = (trans.advantage - mb_mean_val) / mb_std_val;
+                }
+                open_spiel::dune_targeted_buy::RecordForcedNormalization(
+                    global_update, epoch, mb_index,
+                    trans.targeted_buy_card, trans.targeted_buy_round,
+                    trans.gae_advantage, trans.advantage, trans.mc_return, trans.value,
+                    mb_mean_val, mb_std_val);
+              }
+            }
           }
         }
         mb_adv = mb_adv.detach();

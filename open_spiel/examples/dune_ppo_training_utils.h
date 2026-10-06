@@ -107,6 +107,8 @@ struct PpoTransition {
   int targeted_buy_card = 0;
   int targeted_buy_round = 0;
   bool targeted_buy_forced = false;
+  float gae_advantage = 0.0f;
+  float norm_advantage = 0.0f;
 };
 
 inline bool IsAcquisitionAction(Action a) {

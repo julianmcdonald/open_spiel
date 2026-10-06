@@ -85,6 +85,12 @@ ABSL_FLAG(int, targeted_buy_quota_per_card, 8,
           "Targeted buy quota per card per update (default 8 distinct games).");
 ABSL_FLAG(int, targeted_buy_max_round, 6,
           "Maximum round for targeted buy exploration (default 6, inclusive).");
+ABSL_FLAG(std::string, targeted_buy_forced_csv, "",
+          "Path to write targeted buy normalization records CSV.");
+ABSL_FLAG(std::string, targeted_buy_policy_advantage, "gae",
+          "Policy loss advantage for targeted forced buys: gae | full_return (default gae).");
+ABSL_FLAG(std::string, targeted_buy_telemetry_csv, "",
+          "Path to write targeted buy update-path telemetry CSV.");
 ABSL_FLAG(std::string, training_opponent_pool, "",
           "Comma-separated list of frozen opponent checkpoint paths for training pool.");
 ABSL_FLAG(int, threads, 64, "Rollout worker threads.");
@@ -3547,13 +3553,19 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       it->return_value = advantage + it->value;
       last_value[p] = it->value;
       last_gae[p] = advantage;
+      it->gae_advantage = advantage;
+
+      if (it->targeted_buy_forced &&
+          absl::GetFlag(FLAGS_targeted_buy_policy_advantage) == "full_return") {
+        it->advantage = it->mc_return - it->value;
+      }
 
       if (local_stats != nullptr && it->targeted_buy_card > 0) {
         int c_idx = (it->targeted_buy_card == open_spiel::dune_targeted_buy::kScientificBreakthroughTleilaxuId) ? 0 : 1;
         int r_idx = std::clamp(it->targeted_buy_round, 1, 10);
         if (it->targeted_buy_forced) {
           local_stats->targeted_buy_telemetry.forced_buys[c_idx][r_idx]++;
-          local_stats->targeted_buy_telemetry.forced_sum_adv[c_idx][r_idx] += advantage;
+          local_stats->targeted_buy_telemetry.forced_sum_adv[c_idx][r_idx] += it->advantage;
         } else {
           local_stats->targeted_buy_telemetry.unforced_sum_adv[c_idx][r_idx] += advantage;
         }
@@ -7077,6 +7089,10 @@ int main(int argc, char** argv) {
   }
   const std::string parity_command_line = parity_command_line_stream.str();
   absl::ParseCommandLine(argc, argv);
+  open_spiel::dune_targeted_buy::g_forced_norm_csv_path =
+      absl::GetFlag(FLAGS_targeted_buy_forced_csv);
+  open_spiel::dune_targeted_buy::g_forced_telemetry_csv_path =
+      absl::GetFlag(FLAGS_targeted_buy_telemetry_csv);
   std::signal(SIGTERM, open_spiel::SignalHandler);
   std::signal(SIGINT, open_spiel::SignalHandler);
   const auto vrpo_schedule_process_start =

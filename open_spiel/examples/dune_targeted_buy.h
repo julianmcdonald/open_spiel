@@ -11,6 +11,8 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
+#include <filesystem>
 
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -93,6 +95,149 @@ struct TargetedBuyTracker {
 
 // Global tracker instance shared across worker threads within each training update.
 inline TargetedBuyTracker g_targeted_buy_tracker;
+
+// Record structure for native minibatch normalization diagnostic logging.
+struct ForcedNormalizationRecord {
+  int update = 0;
+  int epoch = 0;
+  int minibatch = 0;
+  int card_id = 0;
+  int round = 0;
+  float raw_gae = 0.0f;
+  float mc_return = 0.0f;
+  float value = 0.0f;
+  float full_return_minus_value = 0.0f;
+  float mb_mean = 0.0f;
+  float mb_std = 0.0f;
+  float norm_gae = 0.0f;
+  float norm_full_return = 0.0f;
+  float raw_adv_used = 0.0f;
+  float norm_adv_used = 0.0f;
+};
+
+inline std::mutex g_forced_norm_mutex;
+inline std::vector<ForcedNormalizationRecord> g_forced_norm_records;
+inline std::string g_forced_norm_csv_path;
+
+inline void RecordForcedNormalization(
+    int update, int epoch, int mb_index,
+    int card_id, int round,
+    float raw_gae, float raw_adv_used, float mc_return, float value,
+    float mb_mean, float mb_std) {
+  float full_return_minus_value = mc_return - value;
+  float norm_gae = (raw_gae - mb_mean) / mb_std;
+  float norm_full_return = (full_return_minus_value - mb_mean) / mb_std;
+  float norm_adv_used = (raw_adv_used - mb_mean) / mb_std;
+
+  ForcedNormalizationRecord rec{
+      update, epoch, mb_index, card_id, round,
+      raw_gae, mc_return, value, full_return_minus_value,
+      mb_mean, mb_std, norm_gae, norm_full_return,
+      raw_adv_used, norm_adv_used
+  };
+
+  {
+    std::lock_guard<std::mutex> lock(g_forced_norm_mutex);
+    g_forced_norm_records.push_back(rec);
+  }
+
+  std::cout << absl::StrFormat(
+      "[TARGETED_BUY_FORCED_NORM] update=%d epoch=%d mb=%d card=%d (%s) round=%d | "
+      "raw_gae=%+.4f full_ret=%+.4f val=%+.4f full_ret_minus_v=%+.4f | "
+      "adv_used_raw=%+.4f adv_used_norm=%+.4f | "
+      "mb_mean=%+.4f mb_std=%.4f | norm_gae=%+.4f norm_full_ret=%+.4f\n",
+      update, epoch, mb_index, card_id,
+      (card_id == kScientificBreakthroughTleilaxuId ? "Scientific Breakthrough" : "Stitched Horror"),
+      round, raw_gae, mc_return, value, full_return_minus_value,
+      raw_adv_used, norm_adv_used,
+      mb_mean, mb_std, norm_gae, norm_full_return);
+
+  if (!g_forced_norm_csv_path.empty()) {
+    std::lock_guard<std::mutex> lock(g_forced_norm_mutex);
+    bool exists = std::filesystem::exists(g_forced_norm_csv_path);
+    std::ofstream ofs(g_forced_norm_csv_path, std::ios::app);
+    if (ofs.is_open()) {
+      if (!exists || std::filesystem::file_size(g_forced_norm_csv_path) == 0) {
+        ofs << "update,epoch,minibatch,card_id,card_name,round,raw_gae,mc_return,value,full_return_minus_value,mb_mean,mb_std,norm_gae,norm_full_return,raw_adv_used,norm_adv_used\n";
+      }
+      ofs << absl::StrFormat("%d,%d,%d,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                             update, epoch, mb_index, card_id,
+                             (card_id == kScientificBreakthroughTleilaxuId ? "Scientific Breakthrough" : "Stitched Horror"),
+                             round, raw_gae, mc_return, value, full_return_minus_value,
+                             mb_mean, mb_std, norm_gae, norm_full_return,
+                             raw_adv_used, norm_adv_used);
+    }
+  }
+}
+
+// Record structure for update-path telemetry (Step 3).
+struct ForcedUpdateTelemetryRecord {
+  int update = 0;
+  int card_id = 0;
+  int round = 0;
+  float log_pi_collect = 0.0f;
+  float log_pi_before = 0.0f;
+  float log_pi_after = 0.0f;
+  float ratio_pre = 0.0f;
+  float adv_used_raw = 0.0f;
+  float adv_used_norm = 0.0f;
+  float gae_adv = 0.0f;
+  float full_return_minus_val = 0.0f;
+};
+
+inline std::mutex g_forced_telemetry_mutex;
+inline std::vector<ForcedUpdateTelemetryRecord> g_forced_telemetry_records;
+inline std::string g_forced_telemetry_csv_path;
+
+inline void RecordForcedUpdateTelemetry(
+    int update, int card_id, int round,
+    float log_pi_collect, float log_pi_before, float log_pi_after,
+    float ratio_pre, float adv_used_raw, float adv_used_norm,
+    float gae_adv, float full_return_minus_val) {
+  ForcedUpdateTelemetryRecord rec{
+      update, card_id, round,
+      log_pi_collect, log_pi_before, log_pi_after,
+      ratio_pre, adv_used_raw, adv_used_norm,
+      gae_adv, full_return_minus_val
+  };
+
+  {
+    std::lock_guard<std::mutex> lock(g_forced_telemetry_mutex);
+    g_forced_telemetry_records.push_back(rec);
+  }
+
+  std::cout << absl::StrFormat(
+      "[TARGETED_BUY_UPDATE_TELEMETRY] update=%d card=%d (%s) round=%d | "
+      "log_pi_collect=%+.6f log_pi_before=%+.6f log_pi_after=%+.6f ratio_pre=%.6f | "
+      "adv_used_raw=%+.6f adv_used_norm=%+.6f gae_adv=%+.6f full_ret_minus_v=%+.6f\n",
+      update, card_id,
+      (card_id == kScientificBreakthroughTleilaxuId ? "Scientific Breakthrough" : "Stitched Horror"),
+      round, log_pi_collect, log_pi_before, log_pi_after, ratio_pre,
+      adv_used_raw, adv_used_norm, gae_adv, full_return_minus_val);
+
+  std::string csv_path = g_forced_telemetry_csv_path;
+  if (csv_path.empty() && !g_forced_norm_csv_path.empty()) {
+    std::filesystem::path p(g_forced_norm_csv_path);
+    csv_path = (p.parent_path() / "targeted_buy_update_telemetry.csv").string();
+  }
+
+  if (!csv_path.empty()) {
+    std::lock_guard<std::mutex> lock(g_forced_telemetry_mutex);
+    bool exists = std::filesystem::exists(csv_path);
+    std::ofstream ofs(csv_path, std::ios::app);
+    if (ofs.is_open()) {
+      if (!exists || std::filesystem::file_size(csv_path) == 0) {
+        ofs << "update,card_id,card_name,round,log_pi_collect,log_pi_before,log_pi_after,ratio_pre,adv_used_raw,adv_used_norm,gae_adv,full_return_minus_value\n";
+      }
+      ofs << absl::StrFormat("%d,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                             update, card_id,
+                             (card_id == kScientificBreakthroughTleilaxuId ? "Scientific Breakthrough" : "Stitched Horror"),
+                             round, log_pi_collect, log_pi_before, log_pi_after, ratio_pre,
+                             adv_used_raw, adv_used_norm, gae_adv, full_return_minus_val);
+    }
+  }
+}
+
 
 // Helper to find a legal Tleilaxu acquisition action for a target Tleilaxu card ID in the current state.
 inline bool FindLegalTleilaxuBuyAction(
