@@ -45,6 +45,17 @@ ABSL_FLAG(bool, train_amp, false, "");
 ABSL_FLAG(bool, allow_tf32, false, "");
 ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
+ABSL_FLAG(int, hidden_dim, 2048, "");
+ABSL_FLAG(int, num_blocks, 8, "");
+ABSL_FLAG(bool, nonlinear_value_head, false, "");
+ABSL_FLAG(std::string, market_appendix_mode, "full_public_information_v3", "");
+ABSL_FLAG(uint64_t, head_init_constant, 0, "");
+ABSL_FLAG(bool, enable_semantic_scorer, true, "");
+ABSL_FLAG(double, specimen_exchange_penalty, 0.0, "");
+ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
+ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
+ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
+ABSL_FLAG(int, rollout_games, 256, "");
 
 using namespace open_spiel;
 using namespace open_spiel::dune_imperium;

@@ -1660,12 +1660,22 @@ void TestInvariantGatesAndScenarios() {
     assert(res1.diagnostics.hard_sim_limit == 16);
     assert(res1.simulations_completed == 16);
 
-    // Advance state to next combat action for the same player (we construct state descendant history)
+    // Walk forward from res1's choice, without searching, to the first
+    // descendant decision that has exactly one legal action. The decision
+    // right after a reveal-turn purchase is not forced (End Turn and Family
+    // Atomics are both legal), so the forced state can be a few moves later.
     auto state_combat2 = state_combat->Clone();
     state_combat2->ApplyAction(res1.diagnostics.selected_action);
-    while (state_combat2->IsChanceNode()) {
-      state_combat2->ApplyAction(state_combat2->ChanceOutcomes().front().first);
+    while (!state_combat2->IsTerminal() &&
+           (state_combat2->IsChanceNode() ||
+            state_combat2->LegalActions().size() != 1)) {
+      if (state_combat2->IsChanceNode()) {
+        state_combat2->ApplyAction(state_combat2->ChanceOutcomes().front().first);
+      } else {
+        state_combat2->ApplyAction(state_combat2->LegalActions().front());
+      }
     }
+    assert(!state_combat2->IsTerminal());
 
 
 

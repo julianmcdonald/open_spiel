@@ -98,6 +98,17 @@ ABSL_FLAG(double, intermediate_vp_breadcrumb_weight, 0.2,
           "Training-only intermediate VP breadcrumb weight.");
 ABSL_FLAG(double, specimen_exchange_penalty, 0.02,
           "Positive training-only anti-breadcrumb penalty.");
+// The rest of the flags dune_ppo_training_utils.cc reads, with the trainer's
+// defaults. This binary defines them itself, rather than linking
+// dune_ppo_training_flags.cc, to keep its 0.02 specimen default above.
+ABSL_FLAG(int, rollout_games, 0, "Unused here; read by training utils.");
+ABSL_FLAG(std::string, market_appendix_mode, "none", "Card-slot input mode.");
+ABSL_FLAG(bool, allow_tf32, true, "Allow TF32 for CUDA CuBLAS/CuDNN.");
+ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the semantic action scorer.");
+ABSL_FLAG(double, family_atomics_penalty, 0.0, "Training-only Family Atomics penalty.");
+ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "Training-only plot intrigue penalty.");
+ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "Plot intrigue penalty exemption.");
+ABSL_FLAG(uint64_t, head_init_constant, 20260800, "PWO-5 kHeadInitConstant.");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
           "Environment transition count at which shaping decay starts.");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 10000000,

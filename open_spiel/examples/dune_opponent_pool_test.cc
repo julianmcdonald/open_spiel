@@ -47,7 +47,7 @@ ABSL_FLAG(std::string, model_checkpoint, "", "");
 ABSL_FLAG(std::string, optim_checkpoint, "", "");
 ABSL_FLAG(bool, nonlinear_value_head, false, "");
 ABSL_FLAG(std::string, market_appendix_mode, "full_public_information_v3", "");
-ABSL_FLAG(double, head_init_constant, 0.0, "");
+ABSL_FLAG(uint64_t, head_init_constant, 0, "");
 ABSL_FLAG(bool, enable_semantic_scorer, true, "");
 ABSL_FLAG(double, specimen_exchange_penalty, 0.0, "");
 ABSL_FLAG(double, family_atomics_penalty, 0.0, "");

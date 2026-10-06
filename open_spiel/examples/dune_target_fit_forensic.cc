@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_split.h"
 #include "open_spiel/spiel_utils.h"
@@ -43,8 +44,6 @@ ABSL_FLAG(std::string, expected_extended_hash, "", "Recorded trained extended-ro
 ABSL_FLAG(std::string, output, "", "Output JSON path.");
 ABSL_FLAG(int, observation_size, 5580, "Model input width.");
 ABSL_FLAG(int, action_dim, 2391, "Policy vocabulary size.");
-ABSL_FLAG(int, hidden_dim, 2048, "Model hidden width.");
-ABSL_FLAG(int, num_blocks, 8, "Residual block count.");
 ABSL_FLAG(int, batch_size, 256, "Inference batch size.");
 ABSL_FLAG(double, logit_cap, 10.0, "Learner's legal-centered tanh logit cap.");
 

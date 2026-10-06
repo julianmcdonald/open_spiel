@@ -63,6 +63,7 @@
 #include <string>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/spiel.h"
 #include "dune_network.h"
@@ -74,9 +75,6 @@ ABSL_FLAG(std::string, search_label_dir,
           "calibration_results_v2/pwo5_prep/search_labels",
           "Role-aware pack. Its `validation` role IS the section 8.5 "
           "game-disjoint held-out population.");
-ABSL_FLAG(int, hidden_dim, 2048, "Must match the checkpoint.");
-ABSL_FLAG(int, num_blocks, 8, "Must match the checkpoint.");
-ABSL_FLAG(bool, nonlinear_value_head, false, "Must match the checkpoint.");
 ABSL_FLAG(bool, with_aux_heads, true,
           "PWO-5 pilot checkpoints (P/T/H alike) carry the three auxiliary "
           "heads. torch::load fails loudly if this is wrong.");

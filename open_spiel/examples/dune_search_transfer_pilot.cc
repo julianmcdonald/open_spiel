@@ -30,6 +30,7 @@
 #include <torch/torch.h>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
@@ -61,8 +62,6 @@ ABSL_FLAG(uint64_t, seed, 2026090850ULL, "Base seed for data generation.");
 ABSL_FLAG(int, threads, 16, "Number of worker threads.");
 
 // Architecture & limits
-ABSL_FLAG(int, hidden_dim, 2048, "Model hidden dimension.");
-ABSL_FLAG(int, num_blocks, 8, "Model residual blocks.");
 ABSL_FLAG(int, opp_hidden_dim, 2048, "Opponent model hidden dimension.");
 ABSL_FLAG(int, opp_num_blocks, 8, "Opponent model residual blocks.");
 ABSL_FLAG(double, candidate_logit_cap, 10.0, "Candidate logit cap.");

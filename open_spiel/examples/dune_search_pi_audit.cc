@@ -55,6 +55,7 @@
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
 #include "open_spiel/spiel.h"
@@ -121,8 +122,6 @@ ABSL_FLAG(double, search_pi_unsearched_role_temperature, 1.0,
 ABSL_FLAG(uint64_t, search_pi_seed_domain, 0, "REQUIRED nonzero.");
 
 // --- Machinery -------------------------------------------------------------
-ABSL_FLAG(int, hidden_dim, 2048, "Network hidden dimension.");
-ABSL_FLAG(int, num_blocks, 8, "Network residual block count.");
 ABSL_FLAG(double, logit_cap, 10.0, "Evaluator logit cap. The trainer's default.");
 
 // dune_ppo_training_utils.cc DECLARES these and dune_ppo_train.cc defines them,
@@ -144,7 +143,6 @@ ABSL_FLAG(double, grad_clip_norm, 0.5, "");
 ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
-ABSL_FLAG(bool, nonlinear_value_head, false, "Nonlinear value head.");
 ABSL_FLAG(int, seed, 20276001,
           "Master seed. Feeds torch::manual_seed exactly as the trainer does; "
           "it does not seed the game, which draws from --search_pi_seed_domain.");

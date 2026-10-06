@@ -38,18 +38,7 @@ ABSL_DECLARE_FLAG(double, target_kl);
 ABSL_DECLARE_FLAG(bool, train_amp);
 ABSL_DECLARE_FLAG(double, grad_clip_norm);
 ABSL_DECLARE_FLAG(bool, diagnostics_only);
-ABSL_DECLARE_FLAG(int, hidden_dim);
-ABSL_DECLARE_FLAG(int, num_blocks);
-ABSL_DECLARE_FLAG(bool, nonlinear_value_head);
-ABSL_DECLARE_FLAG(std::string, market_appendix_mode);
-ABSL_DECLARE_FLAG(double, head_init_constant);
-ABSL_DECLARE_FLAG(bool, allow_tf32);
-ABSL_DECLARE_FLAG(bool, enable_semantic_scorer);
-ABSL_DECLARE_FLAG(double, specimen_exchange_penalty);
-ABSL_DECLARE_FLAG(double, family_atomics_penalty);
-ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);
-ABSL_DECLARE_FLAG(int, plot_intrigue_exemption_threshold);
-ABSL_DECLARE_FLAG(int, rollout_games);
+#include "dune_ppo_training_flags.h"
 
 std::string g_reward_transition_source_fingerprint = "";
 int64_t g_reward_transition_source_update = -1;
