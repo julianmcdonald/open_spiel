@@ -128,6 +128,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_player_draw_deck",
            &DuneImperiumState::SetPlayerDrawDeckForTesting, py::arg("player"),
            py::arg("deck"))
+      .def("set_player_deck_top_cards",
+           &DuneImperiumState::SetPlayerDeckTopCardsForTesting,
+           py::arg("player"), py::arg("cards"))
       .def("set_imperium_row", &DuneImperiumState::SetImperiumRowForTesting,
            py::arg("row"))
       .def("set_tleilaxu_row", &DuneImperiumState::SetTleilaxuRowForTesting,
@@ -172,6 +175,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"), py::arg("amount"))
       .def("set_troops", &DuneImperiumState::SetTroopsForTesting,
            py::arg("player"), py::arg("garrison"), py::arg("combat"))
+      .def("set_player_troops_gained_this_turn",
+           &DuneImperiumState::SetPlayerTroopsGainedThisTurnForTesting,
+           py::arg("player"), py::arg("amount"))
       .def("set_player_dreadnoughts_in_garrison",
            &DuneImperiumState::SetPlayerDreadnoughtsInGarrisonForTesting,
            py::arg("player"), py::arg("amount"))
@@ -247,6 +253,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                &DuneImperiumState::GetPlayerDrawDeckForTesting),
            py::arg("player"),
            py::return_value_policy::reference_internal)
+      .def("get_pending_poison_snooper_card",
+           &DuneImperiumState::GetPendingPoisonSnooperCardForTesting)
       .def("get_player_discard", &DuneImperiumState::GetPlayerDiscardForTesting,
            py::arg("player"), py::return_value_policy::reference_internal)
       .def("set_player_discard", &DuneImperiumState::SetPlayerDiscardForTesting,
@@ -333,6 +341,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"))
       .def("get_player_troops_in_garrison",
            &DuneImperiumState::GetPlayerTroopsInGarrisonForTesting,
+           py::arg("player"))
+      .def("get_player_troops_gained_this_turn",
+           &DuneImperiumState::GetPlayerTroopsGainedThisTurnForTesting,
            py::arg("player"))
       .def("get_player_dreadnoughts_in_garrison",
            &DuneImperiumState::GetPlayerDreadnoughtsInGarrisonForTesting,
@@ -517,6 +528,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetPlayerTrashedCards, py::arg("player"))
       .def("get_pending_intrigue_choice_kind",
            &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
+      .def("prioritize_winning_dreadnought_choice_for_steam",
+           &DuneImperiumState::PrioritizeWinningDreadnoughtChoiceForSteam,
+           py::arg("player"))
+      .def("prioritize_combat_shipping_for_steam",
+           &DuneImperiumState::PrioritizeCombatShippingForSteam,
+           py::arg("player"))
       .def("get_pending_intrigue_choice_player",
            &DuneImperiumState::GetPendingIntrigueChoicePlayerForTesting)
 
