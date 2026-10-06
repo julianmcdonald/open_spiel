@@ -512,6 +512,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("get_tessia_rewards_claimed",
            &DuneImperiumState::GetTessiaSnooperRewardsClaimed,
            py::arg("player"))
+      .def("get_pending_tessia_reward_kind",
+           &DuneImperiumState::GetPendingTessiaRewardKind,
+           py::arg("player"), py::arg("faction"))
+      .def("get_pending_memocorders_influence",
+           &DuneImperiumState::GetPendingMemocordersInfluence,
+           py::arg("player"))
       .def("get_paul_known_top_card",
            &DuneImperiumState::GetPaulKnownTopCardForTesting, py::arg("player"))
       .def("deck_reshuffle_count", &DuneImperiumState::deck_reshuffle_count,
