@@ -1061,7 +1061,7 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
             if (dune_s) {
               const std::string cand_schema = (!evaluators.empty() && evaluators.front())
                                                   ? evaluators.front()->SemanticDescriptorSchema()
-                                                  : dune_semantic::kDescriptorSchemaVersion;
+                                                  : dune_semantic::kDescriptorSchemaVersionV3;
               dune_semantic::ExtractCandidateDescriptors(*dune_s, current_legals, &agr_ex.candidate_data, cand_schema);
             }
           }
@@ -1104,7 +1104,7 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
           if (dune_s) {
             const std::string cand_schema = (!evaluators.empty() && evaluators.front())
                                                 ? evaluators.front()->SemanticDescriptorSchema()
-                                                : dune_semantic::kDescriptorSchemaVersion;
+                                                : dune_semantic::kDescriptorSchemaVersionV3;
             dune_semantic::ExtractCandidateDescriptors(*dune_s, current_legals, &ex.candidate_data, cand_schema);
           }
         }

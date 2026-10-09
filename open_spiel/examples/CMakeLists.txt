@@ -210,6 +210,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_population_eval dune_population_eval.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_population_eval ${TORCH_LIBRARIES})
 
+  add_executable(dune_distill
+    dune_distill.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_distill dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_search_benchmark dune_search_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_benchmark dune_search ${TORCH_LIBRARIES})
 
@@ -506,6 +512,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_semantic_verification_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_semantic_verification_test COMMAND dune_semantic_verification_test)
+
+  add_executable(dune_f_verification dune_f_verification.cc
+    ../games/dune_imperium/dune_imperium_test_utils.cc
+    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_f_verification dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_f_verification COMMAND dune_f_verification)
 
   add_executable(dune_purchase_identity_test
     ../games/dune_imperium/dune_purchase_identity_test.cc

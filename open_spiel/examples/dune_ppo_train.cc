@@ -1043,6 +1043,12 @@ struct WorkerStats {
 void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
                       std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
   torch::NoGradGuard no_grad;
+  if (source->enable_zone_encoder_ && !target->enable_zone_encoder_) {
+    target->EnableZoneEncoder();
+    if (!source->parameters().empty()) {
+      target->to(source->parameters().front().device());
+    }
+  }
   auto source_params = source->named_parameters();
   auto source_buffers = source->named_buffers();
   for (auto& item : target->named_parameters()) {
@@ -1066,6 +1072,7 @@ void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
   }
   target->market_appendix_mode_ = source->market_appendix_mode_;
   target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
+  target->enable_zone_encoder_ = source->enable_zone_encoder_;
 }
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
@@ -1300,6 +1307,19 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
     }
   }
 
+  // F prototype parameters (appended to higher-rate group)
+  std::vector<torch::Tensor> f_params_set;
+  if (model->semantic_scorer_ && model->semantic_scorer_->out_layer_f) {
+    for (auto& p : model->semantic_scorer_->out_layer_f->parameters()) {
+      f_params_set.push_back(p);
+    }
+  }
+  if (model->enable_zone_encoder_ && model->zone_encoder_) {
+    for (auto& p : model->zone_encoder_->parameters()) {
+      f_params_set.push_back(p);
+    }
+  }
+
   auto policy_params_set = model->policy_head->parameters();
   std::vector<torch::Tensor> aux_params_set;
   if (model->has_aux_heads_) {
@@ -1329,15 +1349,30 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
         break;
       }
     }
+    bool is_f = false;
+    for (auto& f_param : f_params_set) {
+      if (param.is_same(f_param)) {
+        is_f = true;
+        break;
+      }
+    }
     if (is_policy) {
       policy_params.push_back(param);
     } else if (is_aux) {
       aux_head_params.push_back(param);
     } else if (is_new_block) {
       new_block_params.push_back(param);
+    } else if (is_f) {
+      // Do not add to other_params; will be appended to new_block_params below.
     } else {
       other_params.push_back(param);
     }
+  }
+
+  // Preserve existing parameter membership/order and map inherited state correctly;
+  // append the new parameters to the existing higher-rate group.
+  for (auto& p : f_params_set) {
+    new_block_params.push_back(p);
   }
 
   // Group order: 0 = policy, 1 = other (trunk/value/scorer), 2 = aux heads (if present),
@@ -1657,7 +1692,7 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
 
   if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
     config_obj["enable_semantic_scorer"] = true;
-    config_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+    config_obj["semantic_descriptor_schema"] = absl::GetFlag(FLAGS_semantic_descriptor_schema);
   }
   if (absl::GetFlag(FLAGS_family_atomics_penalty) != 0.0) {
     config_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
@@ -2177,8 +2212,9 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     }
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
-      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+      manifest_obj["semantic_descriptor_schema"] = model->semantic_descriptor_schema_;
     }
+    manifest_obj["enable_zone_encoder"] = model->enable_zone_encoder_;
     manifest_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
     manifest_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
     manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
@@ -2257,6 +2293,127 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     SpielFatalError("SaveCheckpoint failed, aborting training to prevent corrupted states.");
   }
 }
+
+// Reuses an existing completed checkpoint bundle (update) to publish the final
+// aliases (ppo_model_final.*) atomically without calling torch::save again.
+bool PublishFinalCheckpointFromExisting(
+    const std::string& prefix, int update,
+    bool separate_actor_critic) {
+  std::error_code ec;
+  if (separate_actor_critic) {
+    std::string src_m = absl::StrCat(prefix, "_model_update_", update, ".pt");
+    std::string src_o = absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
+    std::string src_cm = absl::StrCat(prefix, "_critic_model_update_", update, ".pt");
+    std::string src_co = absl::StrCat(prefix, "_critic_optimizer_update_", update, ".pt");
+    std::string src_j = absl::StrCat(prefix, "_model_update_", update, ".json");
+
+    if (!std::filesystem::exists(src_m, ec) || !std::filesystem::exists(src_o, ec) ||
+        !std::filesystem::exists(src_cm, ec) || !std::filesystem::exists(src_co, ec) ||
+        !std::filesystem::exists(src_j, ec)) {
+      return false;
+    }
+
+    std::string dst_m = absl::StrCat(prefix, "_model_final.pt");
+    std::string dst_o = absl::StrCat(prefix, "_optimizer_final.pt");
+    std::string dst_cm = absl::StrCat(prefix, "_critic_model_final.pt");
+    std::string dst_co = absl::StrCat(prefix, "_critic_optimizer_final.pt");
+    std::string dst_j = absl::StrCat(prefix, "_model_final.json");
+
+    auto link_or_copy = [](const std::string& src, const std::string& dst) {
+      if (std::filesystem::exists(dst)) {
+        std::error_code eq_ec;
+        if (std::filesystem::equivalent(src, dst, eq_ec)) return;
+      }
+      std::string tmp = dst + ".tmp";
+      std::error_code ec;
+      if (std::filesystem::exists(tmp, ec)) std::filesystem::remove(tmp, ec);
+      std::filesystem::create_hard_link(src, tmp, ec);
+      if (ec) {
+        std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+          SpielFatalError("Failed to link or copy bundle artifact (" + src + " -> " + tmp + "): " + ec.message());
+        }
+      }
+      std::filesystem::rename(tmp, dst);
+    };
+
+    link_or_copy(src_m, dst_m);
+    link_or_copy(src_o, dst_o);
+    link_or_copy(src_cm, dst_cm);
+    link_or_copy(src_co, dst_co);
+
+    std::ifstream ifs(src_j);
+    if (!ifs) return false;
+    std::string json_str((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    ifs.close();
+    auto parsed = json::FromString(json_str);
+    if (parsed && parsed->IsObject()) {
+      auto obj = parsed->GetObject();
+      obj["model_filename"] = std::filesystem::path(dst_m).filename().string();
+      obj["optimizer_filename"] = std::filesystem::path(dst_o).filename().string();
+      obj["critic_model_filename"] = std::filesystem::path(dst_cm).filename().string();
+      obj["critic_optimizer_filename"] = std::filesystem::path(dst_co).filename().string();
+      std::string tmp_j = dst_j + ".tmp";
+      std::ofstream ofs(tmp_j);
+      ofs << json::ToString(obj, true);
+      ofs.close();
+      std::filesystem::rename(tmp_j, dst_j);
+    }
+    return true;
+  } else {
+    std::string src_m = absl::StrCat(prefix, "_model_update_", update, ".pt");
+    std::string src_o = absl::StrCat(prefix, "_optimizer_update_", update, ".pt");
+    std::string src_j = absl::StrCat(prefix, "_model_update_", update, ".json");
+
+    if (!std::filesystem::exists(src_m, ec) || !std::filesystem::exists(src_o, ec) ||
+        !std::filesystem::exists(src_j, ec)) {
+      return false;
+    }
+
+    std::string dst_m = absl::StrCat(prefix, "_model_final.pt");
+    std::string dst_o = absl::StrCat(prefix, "_optimizer_final.pt");
+    std::string dst_j = absl::StrCat(prefix, "_model_final.json");
+
+    auto link_or_copy = [](const std::string& src, const std::string& dst) {
+      if (std::filesystem::exists(dst)) {
+        std::error_code eq_ec;
+        if (std::filesystem::equivalent(src, dst, eq_ec)) return;
+      }
+      std::string tmp = dst + ".tmp";
+      std::error_code ec;
+      if (std::filesystem::exists(tmp, ec)) std::filesystem::remove(tmp, ec);
+      std::filesystem::create_hard_link(src, tmp, ec);
+      if (ec) {
+        std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+          SpielFatalError("Failed to link or copy bundle artifact (" + src + " -> " + tmp + "): " + ec.message());
+        }
+      }
+      std::filesystem::rename(tmp, dst);
+    };
+
+    link_or_copy(src_m, dst_m);
+    link_or_copy(src_o, dst_o);
+
+    std::ifstream ifs(src_j);
+    if (!ifs) return false;
+    std::string json_str((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    ifs.close();
+    auto parsed = json::FromString(json_str);
+    if (parsed && parsed->IsObject()) {
+      auto obj = parsed->GetObject();
+      obj["model_filename"] = std::filesystem::path(dst_m).filename().string();
+      obj["optimizer_filename"] = std::filesystem::path(dst_o).filename().string();
+      std::string tmp_j = dst_j + ".tmp";
+      std::ofstream ofs(tmp_j);
+      ofs << json::ToString(obj, true);
+      ofs.close();
+      std::filesystem::rename(tmp_j, dst_j);
+    }
+    return true;
+  }
+}
+
 
 
 
@@ -2483,7 +2640,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       const dune_semantic::CandidateActionData* p_cand_data = nullptr;
       if (dune_state != nullptr) {
         const std::string cand_schema = active_evaluator ? active_evaluator->SemanticDescriptorSchema()
-                                                         : dune_semantic::kDescriptorSchemaVersion;
+                                                         : absl::GetFlag(FLAGS_semantic_descriptor_schema);
         dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data, cand_schema);
         p_cand_data = &cand_data;
       }
@@ -8074,6 +8231,8 @@ int main(int argc, char** argv) {
   }
 
   const bool enable_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer);
+  const bool enable_zone_enc = absl::GetFlag(FLAGS_enable_zone_encoder);
+  const std::string sem_schema = absl::GetFlag(FLAGS_semantic_descriptor_schema);
   if (obs_size == dune_imperium::kFullPublicInformationStateSize && !enable_scorer) {
     SpielFatalError("9,182 actor requires --enable_semantic_scorer=true");
   }
@@ -8081,7 +8240,7 @@ int main(int argc, char** argv) {
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
           absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-          pwo5_aux_layout, pwo5_head_init_seed, enable_scorer);
+          pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc);
   // The INFERENCE model deliberately does NOT get the heads. Section 8.6
   // requires the three heads be computed "never in the rollout/inference
   // forward"; constructing them here would make that a matter of care instead
@@ -8090,7 +8249,11 @@ int main(int argc, char** argv) {
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
           absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-          /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer);
+          /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer, enable_zone_enc);
+  if (!sem_schema.empty()) {
+    training_model->semantic_descriptor_schema_ = sem_schema;
+    inference_model->semantic_descriptor_schema_ = sem_schema;
+  }
   training_model->to(device);
   inference_model->to(device);
 
@@ -10025,8 +10188,9 @@ int main(int argc, char** argv) {
     }
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
-      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+      manifest_obj["semantic_descriptor_schema"] = training_model->semantic_descriptor_schema_;
     }
+    manifest_obj["enable_zone_encoder"] = training_model->enable_zone_encoder_;
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
     manifest_obj["random_leader_draft"] = absl::GetFlag(FLAGS_random_leader_draft);
     // PWO-5 Appendix A.1 note 3: the same block the checkpoint writer emits, so
@@ -14183,30 +14347,35 @@ int main(int argc, char** argv) {
 
       if (absl::GetFlag(FLAGS_save_final_checkpoint)) {
         std::string prefix = absl::GetFlag(FLAGS_run_prefix);
-        if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
-          std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
-          std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
-          std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
-          std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
-          open_spiel::SaveDualCheckpoint(
-              training_model, *optimizer, training_critic, *critic_optimizer,
-              actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
-              update, update, total_env_steps.load(), next_episode_id.load(),
-              master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
-              search_label_fingerprint, run_uuid,
-              absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+        bool sep_ac = absl::GetFlag(FLAGS_separate_actor_critic) && (critic_optimizer != nullptr);
+        if (!PublishFinalCheckpointFromExisting(prefix, update, sep_ac)) {
+          if (sep_ac) {
+            std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
+            std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+            std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
+            std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
+            open_spiel::SaveDualCheckpoint(
+                training_model, *optimizer, training_critic, *critic_optimizer,
+                actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+                update, update, total_env_steps.load(), next_episode_id.load(),
+                master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+                search_label_fingerprint, run_uuid,
+                absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+          } else {
+            std::string model_path = absl::StrCat(prefix, "_model_final.pt");
+            std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+            open_spiel::OnlineCollectionState aux_final = build_aux_state();
+            open_spiel::SaveCheckpoint(training_model, *optimizer,
+                                       model_path, optim_path,
+                                       update, update,
+                                       total_env_steps.load(), next_episode_id.load(),
+                                       master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                       config_fingerprint, search_label_fingerprint,
+                                       run_uuid,
+                                       online_search_collection ? &aux_final : nullptr);
+          }
         } else {
-          std::string model_path = absl::StrCat(prefix, "_model_final.pt");
-          std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
-          open_spiel::OnlineCollectionState aux_final = build_aux_state();
-          open_spiel::SaveCheckpoint(training_model, *optimizer,
-                                     model_path, optim_path,
-                                     update, update,
-                                     total_env_steps.load(), next_episode_id.load(),
-                                     master, absl::GetFlag(FLAGS_seed_scheme_version),
-                                     config_fingerprint, search_label_fingerprint,
-                                     run_uuid,
-                                     online_search_collection ? &aux_final : nullptr);
+          std::cout << "[dune_ppo_train] Reused completed endpoint checkpoint for final export (zero re-serialization).\n";
         }
         final_checkpoint_saved = true;
       }
@@ -14252,30 +14421,35 @@ int main(int argc, char** argv) {
 
   if (absl::GetFlag(FLAGS_save_final_checkpoint) && !final_checkpoint_saved && last_completed_update >= start_update) {
     std::string prefix = absl::GetFlag(FLAGS_run_prefix);
-    if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
-      std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
-      std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
-      std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
-      std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
-      open_spiel::SaveDualCheckpoint(
-          training_model, *optimizer, training_critic, *critic_optimizer,
-          actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
-          last_completed_update, last_completed_update, total_env_steps.load(), next_episode_id.load(),
-          master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
-          search_label_fingerprint, run_uuid,
-          absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+    bool sep_ac = absl::GetFlag(FLAGS_separate_actor_critic) && (training_critic != nullptr);
+    if (!PublishFinalCheckpointFromExisting(prefix, last_completed_update, sep_ac)) {
+      if (sep_ac) {
+        std::string actor_model_path = absl::StrCat(prefix, "_model_final.pt");
+        std::string actor_optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+        std::string critic_model_path = absl::StrCat(prefix, "_critic_model_final.pt");
+        std::string critic_optim_path = absl::StrCat(prefix, "_critic_optimizer_final.pt");
+        open_spiel::SaveDualCheckpoint(
+            training_model, *optimizer, training_critic, *critic_optimizer,
+            actor_model_path, actor_optim_path, critic_model_path, critic_optim_path,
+            last_completed_update, last_completed_update, total_env_steps.load(), next_episode_id.load(),
+            master, absl::GetFlag(FLAGS_seed_scheme_version), config_fingerprint,
+            search_label_fingerprint, run_uuid,
+            absl::GetFlag(FLAGS_model_checkpoint), absl::GetFlag(FLAGS_optim_checkpoint));
+      } else {
+        std::string model_path = absl::StrCat(prefix, "_model_final.pt");
+        std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
+        open_spiel::OnlineCollectionState aux_final = build_aux_state();
+        open_spiel::SaveCheckpoint(training_model, *optimizer,
+                                   model_path, optim_path,
+                                   last_completed_update, last_completed_update,
+                                   total_env_steps.load(), next_episode_id.load(),
+                                   master, absl::GetFlag(FLAGS_seed_scheme_version),
+                                   config_fingerprint, search_label_fingerprint,
+                                   run_uuid,
+                                   online_search_collection ? &aux_final : nullptr);
+      }
     } else {
-      std::string model_path = absl::StrCat(prefix, "_model_final.pt");
-      std::string optim_path = absl::StrCat(prefix, "_optimizer_final.pt");
-      open_spiel::OnlineCollectionState aux_final = build_aux_state();
-      open_spiel::SaveCheckpoint(training_model, *optimizer,
-                                 model_path, optim_path,
-                                 last_completed_update, last_completed_update,
-                                 total_env_steps.load(), next_episode_id.load(),
-                                 master, absl::GetFlag(FLAGS_seed_scheme_version),
-                                 config_fingerprint, search_label_fingerprint,
-                                 run_uuid,
-                                 online_search_collection ? &aux_final : nullptr);
+      std::cout << "[dune_ppo_train] Reused completed endpoint checkpoint for final export (zero re-serialization).\n";
     }
   }
   if (!card_telemetry_path.empty() && last_completed_update >= start_update) {

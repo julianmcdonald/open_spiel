@@ -1228,8 +1228,9 @@ void SaveDualCheckpoint(
     }
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
-      manifest_obj["semantic_descriptor_schema"] = std::string(dune_semantic::kDescriptorSchemaVersion);
+      manifest_obj["semantic_descriptor_schema"] = actor_model->semantic_descriptor_schema_;
     }
+    manifest_obj["enable_zone_encoder"] = actor_model->enable_zone_encoder_;
     manifest_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
     manifest_obj["family_atomics_penalty"] = absl::GetFlag(FLAGS_family_atomics_penalty);
     manifest_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
@@ -1378,7 +1379,7 @@ bool LoadModelCheckpointMigrating(
 
   std::filesystem::path metadata_path(path);
   metadata_path.replace_extension(".json");
-  std::string source_schema = dune_semantic::kDescriptorSchemaVersionV2;
+  std::string source_schema;
   if (std::filesystem::exists(metadata_path)) {
     std::ifstream input(metadata_path);
     if (input) {
@@ -1390,13 +1391,33 @@ bool LoadModelCheckpointMigrating(
         if (schema_entry != object.end() && schema_entry->second.IsString()) {
           source_schema = schema_entry->second.GetString();
           if (source_schema != dune_semantic::kDescriptorSchemaVersionV2 &&
-              source_schema != dune_semantic::kDescriptorSchemaVersionV3) {
+              source_schema != dune_semantic::kDescriptorSchemaVersionV3 &&
+              source_schema != dune_semantic::kDescriptorSchemaVersionV4) {
             SpielFatalError("Mismatched or invalid semantic_descriptor_schema in metadata: " + metadata_path.string());
+          }
+        }
+        auto eze_entry = object.find("enable_zone_encoder");
+        if (eze_entry != object.end()) {
+          bool eze = (eze_entry->second.IsBool() && eze_entry->second.GetBool()) ||
+                     (eze_entry->second.IsString() && eze_entry->second.GetString() == "true");
+          if (eze) {
+            model->EnableZoneEncoder();
           }
         }
       }
     }
   }
+
+  auto update_semantic_schema = [&]() {
+    if (!source_schema.empty()) {
+      if (source_schema == dune_semantic::kDescriptorSchemaVersionV4 ||
+          model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
+        model->semantic_descriptor_schema_ = source_schema;
+      }
+    } else if (model->semantic_descriptor_schema_.empty()) {
+      model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    }
+  };
 
   int64_t ckpt_input_dim = input_dim;
   {
@@ -1424,13 +1445,13 @@ bool LoadModelCheckpointMigrating(
     CopyInputToFullPublicInformation(model->input_layer->weight,
                                      temp_model->input_layer->weight, source_mode);
     model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    update_semantic_schema();
   } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
     const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
     CopyInputToOrderedCardSlots(model->input_layer->weight,
                                temp_model->input_layer->weight, source_mode);
     model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    update_semantic_schema();
   } else if (input_dim == dune_imperium::kExpandedInformationStateSize) {
     if (ckpt_input_dim == input_dim) {
       model->input_layer->weight.copy_(temp_model->input_layer->weight);
@@ -1465,13 +1486,13 @@ bool LoadModelCheckpointMigrating(
                                       ckpt_input_dim, input_dim));
     }
     model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    update_semantic_schema();
   } else {
     SpielFatalError(absl::StrFormat("Unsupported model input migration: ckpt=%d -> target=%d",
                                     ckpt_input_dim, input_dim));
   }
   if (model->with_semantic_scorer_) {
-    model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    update_semantic_schema();
   }
   if (model->input_layer->bias.defined() &&
       temp_model->input_layer->bias.defined()) {
@@ -1543,11 +1564,23 @@ bool LoadModelCheckpointMigrating(
     archive.load_from(path, device);
     torch::serialize::InputArchive scorer_archive;
     if (archive.try_read("semantic_scorer", scorer_archive)) {
-      model->semantic_scorer_->Load(scorer_archive, source_schema);
+      const std::string effective_schema = source_schema.empty() ? model->semantic_descriptor_schema_ : source_schema;
+      model->semantic_scorer_->Load(scorer_archive, effective_schema);
       std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path
-                << " (schema: " << source_schema << ")" << std::endl;
+                << " (schema: " << model->semantic_descriptor_schema_ << ")" << std::endl;
     } else {
       std::cout << "[SEMANTIC SCORER] Checkpoint does not contain semantic_scorer; keeping zero-init scorer." << std::endl;
+    }
+  }
+  if (model->enable_zone_encoder_ && model->zone_encoder_) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, device);
+    torch::serialize::InputArchive ze_archive;
+    if (archive.try_read("zone_encoder", ze_archive)) {
+      model->zone_encoder_->load(ze_archive);
+      std::cout << "[ZONE ENCODER] Loaded zone_encoder submodule from " << path << std::endl;
+    } else {
+      std::cout << "[ZONE ENCODER] Checkpoint does not contain zone_encoder; keeping zero-init zone encoder." << std::endl;
     }
   }
   return migrated;
@@ -1557,7 +1590,7 @@ void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                          const std::string& path, torch::Device device,
                          bool allow_skip_semantic_scorer) {
   if (model->has_aux_heads_ || model->with_semantic_scorer_ ||
-      CheckpointHasSemanticScorer(path) ||
+      model->enable_zone_encoder_ || CheckpointHasSemanticScorer(path) ||
       dune_imperium::IsExtendedInformationStateSize(model->input_layer->weight.size(1)) ||
       model->input_layer->weight.size(1) == open_spiel::kPrivilegedCriticInformationStateSize ||
       allow_skip_semantic_scorer) {

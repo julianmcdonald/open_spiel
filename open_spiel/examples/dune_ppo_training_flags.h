@@ -16,6 +16,8 @@ ABSL_DECLARE_FLAG(bool, nonlinear_value_head);
 ABSL_DECLARE_FLAG(std::string, market_appendix_mode);
 ABSL_DECLARE_FLAG(bool, allow_tf32);
 ABSL_DECLARE_FLAG(bool, enable_semantic_scorer);
+ABSL_DECLARE_FLAG(bool, enable_zone_encoder);
+ABSL_DECLARE_FLAG(std::string, semantic_descriptor_schema);
 ABSL_DECLARE_FLAG(double, specimen_exchange_penalty);
 ABSL_DECLARE_FLAG(double, family_atomics_penalty);
 ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);

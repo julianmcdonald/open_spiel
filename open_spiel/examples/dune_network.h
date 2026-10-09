@@ -68,6 +68,129 @@ inline constexpr double kValueHeadOutputInitScale = 0.01;
 // output weights, for the same reason and with the same precedent.
 inline constexpr double kAuxHeadOutputInitScale = 0.01;
 
+// 1b. Zone Encoder for Prototype F: extracts card zone features from 9,182 obs,
+// pools them via shared card_embedding weights, and projects into trunk.
+struct ZoneEncoderImpl : torch::nn::Module {
+  static constexpr int64_t kZoneInputDim = 1370;
+  static constexpr int64_t kZoneHiddenDim = 512;
+  static constexpr int64_t kTrunkDim = 2048;
+
+  torch::nn::Linear fc1{nullptr};
+  torch::nn::LayerNorm ln1{nullptr};
+  torch::nn::Linear out_proj{nullptr};
+
+  torch::Tensor tleilaxu_card_map_;
+
+  ZoneEncoderImpl() {
+    fc1 = register_module("fc1", torch::nn::Linear(kZoneInputDim, kZoneHiddenDim));
+    ln1 = register_module("ln1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kZoneHiddenDim})));
+    out_proj = register_module("out_proj", torch::nn::Linear(kZoneHiddenDim, kTrunkDim));
+
+    // Zero-initialize out_proj (weight and bias) so initial output delta is exactly 0.0.
+    {
+      torch::NoGradGuard no_grad;
+      out_proj->weight.zero_();
+      if (out_proj->bias.defined()) {
+        out_proj->bias.zero_();
+      }
+    }
+  }
+
+  void load(torch::serialize::InputArchive& archive) {
+    torch::serialize::InputArchive fc1_arch, ln1_arch, out_arch;
+    if (archive.try_read("fc1", fc1_arch)) fc1->load(fc1_arch);
+    if (archive.try_read("ln1", ln1_arch)) ln1->load(ln1_arch);
+    if (archive.try_read("out_proj", out_arch)) out_proj->load(out_arch);
+  }
+
+  torch::Tensor forward(const torch::Tensor& obs, const torch::Tensor& card_embed_table) {
+    if (obs.size(1) < dune_imperium::kFullPublicInformationStateSize) {
+      return torch::zeros({obs.size(0), kTrunkDim}, obs.options());
+    }
+
+    if (!tleilaxu_card_map_.defined() ||
+        tleilaxu_card_map_.device() != obs.device() ||
+        tleilaxu_card_map_.dtype() != obs.dtype()) {
+      torch::NoGradGuard no_grad;
+      tleilaxu_card_map_ = torch::zeros(
+          {20, dune_imperium::kNumImperiumCardIds},
+          obs.options());
+      for (size_t local_id = 1; local_id < dune_imperium::kTleilaxuCards.size(); ++local_id) {
+        int shared_id = dune_imperium::kTleilaxuCards[local_id].imperium_card_id;
+        if (shared_id >= 0 && shared_id < dune_imperium::kNumImperiumCardIds) {
+          tleilaxu_card_map_[local_id][shared_id] = 1.0f;
+        }
+      }
+    }
+
+    const int64_t B = obs.size(0);
+    // card_embed_table is [256, 32]; slice to [126, 32]
+    auto card_embed = card_embed_table.slice(0, 0, dune_imperium::kNumImperiumCardIds);
+    const int64_t C = card_embed.size(1); // 32
+
+    // 1. Self piles: 5 piles x 126 dims, starting at 475 (hand, draw, discard, played, revealed)
+    auto self_piles = obs.slice(1, 475, 475 + 5 * 126).reshape({B, 5, 126});
+    auto self_embed = torch::matmul(self_piles, card_embed).reshape({B, 5 * C}); // [B, 160]
+
+    // 2. Opponent piles:
+    // Opponent deck pools: 3 opponents x 3 piles (total, discard, draw)
+    auto opp1_piles = obs.slice(1, 1146, 1146 + 3 * 126);
+    auto opp2_piles = obs.slice(1, 1525, 1525 + 3 * 126);
+    auto opp3_piles = obs.slice(1, 1904, 1904 + 3 * 126);
+    // Opponent revealed: 3 opponents x 126 dims at 6255
+    auto opp_revealed = obs.slice(1, 6255, 6255 + 3 * 126);
+    auto all_opp = torch::cat({opp1_piles, opp2_piles, opp3_piles, opp_revealed}, 1).reshape({B, 12, 126});
+    auto opp_embed = torch::matmul(all_opp, card_embed).reshape({B, 12 * C}); // [B, 384]
+
+    // 3. Market slots: 5 slots x 127 dims at 5580 (126 one-hot + 1 empty)
+    auto mkt_raw = obs.slice(1, 5580, 5580 + 5 * 127).reshape({B, 5, 127});
+    auto mkt_cards = mkt_raw.slice(2, 0, 126);
+    auto mkt_empty = mkt_raw.slice(2, 126, 127);
+    auto mkt_card_embed = torch::matmul(mkt_cards, card_embed); // [B, 5, C]
+    auto mkt_combined = torch::cat({mkt_card_embed, mkt_empty}, 2).reshape({B, 5 * (C + 1)}); // [B, 165]
+
+    // 4. Tleilaxu market: 2 slots x 20 dims at 6215 (local 0 = Reclaimed, 1..18 = cards, 19 = empty)
+    auto tx_raw = obs.slice(1, 6215, 6215 + 2 * 20).reshape({B, 2, 20});
+    auto tx_reclaimed = tx_raw.slice(2, 0, 1);
+    auto tx_empty = tx_raw.slice(2, 19, 20);
+    auto tx_cards_126 = torch::matmul(tx_raw, tleilaxu_card_map_);
+    auto tx_card_embed = torch::matmul(tx_cards_126, card_embed); // [B, 2, C]
+    auto tx_combined = torch::cat({tx_card_embed, tx_reclaimed, tx_empty}, 2).reshape({B, 2 * (C + 2)}); // [B, 68]
+
+    // 5. Ordered topdeck: 4 players x 4 depths x 127 dims at 6655
+    auto td_raw = obs.slice(1, 6655, 6655 + 16 * 127).reshape({B, 16, 127});
+    auto td_cards = td_raw.slice(2, 0, 126);
+    auto td_empty = td_raw.slice(2, 126, 127);
+    auto td_card_embed = torch::matmul(td_cards, card_embed); // [B, 16, C]
+    auto td_combined = torch::cat({td_card_embed, td_empty}, 2).reshape({B, 16 * (C + 1)}); // [B, 528]
+
+    // 6. Pending graft: 1 slot x 127 dims at 8691
+    auto graft_raw = obs.slice(1, 8691, 8691 + 127);
+    auto graft_card = graft_raw.slice(1, 0, 126);
+    auto graft_empty = graft_raw.slice(1, 126, 127);
+    auto graft_card_embed = torch::matmul(graft_card, card_embed); // [B, C]
+    auto graft_combined = torch::cat({graft_card_embed, graft_empty}, 1); // [B, C + 1 = 33]
+
+    // 7. Imperium discard: 126 dims at 2632
+    auto imp_discard = obs.slice(1, 2632, 2632 + 126);
+    auto imp_discard_embed = torch::matmul(imp_discard, card_embed); // [B, C = 32]
+
+    auto zone_repr = torch::cat({
+        self_embed,         // 160
+        opp_embed,          // 384
+        mkt_combined,       // 165
+        tx_combined,        // 68
+        td_combined,        // 528
+        graft_combined,     // 33
+        imp_discard_embed   // 32
+    }, 1); // Total: 1370 dims
+
+    auto h = torch::relu(ln1->forward(fc1->forward(zone_repr)));
+    return out_proj->forward(h);
+  }
+};
+TORCH_MODULE(ZoneEncoder);
+
 // 2. Main Dual-Headed Policy-Value Network Definition
 struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
@@ -104,10 +227,12 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   bool has_aux_heads_ = false;
   bool with_semantic_scorer_ = false;
   std::shared_ptr<dune_semantic::SemanticActionScorerImpl> semantic_scorer_{nullptr};
+  bool enable_zone_encoder_ = false;
+  std::shared_ptr<ZoneEncoderImpl> zone_encoder_{nullptr};
   dune_imperium::MarketAppendixMode market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
   std::string semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false) {
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false, bool enable_zone_encoder = false) {
     use_nonlinear_value_head_ = use_nonlinear;
     with_semantic_scorer_ = with_semantic_scorer;
     if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
@@ -225,16 +350,29 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     }
 
     if (with_semantic_scorer_) {
-      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
+      bool enable_f = (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4);
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f);
+      register_module("semantic_scorer", semantic_scorer_);
+    }
+    if (enable_zone_encoder) {
+      EnableZoneEncoder();
+    }
+  }
+
+  void EnableSemanticScorer(bool enable_f = false) {
+    if (!with_semantic_scorer_) {
+      with_semantic_scorer_ = true;
+      enable_f = enable_f || (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4);
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f);
       register_module("semantic_scorer", semantic_scorer_);
     }
   }
 
-  void EnableSemanticScorer() {
-    if (!with_semantic_scorer_) {
-      with_semantic_scorer_ = true;
-      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>();
-      register_module("semantic_scorer", semantic_scorer_);
+  void EnableZoneEncoder() {
+    enable_zone_encoder_ = true;
+    if (!zone_encoder_) {
+      zone_encoder_ = std::make_shared<ZoneEncoderImpl>();
+      register_module("zone_encoder", zone_encoder_);
     }
   }
 
@@ -254,7 +392,11 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   // Shared trunk. Split out of forward() so ForwardAux() reuses exactly the
   // same computation rather than a parallel copy of it.
   torch::Tensor Trunk(torch::Tensor x) {
-    x = torch::relu(input_layer->forward(x));
+    torch::Tensor trunk_in = input_layer->forward(x);
+    if (enable_zone_encoder_ && zone_encoder_ && with_semantic_scorer_ && semantic_scorer_) {
+      trunk_in = trunk_in + zone_encoder_->forward(x, semantic_scorer_->card_embedding->weight);
+    }
+    x = torch::relu(trunk_in);
     for (auto& block : res_blocks) {
       x = block->forward(x);
     }
@@ -409,11 +551,23 @@ inline void LoadModelCheckpointRobust(
     if (it_sds != dict.end() && it_sds->second.IsString()) {
       sds_found = it_sds->second.GetString();
       if (sds_found != dune_semantic::kDescriptorSchemaVersionV2 &&
-          sds_found != dune_semantic::kDescriptorSchemaVersionV3) {
+          sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
+          sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
         SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
                         " has invalid semantic_descriptor_schema ('" + sds_found + "')");
       }
       model->semantic_descriptor_schema_ = sds_found;
+    }
+
+    auto it_eze = dict.find("enable_zone_encoder");
+    if (it_eze != dict.end()) {
+      bool enabled = (it_eze->second.IsBool() && it_eze->second.GetBool()) ||
+                     (it_eze->second.IsString() && it_eze->second.GetString() == "true");
+      if (enabled) {
+        model->EnableZoneEncoder();
+      } else {
+        model->enable_zone_encoder_ = false;
+      }
     }
 
     auto it_ess = dict.find("enable_semantic_scorer");
@@ -508,8 +662,9 @@ inline void LoadModelCheckpointRobust(
     if (!checkpoint_has_scorer) {
       SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires trained semantic scorer: " + path);
     }
-    if (sds_found != dune_semantic::kDescriptorSchemaVersionV3) {
-      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires semantic_descriptor_schema='semantic_action_v3': " + path);
+    if (sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
+        sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
+      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires semantic_descriptor_schema='semantic_action_v3' or 'semantic_action_v4': " + path);
     }
     if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
       SpielFatalError("LoadModelCheckpointRobust: 9182 model requires with_semantic_scorer=true: " + path);
@@ -520,6 +675,13 @@ inline void LoadModelCheckpointRobust(
     torch::serialize::InputArchive s_arch;
     if (archive.try_read("semantic_scorer", s_arch)) {
       model->semantic_scorer_->Load(s_arch, model->semantic_descriptor_schema_);
+    }
+  }
+
+  if (model->enable_zone_encoder_ && model->zone_encoder_) {
+    torch::serialize::InputArchive z_arch;
+    if (archive.try_read("zone_encoder", z_arch)) {
+      model->zone_encoder_->load(z_arch);
     }
   }
 }
@@ -538,10 +700,33 @@ inline bool CheckpointHasSemanticScorer(const std::string& path, torch::Device d
 inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     double lr = 2.5e-4, double weight_decay = 0.0,
-    double policy_weight_decay = 0.0) {
+    double policy_weight_decay = 0.0, double new_block_lr = 0.0,
+    int new_block_first_idx = 8) {
   std::vector<torch::Tensor> policy_params;
   std::vector<torch::Tensor> other_params;
   std::vector<torch::Tensor> aux_head_params;
+  std::vector<torch::Tensor> new_block_params;
+
+  std::vector<torch::Tensor> new_block_params_set;
+  if (new_block_lr > 0.0) {
+    for (int b = new_block_first_idx; b < static_cast<int>(model->res_blocks.size()); ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        new_block_params_set.push_back(p);
+      }
+    }
+  }
+
+  std::vector<torch::Tensor> f_params_set;
+  if (model->semantic_scorer_ && model->semantic_scorer_->out_layer_f) {
+    for (auto& p : model->semantic_scorer_->out_layer_f->parameters()) {
+      f_params_set.push_back(p);
+    }
+  }
+  if (model->enable_zone_encoder_ && model->zone_encoder_) {
+    for (auto& p : model->zone_encoder_->parameters()) {
+      f_params_set.push_back(p);
+    }
+  }
 
   auto policy_params_set = model->policy_head->parameters();
   std::vector<torch::Tensor> aux_params_set;
@@ -559,9 +744,29 @@ inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
     for (auto& aux_param : aux_params_set) {
       if (param.is_same(aux_param)) { is_aux = true; break; }
     }
+    bool is_new_block = false;
+    for (auto& nb_param : new_block_params_set) {
+      if (param.is_same(nb_param)) { is_new_block = true; break; }
+    }
+    bool is_f = false;
+    for (auto& f_param : f_params_set) {
+      if (param.is_same(f_param)) { is_f = true; break; }
+    }
     if (is_policy) policy_params.push_back(param);
     else if (is_aux) aux_head_params.push_back(param);
+    else if (is_new_block) new_block_params.push_back(param);
+    else if (is_f) { /* Handled below: appended to higher-rate group */ }
     else other_params.push_back(param);
+  }
+
+  if (new_block_lr > 0.0) {
+    for (auto& p : f_params_set) {
+      new_block_params.push_back(p);
+    }
+  } else {
+    for (auto& p : f_params_set) {
+      other_params.push_back(p);
+    }
   }
 
   std::vector<torch::optim::OptimizerParamGroup> groups;
@@ -569,6 +774,9 @@ inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
   groups.emplace_back(other_params);
   if (model->has_aux_heads_) {
     groups.emplace_back(aux_head_params);
+  }
+  if (new_block_lr > 0.0) {
+    groups.emplace_back(new_block_params);
   }
   auto optimizer = std::make_unique<torch::optim::AdamW>(
       groups, torch::optim::AdamWOptions(lr).eps(1e-5));
@@ -579,6 +787,13 @@ inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
   if (model->has_aux_heads_) {
     static_cast<torch::optim::AdamWOptions&>(
         optimizer->param_groups()[2].options()).weight_decay(0.0);
+  }
+  if (new_block_lr > 0.0) {
+    const size_t nb_idx = optimizer->param_groups().size() - 1;
+    auto& nb_options = static_cast<torch::optim::AdamWOptions&>(
+        optimizer->param_groups()[nb_idx].options());
+    nb_options.lr(new_block_lr);
+    nb_options.weight_decay(0.0);
   }
   return optimizer;
 }
@@ -679,6 +894,141 @@ inline bool LoadOptimizerCheckpointMigrating(
   const int dst_num_blocks = static_cast<int>(model->res_blocks.size());
   const bool use_nonlinear = model->use_nonlinear_value_head_;
   int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
+
+  // Explicit U31400 3-group layout migration:
+  // Source layout has 3 groups: Group 0 = policy (2), Group 1 = torso (86), Group 2 = res9..res12 (32).
+  // Target model is 12 blocks with F parameters appended to Group 2.
+  const bool is_u31400_layout = (ckpt_num_groups == 3 && group_param_counts.size() == 3 &&
+                                 group_param_counts[0] == 2 && group_param_counts[1] == 86 &&
+                                 group_param_counts[2] == 32 && dst_num_blocks == 12 &&
+                                 model->semantic_scorer_ && model->semantic_scorer_->out_layer_f);
+  if (is_u31400_layout) {
+    std::cout << "[MIGRATION] Detected 12-block 3-group source layout (U31400 style: 2, 86, 32 params). Building matching 3-group source optimizer.\n";
+    std::vector<torch::Tensor> src_g0;
+    src_g0.push_back(torch::zeros_like(model->policy_head->weight, device));
+    if (model->policy_head->bias.defined()) {
+      src_g0.push_back(torch::zeros_like(model->policy_head->bias, device));
+    }
+
+    std::vector<torch::Tensor> src_g1;
+    // input_layer (2)
+    src_g1.push_back(torch::zeros({model->input_layer->weight.size(0), ckpt_input_dim}, device));
+    if (model->input_layer->bias.defined()) {
+      src_g1.push_back(torch::zeros_like(model->input_layer->bias, device));
+    }
+    // res1..res8 (64)
+    for (int b = 0; b < 8; ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        src_g1.push_back(torch::zeros_like(p, device));
+      }
+    }
+    // value_head (2)
+    for (auto& p : model->value_head->parameters()) {
+      src_g1.push_back(torch::zeros_like(p, device));
+    }
+    // semantic_scorer (18 inherited params)
+    auto add_scorer_params = [&](auto& mod) {
+      for (auto& p : mod->parameters()) {
+        src_g1.push_back(torch::zeros_like(p, device));
+      }
+    };
+    if (model->semantic_scorer_) {
+      add_scorer_params(model->semantic_scorer_->card_embedding);
+      add_scorer_params(model->semantic_scorer_->space_embedding);
+      add_scorer_params(model->semantic_scorer_->desc_proj);
+      add_scorer_params(model->semantic_scorer_->desc_ln);
+      add_scorer_params(model->semantic_scorer_->trunk_proj);
+      add_scorer_params(model->semantic_scorer_->trunk_ln);
+      add_scorer_params(model->semantic_scorer_->mlp1);
+      add_scorer_params(model->semantic_scorer_->mlp1_ln);
+      add_scorer_params(model->semantic_scorer_->out_layer);
+      add_scorer_params(model->semantic_scorer_->out_layer_ext);
+    }
+
+    std::vector<torch::Tensor> src_g2;
+    // res9..res12 (32)
+    for (int b = 8; b < 12; ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        src_g2.push_back(torch::zeros_like(p, device));
+      }
+    }
+
+    std::vector<torch::optim::OptimizerParamGroup> src_groups;
+    src_groups.emplace_back(src_g0);
+    src_groups.emplace_back(src_g1);
+    src_groups.emplace_back(src_g2);
+
+    torch::optim::AdamW src_optimizer(src_groups, torch::optim::AdamWOptions(lr).eps(1e-5));
+    try {
+      torch::load(src_optimizer, path, device);
+    } catch (const c10::Error& e) {
+      std::cerr << "[MIGRATION ERROR] U31400 source optimizer torch::load failed: " << e.msg() << std::endl;
+      return false;
+    }
+
+    int moved = 0;
+    auto move_state = [&](const torch::Tensor& src_t, const torch::Tensor& dst_t) {
+      auto src_key = src_t.unsafeGetTensorImpl();
+      auto it = src_optimizer.state().find(src_key);
+      if (it != src_optimizer.state().end()) {
+        optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(it->second);
+        ++moved;
+        return true;
+      }
+      return false;
+    };
+
+    // Group 0: policy
+    move_state(src_g0[0], model->policy_head->weight);
+    if (model->policy_head->bias.defined() && src_g0.size() > 1) {
+      move_state(src_g0[1], model->policy_head->bias);
+    }
+
+    // Group 1: torso
+    move_state(src_g1[0], model->input_layer->weight);
+    if (model->input_layer->bias.defined() && src_g1.size() > 1) {
+      move_state(src_g1[1], model->input_layer->bias);
+    }
+    size_t g1_idx = 1 + (model->input_layer->bias.defined() ? 1 : 0);
+    for (int b = 0; b < 8; ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        move_state(src_g1[g1_idx++], p);
+      }
+    }
+    for (auto& p : model->value_head->parameters()) {
+      move_state(src_g1[g1_idx++], p);
+    }
+    if (model->semantic_scorer_) {
+      auto move_scorer_mod = [&](auto& mod) {
+        for (auto& p : mod->parameters()) {
+          move_state(src_g1[g1_idx++], p);
+        }
+      };
+      move_scorer_mod(model->semantic_scorer_->card_embedding);
+      move_scorer_mod(model->semantic_scorer_->space_embedding);
+      move_scorer_mod(model->semantic_scorer_->desc_proj);
+      move_scorer_mod(model->semantic_scorer_->desc_ln);
+      move_scorer_mod(model->semantic_scorer_->trunk_proj);
+      move_scorer_mod(model->semantic_scorer_->trunk_ln);
+      move_scorer_mod(model->semantic_scorer_->mlp1);
+      move_scorer_mod(model->semantic_scorer_->mlp1_ln);
+      move_scorer_mod(model->semantic_scorer_->out_layer);
+      move_scorer_mod(model->semantic_scorer_->out_layer_ext);
+    }
+
+    // Group 2: res9..res12
+    size_t g2_idx = 0;
+    for (int b = 8; b < 12; ++b) {
+      for (auto& p : model->res_blocks[b]->parameters()) {
+        move_state(src_g2[g2_idx++], p);
+      }
+    }
+
+    // New parameters in Prototype F start with empty optimizer state as specified.
+    std::cout << "[MIGRATION] U31400 optimizer successfully migrated from " << path << ": moved "
+              << moved << " parameter states (expected 120), leaving new parameters with empty optimizer state." << std::endl;
+    return true;
+  }
 
   // Explicit 8->12 migration path: build source layout from source block count
   int src_num_blocks = dst_num_blocks;
@@ -1235,8 +1585,9 @@ public:
         action_dim_ = model_->policy_head->weight.size(0);
         if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
-                model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3) {
-                SpielFatalError("DeterministicEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+                (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
+                SpielFatalError("DeterministicEvaluator: 9182 actor requires an active semantic scorer with schema v3 or v4");
             }
         }
     }
@@ -1475,8 +1826,9 @@ public:
         model_action_dim_ = model_->policy_head->weight.size(0);
         if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
-                model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3) {
-                SpielFatalError("BatchedEvaluator: 9182 actor requires an active semantic scorer with schema v3");
+                (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
+                SpielFatalError("BatchedEvaluator: 9182 actor requires an active semantic scorer with schema v3 or v4");
             }
         }
 

@@ -22,7 +22,8 @@ namespace dune_semantic {
 
 inline constexpr const char* kDescriptorSchemaVersionV2 = "semantic_action_v2";
 inline constexpr const char* kDescriptorSchemaVersionV3 = "semantic_action_v3";
-inline constexpr const char* kDescriptorSchemaVersion = kDescriptorSchemaVersionV3;
+inline constexpr const char* kDescriptorSchemaVersionV4 = "semantic_action_v4";
+inline constexpr const char* kDescriptorSchemaVersion = kDescriptorSchemaVersionV4;
 
 inline constexpr int kIntrigueCardVocabOffset = 128;
 
@@ -34,6 +35,7 @@ enum class ActionRole : uint8_t {
   kIndexedIntrigue = 4,
   kGraftSolo = 5,
   kHundroOffer = 6,
+  kTleilaxuPurchase = 7,
 };
 
 inline constexpr int kCardVocabSize = 256;
@@ -344,7 +346,67 @@ inline void ExtractCandidateDescriptors(
       }
     }
 
-    // 7. Unsupported Roles
+    // 7. Tleilaxu Market Row Purchases (actions 91 and 92)
+    if (action == dune_imperium::kActionTleilaxuAcquire0 + 1 ||
+        action == dune_imperium::kActionTleilaxuAcquire0 + 2) {
+      if (schema_version != kDescriptorSchemaVersionV2 &&
+          schema_version != kDescriptorSchemaVersionV3) {
+        const int slot = action - (dune_imperium::kActionTleilaxuAcquire0 + 1);
+        const int local_id = state.GetTleilaxuRowCardForTesting(slot);
+        out_data->space_ids[i] = 0;
+        if (local_id != dune_imperium::kInvalidCard && local_id >= 1 &&
+            local_id < static_cast<int>(dune_imperium::kTleilaxuCards.size())) {
+          const int shared_id = dune_imperium::kTleilaxuCards[local_id].imperium_card_id;
+          if (shared_id >= 0 && shared_id < kCardVocabSize) {
+            out_data->card_ids[i] = shared_id;
+            out_data->supported[i] = 1;
+            out_data->roles[i] = ActionRole::kTleilaxuPurchase;
+            f[0] = 0.0f;
+
+            const auto* card = dune_imperium::FindImperiumCardById(shared_id);
+            if (card != nullptr) {
+              f[9] = static_cast<float>(card->persuasion_cost) / 10.0f;
+              f[10] = (card->access_mask & dune_imperium::kAccessEmperor) ? 1.0f : 0.0f;
+              f[11] = (card->access_mask & dune_imperium::kAccessSpacingGuild) ? 1.0f : 0.0f;
+              f[12] = (card->access_mask & dune_imperium::kAccessBeneGesserit) ? 1.0f : 0.0f;
+              f[13] = (card->access_mask & dune_imperium::kAccessFremen) ? 1.0f : 0.0f;
+              f[14] = (card->access_mask & dune_imperium::kAccessSpiceTrade) ? 1.0f : 0.0f;
+              f[15] = (card->access_mask & dune_imperium::kAccessLandsraad) ? 1.0f : 0.0f;
+              f[16] = (card->access_mask & dune_imperium::kAccessCity) ? 1.0f : 0.0f;
+              f[17] = (card->faction_mask & (1u << 0)) ? 1.0f : 0.0f;
+              f[18] = (card->faction_mask & (1u << 1)) ? 1.0f : 0.0f;
+              f[19] = (card->faction_mask & (1u << 2)) ? 1.0f : 0.0f;
+              f[20] = (card->faction_mask & (1u << 3)) ? 1.0f : 0.0f;
+              f[21] = static_cast<float>(card->reveal_persuasion) / 10.0f;
+              f[22] = static_cast<float>(card->reveal_swords) / 5.0f;
+              f[23] = static_cast<float>(card->agent_card_draw) / 3.0f;
+              f[24] = static_cast<float>(card->reveal_card_draw) / 3.0f;
+              f[25] = static_cast<float>(card->agent_troops) / 5.0f;
+              f[26] = static_cast<float>(card->reveal_troops) / 5.0f;
+            }
+          } else {
+            out_data->card_ids[i] = 0;
+            out_data->supported[i] = 0;
+            out_data->roles[i] = ActionRole::kUnsupported;
+            f[0] = 1.0f;
+          }
+        } else {
+          out_data->card_ids[i] = 0;
+          out_data->supported[i] = 0;
+          out_data->roles[i] = ActionRole::kUnsupported;
+          f[0] = 1.0f;
+        }
+      } else {
+        out_data->card_ids[i] = 0;
+        out_data->space_ids[i] = 0;
+        out_data->supported[i] = 0;
+        out_data->roles[i] = ActionRole::kUnsupported;
+        f[0] = 1.0f;
+      }
+      continue;
+    }
+
+    // 8. Unsupported Roles
     f[0] = 1.0f; // is_unsupported
     out_data->card_ids[i] = 0;
     out_data->space_ids[i] = 0;
@@ -368,8 +430,10 @@ struct SemanticActionScorerImpl : torch::nn::Module {
   torch::nn::LayerNorm mlp1_ln{nullptr};
   torch::nn::Linear out_layer{nullptr};
   torch::nn::Linear out_layer_ext{nullptr};
+  torch::nn::Linear out_layer_f{nullptr};
+  bool enable_f_ = false;
 
-  SemanticActionScorerImpl() {
+  SemanticActionScorerImpl(bool enable_f = false) : enable_f_(enable_f) {
     card_embedding = register_module(
         "card_embedding", torch::nn::Embedding(kCardVocabSize, kCardEmbedDim));
     space_embedding = register_module(
@@ -401,6 +465,16 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       out_layer_ext->weight.zero_();
       if (out_layer_ext->bias.defined()) {
         out_layer_ext->bias.zero_();
+      }
+    }
+
+    if (enable_f_) {
+      out_layer_f = register_module(
+          "out_layer_f", torch::nn::Linear(kScorerHiddenDim, 1));
+      torch::NoGradGuard no_grad;
+      out_layer_f->weight.zero_();
+      if (out_layer_f->bias.defined()) {
+        out_layer_f->bias.zero_();
       }
     }
   }
@@ -439,6 +513,19 @@ struct SemanticActionScorerImpl : torch::nn::Module {
         SpielFatalError("SemanticActionScorer: missing required submodule 'out_layer_ext' in v3 checkpoint");
       }
     }
+
+    if (enable_f_ && out_layer_f) {
+      torch::serialize::InputArchive f_arch;
+      if (archive.try_read("out_layer_f", f_arch)) {
+        out_layer_f->load(f_arch);
+      } else {
+        torch::NoGradGuard no_grad;
+        out_layer_f->weight.zero_();
+        if (out_layer_f->bias.defined()) {
+          out_layer_f->bias.zero_();
+        }
+      }
+    }
   }
 
   void load(torch::serialize::InputArchive& archive) {
@@ -455,7 +542,8 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       const torch::Tensor& space_ids,        // [M]
       const torch::Tensor& supported_mask,   // [M]
       torch::Tensor& inout_logits,           // [B, 2391]
-      const torch::Tensor& is_ext_mask = torch::Tensor()) {
+      const torch::Tensor& is_ext_mask = torch::Tensor(),
+      const torch::Tensor& is_f_mask = torch::Tensor()) {
     if (batch_indices.numel() == 0 || feat_tensor.numel() == 0) {
       return;
     }
@@ -474,7 +562,16 @@ struct SemanticActionScorerImpl : torch::nn::Module {
     auto legacy_corr = out_layer->forward(u).squeeze(-1);                  // [M]
     auto ext_corr = out_layer_ext->forward(u).squeeze(-1);                 // [M]
     torch::Tensor raw_corr;
-    if (is_ext_mask.defined() && is_ext_mask.numel() > 0) {
+    if (enable_f_ && out_layer_f && is_f_mask.defined() && is_f_mask.numel() > 0) {
+      auto f_corr = out_layer_f->forward(u).squeeze(-1);                   // [M]
+      torch::Tensor base_corr;
+      if (is_ext_mask.defined() && is_ext_mask.numel() > 0) {
+        base_corr = torch::where(is_ext_mask, ext_corr, legacy_corr);
+      } else {
+        base_corr = legacy_corr;
+      }
+      raw_corr = torch::where(is_f_mask, f_corr, base_corr);
+    } else if (is_ext_mask.defined() && is_ext_mask.numel() > 0) {
       raw_corr = torch::where(is_ext_mask, ext_corr, legacy_corr);
     } else {
       raw_corr = legacy_corr;
@@ -509,6 +606,7 @@ inline void ApplySemanticScorerBatch(
   std::vector<int64_t> space_ids;
   std::vector<float> supported;
   std::vector<uint8_t> is_ext;
+  std::vector<uint8_t> is_f;
 
   batch_indices.reserve(total_cands);
   action_indices.reserve(total_cands);
@@ -517,6 +615,7 @@ inline void ApplySemanticScorerBatch(
   space_ids.reserve(total_cands);
   supported.reserve(total_cands);
   is_ext.reserve(total_cands);
+  is_f.reserve(total_cands);
 
   for (size_t b = 0; b < batch_actions.size(); ++b) {
     const auto* data = batch_actions[b];
@@ -529,12 +628,15 @@ inline void ApplySemanticScorerBatch(
       space_ids.push_back(data->space_ids[j]);
       supported.push_back(data->supported[j] ? 1.0f : 0.0f);
       bool ext = false;
+      bool f_role = false;
       if (j < data->roles.size()) {
         ext = (data->roles[j] == ActionRole::kIndexedIntrigue ||
                data->roles[j] == ActionRole::kGraftSolo ||
                data->roles[j] == ActionRole::kHundroOffer);
+        f_role = (data->roles[j] == ActionRole::kTleilaxuPurchase);
       }
       is_ext.push_back(ext ? 1 : 0);
+      is_f.push_back(f_role ? 1 : 0);
     }
     features.insert(features.end(), data->features.begin(), data->features.end());
   }
@@ -548,11 +650,12 @@ inline void ApplySemanticScorerBatch(
   torch::Tensor s_t = torch::tensor(space_ids, opts_i64);
   torch::Tensor supp_t = torch::tensor(supported, opts_f32);
   torch::Tensor is_ext_t = torch::tensor(is_ext, torch::TensorOptions().dtype(torch::kUInt8).device(device)).to(torch::kBool);
+  torch::Tensor is_f_t = torch::tensor(is_f, torch::TensorOptions().dtype(torch::kUInt8).device(device)).to(torch::kBool);
   torch::Tensor feat_t = torch::tensor(features, torch::TensorOptions().dtype(torch::kFloat32))
                              .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(kSemanticFeatDim)})
                              .to(device);
 
-  scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t);
+  scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t, is_f_t);
 }
 
 #endif // OPEN_SPIEL_BUILD_WITH_LIBTORCH

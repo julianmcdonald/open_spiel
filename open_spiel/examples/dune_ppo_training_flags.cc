@@ -30,6 +30,9 @@ ABSL_FLAG(bool, allow_tf32, true,
           "Allow TF32 for CUDA CuBLAS/CuDNN. Default true preserves the "
           "historical runtime policy.");
 ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the neural Semantic Action Scorer on legal candidate actions.");
+ABSL_FLAG(bool, enable_zone_encoder, false, "Enable the zone encoder adapter feeding trunk.");
+ABSL_FLAG(std::string, semantic_descriptor_schema, "semantic_action_v3",
+          "Semantic descriptor schema version (e.g. semantic_action_v3, semantic_action_v4).");
 
 // Training-only reward shaping.
 // Sign convention: the value is SUBTRACTED from reward — pass a POSITIVE value to penalize. (The phase-18 pilots passed -0.02, which was a +0.02 bonus.)
