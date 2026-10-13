@@ -88,6 +88,16 @@ ABSL_FLAG(std::string, pairing_mode, "unpaired",
           "Pairing mode: 'unpaired' or 'paired'.");
 ABSL_FLAG(std::string, truncation_mode, "terminal",
           "Truncation mode: 'terminal' or 'truncated'.");
+ABSL_FLAG(int, num_blocks, 8, "Residual blocks in --model_checkpoint (8 or 12).");
+ABSL_FLAG(bool, search_leader_pick, false,
+          "Search the searching seat's leader pick: every legal leader gets paired "
+          "terminal rollouts with the raw greedy policy; the best mean utility wins.");
+ABSL_FLAG(int, leader_rollouts_per_leader, 64,
+          "Paired rollouts per legal leader when --search_leader_pick is set.");
+
+// Seed stream for leader-pick search. It is separate from the in-game search
+// counter, so turning the leader search on leaves every later search seed unchanged.
+constexpr uint64_t kStreamLeaderPickSearch = 0x4C454144;  // "LEAD"
 
 struct RecordedDecision {
   int game_id = 0;
@@ -131,7 +141,15 @@ struct GameOutcome {
   int total_new_rollouts = 0;
   int total_new_info_resets = 0;
   int ending_round = 0;
+  int placement = 0;
   double duration_seconds = 0.0;
+  bool leader_searched = false;
+  int leader_legal_count = 0;
+  int leader_raw_action = -1;
+  int leader_chosen_action = -1;
+  int leader_new_rollouts = 0;
+  double leader_search_seconds = 0.0;
+  std::vector<std::pair<Action, double>> leader_utilities;
   std::vector<RecordedDecision> decisions_trace;
 };
 
@@ -170,7 +188,9 @@ GameOutcome PlayCompoundTournamentGame(
     SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
     double softmax_temperature = 0.5,
     double eta_blend = 0.80,
-    bool record_trajectories = false) {
+    bool record_trajectories = false,
+    bool search_leader_pick = false,
+    int leader_rollouts_per_leader = 64) {
   auto start_time = std::chrono::steady_clock::now();
   std::unique_ptr<State> state = game->NewInitialState();
   std::mt19937 chance_rng(game_seed);
@@ -261,7 +281,37 @@ GameOutcome PlayCompoundTournamentGame(
       std::vector<std::pair<Action, double>> q_search_target;
       std::vector<std::pair<Action, double>> q_blend_target;
 
-      if (should_search && legals.size() > 1) {
+      const auto* dune_phase = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+      const bool leader_pick = dune_phase != nullptr && dune_phase->phase() == GamePhase::kLeaderDraft;
+
+      if (search_leader_pick && leader_pick && legals.size() > 1) {
+        auto leader_start = std::chrono::steady_clock::now();
+        uint64_t lseed = dune_seed::DeriveSeed(game_seed, kStreamLeaderPickSearch, cur);
+        auto l_res = CompoundRolloutSearchDecision(
+            *state, cur, /*turn_tree=*/nullptr, evaluators,
+            static_cast<int>(legals.size()), leader_rollouts_per_leader,
+            /*min_override_margin=*/0.0, TreeReuseMode::kAdditive, lseed,
+            SearchPairingMode::kPaired, SearchTruncationMode::kTerminal);
+        chosen_action = l_res.action;
+        overridden = l_res.overridden;
+        is_searched = true;
+        decision_role = "leader_search";
+        raw_mean_u = l_res.raw_mean_utility;
+        chosen_mean_u = l_res.chosen_mean_utility;
+        for (const auto& p : l_res.candidate_utilities) {
+          candidate_utilities_recorded.push_back({p.first, p.second});
+        }
+        outcome.leader_searched = true;
+        outcome.leader_legal_count = static_cast<int>(legals.size());
+        outcome.leader_raw_action = greedy_raw_action;
+        outcome.leader_chosen_action = chosen_action;
+        outcome.leader_new_rollouts = l_res.new_rollouts_executed;
+        outcome.leader_utilities = l_res.candidate_utilities;
+        outcome.leader_search_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - leader_start).count();
+        q_search_target = ComputeSoftmaxTarget(l_res.candidate_utilities, legals, softmax_temperature);
+        q_blend_target = BlendTargets(mu_legal, q_search_target, eta_blend);
+      } else if (should_search && legals.size() > 1) {
         searches++;
         uint64_t dseed = dune_seed::DeriveSeed(game_seed, cur, search_seed_counter++);
         auto s_res = CompoundRolloutSearchDecision(
@@ -419,6 +469,8 @@ GameOutcome PlayCompoundTournamentGame(
   outcome.search_won = (winner == search_seat);
   outcome.search_utility = outcome.final_returns[search_seat];
   outcome.search_vp = outcome.final_vps[search_seat];
+  outcome.placement = 1;
+  for (double r : outcome.final_returns) outcome.placement += r > outcome.search_utility;
 
   return outcome;
 }
@@ -445,6 +497,17 @@ int main(int argc, char** argv) {
   const double softmax_temp = absl::GetFlag(FLAGS_softmax_temperature);
   const double eta_blend = absl::GetFlag(FLAGS_eta_blend);
   const bool record_trajectories = !trajectory_meta_path.empty() && !trajectory_obs_path.empty();
+  const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const bool search_leader_pick = absl::GetFlag(FLAGS_search_leader_pick);
+  const int leader_rollouts_per_leader = absl::GetFlag(FLAGS_leader_rollouts_per_leader);
+  if (num_blocks != 8 && num_blocks != 12) {
+    std::cerr << "[ERROR] --num_blocks must be 8 or 12\n";
+    return 1;
+  }
+  if (search_leader_pick && leader_rollouts_per_leader < 1) {
+    std::cerr << "[ERROR] --leader_rollouts_per_leader must be positive\n";
+    return 1;
+  }
 
   TreeReuseMode reuse_mode = (reuse_mode_str == "additive")
       ? TreeReuseMode::kAdditive
@@ -462,6 +525,11 @@ int main(int argc, char** argv) {
   std::cout << "Override Margin: >=" << std::fixed << std::setprecision(2) << min_override_margin
             << " utility advantage | High Stakes Only: " << (high_stakes_only ? "TRUE" : "FALSE") << "\n";
   std::cout << "Seat Rotation: " << (rotate_seat ? "TRUE (balanced 25 games/seat)" : "FALSE") << "\n";
+  std::cout << "Leader Pick Search: " << (search_leader_pick ? "ON" : "OFF");
+  if (search_leader_pick) {
+    std::cout << " (" << leader_rollouts_per_leader << " paired terminal rollouts/leader)";
+  }
+  std::cout << " | Blocks: " << num_blocks << "\n";
   std::cout << "================================================================================\n";
 
   // Check CUDA
@@ -481,7 +549,7 @@ int main(int argc, char** argv) {
 
   for (int e = 0; e < num_evaluators; ++e) {
     models[e] = std::make_shared<SharedDunePolicyValueNetImpl>(
-        kFullPublicInformationStateSize, 2048, 2391, 8,
+        kFullPublicInformationStateSize, 2048, 2391, num_blocks,
         /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
     models[e]->to(device);
@@ -533,7 +601,8 @@ int main(int argc, char** argv) {
           g, s_seat, game, evaluators, thread_id, top_k, rollouts_per_action,
           min_override_margin, reuse_mode, high_stakes_only, gseed,
           pairing_mode, truncation_mode,
-          softmax_temp, eta_blend, record_trajectories);
+          softmax_temp, eta_blend, record_trajectories,
+          search_leader_pick, leader_rollouts_per_leader);
 
       outcomes[g] = res;
 
@@ -663,6 +732,13 @@ int main(int argc, char** argv) {
   root["rollouts_per_action"] = json::Value(static_cast<int64_t>(rollouts_per_action));
   root["pairing_mode"] = json::Value(pairing_str);
   root["truncation_mode"] = json::Value(truncation_str);
+  root["master_seed"] = json::Value(std::to_string(master_seed));
+  root["top_k_actions"] = json::Value(static_cast<int64_t>(top_k));
+  root["min_override_margin"] = json::Value(min_override_margin);
+  root["tree_reuse_mode"] = json::Value(reuse_mode_str);
+  root["num_blocks"] = json::Value(static_cast<int64_t>(num_blocks));
+  root["search_leader_pick"] = json::Value(search_leader_pick);
+  root["leader_rollouts_per_leader"] = json::Value(static_cast<int64_t>(leader_rollouts_per_leader));
   root["win_rate"] = json::Value(win_rate);
   root["total_wins"] = json::Value(static_cast<int64_t>(total_wins));
   root["mean_utility"] = json::Value(mean_util);
@@ -701,6 +777,24 @@ int main(int argc, char** argv) {
     g_obj["search_utility"] = json::Value(out.search_utility);
     g_obj["search_vp"] = json::Value(static_cast<int64_t>(out.search_vp));
     g_obj["ending_round"] = json::Value(static_cast<int64_t>(out.ending_round));
+    g_obj["placement"] = json::Value(static_cast<int64_t>(out.placement));
+    g_obj["returns"] = json::Value([&out] {
+      json::Array a;
+      for (double r : out.final_returns) a.push_back(json::Value(r));
+      return a;
+    }());
+    g_obj["leader_searched"] = json::Value(out.leader_searched);
+    g_obj["leader_legal_count"] = json::Value(static_cast<int64_t>(out.leader_legal_count));
+    g_obj["leader_raw_action"] = json::Value(static_cast<int64_t>(out.leader_raw_action));
+    g_obj["leader_chosen_action"] = json::Value(static_cast<int64_t>(out.leader_chosen_action));
+    g_obj["leader_new_rollouts"] = json::Value(static_cast<int64_t>(out.leader_new_rollouts));
+    g_obj["leader_search_seconds"] = json::Value(out.leader_search_seconds);
+    json::Array leader_utils;
+    for (const auto& lu : out.leader_utilities) {
+      leader_utils.push_back(json::Value(json::Array{
+          json::Value(static_cast<int64_t>(lu.first)), json::Value(lu.second)}));
+    }
+    g_obj["leader_utilities"] = json::Value(leader_utils);
     g_obj["total_searches"] = json::Value(static_cast<int64_t>(out.total_searches));
     g_obj["total_overrides"] = json::Value(static_cast<int64_t>(out.total_overrides));
     g_obj["reused_rollouts"] = json::Value(static_cast<int64_t>(out.total_reused_rollouts));
