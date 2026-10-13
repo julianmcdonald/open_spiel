@@ -100,6 +100,13 @@ ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
 ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
 ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
 ABSL_FLAG(int, rollout_games, 256, "");
+ABSL_FLAG(bool, enable_ema_tracking, false, "");
+ABSL_FLAG(double, ema_half_life, 100.0, "");
+ABSL_FLAG(double, ema_decay, 0.0, "");
+ABSL_FLAG(std::string, ema_model_checkpoint, "", "");
+ABSL_DECLARE_FLAG(bool, advantage_filtering);
+ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
+ABSL_DECLARE_FLAG(bool, enable_study_readouts);
 ABSL_DECLARE_FLAG(bool, train_value_only);
 // WO-PERF-1 flags (defined in dune_ppo_training_utils.cc).
 ABSL_DECLARE_FLAG(std::string, diag_prepass_mode);

@@ -24,4 +24,14 @@ ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);
 ABSL_DECLARE_FLAG(int, plot_intrigue_exemption_threshold);
 ABSL_DECLARE_FLAG(uint64_t, head_init_constant);
 
+// 12-block H/J study flags.
+ABSL_DECLARE_FLAG(bool, enable_ema_tracking);
+ABSL_DECLARE_FLAG(double, ema_half_life);
+ABSL_DECLARE_FLAG(double, ema_decay);
+ABSL_DECLARE_FLAG(std::string, ema_model_checkpoint);
+ABSL_DECLARE_FLAG(bool, advantage_filtering);
+ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
+ABSL_DECLARE_FLAG(bool, enable_study_readouts);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
+

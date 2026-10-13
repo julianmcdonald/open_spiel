@@ -484,6 +484,17 @@ struct PpoUpdateStats {
   // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
   double reverse_kl = 0.0;
 
+  // --- 12-block H/J study readouts ---
+  int64_t single_action_transitions = 0;
+  double single_action_fraction = 0.0;
+  double single_action_value_mse_before = 0.0;
+  double single_action_value_mse_after = 0.0;
+  int64_t single_action_sample_size = 0;
+  double unfiltered_kl = 0.0;
+  int64_t unfiltered_kl_sample_size = 0;
+  int64_t retained_transitions = 0;
+  int64_t optimizer_minibatches = 0;
+
   // WO-PERF-TIMING. All zero and `enabled == false` unless
   // --phase_timing_mode=phases. No diagnostics column consumes this; it is
   // written only to the phase_timing.jsonl sidecar.

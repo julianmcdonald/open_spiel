@@ -2497,6 +2497,10 @@ private:
         torch::Tensor compact_device_mask;
         torch::Tensor compact_device_rows;
         torch::Tensor compact_host_probs;
+        // Logit-cap telemetry for the compact path, copied to the host with the
+        // results and recorded in finish_slot, so launching never waits on it.
+        torch::Tensor host_cap_stats;
+        bool has_cap_stats = false;
         bool pending = false;
         int64_t membership_batch_id = -1;
     };
@@ -2510,6 +2514,21 @@ private:
             slot.stream = std::make_unique<c10::cuda::CUDAStream>(
                 c10::cuda::getStreamFromPool(high_priority_stream_,
                                              device_index));
+            auto host_options = torch::TensorOptions()
+                .dtype(torch::kFloat32).device(torch::kCPU)
+                .pinned_memory(true);
+            auto device_options = torch::TensorOptions()
+                .dtype(torch::kFloat32).device(device_);
+            slot.host_obs = torch::empty(
+                {target_batch_size_, model_input_dim_}, host_options);
+            slot.device_obs = torch::empty(
+                {target_batch_size_, model_input_dim_}, device_options);
+            slot.device_values = torch::empty(
+                {target_batch_size_}, device_options);
+            slot.host_values = torch::empty(
+                {target_batch_size_}, host_options);
+            slot.complete = std::make_unique<c10::Event>(
+                c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
         }
         int pending_slot = -1;
         int next_slot = 0;
@@ -2649,6 +2668,12 @@ private:
         auto finish_slot = [&](AsyncBatchSlot& slot) {
             if (!slot.pending) return;
             slot.complete->synchronize();
+            if (slot.has_cap_stats) {
+                const double* cap = slot.host_cap_stats.data_ptr<double>();
+                RecordLogitCapStats(cap[0], cap[1], static_cast<int64_t>(cap[2]),
+                                    static_cast<int64_t>(cap[3]));
+                slot.has_cap_stats = false;
+            }
             const float* values = slot.host_values.data_ptr<float>();
             const size_t action_dim = static_cast<size_t>(model_action_dim_);
             dune_hotspot::ScopedTimer hotspot_timer(
@@ -2727,8 +2752,10 @@ private:
                     .pinned_memory(true);
                 auto device_options = torch::TensorOptions()
                     .dtype(torch::kFloat32).device(device_);
-                slot.host_obs = torch::empty(
-                    {target_batch_size_, model_input_dim_}, host_options);
+                if (!slot.host_obs.defined()) {
+                    slot.host_obs = torch::empty(
+                        {target_batch_size_, model_input_dim_}, host_options);
+                }
                 slot.device_obs = torch::empty(
                     {target_batch_size_, model_input_dim_}, device_options);
                 slot.device_values = torch::empty(
@@ -2793,12 +2820,14 @@ private:
                 if (!slot.compact_request_indices.empty()) {
                     const int compact_count =
                         static_cast<int>(slot.compact_request_indices.size());
+                    // Pinned staging: a pageable host-to-device copy synchronizes
+                    // the stream, so the runner would wait for the forward pass.
                     torch::Tensor ids_cpu = torch::zeros(
                         {compact_count, slot.compact_max_legal},
-                        torch::TensorOptions().dtype(torch::kInt64));
+                        torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
                     torch::Tensor mask_cpu = torch::zeros(
                         {compact_count, slot.compact_max_legal},
-                        torch::TensorOptions().dtype(torch::kBool));
+                        torch::TensorOptions().dtype(torch::kBool).pinned_memory(true));
                     int64_t* ids = ids_cpu.data_ptr<int64_t>();
                     bool* mask = mask_cpu.data_ptr<bool>();
                     for (int k = 0; k < compact_count; ++k) {
@@ -2814,15 +2843,15 @@ private:
                         device_, /*non_blocking=*/true);
                     slot.compact_device_mask = mask_cpu.to(
                         device_, /*non_blocking=*/true);
-                    std::vector<int64_t> compact_row_ids;
-                    compact_row_ids.reserve(compact_count);
-                    for (size_t row_index : slot.compact_request_indices) {
-                        compact_row_ids.push_back(static_cast<int64_t>(row_index));
+                    torch::Tensor rows_cpu = torch::empty(
+                        {compact_count},
+                        torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+                    int64_t* rows = rows_cpu.data_ptr<int64_t>();
+                    for (int k = 0; k < compact_count; ++k) {
+                        rows[k] = static_cast<int64_t>(slot.compact_request_indices[k]);
                     }
-                    slot.compact_device_rows = torch::tensor(
-                        compact_row_ids,
-                        torch::TensorOptions().dtype(torch::kInt64))
-                        .to(device_, /*non_blocking=*/true);
+                    slot.compact_device_rows = rows_cpu.to(
+                        device_, /*non_blocking=*/true);
                     auto compact_logits = outputs.logits.index_select(
                         0, slot.compact_device_rows)
                         .gather(1, slot.compact_device_ids)
@@ -2841,12 +2870,24 @@ private:
                     }
                     const torch::Tensor post_max = compact_logits.abs().masked_fill(
                         slot.compact_device_mask.logical_not(), 0.0).amax(1);
-                    RecordLogitCapStats(
-                        pre_max.max().item<double>(), post_max.max().item<double>(),
-                        legal.sum().item<int64_t>(),
+                    // Same four statistics as before; reading them with item()
+                    // here forced a device sync on every batch.
+                    const torch::Tensor saturated =
                         ((compact_logits.abs() >=
                           0.99 * static_cast<float>(logit_cap_)) &
-                         slot.compact_device_mask).sum().item<int64_t>());
+                         slot.compact_device_mask).sum();
+                    const torch::Tensor cap_stats = torch::stack(
+                        {pre_max.max().to(torch::kFloat64),
+                         post_max.max().to(torch::kFloat64),
+                         legal.sum().to(torch::kFloat64),
+                         saturated.to(torch::kFloat64)});
+                    if (!slot.host_cap_stats.defined()) {
+                        slot.host_cap_stats = torch::empty(
+                            {4}, torch::TensorOptions().dtype(torch::kFloat64)
+                                     .pinned_memory(true));
+                    }
+                    slot.host_cap_stats.copy_(cap_stats, /*non_blocking=*/true);
+                    slot.has_cap_stats = true;
                     auto compact_probs = torch::softmax(
                         compact_logits.masked_fill(
                             slot.compact_device_mask.logical_not(), -1e9f),

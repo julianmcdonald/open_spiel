@@ -70,3 +70,14 @@ ABSL_FLAG(uint64_t, head_init_constant, 20260800,
           "byte-identical across ALL SIX arms. Deriving from the triplet seed "
           "would give T1/P1/H1 one set and T2/P2/H2 another. Outside the "
           "reserved final-gate base-seed range by section 10.2's arithmetic.");
+
+// 12-block H/J study flags.
+ABSL_FLAG(bool, enable_ema_tracking, false,
+          "Enable persistent EMA tracking for evaluation and play.");
+ABSL_FLAG(double, ema_half_life, 100.0,
+          "EMA half-life in completed updates (default 100).");
+ABSL_FLAG(double, ema_decay, 0.0,
+          "Explicit EMA decay factor per update. If <= 0, computed from ema_half_life: pow(0.5, 1/half_life).");
+ABSL_FLAG(std::string, ema_model_checkpoint, "",
+          "Optional path to existing EMA model checkpoint to resume.");
+

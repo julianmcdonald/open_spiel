@@ -2112,6 +2112,29 @@ std::string ValidateAndComputeSingleLearnerTransitionFingerprint(
   return computed_source_fp;
 }
 
+void UpdateEmaWeights(
+    const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
+    std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
+    double decay) {
+  torch::NoGradGuard no_grad;
+  auto model_params = model->named_parameters();
+  auto ema_params = ema_model->named_parameters();
+  for (const auto& kv : model_params) {
+    auto it = ema_params.find(kv.key());
+    if (it != nullptr) {
+      it->mul_(decay).add_(kv.value().detach(), 1.0 - decay);
+    }
+  }
+  auto model_buffers = model->named_buffers();
+  auto ema_buffers = ema_model->named_buffers();
+  for (const auto& kv : model_buffers) {
+    auto it = ema_buffers.find(kv.key());
+    if (it != nullptr) {
+      it->copy_(kv.value().detach());
+    }
+  }
+}
+
 void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     torch::optim::AdamW& optimizer,
                     const std::string& model_path,
@@ -2126,7 +2149,11 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     const std::string& search_label_fingerprint,
                     const std::string& run_uuid,
                     const open_spiel::OnlineCollectionState* aux_state = nullptr,
-                    const open_spiel::SearchPiState* search_pi_state = nullptr) {
+                    const open_spiel::SearchPiState* search_pi_state = nullptr,
+                    std::shared_ptr<SharedDunePolicyValueNetImpl> ema_model = nullptr,
+                    int64_t ema_updates_absorbed = 0,
+                    double ema_half_life = 0.0,
+                    double ema_decay = 0.0) {
   if (model_path.empty() || optim_path.empty()) {
     SpielFatalError("SaveCheckpoint called with empty path.");
   }
@@ -2166,6 +2193,11 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
   manifest_path.replace_extension(".json");
   std::string manifest_path_str = manifest_path.string();
   std::string manifest_tmp = manifest_path_str + ".tmp";
+
+  std::string ema_model_path;
+  std::string ema_tmp;
+  std::string ema_manifest_path;
+  std::string ema_manifest_tmp;
 
   try {
     torch::save(model, model_tmp);
@@ -2285,11 +2317,66 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
               << "  Model: " << model_path << " (" << model_size << " bytes, sha256=" << model_hash << ")\n"
               << "  Optimizer: " << optim_path << " (" << optim_size << " bytes, sha256=" << optim_hash << ")\n"
               << "  Manifest: " << manifest_path << "\n";
+
+    if (ema_model != nullptr) {
+      std::string filename = std::filesystem::path(model_path).filename().string();
+      std::string parent_dir = std::filesystem::path(model_path).parent_path().string();
+      std::string ema_filename;
+      if (filename.find("_model_update_") != std::string::npos) {
+        ema_filename = filename;
+        size_t pos = ema_filename.find("_model_update_");
+        ema_filename.replace(pos, 14, "_model_ema_update_");
+      } else if (filename.find("_model_final") != std::string::npos) {
+        ema_filename = filename;
+        size_t pos = ema_filename.find("_model_final");
+        ema_filename.replace(pos, 12, "_model_ema_final");
+      } else {
+        ema_filename = "ema_" + filename;
+      }
+      ema_model_path = parent_dir.empty() ? ema_filename : (parent_dir + "/" + ema_filename);
+      ema_tmp = ema_model_path + ".tmp";
+      std::filesystem::path emp(ema_model_path);
+      emp.replace_extension(".json");
+      ema_manifest_path = emp.string();
+      ema_manifest_tmp = ema_manifest_path + ".tmp";
+
+      torch::save(ema_model, ema_tmp);
+      size_t ema_size = 0;
+      std::string ema_hash = ComputeFileSHA256(ema_tmp, &ema_size);
+
+      json::Object ema_manifest_obj = manifest_obj;
+      ema_manifest_obj["checkpoint_uuid"] = GenerateUUID();
+      ema_manifest_obj["model_filename"] = ema_filename;
+      ema_manifest_obj["model_file_size"] = static_cast<int64_t>(ema_size);
+      ema_manifest_obj["model_sha256"] = ema_hash;
+      ema_manifest_obj["ema_updates_absorbed"] = static_cast<int64_t>(ema_updates_absorbed);
+      ema_manifest_obj["ema_half_life"] = ema_half_life;
+      ema_manifest_obj["ema_decay"] = ema_decay;
+      ema_manifest_obj["source_model_filename"] = std::filesystem::path(model_path).filename().string();
+      ema_manifest_obj.erase("optimizer_filename");
+      ema_manifest_obj.erase("optimizer_file_size");
+      ema_manifest_obj.erase("optimizer_sha256");
+
+      {
+        std::ofstream ofs(ema_manifest_tmp);
+        if (!ofs) throw std::runtime_error("Could not open ema manifest temp file: " + ema_manifest_tmp);
+        ofs << json::ToString(ema_manifest_obj, true);
+      }
+
+      std::filesystem::rename(ema_tmp, ema_model_path);
+      std::filesystem::rename(ema_manifest_tmp, ema_manifest_path);
+
+      std::cout << "  EMA Model: " << ema_model_path << " (" << ema_size << " bytes, sha256=" << ema_hash
+                << ", absorbed=" << ema_updates_absorbed << ")\n"
+                << "  EMA Manifest: " << ema_manifest_path << "\n";
+    }
   } catch (const std::exception& e) {
     std::cerr << "CRITICAL ERROR: SaveCheckpoint failed: " << e.what() << "\n";
     if (std::filesystem::exists(model_tmp)) std::filesystem::remove(model_tmp);
     if (std::filesystem::exists(optim_tmp)) std::filesystem::remove(optim_tmp);
     if (std::filesystem::exists(manifest_tmp)) std::filesystem::remove(manifest_tmp);
+    if (!ema_tmp.empty() && std::filesystem::exists(ema_tmp)) std::filesystem::remove(ema_tmp);
+    if (!ema_manifest_tmp.empty() && std::filesystem::exists(ema_manifest_tmp)) std::filesystem::remove(ema_manifest_tmp);
     SpielFatalError("SaveCheckpoint failed, aborting training to prevent corrupted states.");
   }
 }
@@ -2359,6 +2446,29 @@ bool PublishFinalCheckpointFromExisting(
       ofs.close();
       std::filesystem::rename(tmp_j, dst_j);
     }
+
+    std::string src_ema_m = absl::StrCat(prefix, "_model_ema_update_", update, ".pt");
+    std::string src_ema_j = absl::StrCat(prefix, "_model_ema_update_", update, ".json");
+    if (std::filesystem::exists(src_ema_m, ec) && std::filesystem::exists(src_ema_j, ec)) {
+      std::string dst_ema_m = absl::StrCat(prefix, "_model_ema_final.pt");
+      std::string dst_ema_j = absl::StrCat(prefix, "_model_ema_final.json");
+      link_or_copy(src_ema_m, dst_ema_m);
+      std::ifstream eifs(src_ema_j);
+      if (eifs) {
+        std::string ejson_str((std::istreambuf_iterator<char>(eifs)), std::istreambuf_iterator<char>());
+        eifs.close();
+        auto e_parsed = json::FromString(ejson_str);
+        if (e_parsed && e_parsed->IsObject()) {
+          auto e_obj = e_parsed->GetObject();
+          e_obj["model_filename"] = std::filesystem::path(dst_ema_m).filename().string();
+          std::string tmp_ej = dst_ema_j + ".tmp";
+          std::ofstream eofs(tmp_ej);
+          eofs << json::ToString(e_obj, true);
+          eofs.close();
+          std::filesystem::rename(tmp_ej, dst_ema_j);
+        }
+      }
+    }
     return true;
   } else {
     std::string src_m = absl::StrCat(prefix, "_model_update_", update, ".pt");
@@ -2409,6 +2519,29 @@ bool PublishFinalCheckpointFromExisting(
       ofs << json::ToString(obj, true);
       ofs.close();
       std::filesystem::rename(tmp_j, dst_j);
+    }
+
+    std::string src_ema_m = absl::StrCat(prefix, "_model_ema_update_", update, ".pt");
+    std::string src_ema_j = absl::StrCat(prefix, "_model_ema_update_", update, ".json");
+    if (std::filesystem::exists(src_ema_m, ec) && std::filesystem::exists(src_ema_j, ec)) {
+      std::string dst_ema_m = absl::StrCat(prefix, "_model_ema_final.pt");
+      std::string dst_ema_j = absl::StrCat(prefix, "_model_ema_final.json");
+      link_or_copy(src_ema_m, dst_ema_m);
+      std::ifstream eifs(src_ema_j);
+      if (eifs) {
+        std::string ejson_str((std::istreambuf_iterator<char>(eifs)), std::istreambuf_iterator<char>());
+        eifs.close();
+        auto e_parsed = json::FromString(ejson_str);
+        if (e_parsed && e_parsed->IsObject()) {
+          auto e_obj = e_parsed->GetObject();
+          e_obj["model_filename"] = std::filesystem::path(dst_ema_m).filename().string();
+          std::string tmp_ej = dst_ema_j + ".tmp";
+          std::ofstream eofs(tmp_ej);
+          eofs << json::ToString(e_obj, true);
+          eofs.close();
+          std::filesystem::rename(tmp_ej, dst_ema_j);
+        }
+      }
     }
     return true;
   }
@@ -8263,6 +8396,30 @@ int main(int argc, char** argv) {
     training_model->market_appendix_mode_ = parsed_mode;
     inference_model->market_appendix_mode_ = parsed_mode;
   }
+
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> ema_model = nullptr;
+  int64_t ema_updates_absorbed = 0;
+  double ema_half_life = absl::GetFlag(FLAGS_ema_half_life);
+  double ema_decay = absl::GetFlag(FLAGS_ema_decay);
+  if (ema_decay <= 0.0 && ema_half_life > 0.0) {
+    ema_decay = std::pow(0.5, 1.0 / ema_half_life);
+  }
+  if (absl::GetFlag(FLAGS_enable_ema_tracking)) {
+    ema_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
+        pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc);
+    if (!sem_schema.empty()) {
+      ema_model->semantic_descriptor_schema_ = sem_schema;
+    }
+    ema_model->to(device);
+    if (m_mode_str != "none") {
+      ema_model->market_appendix_mode_ = training_model->market_appendix_mode_;
+    }
+    std::cout << absl::StrFormat(
+        "[EMA] Initialized EMA tracking model: half_life=%.1f, decay=%.8f\n",
+        ema_half_life, ema_decay);
+  }
   if (obs_size == dune_imperium::kExpandedInformationStateSize) {
     if (absl::GetFlag(FLAGS_init_mode) == "random") {
       if (m_mode_str != "zeros" && m_mode_str != "ordered_market") {
@@ -9908,6 +10065,42 @@ int main(int argc, char** argv) {
 
     try {
       LoadModelCheckpoint(training_model, model_path, device);
+      if (absl::GetFlag(FLAGS_enable_ema_tracking) && ema_model != nullptr) {
+        std::string ema_path = absl::GetFlag(FLAGS_ema_model_checkpoint);
+        if (ema_path.empty()) {
+          std::string sibling_ema = (std::filesystem::path(model_path).parent_path() /
+              ("ppo_model_ema_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+          if (std::filesystem::exists(sibling_ema)) {
+            ema_path = sibling_ema;
+          }
+        }
+        if (!ema_path.empty() && std::filesystem::exists(ema_path)) {
+          LoadModelCheckpoint(ema_model, ema_path, device);
+          std::string ema_json_path = (std::filesystem::path(ema_path).parent_path() /
+              (std::filesystem::path(ema_path).stem().string() + ".json")).string();
+          if (std::filesystem::exists(ema_json_path)) {
+            std::ifstream ejf(ema_json_path);
+            if (ejf) {
+              std::string content((std::istreambuf_iterator<char>(ejf)), std::istreambuf_iterator<char>());
+              auto parsed = open_spiel::json::FromString(content);
+              if (parsed && parsed->IsObject()) {
+                auto obj = parsed->GetObject();
+                auto it_u = obj.find("ema_updates_absorbed");
+                if (it_u != obj.end() && it_u->second.IsInt()) {
+                  ema_updates_absorbed = it_u->second.GetInt();
+                }
+              }
+            }
+          }
+          std::cout << absl::StrFormat(
+              "[EMA] Resumed EMA model from %s (updates_absorbed=%lld)\n",
+              ema_path, (long long)ema_updates_absorbed);
+        } else {
+          CopyModelWeights(training_model, ema_model);
+          ema_updates_absorbed = 0;
+          std::cout << "[EMA] No prior EMA checkpoint found; initialized EMA weights from training model.\n";
+        }
+      }
       if (anchor_model) {
         LoadModelCheckpoint(anchor_model, model_path, device);
         anchor_model->eval();
@@ -10736,6 +10929,9 @@ int main(int argc, char** argv) {
   }
   if (collection_model != nullptr) {
     CopyModelWeights(training_model, collection_model);
+  }
+  if (ema_model != nullptr && ema_updates_absorbed == 0) {
+    CopyModelWeights(training_model, ema_model);
   }
 
   std::shared_ptr<open_spiel::IGameEvaluator> evaluator;
@@ -13575,6 +13771,11 @@ int main(int argc, char** argv) {
     // counters / hash chain / resume cursor (main thread only).
     account_aux_consumed(current_collect);
 
+    if (ema_model != nullptr) {
+      UpdateEmaWeights(training_model, ema_model, ema_decay);
+      ema_updates_absorbed++;
+    }
+
     double hs_pre_share = (current_collect.nontrivial_transitions > 0)
         ? (static_cast<double>(current_collect.high_stakes_pre_transitions) / current_collect.nontrivial_transitions)
         : 0.0;
@@ -14273,7 +14474,10 @@ int main(int argc, char** argv) {
                                    master, absl::GetFlag(FLAGS_seed_scheme_version),
                                    config_fingerprint, search_label_fingerprint,
                                    run_uuid,
-                                   online_search_collection ? &aux_ckpt : nullptr);
+                                   online_search_collection ? &aux_ckpt : nullptr,
+                                   /*search_pi_state=*/nullptr,
+                                   ema_model, ema_updates_absorbed,
+                                   ema_half_life, ema_decay);
       }
       if (!card_telemetry_path.empty()) {
         open_spiel::SaveCardTelemetry(card_telemetry_path, update, cum_card11, cum_card13, /*is_checkpoint=*/true);
@@ -14341,7 +14545,10 @@ int main(int argc, char** argv) {
                                      master, absl::GetFlag(FLAGS_seed_scheme_version),
                                      config_fingerprint, search_label_fingerprint,
                                      run_uuid,
-                                     online_search_collection ? &aux_ckpt : nullptr);
+                                     online_search_collection ? &aux_ckpt : nullptr,
+                                     /*search_pi_state=*/nullptr,
+                                     ema_model, ema_updates_absorbed,
+                                     ema_half_life, ema_decay);
         }
       }
 
@@ -14372,7 +14579,10 @@ int main(int argc, char** argv) {
                                        master, absl::GetFlag(FLAGS_seed_scheme_version),
                                        config_fingerprint, search_label_fingerprint,
                                        run_uuid,
-                                       online_search_collection ? &aux_final : nullptr);
+                                       online_search_collection ? &aux_final : nullptr,
+                                       /*search_pi_state=*/nullptr,
+                                       ema_model, ema_updates_absorbed,
+                                       ema_half_life, ema_decay);
           }
         } else {
           std::cout << "[dune_ppo_train] Reused completed endpoint checkpoint for final export (zero re-serialization).\n";
@@ -14446,7 +14656,10 @@ int main(int argc, char** argv) {
                                    master, absl::GetFlag(FLAGS_seed_scheme_version),
                                    config_fingerprint, search_label_fingerprint,
                                    run_uuid,
-                                   online_search_collection ? &aux_final : nullptr);
+                                   online_search_collection ? &aux_final : nullptr,
+                                   /*search_pi_state=*/nullptr,
+                                   ema_model, ema_updates_absorbed,
+                                   ema_half_life, ema_decay);
       }
     } else {
       std::cout << "[dune_ppo_train] Reused completed endpoint checkpoint for final export (zero re-serialization).\n";

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <type_traits>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -641,19 +643,30 @@ inline void ApplySemanticScorerBatch(
     features.insert(features.end(), data->features.begin(), data->features.end());
   }
 
-  auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
-  auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  // Stage each input in pinned host memory and copy it asynchronously on the
+  // current stream. A blocking (or pageable) host-to-device copy synchronizes
+  // the stream, which stalls the caller until the trunk forward has finished.
+  const bool on_cuda = device.is_cuda();
+  auto upload = [&](const auto& vec, torch::ScalarType dtype) {
+    using T = typename std::decay_t<decltype(vec)>::value_type;
+    torch::Tensor host = torch::empty(
+        {static_cast<int64_t>(vec.size())},
+        torch::TensorOptions().dtype(dtype).pinned_memory(on_cuda));
+    if (!vec.empty()) {
+      std::memcpy(host.data_ptr(), vec.data(), vec.size() * sizeof(T));
+    }
+    return on_cuda ? host.to(device, /*non_blocking=*/true) : host;
+  };
 
-  torch::Tensor b_t = torch::tensor(batch_indices, opts_i64);
-  torch::Tensor a_t = torch::tensor(action_indices, opts_i64);
-  torch::Tensor c_t = torch::tensor(card_ids, opts_i64);
-  torch::Tensor s_t = torch::tensor(space_ids, opts_i64);
-  torch::Tensor supp_t = torch::tensor(supported, opts_f32);
-  torch::Tensor is_ext_t = torch::tensor(is_ext, torch::TensorOptions().dtype(torch::kUInt8).device(device)).to(torch::kBool);
-  torch::Tensor is_f_t = torch::tensor(is_f, torch::TensorOptions().dtype(torch::kUInt8).device(device)).to(torch::kBool);
-  torch::Tensor feat_t = torch::tensor(features, torch::TensorOptions().dtype(torch::kFloat32))
-                             .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(kSemanticFeatDim)})
-                             .to(device);
+  torch::Tensor b_t = upload(batch_indices, torch::kInt64);
+  torch::Tensor a_t = upload(action_indices, torch::kInt64);
+  torch::Tensor c_t = upload(card_ids, torch::kInt64);
+  torch::Tensor s_t = upload(space_ids, torch::kInt64);
+  torch::Tensor supp_t = upload(supported, torch::kFloat32);
+  torch::Tensor is_ext_t = upload(is_ext, torch::kUInt8).to(torch::kBool);
+  torch::Tensor is_f_t = upload(is_f, torch::kUInt8).to(torch::kBool);
+  torch::Tensor feat_t = upload(features, torch::kFloat32)
+                             .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(kSemanticFeatDim)});
 
   scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t, is_f_t);
 }

@@ -249,6 +249,11 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_create_corpus dune_create_corpus.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_create_corpus dune_search ${TORCH_LIBRARIES})
 
+  add_executable(dune_actor_search_pilot
+    dune_actor_search_pilot.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_actor_search_pilot dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_critic_fidelity_gate dune_critic_fidelity_gate.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_critic_fidelity_gate dune_search ${TORCH_LIBRARIES})
 
@@ -294,6 +299,17 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
     dune_compound_search_tournament.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_compound_search_tournament dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_play_search_tournament
+    dune_play_search_tournament.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_play_search_tournament dune_search ${TORCH_LIBRARIES})
+
+  add_executable(dune_wide_rollout_search_test
+    dune_wide_rollout_search_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_wide_rollout_search_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_wide_rollout_search_test COMMAND dune_wide_rollout_search_test)
 
   add_executable(dune_fixed_root_search_benchmark
     dune_fixed_root_search_benchmark.cc

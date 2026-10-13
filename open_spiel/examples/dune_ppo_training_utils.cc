@@ -122,6 +122,14 @@ ABSL_FLAG(std::string, phase_timing_mode, "off",
           "manifest cannot detect a mid-run flip: every timed arm must be a "
           "FRESH run, never a resume. Rejected with --pipeline=true, whose "
           "background collection thread shares the compute stream.");
+
+ABSL_FLAG(bool, advantage_filtering, false,
+          "When true, standardizes advantages across multi-choice rollout rows, "
+          "retains top quantile by |std_adv|, and skips minibatch renormalization.");
+ABSL_FLAG(double, advantage_filtering_quantile, 0.25,
+          "Quantile cutoff for advantage filtering (default 0.25).");
+ABSL_FLAG(bool, enable_study_readouts, false,
+          "When true, logs unfiltered KL diagnostic and single-action value error readouts.");
 #endif
 
 namespace open_spiel {
@@ -2036,6 +2044,8 @@ PpoUpdateStats TrainPpoUpdate(
   float* staging_old_values_ptr = staging_old_values_cpu.data_ptr<float>();
   bool* staging_nontrivial_ptr = staging_nontrivial_cpu.data_ptr<bool>();
 
+  std::vector<PpoTransition>* train_batch_ptr = &batch;
+
   // Staging helper that packs active rows, clears legal masks, and uploads
   // ONLY the active [0, mb_len] rows to the device.
   auto stage_and_upload = [&](const int64_t* mb_indices, int64_t start_seq,
@@ -2059,7 +2069,7 @@ PpoUpdateStats TrainPpoUpdate(
 
     for (int64_t i = 0; i < mb_len; ++i) {
       int64_t idx = mb_indices ? mb_indices[i] : (start_seq + i);
-      const PpoTransition& transition = batch[idx];
+      const PpoTransition& transition = (*train_batch_ptr)[idx];
       std::memcpy(staging_states_ptr + i * obs_size, transition.state.data(),
                   obs_size * sizeof(float));
       for (Action action : transition.legal_actions) {
@@ -2083,7 +2093,7 @@ PpoUpdateStats TrainPpoUpdate(
     if (::absl::GetFlag(::FLAGS_verify_packing_alignment)) {
       std::string err;
       if (!VerifyPackedMinibatchAlignment(
-              batch, mb_indices, start_seq, mb_len, obs_size, action_dim,
+              *train_batch_ptr, mb_indices, start_seq, mb_len, obs_size, action_dim,
               staging_states_ptr, staging_masks_ptr, staging_actions_ptr,
               out_cands ? *out_cands : std::vector<const dune_semantic::CandidateActionData*>(),
               &err)) {
@@ -2143,6 +2153,8 @@ PpoUpdateStats TrainPpoUpdate(
   stats.total_transitions = n;
   stats.nontrivial_transitions = nontrivial_count;
   stats.forced_transitions = n - nontrivial_count;
+  stats.single_action_transitions = stats.forced_transitions;
+  stats.single_action_fraction = n > 0 ? (static_cast<double>(stats.single_action_transitions) / n) : 0.0;
 
   // 3. Policy KL Before & Saturation Checks
   //
@@ -2562,11 +2574,128 @@ PpoUpdateStats TrainPpoUpdate(
     log_pi_before = compute_forced_log_probs(forced_indices);
   }
 
+  // --- 12-block H/J study: pre-update diagnostics and filtering ---
+  const bool do_filtering = ::absl::GetFlag(::FLAGS_advantage_filtering);
+  const double filter_quantile = ::absl::GetFlag(::FLAGS_advantage_filtering_quantile);
+  const bool study_readouts = ::absl::GetFlag(::FLAGS_enable_study_readouts) || do_filtering;
+
+  std::vector<int64_t> sa_indices;
+  auto compute_value_mse = [&](const std::vector<int64_t>& indices) -> double {
+    if (indices.empty()) return 0.0;
+    torch::NoGradGuard no_grad;
+    bool was_training = model->is_training();
+    model->eval();
+    double total_sq_err = 0.0;
+    int64_t count = 0;
+    for (size_t start = 0; start < indices.size(); start += minibatch_size) {
+      size_t end = std::min(start + static_cast<size_t>(minibatch_size), indices.size());
+      int64_t chunk_len = end - start;
+      torch::Tensor s_dev = torch::empty({chunk_len, obs_size}, cpu_float);
+      torch::Tensor t_dev = torch::empty({chunk_len}, cpu_float);
+      float* sp = s_dev.data_ptr<float>();
+      float* tp = t_dev.data_ptr<float>();
+      for (int64_t i = 0; i < chunk_len; ++i) {
+        int64_t idx = indices[start + i];
+        std::memcpy(sp + i * obs_size, batch[idx].state.data(), obs_size * sizeof(float));
+        tp[i] = batch[idx].return_value;
+      }
+      torch::Tensor dev_s = s_dev.to(device);
+      torch::Tensor dev_t = t_dev.to(device);
+      auto out = model->forward(dev_s);
+      torch::Tensor v = out.values.squeeze(1);
+      torch::Tensor sq_err = (v - dev_t).pow(2);
+      total_sq_err += sq_err.sum().item<double>();
+      count += chunk_len;
+    }
+    if (was_training) model->train();
+    return count > 0 ? (total_sq_err / count) : 0.0;
+  };
+
+  if (study_readouts) {
+    for (int64_t i = 0; i < n; ++i) {
+      if (batch[i].legal_actions.size() <= 1) {
+        sa_indices.push_back(i);
+      }
+    }
+    if (sa_indices.size() > 1024) {
+      uint64_t sa_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, 99991);
+      std::mt19937_64 sa_rng(sa_seed);
+      std::shuffle(sa_indices.begin(), sa_indices.end(), sa_rng);
+      sa_indices.resize(1024);
+      std::sort(sa_indices.begin(), sa_indices.end());
+    }
+    stats.single_action_sample_size = static_cast<int64_t>(sa_indices.size());
+    stats.single_action_value_mse_before = compute_value_mse(sa_indices);
+  }
+
+  std::vector<PpoTransition> filtered_batch;
+  if (do_filtering) {
+    std::vector<int64_t> mc_indices;
+    mc_indices.reserve(nontrivial_count);
+    for (int64_t i = 0; i < n; ++i) {
+      if (batch[i].legal_actions.size() > 1) {
+        mc_indices.push_back(i);
+      }
+    }
+    if (!mc_indices.empty()) {
+      double adv_sum = 0.0;
+      for (int64_t idx : mc_indices) {
+        adv_sum += batch[idx].advantage;
+      }
+      double adv_mean = adv_sum / mc_indices.size();
+      double adv_sq_sum = 0.0;
+      for (int64_t idx : mc_indices) {
+        double diff = batch[idx].advantage - adv_mean;
+        adv_sq_sum += diff * diff;
+      }
+      double adv_std = std::sqrt(adv_sq_sum / mc_indices.size()) + 1e-8;
+
+      std::vector<std::pair<double, int64_t>> abs_std_adv_and_idx;
+      abs_std_adv_and_idx.reserve(mc_indices.size());
+      for (int64_t idx : mc_indices) {
+        double std_adv = (batch[idx].advantage - adv_mean) / adv_std;
+        batch[idx].advantage = static_cast<float>(std_adv);
+        abs_std_adv_and_idx.push_back({std::abs(std_adv), idx});
+      }
+
+      int64_t k_retained = std::max<int64_t>(1, std::round(filter_quantile * mc_indices.size()));
+      if (k_retained < static_cast<int64_t>(abs_std_adv_and_idx.size())) {
+        std::nth_element(
+            abs_std_adv_and_idx.begin(),
+            abs_std_adv_and_idx.begin() + k_retained,
+            abs_std_adv_and_idx.end(),
+            [](const std::pair<double, int64_t>& a, const std::pair<double, int64_t>& b) {
+              return a.first > b.first;
+            });
+        abs_std_adv_and_idx.resize(k_retained);
+      }
+      std::vector<int64_t> retained_indices;
+      retained_indices.reserve(abs_std_adv_and_idx.size());
+      for (const auto& item : abs_std_adv_and_idx) {
+        retained_indices.push_back(item.second);
+      }
+      std::sort(retained_indices.begin(), retained_indices.end());
+
+      filtered_batch.reserve(retained_indices.size());
+      for (int64_t idx : retained_indices) {
+        filtered_batch.push_back(batch[idx]);
+      }
+      train_batch_ptr = &filtered_batch;
+      stats.retained_transitions = static_cast<int64_t>(filtered_batch.size());
+      normalize_advantages = false;  // Do not recenter or rescale selected rows!
+    } else {
+      stats.retained_transitions = 0;
+    }
+  } else {
+    stats.retained_transitions = n;
+  }
+  const int64_t n_train = static_cast<int64_t>(train_batch_ptr->size());
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
     torch::Tensor permutation_cpu =
-        torch::randperm(n, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
+        torch::randperm(n_train, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
     torch::Tensor permutation_device;
     if (reverse_kl_active) {
       permutation_device = permutation_cpu.to(device);
@@ -2576,8 +2705,8 @@ PpoUpdateStats TrainPpoUpdate(
     double epoch_kl_sum = 0.0;
     int64_t epoch_kl_nontrivial_count = 0;
 
-    for (int64_t start = 0; start < n; start += minibatch_size) {
-      int64_t end = std::min(start + minibatch_size, n);
+    for (int64_t start = 0; start < n_train; start += minibatch_size) {
+      int64_t end = std::min(start + minibatch_size, n_train);
       const int64_t mb_len = end - start;
       const int64_t mb_index = start / minibatch_size;  // minibatch # within epoch
       const int64_t* mb_indices = perm_ptr + start;
@@ -2904,7 +3033,7 @@ PpoUpdateStats TrainPpoUpdate(
             float mb_mean_val = mean.item<float>();
             float mb_std_val = std.item<float>();
             for (int64_t i = 0; i < mb_len; ++i) {
-              auto& trans = batch[mb_indices[i]];
+              auto& trans = (*train_batch_ptr)[mb_indices[i]];
               if (trans.targeted_buy_forced) {
                 if (epoch == 0) {
                   trans.norm_advantage = (trans.advantage - mb_mean_val) / mb_std_val;
@@ -3235,6 +3364,94 @@ PpoUpdateStats TrainPpoUpdate(
       stats.reverse_kl = weighted_reverse_kl_sum / total_nontrivial_count;
     } else {
       stats.reverse_kl = 0.0;
+    }
+  }
+
+  stats.optimizer_minibatches = stats.minibatches;
+
+  if (study_readouts) {
+    stats.single_action_value_mse_after = compute_value_mse(sa_indices);
+
+    // Uniform sample of unfiltered nontrivial decisions for KL diagnostic
+    std::vector<int64_t> nontrivial_indices;
+    nontrivial_indices.reserve(nontrivial_count);
+    for (int64_t i = 0; i < n; ++i) {
+      if (batch[i].legal_actions.size() > 1 && !batch[i].mask_policy_loss) {
+        nontrivial_indices.push_back(i);
+      }
+    }
+    if (!nontrivial_indices.empty()) {
+      if (nontrivial_indices.size() > 1024) {
+        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, 99993);
+        std::mt19937_64 kl_rng(kl_seed);
+        std::shuffle(nontrivial_indices.begin(), nontrivial_indices.end(), kl_rng);
+        nontrivial_indices.resize(1024);
+        std::sort(nontrivial_indices.begin(), nontrivial_indices.end());
+      }
+      stats.unfiltered_kl_sample_size = static_cast<int64_t>(nontrivial_indices.size());
+
+      torch::NoGradGuard no_grad;
+      bool was_training = model->is_training();
+      model->eval();
+
+      double kl_sum = 0.0;
+      int64_t kl_count = 0;
+
+      for (size_t start = 0; start < nontrivial_indices.size(); start += minibatch_size) {
+        size_t end = std::min(start + static_cast<size_t>(minibatch_size), nontrivial_indices.size());
+        int64_t chunk_len = end - start;
+
+        torch::Tensor s_dev = torch::empty({chunk_len, obs_size}, cpu_float);
+        torch::Tensor m_dev = torch::zeros({chunk_len, action_dim}, cpu_bool);
+        torch::Tensor a_dev = torch::empty({chunk_len}, cpu_long);
+        torch::Tensor olp_dev = torch::empty({chunk_len}, cpu_float);
+
+        float* sp = s_dev.data_ptr<float>();
+        bool* mp = m_dev.data_ptr<bool>();
+        int64_t* ap = a_dev.data_ptr<int64_t>();
+        float* olpp = olp_dev.data_ptr<float>();
+
+        std::vector<const dune_semantic::CandidateActionData*> cands(chunk_len, nullptr);
+
+        for (int64_t i = 0; i < chunk_len; ++i) {
+          int64_t idx = nontrivial_indices[start + i];
+          const auto& trans = batch[idx];
+          std::memcpy(sp + i * obs_size, trans.state.data(), obs_size * sizeof(float));
+          for (Action a : trans.legal_actions) {
+            if (a >= 0 && a < action_dim) {
+              mp[i * action_dim + a] = true;
+            }
+          }
+          ap[i] = trans.action;
+          olpp[i] = trans.old_log_prob;
+          cands[i] = &trans.candidate_data;
+        }
+
+        torch::Tensor ds = s_dev.to(device);
+        torch::Tensor dm = m_dev.to(device);
+        torch::Tensor da = a_dev.to(device);
+        torch::Tensor dolp = olp_dev.to(device);
+
+        auto outputs = model->forward(ds);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, outputs.trunk, cands, outputs.logits, device);
+        }
+        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, dm, logit_cap);
+        torch::Tensor masked_logits = logits.masked_fill(dm.logical_not(), -1e9f);
+        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+        torch::Tensor selected_lp = log_probs.gather(1, da.unsqueeze(1)).squeeze(1);
+
+        torch::Tensor log_ratio = selected_lp - dolp;
+        torch::Tensor ratio = torch::exp(log_ratio);
+        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+
+        kl_sum += approx_kl.sum().item<double>();
+        kl_count += chunk_len;
+      }
+
+      if (was_training) model->train();
+      stats.unfiltered_kl = kl_count > 0 ? (kl_sum / kl_count) : 0.0;
     }
   }
 
@@ -4156,6 +4373,12 @@ const char* const kDiagnosticsCsvHeaderV5Suffix =
 // block so the frozen positions 70-86 never move.
 const char* const kDiagnosticsCsvHeaderV6Suffix = ",measured_transitions";
 
+const char* const kDiagnosticsCsvHeaderStudySuffix =
+    ",single_action_transitions,single_action_fraction,"
+    "single_action_value_mse_before,single_action_value_mse_after,"
+    "single_action_sample_size,unfiltered_kl,unfiltered_kl_sample_size,"
+    "retained_transitions,optimizer_minibatches";
+
 std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
   std::string header(kDiagnosticsCsvHeader);
   if (emit_canary_columns) header += kDiagnosticsCsvHeaderV5Suffix;
@@ -4164,6 +4387,10 @@ std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
   }
   if (::absl::GetFlag(::FLAGS_purchase_exploration)) {
     header += ",forced_buys";
+  }
+  if (::absl::GetFlag(::FLAGS_enable_study_readouts) ||
+      ::absl::GetFlag(::FLAGS_advantage_filtering)) {
+    header += kDiagnosticsCsvHeaderStudySuffix;
   }
   return header;
 }
@@ -4682,6 +4909,18 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     if (::absl::GetFlag(::FLAGS_purchase_exploration)) {
       ofs << "," << stats.forced_buys;
     }
+    if (::absl::GetFlag(::FLAGS_enable_study_readouts) ||
+        ::absl::GetFlag(::FLAGS_advantage_filtering)) {
+      ofs << "," << stats.single_action_transitions
+          << "," << stats.single_action_fraction
+          << "," << stats.single_action_value_mse_before
+          << "," << stats.single_action_value_mse_after
+          << "," << stats.single_action_sample_size
+          << "," << stats.unfiltered_kl
+          << "," << stats.unfiltered_kl_sample_size
+          << "," << stats.retained_transitions
+          << "," << stats.optimizer_minibatches;
+    }
     ofs << "\n";
     ofs.flush();
     if (!ofs) {
@@ -4777,6 +5016,18 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
     if (::absl::GetFlag(::FLAGS_diag_prepass_mode) == "cadenced") {
       obj["measured_transitions"] =
           static_cast<int64_t>(stats.measured_transitions);
+    }
+    if (::absl::GetFlag(::FLAGS_enable_study_readouts) ||
+        ::absl::GetFlag(::FLAGS_advantage_filtering)) {
+      obj["single_action_transitions"] = static_cast<int64_t>(stats.single_action_transitions);
+      obj["single_action_fraction"] = stats.single_action_fraction;
+      obj["single_action_value_mse_before"] = stats.single_action_value_mse_before;
+      obj["single_action_value_mse_after"] = stats.single_action_value_mse_after;
+      obj["single_action_sample_size"] = static_cast<int64_t>(stats.single_action_sample_size);
+      obj["unfiltered_kl"] = stats.unfiltered_kl;
+      obj["unfiltered_kl_sample_size"] = static_cast<int64_t>(stats.unfiltered_kl_sample_size);
+      obj["retained_transitions"] = static_cast<int64_t>(stats.retained_transitions);
+      obj["optimizer_minibatches"] = static_cast<int64_t>(stats.optimizer_minibatches);
     }
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";

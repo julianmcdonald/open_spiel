@@ -1292,6 +1292,9 @@ void RunEvaluation() {
       market_diag_games_path = (std::filesystem::path(output_dir) / "market_diagnostics_games.jsonl").string();
     }
   }
+  if (!output_dir.empty()) {
+    std::filesystem::create_directories(output_dir);
+  }
 
   if (model_checkpoint.empty()) {
     std::cerr << "Error: --model_checkpoint is required.\n";
