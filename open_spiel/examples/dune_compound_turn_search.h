@@ -15,6 +15,7 @@
 #ifndef OPEN_SPIEL_EXAMPLES_DUNE_COMPOUND_TURN_SEARCH_H_
 #define OPEN_SPIEL_EXAMPLES_DUNE_COMPOUND_TURN_SEARCH_H_
 
+#include <functional>
 #include <memory>
 #include <random>
 #include <unordered_map>
@@ -307,6 +308,11 @@ struct CompoundSearchDecisionResult {
   std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities = {};
 };
 
+// Optional source of search worlds, keyed by the world seed. Returning nullptr
+// (or leaving it empty) uses ResampleFromInfostate as before. A sampler must be
+// deterministic in its seed so paired candidates share worlds.
+using SearchWorldSampler = std::function<std::unique_ptr<State>(uint64_t world_seed)>;
+
 // Intra-turn compound rollout search decision with tree preservation
 inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     const State& state,
@@ -319,7 +325,8 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     TreeReuseMode reuse_mode,
     uint64_t decision_seed,
     SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
-    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal) {
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
+    const SearchWorldSampler& world_sampler = nullptr) {
   std::vector<Action> legal_actions = state.LegalActions();
   if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -378,7 +385,16 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
           : dune_seed::DeriveSeed(decision_seed, c_idx, r);
       std::unique_ptr<State> sim_state = nullptr;
 
-      if (dune) {
+      if (world_sampler) {
+        sim_state = world_sampler(wseed);
+        if (sim_state) {
+          const auto sim_legal = sim_state->LegalActions();
+          if (std::find(sim_legal.begin(), sim_legal.end(), cand_a) == sim_legal.end()) {
+            sim_state = nullptr;
+          }
+        }
+      }
+      if (!sim_state && dune) {
         std::mt19937 wrng(wseed);
         auto rng_func = [&wrng]() {
           return std::generate_canonical<double, 53>(wrng);

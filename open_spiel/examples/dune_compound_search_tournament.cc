@@ -34,6 +34,7 @@
 #include "dune_sha256.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_compound_turn_search.h"
+#include "dune_belief_particles.h"
 
 using namespace open_spiel;
 using namespace open_spiel::dune_imperium;
@@ -95,6 +96,17 @@ ABSL_FLAG(bool, search_leader_pick, false,
 ABSL_FLAG(int, leader_rollouts_per_leader, 64,
           "Paired rollouts per legal leader when --search_leader_pick is set.");
 
+ABSL_FLAG(bool, belief_worlds, false,
+          "Draw in-game search worlds from a belief particle filter weighted by "
+          "the opponents' observed actions, instead of the uniform resampler.");
+ABSL_FLAG(int, belief_particles, 128, "Particles in the belief filter.");
+ABSL_FLAG(double, belief_temperature, 1.0,
+          "Exponent on the opponent model's action probability (0 = constraints only).");
+ABSL_FLAG(double, belief_epsilon, 0.05,
+          "Mix of uniform-over-legal into the opponent model's action probability.");
+
+constexpr uint64_t kStreamBeliefFilter = 0x42454C46;  // "BELF"
+
 // Seed stream for leader-pick search. It is separate from the in-game search
 // counter, so turning the leader search on leaves every later search seed unchanged.
 constexpr uint64_t kStreamLeaderPickSearch = 0x4C454144;  // "LEAD"
@@ -150,6 +162,9 @@ struct GameOutcome {
   int leader_new_rollouts = 0;
   double leader_search_seconds = 0.0;
   std::vector<std::pair<Action, double>> leader_utilities;
+  bool belief_worlds = false;
+  open_spiel::dune_belief::BeliefStats belief_stats;
+  double belief_ess_sum_at_searches = 0.0;
   std::vector<RecordedDecision> decisions_trace;
 };
 
@@ -190,7 +205,9 @@ GameOutcome PlayCompoundTournamentGame(
     double eta_blend = 0.80,
     bool record_trajectories = false,
     bool search_leader_pick = false,
-    int leader_rollouts_per_leader = 64) {
+    int leader_rollouts_per_leader = 64,
+    bool belief_worlds = false,
+    const open_spiel::dune_belief::BeliefOptions& belief_options = {}) {
   auto start_time = std::chrono::steady_clock::now();
   std::unique_ptr<State> state = game->NewInitialState();
   std::mt19937 chance_rng(game_seed);
@@ -208,6 +225,33 @@ GameOutcome PlayCompoundTournamentGame(
   Player last_player = kInvalidPlayer;
   GameOutcome outcome;
 
+  // The belief filter shadows the real game from the searching seat's view.
+  // The opponents' model is the same raw policy they play.
+  std::unique_ptr<open_spiel::dune_belief::BeliefParticleFilter> belief;
+  SearchWorldSampler world_sampler = nullptr;
+  if (belief_worlds) {
+    auto opponent_model = [greedy_evaluator](const State& s, Action a) {
+      for (const auto& ap : greedy_evaluator->Prior(s)) {
+        if (ap.first == a) return ap.second;
+      }
+      return 0.0;
+    };
+    belief = std::make_unique<open_spiel::dune_belief::BeliefParticleFilter>(
+        *state, search_seat, belief_options,
+        dune_seed::DeriveSeed(game_seed, kStreamBeliefFilter), opponent_model);
+    world_sampler = [&belief](uint64_t world_seed) { return belief->SampleWorld(world_seed); };
+    outcome.belief_worlds = true;
+  }
+  auto apply_real_action = [&](Action a) {
+    if (!belief) {
+      state->ApplyAction(a);
+      return;
+    }
+    std::unique_ptr<State> before = state->Clone();
+    state->ApplyAction(a);
+    belief->Observe(*before, a, *state);
+  };
+
   while (!state->IsTerminal()) {
     if (state->IsChanceNode()) {
       const auto* dune_before = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
@@ -217,7 +261,7 @@ GameOutcome PlayCompoundTournamentGame(
       auto chance_outcomes = state->ChanceOutcomes();
       double u = std::generate_canonical<double, 53>(chance_rng);
       Action ca = open_spiel::SampleAction(chance_outcomes, u).first;
-      state->ApplyAction(ca);
+      apply_real_action(ca);
 
       const auto* dune_after = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
       if (dune_after) {
@@ -314,9 +358,11 @@ GameOutcome PlayCompoundTournamentGame(
       } else if (should_search && legals.size() > 1) {
         searches++;
         uint64_t dseed = dune_seed::DeriveSeed(game_seed, cur, search_seed_counter++);
+        if (belief) outcome.belief_ess_sum_at_searches += belief->EffectiveSampleSize();
         auto s_res = CompoundRolloutSearchDecision(
             *state, cur, &turn_tree, evaluators, top_k, rollouts_per_action,
-            min_override_margin, reuse_mode, dseed, pairing_mode, truncation_mode);
+            min_override_margin, reuse_mode, dseed, pairing_mode, truncation_mode,
+            world_sampler);
         chosen_action = s_res.action;
         overridden = s_res.overridden;
         if (s_res.overridden) overrides++;
@@ -415,7 +461,7 @@ GameOutcome PlayCompoundTournamentGame(
     int hand_before = (cur == search_seat && dune_before) ? dune_before->GetPlayerCardsInHand(search_seat) : 0;
     int int_before = (cur == search_seat && dune_before) ? static_cast<int>(dune_before->GetPlayerIntrigues(search_seat).size()) : 0;
 
-    state->ApplyAction(chosen_action);
+    apply_real_action(chosen_action);
 
     if (cur == search_seat && chosen_action != dune_imperium::kActionEndTurn) {
       const auto* dune_after = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
@@ -471,6 +517,7 @@ GameOutcome PlayCompoundTournamentGame(
   outcome.search_vp = outcome.final_vps[search_seat];
   outcome.placement = 1;
   for (double r : outcome.final_returns) outcome.placement += r > outcome.search_utility;
+  if (belief) outcome.belief_stats = belief->stats();
 
   return outcome;
 }
@@ -500,6 +547,16 @@ int main(int argc, char** argv) {
   const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
   const bool search_leader_pick = absl::GetFlag(FLAGS_search_leader_pick);
   const int leader_rollouts_per_leader = absl::GetFlag(FLAGS_leader_rollouts_per_leader);
+  const bool belief_worlds = absl::GetFlag(FLAGS_belief_worlds);
+  open_spiel::dune_belief::BeliefOptions belief_options;
+  belief_options.num_particles = absl::GetFlag(FLAGS_belief_particles);
+  belief_options.temperature = absl::GetFlag(FLAGS_belief_temperature);
+  belief_options.epsilon = absl::GetFlag(FLAGS_belief_epsilon);
+  if (belief_worlds && (belief_options.num_particles < 1 || belief_options.epsilon < 0.0 ||
+                        belief_options.epsilon > 1.0 || belief_options.temperature < 0.0)) {
+    std::cerr << "[ERROR] invalid --belief_* options\n";
+    return 1;
+  }
   if (num_blocks != 8 && num_blocks != 12) {
     std::cerr << "[ERROR] --num_blocks must be 8 or 12\n";
     return 1;
@@ -530,6 +587,12 @@ int main(int argc, char** argv) {
     std::cout << " (" << leader_rollouts_per_leader << " paired terminal rollouts/leader)";
   }
   std::cout << " | Blocks: " << num_blocks << "\n";
+  std::cout << "Belief Worlds: " << (belief_worlds ? "ON" : "OFF");
+  if (belief_worlds) {
+    std::cout << " (" << belief_options.num_particles << " particles, temperature "
+              << belief_options.temperature << ", epsilon " << belief_options.epsilon << ")";
+  }
+  std::cout << "\n";
   std::cout << "================================================================================\n";
 
   // Check CUDA
@@ -602,7 +665,8 @@ int main(int argc, char** argv) {
           min_override_margin, reuse_mode, high_stakes_only, gseed,
           pairing_mode, truncation_mode,
           softmax_temp, eta_blend, record_trajectories,
-          search_leader_pick, leader_rollouts_per_leader);
+          search_leader_pick, leader_rollouts_per_leader,
+          belief_worlds, belief_options);
 
       outcomes[g] = res;
 
@@ -739,6 +803,10 @@ int main(int argc, char** argv) {
   root["num_blocks"] = json::Value(static_cast<int64_t>(num_blocks));
   root["search_leader_pick"] = json::Value(search_leader_pick);
   root["leader_rollouts_per_leader"] = json::Value(static_cast<int64_t>(leader_rollouts_per_leader));
+  root["belief_worlds"] = json::Value(belief_worlds);
+  root["belief_particles"] = json::Value(static_cast<int64_t>(belief_options.num_particles));
+  root["belief_temperature"] = json::Value(belief_options.temperature);
+  root["belief_epsilon"] = json::Value(belief_options.epsilon);
   root["win_rate"] = json::Value(win_rate);
   root["total_wins"] = json::Value(static_cast<int64_t>(total_wins));
   root["mean_utility"] = json::Value(mean_util);
@@ -795,6 +863,17 @@ int main(int argc, char** argv) {
           json::Value(static_cast<int64_t>(lu.first)), json::Value(lu.second)}));
     }
     g_obj["leader_utilities"] = json::Value(leader_utils);
+    if (out.belief_worlds) {
+      const auto& b = out.belief_stats;
+      g_obj["belief_hidden_chance_nodes"] = json::Value(b.hidden_chance_nodes);
+      g_obj["belief_opponent_decisions"] = json::Value(b.opponent_decisions);
+      g_obj["belief_killed_illegal"] = json::Value(b.killed_illegal);
+      g_obj["belief_killed_inconsistent"] = json::Value(b.killed_inconsistent);
+      g_obj["belief_resamples"] = json::Value(b.resamples);
+      g_obj["belief_rebuilds"] = json::Value(b.rebuilds);
+      g_obj["belief_mean_ess_at_searches"] = json::Value(
+          out.total_searches > 0 ? out.belief_ess_sum_at_searches / out.total_searches : 0.0);
+    }
     g_obj["total_searches"] = json::Value(static_cast<int64_t>(out.total_searches));
     g_obj["total_overrides"] = json::Value(static_cast<int64_t>(out.total_overrides));
     g_obj["reused_rollouts"] = json::Value(static_cast<int64_t>(out.total_reused_rollouts));
