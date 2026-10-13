@@ -1140,6 +1140,16 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
             action = a;
           }
         }
+        double total_unscaled = 0.0;
+        for (Action a : actions) {
+          total_unscaled += std::exp(prev_logits_vec[a] - max_logit);
+        }
+        if (total_unscaled > 0.0 && std::isfinite(total_unscaled)) {
+          behavior_prob = static_cast<float>(
+              std::exp(prev_logits_vec[action] - max_logit) / total_unscaled);
+        } else {
+          behavior_prob = 1.0f / static_cast<float>(actions.size());
+        }
       }
 
       size_t current_transition_index = trajectory.size();
@@ -1226,12 +1236,7 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
         }
       }
 
-      // Clear combat tracking when a new combat phase begins
-      if (dune_state != nullptr &&
-          pre_action_phase != dune_imperium::GamePhase::kCombat &&
-          dune_state->phase() == dune_imperium::GamePhase::kCombat) {
-        for (auto& cc : combat_credit) cc.clear();
-      }
+
 
       if (IsLearnerTurn(current_player, learner_seat, learner_seat_mode)) {
         // Track combat-causal transitions: record when CombatStrength increases.
@@ -1345,6 +1350,14 @@ int TorchSimulation(std::mt19937* rng, const Game& game, std::shared_ptr<Batched
             trajectory[idx].reward_target += shaped_bonus_by_player[p];
           }
         }
+      }
+
+      // M-3: Clear combat tracking only when transitioning OUT of combat phase,
+      // after all combat VP adjustments have been retro-credited.
+      if (dune_state != nullptr &&
+          pre_action_phase == dune_imperium::GamePhase::kCombat &&
+          dune_state->phase() != dune_imperium::GamePhase::kCombat) {
+        for (auto& cc : combat_credit) cc.clear();
       }
     }
   }
@@ -1472,6 +1485,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       // Push to trajectory
       Transition transition;
       transition.spatial_tensor = std::move(obs);
+      float uniform_prob = 1.0f / static_cast<float>(actions.size());
       transition.legal_actions = std::move(actions); // Store sparse legal actions list directly
       transition.action_taken = action;
       transition.prev_logits = std::vector<float>(action_size, 0.0f);
@@ -1479,7 +1493,7 @@ int RandomSimulation(std::mt19937* rng, const Game& game, int64_t obs_size, std:
       transition.advantage = 0.0f;
       transition.reward_target = 0.0f;
       transition.v_value = 0.0f; // Store V(s) = 0.0f explicitly
-      transition.behavior_prob = 1.0f / static_cast<float>(actions.size());
+      transition.behavior_prob = uniform_prob;
       transition.importance_multiplier = 1.0f;
       transition.training_step_inserted = 0;
       transition.player_id = current_player;

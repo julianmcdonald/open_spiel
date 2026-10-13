@@ -232,12 +232,15 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   dune_imperium::MarketAppendixMode market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
   std::string semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
 
-  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false, bool enable_zone_encoder = false) {
+  SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false, bool enable_zone_encoder = false, std::string semantic_descriptor_schema = "") {
     use_nonlinear_value_head_ = use_nonlinear;
     with_semantic_scorer_ = with_semantic_scorer;
+    if (!semantic_descriptor_schema.empty()) {
+      semantic_descriptor_schema_ = semantic_descriptor_schema;
+    }
     if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
       market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
-      if (with_semantic_scorer_) {
+      if (with_semantic_scorer_ && semantic_descriptor_schema.empty()) {
         semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
       }
     } else if (input_dim == dune_imperium::kOrderedCardSlotsInformationStateSize) {
@@ -356,6 +359,14 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     }
     if (enable_zone_encoder) {
       EnableZoneEncoder();
+    }
+  }
+
+  void SetSemanticDescriptorSchema(const std::string& schema) {
+    semantic_descriptor_schema_ = schema;
+    if (with_semantic_scorer_ && semantic_scorer_ &&
+        schema == dune_semantic::kDescriptorSchemaVersionV4) {
+      semantic_scorer_->EnableF();
     }
   }
 
@@ -556,7 +567,10 @@ inline void LoadModelCheckpointRobust(
         SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
                         " has invalid semantic_descriptor_schema ('" + sds_found + "')");
       }
-      model->semantic_descriptor_schema_ = sds_found;
+      if (sds_found == dune_semantic::kDescriptorSchemaVersionV4 ||
+          model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
+        model->SetSemanticDescriptorSchema(sds_found);
+      }
     }
 
     auto it_eze = dict.find("enable_zone_encoder");
@@ -669,6 +683,10 @@ inline void LoadModelCheckpointRobust(
     if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
       SpielFatalError("LoadModelCheckpointRobust: 9182 model requires with_semantic_scorer=true: " + path);
     }
+  }
+
+  if (model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4) {
+    model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV4);
   }
 
   if (model->with_semantic_scorer_ && model->semantic_scorer_) {

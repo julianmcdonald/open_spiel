@@ -269,7 +269,8 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
                                     ? remaining_time_ms
                                     : config_.relative_time_budget_ms;
     if (!std::isfinite(resolved_live_deadline_ms) ||
-        resolved_live_deadline_ms <= 0.0) {
+        resolved_live_deadline_ms < 0.0 ||
+        (remaining_time_ms < 0.0 && resolved_live_deadline_ms <= 0.0)) {
       SpielFatalError(absl::StrCat(
           "DuneSearchSession: kLiveDeadline budget mode entered with no usable "
           "time budget (resolved=",
@@ -500,7 +501,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
       // runaway guard, as on the leader path.
       max_time_ms = config_.relative_time_budget_ms;
     } else if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
-      if (!live_deadline_initialized_) {
+      if (!live_deadline_initialized_ && resolved_live_deadline_ms > 0.0) {
         absolute_live_deadline_ =
             std::chrono::steady_clock::now() +
             std::chrono::milliseconds(
@@ -508,10 +509,22 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
         live_deadline_budget_ms_ = resolved_live_deadline_ms;
         live_deadline_initialized_ = true;
       }
-      auto now = std::chrono::steady_clock::now();
-      double reserve_sec = (role == DuneDecisionRole::kAgentPrimary) ? config_.live_continuation_reserve_seconds : 0.0;
-      double remaining_sec = std::chrono::duration<double>(absolute_live_deadline_ - now).count() - reserve_sec;
-      max_time_ms = remaining_sec * 1000.0;
+      if (resolved_live_deadline_ms == 0.0) {
+        max_time_ms = 0.0;
+      } else {
+        auto now = std::chrono::steady_clock::now();
+        double reserve_sec = 0.0;
+        if (role == DuneDecisionRole::kAgentPrimary) {
+          reserve_sec = config_.live_continuation_reserve_seconds;
+          if (reserve_sec * 1000.0 >= live_deadline_budget_ms_) {
+            reserve_sec = 0.5 * (live_deadline_budget_ms_ / 1000.0);
+          }
+        }
+        double remaining_sec =
+            std::chrono::duration<double>(absolute_live_deadline_ - now).count() -
+            reserve_sec;
+        max_time_ms = remaining_sec * 1000.0;
+      }
       if (max_time_ms <= 0.0) {
         // Live deadline reached: calling RunSearch with max_time_ms == 0 trips
         // the expired-deadline pre-loop check and returns a uniform policy (the

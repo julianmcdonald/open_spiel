@@ -1043,11 +1043,12 @@ struct WorkerStats {
 void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
                       std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
   torch::NoGradGuard no_grad;
+  target->SetSemanticDescriptorSchema(source->semantic_descriptor_schema_);
   if (source->enable_zone_encoder_ && !target->enable_zone_encoder_) {
     target->EnableZoneEncoder();
-    if (!source->parameters().empty()) {
-      target->to(source->parameters().front().device());
-    }
+  }
+  if (!source->parameters().empty()) {
+    target->to(source->parameters().front().device());
   }
   auto source_params = source->named_parameters();
   auto source_buffers = source->named_buffers();
@@ -3571,89 +3572,91 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
       }
 
-      if (dune_state != nullptr && is_learner) {
-        if (current_player >= 0 && current_player < game.NumPlayers() &&
-            action != dune_imperium::kActionCombatPass) {
-          int post_strength = dune_imperium::CombatStrength(*dune_state, current_player);
-          int strength_delta = post_strength - pre_combat_strength[current_player];
-          if (strength_delta > 0) {
-            combat_accumulator.RecordDeployment(current_player, trajectory->size() - 1, strength_delta);
+      if (dune_state != nullptr) {
+        if (is_learner) {
+          if (current_player >= 0 && current_player < game.NumPlayers() &&
+              action != dune_imperium::kActionCombatPass) {
+            int post_strength = dune_imperium::CombatStrength(*dune_state, current_player);
+            int strength_delta = post_strength - pre_combat_strength[current_player];
+            if (strength_delta > 0) {
+              combat_accumulator.RecordDeployment(current_player, trajectory->size() - 1, strength_delta);
+            }
           }
-        }
 
-        // Specimen-exchange anti-breadcrumb (Item 3): a small negative shaping on
-        // the transition that takes a ConvertSpecimenToTroop action (IDs 741-752
-        // -- 740 is an unused base constant and is never legal; see
-        // dune_specimen_conversion.h), to discourage the over-used
-        // specimen->troop breadcrumb behavior. Training-only (never eval). Must
-        // be set to the SAME value on both the pilot and control arms so the
-        // search-distillation contrast stays pure.
-        //
-        // PWO-5 gate 2 items (b)+(c): the range predicate and the subtraction
-        // both moved into shared, unit-tested helpers. The sign is the point --
-        // a POSITIVE penalty must DECREASE this reward.
-        // Specimen conversion shaping
-        if (dune_shaping::IsSpecimenConversionAction(action)) {
-          if (local_stats != nullptr) {
-            local_stats->specimen_conversions++;
-          }
-          if (specimen_exchange_penalty != 0.0 &&
-              current_player >= 0 && current_player < game.NumPlayers()) {
-            int idx = last_transition_index[current_player];
-            if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-              float before_rew = (*trajectory)[idx].reward;
-              (*trajectory)[idx].reward = ApplySpecimenExchangeShaping(
-                  before_rew, action, specimen_exchange_penalty,
-                  reward_lambda);
-              if (local_stats != nullptr) {
-                local_stats->specimen_penalty_deducted += (before_rew - (*trajectory)[idx].reward);
-              }
-            }
-          }
-        }
-
-        // Family Atomics shaping
-        if (is_atomics_action) {
-          if (atomics_exempt) {
+          // Specimen-exchange anti-breadcrumb (Item 3): a small negative shaping on
+          // the transition that takes a ConvertSpecimenToTroop action (IDs 741-752
+          // -- 740 is an unused base constant and is never legal; see
+          // dune_specimen_conversion.h), to discourage the over-used
+          // specimen->troop breadcrumb behavior. Training-only (never eval). Must
+          // be set to the SAME value on both the pilot and control arms so the
+          // search-distillation contrast stays pure.
+          //
+          // PWO-5 gate 2 items (b)+(c): the range predicate and the subtraction
+          // both moved into shared, unit-tested helpers. The sign is the point --
+          // a POSITIVE penalty must DECREASE this reward.
+          // Specimen conversion shaping
+          if (dune_shaping::IsSpecimenConversionAction(action)) {
             if (local_stats != nullptr) {
-              local_stats->atomics_exempt++;
+              local_stats->specimen_conversions++;
             }
-          } else {
-            if (local_stats != nullptr) {
-              local_stats->atomics_penalized++;
-            }
-            if (family_atomics_penalty != 0.0 &&
+            if (specimen_exchange_penalty != 0.0 &&
                 current_player >= 0 && current_player < game.NumPlayers()) {
               int idx = last_transition_index[current_player];
               if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-                float penalty_amount = static_cast<float>(family_atomics_penalty) * reward_lambda;
-                (*trajectory)[idx].reward -= penalty_amount;
+                float before_rew = (*trajectory)[idx].reward;
+                (*trajectory)[idx].reward = ApplySpecimenExchangeShaping(
+                    before_rew, action, specimen_exchange_penalty,
+                    reward_lambda);
                 if (local_stats != nullptr) {
-                  local_stats->atomics_penalty_deducted += penalty_amount;
+                  local_stats->specimen_penalty_deducted += (before_rew - (*trajectory)[idx].reward);
                 }
               }
             }
           }
-        }
 
-        // Plot Intrigue shaping
-        if (is_plot_intrigue_action) {
-          if (plot_intrigue_exempt) {
-            if (local_stats != nullptr) {
-              local_stats->plot_exempt++;
+          // Family Atomics shaping
+          if (is_atomics_action) {
+            if (atomics_exempt) {
+              if (local_stats != nullptr) {
+                local_stats->atomics_exempt++;
+              }
+            } else {
+              if (local_stats != nullptr) {
+                local_stats->atomics_penalized++;
+              }
+              if (family_atomics_penalty != 0.0 &&
+                  current_player >= 0 && current_player < game.NumPlayers()) {
+                int idx = last_transition_index[current_player];
+                if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+                  float penalty_amount = static_cast<float>(family_atomics_penalty) * reward_lambda;
+                  (*trajectory)[idx].reward -= penalty_amount;
+                  if (local_stats != nullptr) {
+                    local_stats->atomics_penalty_deducted += penalty_amount;
+                  }
+                }
+              }
             }
-          } else {
-            if (local_stats != nullptr) {
-              local_stats->plot_penalized++;
-            }
-            if (plot_intrigue_penalty != 0.0 &&
-                current_player >= 0 && current_player < game.NumPlayers()) {
-              int idx = last_transition_index[current_player];
-              if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
-                float penalty_amount = static_cast<float>(plot_intrigue_penalty) * reward_lambda;
-                (*trajectory)[idx].reward -= penalty_amount;
-                if (local_stats != nullptr) {
-                  local_stats->plot_penalty_deducted += penalty_amount;
+          }
+
+          // Plot Intrigue shaping
+          if (is_plot_intrigue_action) {
+            if (plot_intrigue_exempt) {
+              if (local_stats != nullptr) {
+                local_stats->plot_exempt++;
+              }
+            } else {
+              if (local_stats != nullptr) {
+                local_stats->plot_penalized++;
+              }
+              if (plot_intrigue_penalty != 0.0 &&
+                  current_player >= 0 && current_player < game.NumPlayers()) {
+                int idx = last_transition_index[current_player];
+                if (idx >= 0 && idx < static_cast<int>(trajectory->size())) {
+                  float penalty_amount = static_cast<float>(plot_intrigue_penalty) * reward_lambda;
+                  (*trajectory)[idx].reward -= penalty_amount;
+                  if (local_stats != nullptr) {
+                    local_stats->plot_penalty_deducted += penalty_amount;
+                  }
                 }
               }
             }
@@ -3694,9 +3697,11 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
           int raw_noncombat = raw_total_vp_delta - raw_conflict_vp_delta;
 
-          local_stats->raw_conflict_vp += raw_conflict_vp_delta;
-          local_stats->raw_noncombat_vp += raw_noncombat;
-          local_stats->raw_total_vp += raw_total_vp_delta;
+          if (local_stats != nullptr) {
+            local_stats->raw_conflict_vp += raw_conflict_vp_delta;
+            local_stats->raw_noncombat_vp += raw_noncombat;
+            local_stats->raw_total_vp += raw_total_vp_delta;
+          }
 
           float combat_shape = std::max(raw_conflict_vp_delta, 0)
                                 * static_cast<float>(shaped_weight) * reward_lambda;
@@ -3711,7 +3716,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
           }
 
           if (combat_shape > 0.0f) {
-            local_stats->conflict_vp_generated += combat_shape;
+            if (local_stats != nullptr) {
+              local_stats->conflict_vp_generated += combat_shape;
+            }
             int total_investment = combat_accumulator.GetTotalInvestment(p);
             if (total_investment > 0) {
               for (const auto& ev : combat_accumulator.GetEvents(p)) {
@@ -3719,11 +3726,15 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   float attributed_portion = combat_shape * static_cast<float>(ev.strength_delta) /
                                              static_cast<float>(total_investment);
                   (*trajectory)[ev.transition_index].reward += attributed_portion;
-                  local_stats->conflict_vp_attributed += attributed_portion;
+                  if (local_stats != nullptr) {
+                    local_stats->conflict_vp_attributed += attributed_portion;
+                  }
                 }
               }
             } else {
-              local_stats->conflict_vp_unattributed += combat_shape;
+              if (local_stats != nullptr) {
+                local_stats->conflict_vp_unattributed += combat_shape;
+              }
             }
           }
         }
@@ -8373,7 +8384,7 @@ int main(int argc, char** argv) {
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
           absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-          pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc);
+          pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc, sem_schema);
   // The INFERENCE model deliberately does NOT get the heads. Section 8.6
   // requires the three heads be computed "never in the rollout/inference
   // forward"; constructing them here would make that a matter of care instead
@@ -8382,10 +8393,10 @@ int main(int argc, char** argv) {
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
           absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-          /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer, enable_zone_enc);
+          /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer, enable_zone_enc, sem_schema);
   if (!sem_schema.empty()) {
-    training_model->semantic_descriptor_schema_ = sem_schema;
-    inference_model->semantic_descriptor_schema_ = sem_schema;
+    training_model->SetSemanticDescriptorSchema(sem_schema);
+    inference_model->SetSemanticDescriptorSchema(sem_schema);
   }
   training_model->to(device);
   inference_model->to(device);
@@ -8408,9 +8419,9 @@ int main(int argc, char** argv) {
     ema_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
         obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
         absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
-        pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc);
+        pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc, sem_schema);
     if (!sem_schema.empty()) {
-      ema_model->semantic_descriptor_schema_ = sem_schema;
+      ema_model->SetSemanticDescriptorSchema(sem_schema);
     }
     ema_model->to(device);
     if (m_mode_str != "none") {
@@ -8769,7 +8780,11 @@ int main(int argc, char** argv) {
   if (absl::GetFlag(FLAGS_train_value_only) && absl::GetFlag(FLAGS_unfreeze_trunk)) {
     anchor_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
         obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
-        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+        absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer, enable_zone_enc, sem_schema);
+    if (!sem_schema.empty()) {
+      anchor_model->SetSemanticDescriptorSchema(sem_schema);
+    }
     anchor_model->to(device);
   }
 

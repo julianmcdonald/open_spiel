@@ -332,9 +332,14 @@ ResumeState ReadResume(const std::string& path, const std::string& profile,
       SpielFatalError(absl::StrCat("resume semantic mismatch for ", key));
     }
   };
+  const std::string expected_target_type =
+      profile == kWarmNormalizedCmpoProfile
+          ? "normalized_cmpo"
+          : profile == kScratchVisitSearchPiProfile ? "visit_policy"
+                                                     : "regularized_q_kl";
   const auto target_type = resolved_object.find("target_type");
   if (target_type == resolved_object.end() || !target_type->second.IsString() ||
-      target_type->second.GetString() != "visit_policy") {
+      target_type->second.GetString() != expected_target_type) {
     SpielFatalError("resume semantic mismatch for target_type");
   }
   require_int("hidden_dim", expected_hidden_dim);
@@ -826,18 +831,14 @@ int main(int argc, char** argv) {
   std::vector<std::vector<SearchPiRow>> replay_window;
   if (!resume.empty()) {
     std::string replay_error;
-    replay_window.reserve(state.replay_cohort_groups.size());
+    replay_window.reserve(state.replay_paths.size());
     for (const auto& group : state.replay_cohort_groups) {
-      replay_window.emplace_back();
       for (const std::string& path : group) {
         std::vector<SearchPiRow> rows;
         if (!ReadScratchSearchPiRowShardV2(path, &rows, &replay_error)) {
           SpielFatalError("resume replay load failed: " + replay_error);
         }
-        auto& cohort = replay_window.back();
-        cohort.insert(cohort.end(),
-                      std::make_move_iterator(rows.begin()),
-                      std::make_move_iterator(rows.end()));
+        replay_window.push_back(std::move(rows));
       }
     }
   }
@@ -944,6 +945,14 @@ int main(int argc, char** argv) {
         SpielFatalError("visit-policy target construction failed: " +
                         target_error);
       }
+      if (!collected.prefetched_rows.empty()) {
+        ScratchVisitGenerationStats prefetch_visit_stats;
+        if (!ApplyScratchVisitTargets(&collected.prefetched_rows,
+                                      &prefetch_visit_stats, &target_error)) {
+          SpielFatalError("visit-policy prefetch target construction failed: " +
+                          target_error);
+        }
+      }
     } else if (normalized) {
       std::string target_error;
       if (!ApplyNormalizedCmpoTargets(&collected.retained_rows,
@@ -951,6 +960,17 @@ int main(int argc, char** argv) {
         SpielFatalError("normalized CMPO target construction failed: " +
                         target_error);
       }
+      if (!collected.prefetched_rows.empty()) {
+        NormalizedCmpoGenerationStats prefetch_norm_stats;
+        if (!ApplyNormalizedCmpoTargets(&collected.prefetched_rows,
+                                        &prefetch_norm_stats, &target_error)) {
+          SpielFatalError("normalized CMPO prefetch target construction failed: " +
+                          target_error);
+        }
+      }
+    }
+    for (SearchPiRow& row : collected.prefetched_rows) {
+      row.generation = generation + 1;
     }
     ValidateCollection(collected, collection.search);
     collector.reset();

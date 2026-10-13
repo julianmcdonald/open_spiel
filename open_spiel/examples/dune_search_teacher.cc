@@ -592,6 +592,44 @@ int main(int argc, char** argv) {
             }
 
             if (has_coverage && has_mass && prior_aligned) {
+              // S-5: Build clean_priors aligned with diag.actions from ppo_prior
+              // (or diag.raw_priors if populated and matching size) to ensure
+              // targets and KL are computed from the clean prior rather than
+              // the Dirichlet-noised and temperature-scaled diag.priors.
+              std::vector<double> clean_priors(diag.actions.size(), 0.0);
+              if (diag.raw_priors.size() == diag.actions.size()) {
+                clean_priors = diag.raw_priors;
+              } else if (ppo_prior.size() == diag.actions.size()) {
+                for (size_t i = 0; i < diag.actions.size(); ++i) {
+                  clean_priors[i] = ppo_prior[i].second;
+                }
+              } else {
+                for (size_t i = 0; i < diag.actions.size(); ++i) {
+                  bool found = false;
+                  for (const auto& ap : ppo_prior) {
+                    if (ap.first == diag.actions[i]) {
+                      clean_priors[i] = ap.second;
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (!found) {
+                    clean_priors[i] = diag.priors[i];
+                  }
+                }
+              }
+              double clean_sum = 0.0;
+              for (double p : clean_priors) {
+                clean_sum += p;
+              }
+              if (clean_sum > 0.0) {
+                for (double& p : clean_priors) {
+                  p /= clean_sum;
+                }
+              } else {
+                clean_priors = diag.priors;
+              }
+
               std::vector<double> Q_teacher(diag.actions.size());
               for (size_t i = 0; i < diag.actions.size(); ++i) {
                 if (diag.visit_counts[i] >= absl::GetFlag(FLAGS_min_visits_per_action)) {
@@ -603,7 +641,7 @@ int main(int argc, char** argv) {
 
               double V_baseline = 0.0;
               for (size_t i = 0; i < diag.actions.size(); ++i) {
-                V_baseline += diag.priors[i] * Q_teacher[i];
+                V_baseline += clean_priors[i] * Q_teacher[i];
               }
 
               std::vector<double> advantages(diag.actions.size());
@@ -620,7 +658,7 @@ int main(int argc, char** argv) {
               open_spiel::ActionsAndProbs teacher_prior;
               teacher_prior.reserve(diag.actions.size());
               for (size_t i = 0; i < diag.actions.size(); ++i) {
-                double val = diag.priors[i] * std::exp(eta * advantages[i]);
+                double val = clean_priors[i] * std::exp(eta * advantages[i]);
                 teacher_prior.push_back({diag.actions[i], val});
                 sum_exp += val;
               }
@@ -632,7 +670,7 @@ int main(int argc, char** argv) {
               for (size_t i = 0; i < teacher_prior.size(); ++i) {
                 double p_t = teacher_prior[i].second;
                 if (p_t > 1e-12) {
-                  kl += p_t * std::log(p_t / std::max(diag.priors[i], 1e-12));
+                  kl += p_t * std::log(p_t / std::max(clean_priors[i], 1e-12));
                 }
               }
 

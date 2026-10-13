@@ -334,7 +334,8 @@ int main(int argc, char** argv) {
       input_dim, hidden_dim, action_dim, num_blocks,
       /*use_nonlinear=*/false, /*with_aux_heads=*/false,
       /*head_init_seed=*/0, /*with_semantic_scorer=*/true,
-      /*enable_zone_encoder=*/true);
+      /*enable_zone_encoder=*/true,
+      /*semantic_descriptor_schema=*/dune_semantic::kDescriptorSchemaVersionV4);
   // Load inherited weights
   LoadModelCheckpointRobust(target_model, source_model_path, device);
   target_model->to(device);
@@ -705,7 +706,8 @@ int main(int argc, char** argv) {
         input_dim, hidden_dim, action_dim, num_blocks,
         /*use_nonlinear=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, /*with_semantic_scorer=*/true,
-        /*enable_zone_encoder=*/true);
+        /*enable_zone_encoder=*/true,
+        /*semantic_descriptor_schema=*/dune_semantic::kDescriptorSchemaVersionV4);
     LoadModelCheckpointRobust(reloaded_model, test_model_path, device);
     reloaded_model->to(device);
     reloaded_model->eval();
@@ -829,6 +831,69 @@ int main(int argc, char** argv) {
     float grad_norm_fc1 = zone_enc->fc1->weight.grad().norm().item().toFloat();
     std::cout << "  Step 2 upstream zone_encoder fc1 weight grad norm: " << grad_norm_fc1 << "\n";
     CHECK_ASSERT(grad_norm_fc1 > 0.0f, "Upstream fc1 weight grad must be non-zero now that out_proj has moved!");
+
+    // Save target model with non-zero trained out_layer_f and zone_encoder weights, and verify reload parity
+    const std::string trained_save_dir = "/tmp/dune_f_trained_verify_test";
+    std::filesystem::create_directories(trained_save_dir);
+    const std::string trained_model_path = trained_save_dir + "/ppo_model_update_31401.pt";
+    const std::string trained_json_path = trained_save_dir + "/ppo_model_update_31401.json";
+
+    torch::save(target_model, trained_model_path);
+    std::ofstream trained_json(trained_json_path);
+    trained_json << "{\n"
+                 << "  \"global_update\": 31401,\n"
+                 << "  \"hidden_dim\": 2048,\n"
+                 << "  \"num_blocks\": 12,\n"
+                 << "  \"observation_dim\": 9182,\n"
+                 << "  \"enable_semantic_scorer\": true,\n"
+                 << "  \"enable_zone_encoder\": true,\n"
+                 << "  \"semantic_descriptor_schema\": \"semantic_action_v4\",\n"
+                 << "  \"market_appendix_mode\": \"full_public_information_v3\",\n"
+                 << "  \"feature_schema_label\": \"dune_imperium_full_public_information_v3|prefix=ordered_card_slots_v2:6255|opp_revealed=3x126|consumed_conflicts=22|ordered_topdeck=4x4x127|water_overflow=4|pending_graft=127|pending_hundro=2x63|pending_tech=4|pending_ceremony=2x63|pending_intrigue=108|size=9182\",\n"
+                 << "  \"feature_schema_sha256\": \"1f91ede6656d792545589b69b39ed1209cb8255c3ba8dcae49726acde7388e7f\"\n"
+                 << "}\n";
+    trained_json.close();
+
+    auto reloaded_trained = std::make_shared<SharedDunePolicyValueNetImpl>(
+        input_dim, hidden_dim, action_dim, num_blocks,
+        /*use_nonlinear=*/false, /*with_aux_heads=*/false,
+        /*head_init_seed=*/0, /*with_semantic_scorer=*/true,
+        /*enable_zone_encoder=*/true,
+        /*semantic_descriptor_schema=*/dune_semantic::kDescriptorSchemaVersionV4);
+    LoadModelCheckpointRobust(reloaded_trained, trained_model_path, device);
+    reloaded_trained->to(device);
+    reloaded_trained->eval();
+    target_model->eval();
+
+    // Verify all 128 parameters match bitwise, including trained out_layer_f and zone_encoder
+    auto trained_params = target_model->parameters();
+    auto reload_trained_params = reloaded_trained->parameters();
+    CHECK_ASSERT(trained_params.size() == 128, "Trained model param count must be 128");
+    CHECK_ASSERT(reload_trained_params.size() == 128, "Reloaded trained param count must be 128");
+    for (size_t i = 0; i < trained_params.size(); ++i) {
+      CHECK_ASSERT(torch::equal(trained_params[i], reload_trained_params[i]),
+                   "Reloaded trained parameter must match bitwise");
+    }
+    std::cout << "  Reloaded trained model: all 128 parameters match bitwise with nonzero out_layer_f.\n";
+
+    // Forward pass parity check
+    {
+      torch::NoGradGuard no_grad;
+      auto orig_eval_out = target_model->forward(obs_t);
+      dune_semantic::ApplySemanticScorerBatch(
+          target_model->semantic_scorer_, orig_eval_out.trunk, cands_tgt, orig_eval_out.logits, device);
+      auto reload_eval_out = reloaded_trained->forward(obs_t);
+      dune_semantic::ApplySemanticScorerBatch(
+          reloaded_trained->semantic_scorer_, reload_eval_out.trunk, cands_tgt, reload_eval_out.logits, device);
+
+      CHECK_ASSERT(torch::equal(orig_eval_out.logits, reload_eval_out.logits),
+                   "Reloaded trained forward logits must match bitwise");
+      CHECK_ASSERT(torch::equal(orig_eval_out.values, reload_eval_out.values),
+                   "Reloaded trained forward values must match bitwise");
+      std::cout << "  Reloaded trained model: forward pass parity verified with nonzero out_layer_f.\n";
+    }
+
+    std::filesystem::remove_all(trained_save_dir);
 
     std::cout << "CHECK 7 PASSED.\n\n";
   }

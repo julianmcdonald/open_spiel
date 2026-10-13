@@ -1374,6 +1374,9 @@ bool LoadModelCheckpointMigrating(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     const std::string& path, torch::Device device,
     bool allow_skip_semantic_scorer) {
+  if (model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4) {
+    model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV4);
+  }
   int64_t input_dim = model->input_layer->weight.size(1);
   int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
   int64_t action_dim = model->policy_head->weight.size(0);
@@ -1420,10 +1423,10 @@ bool LoadModelCheckpointMigrating(
     if (!source_schema.empty()) {
       if (source_schema == dune_semantic::kDescriptorSchemaVersionV4 ||
           model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
-        model->semantic_descriptor_schema_ = source_schema;
+        model->SetSemanticDescriptorSchema(source_schema);
       }
     } else if (model->semantic_descriptor_schema_.empty()) {
-      model->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+      model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV3);
     }
   };
 
@@ -1572,7 +1575,7 @@ bool LoadModelCheckpointMigrating(
     archive.load_from(path, device);
     torch::serialize::InputArchive scorer_archive;
     if (archive.try_read("semantic_scorer", scorer_archive)) {
-      const std::string effective_schema = source_schema.empty() ? model->semantic_descriptor_schema_ : source_schema;
+      const std::string effective_schema = model->semantic_descriptor_schema_;
       model->semantic_scorer_->Load(scorer_archive, effective_schema);
       std::cout << "[SEMANTIC SCORER] Loaded semantic_scorer submodule from " << path
                 << " (schema: " << model->semantic_descriptor_schema_ << ")" << std::endl;
@@ -2683,6 +2686,35 @@ PpoUpdateStats TrainPpoUpdate(
       train_batch_ptr = &filtered_batch;
       stats.retained_transitions = static_cast<int64_t>(filtered_batch.size());
       normalize_advantages = false;  // Do not recenter or rescale selected rows!
+
+      if (!retained_indices.empty() && static_cast<int64_t>(retained_indices.size()) < n) {
+        if (reverse_kl_active) {
+          auto retained_idx_t = torch::tensor(
+              retained_indices,
+              torch::TensorOptions().dtype(torch::kInt64).device(device));
+          collection_log_probs = collection_log_probs.index_select(0, retained_idx_t);
+        }
+        const int64_t num_mb_train =
+            (static_cast<int64_t>(filtered_batch.size()) + minibatch_size - 1) / minibatch_size;
+        if (aux_active) {
+          auto slices = ComputeAuxSlices(aux_n, num_mb_train);
+          aux_slice_start.assign(num_mb_train, 0);
+          aux_slice_len.assign(num_mb_train, 0);
+          for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(slices.size()); ++k) {
+            aux_slice_start[k] = slices[k].first;
+            aux_slice_len[k] = slices[k].second;
+          }
+        }
+        if (pwo5_active) {
+          auto pslices = ComputeAuxSlices(pwo5_n, num_mb_train);
+          pwo5_slice_start.assign(num_mb_train, 0);
+          pwo5_slice_len.assign(num_mb_train, 0);
+          for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(pslices.size()); ++k) {
+            pwo5_slice_start[k] = pslices[k].first;
+            pwo5_slice_len[k] = pslices[k].second;
+          }
+        }
+      }
     } else {
       stats.retained_transitions = 0;
     }

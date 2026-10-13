@@ -471,6 +471,13 @@ struct SemanticActionScorerImpl : torch::nn::Module {
     }
 
     if (enable_f_) {
+      EnableF();
+    }
+  }
+
+  void EnableF() {
+    enable_f_ = true;
+    if (!out_layer_f) {
       out_layer_f = register_module(
           "out_layer_f", torch::nn::Linear(kScorerHiddenDim, 1));
       torch::NoGradGuard no_grad;
@@ -483,6 +490,9 @@ struct SemanticActionScorerImpl : torch::nn::Module {
 
   void Load(torch::serialize::InputArchive& archive,
             const std::string& schema_version = kDescriptorSchemaVersionV3) {
+    if (schema_version == kDescriptorSchemaVersionV4) {
+      EnableF();
+    }
     auto read_child = [&](const std::string& name, auto& module) {
       torch::serialize::InputArchive child;
       if (!archive.try_read(name, child)) {

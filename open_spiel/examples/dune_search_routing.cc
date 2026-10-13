@@ -52,7 +52,7 @@ DuneDecisionRole ClassifyDuneDecisionRole(const State& state, Player searched_pl
   }
 
   // 4. Combat Intrigue: plays and pass in combat phase.
-  {
+  if (phase == dune_imperium::GamePhase::kCombat) {
     bool has_combat_action = false;
     for (Action a : legal_actions) {
       bool is_combat = (a == dune_imperium::kActionCombatPass) ||
@@ -84,6 +84,23 @@ DuneDecisionRole ClassifyDuneDecisionRole(const State& state, Player searched_pl
         }
       }
       if (has_agent_card_play && !has_space_place) {
+        if (has_active_session) {
+          const std::vector<Action>& history = state.History();
+          bool played_plot_intrigue = false;
+          for (auto it = history.rbegin(); it != history.rend(); ++it) {
+            if (*it == dune_imperium::kActionEndTurn) {
+              break;
+            }
+            if (*it >= dune_imperium::kActionPlayIntriguePlotCard0 &&
+                *it < dune_imperium::kActionPlayIntriguePlotCard0 + dune_imperium::kMaxIntrigueCards) {
+              played_plot_intrigue = true;
+              break;
+            }
+          }
+          if (played_plot_intrigue) {
+            return DuneDecisionRole::kAgentContinuation;
+          }
+        }
         return DuneDecisionRole::kAgentPrimary;
       }
       if (has_space_place || has_active_session) {
@@ -102,6 +119,8 @@ DuneDecisionRole ClassifyDuneDecisionRole(const State& state, Player searched_pl
       }
       if (has_intrigue_plot && has_reveal) {
         return DuneDecisionRole::kOtherOptional;
+      } else if (has_active_session && !has_reveal) {
+        return DuneDecisionRole::kAgentContinuation;
       }
     }
   }
