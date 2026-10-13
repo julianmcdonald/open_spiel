@@ -49,7 +49,8 @@ ABSL_FLAG(uint64_t, shaping_start_env_steps, 0, "");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
 ABSL_FLAG(bool, diagnostics_only, false, "");
 
-ABSL_FLAG(std::string, mode, "raw", "Controller: raw, legacy, or wide.");
+ABSL_FLAG(std::string, mode, "raw",
+          "Controller: raw, legacy, wide, leader, adaptive, or adaptive_leader.");
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen candidate checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Different frozen actual-opponent checkpoint.");
 ABSL_FLAG(int, games, 4, "Number of requested games.");
@@ -76,7 +77,7 @@ constexpr const char* kSimulationPolicy = "candidate_model_all_seats";
 volatile std::sig_atomic_t interrupted = 0;
 void HandleSignal(int) { interrupted = 1; }
 
-enum class Mode { kRaw, kLegacy, kWide };
+enum class Mode { kRaw, kLegacy, kWide, kLeader, kAdaptive, kAdaptiveLeader };
 
 struct Options {
   Mode mode;
@@ -144,7 +145,10 @@ Options ReadOptions() {
   if (o.mode_name == "raw") o.mode = Mode::kRaw;
   else if (o.mode_name == "legacy") o.mode = Mode::kLegacy;
   else if (o.mode_name == "wide") o.mode = Mode::kWide;
-  else throw std::runtime_error("--mode must be raw, legacy, or wide");
+  else if (o.mode_name == "leader") o.mode = Mode::kLeader;
+  else if (o.mode_name == "adaptive") o.mode = Mode::kAdaptive;
+  else if (o.mode_name == "adaptive_leader") o.mode = Mode::kAdaptiveLeader;
+  else throw std::runtime_error("--mode must be raw, legacy, wide, leader, adaptive, or adaptive_leader");
   o.model_path = std::filesystem::canonical(absl::GetFlag(FLAGS_model_checkpoint)).string();
   o.opponent_path = std::filesystem::canonical(absl::GetFlag(FLAGS_opponent_checkpoint)).string();
   if (o.model_path == o.opponent_path) {
@@ -277,6 +281,10 @@ CompoundSearchDecisionResult SearchDecision(
     const State& state, Player seat, TurnSearchTree* tree,
     const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
     const Options& o, uint64_t seed) {
+  if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
+    return AdaptiveRolloutSearchDecision(state, seat, tree, evaluators,
+                                        o.rollouts, kOverrideMargin, seed);
+  }
   if (o.mode == Mode::kWide) {
     return WideRolloutSearchDecision(state, seat, tree, evaluators,
                                     o.rollouts, kOverrideMargin, seed);
@@ -353,28 +361,45 @@ std::optional<GameOutcome> PlayGame(
     Action chosen = raw;
     if (current == out.seat) {
       ++out.decisions;
-      const bool search_allowed = o.mode != Mode::kRaw && !IsLeader(*state);
-      if (search_allowed && IsHighStakesStrategicState(*state, current) && legal.size() > 1) {
+      if ((o.mode == Mode::kLeader || o.mode == Mode::kAdaptiveLeader) &&
+          IsLeader(*state) && legal.size() > 1) {
         const auto search_start = Clock::now();
-        const uint64_t seed = dune_seed::DeriveSeed(out.seed, current, search_seed_counter++);
-        const auto result = SearchDecision(*state, current, &tree, simulations, o, seed);
+        const int rollouts = (o.mode == Mode::kLeader ? o.rollouts : std::min(32, o.rollouts));
+        const uint64_t leader_seed =
+            dune_seed::DeriveSeed(out.seed, 0x4C454144ULL, current);
+        const auto result = LeaderPickRolloutSearchDecision(
+            *state, current, simulations, rollouts, 0.10, leader_seed);
         out.search_seconds += SecondsSince(search_start);
         if (control.Stop()) return std::nullopt;
         chosen = result.action;
         ++out.searches;
         out.overrides += result.overridden;
         out.new_rollouts += result.new_rollouts_executed;
-        out.reused_rollouts += result.prior_rollouts_reused;
-        if (o.mode == Mode::kWide && legal.size() > 3) {
-          ++out.wide_roots;
-        }
-        out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
-      } else if (search_allowed && tree.current_node() && !tree.current_node()->children.empty()) {
-        double best = -1e9;
-        for (Action a : legal) {
-          if (tree.HasPriorData(a) && tree.GetMeanUtility(a) > best) {
-            best = tree.GetMeanUtility(a);
-            chosen = a;
+      } else {
+        const bool search_allowed =
+            o.mode != Mode::kRaw && o.mode != Mode::kLeader && !IsLeader(*state);
+        if (search_allowed && IsHighStakesStrategicState(*state, current) && legal.size() > 1) {
+          const auto search_start = Clock::now();
+          const uint64_t seed = dune_seed::DeriveSeed(out.seed, current, search_seed_counter++);
+          const auto result = SearchDecision(*state, current, &tree, simulations, o, seed);
+          out.search_seconds += SecondsSince(search_start);
+          if (control.Stop()) return std::nullopt;
+          chosen = result.action;
+          ++out.searches;
+          out.overrides += result.overridden;
+          out.new_rollouts += result.new_rollouts_executed;
+          out.reused_rollouts += result.prior_rollouts_reused;
+          if (o.mode == Mode::kWide && legal.size() > 3) {
+            ++out.wide_roots;
+          }
+          out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
+        } else if (search_allowed && tree.current_node() && !tree.current_node()->children.empty()) {
+          double best = -1e9;
+          for (Action a : legal) {
+            if (tree.HasPriorData(a) && tree.GetMeanUtility(a) > best) {
+              best = tree.GetMeanUtility(a);
+              chosen = a;
+            }
           }
         }
       }
@@ -573,7 +598,7 @@ int RunRoots(const Options& o, const Game& game, const ModelBundle& candidate,
     CompoundSearchDecisionResult result;
     result.action = raw;
     TurnSearchTree tree;
-    const bool should_search = o.mode != Mode::kRaw && !IsLeader(*state) &&
+    const bool should_search = o.mode != Mode::kRaw && o.mode != Mode::kLeader && !IsLeader(*state) &&
         IsHighStakesStrategicState(*state, root.seat) && legal.size() > 1;
     if (should_search) {
       result = SearchDecision(*state, root.seat, &tree, evaluators, o, seed);
