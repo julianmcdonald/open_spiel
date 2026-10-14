@@ -19,7 +19,7 @@
 //   today's uniform resampler and never to anything worse.
 // - Optional repair (off by default): a particle that an opponent's action
 //   would kill first moves the cards that action made public (played or
-//   revealed Imperium cards, discarded intrigues) into that opponent's hand
+//   revealed Imperium cards, the intrigue it played) into that opponent's hand
 //   from the same hidden pool, then retries the action. It survives only if
 //   the retry is legal and matches the true observation. This is an
 //   approximation: strict conditioning would discard the particle.
@@ -147,7 +147,7 @@ class BeliefParticleFilter {
                        options_.temperature != 0.0;
     if (weigh) ++stats_.opponent_decisions;
     const bool repair = options_.repair_opponent_hands && !chance && actor != observer_;
-    const ShownCards shown = repair ? CardsShownBy(before, after, actor) : ShownCards{};
+    const ShownCards shown = repair ? CardsShownBy(before, after, actor, action) : ShownCards{};
 
     // 0 ok, 1 illegal, 2 inconsistent, 3 repaired
     std::vector<int> outcome(particles_.size(), 0);
@@ -223,8 +223,7 @@ class BeliefParticleFilter {
 
   // Cards one opponent action made public, read only from public zones of the
   // true states: Imperium cards that entered the actor's played or revealed
-  // zones, and intrigues that moved from the actor's hand to the shared
-  // intrigue discard.
+  // zones, and the intrigue the action played.
   struct ShownCards {
     std::vector<int> hand;
     std::vector<int> intrigues;
@@ -239,7 +238,8 @@ class BeliefParticleFilter {
     return added;
   }
 
-  static ShownCards CardsShownBy(const State& before, const State& after, Player actor) {
+  static ShownCards CardsShownBy(const State& before, const State& after, Player actor,
+                                 Action action) {
     const auto* b = dynamic_cast<const dune_imperium::DuneImperiumState*>(&before);
     const auto* a = dynamic_cast<const dune_imperium::DuneImperiumState*>(&after);
     if (b == nullptr || a == nullptr) return {};
@@ -249,16 +249,15 @@ class BeliefParticleFilter {
       cards.insert(cards.end(), revealed.begin(), revealed.end());
       return cards;
     };
-    // The same action can discard other players' intrigues too (for example,
-    // an effect that makes opponents discard). Credit the actor only with the
-    // discarded cards that left its own hand; who played a card is public.
-    std::vector<int> actor_hand = b->GetIntrigueHandForTesting(actor);
-    std::sort(actor_hand.begin(), actor_hand.end());
-    const std::vector<int> discarded =
-        AddedCards(b->GetIntrigueDiscardForTesting(), a->GetIntrigueDiscardForTesting());
+    // The intrigue the actor played is named by the action itself. Other
+    // intrigues the same action sends to the discard may be other players'.
     std::vector<int> intrigues;
-    std::set_intersection(discarded.begin(), discarded.end(), actor_hand.begin(),
-                          actor_hand.end(), std::back_inserter(intrigues));
+    for (Action first : {dune_imperium::kActionPlayIntriguePlotCard0,
+                         dune_imperium::kActionPlayIntrigueCombatCard0}) {
+      if (action >= first && action < first + dune_imperium::kMaxIntrigueCards) {
+        intrigues.push_back(static_cast<int>(action - first));
+      }
+    }
     return {AddedCards(public_cards(*b), public_cards(*a)), std::move(intrigues)};
   }
 
