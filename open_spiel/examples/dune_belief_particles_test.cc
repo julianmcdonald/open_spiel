@@ -102,20 +102,22 @@ void TestDeterminism(uint64_t seed) {
   }
 }
 
-// Temperature 0 and full epsilon both leave live particles equally weighted,
-// so the filter reduces to the consistency constraints alone.
-void TestUniformLimitKeepsEqualWeights(uint64_t seed) {
+// Temperature 0 leaves live particles equally weighted, so the filter reduces
+// to the consistency constraints alone. Full epsilon ignores the model: every
+// legal action gets 1/|legal|, so a skewed model and a uniform one give the
+// same weights (not equal ones, since particles can differ in legal actions).
+void TestUniformLimits(uint64_t seed) {
   auto game = LoadGame("dune_imperium");
   OpponentActionProb skewed = [](const State& s, Action a) {
     return a == s.LegalActions().front() ? 1.0 : 0.0;
   };
-  for (int variant = 0; variant < 2; ++variant) {
+  {
     auto state = game->NewInitialState();
     BeliefOptions options;
     options.num_particles = 6;
-    if (variant == 0) options.temperature = 0.0; else options.epsilon = 1.0;
+    options.temperature = 0.0;
     BeliefParticleFilter filter(*state, 1, options, seed, skewed);
-    std::mt19937_64 rng(seed + variant);
+    std::mt19937_64 rng(seed);
     for (int steps = 0; steps < 400 && !state->IsTerminal(); ++steps) {
       const Action action = RandomAction(*state, rng);
       auto before = state->Clone();
@@ -127,6 +129,25 @@ void TestUniformLimitKeepsEqualWeights(uint64_t seed) {
       for (int i = 0; i < filter.size(); ++i) {
         if (filter.alive(i)) SPIEL_CHECK_FLOAT_NEAR(w[i], 1.0 / live, 1e-12);
       }
+    }
+  }
+  {
+    auto state = game->NewInitialState();
+    BeliefOptions options;
+    options.num_particles = 6;
+    options.epsilon = 1.0;
+    BeliefParticleFilter with_skewed(*state, 1, options, seed, skewed);
+    BeliefParticleFilter with_uniform(*state, 1, options, seed, UniformOpponentModel());
+    std::mt19937_64 rng(seed + 1);
+    for (int steps = 0; steps < 400 && !state->IsTerminal(); ++steps) {
+      const Action action = RandomAction(*state, rng);
+      auto before = state->Clone();
+      state->ApplyAction(action);
+      with_skewed.Observe(*before, action, *state);
+      with_uniform.Observe(*before, action, *state);
+      const auto a = with_skewed.Weights();
+      const auto b = with_uniform.Weights();
+      for (size_t i = 0; i < a.size(); ++i) SPIEL_CHECK_FLOAT_NEAR(a[i], b[i], 1e-12);
     }
   }
 }
@@ -159,6 +180,44 @@ void TestWeightsStayFiniteUnderSurprise(uint64_t seed) {
   SPIEL_CHECK_GT(filter.stats().opponent_decisions, 0);
 }
 
+// With repair on, an opponent card a particle did not hold is moved into
+// that particle's hands instead of killing it. Repaired particles must still
+// match the observer's view, and repair must actually happen over a game.
+void TestRepairKeepsParticlesConsistent(uint64_t seed) {
+  auto game = LoadGame("dune_imperium");
+  int64_t repaired = 0;
+  for (Player observer = 0; observer < 4; ++observer) {
+    auto state = game->NewInitialState();
+    BeliefOptions options;
+    options.num_particles = 8;
+    options.parallel_tasks = 4;
+    options.repair_opponent_hands = true;
+    BeliefParticleFilter filter(*state, observer, options, seed + observer,
+                                UniformOpponentModel());
+    std::mt19937_64 rng(seed + observer);
+    int steps = 0;
+    while (!state->IsTerminal() && steps++ < kMaxSteps) {
+      const Action action = RandomAction(*state, rng);
+      auto before = state->Clone();
+      state->ApplyAction(action);
+      filter.Observe(*before, action, *state);
+      const std::string truth = state->ObservationString(observer);
+      int alive = 0;
+      for (int i = 0; i < filter.size(); ++i) {
+        if (!filter.alive(i)) continue;
+        ++alive;
+        SPIEL_CHECK_EQ(filter.particle(i).ObservationString(observer), truth);
+      }
+      SPIEL_CHECK_GT(alive, 0);
+    }
+    repaired += filter.stats().repaired;
+    std::cout << "repair observer " << observer << ": repaired=" << filter.stats().repaired
+              << " killed_illegal=" << filter.stats().killed_illegal
+              << " killed_inconsistent=" << filter.stats().killed_inconsistent << "\n";
+  }
+  SPIEL_CHECK_GT(repaired, 0);
+}
+
 }  // namespace
 }  // namespace dune_belief
 }  // namespace open_spiel
@@ -169,8 +228,9 @@ int main() {
     TestParticlesStayConsistent(observer, 20261013 + observer);
   }
   TestDeterminism(7);
-  TestUniformLimitKeepsEqualWeights(11);
+  TestUniformLimits(11);
   TestWeightsStayFiniteUnderSurprise(13);
+  TestRepairKeepsParticlesConsistent(17);
   std::cout << "dune_belief_particles_test passed\n";
   return 0;
 }

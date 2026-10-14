@@ -223,7 +223,8 @@ class BeliefParticleFilter {
 
   // Cards one opponent action made public, read only from public zones of the
   // true states: Imperium cards that entered the actor's played or revealed
-  // zones, and intrigues that entered the shared intrigue discard.
+  // zones, and intrigues that moved from the actor's hand to the shared
+  // intrigue discard.
   struct ShownCards {
     std::vector<int> hand;
     std::vector<int> intrigues;
@@ -248,8 +249,17 @@ class BeliefParticleFilter {
       cards.insert(cards.end(), revealed.begin(), revealed.end());
       return cards;
     };
-    return {AddedCards(public_cards(*b), public_cards(*a)),
-            AddedCards(b->GetIntrigueDiscardForTesting(), a->GetIntrigueDiscardForTesting())};
+    // The same action can discard other players' intrigues too (for example,
+    // an effect that makes opponents discard). Credit the actor only with the
+    // discarded cards that left its own hand; who played a card is public.
+    std::vector<int> actor_hand = b->GetIntrigueHandForTesting(actor);
+    std::sort(actor_hand.begin(), actor_hand.end());
+    const std::vector<int> discarded =
+        AddedCards(b->GetIntrigueDiscardForTesting(), a->GetIntrigueDiscardForTesting());
+    std::vector<int> intrigues;
+    std::set_intersection(discarded.begin(), discarded.end(), actor_hand.begin(),
+                          actor_hand.end(), std::back_inserter(intrigues));
+    return {AddedCards(public_cards(*b), public_cards(*a)), std::move(intrigues)};
   }
 
   // Moves `shown` into `actor`'s hands. False if nothing was shown or a
@@ -285,7 +295,9 @@ class BeliefParticleFilter {
       return 2;
     }
     // Kept only when a repair may follow, since a failed apply mutates the particle.
-    std::unique_ptr<State> original = shown != nullptr ? particle.Clone() : nullptr;
+    const bool can_repair =
+        shown != nullptr && (!shown->hand.empty() || !shown->intrigues.empty());
+    std::unique_ptr<State> original = can_repair ? particle.Clone() : nullptr;
     double log_weight = 0.0;
     int result = ApplyVisible(&particle, action, chance, weigh, truth_obs, &log_weight);
     if (result != 0 && original != nullptr &&
