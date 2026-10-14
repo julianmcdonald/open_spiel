@@ -75,6 +75,9 @@ ABSL_FLAG(int, particles, 64, "Particles per filter.");
 ABSL_FLAG(int, resampler_samples, 64, "Worlds drawn from the uniform resampler.");
 ABSL_FLAG(double, temperature, 1.0, "Belief exponent on the opponent model probability.");
 ABSL_FLAG(double, epsilon, 0.05, "Uniform mix into the opponent model probability.");
+ABSL_FLAG(bool, repair, false,
+          "Both filters repair particles an opponent's action would kill by rebinding "
+          "the shown cards into that opponent's hand (approximate; default off).");
 ABSL_FLAG(int, threads, 8, "Concurrent games or roots.");
 ABSL_FLAG(int, filter_tasks, 4, "Concurrent particle-update tasks per filter.");
 ABSL_FLAG(int, num_evaluators, 2, "Batched evaluator coordinators per model.");
@@ -218,6 +221,8 @@ struct PointRow {
   double belief_ess;
   int64_t belief_rebuilds;
   int64_t uniform_rebuilds;
+  int64_t belief_repaired;
+  int64_t uniform_repaired;
 };
 
 PointRow ScorePoint(int game_id, const State& truth, Player observer,
@@ -252,6 +257,8 @@ PointRow ScorePoint(int game_id, const State& truth, Player observer,
   row.belief_ess = belief_filter.EffectiveSampleSize();
   row.belief_rebuilds = belief_filter.stats().rebuilds;
   row.uniform_rebuilds = uniform_filter.stats().rebuilds;
+  row.belief_repaired = belief_filter.stats().repaired;
+  row.uniform_repaired = uniform_filter.stats().repaired;
   return row;
 }
 
@@ -259,7 +266,9 @@ json::Object RowJson(const PointRow& r) {
   json::Object o{{"game_id", r.game_id}, {"observer", r.observer}, {"round", r.round},
                  {"belief_ess", r.belief_ess},
                  {"belief_rebuilds", r.belief_rebuilds},
-                 {"uniform_rebuilds", r.uniform_rebuilds}};
+                 {"uniform_rebuilds", r.uniform_rebuilds},
+                 {"belief_repaired", r.belief_repaired},
+                 {"uniform_repaired", r.uniform_repaired}};
   for (int k = 0; k < 3; ++k) {
     for (int c = 0; c < 2; ++c) {
       const std::string key = kPredictors[k] + "_" + kCategories[c];
@@ -310,6 +319,7 @@ Filters MakeFilters(const State& initial, Player observer, uint64_t seed,
   options.temperature = absl::GetFlag(FLAGS_temperature);
   options.epsilon = absl::GetFlag(FLAGS_epsilon);
   options.parallel_tasks = absl::GetFlag(FLAGS_filter_tasks);
+  options.repair_opponent_hands = absl::GetFlag(FLAGS_repair);
   Filters f;
   // Both filters share a seed so hidden draws match until weighting differs.
   f.uniform = std::make_unique<BeliefParticleFilter>(
@@ -475,7 +485,8 @@ int main(int argc, char** argv) {
                        {"particles", absl::GetFlag(FLAGS_particles)},
                        {"resampler_samples", resampler_samples},
                        {"temperature", absl::GetFlag(FLAGS_temperature)},
-                       {"epsilon", absl::GetFlag(FLAGS_epsilon)}};
+                       {"epsilon", absl::GetFlag(FLAGS_epsilon)},
+                       {"repair", absl::GetFlag(FLAGS_repair)}};
   const int resamples = absl::GetFlag(FLAGS_bootstrap);
   for (int c = 0; c < 2; ++c) {
     for (int k = 0; k < 3; ++k) {

@@ -104,6 +104,9 @@ ABSL_FLAG(double, belief_temperature, 1.0,
           "Exponent on the opponent model's action probability (0 = constraints only).");
 ABSL_FLAG(double, belief_epsilon, 0.05,
           "Mix of uniform-over-legal into the opponent model's action probability.");
+ABSL_FLAG(bool, belief_repair, false,
+          "Repair belief particles an opponent's action would kill by rebinding the "
+          "shown cards into that opponent's hand (approximate; default off).");
 
 constexpr uint64_t kStreamBeliefFilter = 0x42454C46;  // "BELF"
 
@@ -552,6 +555,7 @@ int main(int argc, char** argv) {
   belief_options.num_particles = absl::GetFlag(FLAGS_belief_particles);
   belief_options.temperature = absl::GetFlag(FLAGS_belief_temperature);
   belief_options.epsilon = absl::GetFlag(FLAGS_belief_epsilon);
+  belief_options.repair_opponent_hands = absl::GetFlag(FLAGS_belief_repair);
   if (belief_worlds && (belief_options.num_particles < 1 || belief_options.epsilon < 0.0 ||
                         belief_options.epsilon > 1.0 || belief_options.temperature < 0.0)) {
     std::cerr << "[ERROR] invalid --belief_* options\n";
@@ -590,7 +594,8 @@ int main(int argc, char** argv) {
   std::cout << "Belief Worlds: " << (belief_worlds ? "ON" : "OFF");
   if (belief_worlds) {
     std::cout << " (" << belief_options.num_particles << " particles, temperature "
-              << belief_options.temperature << ", epsilon " << belief_options.epsilon << ")";
+              << belief_options.temperature << ", epsilon " << belief_options.epsilon
+              << ", repair " << (belief_options.repair_opponent_hands ? "on" : "off") << ")";
   }
   std::cout << "\n";
   std::cout << "================================================================================\n";
@@ -807,6 +812,7 @@ int main(int argc, char** argv) {
   root["belief_particles"] = json::Value(static_cast<int64_t>(belief_options.num_particles));
   root["belief_temperature"] = json::Value(belief_options.temperature);
   root["belief_epsilon"] = json::Value(belief_options.epsilon);
+  root["belief_repair"] = json::Value(belief_options.repair_opponent_hands);
   root["win_rate"] = json::Value(win_rate);
   root["total_wins"] = json::Value(static_cast<int64_t>(total_wins));
   root["mean_utility"] = json::Value(mean_util);

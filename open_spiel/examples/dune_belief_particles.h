@@ -17,6 +17,12 @@
 // - When every particle dies (an opponent's reveal often does this), the filter
 //   rebuilds from the true state with ResampleFromInfostate, so it degrades to
 //   today's uniform resampler and never to anything worse.
+// - Optional repair (off by default): a particle that an opponent's action
+//   would kill first moves the cards that action made public (played or
+//   revealed Imperium cards, discarded intrigues) into that opponent's hand
+//   from the same hidden pool, then retries the action. It survives only if
+//   the retry is legal and matches the true observation. This is an
+//   approximation: strict conditioning would discard the particle.
 //
 // SampleWorld(seed) is deterministic in its seed, so candidates that share a
 // world seed share a world, which keeps C1's paired worlds.
@@ -29,6 +35,7 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <random>
@@ -56,6 +63,8 @@ struct BeliefOptions {
   double resample_ess_fraction = 0.5;
   // Number of concurrent tasks used to update particles.
   int parallel_tasks = 16;
+  // Repair particles an opponent's action would kill (see the header comment).
+  bool repair_opponent_hands = false;
 };
 
 struct BeliefStats {
@@ -66,6 +75,7 @@ struct BeliefStats {
   int64_t killed_inconsistent = 0;
   int64_t resamples = 0;
   int64_t rebuilds = 0;
+  int64_t repaired = 0;
 };
 
 // Probability of `action` for the current player of `state` under the opponent
@@ -136,12 +146,16 @@ class BeliefParticleFilter {
                        before.LegalActions().size() > 1 &&
                        options_.temperature != 0.0;
     if (weigh) ++stats_.opponent_decisions;
+    const bool repair = options_.repair_opponent_hands && !chance && actor != observer_;
+    const ShownCards shown = repair ? CardsShownBy(before, after, actor) : ShownCards{};
 
-    std::vector<int> outcome(particles_.size(), 0);  // 0 ok, 1 illegal, 2 inconsistent
+    // 0 ok, 1 illegal, 2 inconsistent, 3 repaired
+    std::vector<int> outcome(particles_.size(), 0);
     auto update = [&](size_t begin, size_t end) {
       for (size_t i = begin; i < end; ++i) {
         if (!std::isfinite(log_weights_[i])) continue;
-        outcome[i] = UpdateParticle(i, action, chance, hidden, actor, weigh, truth_obs);
+        outcome[i] = UpdateParticle(i, action, chance, hidden, actor, weigh, truth_obs,
+                                    repair ? &shown : nullptr);
       }
     };
     RunParallel(update);
@@ -149,6 +163,7 @@ class BeliefParticleFilter {
     for (size_t i = 0; i < outcome.size(); ++i) {
       if (outcome[i] == 1) ++stats_.killed_illegal;
       if (outcome[i] == 2) ++stats_.killed_inconsistent;
+      if (outcome[i] == 3) ++stats_.repaired;
     }
     ResampleOrRebuild(after);
   }
@@ -206,8 +221,49 @@ class BeliefParticleFilter {
     return alternatives > 0;
   }
 
+  // Cards one opponent action made public, read only from public zones of the
+  // true states: Imperium cards that entered the actor's played or revealed
+  // zones, and intrigues that entered the shared intrigue discard.
+  struct ShownCards {
+    std::vector<int> hand;
+    std::vector<int> intrigues;
+  };
+
+  static std::vector<int> AddedCards(std::vector<int> before, std::vector<int> after) {
+    std::sort(before.begin(), before.end());
+    std::sort(after.begin(), after.end());
+    std::vector<int> added;
+    std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                        std::back_inserter(added));
+    return added;
+  }
+
+  static ShownCards CardsShownBy(const State& before, const State& after, Player actor) {
+    const auto* b = dynamic_cast<const dune_imperium::DuneImperiumState*>(&before);
+    const auto* a = dynamic_cast<const dune_imperium::DuneImperiumState*>(&after);
+    if (b == nullptr || a == nullptr) return {};
+    auto public_cards = [actor](const dune_imperium::DuneImperiumState& s) {
+      std::vector<int> cards = s.GetPlayedAgentCardsForTesting(actor);
+      const std::vector<int>& revealed = s.GetRevealedCardsForTesting(actor);
+      cards.insert(cards.end(), revealed.begin(), revealed.end());
+      return cards;
+    };
+    return {AddedCards(public_cards(*b), public_cards(*a)),
+            AddedCards(b->GetIntrigueDiscardForTesting(), a->GetIntrigueDiscardForTesting())};
+  }
+
+  // Moves `shown` into `actor`'s hands. False if nothing was shown or a
+  // rebind fails; the state may then be partly changed and must be dropped.
+  static bool RebindShownCards(State* state, Player actor, const ShownCards& shown) {
+    auto* dune = dynamic_cast<dune_imperium::DuneImperiumState*>(state);
+    if (dune == nullptr || (shown.hand.empty() && shown.intrigues.empty())) return false;
+    if (!shown.hand.empty() && !dune->RebindHiddenHandForBelief(actor, shown.hand)) return false;
+    return shown.intrigues.empty() || dune->RebindHiddenIntriguesForBelief(actor, shown.intrigues);
+  }
+
   int UpdateParticle(size_t i, Action action, bool chance, bool hidden,
-                     Player actor, bool weigh, const std::string& truth_obs) {
+                     Player actor, bool weigh, const std::string& truth_obs,
+                     const ShownCards* shown) {
     State& particle = *particles_[i];
     if (chance != particle.IsChanceNode() ||
         (!chance && particle.CurrentPlayer() != actor)) {
@@ -228,33 +284,49 @@ class BeliefParticleFilter {
       log_weights_[i] = -std::numeric_limits<double>::infinity();
       return 2;
     }
+    // Kept only when a repair may follow, since a failed apply mutates the particle.
+    std::unique_ptr<State> original = shown != nullptr ? particle.Clone() : nullptr;
+    double log_weight = 0.0;
+    int result = ApplyVisible(&particle, action, chance, weigh, truth_obs, &log_weight);
+    if (result != 0 && original != nullptr &&
+        RebindShownCards(original.get(), actor, *shown) &&
+        ApplyVisible(original.get(), action, chance, weigh, truth_obs, &log_weight) == 0) {
+      particles_[i] = std::move(original);
+      result = 3;
+    }
+    if (result == 1 || result == 2) {
+      log_weights_[i] = -std::numeric_limits<double>::infinity();
+      return result;
+    }
+    log_weights_[i] += log_weight;
+    return result;
+  }
+
+  // Applies a visible action to `state`. Returns 0 if it stays consistent, 1 if
+  // the action is illegal there, 2 if the observation no longer matches.
+  // `log_weight` receives the opponent-model term when `weigh` is set.
+  int ApplyVisible(State* state, Action action, bool chance, bool weigh,
+                   const std::string& truth_obs, double* log_weight) const {
+    *log_weight = 0.0;
     const std::vector<Action> legal =
-        chance ? std::vector<Action>{} : particle.LegalActions();
+        chance ? std::vector<Action>{} : state->LegalActions();
     if (chance) {
       bool legal_outcome = false;
-      for (const auto& [outcome, probability] : particle.ChanceOutcomes()) {
+      for (const auto& [outcome, probability] : state->ChanceOutcomes()) {
         if (outcome == action && probability > 0.0) legal_outcome = true;
       }
-      if (!legal_outcome) {
-        log_weights_[i] = -std::numeric_limits<double>::infinity();
-        return 1;
-      }
+      if (!legal_outcome) return 1;
     } else if (std::find(legal.begin(), legal.end(), action) == legal.end()) {
-      log_weights_[i] = -std::numeric_limits<double>::infinity();
       return 1;
     }
     if (weigh) {
-      const double p = model_(particle, action);
+      const double p = model_(*state, action);
       const double mixed = (1.0 - options_.epsilon) * std::max(0.0, p) +
                            options_.epsilon / static_cast<double>(legal.size());
-      log_weights_[i] += options_.temperature * std::log(std::max(mixed, 1e-300));
+      *log_weight = options_.temperature * std::log(std::max(mixed, 1e-300));
     }
-    particle.ApplyAction(action);
-    if (particle.ObservationString(observer_) != truth_obs) {
-      log_weights_[i] = -std::numeric_limits<double>::infinity();
-      return 2;
-    }
-    return 0;
+    state->ApplyAction(action);
+    return state->ObservationString(observer_) == truth_obs ? 0 : 2;
   }
 
   void ResampleOrRebuild(const State& truth) {
