@@ -745,7 +745,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_property_readonly("session_elapsed_time_ms", &open_spiel::DuneSearchSession::session_elapsed_time_ms);
 
   py::class_<open_spiel::DuneAdaptiveRolloutSession>(di, "DuneAdaptiveRolloutSession")
-      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t>(),
+      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t, bool>(),
            py::arg("checkpoint_path"),
            py::arg("device_str") = "cuda",
            py::arg("hidden_dim") = 2048,
@@ -753,7 +753,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("reference_rollouts_per_action") = 64,
            py::arg("leader_rollouts") = 32,
            py::arg("target_batch_size") = 256,
-           py::arg("seed") = 20261014ULL)
+           py::arg("seed") = 20261014ULL,
+           py::arg("use_successive_halving") = true)
       .def("search", &open_spiel::DuneAdaptiveRolloutSession::Search,
            py::arg("state"), py::arg("remaining_time_ms") = -1.0)
       .def("discard_pending_action", &open_spiel::DuneAdaptiveRolloutSession::DiscardPendingAction)

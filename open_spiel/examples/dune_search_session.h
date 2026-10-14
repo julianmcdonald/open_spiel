@@ -220,7 +220,8 @@ class DuneAdaptiveRolloutSession {
       int reference_rollouts_per_action = 64,
       int leader_rollouts = 32,
       int target_batch_size = 256,
-      uint64_t seed = 20261014ULL);
+      uint64_t seed = 20261014ULL,
+      bool use_successive_halving = true);
   ~DuneAdaptiveRolloutSession();
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
@@ -239,6 +240,7 @@ class DuneAdaptiveRolloutSession {
   int leader_rollouts_;
   int target_batch_size_;
   uint64_t seed_;
+  bool use_successive_halving_ = true;
   uint64_t search_seed_counter_ = 0;
 
   bool has_active_session_ = false;

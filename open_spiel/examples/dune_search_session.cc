@@ -1063,7 +1063,8 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
     int reference_rollouts_per_action,
     int leader_rollouts,
     int target_batch_size,
-    uint64_t seed)
+    uint64_t seed,
+    bool use_successive_halving)
     : checkpoint_path_(checkpoint_path),
       device_str_(device_str),
       hidden_dim_(hidden_dim),
@@ -1071,7 +1072,8 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
       reference_rollouts_per_action_(reference_rollouts_per_action),
       leader_rollouts_(leader_rollouts),
       target_batch_size_(target_batch_size),
-      seed_(seed) {
+      seed_(seed),
+      use_successive_halving_(use_successive_halving) {
   torch::Device device(torch::kCPU);
   if (device_str == "cuda" && torch::cuda::is_available()) {
     device = torch::Device(torch::kCUDA);
@@ -1292,9 +1294,13 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     if (remaining_time_ms > 0.0 && remaining_time_ms < 8000.0) {
       ref_rollouts = std::max(16, static_cast<int>(ref_rollouts * (remaining_time_ms / 8000.0)));
     }
-    const auto c_res = dune_imperium::AdaptiveRolloutSearchDecision(
-        state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15,
-        dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++));
+    const uint64_t decision_seed =
+        dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
+    const auto c_res = use_successive_halving_
+        ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
+              state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed)
+        : dune_imperium::AdaptiveRolloutSearchDecision(
+              state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed);
     result.diagnostics.selected_action = c_res.action;
     result.diagnostics.mcts_proposed_action = c_res.action;
     result.diagnostics.mcts_overrode_raw = c_res.overridden;
