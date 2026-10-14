@@ -1702,6 +1702,9 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["plot_intrigue_penalty"] = absl::GetFlag(FLAGS_plot_intrigue_penalty);
     config_obj["plot_intrigue_exemption_threshold"] = absl::GetFlag(FLAGS_plot_intrigue_exemption_threshold);
   }
+  if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {
+    config_obj["ema_magnet_kl_coef"] = absl::GetFlag(FLAGS_ema_magnet_kl_coef);
+  }
 
   return config_obj;
 }
@@ -2113,6 +2116,53 @@ std::string ValidateAndComputeSingleLearnerTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeEmaMagnetTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_ema_magnet_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+  const double source_coef = absl::GetFlag(FLAGS_ema_magnet_transition_source_coef);
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  if (source_coef > 0.0) {
+    source_config_obj["ema_magnet_kl_coef"] = source_coef;
+  } else {
+    source_config_obj.erase("ema_magnet_kl_coef");
+  }
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_ema_magnet_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "EMA magnet transition source fingerprint mismatch: expected %s, computed %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "EMA magnet transition requires a source manifest matching all settings except ema_magnet_kl_coef; stored=%s computed=%s",
+        fp_it != manifest_obj.end() && fp_it->second.IsString()
+            ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+  std::cout << absl::StrFormat(
+      "[ema_magnet-transition] %.4f -> %.4f; source fingerprint %s",
+      source_coef, absl::GetFlag(FLAGS_ema_magnet_kl_coef), computed_source_fp)
+            << std::endl;
+  return computed_source_fp;
+}
+
 void UpdateEmaWeights(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
@@ -2283,6 +2333,15 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       if (g_single_learner_transition_source_update >= 0) {
         manifest_obj["single_learner_transition_source_update"] = g_single_learner_transition_source_update;
       }
+    }
+    if (!g_ema_magnet_transition_source_fingerprint.empty()) {
+      manifest_obj["ema_magnet_transition_source_fingerprint"] = g_ema_magnet_transition_source_fingerprint;
+      if (g_ema_magnet_transition_source_update >= 0) {
+        manifest_obj["ema_magnet_transition_source_update"] = g_ema_magnet_transition_source_update;
+      }
+    }
+    if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {
+      manifest_obj["ema_magnet_kl_coef"] = absl::GetFlag(FLAGS_ema_magnet_kl_coef);
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
@@ -9850,6 +9909,12 @@ int main(int argc, char** argv) {
                 ValidateAndComputeSingleLearnerTransitionFingerprint(manifest_path, config_fingerprint);
             if (!permitted_transition_source_fingerprint.empty()) {
               g_single_learner_transition_source_fingerprint = permitted_transition_source_fingerprint;
+            } else {
+              permitted_transition_source_fingerprint =
+                  ValidateAndComputeEmaMagnetTransitionFingerprint(manifest_path, config_fingerprint);
+              if (!permitted_transition_source_fingerprint.empty()) {
+                g_ema_magnet_transition_source_fingerprint = permitted_transition_source_fingerprint;
+              }
             }
           }
         }
@@ -9891,6 +9956,9 @@ int main(int argc, char** argv) {
       }
       if (!g_single_learner_transition_source_fingerprint.empty()) {
         g_single_learner_transition_source_update = manifest.global_update;
+      }
+      if (!g_ema_magnet_transition_source_fingerprint.empty()) {
+        g_ema_magnet_transition_source_update = manifest.global_update;
       }
     }
 
@@ -10823,6 +10891,12 @@ int main(int argc, char** argv) {
                   ValidateAndComputeSingleLearnerTransitionFingerprint(manifest_path, config_fingerprint);
               if (!permitted_transition_source_fingerprint.empty()) {
                 g_single_learner_transition_source_fingerprint = permitted_transition_source_fingerprint;
+              } else {
+                permitted_transition_source_fingerprint =
+                    ValidateAndComputeEmaMagnetTransitionFingerprint(manifest_path, config_fingerprint);
+                if (!permitted_transition_source_fingerprint.empty()) {
+                  g_ema_magnet_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                }
               }
             }
           }
@@ -10861,6 +10935,9 @@ int main(int argc, char** argv) {
         }
         if (!g_single_learner_transition_source_fingerprint.empty()) {
           g_single_learner_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_ema_magnet_transition_source_fingerprint.empty()) {
+          g_ema_magnet_transition_source_update = shared_manifest.global_update;
         }
       }
 
@@ -13492,7 +13569,8 @@ int main(int argc, char** argv) {
                   /*abort_grad_norm_ratio=*/0.0,
                   open_spiel::Pwo5AuxBatch(), open_spiel::Pwo5AuxConfig(),
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
-                  /*compute_diagnostics=*/true);
+                  /*compute_diagnostics=*/true,
+                  ema_model, absl::GetFlag(FLAGS_ema_magnet_kl_coef));
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
@@ -13745,7 +13823,8 @@ int main(int argc, char** argv) {
                   online_search_collection ? aux_abort_ratio : 0.0,
                   pwo5_batch, pwo5_cfg,
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
-                  compute_diagnostics);
+                  compute_diagnostics,
+                  ema_model, absl::GetFlag(FLAGS_ema_magnet_kl_coef));
     stats.episode_ids_unique = current_collect.episode_ids_unique;
     stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
@@ -14283,13 +14362,14 @@ int main(int argc, char** argv) {
         "Update %5d/%d | Transitions: %6zu | Games: %llu | "
         "Collect: %.2fs (%.0f t/s) | PPO: %.2fs | Wall: %.2fs | "
         "PolicyLoss: %.6f | ValueLoss: %.6f | Entropy: %.4f | "
-        "ApproxKL: %.6f | ClipFrac: %.3f | ExplVar: %.3f%s%s\n",
+        "ApproxKL: %.6f | ClipFrac: %.3f | ExplVar: %.3f%s%s%s\n",
         update, target_end_update, current_collect.rollout.size(),
         static_cast<unsigned long long>(total_games),
         collect_elapsed, sps, ppo_elapsed, wall_elapsed,
         stats.policy_loss, stats.value_loss, stats.entropy, stats.approx_kl,
         stats.clip_fraction, stats.explained_variance,
         (absl::GetFlag(FLAGS_reverse_kl_coef) > 0.0 ? absl::StrFormat(" | RevKL: %.6f", stats.reverse_kl) : ""),
+        (ema_model != nullptr ? absl::StrFormat(" | MagnetKL: %.6f", stats.ema_magnet_kl) : ""),
         stats.early_stopped ? " | early-stop" : "");
 
     // Phase 18B combined-optimization + collector diagnostics.

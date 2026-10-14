@@ -104,6 +104,7 @@ ABSL_FLAG(bool, enable_ema_tracking, false, "");
 ABSL_FLAG(double, ema_half_life, 100.0, "");
 ABSL_FLAG(double, ema_decay, 0.0, "");
 ABSL_FLAG(std::string, ema_model_checkpoint, "", "");
+ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "");
 ABSL_DECLARE_FLAG(bool, advantage_filtering);
 ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
 ABSL_DECLARE_FLAG(bool, enable_study_readouts);
@@ -11051,6 +11052,247 @@ int main() {
     vi = 0;
     for (const auto& p : model->value_head->parameters()) {
       UTILS_CHECK(torch::equal(p, v_params_before[vi++]));
+    }
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate: EMAgnet forward KL regularization and telemetry") {
+    const int64_t obs_size = 16, action_dim = 8;
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+    absl::SetFlag(&FLAGS_train_amp, false);
+
+    // 1. Bitwise golden parity when ema_magnet_kl_coef == 0.0
+    {
+      torch::manual_seed(42);
+      auto model_baseline = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      torch::manual_seed(42);
+      auto model_control = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      auto ema_dummy = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+
+      torch::optim::AdamW opt_baseline(model_baseline->parameters(), torch::optim::AdamWOptions(1e-3));
+      torch::optim::AdamW opt_control(model_control->parameters(), torch::optim::AdamWOptions(1e-3));
+
+      std::vector<PpoTransition> batch(4);
+      for (int i = 0; i < 4; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.1f * (i + 1));
+        batch[i].legal_actions = {0, 1, 2};
+        batch[i].action = i % 3;
+        batch[i].old_log_prob = -1.0986f;
+        batch[i].reward = 0.1f * (i + 1);
+        batch[i].value = 0.2f * (i + 1);
+        batch[i].advantage = 0.05f * (i + 1);
+        batch[i].return_value = 0.25f * (i + 1);
+        batch[i].episode_id = 100 + i;
+      }
+      auto batch_copy = batch;
+
+      // Run baseline without ema_model (null, 0.0)
+      auto stats_baseline = TrainPpoUpdate(
+          model_baseline, opt_baseline, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/nullptr, /*ema_magnet_kl_coef=*/0.0);
+
+      // Run control with ema_dummy and ema_magnet_kl_coef = 0.0
+      auto stats_control = TrainPpoUpdate(
+          model_control, opt_control, batch_copy, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/ema_dummy, /*ema_magnet_kl_coef=*/0.0);
+
+      // Verify exact bitwise parameter equality between baseline and control
+      auto p_base = model_baseline->named_parameters();
+      auto p_ctrl = model_control->named_parameters();
+      for (const auto& kv : p_base) {
+        auto it = p_ctrl.find(kv.key());
+        UTILS_CHECK(it != nullptr);
+        UTILS_CHECK(torch::equal(kv.value(), *it));
+      }
+    }
+
+    // 2. Reference immutability of ema_model
+    {
+      torch::manual_seed(101);
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      auto ema_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+      std::vector<torch::Tensor> ema_params_before;
+      for (const auto& kv : ema_model->named_parameters()) {
+        ema_params_before.push_back(kv.value().detach().clone());
+      }
+
+      std::vector<PpoTransition> batch(4);
+      for (int i = 0; i < 4; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.2f * (i + 1));
+        batch[i].legal_actions = {0, 1};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.6931f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].advantage = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = 200 + i;
+      }
+
+      auto stats = TrainPpoUpdate(
+          model, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/54321, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          ema_model, /*ema_magnet_kl_coef=*/0.05);
+
+      size_t pi = 0;
+      for (const auto& kv : ema_model->named_parameters()) {
+        UTILS_CHECK(torch::equal(kv.value(), ema_params_before[pi++]));
+      }
+      UTILS_CHECK(stats.ema_magnet_kl > 0.0);
+    }
+
+    // 3. Zero KL at identical policy weights
+    {
+      torch::manual_seed(202);
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      auto ema_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      // Copy identical weights
+      {
+        torch::NoGradGuard no_grad;
+        auto mp = model->named_parameters();
+        auto ep = ema_model->named_parameters();
+        for (const auto& kv : mp) {
+          auto it = ep.find(kv.key());
+          if (it != nullptr) it->copy_(kv.value());
+        }
+      }
+      // Zero learning rate so model doesn't move during minibatches
+      torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(0.0));
+
+      std::vector<PpoTransition> batch(4);
+      for (int i = 0; i < 4; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.3f * (i + 1));
+        batch[i].legal_actions = {0, 1, 2};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -1.0986f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].advantage = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = 300 + i;
+      }
+
+      auto stats = TrainPpoUpdate(
+          model, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/65432, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          ema_model, /*ema_magnet_kl_coef=*/0.02);
+
+      CHECK_NEAR(stats.ema_magnet_kl, 0.0, 1e-6);
+    }
+
+    // 4. Forced single-action exclusion (mb_nontrivial masking)
+    {
+      torch::manual_seed(303);
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      auto ema_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+      // Batch where ALL transitions have only 1 legal action: forced decision
+      std::vector<PpoTransition> batch(4);
+      for (int i = 0; i < 4; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.4f * (i + 1));
+        batch[i].legal_actions = {1}; // Single action!
+        batch[i].action = 1;
+        batch[i].old_log_prob = 0.0f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].advantage = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = 400 + i;
+      }
+
+      auto stats = TrainPpoUpdate(
+          model, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/76543, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          ema_model, /*ema_magnet_kl_coef=*/0.02);
+
+      // Since all actions were forced (nontrivial count = 0), ema_magnet_kl must be 0.0
+      CHECK_NEAR(stats.ema_magnet_kl, 0.0, 1e-12);
+    }
+
+    // 5. Gradient direction pulling actor parameters toward EMA policy
+    {
+      torch::manual_seed(404);
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+      auto ema_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+
+      // Model: zero out policy head bias and weights so initial logits are near zero
+      // EMA model: set large positive bias on action 0 and large negative on action 1
+      {
+        torch::NoGradGuard no_grad;
+        for (auto& p : model->parameters()) p.zero_();
+        for (auto& p : ema_model->parameters()) p.zero_();
+        ema_model->policy_head->bias[0].fill_(5.0f);
+        ema_model->policy_head->bias[1].fill_(-5.0f);
+      }
+
+      torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-2));
+
+      std::vector<PpoTransition> batch(4);
+      for (int i = 0; i < 4; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.0f);
+        batch[i].legal_actions = {0, 1};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.6931f;
+        // Zero out PPO advantages so PPO policy loss gradient is zero
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].advantage = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = 500 + i;
+      }
+
+      // Initial model logit difference (action 0 vs action 1) is 0
+      auto out_before = model->forward(torch::zeros({1, obs_size}));
+      float diff_before = (out_before.logits[0][0] - out_before.logits[0][1]).item<float>();
+      CHECK_NEAR(diff_before, 0.0f, 1e-5);
+
+      // Run update with only EMA magnet active
+      TrainPpoUpdate(
+          model, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/87654, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          ema_model, /*ema_magnet_kl_coef=*/1.0);
+
+      // After update, model logit difference should increase toward EMA (action 0 > action 1)
+      auto out_after = model->forward(torch::zeros({1, obs_size}));
+      float diff_after = (out_after.logits[0][0] - out_after.logits[0][1]).item<float>();
+      UTILS_CHECK(diff_after > diff_before + 1e-3f);
     }
   } TEST_END();
 

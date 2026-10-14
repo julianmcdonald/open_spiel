@@ -81,3 +81,14 @@ ABSL_FLAG(double, ema_decay, 0.0,
 ABSL_FLAG(std::string, ema_model_checkpoint, "",
           "Optional path to existing EMA model checkpoint to resume.");
 
+// EMAgnet forward KL regularization flags.
+ABSL_FLAG(double, ema_magnet_kl_coef, 0.0,
+          "Forward KL regularization coefficient toward moving parameter-EMA policy: "
+          "adds ema_magnet_kl_coef * KL(pi_EMA || pi_theta) to actor loss.");
+ABSL_FLAG(bool, allow_ema_magnet_transition, false,
+          "Allow transition from a parent manifest with different ema_magnet_kl_coef.");
+ABSL_FLAG(double, ema_magnet_transition_source_coef, 0.0,
+          "Expected parent ema_magnet_kl_coef for transition.");
+ABSL_FLAG(std::string, ema_magnet_transition_source_fingerprint, "",
+          "Expected parent config fingerprint for ema_magnet transition.");
+

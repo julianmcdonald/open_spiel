@@ -55,6 +55,8 @@ extern std::string g_target_kl_transition_source_fingerprint;
 extern int64_t g_target_kl_transition_source_update;
 extern std::string g_single_learner_transition_source_fingerprint;
 extern int64_t g_single_learner_transition_source_update;
+extern std::string g_ema_magnet_transition_source_fingerprint;
+extern int64_t g_ema_magnet_transition_source_update;
 
 namespace open_spiel {
 
@@ -484,6 +486,9 @@ struct PpoUpdateStats {
   // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
   double reverse_kl = 0.0;
 
+  // --- EMAgnet forward KL regularization (Arm 2 / Treatment) ---
+  double ema_magnet_kl = 0.0;
+
   // --- 12-block H/J study readouts ---
   int64_t single_action_transitions = 0;
   double single_action_fraction = 0.0;
@@ -667,7 +672,10 @@ PpoUpdateStats TrainPpoUpdate(
     // Detached collection snapshot; coefficient 0 => inert.
     std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model = nullptr,
     double reverse_kl_coef = 0.0,
-    bool compute_diagnostics = true);
+    bool compute_diagnostics = true,
+    // Arm 2 (Treatment): EMAgnet forward KL regularization to moving parameter-EMA model.
+    std::shared_ptr<SharedDunePolicyValueNetImpl> ema_model = nullptr,
+    double ema_magnet_kl_coef = 0.0);
 
 // Arm D: Fully separate actor and critic networks.
 // Actor parameters produce policy logits and entropy loss; critic parameters produce

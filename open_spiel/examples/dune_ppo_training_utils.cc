@@ -50,6 +50,8 @@ std::string g_target_kl_transition_source_fingerprint = "";
 int64_t g_target_kl_transition_source_update = -1;
 std::string g_single_learner_transition_source_fingerprint = "";
 int64_t g_single_learner_transition_source_update = -1;
+std::string g_ema_magnet_transition_source_fingerprint = "";
+int64_t g_ema_magnet_transition_source_update = -1;
 
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
@@ -1276,6 +1278,15 @@ void SaveDualCheckpoint(
         manifest_obj["single_learner_transition_source_update"] = g_single_learner_transition_source_update;
       }
     }
+    if (!g_ema_magnet_transition_source_fingerprint.empty()) {
+      manifest_obj["ema_magnet_transition_source_fingerprint"] = g_ema_magnet_transition_source_fingerprint;
+      if (g_ema_magnet_transition_source_update >= 0) {
+        manifest_obj["ema_magnet_transition_source_update"] = g_ema_magnet_transition_source_update;
+      }
+    }
+    if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {
+      manifest_obj["ema_magnet_kl_coef"] = absl::GetFlag(FLAGS_ema_magnet_kl_coef);
+    }
 
     manifest_obj["architecture"] = "separate_actor_critic";
     manifest_obj["separate_actor_critic"] = true;
@@ -1959,7 +1970,9 @@ PpoUpdateStats TrainPpoUpdate(
     const Pwo5AuxBatch& pwo5_aux, const Pwo5AuxConfig& pwo5_cfg,
     std::shared_ptr<SharedDunePolicyValueNetImpl> collection_model,
     double reverse_kl_coef,
-    bool compute_diagnostics) {
+    bool compute_diagnostics,
+    std::shared_ptr<SharedDunePolicyValueNetImpl> ema_model,
+    double ema_magnet_kl_coef) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
 
@@ -2503,6 +2516,16 @@ PpoUpdateStats TrainPpoUpdate(
   }
   double weighted_reverse_kl_sum = 0.0;
 
+  // --- EMAgnet forward KL regularization (Arm 2: Treatment) ---
+  const bool ema_magnet_active =
+      (ema_model != nullptr && ema_magnet_kl_coef > 0.0 &&
+       !::absl::GetFlag(::FLAGS_train_value_only));
+  if (ema_model != nullptr) {
+    ema_model->eval();
+  }
+  double weighted_ema_magnet_kl_sum = 0.0;
+  int64_t ema_magnet_nontrivial_count = 0;
+
   // Step 3 update-path telemetry: collect forced row indices and pre-update log probabilities.
   std::vector<size_t> forced_indices;
   for (size_t i = 0; i < batch.size(); ++i) {
@@ -2975,6 +2998,7 @@ PpoUpdateStats TrainPpoUpdate(
       // the fraction contributes 0 rather than a fabricated value.
       torch::Tensor value_clip_frac_t;
       torch::Tensor reverse_kl_penalty_t;
+      torch::Tensor ema_magnet_kl_t;
 
       auto compute_loss = [&]() {
         auto outputs = model->forward(mb_states);
@@ -3105,6 +3129,32 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor decision_kl = legal_kl.sum(-1);
             reverse_kl_penalty_t = decision_kl.masked_select(mb_nontrivial).mean();
             total_loss = total_loss + static_cast<float>(reverse_kl_coef) * reverse_kl_penalty_t;
+          }
+          if (ema_magnet_active) {
+            torch::Tensor ema_logits;
+            {
+              torch::NoGradGuard no_grad;
+              auto ema_out = ema_model->forward(mb_states);
+              if (ema_model->with_semantic_scorer_ && ema_model->semantic_scorer_) {
+                dune_semantic::ApplySemanticScorerBatch(
+                    ema_model->semantic_scorer_, ema_out.trunk, mb_candidate_actions,
+                    ema_out.logits, device);
+              }
+              ema_logits = CenterAndCapLogitsTensor(ema_out.logits, mb_masks, logit_cap);
+            }
+            torch::Tensor masked_ema_logits =
+                ema_logits.masked_fill(mb_masks.logical_not(), -1e9f);
+            torch::Tensor ema_log_probs = torch::log_softmax(masked_ema_logits, -1);
+            torch::Tensor ema_probs = torch::softmax(masked_ema_logits, -1);
+
+            torch::Tensor log_diff = ema_log_probs - log_probs;
+            torch::Tensor kl_elem = ema_probs * log_diff;
+            torch::Tensor legal_kl =
+                torch::where(mb_masks, kl_elem, torch::zeros_like(kl_elem));
+            torch::Tensor decision_kl = legal_kl.sum(-1);
+            ema_magnet_kl_t = decision_kl.masked_select(mb_nontrivial).mean();
+            total_loss = total_loss +
+                         static_cast<float>(ema_magnet_kl_coef) * ema_magnet_kl_t;
           }
         } else {
           // 0 nontrivial transitions: train critic only
@@ -3278,6 +3328,10 @@ PpoUpdateStats TrainPpoUpdate(
         if (reverse_kl_active && reverse_kl_penalty_t.defined()) {
           weighted_reverse_kl_sum += reverse_kl_penalty_t.item<double>() * mb_num_nontrivial;
         }
+        if (ema_magnet_active && ema_magnet_kl_t.defined()) {
+          weighted_ema_magnet_kl_sum += ema_magnet_kl_t.item<double>() * mb_num_nontrivial;
+          ema_magnet_nontrivial_count += mb_num_nontrivial;
+        }
       }
       phase_timer.End(kPhaseScalarReads);
 
@@ -3397,6 +3451,11 @@ PpoUpdateStats TrainPpoUpdate(
     } else {
       stats.reverse_kl = 0.0;
     }
+    if (ema_magnet_active && ema_magnet_nontrivial_count > 0) {
+      stats.ema_magnet_kl = weighted_ema_magnet_kl_sum / ema_magnet_nontrivial_count;
+    } else {
+      stats.ema_magnet_kl = 0.0;
+    }
   }
 
   stats.optimizer_minibatches = stats.minibatches;
@@ -3427,6 +3486,7 @@ PpoUpdateStats TrainPpoUpdate(
       model->eval();
 
       double kl_sum = 0.0;
+      double ema_kl_sum = 0.0;
       int64_t kl_count = 0;
 
       for (size_t start = 0; start < nontrivial_indices.size(); start += minibatch_size) {
@@ -3479,11 +3539,109 @@ PpoUpdateStats TrainPpoUpdate(
         torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
 
         kl_sum += approx_kl.sum().item<double>();
+        if (ema_model != nullptr) {
+          auto ema_out = ema_model->forward(ds);
+          if (ema_model->with_semantic_scorer_ && ema_model->semantic_scorer_) {
+            dune_semantic::ApplySemanticScorerBatch(
+                ema_model->semantic_scorer_, ema_out.trunk, cands, ema_out.logits, device);
+          }
+          torch::Tensor ema_logits = CenterAndCapLogitsTensor(ema_out.logits, dm, logit_cap);
+          torch::Tensor masked_ema_logits = ema_logits.masked_fill(dm.logical_not(), -1e9f);
+          torch::Tensor ema_lp = torch::log_softmax(masked_ema_logits, -1);
+          torch::Tensor ema_p = torch::softmax(masked_ema_logits, -1);
+
+          torch::Tensor log_diff = ema_lp - log_probs;
+          torch::Tensor kl_elem = ema_p * log_diff;
+          torch::Tensor legal_kl = torch::where(dm, kl_elem, torch::zeros_like(kl_elem));
+          ema_kl_sum += legal_kl.sum(-1).sum().item<double>();
+        }
         kl_count += chunk_len;
       }
 
       if (was_training) model->train();
       stats.unfiltered_kl = kl_count > 0 ? (kl_sum / kl_count) : 0.0;
+      if (ema_model != nullptr && kl_count > 0) {
+        stats.ema_magnet_kl = ema_kl_sum / kl_count;
+      }
+    }
+  }
+
+  if (!study_readouts && ema_model != nullptr && compute_diagnostics) {
+    std::vector<int64_t> nontrivial_indices;
+    nontrivial_indices.reserve(nontrivial_count);
+    for (int64_t i = 0; i < n; ++i) {
+      if (batch[i].legal_actions.size() > 1 && !batch[i].mask_policy_loss) {
+        nontrivial_indices.push_back(i);
+      }
+    }
+    if (!nontrivial_indices.empty()) {
+      if (nontrivial_indices.size() > 1024) {
+        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, 99993);
+        std::mt19937_64 kl_rng(kl_seed);
+        std::shuffle(nontrivial_indices.begin(), nontrivial_indices.end(), kl_rng);
+        nontrivial_indices.resize(1024);
+        std::sort(nontrivial_indices.begin(), nontrivial_indices.end());
+      }
+      torch::NoGradGuard no_grad;
+      bool was_training = model->is_training();
+      model->eval();
+      double ema_kl_sum = 0.0;
+      int64_t kl_count = 0;
+
+      for (size_t start = 0; start < nontrivial_indices.size(); start += minibatch_size) {
+        size_t end = std::min(start + static_cast<size_t>(minibatch_size), nontrivial_indices.size());
+        int64_t chunk_len = end - start;
+
+        torch::Tensor s_dev = torch::empty({chunk_len, obs_size}, cpu_float);
+        torch::Tensor m_dev = torch::zeros({chunk_len, action_dim}, cpu_bool);
+        float* sp = s_dev.data_ptr<float>();
+        bool* mp = m_dev.data_ptr<bool>();
+        std::vector<const dune_semantic::CandidateActionData*> cands(chunk_len, nullptr);
+
+        for (int64_t i = 0; i < chunk_len; ++i) {
+          int64_t idx = nontrivial_indices[start + i];
+          const auto& trans = batch[idx];
+          std::memcpy(sp + i * obs_size, trans.state.data(), obs_size * sizeof(float));
+          for (Action a : trans.legal_actions) {
+            if (a >= 0 && a < action_dim) {
+              mp[i * action_dim + a] = true;
+            }
+          }
+          cands[i] = &trans.candidate_data;
+        }
+
+        torch::Tensor ds = s_dev.to(device);
+        torch::Tensor dm = m_dev.to(device);
+
+        auto outputs = model->forward(ds);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, outputs.trunk, cands, outputs.logits, device);
+        }
+        torch::Tensor logits = CenterAndCapLogitsTensor(outputs.logits, dm, logit_cap);
+        torch::Tensor masked_logits = logits.masked_fill(dm.logical_not(), -1e9f);
+        torch::Tensor log_probs = torch::log_softmax(masked_logits, -1);
+
+        auto ema_out = ema_model->forward(ds);
+        if (ema_model->with_semantic_scorer_ && ema_model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              ema_model->semantic_scorer_, ema_out.trunk, cands, ema_out.logits, device);
+        }
+        torch::Tensor ema_logits = CenterAndCapLogitsTensor(ema_out.logits, dm, logit_cap);
+        torch::Tensor masked_ema_logits = ema_logits.masked_fill(dm.logical_not(), -1e9f);
+        torch::Tensor ema_lp = torch::log_softmax(masked_ema_logits, -1);
+        torch::Tensor ema_p = torch::softmax(masked_ema_logits, -1);
+
+        torch::Tensor log_diff = ema_lp - log_probs;
+        torch::Tensor kl_elem = ema_p * log_diff;
+        torch::Tensor legal_kl = torch::where(dm, kl_elem, torch::zeros_like(kl_elem));
+        ema_kl_sum += legal_kl.sum(-1).sum().item<double>();
+        kl_count += chunk_len;
+      }
+      if (was_training) model->train();
+      if (ema_model != nullptr && kl_count > 0) {
+        stats.ema_magnet_kl = ema_kl_sum / kl_count;
+      }
     }
   }
 
@@ -4424,6 +4582,9 @@ std::string DiagnosticsCsvHeader(bool emit_canary_columns) {
       ::absl::GetFlag(::FLAGS_advantage_filtering)) {
     header += kDiagnosticsCsvHeaderStudySuffix;
   }
+  if (::absl::GetFlag(::FLAGS_enable_ema_tracking)) {
+    header += ",ema_magnet_kl";
+  }
   return header;
 }
 
@@ -4953,6 +5114,9 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
           << "," << stats.retained_transitions
           << "," << stats.optimizer_minibatches;
     }
+    if (::absl::GetFlag(::FLAGS_enable_ema_tracking)) {
+      ofs << "," << stats.ema_magnet_kl;
+    }
     ofs << "\n";
     ofs.flush();
     if (!ofs) {
@@ -5060,6 +5224,9 @@ void WriteDiagnostics(const std::string& filepath, int update, const PpoUpdateSt
       obj["unfiltered_kl_sample_size"] = static_cast<int64_t>(stats.unfiltered_kl_sample_size);
       obj["retained_transitions"] = static_cast<int64_t>(stats.retained_transitions);
       obj["optimizer_minibatches"] = static_cast<int64_t>(stats.optimizer_minibatches);
+    }
+    if (::absl::GetFlag(::FLAGS_enable_ema_tracking)) {
+      obj["ema_magnet_kl"] = stats.ema_magnet_kl;
     }
 
     ofs << open_spiel::json::ToString(obj, false) << "\n";

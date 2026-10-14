@@ -33,5 +33,11 @@ ABSL_DECLARE_FLAG(bool, advantage_filtering);
 ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
 ABSL_DECLARE_FLAG(bool, enable_study_readouts);
 
+// EMAgnet forward KL regularization flags.
+ABSL_DECLARE_FLAG(double, ema_magnet_kl_coef);
+ABSL_DECLARE_FLAG(bool, allow_ema_magnet_transition);
+ABSL_DECLARE_FLAG(double, ema_magnet_transition_source_coef);
+ABSL_DECLARE_FLAG(std::string, ema_magnet_transition_source_fingerprint);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 
