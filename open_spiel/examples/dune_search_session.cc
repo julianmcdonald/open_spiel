@@ -1190,6 +1190,7 @@ void DuneAdaptiveRolloutSession::ResetSession(const std::string& reason) {
   last_history_.clear();
   session_new_simulations_completed_ = 0;
   session_elapsed_time_ms_ = 0.0;
+  turn_elapsed_search_time_ms_ = 0.0;
 }
 
 DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double remaining_time_ms) {
@@ -1201,20 +1202,26 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
 
   if (!has_active_session_ || p != last_player_ || dune_state.GetCurrentRound() != last_round_) {
     impl_->tree.Reset();
+    turn_elapsed_search_time_ms_ = 0.0;
   } else if (state.History().size() > last_history_.size() &&
              std::equal(last_history_.begin(), last_history_.end(), state.History().begin())) {
     if (dune_state.GetPlayerCardsInHand(p) > last_hand_ ||
         static_cast<int>(dune_state.GetPlayerIntrigues(p).size()) > last_intrigues_) {
       impl_->tree.Reset();
+      turn_elapsed_search_time_ms_ = 0.0;
     } else {
       for (size_t i = last_history_.size(); i < state.History().size(); ++i) {
         Action a = state.History()[i];
         impl_->tree.Advance(a);
-        if (a == dune_imperium::kActionEndTurn) impl_->tree.Reset();
+        if (a == dune_imperium::kActionEndTurn) {
+          impl_->tree.Reset();
+          turn_elapsed_search_time_ms_ = 0.0;
+        }
       }
     }
   } else if (state.History() != last_history_) {
     impl_->tree.Reset();
+    turn_elapsed_search_time_ms_ = 0.0;
   }
 
   has_active_session_ = true;
@@ -1254,7 +1261,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
   bool is_leader = (dune_state.phase() == dune_imperium::GamePhase::kLeaderDraft ||
                     dune_state.phase() == dune_imperium::GamePhase::kLeaderOfferChance);
 
-  if (legal.size() <= 1 || remaining_time_ms == 0.0) {
+  if (legal.size() <= 1) {
     result.diagnostics.selected_action = raw_action;
     result.diagnostics.mcts_proposed_action = raw_action;
     result.used_fallback = true;
@@ -1262,86 +1269,193 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     result.diagnostics.fallback_reason = result.fallback_reason;
     result.policy = raw_prior;
   } else if (is_leader) {
-    const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
-        state, p, {impl_->evaluator}, leader_rollouts_, 0.10,
-        dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++));
-    result.diagnostics.selected_action = c_res.action;
-    result.diagnostics.mcts_proposed_action = c_res.action;
-    result.diagnostics.mcts_overrode_raw = c_res.overridden;
-    result.simulations_completed = c_res.new_rollouts_executed;
-    result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
-    result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
-    result.policy = raw_prior;
+    const double kReserveMs = 10000.0;
+    const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
+        ? (remaining_time_ms - kReserveMs)
+        : -1.0;
 
-    for (const auto& cu : c_res.candidate_utilities) {
-      for (size_t i = 0; i < legal.size(); ++i) {
-        if (legal[i] == cu.first) {
-          result.diagnostics.q_values[i] = cu.second;
-          break;
-        }
-      }
-    }
-    for (const auto& cru : c_res.candidate_rollout_utilities) {
-      for (size_t i = 0; i < legal.size(); ++i) {
-        if (legal[i] == cru.first) {
-          result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
-          break;
-        }
-      }
-    }
-  } else if (dune_imperium::IsHighStakesStrategicState(state, p)) {
-    int ref_rollouts = reference_rollouts_per_action_;
-    if (remaining_time_ms > 0.0 && remaining_time_ms < 8000.0) {
-      ref_rollouts = std::max(16, static_cast<int>(ref_rollouts * (remaining_time_ms / 8000.0)));
-    }
-    const uint64_t decision_seed =
-        dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
-    const auto c_res = use_successive_halving_
-        ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
-              state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed)
-        : dune_imperium::AdaptiveRolloutSearchDecision(
-              state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed);
-    result.diagnostics.selected_action = c_res.action;
-    result.diagnostics.mcts_proposed_action = c_res.action;
-    result.diagnostics.mcts_overrode_raw = c_res.overridden;
-    result.simulations_completed = c_res.new_rollouts_executed;
-    result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
-    result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
-    result.policy = raw_prior;
+    int effective_leader_rollouts = leader_rollouts_;
+    double target_ms = -1.0;
+    bool deadline_reached = false;
 
-    for (const auto& cu : c_res.candidate_utilities) {
-      for (size_t i = 0; i < legal.size(); ++i) {
-        if (legal[i] == cu.first) {
-          result.diagnostics.q_values[i] = cu.second;
-          break;
+    if (remaining_time_ms >= 0.0) {
+      if (available_after_reserve_ms <= 0.0) {
+        deadline_reached = true;
+      } else {
+        target_ms = std::min(25000.0, available_after_reserve_ms);
+        int num_cands = std::max(1, static_cast<int>(legal.size()));
+        int total_leader_rollout_budget = static_cast<int>(target_ms / std::max(2.0, ms_per_rollout_ema_));
+        effective_leader_rollouts = std::min(2 * leader_rollouts_, total_leader_rollout_budget / num_cands);
+        if (effective_leader_rollouts < 2) {
+          deadline_reached = true;
         }
       }
     }
-    for (const auto& cru : c_res.candidate_rollout_utilities) {
-      for (size_t i = 0; i < legal.size(); ++i) {
-        if (legal[i] == cru.first) {
-          result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
-          break;
+
+    if (deadline_reached) {
+      result.diagnostics.selected_action = raw_action;
+      result.diagnostics.mcts_proposed_action = raw_action;
+      result.used_fallback = true;
+      result.fallback_reason = "live_deadline_reached";
+      result.diagnostics.fallback_reason = "live_deadline_reached";
+      result.policy = raw_prior;
+    } else {
+      int num_cands = std::max(1, static_cast<int>(legal.size()));
+      const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
+          state, p, {impl_->evaluator}, effective_leader_rollouts, 0.10,
+          dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
+          dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn,
+          /*sample_opponent_leader_draft=*/true,
+          /*max_time_ms=*/target_ms);
+      result.diagnostics.selected_action = c_res.action;
+      result.diagnostics.mcts_proposed_action = c_res.action;
+      result.diagnostics.mcts_overrode_raw = c_res.overridden;
+      result.simulations_completed = c_res.new_rollouts_executed;
+      result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+      result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+      result.policy = raw_prior;
+
+      for (const auto& cu : c_res.candidate_utilities) {
+        for (size_t i = 0; i < legal.size(); ++i) {
+          if (legal[i] == cu.first) {
+            result.diagnostics.q_values[i] = cu.second;
+            break;
+          }
         }
+      }
+      for (const auto& cru : c_res.candidate_rollout_utilities) {
+        for (size_t i = 0; i < legal.size(); ++i) {
+          if (legal[i] == cru.first) {
+            result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+            break;
+          }
+        }
+      }
+      const int retained_pairs = c_res.candidate_rollout_utilities.empty()
+          ? 0
+          : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
+      if (remaining_time_ms >= 0.0 && (retained_pairs < 2 || c_res.new_rollouts_executed < 2 * num_cands)) {
+        result.used_fallback = true;
+        result.fallback_reason = "live_deadline_reached";
+        result.diagnostics.fallback_reason = "live_deadline_reached";
       }
     }
   } else {
-    Action chosen = raw_action;
-    if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
-      double best = -1e9;
-      for (Action a : legal) {
-        if (impl_->tree.HasPriorData(a) && impl_->tree.GetMeanUtility(a) > best) {
-          best = impl_->tree.GetMeanUtility(a);
-          chosen = a;
+    const double kReserveMs = 10000.0;
+    const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
+        ? (remaining_time_ms - kReserveMs)
+        : -1.0;
+
+    bool ran_high_stakes = false;
+    bool live_deadline_starved = false;
+
+    if (dune_imperium::IsHighStakesStrategicState(state, p)) {
+      if (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0) {
+        live_deadline_starved = true;
+      } else {
+        int ref_rollouts = reference_rollouts_per_action_;
+        double target_ms = -1.0;
+        if (remaining_time_ms >= 0.0) {
+          double frac = (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns) ? 0.60 : 0.75;
+          double cap = (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns) ? 25000.0 : 30000.0;
+          target_ms = std::min(cap, frac * available_after_reserve_ms);
+          int total_rollout_budget = static_cast<int>(target_ms / std::max(2.0, ms_per_rollout_ema_));
+          ref_rollouts = std::min(4 * reference_rollouts_per_action_, total_rollout_budget / 3);
+        }
+
+        if (remaining_time_ms >= 0.0 && ref_rollouts < 4) {
+          live_deadline_starved = true;
+        } else {
+          ran_high_stakes = true;
+          const uint64_t decision_seed =
+              dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
+          const auto c_res = use_successive_halving_
+              ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
+                    state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
+                    dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn, /*unbiased_stage2_gate=*/true, target_ms)
+              : dune_imperium::AdaptiveRolloutSearchDecision(
+                    state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
+                    dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn, target_ms);
+          result.diagnostics.selected_action = c_res.action;
+          result.diagnostics.mcts_proposed_action = c_res.action;
+          result.diagnostics.mcts_overrode_raw = c_res.overridden;
+          result.simulations_completed = c_res.new_rollouts_executed;
+          result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+          result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+          result.policy = raw_prior;
+
+          for (const auto& cu : c_res.candidate_utilities) {
+            for (size_t i = 0; i < legal.size(); ++i) {
+              if (legal[i] == cu.first) {
+                result.diagnostics.q_values[i] = cu.second;
+                break;
+              }
+            }
+          }
+          for (const auto& cru : c_res.candidate_rollout_utilities) {
+            for (size_t i = 0; i < legal.size(); ++i) {
+              if (legal[i] == cru.first) {
+                result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+                break;
+              }
+            }
+          }
+          const int retained_pairs = c_res.candidate_rollout_utilities.empty()
+              ? 0
+              : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
+          if (remaining_time_ms >= 0.0 && retained_pairs < 2) {
+            result.used_fallback = true;
+            result.fallback_reason = "live_deadline_reached";
+            result.diagnostics.fallback_reason = "live_deadline_reached";
+          }
         }
       }
     }
-    result.diagnostics.selected_action = chosen;
-    result.diagnostics.mcts_proposed_action = chosen;
-    result.used_fallback = true;
-    result.fallback_reason = "policy_only";
-    result.diagnostics.fallback_reason = "policy_only";
-    result.policy = raw_prior;
+
+    if (!ran_high_stakes) {
+      Action chosen = raw_action;
+      int inherited_visits = 0;
+      int covered_in_tree = 0;
+      if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
+        double best = -1e9;
+        for (size_t i = 0; i < legal.size(); ++i) {
+          Action a = legal[i];
+          if (impl_->tree.HasPriorData(a)) {
+            int v = impl_->tree.GetVisits(a);
+            double q = impl_->tree.GetMeanUtility(a);
+            result.diagnostics.visit_counts[i] = v;
+            result.diagnostics.q_values[i] = q;
+            inherited_visits += v;
+            covered_in_tree++;
+            if (q > best) {
+              best = q;
+              chosen = a;
+            }
+          }
+        }
+      }
+
+      if (covered_in_tree > 0) {
+        result.diagnostics.selected_action = chosen;
+        result.diagnostics.mcts_proposed_action = chosen;
+        result.diagnostics.mcts_overrode_raw = (chosen != raw_action);
+        result.used_fallback = false;
+        result.fallback_reason = "none";
+        result.diagnostics.fallback_reason = "none";
+        result.diagnostics.inherited_root_visits = inherited_visits;
+        result.policy = raw_prior;
+      } else {
+        result.diagnostics.selected_action = raw_action;
+        result.diagnostics.mcts_proposed_action = raw_action;
+        result.used_fallback = true;
+        std::string reason = (live_deadline_starved || (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0))
+            ? "live_deadline_reached"
+            : "policy_only";
+        result.fallback_reason = reason;
+        result.diagnostics.fallback_reason = reason;
+        result.policy = raw_prior;
+      }
+    }
   }
 
   int covered = 0;
@@ -1358,7 +1472,12 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
   result.elapsed_time_ms = elapsed_ms;
   result.diagnostics.elapsed_search_time_ms = elapsed_ms;
   session_elapsed_time_ms_ += elapsed_ms;
+  turn_elapsed_search_time_ms_ += elapsed_ms;
   session_new_simulations_completed_ += result.simulations_completed;
+  if (result.simulations_completed >= 6 && !result.used_fallback && elapsed_ms > 0.0) {
+    double current_rate = elapsed_ms / result.simulations_completed;
+    ms_per_rollout_ema_ = 0.8 * ms_per_rollout_ema_ + 0.2 * current_rate;
+  }
 
   last_search_state_ = state.Clone();
   last_search_result_ = result;

@@ -1,9 +1,14 @@
 #include "open_spiel/examples/dune_wide_rollout_search.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <memory>
+#include <thread>
 #include <vector>
 
+#include "open_spiel/games/dune_imperium/dune_imperium.h"
+#include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 
 namespace open_spiel {
@@ -266,6 +271,535 @@ void NativeSuccessiveHalvingTest(const std::shared_ptr<const Game>& game) {
     // Total = 96 + 96 = 192 rollouts executed.
     SPIEL_CHECK_EQ(result.new_rollouts_executed, 192);
   }
+
+  // Case 3: Challenger is best, unbiased_stage2_gate = true confirms override.
+  {
+    const Action winner = actions[2];
+    PayoffState winner_state(game, actions, winner, /*advantage=*/1.0, /*noise_size=*/0.0);
+    TurnSearchTree tree;
+    const auto result = SuccessiveHalvingRolloutSearchDecision(
+        winner_state, 0, &tree, evaluators, 64, 0.15, 42,
+        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/true);
+    SPIEL_CHECK_EQ(result.action, winner);
+    SPIEL_CHECK_TRUE(result.overridden);
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 192);
+  }
+
+  // Case 4: K = 2 candidate confirmation with unbiased_stage2_gate = true.
+  {
+    const auto actions2 = Actions(2);
+    const Action winner2 = actions2[1];
+    PayoffState winner2_state(game, actions2, winner2, /*advantage=*/1.0, /*noise_size=*/0.0);
+    TurnSearchTree tree2;
+    const auto result2 = SuccessiveHalvingRolloutSearchDecision(
+        winner2_state, 0, &tree2, evaluators, 64, 0.15, 42,
+        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/true);
+    SPIEL_CHECK_EQ(result2.action, winner2);
+    SPIEL_CHECK_TRUE(result2.overridden);
+    SPIEL_CHECK_EQ(result2.new_rollouts_executed, 192);
+  }
+}
+
+void ComputeMeanPairedCorrelationTest() {
+  // Test 1: Empty or single-candidate returns default
+  {
+    const auto stats0 = ComputeMeanPairedCorrelation(std::vector<std::vector<double>>{});
+    SPIEL_CHECK_EQ(stats0.pair_count, 0);
+    SPIEL_CHECK_FLOAT_EQ(stats0.sum_corr, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats0.mean_paired_corr, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats0.sum_diff_var, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats0.mean_paired_diff_var, 0.0);
+
+    const auto stats1 = ComputeMeanPairedCorrelation(std::vector<std::vector<double>>{{1.0, 2.0}});
+    SPIEL_CHECK_EQ(stats1.pair_count, 0);
+  }
+
+  // Test 2: Perfect positive correlation (r = 1.0, diff_var = 0.0)
+  {
+    const std::vector<double> c0 = {1.0, 2.0, 3.0, 4.0};
+    const std::vector<double> c1 = {11.0, 12.0, 13.0, 14.0};
+    const auto stats = ComputeMeanPairedCorrelation(std::vector<std::vector<double>>{c0, c1});
+    SPIEL_CHECK_EQ(stats.pair_count, 1);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_corr, 1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_corr, 1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_diff_var, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_diff_var, 0.0);
+  }
+
+  // Test 3: Anti-correlation (r = -1.0)
+  {
+    const std::vector<double> c0 = {1.0, 2.0, 3.0, 4.0};
+    const std::vector<double> c1 = {4.0, 3.0, 2.0, 1.0};
+    const auto stats = ComputeMeanPairedCorrelation(std::vector<std::vector<double>>{c0, c1});
+    SPIEL_CHECK_EQ(stats.pair_count, 1);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_corr, -1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_corr, -1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_diff_var, 20.0 / 3.0);
+  }
+
+  // Test 4: Multi-candidate pairing and overload with vector<pair<Action, vector<double>>>
+  {
+    const std::vector<double> c0 = {1.0, 2.0, 3.0, 4.0};
+    const std::vector<double> c1 = {11.0, 12.0, 13.0, 14.0};
+    const std::vector<double> c2 = {4.0, 3.0, 2.0, 1.0};
+    const std::vector<std::pair<Action, std::vector<double>>> candidate_rollouts = {
+        {10, c0}, {20, c1}, {30, c2}};
+    const auto stats = ComputeMeanPairedCorrelation(candidate_rollouts);
+    SPIEL_CHECK_EQ(stats.pair_count, 2);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_corr, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_corr, 0.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_diff_var, 20.0 / 3.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_diff_var, 10.0 / 3.0);
+  }
+
+  // Test 5: Zero-variance candidate excluded from corr_pair_count and mean_paired_corr,
+  // but included in diff_var_pair_count and mean_paired_diff_var.
+  {
+    const std::vector<double> c0 = {1.0, 2.0, 3.0, 4.0};
+    const std::vector<double> c1 = {11.0, 12.0, 13.0, 14.0};
+    const std::vector<double> c2 = {5.0, 5.0, 5.0, 5.0};
+    const std::vector<std::vector<double>> candidate_rollouts = {c0, c1, c2};
+    const auto stats = ComputeMeanPairedCorrelation(candidate_rollouts);
+    SPIEL_CHECK_EQ(stats.pair_count, 1);
+    SPIEL_CHECK_EQ(stats.corr_pair_count, 1);
+    SPIEL_CHECK_EQ(stats.diff_var_pair_count, 2);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_corr, 1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_corr, 1.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.sum_diff_var, 5.0 / 3.0);
+    SPIEL_CHECK_FLOAT_EQ(stats.mean_paired_diff_var, (5.0 / 3.0) / 2.0);
+  }
+}
+
+void CurrentChanceStreamIdTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune_state = dynamic_cast<DuneImperiumState*>(state.get());
+  SPIEL_CHECK_TRUE(dune_state != nullptr);
+
+  // 1. Initial setup refills: 5 Imperium row slots (stream 1)
+  for (int slot = 0; slot < 5; ++slot) {
+    SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 1);
+    SPIEL_CHECK_GT(dune_state->CurrentChanceDeckRemainingSize(), 0);
+    const auto outcomes = dune_state->ChanceOutcomes();
+    SPIEL_CHECK_FALSE(outcomes.empty());
+    dune_state->ApplyAction(outcomes.front().first);
+  }
+
+  // 2. Initial setup refills: 2 Tleilaxu row slots (stream 2)
+  for (int slot = 0; slot < 2; ++slot) {
+    SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 2);
+    SPIEL_CHECK_GT(dune_state->CurrentChanceDeckRemainingSize(), 0);
+    const auto outcomes = dune_state->ChanceOutcomes();
+    SPIEL_CHECK_FALSE(outcomes.empty());
+    dune_state->ApplyAction(outcomes.front().first);
+  }
+
+  // 3. Initial setup refills: 3 Tech stack slots (streams 3, 4, 5)
+  for (int stack = 0; stack < 3; ++stack) {
+    SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 3 + stack);
+    SPIEL_CHECK_GT(dune_state->CurrentChanceDeckRemainingSize(), 0);
+    const auto outcomes = dune_state->ChanceOutcomes();
+    SPIEL_CHECK_FALSE(outcomes.empty());
+    dune_state->ApplyAction(outcomes.front().first);
+  }
+
+  // 4. Now initial setup is complete, phase is kLeaderOfferChance -> stream 6
+  SPIEL_CHECK_TRUE(dune_state->phase() == GamePhase::kLeaderOfferChance);
+  SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 6);
+
+  // 5. In kRoundStart, if conflict not yet revealed -> stream 0
+  dune_state->SetPhaseForTesting(GamePhase::kRoundStart);
+  dune_state->SetRoundStartConflictDoneForTesting(false);
+  SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 0);
+  SPIEL_CHECK_GT(dune_state->CurrentChanceDeckRemainingSize(), 0);
+
+  // 6. If conflict is revealed and imperium slot refill is pending -> stream 1
+  dune_state->SetRoundStartConflictDoneForTesting(true);
+  dune_state->SetPendingImperiumSlotForTesting(1);
+  SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 1);
+  SPIEL_CHECK_GT(dune_state->CurrentChanceDeckRemainingSize(), 0);
+
+  // 7. Clear imperium slot, set pending player draw player for seats 0..3 -> streams 10..13
+  dune_state->SetPendingImperiumSlotForTesting(kInvalidCard);
+  for (int p = 0; p < kNumPlayers; ++p) {
+    dune_state->SetPendingPlayerDrawPlayerForTesting(p);
+    SPIEL_CHECK_EQ(dune_state->CurrentChanceStreamId(), 10 + p);
+  }
+}
+
+class CrnTestDuneState : public DuneImperiumState {
+ public:
+  explicit CrnTestDuneState(const std::shared_ptr<const Game>& game)
+      : DuneImperiumState(game) {
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<CrnTestDuneState>(*this);
+  }
+
+  void SetBranchB(bool is_branch_b) {
+    is_branch_b_ = is_branch_b;
+  }
+
+  bool IsTerminal() const override {
+    return done_ || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (done_) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  ActionsAndProbs ChanceOutcomes() const override {
+    const int stream = CurrentChanceStreamId();
+    if (stream == 0) {
+      return {{1, 0.5}, {2, 0.5}};
+    }
+    if (stream >= 10 && stream <= 13) {
+      return {{10, 0.25}, {11, 0.25}, {12, 0.25}, {13, 0.25}};
+    }
+    return DuneImperiumState::ChanceOutcomes();
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    history_actions_.push_back(action);
+    step_++;
+    if (!is_branch_b_) {
+      if (step_ == 1) {
+        SetRoundStartConflictDoneForTesting(true);
+        SetPendingPlayerDrawPlayerForTesting(1);
+      } else if (step_ >= 2) {
+        done_ = true;
+      }
+    } else {
+      if (step_ == 1) {
+        SetRoundStartConflictDoneForTesting(false);
+        SetPendingPlayerDrawPlayerForTesting(-1);
+      } else if (step_ == 2) {
+        SetRoundStartConflictDoneForTesting(true);
+        SetPendingPlayerDrawPlayerForTesting(1);
+      } else if (step_ >= 3) {
+        done_ = true;
+      }
+    }
+  }
+
+ public:
+  const std::vector<Action>& history_actions() const { return history_actions_; }
+
+ private:
+  bool is_branch_b_ = false;
+  int step_ = 0;
+  bool done_ = false;
+  std::vector<Action> history_actions_;
+};
+
+void DeckOrderCrnAlignmentAndParityTest(const std::shared_ptr<const Game>& game) {
+  int crn_matches = 0;
+  int seq_mismatches = 0;
+  const int num_seeds = 50;
+
+  for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+    // 1. Test kDeckOrderCrn:
+    CrnTestDuneState state_a_crn(game);
+    state_a_crn.SetPhaseForTesting(GamePhase::kRoundStart);
+    state_a_crn.SetRoundStartConflictDoneForTesting(false);
+    state_a_crn.SetPendingPlayerDrawPlayerForTesting(-1);
+    state_a_crn.SetRoundNumberForTesting(1);
+    state_a_crn.SetBranchB(false);
+
+    CrnTestDuneState state_b_crn(game);
+    state_b_crn.SetPhaseForTesting(GamePhase::kRoundStart);
+    state_b_crn.SetRoundStartConflictDoneForTesting(true);
+    state_b_crn.SetPendingPlayerDrawPlayerForTesting(0);
+    state_b_crn.SetRoundNumberForTesting(1);
+    state_b_crn.SetBranchB(true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_crn, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_crn, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+
+    SPIEL_CHECK_EQ(state_a_crn.history_actions().size(), 2);
+    SPIEL_CHECK_EQ(state_b_crn.history_actions().size(), 3);
+    SPIEL_CHECK_EQ(state_a_crn.history_actions()[0], state_b_crn.history_actions()[1]);
+    SPIEL_CHECK_EQ(state_a_crn.history_actions()[1], state_b_crn.history_actions()[2]);
+    crn_matches++;
+
+    // 2. Test kSequential:
+    CrnTestDuneState state_a_seq(game);
+    state_a_seq.SetPhaseForTesting(GamePhase::kRoundStart);
+    state_a_seq.SetRoundStartConflictDoneForTesting(false);
+    state_a_seq.SetPendingPlayerDrawPlayerForTesting(-1);
+    state_a_seq.SetRoundNumberForTesting(1);
+    state_a_seq.SetBranchB(false);
+
+    CrnTestDuneState state_b_seq(game);
+    state_b_seq.SetPhaseForTesting(GamePhase::kRoundStart);
+    state_b_seq.SetRoundStartConflictDoneForTesting(true);
+    state_b_seq.SetPendingPlayerDrawPlayerForTesting(0);
+    state_b_seq.SetRoundNumberForTesting(1);
+    state_b_seq.SetBranchB(true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_seq, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_seq, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential);
+
+    if (state_a_seq.history_actions()[0] != state_b_seq.history_actions()[1] ||
+        state_a_seq.history_actions()[1] != state_b_seq.history_actions()[2]) {
+      seq_mismatches++;
+    }
+  }
+
+  SPIEL_CHECK_EQ(crn_matches, num_seeds);
+  SPIEL_CHECK_GT(seq_mismatches, 0);
+}
+
+class NativeReshuffleCrnTestState : public DuneImperiumState {
+ public:
+  NativeReshuffleCrnTestState(const std::shared_ptr<const Game>& game, bool is_branch_b)
+      : DuneImperiumState(game), is_branch_b_(is_branch_b) {
+    SetPhaseForTesting(GamePhase::kRoundStart);
+    SetRoundStartConflictDoneForTesting(true);
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+    SetPendingPlayerDrawPlayerForTesting(0);
+    // Real native discard pile with distinct cards for player 0:
+    SetPlayerDiscardForTesting(0, {10, 11, 12, 13});
+    if (!is_branch_b_) {
+      // Branch A: 1 card in draw deck, hand size 2
+      SetPlayerDrawDeckForTesting(0, {9});
+      SetPlayerHandForTesting(0, {1, 2});
+    } else {
+      // Branch B: 0 cards in draw deck (already drew card 9), hand size 3
+      SetPlayerDrawDeckForTesting(0, {});
+      SetPlayerHandForTesting(0, {1, 2, 9});
+    }
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<NativeReshuffleCrnTestState>(*this);
+  }
+
+  bool is_done() const {
+    return static_cast<int>(History().size() - initial_history_size_) >=
+           (is_branch_b_ ? 2 : 3);
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool is_branch_b_ = false;
+  size_t initial_history_size_ = 0;
+};
+
+void ReshuffleEpochCrnTest(const std::shared_ptr<const Game>& game) {
+  int crn_matches = 0;
+  int seq_mismatches = 0;
+  const int num_seeds = 50;
+
+  for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+    // 1. Test kDeckOrderCrn:
+    NativeReshuffleCrnTestState state_a_crn(game, /*is_branch_b=*/false);
+    NativeReshuffleCrnTestState state_b_crn(game, /*is_branch_b=*/true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_crn, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_crn, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+
+    SPIEL_CHECK_EQ(state_a_crn.history_actions().size(), 3);
+    SPIEL_CHECK_EQ(state_b_crn.history_actions().size(), 2);
+    // Draw 0 in Branch A was card 9 from draw deck before reshuffle:
+    SPIEL_CHECK_EQ(state_a_crn.history_actions()[0], 9);
+    // Under CRN, draw 1 of Branch A (first reshuffled card) must match draw 0 of Branch B!
+    SPIEL_CHECK_EQ(state_a_crn.history_actions()[1], state_b_crn.history_actions()[0]);
+    // Draw 2 of Branch A (second reshuffled card) must match draw 1 of Branch B!
+    SPIEL_CHECK_EQ(state_a_crn.history_actions()[2], state_b_crn.history_actions()[1]);
+    crn_matches++;
+
+    // 2. Test kSequential:
+    NativeReshuffleCrnTestState state_a_seq(game, /*is_branch_b=*/false);
+    NativeReshuffleCrnTestState state_b_seq(game, /*is_branch_b=*/true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_seq, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_seq, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential);
+
+    if (state_a_seq.history_actions()[1] != state_b_seq.history_actions()[0] ||
+        state_a_seq.history_actions()[2] != state_b_seq.history_actions()[1]) {
+      seq_mismatches++;
+    }
+  }
+
+  SPIEL_CHECK_EQ(crn_matches, num_seeds);
+  SPIEL_CHECK_GT(seq_mismatches, 0);
+}
+
+void SmallBudgetGuardTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(2);
+
+  // Challenger (actions[1]) has huge advantage (+10.0), but r_completed <= 1
+  // or r_stage2 <= 1 must guard t_stat and prevent override.
+  PayoffState state(game, actions, actions[1], /*advantage=*/10.0, /*noise_size=*/0.0);
+
+  // 1. PairedPriorSortedRolloutSearchDecision with rollouts_per_action = 1 -> r_completed = 1
+  {
+    TurnSearchTree tree;
+    const auto result = PairedPriorSortedRolloutSearchDecision(
+        state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/1,
+        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42);
+    SPIEL_CHECK_EQ(result.action, actions[0]);
+    SPIEL_CHECK_FALSE(result.overridden);
+  }
+
+  // 2. SuccessiveHalvingRolloutSearchDecision with reference_rollouts_per_action = 1 -> r_stage2 <= 1
+  {
+    TurnSearchTree tree;
+    const auto result = SuccessiveHalvingRolloutSearchDecision(
+        state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/1,
+        /*min_override_margin=*/0.15, 42);
+    SPIEL_CHECK_EQ(result.action, actions[0]);
+    SPIEL_CHECK_FALSE(result.overridden);
+  }
+
+  // 3. PairedPriorSortedRolloutSearchDecision with rollouts_per_action = 2 -> r_completed = 2 confirms override
+  {
+    TurnSearchTree tree;
+    const auto result = PairedPriorSortedRolloutSearchDecision(
+        state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/2,
+        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42);
+    SPIEL_CHECK_EQ(result.action, actions[1]);
+    SPIEL_CHECK_TRUE(result.overridden);
+  }
+}
+
+class SlowDeadlineState : public State {
+ public:
+  SlowDeadlineState(std::shared_ptr<const Game> game, std::vector<Action> actions)
+      : State(game), actions_(std::move(actions)) {}
+
+  Player CurrentPlayer() const override {
+    return step_ >= 4 ? kTerminalPlayerId : (step_ % 2 == 1 ? kChancePlayerId : 0);
+  }
+  std::vector<Action> LegalActions() const override {
+    if (step_ >= 4) return {};
+    return actions_;
+  }
+  ActionsAndProbs ChanceOutcomes() const override {
+    return {{0, 0.5}, {1, 0.5}};
+  }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "SlowDeadlineState"; }
+  bool IsTerminal() const override { return step_ >= 4; }
+  std::vector<double> Returns() const override { return {1.0, -1.0, 0.0, 0.0}; }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<SlowDeadlineState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action /*action*/) override {
+    ++step_;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+ private:
+  std::vector<Action> actions_;
+  int step_ = 0;
+};
+
+void DeadlineEnforcementTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(2);
+  SlowDeadlineState slow_state(game, actions);
+
+  // 1. PairedPriorSortedRolloutSearchDecision with tiny deadline (0.001 ms).
+  // Must return quickly without hanging and retain only paired completed worlds.
+  {
+    TurnSearchTree tree;
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto result = PairedPriorSortedRolloutSearchDecision(
+        slow_state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42,
+        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+        /*max_time_ms=*/0.001);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+
+    SPIEL_CHECK_LT(elapsed, 500);
+    SPIEL_CHECK_EQ(result.action, actions[0]);
+    SPIEL_CHECK_FALSE(result.overridden);
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 0);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(),
+                   result.candidate_rollout_utilities[1].second.size());
+  }
+
+  // 2. SuccessiveHalvingRolloutSearchDecision with tiny deadline (0.001 ms).
+  {
+    TurnSearchTree tree;
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto result = SuccessiveHalvingRolloutSearchDecision(
+        slow_state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15, 42,
+        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+        /*max_time_ms=*/0.001);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+
+    SPIEL_CHECK_LT(elapsed, 500);
+    SPIEL_CHECK_EQ(result.action, actions[0]);
+    SPIEL_CHECK_FALSE(result.overridden);
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 0);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(),
+                   result.candidate_rollout_utilities[1].second.size());
+  }
+
+  // 3. Fast state with generous deadline (5000.0 ms) completes normally and paired.
+  {
+    PayoffState fast_state(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/0.0);
+    TurnSearchTree tree;
+    const auto result = PairedPriorSortedRolloutSearchDecision(
+        fast_state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42,
+        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+        /*max_time_ms=*/5000.0);
+    SPIEL_CHECK_EQ(result.action, actions[1]);
+    SPIEL_CHECK_TRUE(result.overridden);
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 16);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(), 8);
+    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[1].second.size(), 8);
+  }
 }
 
 }  // namespace
@@ -280,4 +814,10 @@ int main() {
   NativeWideCompoundParityTest(game);
   RawRetentionAndMarginTest(game);
   NativeSuccessiveHalvingTest(game);
+  ComputeMeanPairedCorrelationTest();
+  CurrentChanceStreamIdTest(game);
+  DeckOrderCrnAlignmentAndParityTest(game);
+  ReshuffleEpochCrnTest(game);
+  SmallBudgetGuardTest(game);
+  DeadlineEnforcementTest(game);
 }

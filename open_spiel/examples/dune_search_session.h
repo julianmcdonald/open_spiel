@@ -230,6 +230,8 @@ class DuneAdaptiveRolloutSession {
   bool HasActiveSession() const { return has_active_session_; }
   int session_new_simulations_completed() const { return session_new_simulations_completed_; }
   double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
+  double ms_per_rollout_ema() const { return ms_per_rollout_ema_; }
+  double turn_elapsed_search_time_ms() const { return turn_elapsed_search_time_ms_; }
 
  private:
   std::string checkpoint_path_;
@@ -253,6 +255,8 @@ class DuneAdaptiveRolloutSession {
 
   int session_new_simulations_completed_ = 0;
   double session_elapsed_time_ms_ = 0.0;
+  double turn_elapsed_search_time_ms_ = 0.0;
+  double ms_per_rollout_ema_ = 14.0;
 
   std::unique_ptr<State> last_search_state_;
   DuneSearchResult last_search_result_;

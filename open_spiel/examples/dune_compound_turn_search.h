@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <future>
 #include <set>
@@ -139,6 +140,14 @@ enum class SearchTruncationMode {
   kNextRoundSearchPlayer   // Cut off at search player's first decision in subsequent round
 };
 
+// Search rollout CRN mode:
+// kDeckOrderCrn implements stream-and-reshuffle-epoch-indexed CRN
+// (separating the 15 chance streams and resynchronizing draw indices whenever a deck reshuffles).
+enum class SearchRolloutCrnMode {
+  kSequential = 0,
+  kDeckOrderCrn = 1,
+};
+
 // Conversion scale from value head predicted return to ladder game returns
 inline constexpr double kValueToLadderScale = 4.0;
 
@@ -151,6 +160,7 @@ inline double TruncatedLeafUtility(double value_head_prediction) {
 struct RolloutTrajectory {
   double terminal_utility = 0.0;
   std::vector<Action> intra_turn_actions;
+  bool aborted_by_deadline = false;
 };
 
 // Simulate a rollout to terminal or truncation cutoff while recording any actions
@@ -160,28 +170,75 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     Player search_player,
     BatchedNNEvaluator* evaluator,
     uint64_t rollout_seed,
-    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal) {
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
+    bool sample_opponent_leader_draft = false,
+    const std::chrono::steady_clock::time_point* deadline = nullptr) {
   std::mt19937 rng(rollout_seed);
   int steps = 0;
   const int max_steps = 2500;
   std::vector<Action> intra_turn_actions;
   bool active_turn = true;
 
-  const auto* dune_init = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
-  int start_round = dune_init ? dune_init->GetCurrentRound() : 1;
+  const auto* cur_dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
+  int start_round = cur_dune ? cur_dune->GetCurrentRound() : 1;
+
+  std::array<int, 15> epoch_draw_ordinal{};
+  std::array<int, 15> last_deck_size;
+  last_deck_size.fill(-1);
+  std::array<int, 15> reshuffle_epoch{};
+  std::array<bool, 15> just_reshuffled{};
 
   while (!sim_state->IsTerminal() && steps < max_steps) {
+    if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) {
+      return {0.0, std::move(intra_turn_actions), /*aborted_by_deadline=*/true};
+    }
     steps++;
     if (sim_state->IsChanceNode()) {
       auto chance_outcomes = sim_state->ChanceOutcomes();
-      double u = std::generate_canonical<double, 53>(rng);
-      Action ca = open_spiel::SampleAction(chance_outcomes, u).first;
-      sim_state->ApplyAction(ca);
+      if (crn_mode == SearchRolloutCrnMode::kSequential) {
+        double u = std::generate_canonical<double, 53>(rng);
+        Action ca = open_spiel::SampleAction(chance_outcomes, u).first;
+        sim_state->ApplyAction(ca);
+      } else {
+        const int s_id = cur_dune ? cur_dune->CurrentChanceStreamId() : 14;
+        if (cur_dune != nullptr) {
+          const int rem_size = cur_dune->CurrentChanceDeckRemainingSize();
+          const bool will_reshuffle = cur_dune->CurrentChanceWillReshuffle();
+          const bool is_tracked_deck =
+              (s_id == 0 || s_id == 1 || s_id == 2 || (s_id >= 3 && s_id <= 5) ||
+               s_id == 8 || (s_id >= 10 && s_id <= 13));
+          if (is_tracked_deck) {
+            if (will_reshuffle) {
+              reshuffle_epoch[s_id]++;
+              epoch_draw_ordinal[s_id] = 0;
+              just_reshuffled[s_id] = true;
+            } else {
+              if (!just_reshuffled[s_id] && last_deck_size[s_id] >= 0 &&
+                  rem_size > last_deck_size[s_id]) {
+                reshuffle_epoch[s_id]++;
+                epoch_draw_ordinal[s_id] = 0;
+              }
+              just_reshuffled[s_id] = false;
+            }
+            last_deck_size[s_id] = rem_size;
+          }
+        }
+        const uint64_t k = (s_id == 0 && cur_dune != nullptr)
+                               ? static_cast<uint64_t>(cur_dune->GetCurrentRound())
+                               : ((static_cast<uint64_t>(reshuffle_epoch[s_id]) << 32) |
+                                  static_cast<uint64_t>(epoch_draw_ordinal[s_id]++));
+        const uint64_t draw_seed = dune_seed::DeriveSeed(
+            rollout_seed, 0x43524E00ULL + static_cast<uint64_t>(s_id), k);
+        const double u =
+            static_cast<double>(draw_seed >> 11) * (1.0 / 9007199254740992.0);
+        Action ca = open_spiel::SampleAction(chance_outcomes, u).first;
+        sim_state->ApplyAction(ca);
+      }
       continue;
     }
 
     Player cur = sim_state->CurrentPlayer();
-    const auto* cur_dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
     int cur_round = cur_dune ? cur_dune->GetCurrentRound() : 1;
 
     // Truncation check: search player's first decision in the subsequent round
@@ -197,6 +254,32 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     Action a = kInvalidAction;
     if (legals.size() == 1) {
       a = legals.front();
+    } else if (sample_opponent_leader_draft && cur_dune != nullptr &&
+               cur_dune->phase() == dune_imperium::GamePhase::kLeaderDraft &&
+               cur != search_player) {
+      ActionsAndProbs prior = evaluator ? evaluator->Prior(*sim_state) : ActionsAndProbs{};
+      std::vector<double> prior_probs(legals.size(), 0.0);
+      double prior_sum = 0.0;
+      for (size_t i = 0; i < legals.size(); ++i) {
+        for (const auto& ap : prior) {
+          if (ap.first == legals[i]) {
+            prior_probs[i] = std::max(0.0, ap.second);
+            prior_sum += prior_probs[i];
+            break;
+          }
+        }
+      }
+      const double uniform_prob = 1.0 / static_cast<double>(legals.size());
+      ActionsAndProbs mixture_outcomes;
+      mixture_outcomes.reserve(legals.size());
+      for (size_t i = 0; i < legals.size(); ++i) {
+        double p_prior = (prior_sum > 1e-12) ? (prior_probs[i] / prior_sum) : uniform_prob;
+        double p_mix = 0.5 * p_prior + 0.5 * uniform_prob;
+        mixture_outcomes.push_back({legals[i], p_mix});
+      }
+      uint64_t lead_seed = dune_seed::DeriveSeed(rollout_seed, 0x4C445246ULL, static_cast<uint64_t>(cur));
+      double u_lead = static_cast<double>(lead_seed >> 11) * (1.0 / 9007199254740992.0);
+      a = open_spiel::SampleAction(mixture_outcomes, u_lead).first;
     } else {
       ActionsAndProbs prior = evaluator ? evaluator->Prior(*sim_state) : ActionsAndProbs{};
       // Pick greedy action
@@ -319,7 +402,8 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     TreeReuseMode reuse_mode,
     uint64_t decision_seed,
     SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
-    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal) {
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential) {
   std::vector<Action> legal_actions = state.LegalActions();
   if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -413,9 +497,9 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
       auto* active_evaluator = evaluators[i % evaluators.size()].get();
       futures.push_back(std::async(
           std::launch::async,
-          [s_ptr, search_player, active_evaluator, s_seed, truncation_mode]() {
+          [s_ptr, search_player, active_evaluator, s_seed, truncation_mode, crn_mode]() {
             return SimulateRolloutWithTurnTrajectory(
-                s_ptr, search_player, active_evaluator, s_seed, truncation_mode);
+                s_ptr, search_player, active_evaluator, s_seed, truncation_mode, crn_mode);
           }));
     }
 

@@ -68,6 +68,13 @@ ABSL_FLAG(bool, rollout_amp, false, "Use AMP for every candidate and opponent ev
 ABSL_FLAG(bool, allow_tf32, false, "Allow TF32 for every candidate and opponent evaluation.");
 ABSL_FLAG(std::string, roots_json, "", "Optional census_sampled_roots.json for serial root timing.");
 ABSL_FLAG(int, max_roots, 12, "Maximum balanced roots; -1 selects all.");
+ABSL_FLAG(std::string, crn_mode, "sequential",
+          "CRN mode: sequential or deck_order.");
+ABSL_FLAG(bool, unbiased_stage2_gate, false,
+          "Use unbiased Stage-2 Successive Halving gate.");
+ABSL_FLAG(int, leader_rollouts, 32, "Leader pick rollout search rollouts.");
+ABSL_FLAG(bool, sample_opponent_leader_draft, false,
+          "Sample opponent leader draft mixture in rollout search.");
 
 namespace {
 using namespace open_spiel;
@@ -111,7 +118,20 @@ struct Options {
   double max_seconds;
   std::vector<int> explicit_game_ids;
   std::string config_key;
+  SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential;
+  bool unbiased_stage2_gate = false;
+  int leader_rollouts = 32;
+  bool sample_opponent_leader_draft = false;
+  bool leader_rollouts_explicit = false;
 };
+
+inline std::string CrnModeName(SearchRolloutCrnMode mode) {
+  switch (mode) {
+    case SearchRolloutCrnMode::kSequential: return "sequential";
+    case SearchRolloutCrnMode::kDeckOrderCrn: return "deck_order";
+  }
+  return "sequential";
+}
 
 double SecondsSince(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
@@ -152,8 +172,17 @@ bool BoolField(const json::Object& object, const std::string& field,
   return it->second.GetBool();
 }
 
-Options ReadOptions() {
+Options ReadOptions(int argc = 0, char** argv = nullptr) {
   Options o;
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg = argv[i];
+    if (arg.rfind("--leader_rollouts=", 0) == 0 ||
+        arg.rfind("-leader_rollouts=", 0) == 0 ||
+        arg == "--leader_rollouts" || arg == "-leader_rollouts") {
+      o.leader_rollouts_explicit = true;
+      break;
+    }
+  }
   o.mode_name = absl::GetFlag(FLAGS_mode);
   if (o.mode_name == "raw") o.mode = Mode::kRaw;
   else if (o.mode_name == "legacy") o.mode = Mode::kLegacy;
@@ -204,9 +233,24 @@ Options ReadOptions() {
   o.rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
   o.allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
   o.max_seconds = absl::GetFlag(FLAGS_max_seconds);
+  std::string crn_mode_str = absl::GetFlag(FLAGS_crn_mode);
+  if (crn_mode_str == "sequential") {
+    o.crn_mode = SearchRolloutCrnMode::kSequential;
+  } else if (crn_mode_str == "deck_order") {
+    o.crn_mode = SearchRolloutCrnMode::kDeckOrderCrn;
+  } else {
+    throw std::runtime_error("--crn_mode must be sequential or deck_order");
+  }
+  o.unbiased_stage2_gate = absl::GetFlag(FLAGS_unbiased_stage2_gate);
+  o.leader_rollouts = absl::GetFlag(FLAGS_leader_rollouts);
+  o.sample_opponent_leader_draft = absl::GetFlag(FLAGS_sample_opponent_leader_draft);
+  if (o.mode == Mode::kLeader && !o.leader_rollouts_explicit) {
+    o.leader_rollouts = o.rollouts;
+  }
   if (o.output_path.empty() || o.games < 0 || o.start_game_id < 0 ||
       o.start_game_id > std::numeric_limits<int>::max() - o.games ||
       o.threads < 1 || o.batch_size < 1 || o.rollouts < 1 ||
+      o.leader_rollouts < 1 ||
       o.max_roots == 0 || o.max_roots < -1 ||
       !std::isfinite(o.max_seconds) || o.max_seconds < 0) {
     throw std::runtime_error("Invalid output, count, or time-limit option");
@@ -222,7 +266,11 @@ Options ReadOptions() {
       {"rollouts_per_action", o.rollouts}, {"margin", kOverrideMargin},
       {"rollout_amp", o.rollout_amp}, {"allow_tf32", o.allow_tf32},
       {"device", o.device_name}, {"threads", o.threads},
-      {"target_batch_size", o.batch_size}};
+      {"target_batch_size", o.batch_size},
+      {"crn_mode", CrnModeName(o.crn_mode)},
+      {"unbiased_stage2_gate", o.unbiased_stage2_gate},
+      {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
+      {"leader_rollouts", o.leader_rollouts}};
   o.config_key = ComputeStringSHA256(json::ToString(identity));
   return o;
 }
@@ -315,21 +363,24 @@ CompoundSearchDecisionResult SearchDecision(
     const Options& o, uint64_t seed) {
   if (o.mode == Mode::kShAdaptive || o.mode == Mode::kShAdaptiveLeader ||
       o.mode == Mode::kFullShAdaptiveLeader) {
-    return SuccessiveHalvingRolloutSearchDecision(state, seat, tree, evaluators,
-                                                  o.rollouts, kOverrideMargin, seed);
+    return SuccessiveHalvingRolloutSearchDecision(
+        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
+        o.crn_mode, o.unbiased_stage2_gate);
   }
   if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
-    return AdaptiveRolloutSearchDecision(state, seat, tree, evaluators,
-                                        o.rollouts, kOverrideMargin, seed);
+    return AdaptiveRolloutSearchDecision(
+        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
+        o.crn_mode);
   }
   if (o.mode == Mode::kWide) {
-    return WideRolloutSearchDecision(state, seat, tree, evaluators,
-                                    o.rollouts, kOverrideMargin, seed);
+    return WideRolloutSearchDecision(
+        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
+        o.crn_mode);
   }
   return CompoundRolloutSearchDecision(
       state, seat, tree, evaluators, 3, o.rollouts, kOverrideMargin,
       TreeReuseMode::kAdditive, seed, SearchPairingMode::kUnpaired,
-      SearchTruncationMode::kTerminal);
+      SearchTruncationMode::kTerminal, o.crn_mode);
 }
 
 struct GameOutcome {
@@ -350,6 +401,25 @@ struct GameOutcome {
   int prior_rank4plus_selections = 0;
   double search_seconds = 0;
   double game_seconds = 0;
+  double sum_paired_corr = 0.0;
+  double sum_paired_diff_var = 0.0;
+  int paired_corr_pairs = 0;
+  int paired_diff_var_pairs = 0;
+};
+using GameResult = GameOutcome;
+
+struct Summary {
+  int completed_games = 0;
+  double sum_paired_corr = 0.0;
+  double sum_paired_diff_var = 0.0;
+  int paired_corr_pairs = 0;
+  int paired_diff_var_pairs = 0;
+  double mean_paired_rollout_corr() const {
+    return paired_corr_pairs > 0 ? (sum_paired_corr / paired_corr_pairs) : 0.0;
+  }
+  double mean_paired_diff_var() const {
+    return paired_diff_var_pairs > 0 ? (sum_paired_diff_var / paired_diff_var_pairs) : 0.0;
+  }
 };
 
 std::optional<GameOutcome> PlayGame(
@@ -403,17 +473,25 @@ std::optional<GameOutcome> PlayGame(
            o.mode == Mode::kFullShAdaptiveLeader) &&
           IsLeader(*state) && legal.size() > 1) {
         const auto search_start = Clock::now();
-        const int rollouts = (o.mode == Mode::kLeader ? o.rollouts : std::min(32, o.rollouts));
+        const int rollouts = o.leader_rollouts;
         const uint64_t leader_seed =
             dune_seed::DeriveSeed(out.seed, 0x4C454144ULL, current);
         const auto result = LeaderPickRolloutSearchDecision(
-            *state, current, simulations, rollouts, 0.10, leader_seed);
+            *state, current, simulations, rollouts, 0.10, leader_seed,
+            o.crn_mode, o.sample_opponent_leader_draft);
         out.search_seconds += SecondsSince(search_start);
         if (control.Stop()) return std::nullopt;
         chosen = result.action;
         ++out.searches;
         out.overrides += result.overridden;
         out.new_rollouts += result.new_rollouts_executed;
+        if (result.candidate_rollout_utilities.size() >= 2) {
+          auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
+          out.sum_paired_corr += corr_stats.sum_corr;
+          out.sum_paired_diff_var += corr_stats.sum_diff_var;
+          out.paired_corr_pairs += corr_stats.corr_pair_count;
+          out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
+        }
       } else {
         const bool search_allowed =
             o.mode != Mode::kRaw && o.mode != Mode::kLeader && !IsLeader(*state);
@@ -432,6 +510,13 @@ std::optional<GameOutcome> PlayGame(
             out.new_rollouts += result.new_rollouts_executed;
             out.reused_rollouts += result.prior_rollouts_reused;
             out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
+            if (result.candidate_rollout_utilities.size() >= 2) {
+              auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
+              out.sum_paired_corr += corr_stats.sum_corr;
+              out.sum_paired_diff_var += corr_stats.sum_diff_var;
+              out.paired_corr_pairs += corr_stats.corr_pair_count;
+              out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
+            }
           }
         } else if (search_allowed && IsHighStakesStrategicState(*state, current) && legal.size() > 1) {
           const auto search_start = Clock::now();
@@ -448,6 +533,13 @@ std::optional<GameOutcome> PlayGame(
             ++out.wide_roots;
           }
           out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
+          if (result.candidate_rollout_utilities.size() >= 2) {
+            auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
+            out.sum_paired_corr += corr_stats.sum_corr;
+            out.sum_paired_diff_var += corr_stats.sum_diff_var;
+            out.paired_corr_pairs += corr_stats.corr_pair_count;
+            out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
+          }
         } else if (search_allowed && tree.current_node() && !tree.current_node()->children.empty()) {
           double best = -1e9;
           for (Action a : legal) {
@@ -499,7 +591,11 @@ json::Object BaseRecord(const Options& o, const std::string& kind) {
           {"master_seed", std::to_string(o.master_seed)}, {"rollouts_per_action", o.rollouts},
           {"margin", kOverrideMargin}, {"rollout_amp", o.rollout_amp},
           {"allow_tf32", o.allow_tf32}, {"device", o.device_name},
-          {"threads", o.threads}, {"target_batch_size", o.batch_size}};
+          {"threads", o.threads}, {"target_batch_size", o.batch_size},
+          {"crn_mode", o.crn_mode == SearchRolloutCrnMode::kDeckOrderCrn ? "deck_order" : "sequential"},
+          {"unbiased_stage2_gate", o.unbiased_stage2_gate},
+          {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
+          {"leader_rollouts", o.leader_rollouts}};
 }
 
 json::Object GameRecord(const GameOutcome& out, const Options& o) {
@@ -525,6 +621,18 @@ json::Object GameRecord(const GameOutcome& out, const Options& o) {
   row["prior_rank4plus_selections"] = out.prior_rank4plus_selections;
   row["search_wall_seconds"] = out.search_seconds;
   row["game_wall_seconds"] = out.game_seconds;
+  const double mean_paired_corr = out.paired_corr_pairs > 0
+                                      ? (out.sum_paired_corr / out.paired_corr_pairs)
+                                      : 0.0;
+  const double mean_paired_diff_var = out.paired_diff_var_pairs > 0
+                                          ? (out.sum_paired_diff_var / out.paired_diff_var_pairs)
+                                          : 0.0;
+  row["sum_paired_corr"] = out.sum_paired_corr;
+  row["sum_paired_diff_var"] = out.sum_paired_diff_var;
+  row["paired_corr_pairs"] = out.paired_corr_pairs;
+  row["paired_diff_var_pairs"] = out.paired_diff_var_pairs;
+  row["mean_paired_rollout_corr"] = mean_paired_corr;
+  row["mean_paired_diff_var"] = mean_paired_diff_var;
   return row;
 }
 
@@ -685,6 +793,15 @@ int RunRoots(const Options& o, const Game& game, const ModelBundle& candidate,
       utilities.emplace_back(json::Array{action, utility});
     }
     row["candidate_utilities"] = utilities;
+    double root_mean_paired_corr = 0.0;
+    double root_mean_paired_diff_var = 0.0;
+    if (result.candidate_rollout_utilities.size() >= 2) {
+      auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
+      root_mean_paired_corr = corr_stats.mean_paired_corr;
+      root_mean_paired_diff_var = corr_stats.mean_paired_diff_var;
+    }
+    row["mean_paired_rollout_corr"] = root_mean_paired_corr;
+    row["mean_paired_diff_var"] = root_mean_paired_diff_var;
     output << json::ToString(row) << '\n' << std::flush;
     if (!output) throw std::runtime_error("Failed to append root output");
     std::cout << "[ROOT] " << ++done << '/' << roots.size() << " id=" << root.root_id
@@ -699,7 +816,7 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
   try {
-    const Options o = ReadOptions();
+    const Options o = ReadOptions(argc, argv);
     RunControl control;
     control.max_seconds = o.max_seconds;
     const auto completed = ReadCompleted(o);
@@ -745,6 +862,7 @@ int main(int argc, char** argv) {
     std::atomic<size_t> next{0};
     std::mutex writer;
     int done = 0;
+    Summary summary;
     std::string error;
     const auto play_start = Clock::now();
     auto worker = [&]() {
@@ -756,6 +874,11 @@ int main(int argc, char** argv) {
           if (!result) break;
           const auto row = GameRecord(*result, o);
           std::lock_guard<std::mutex> lock(writer);
+          summary.completed_games++;
+          summary.sum_paired_corr += result->sum_paired_corr;
+          summary.sum_paired_diff_var += result->sum_paired_diff_var;
+          summary.paired_corr_pairs += result->paired_corr_pairs;
+          summary.paired_diff_var_pairs += result->paired_diff_var_pairs;
           output << json::ToString(row) << '\n' << std::flush;
           if (!output) throw std::runtime_error("Failed to append completed game");
           ++done;
