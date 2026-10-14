@@ -236,6 +236,38 @@ void RawRetentionAndMarginTest(const std::shared_ptr<const Game>& game) {
   }
 }
 
+void NativeSuccessiveHalvingTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(6);
+
+  // Case 1: Raw action is already best -> Early stop after Stage 1.
+  {
+    PayoffState raw_best_state(game, actions, actions[0], /*advantage=*/1.0, /*noise_size=*/0.0);
+    TurnSearchTree tree;
+    const auto result = SuccessiveHalvingRolloutSearchDecision(
+        raw_best_state, 0, &tree, evaluators, 64, 0.15, 42);
+    SPIEL_CHECK_EQ(result.action, actions[0]);
+    SPIEL_CHECK_FALSE(result.overridden);
+    // K=6, total_budget=192, stage1_budget=96, r_stage1=16 -> 96 rollouts executed
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 96);
+  }
+
+  // Case 2: Challenger is best and beats margin -> Two-stage confirmation.
+  {
+    const Action winner = actions[2];
+    PayoffState winner_state(game, actions, winner, /*advantage=*/1.0, /*noise_size=*/0.0);
+    TurnSearchTree tree;
+    const auto result = SuccessiveHalvingRolloutSearchDecision(
+        winner_state, 0, &tree, evaluators, 64, 0.15, 42);
+    SPIEL_CHECK_EQ(result.action, winner);
+    SPIEL_CHECK_TRUE(result.overridden);
+    // Stage 1: 96 rollouts. Stage 2: finalists={0, 2}, stage2_budget=96, r_stage2=48. 2*48=96.
+    // Total = 96 + 96 = 192 rollouts executed.
+    SPIEL_CHECK_EQ(result.new_rollouts_executed, 192);
+  }
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -247,4 +279,5 @@ int main() {
   NativeWideBudgetAndPairingTest(game);
   NativeWideCompoundParityTest(game);
   RawRetentionAndMarginTest(game);
+  NativeSuccessiveHalvingTest(game);
 }

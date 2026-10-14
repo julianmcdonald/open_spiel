@@ -79,7 +79,7 @@ constexpr const char* kSimulationPolicy = "candidate_model_all_seats";
 volatile std::sig_atomic_t interrupted = 0;
 void HandleSignal(int) { interrupted = 1; }
 
-enum class Mode { kRaw, kLegacy, kWide, kLeader, kAdaptive, kAdaptiveLeader };
+enum class Mode { kRaw, kLegacy, kWide, kLeader, kAdaptive, kAdaptiveLeader, kShAdaptive, kShAdaptiveLeader };
 
 struct Options {
   Mode mode;
@@ -151,7 +151,9 @@ Options ReadOptions() {
   else if (o.mode_name == "leader") o.mode = Mode::kLeader;
   else if (o.mode_name == "adaptive") o.mode = Mode::kAdaptive;
   else if (o.mode_name == "adaptive_leader") o.mode = Mode::kAdaptiveLeader;
-  else throw std::runtime_error("--mode must be raw, legacy, wide, leader, adaptive, or adaptive_leader");
+  else if (o.mode_name == "sh_adaptive") o.mode = Mode::kShAdaptive;
+  else if (o.mode_name == "sh_adaptive_leader") o.mode = Mode::kShAdaptiveLeader;
+  else throw std::runtime_error("--mode must be raw, legacy, wide, leader, adaptive, adaptive_leader, sh_adaptive, or sh_adaptive_leader");
   o.model_path = std::filesystem::canonical(absl::GetFlag(FLAGS_model_checkpoint)).string();
   o.opponent_path = std::filesystem::canonical(absl::GetFlag(FLAGS_opponent_checkpoint)).string();
   if (o.model_path == o.opponent_path) {
@@ -300,6 +302,10 @@ CompoundSearchDecisionResult SearchDecision(
     const State& state, Player seat, TurnSearchTree* tree,
     const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
     const Options& o, uint64_t seed) {
+  if (o.mode == Mode::kShAdaptive || o.mode == Mode::kShAdaptiveLeader) {
+    return SuccessiveHalvingRolloutSearchDecision(state, seat, tree, evaluators,
+                                                  o.rollouts, kOverrideMargin, seed);
+  }
   if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
     return AdaptiveRolloutSearchDecision(state, seat, tree, evaluators,
                                         o.rollouts, kOverrideMargin, seed);
@@ -380,7 +386,8 @@ std::optional<GameOutcome> PlayGame(
     Action chosen = raw;
     if (current == out.seat) {
       ++out.decisions;
-      if ((o.mode == Mode::kLeader || o.mode == Mode::kAdaptiveLeader) &&
+      if ((o.mode == Mode::kLeader || o.mode == Mode::kAdaptiveLeader ||
+           o.mode == Mode::kShAdaptiveLeader) &&
           IsLeader(*state) && legal.size() > 1) {
         const auto search_start = Clock::now();
         const int rollouts = (o.mode == Mode::kLeader ? o.rollouts : std::min(32, o.rollouts));
