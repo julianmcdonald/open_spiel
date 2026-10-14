@@ -210,6 +210,55 @@ std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
 
 void LoadCalibratedParameters(DuneSearchConfig& config);
 
+class DuneAdaptiveRolloutSession {
+ public:
+  DuneAdaptiveRolloutSession(
+      const std::string& checkpoint_path,
+      const std::string& device_str = "cuda",
+      int hidden_dim = 2048,
+      int num_blocks = 12,
+      int reference_rollouts_per_action = 64,
+      int leader_rollouts = 32,
+      int target_batch_size = 256,
+      uint64_t seed = 20261014ULL);
+  ~DuneAdaptiveRolloutSession();
+
+  DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
+  void DiscardPendingAction();
+  void ResetSession(const std::string& reason);
+  bool HasActiveSession() const { return has_active_session_; }
+  int session_new_simulations_completed() const { return session_new_simulations_completed_; }
+  double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
+
+ private:
+  std::string checkpoint_path_;
+  std::string device_str_;
+  int hidden_dim_;
+  int num_blocks_;
+  int reference_rollouts_per_action_;
+  int leader_rollouts_;
+  int target_batch_size_;
+  uint64_t seed_;
+  uint64_t search_seed_counter_ = 0;
+
+  bool has_active_session_ = false;
+  bool has_pending_commit_ = false;
+  Player last_player_ = kInvalidPlayer;
+  int last_round_ = -1;
+  int last_hand_ = 0;
+  int last_intrigues_ = 0;
+  std::vector<Action> last_history_;
+
+  int session_new_simulations_completed_ = 0;
+  double session_elapsed_time_ms_ = 0.0;
+
+  std::unique_ptr<State> last_search_state_;
+  DuneSearchResult last_search_result_;
+
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 } // namespace open_spiel
 
 #endif // OPEN_SPIEL_EXAMPLES_DUNE_SEARCH_SESSION_H_

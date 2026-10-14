@@ -10,6 +10,9 @@
 #include <cmath>
 #include <iostream>
 #include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
+#include "dune_compound_turn_search.h"
+#include "dune_wide_rollout_search.h"
 #include <torch/torch.h>
 
 namespace open_spiel {
@@ -1039,6 +1042,322 @@ DuneSearchResult DuneSearchSession::SearchAndSelectWithDeadline(
   double r_val = dist(rng_);
   ControllerDecision dec = SelectControllerAction(state, res, r_val);
   return CommitAction(dec);
+}
+
+struct DuneAdaptiveRolloutSession::Impl {
+  torch::Device device;
+  std::shared_ptr<SharedDunePolicyValueNetImpl> model;
+  std::unique_ptr<std::shared_mutex> mutex;
+  std::shared_ptr<BatchedEvaluator> coordinator;
+  std::shared_ptr<BatchedNNEvaluator> evaluator;
+  dune_imperium::TurnSearchTree tree;
+
+  explicit Impl(torch::Device dev) : device(dev) {}
+};
+
+DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
+    const std::string& checkpoint_path,
+    const std::string& device_str,
+    int hidden_dim,
+    int num_blocks,
+    int reference_rollouts_per_action,
+    int leader_rollouts,
+    int target_batch_size,
+    uint64_t seed)
+    : checkpoint_path_(checkpoint_path),
+      device_str_(device_str),
+      hidden_dim_(hidden_dim),
+      num_blocks_(num_blocks),
+      reference_rollouts_per_action_(reference_rollouts_per_action),
+      leader_rollouts_(leader_rollouts),
+      target_batch_size_(target_batch_size),
+      seed_(seed) {
+  torch::Device device(torch::kCPU);
+  if (device_str == "cuda" && torch::cuda::is_available()) {
+    device = torch::Device(torch::kCUDA);
+  } else if (device_str == "cpu") {
+    device = torch::Device(torch::kCPU);
+  } else {
+    device = torch::Device(device_str);
+  }
+
+  impl_ = std::make_unique<Impl>(device);
+
+  int64_t ckpt_input_dim = dune_imperium::kFullPublicInformationStateSize;
+  {
+    torch::serialize::InputArchive archive;
+    archive.load_from(checkpoint_path_, torch::kCPU);
+    torch::serialize::InputArchive in_archive;
+    if (archive.try_read("input_layer", in_archive)) {
+      torch::Tensor w;
+      if (in_archive.try_read("weight", w)) {
+        ckpt_input_dim = w.size(1);
+      }
+    }
+  }
+
+  dune_imperium::MarketAppendixMode detected_mode =
+      dune_imperium::MarketAppendixMode::kNone;
+  std::string descriptor_schema = "";
+  bool has_semantic_scorer_flag = false;
+  {
+    std::string json_path = checkpoint_path_;
+    if (json_path.size() >= 3 && json_path.substr(json_path.size() - 3) == ".pt") {
+      json_path = json_path.substr(0, json_path.size() - 3) + ".json";
+      std::ifstream jf(json_path);
+      if (jf.good()) {
+        std::string jstr((std::istreambuf_iterator<char>(jf)),
+                         std::istreambuf_iterator<char>());
+        auto jval = open_spiel::json::FromString(jstr);
+        if (jval.has_value() && jval->IsObject()) {
+          const auto& dict = jval->GetObject();
+          auto it_mm = dict.find("market_appendix_mode");
+          if (it_mm != dict.end() && it_mm->second.IsString()) {
+            detected_mode = dune_imperium::ParseMarketAppendixMode(
+                it_mm->second.GetString());
+          }
+          auto it_hd = dict.find("hidden_dim");
+          if (it_hd != dict.end() && it_hd->second.IsInt()) {
+            hidden_dim_ = it_hd->second.GetInt();
+          }
+          auto it_nb = dict.find("num_blocks");
+          if (it_nb != dict.end() && it_nb->second.IsInt()) {
+            num_blocks_ = it_nb->second.GetInt();
+          }
+          auto it_od = dict.find("observation_dim");
+          if (it_od != dict.end() && it_od->second.IsInt()) {
+            ckpt_input_dim = it_od->second.GetInt();
+          }
+          auto it_ss = dict.find("semantic_descriptor_schema");
+          if (it_ss != dict.end() && it_ss->second.IsString()) {
+            descriptor_schema = it_ss->second.GetString();
+          }
+          auto it_ws = dict.find("enable_semantic_scorer");
+          if (it_ws != dict.end() && it_ws->second.IsBool()) {
+            has_semantic_scorer_flag = it_ws->second.GetBool();
+          }
+        }
+      }
+    }
+  }
+
+  const bool has_scorer = has_semantic_scorer_flag ||
+                          CheckpointHasSemanticScorer(checkpoint_path_, torch::kCPU);
+
+  impl_->model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      ckpt_input_dim, hidden_dim_, dune_imperium::kNumDistinctPlayerActions,
+      num_blocks_, /*use_nonlinear=*/false, /*with_aux_heads=*/false,
+      /*head_init_seed=*/0, /*with_semantic_scorer=*/has_scorer,
+      /*enable_zone_encoder=*/false, descriptor_schema);
+
+  LoadModelCheckpointRobust(impl_->model, checkpoint_path_, torch::Device(torch::kCPU));
+  impl_->model->to(impl_->device);
+  impl_->model->eval();
+  for (auto& parameter : impl_->model->parameters()) {
+    parameter.set_requires_grad(false);
+  }
+
+  impl_->mutex = std::make_unique<std::shared_mutex>();
+  impl_->coordinator = std::make_shared<BatchedEvaluator>(
+      impl_->model, target_batch_size_, 1, impl_->device,
+      impl_->mutex.get(), 10.0f, false, true, false,
+      /*rollout_amp=*/false, /*allow_tf32=*/false);
+  impl_->evaluator = std::make_shared<BatchedNNEvaluator>(impl_->coordinator, 10.0f, detected_mode);
+
+  ResetSession("initialization");
+}
+
+DuneAdaptiveRolloutSession::~DuneAdaptiveRolloutSession() = default;
+
+void DuneAdaptiveRolloutSession::DiscardPendingAction() {
+  last_search_state_.reset();
+  has_pending_commit_ = false;
+}
+
+void DuneAdaptiveRolloutSession::ResetSession(const std::string& reason) {
+  if (impl_) {
+    impl_->tree.Reset();
+  }
+  has_active_session_ = false;
+  has_pending_commit_ = false;
+  last_search_state_.reset();
+  last_player_ = kInvalidPlayer;
+  last_round_ = -1;
+  last_hand_ = 0;
+  last_intrigues_ = 0;
+  last_history_.clear();
+  session_new_simulations_completed_ = 0;
+  session_elapsed_time_ms_ = 0.0;
+}
+
+DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double remaining_time_ms) {
+  if (has_pending_commit_) {
+    SpielFatalError("DuneAdaptiveRolloutSession::Search called while a commit is still pending!");
+  }
+  const auto& dune_state = static_cast<const dune_imperium::DuneImperiumState&>(state);
+  Player p = state.CurrentPlayer();
+
+  if (!has_active_session_ || p != last_player_ || dune_state.GetCurrentRound() != last_round_) {
+    impl_->tree.Reset();
+  } else if (state.History().size() > last_history_.size() &&
+             std::equal(last_history_.begin(), last_history_.end(), state.History().begin())) {
+    if (dune_state.GetPlayerCardsInHand(p) > last_hand_ ||
+        static_cast<int>(dune_state.GetPlayerIntrigues(p).size()) > last_intrigues_) {
+      impl_->tree.Reset();
+    } else {
+      for (size_t i = last_history_.size(); i < state.History().size(); ++i) {
+        Action a = state.History()[i];
+        impl_->tree.Advance(a);
+        if (a == dune_imperium::kActionEndTurn) impl_->tree.Reset();
+      }
+    }
+  } else if (state.History() != last_history_) {
+    impl_->tree.Reset();
+  }
+
+  has_active_session_ = true;
+  last_player_ = p;
+  last_round_ = dune_state.GetCurrentRound();
+  last_hand_ = (p >= 0 && p < 4) ? dune_state.GetPlayerCardsInHand(p) : 0;
+  last_intrigues_ = (p >= 0 && p < 4) ? static_cast<int>(dune_state.GetPlayerIntrigues(p).size()) : 0;
+  last_history_ = state.History();
+
+  const auto t_start = std::chrono::steady_clock::now();
+  auto [raw_prior, values] = impl_->evaluator->PriorAndEvaluate(state);
+  std::vector<Action> legal = state.LegalActions();
+  Action raw_action = legal.empty() ? kInvalidAction : dune_imperium::PickGreedyAction(raw_prior, legal);
+
+  DuneSearchResult result;
+  result.diagnostics.protocol_version = "adaptive_rollout";
+  result.diagnostics.searched_seat = p;
+  result.diagnostics.round = dune_state.GetCurrentRound();
+  result.diagnostics.phase = LocalPhaseToString(dune_state.phase());
+  result.diagnostics.actions = legal;
+  result.diagnostics.priors.assign(legal.size(), 0.0);
+  for (size_t i = 0; i < legal.size(); ++i) {
+    Action a = legal[i];
+    for (const auto& ap : raw_prior) {
+      if (ap.first == a) {
+        result.diagnostics.priors[i] = ap.second;
+        break;
+      }
+    }
+  }
+  result.diagnostics.raw_priors = result.diagnostics.priors;
+  result.diagnostics.root_value = (p >= 0 && p < static_cast<int>(values.size())) ? values[p] : 0.0;
+  result.diagnostics.raw_reference_action = raw_action;
+  result.diagnostics.visit_counts.assign(legal.size(), 0);
+  result.diagnostics.q_values.assign(legal.size(), result.diagnostics.root_value);
+
+  bool is_leader = (dune_state.phase() == dune_imperium::GamePhase::kLeaderDraft ||
+                    dune_state.phase() == dune_imperium::GamePhase::kLeaderOfferChance);
+
+  if (legal.size() <= 1 || remaining_time_ms == 0.0) {
+    result.diagnostics.selected_action = raw_action;
+    result.diagnostics.mcts_proposed_action = raw_action;
+    result.used_fallback = true;
+    result.fallback_reason = (remaining_time_ms == 0.0) ? "live_deadline_reached" : "forced_or_bookkeeping";
+    result.diagnostics.fallback_reason = result.fallback_reason;
+    result.policy = raw_prior;
+  } else if (is_leader) {
+    const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
+        state, p, {impl_->evaluator}, leader_rollouts_, 0.10,
+        dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++));
+    result.diagnostics.selected_action = c_res.action;
+    result.diagnostics.mcts_proposed_action = c_res.action;
+    result.diagnostics.mcts_overrode_raw = c_res.overridden;
+    result.simulations_completed = c_res.new_rollouts_executed;
+    result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+    result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+    result.policy = raw_prior;
+
+    for (const auto& cu : c_res.candidate_utilities) {
+      for (size_t i = 0; i < legal.size(); ++i) {
+        if (legal[i] == cu.first) {
+          result.diagnostics.q_values[i] = cu.second;
+          break;
+        }
+      }
+    }
+    for (const auto& cru : c_res.candidate_rollout_utilities) {
+      for (size_t i = 0; i < legal.size(); ++i) {
+        if (legal[i] == cru.first) {
+          result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+          break;
+        }
+      }
+    }
+  } else if (dune_imperium::IsHighStakesStrategicState(state, p)) {
+    int ref_rollouts = reference_rollouts_per_action_;
+    if (remaining_time_ms > 0.0 && remaining_time_ms < 8000.0) {
+      ref_rollouts = std::max(16, static_cast<int>(ref_rollouts * (remaining_time_ms / 8000.0)));
+    }
+    const auto c_res = dune_imperium::AdaptiveRolloutSearchDecision(
+        state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15,
+        dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++));
+    result.diagnostics.selected_action = c_res.action;
+    result.diagnostics.mcts_proposed_action = c_res.action;
+    result.diagnostics.mcts_overrode_raw = c_res.overridden;
+    result.simulations_completed = c_res.new_rollouts_executed;
+    result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+    result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+    result.policy = raw_prior;
+
+    for (const auto& cu : c_res.candidate_utilities) {
+      for (size_t i = 0; i < legal.size(); ++i) {
+        if (legal[i] == cu.first) {
+          result.diagnostics.q_values[i] = cu.second;
+          break;
+        }
+      }
+    }
+    for (const auto& cru : c_res.candidate_rollout_utilities) {
+      for (size_t i = 0; i < legal.size(); ++i) {
+        if (legal[i] == cru.first) {
+          result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+          break;
+        }
+      }
+    }
+  } else {
+    Action chosen = raw_action;
+    if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
+      double best = -1e9;
+      for (Action a : legal) {
+        if (impl_->tree.HasPriorData(a) && impl_->tree.GetMeanUtility(a) > best) {
+          best = impl_->tree.GetMeanUtility(a);
+          chosen = a;
+        }
+      }
+    }
+    result.diagnostics.selected_action = chosen;
+    result.diagnostics.mcts_proposed_action = chosen;
+    result.used_fallback = true;
+    result.fallback_reason = "policy_only";
+    result.diagnostics.fallback_reason = "policy_only";
+    result.policy = raw_prior;
+  }
+
+  int covered = 0;
+  int total_visits = 0;
+  for (int v : result.diagnostics.visit_counts) {
+    total_visits += v;
+    if (v > 0) covered++;
+  }
+  result.diagnostics.total_root_visits = total_visits;
+  result.diagnostics.num_covered_actions = covered;
+
+  const auto t_end = std::chrono::steady_clock::now();
+  double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+  result.elapsed_time_ms = elapsed_ms;
+  result.diagnostics.elapsed_search_time_ms = elapsed_ms;
+  session_elapsed_time_ms_ += elapsed_ms;
+  session_new_simulations_completed_ += result.simulations_completed;
+
+  last_search_state_ = state.Clone();
+  last_search_result_ = result;
+  has_pending_commit_ = true;
+  return result;
 }
 
 } // namespace open_spiel
