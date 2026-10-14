@@ -1304,8 +1304,8 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
           state, p, {impl_->evaluator}, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
-          dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn,
-          /*sample_opponent_leader_draft=*/true,
+          dune_imperium::SearchRolloutCrnMode::kSequential,
+          /*sample_opponent_leader_draft=*/false,
           /*max_time_ms=*/target_ms);
       result.diagnostics.selected_action = c_res.action;
       result.diagnostics.mcts_proposed_action = c_res.action;
@@ -1372,10 +1372,10 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           const auto c_res = use_successive_halving_
               ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
                     state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn, /*unbiased_stage2_gate=*/true, target_ms)
+                    dune_imperium::SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false, target_ms)
               : dune_imperium::AdaptiveRolloutSearchDecision(
                     state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn, target_ms);
+                    dune_imperium::SearchRolloutCrnMode::kSequential, target_ms);
           result.diagnostics.selected_action = c_res.action;
           result.diagnostics.mcts_proposed_action = c_res.action;
           result.diagnostics.mcts_overrode_raw = c_res.overridden;
