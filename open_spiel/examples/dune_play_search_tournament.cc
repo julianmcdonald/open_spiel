@@ -15,6 +15,7 @@
 #include <random>
 #include <set>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -54,6 +55,7 @@ ABSL_FLAG(std::string, mode, "raw",
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen candidate checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Different frozen actual-opponent checkpoint.");
 ABSL_FLAG(int, games, 4, "Number of requested games.");
+ABSL_FLAG(std::string, game_ids, "", "Optional comma-separated list of explicit game IDs to run.");
 ABSL_FLAG(int, start_game_id, 0, "First game ID, independent of scheduling.");
 ABSL_FLAG(uint64_t, master_seed, 20261014ULL, "Shared seed across controller arms.");
 ABSL_FLAG(int, threads, 4, "Concurrent full-game workers.");
@@ -97,6 +99,7 @@ struct Options {
   bool rollout_amp;
   bool allow_tf32;
   double max_seconds;
+  std::vector<int> explicit_game_ids;
   std::string config_key;
 };
 
@@ -164,6 +167,22 @@ Options ReadOptions() {
   }
   o.games = absl::GetFlag(FLAGS_games);
   o.start_game_id = absl::GetFlag(FLAGS_start_game_id);
+  std::string game_ids_str = absl::GetFlag(FLAGS_game_ids);
+  if (!game_ids_str.empty()) {
+    std::stringstream ss(game_ids_str);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+      if (!token.empty()) {
+        int gid = std::stoi(token);
+        if (gid < 0) throw std::runtime_error("game_id must be non-negative");
+        o.explicit_game_ids.push_back(gid);
+      }
+    }
+    if (o.explicit_game_ids.empty()) {
+      throw std::runtime_error("--game_ids cannot be empty if specified");
+    }
+    o.games = static_cast<int>(o.explicit_game_ids.size());
+  }
   o.threads = absl::GetFlag(FLAGS_threads);
   o.batch_size = absl::GetFlag(FLAGS_target_batch_size);
   o.rollouts = absl::GetFlag(FLAGS_rollouts_per_action);
@@ -648,10 +667,17 @@ int main(int argc, char** argv) {
     std::vector<int> pending;
     int skipped = 0;
     if (o.roots_path.empty()) {
-      for (int i = 0; i < o.games; ++i) {
-        const int id = o.start_game_id + i;
-        if (completed.count(id)) ++skipped;
-        else pending.push_back(id);
+      if (!o.explicit_game_ids.empty()) {
+        for (int id : o.explicit_game_ids) {
+          if (completed.count(id)) ++skipped;
+          else pending.push_back(id);
+        }
+      } else {
+        for (int i = 0; i < o.games; ++i) {
+          const int id = o.start_game_id + i;
+          if (completed.count(id)) ++skipped;
+          else pending.push_back(id);
+        }
       }
       if (pending.empty()) {
         std::cout << "[DONE] requested games already complete: " << skipped << '\n';
