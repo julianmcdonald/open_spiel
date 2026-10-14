@@ -66,6 +66,37 @@ inline std::vector<std::pair<Action, double>> GetSortedCandidatesByPrior(
   return result;
 }
 
+inline bool IsConvertSpecimenAction(Action a) {
+  return a >= kActionConvertSpecimenToTroop0 + 1 &&
+         a <= kActionConvertSpecimenToTroop0 + 12;
+}
+
+inline bool IsFullStrategicState(
+    const State& state,
+    Player searched_player,
+    const ActionsAndProbs& prior,
+    double min_second_prior = 0.020) {
+  if (state.CurrentPlayer() != searched_player) return false;
+  const std::vector<Action> legal = state.LegalActions();
+  if (legal.size() < 2) return false;
+  int non_specimen_count = 0;
+  for (Action a : legal) {
+    if (!IsConvertSpecimenAction(a)) {
+      ++non_specimen_count;
+    }
+  }
+  if (non_specimen_count < 2) return false;
+  const auto sorted = GetSortedCandidatesByPrior(prior, legal);
+  if (sorted.size() < 2 || sorted[1].second < min_second_prior) {
+    return false;
+  }
+  if (IsConvertSpecimenAction(sorted[1].first) &&
+      (sorted.size() < 3 || sorted[2].second < min_second_prior)) {
+    return false;
+  }
+  return true;
+}
+
 struct RolloutTask {
   size_t c_idx;
   int rollout_idx;
