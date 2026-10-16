@@ -52,6 +52,8 @@ std::string g_single_learner_transition_source_fingerprint = "";
 int64_t g_single_learner_transition_source_update = -1;
 std::string g_ema_magnet_transition_source_fingerprint = "";
 int64_t g_ema_magnet_transition_source_update = -1;
+std::string g_pool_transition_source_fingerprint = "";
+int64_t g_pool_transition_source_update = -1;
 
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");

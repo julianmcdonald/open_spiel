@@ -39,5 +39,11 @@ ABSL_DECLARE_FLAG(bool, allow_ema_magnet_transition);
 ABSL_DECLARE_FLAG(double, ema_magnet_transition_source_coef);
 ABSL_DECLARE_FLAG(std::string, ema_magnet_transition_source_fingerprint);
 
+// Mixed-episode multi-learner opponent pool flags.
+ABSL_DECLARE_FLAG(double, pool_game_fraction);
+ABSL_DECLARE_FLAG(int, pool_opponents_per_game);
+ABSL_DECLARE_FLAG(bool, allow_pool_transition);
+ABSL_DECLARE_FLAG(std::string, pool_transition_source_fingerprint);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

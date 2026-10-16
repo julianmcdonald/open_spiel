@@ -54,6 +54,18 @@ ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
 ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
 ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
 ABSL_FLAG(int, rollout_games, 256, "");
+ABSL_FLAG(bool, enable_ema_tracking, false, "");
+ABSL_FLAG(double, ema_half_life, 100.0, "");
+ABSL_FLAG(double, ema_decay, 0.0, "");
+ABSL_FLAG(std::string, ema_model_checkpoint, "", "");
+ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "");
+ABSL_FLAG(bool, allow_ema_magnet_transition, false, "");
+ABSL_FLAG(double, ema_magnet_transition_source_coef, 0.0, "");
+ABSL_FLAG(std::string, ema_magnet_transition_source_fingerprint, "", "");
+ABSL_FLAG(double, pool_game_fraction, 0.0, "");
+ABSL_FLAG(int, pool_opponents_per_game, 0, "");
+ABSL_FLAG(bool, allow_pool_transition, false, "");
+ABSL_FLAG(std::string, pool_transition_source_fingerprint, "", "");
 
 #define TEST_CHECK(cond)                                                       \
   do {                                                                         \
@@ -394,6 +406,174 @@ void TestProof7_SaveResumePreservation() {
   std::cout << "PASSED" << std::endl;
 }
 
+// =========================================================================
+// Proof 8: Bitwise identical is_learner_seat masks between pool_size=0 and
+// pool_size=4 across 1,000 episodes (~3.0 learner seats/game average), and
+// proper ResolveEvaluator routing for both learner and non-learner seats.
+// =========================================================================
+void TestProof8_MixedPoolSeatAssignmentBitwiseIdenticalMasksAndRouting() {
+  std::cout << "[Proof 8] Mixed pool seat assignment bitwise mask identity and routing... " << std::flush;
+  const uint64_t master = 1337;
+  const double pool_game_fraction = 0.50;
+  const int pool_opponents_per_game = 2;
+
+  auto learner_eval = std::make_shared<DistinguishableEvaluator>(100.0f);
+  auto opp0 = std::make_shared<DistinguishableEvaluator>(200.0f);
+  auto opp1 = std::make_shared<DistinguishableEvaluator>(300.0f);
+  auto opp2 = std::make_shared<DistinguishableEvaluator>(400.0f);
+  auto opp3 = std::make_shared<DistinguishableEvaluator>(500.0f);
+  std::vector<std::shared_ptr<IGameEvaluator>> pool = {opp0, opp1, opp2, opp3};
+  std::vector<std::shared_ptr<IGameEvaluator>> empty_pool;
+
+  std::vector<float> dummy_obs(kObsSize, 0.0f);
+
+  int total_learner_seats = 0;
+  int mixed_game_count = 0;
+
+  for (uint64_t ep = 0; ep < 1000; ++ep) {
+    auto assign_control = dune_opponent_pool::ComputeMixedPoolSeatAssignment(
+        master, ep, /*pool_size=*/0, pool_game_fraction, pool_opponents_per_game);
+    auto assign_pool = dune_opponent_pool::ComputeMixedPoolSeatAssignment(
+        master, ep, pool.size(), pool_game_fraction, pool_opponents_per_game);
+
+    int ep_learner_seats = 0;
+    for (int p = 0; p < 4; ++p) {
+      // 1. Bitwise identical is_learner_seat mask between control (pool_size=0) and pool (pool_size=4)
+      TEST_CHECK(assign_control.is_learner_seat[p] == assign_pool.is_learner_seat[p]);
+      if (assign_pool.is_learner_seat[p]) {
+        ep_learner_seats++;
+      }
+    }
+    total_learner_seats += ep_learner_seats;
+    if (ep_learner_seats == 2) {
+      mixed_game_count++;
+    } else {
+      TEST_CHECK(ep_learner_seats == 4);
+    }
+
+    // 2. ResolveEvaluator routing
+    for (int p = 0; p < 4; ++p) {
+      auto resolved_pool = dune_opponent_pool::ResolveEvaluator(p, assign_pool, learner_eval, pool);
+      EvalResult res_pool = resolved_pool->Evaluate(dummy_obs);
+
+      if (assign_pool.is_learner_seat[p]) {
+        // Learner seat resolves to learner_eval
+        TEST_CHECK_NEAR(res_pool.logits[0], 100.0f, 1e-4);
+      } else {
+        // Opponent seat resolves to selected pool model
+        size_t opp_idx = assign_pool.opponent_pool_indices[p];
+        TEST_CHECK(opp_idx < pool.size());
+        float expected_sig = 200.0f + static_cast<float>(opp_idx) * 100.0f;
+        TEST_CHECK_NEAR(res_pool.logits[0], expected_sig, 1e-4);
+      }
+
+      // In control mode (empty pool), all seats resolve to learner_eval
+      auto resolved_control = dune_opponent_pool::ResolveEvaluator(p, assign_control, learner_eval, empty_pool);
+      EvalResult res_control = resolved_control->Evaluate(dummy_obs);
+      TEST_CHECK_NEAR(res_control.logits[0], 100.0f, 1e-4);
+    }
+  }
+
+  // 3. Expected ~3.0 learner seats per game (75% volume)
+  double avg_learner_seats = static_cast<double>(total_learner_seats) / 1000.0;
+  TEST_CHECK(avg_learner_seats >= 2.85 && avg_learner_seats <= 3.15);
+  TEST_CHECK(mixed_game_count >= 400 && mixed_game_count <= 600);
+
+  std::cout << "PASSED (avg learner seats/game: " << avg_learner_seats << ")" << std::endl;
+}
+
+// =========================================================================
+// Proof 9: Multi-learner episode trajectory collection and independent per-seat GAE
+// =========================================================================
+void TestProof9_MixedPoolRolloutMultiLearnerIsolationAndPerSeatGae() {
+  std::cout << "[Proof 9] Multi-learner trajectory isolation and independent per-seat GAE... " << std::flush;
+
+  auto game = LoadGame("dune_imperium");
+  TEST_CHECK(game != nullptr);
+
+  std::mutex eval_mutex;
+  auto learner_model = std::make_shared<SharedDunePolicyValueNetImpl>(kObsSize, 64, kActionDim, 1, false);
+  learner_model->eval();
+  auto learner_eval = std::make_shared<DeterministicEvaluator>(learner_model, torch::kCPU, &eval_mutex);
+
+  auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(kObsSize, 64, kActionDim, 1, false);
+  opp_model->eval();
+  auto opp_eval = std::make_shared<DeterministicEvaluator>(opp_model, torch::kCPU, &eval_mutex);
+  std::vector<std::shared_ptr<IGameEvaluator>> pool = {opp_eval};
+
+  uint64_t master = 999;
+  const double pool_game_fraction = 0.50;
+  const int pool_opponents_per_game = 2;
+
+  int test_episodes_run = 0;
+  for (uint64_t ep = 0; ep < 16; ++ep) {
+    auto assignment = dune_opponent_pool::ComputeMixedPoolSeatAssignment(
+        master, ep, pool.size(), pool_game_fraction, pool_opponents_per_game);
+
+    std::vector<PpoTransition> trajectory;
+    std::atomic<uint64_t> total_env_steps{0};
+
+    int moves = dune_opponent_pool::SimulateMixedPoolRollout(
+        master, ep, *game, learner_eval, pool, kObsSize,
+        pool_game_fraction, pool_opponents_per_game,
+        &trajectory, &total_env_steps, /*reward_scale=*/4.0f);
+
+    TEST_CHECK(moves > 0);
+    TEST_CHECK(total_env_steps.load() > 0);
+    test_episodes_run++;
+
+    // 1. Only learner seats enter trajectory; no opponent rows leak
+    std::vector<std::vector<size_t>> per_player_trans(4);
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+      const auto& t = trajectory[i];
+      TEST_CHECK(t.player_id >= 0 && t.player_id < 4);
+      TEST_CHECK(assignment.is_learner_seat[t.player_id]);
+      TEST_CHECK(t.episode_id == ep);
+      TEST_CHECK(!t.legal_actions.empty());
+      TEST_CHECK(!std::isnan(t.old_log_prob));
+      TEST_CHECK(!std::isnan(t.value));
+      TEST_CHECK(!std::isnan(t.advantage));
+      TEST_CHECK(!std::isnan(t.return_value));
+
+      // 2. Fundamental identity: return_value == advantage + value
+      TEST_CHECK_NEAR(t.return_value, t.advantage + t.value, 1e-4);
+
+      per_player_trans[t.player_id].push_back(i);
+    }
+
+    // 3. For every opponent seat, zero transitions in trajectory
+    for (int p = 0; p < 4; ++p) {
+      if (!assignment.is_learner_seat[p]) {
+        TEST_CHECK(per_player_trans[p].empty());
+      }
+    }
+
+    // 4. Verify exact independent backward GAE recurrence per player
+    for (int p = 0; p < 4; ++p) {
+      if (!assignment.is_learner_seat[p] || per_player_trans[p].empty()) continue;
+      const auto& indices = per_player_trans[p];
+      const size_t n_p = indices.size();
+
+      // Last transition for player p: next value and next advantage are 0
+      const auto& last_t = trajectory[indices[n_p - 1]];
+      float expected_adv = last_t.reward + 0.0f - last_t.value;
+      TEST_CHECK_NEAR(last_t.advantage, expected_adv, 1e-4);
+
+      // Intermediate transitions for player p: recurrence
+      for (size_t step = 0; step + 1 < n_p; ++step) {
+        const auto& cur_t = trajectory[indices[step]];
+        const auto& next_t = trajectory[indices[step + 1]];
+        float delta = cur_t.reward + 1.0f * next_t.value - cur_t.value;
+        float adv = delta + 1.0f * next_t.advantage;
+        TEST_CHECK_NEAR(cur_t.advantage, adv, 1e-4);
+      }
+    }
+  }
+
+  TEST_CHECK(test_episodes_run == 16);
+  std::cout << "PASSED" << std::endl;
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -406,6 +586,8 @@ int main() {
   open_spiel::TestProof5_OpponentModelImmutability();
   open_spiel::TestProof6_IdenticalU200InitAndFreshOptimizer();
   open_spiel::TestProof7_SaveResumePreservation();
-  std::cout << "\nALL 7/7 OPPONENT POOL MANDATORY PROOFS PASSED!" << std::endl;
+  open_spiel::TestProof8_MixedPoolSeatAssignmentBitwiseIdenticalMasksAndRouting();
+  open_spiel::TestProof9_MixedPoolRolloutMultiLearnerIsolationAndPerSeatGae();
+  std::cout << "\nALL 9/9 OPPONENT POOL MANDATORY PROOFS PASSED!" << std::endl;
   return 0;
 }

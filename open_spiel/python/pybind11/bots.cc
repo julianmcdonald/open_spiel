@@ -105,6 +105,10 @@ void init_pyspiel_bots(py::module& m) {
 
   py::class_<algorithms::Evaluator, std::shared_ptr<algorithms::Evaluator>>
       mcts_evaluator(m, "Evaluator");
+  mcts_evaluator
+      .def("evaluate", &algorithms::Evaluator::Evaluate, py::arg("state"))
+      .def("prior", &algorithms::Evaluator::Prior, py::arg("state"))
+      .def("prior_and_evaluate", &algorithms::Evaluator::PriorAndEvaluate, py::arg("state"));
   py::class_<algorithms::RandomRolloutEvaluator, algorithms::Evaluator,
              std::shared_ptr<algorithms::RandomRolloutEvaluator>>(
       m, "RandomRolloutEvaluator")

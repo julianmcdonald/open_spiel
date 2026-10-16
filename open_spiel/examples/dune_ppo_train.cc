@@ -1677,6 +1677,13 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
   }
 
+  if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
+      absl::GetFlag(FLAGS_pool_opponents_per_game) > 0) {
+    config_obj["pool_game_fraction"] = absl::GetFlag(FLAGS_pool_game_fraction);
+    config_obj["pool_opponents_per_game"] = absl::GetFlag(FLAGS_pool_opponents_per_game);
+    config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
+  }
+
   if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v3") {
     const auto schema = dune_imperium::GetInformationStateSchema(
         dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
@@ -2163,6 +2170,72 @@ std::string ValidateAndComputeEmaMagnetTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputePoolTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_pool_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+
+  auto pgf_it = manifest_obj.find("pool_game_fraction");
+  auto pop_it = manifest_obj.find("pool_opponents_per_game");
+  auto top_it = manifest_obj.find("training_opponent_pool");
+
+  double source_pgf = (pgf_it != manifest_obj.end() && pgf_it->second.IsDouble()) ? pgf_it->second.GetDouble() : 0.0;
+  int64_t source_pop = (pop_it != manifest_obj.end() && pop_it->second.IsInt()) ? pop_it->second.GetInt() : 0;
+  std::string source_top = (top_it != manifest_obj.end() && top_it->second.IsString()) ? top_it->second.GetString() : "";
+
+  if (source_pgf > 0.0 && source_pop > 0) {
+    source_config_obj["pool_game_fraction"] = source_pgf;
+    source_config_obj["pool_opponents_per_game"] = source_pop;
+    source_config_obj["training_opponent_pool"] = source_top;
+  } else {
+    source_config_obj.erase("pool_game_fraction");
+    source_config_obj.erase("pool_opponents_per_game");
+    source_config_obj.erase("training_opponent_pool");
+  }
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_pool_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Pool transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Pool transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_pool_transition permits pool settings to differ from parent manifest.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+  std::cout << absl::StrFormat(
+      "[pool-transition] Validated intentional opponent pool continuation transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Pool settings: (frac=%.2f, opps=%lld, pool='%s') -> (frac=%.2f, opps=%d, pool='%s')\n",
+      computed_source_fp, current_config_fingerprint,
+      source_pgf, static_cast<long long>(source_pop), source_top,
+      absl::GetFlag(FLAGS_pool_game_fraction), absl::GetFlag(FLAGS_pool_opponents_per_game),
+      absl::GetFlag(FLAGS_training_opponent_pool)) << std::endl;
+  return computed_source_fp;
+}
+
 void UpdateEmaWeights(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
@@ -2342,6 +2415,18 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     }
     if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {
       manifest_obj["ema_magnet_kl_coef"] = absl::GetFlag(FLAGS_ema_magnet_kl_coef);
+    }
+    if (!g_pool_transition_source_fingerprint.empty()) {
+      manifest_obj["pool_transition_source_fingerprint"] = g_pool_transition_source_fingerprint;
+      if (g_pool_transition_source_update >= 0) {
+        manifest_obj["pool_transition_source_update"] = g_pool_transition_source_update;
+      }
+    }
+    if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
+        absl::GetFlag(FLAGS_pool_opponents_per_game) > 0) {
+      manifest_obj["pool_game_fraction"] = absl::GetFlag(FLAGS_pool_game_fraction);
+      manifest_obj["pool_opponents_per_game"] = absl::GetFlag(FLAGS_pool_opponents_per_game);
+      manifest_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
     }
     // PWO-5 Appendix A.1 note 3: the matching fields, asserted on resume.
     if (g_pwo5_manifest_active) {
@@ -2633,8 +2718,19 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
   }
 
   const bool single_learner = absl::GetFlag(FLAGS_single_learner_training);
-  const auto seat_assignment =
-      dune_opponent_pool::ComputeSeatAssignment(master, episode_id, opponent_evaluators.size());
+  const double pool_game_fraction = absl::GetFlag(FLAGS_pool_game_fraction);
+  const int pool_opponents_per_game = absl::GetFlag(FLAGS_pool_opponents_per_game);
+  dune_opponent_pool::SeatAssignment seat_assignment;
+  if (single_learner) {
+    seat_assignment = dune_opponent_pool::ComputeSeatAssignment(
+        master, episode_id, opponent_evaluators.size());
+  } else if (pool_game_fraction > 0.0 && pool_opponents_per_game > 0) {
+    seat_assignment = dune_opponent_pool::ComputeMixedPoolSeatAssignment(
+        master, episode_id, opponent_evaluators.size(), pool_game_fraction,
+        pool_opponents_per_game);
+  } else {
+    seat_assignment = dune_opponent_pool::SeatAssignment{};
+  }
   const int learner_seat = single_learner ? seat_assignment.learner_seat : -1;
 
   auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
@@ -2813,7 +2909,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         std::abort();
       }
 
-      const bool is_learner = (!single_learner) || (current_player == learner_seat);
+      const bool is_learner = (current_player >= 0 && current_player < 4) &&
+                              seat_assignment.is_learner_seat[current_player];
 
       std::vector<float> obs(obs_size, 0.0f);
       if (dune_state != nullptr && dune_imperium::IsExtendedInformationStateSize(obs_size)) {
@@ -3723,7 +3820,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
 
         for (int p = 0; p < game.NumPlayers(); ++p) {
-          if (single_learner && p != learner_seat) continue;
+          if (!seat_assignment.is_learner_seat[p]) continue;
           int new_tleilaxu = dune_state->GetTleilaxuTrackForTesting(p);
           int tleilaxu_delta = new_tleilaxu - current_tleilaxu[p];
           current_tleilaxu[p] = new_tleilaxu;
@@ -3747,7 +3844,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
 
         for (int p = 0; p < game.NumPlayers(); ++p) {
-          if (single_learner && p != learner_seat) continue;
+          if (!seat_assignment.is_learner_seat[p]) continue;
           int raw_conflict_vp_delta = dune_state->ConflictVpDelta(p) - prev_conflict_vp[p];
           prev_conflict_vp[p] = dune_state->ConflictVpDelta(p);
 
@@ -9914,6 +10011,12 @@ int main(int argc, char** argv) {
                   ValidateAndComputeEmaMagnetTransitionFingerprint(manifest_path, config_fingerprint);
               if (!permitted_transition_source_fingerprint.empty()) {
                 g_ema_magnet_transition_source_fingerprint = permitted_transition_source_fingerprint;
+              } else {
+                permitted_transition_source_fingerprint =
+                    ValidateAndComputePoolTransitionFingerprint(manifest_path, config_fingerprint);
+                if (!permitted_transition_source_fingerprint.empty()) {
+                  g_pool_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                }
               }
             }
           }
@@ -9959,6 +10062,9 @@ int main(int argc, char** argv) {
       }
       if (!g_ema_magnet_transition_source_fingerprint.empty()) {
         g_ema_magnet_transition_source_update = manifest.global_update;
+      }
+      if (!g_pool_transition_source_fingerprint.empty()) {
+        g_pool_transition_source_update = manifest.global_update;
       }
     }
 
@@ -10896,6 +11002,12 @@ int main(int argc, char** argv) {
                     ValidateAndComputeEmaMagnetTransitionFingerprint(manifest_path, config_fingerprint);
                 if (!permitted_transition_source_fingerprint.empty()) {
                   g_ema_magnet_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                } else {
+                  permitted_transition_source_fingerprint =
+                      ValidateAndComputePoolTransitionFingerprint(manifest_path, config_fingerprint);
+                  if (!permitted_transition_source_fingerprint.empty()) {
+                    g_pool_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                  }
                 }
               }
             }
@@ -10938,6 +11050,9 @@ int main(int argc, char** argv) {
         }
         if (!g_ema_magnet_transition_source_fingerprint.empty()) {
           g_ema_magnet_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_pool_transition_source_fingerprint.empty()) {
+          g_pool_transition_source_update = shared_manifest.global_update;
         }
       }
 
@@ -11047,7 +11162,11 @@ int main(int argc, char** argv) {
   std::vector<std::shared_ptr<open_spiel::IGameEvaluator>> opponent_evaluators;
   std::vector<std::string> opponent_hashes_before;
 
-  if (absl::GetFlag(FLAGS_single_learner_training)) {
+  const bool is_single_learner = absl::GetFlag(FLAGS_single_learner_training);
+  const bool is_mixed_pool = (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
+                              absl::GetFlag(FLAGS_pool_opponents_per_game) > 0);
+
+  if (is_single_learner || is_mixed_pool) {
     std::string pool_str = absl::GetFlag(FLAGS_training_opponent_pool);
     if (!pool_str.empty()) {
       std::vector<std::string> opp_paths = dune_opponent_pool::ParseOpponentPoolPaths(pool_str);
@@ -11090,10 +11209,23 @@ int main(int argc, char** argv) {
         }
         opponent_evaluators.push_back(opp_eval);
       }
-      std::cout << "[OPPONENT POOL] Loaded " << opponent_evaluators.size()
-                << " frozen opponent models for single-learner training." << std::endl;
+      if (is_mixed_pool) {
+        std::cout << "[OPPONENT POOL] Loaded " << opponent_evaluators.size()
+                  << " frozen opponent models for mixed-episode multi-learner training (fraction="
+                  << absl::GetFlag(FLAGS_pool_game_fraction) << ", opponents="
+                  << absl::GetFlag(FLAGS_pool_opponents_per_game) << ")." << std::endl;
+      } else {
+        std::cout << "[OPPONENT POOL] Loaded " << opponent_evaluators.size()
+                  << " frozen opponent models for single-learner training." << std::endl;
+      }
     } else {
-      std::cout << "[OPPONENT POOL] Single-learner training active in current-policy control mode (Arm A: 0 pool models, snapshot opponent)." << std::endl;
+      if (is_mixed_pool) {
+        std::cout << "[OPPONENT POOL] Mixed-episode training active in current-policy control mode (Arm 1 Control: 0 pool models, fraction="
+                  << absl::GetFlag(FLAGS_pool_game_fraction) << ", opponents="
+                  << absl::GetFlag(FLAGS_pool_opponents_per_game) << ")." << std::endl;
+      } else {
+        std::cout << "[OPPONENT POOL] Single-learner training active in current-policy control mode (Arm A: 0 pool models, snapshot opponent)." << std::endl;
+      }
     }
   }
 

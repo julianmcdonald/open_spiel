@@ -263,20 +263,12 @@ list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium_state_combat.cc
   dune_imperium/dune_imperium_state_intrigue.cc
   dune_imperium/dune_imperium_state_reveal.cc
+  dune_imperium/dune_imperium_state_reveal_cards.cc
   dune_imperium/dune_imperium_state_tech.cc
+  dune_imperium/dune_imperium_state_tensor.cc
   dune_imperium/dune_imperium_state_util.cc
   dune_imperium/dune_imperium_util.cc
   dune_imperium/dune_imperium_util.h
-)
-
-list(APPEND GAME_SOURCES
-  dune_imperium/dune_imperium.cc
-  dune_imperium/dune_imperium.h
-  dune_imperium/dune_imperium_cards.cc
-  dune_imperium/dune_imperium_cards.h
-  dune_imperium/dune_imperium_board.cc
-  dune_imperium/dune_imperium_board.h
-  dune_imperium/dune_imperium_state_util.cc
 )
 
 add_library (games OBJECT ${GAME_SOURCES})

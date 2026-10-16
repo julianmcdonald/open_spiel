@@ -92,3 +92,13 @@ ABSL_FLAG(double, ema_magnet_transition_source_coef, 0.0,
 ABSL_FLAG(std::string, ema_magnet_transition_source_fingerprint, "",
           "Expected parent config fingerprint for ema_magnet transition.");
 
+// Mixed-episode multi-learner opponent pool flags.
+ABSL_FLAG(double, pool_game_fraction, 0.0,
+          "Fraction of training games with opponent pool seats (default 0.0).");
+ABSL_FLAG(int, pool_opponents_per_game, 0,
+          "Number of opponent pool seats in a selected pool game (1..3, default 0).");
+ABSL_FLAG(bool, allow_pool_transition, false,
+          "Allow transition from a parent manifest with different pool settings.");
+ABSL_FLAG(std::string, pool_transition_source_fingerprint, "",
+          "Expected parent config fingerprint for pool transition.");
+

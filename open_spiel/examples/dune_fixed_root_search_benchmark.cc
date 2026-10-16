@@ -22,6 +22,7 @@
 #include "open_spiel/examples/dune_compound_turn_search.h"
 #include "open_spiel/examples/dune_network.h"
 #include "open_spiel/examples/dune_seed_utils.h"
+#include "open_spiel/examples/dune_wide_rollout_search.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 #include "open_spiel/utils/json.h"
@@ -49,6 +50,13 @@ ABSL_FLAG(bool, rollout_amp, false, "Use AMP in evaluator rollouts (default fals
 ABSL_FLAG(bool, allow_tf32, false, "Allow TF32 in evaluator (default false).");
 ABSL_FLAG(double, temperature, 1.0, "Temperature applied to capped logits in replay mode.");
 ABSL_FLAG(bool, dump_per_state, false, "Dump per-state candidate probabilities and entropy in output JSON.");
+ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks in model (8 or 12).");
+ABSL_FLAG(bool, sh_offline_check, false,
+          "Run R7-39 Step 6 Successive Halving exploratory offline check (raw, sh_192_incumbent, sh_384_incumbent, sh_384_k5, Ref512).");
+ABSL_FLAG(bool, skip_game_string_check, false,
+          "Allow mismatched game_string metadata; replay, seat and observation checks remain strict.");
+ABSL_FLAG(bool, skip_recheck_1024, false,
+          "Skip the 1,024-rollout disagreement re-check pass.");
 
 namespace benchmark_domains {
 constexpr uint64_t kDomainV0_Run1        = 0x0501;
@@ -62,7 +70,20 @@ constexpr uint64_t kDomainV2_64_Paired   = 0x0508;
 constexpr uint64_t kDomainV2_64_Unpaired = 0x0509;
 constexpr uint64_t kDomainRef512         = 0x050A;
 constexpr uint64_t kDomainRecheck1024    = 0x050B;
+
+constexpr uint64_t kDomainRaw            = 0x0601;
+constexpr uint64_t kDomainSH192Incumbent = 0x0602;
+constexpr uint64_t kDomainSH384Incumbent = 0x0603;
+constexpr uint64_t kDomainSH384K5        = 0x0604;
+constexpr uint64_t kDomainSHRef512       = 0x0605;
 }  // namespace benchmark_domains
+
+enum class BenchmarkVariantType {
+  kCompound,
+  kRaw,
+  kSuccessiveHalvingDynamic,
+  kSuccessiveHalvingFixedTop5,
+};
 
 struct VariantConfig {
   std::string name;
@@ -70,6 +91,9 @@ struct VariantConfig {
   SearchPairingMode pairing;
   SearchTruncationMode truncation;
   uint64_t seed_domain;
+  BenchmarkVariantType type = BenchmarkVariantType::kCompound;
+  int reference_rollouts_per_action = 0;
+  bool fixed_top5 = false;
 };
 
 struct SampledRoot {
@@ -328,7 +352,8 @@ int RunHeldOutReplayEvaluation(
   std::cout << "[DEVICE] Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
 
   auto model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 8,
+      open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391,
+      absl::GetFlag(FLAGS_num_blocks),
       /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
       /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
   model->to(device);
@@ -771,6 +796,8 @@ int main(int argc, char** argv) {
   const int num_evals = absl::GetFlag(FLAGS_num_evaluators);
   const int target_batch_size = absl::GetFlag(FLAGS_target_batch_size);
   const int top_k = absl::GetFlag(FLAGS_top_k_actions);
+  const int reference_top_k = absl::GetFlag(FLAGS_sh_offline_check)
+      ? std::max(top_k, 5) : top_k;
   const double min_override_margin = absl::GetFlag(FLAGS_min_override_margin);
   const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
 
@@ -833,11 +860,18 @@ int main(int argc, char** argv) {
     open_spiel::SpielFatalError("Fatal: 'metadata.game_string' in sampled roots JSON is empty!");
   }
   if (expected_game_str != current_game_str) {
-    open_spiel::SpielFatalError(absl::StrFormat(
-        "Fatal: Game string mismatch between census and benchmark!\nExpected: %s\nActual:   %s",
-        expected_game_str, current_game_str));
+    if (absl::GetFlag(FLAGS_skip_game_string_check)) {
+      std::cout << absl::StrFormat(
+          "[WARNING] Game string mismatch between census and benchmark (ignored due to --skip_game_string_check)!\nExpected: %s\nActual:   %s\n",
+          expected_game_str, current_game_str);
+    } else {
+      open_spiel::SpielFatalError(absl::StrFormat(
+          "Fatal: Game string mismatch between census and benchmark!\nExpected: %s\nActual:   %s",
+          expected_game_str, current_game_str));
+    }
+  } else {
+    std::cout << "[PARITY] Verified game->ToString() matches census summary string.\n";
   }
-  std::cout << "[PARITY] Verified game->ToString() matches census summary string.\n";
 
   std::vector<SampledRoot> sampled_roots;
   const auto& roots_arr = roots_obj.at("roots").GetArray();
@@ -888,7 +922,8 @@ int main(int argc, char** argv) {
 
   for (int e = 0; e < num_evals; ++e) {
     models[e] = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 8,
+        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391,
+        absl::GetFlag(FLAGS_num_blocks),
         /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
     models[e]->to(device);
@@ -920,12 +955,25 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < sampled_roots.size(); ++i) {
     const auto& root = sampled_roots[i];
     std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+    bool replay_failed = false;
     for (int64_t a : root.action_history) {
+      std::vector<open_spiel::Action> legals = state->LegalActions();
+      bool is_legal = false;
+      for (open_spiel::Action la : legals) {
+        if (la == a) {
+          is_legal = true;
+          break;
+        }
+      }
+      if (!is_legal) {
+        replay_failed = true;
+        break;
+      }
       state->ApplyAction(a);
     }
-    if (state->CurrentPlayer() != root.search_seat) {
+    if (replay_failed || state->CurrentPlayer() != root.search_seat) {
       open_spiel::SpielFatalError(absl::StrFormat(
-          "Root %d seat mismatch: state->CurrentPlayer()=%d != root.search_seat=%d",
+          "Root %d seat mismatch or replay failed: state->CurrentPlayer()=%d, root.search_seat=%d",
           root.root_id, state->CurrentPlayer(), root.search_seat));
     }
 
@@ -958,27 +1006,55 @@ int main(int argc, char** argv) {
     }
   }
   obs_file.close();
-  std::cout << "[VERIFY] All " << sampled_roots.size() << " root observations verified bit-for-bit against binary!\n";
+  std::cout << absl::StrFormat("[VERIFY] Verified replay, seat and observation parity for %zu roots.\n", sampled_roots.size());
+  if (sampled_roots.empty()) {
+    open_spiel::SpielFatalError("No roots provided for benchmark!");
+  }
 
   // Configure Variants
   std::vector<VariantConfig> variants;
-  if (absl::GetFlag(FLAGS_leaf_check_only)) {
+  if (absl::GetFlag(FLAGS_sh_offline_check)) {
     variants = {
-        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Paired},
-        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainRef512}
+        {"raw", 0, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, false},
+        {"sh_192_incumbent", 192, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSH192Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, false},
+        {"sh_384_incumbent", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSH384Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, false},
+        {"sh_384_k5", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSH384K5, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 128, true},
+        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHRef512, BenchmarkVariantType::kCompound, 0, false}
+    };
+  } else if (absl::GetFlag(FLAGS_leaf_check_only)) {
+    variants = {
+        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, false},
+        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, false}
     };
   } else {
     variants = {
-        {"V0_Run1", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run1},
-        {"V0_Run2", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV0_Run2},
-        {"V1", 64, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainV1},
-        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Paired},
-        {"V2_16_Unpaired", 16, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_16_Unpaired},
-        {"V2_32_Paired", 32, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Paired},
-        {"V2_32_Unpaired", 32, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_32_Unpaired},
-        {"V2_64_Paired", 64, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Paired},
-        {"V2_64_Unpaired", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer, benchmark_domains::kDomainV2_64_Unpaired},
-        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal, benchmark_domains::kDomainRef512}
+        {"V0_Run1", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainV0_Run1, BenchmarkVariantType::kCompound, 0, false},
+        {"V0_Run2", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainV0_Run2, BenchmarkVariantType::kCompound, 0, false},
+        {"V1", 64, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainV1, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_16_Unpaired", 16, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_16_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_32_Paired", 32, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_32_Paired, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_32_Unpaired", 32, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_32_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_64_Paired", 64, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_64_Paired, BenchmarkVariantType::kCompound, 0, false},
+        {"V2_64_Unpaired", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
+         benchmark_domains::kDomainV2_64_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+        {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, false}
     };
   }
 
@@ -1013,32 +1089,64 @@ int main(int argc, char** argv) {
       const auto& v_cfg = variants[v_idx];
       uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, v_cfg.seed_domain, root.root_id);
 
-      // MUST FIX 3: Measure network evaluations as counter delta around search
       uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
       auto t_start = std::chrono::steady_clock::now();
-      auto s_res = CompoundRolloutSearchDecision(
-          *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
-          top_k, v_cfg.rollouts, min_override_margin,
-          TreeReuseMode::kTargetFill, dec_seed,
-          v_cfg.pairing, v_cfg.truncation);
+
+      VariantResult vr;
+      vr.decision_seed = dec_seed;
+
+      if (v_cfg.type == BenchmarkVariantType::kRaw) {
+        const auto legal = state->LegalActions();
+        const ActionsAndProbs raw_prior = evaluators.front()->Prior(*state);
+        const auto sorted_by_prior = GetSortedCandidatesByPrior(raw_prior, legal);
+        Action raw_a = sorted_by_prior.empty() ? (legal.empty() ? kInvalidAction : legal.front()) : sorted_by_prior.front().first;
+        vr.chosen_action = raw_a;
+        vr.overridden = false;
+        vr.raw_mean_utility = 0.0;
+        vr.chosen_mean_utility = 0.0;
+      } else if (v_cfg.type == BenchmarkVariantType::kSuccessiveHalvingDynamic ||
+                 v_cfg.type == BenchmarkVariantType::kSuccessiveHalvingFixedTop5) {
+        auto s_res = SuccessiveHalvingRolloutSearchDecision(
+            *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+            v_cfg.reference_rollouts_per_action, min_override_margin,
+            dec_seed, SearchRolloutCrnMode::kSequential,
+            /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0,
+            v_cfg.fixed_top5);
+        vr.chosen_action = s_res.action;
+        vr.overridden = s_res.overridden;
+        vr.raw_mean_utility = s_res.raw_mean_utility;
+        vr.chosen_mean_utility = s_res.chosen_mean_utility;
+        for (const auto& cu : s_res.candidate_utilities) {
+          vr.candidate_utilities.push_back({cu.first, cu.second});
+        }
+        for (const auto& cru : s_res.candidate_rollout_utilities) {
+          vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
+        }
+      } else {
+        const int eff_top_k = v_cfg.name == "Ref512" ? reference_top_k : top_k;
+        auto s_res = CompoundRolloutSearchDecision(
+            *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+            eff_top_k, v_cfg.rollouts, min_override_margin,
+            TreeReuseMode::kTargetFill, dec_seed,
+            v_cfg.pairing, v_cfg.truncation);
+        vr.chosen_action = s_res.action;
+        vr.overridden = s_res.overridden;
+        vr.raw_mean_utility = s_res.raw_mean_utility;
+        vr.chosen_mean_utility = s_res.chosen_mean_utility;
+        for (const auto& cu : s_res.candidate_utilities) {
+          vr.candidate_utilities.push_back({cu.first, cu.second});
+        }
+        for (const auto& cru : s_res.candidate_rollout_utilities) {
+          vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
+        }
+      }
+
       auto t_end = std::chrono::steady_clock::now();
       uint64_t evals_after = open_spiel::GetTotalNetworkEvaluations();
       double dur_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-      VariantResult vr;
-      vr.chosen_action = s_res.action;
-      vr.overridden = s_res.overridden;
-      vr.raw_mean_utility = s_res.raw_mean_utility;
-      vr.chosen_mean_utility = s_res.chosen_mean_utility;
-      vr.decision_seed = dec_seed;
       vr.evaluations = evals_after - evals_before;
       vr.duration_ms = dur_ms;
-      for (const auto& cu : s_res.candidate_utilities) {
-        vr.candidate_utilities.push_back({cu.first, cu.second});
-      }
-      for (const auto& cru : s_res.candidate_rollout_utilities) {
-        vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
-      }
       all_results[r_idx][v_idx] = std::move(vr);
     }
 
@@ -1209,72 +1317,77 @@ int main(int argc, char** argv) {
   std::cout << "[RECEIPT] Saved complete main sweep (all variants across all roots) to " << output_path << "\n";
 
 
-  // 1,024-Rollout Re-check Pass on Disagreement Roots
-  std::vector<int> disagreement_root_indices;
-  for (size_t r_idx = 0; r_idx < sampled_roots.size(); ++r_idx) {
-    const auto& ref_vr = all_results[r_idx][ref_idx];
-    bool has_disagreement = false;
-    for (size_t v_idx = 0; v_idx < ref_idx; ++v_idx) {
-      if (all_results[r_idx][v_idx].chosen_action != ref_vr.chosen_action) {
-        has_disagreement = true;
-        break;
+  std::vector<VariantResult> recheck_1024_results;
+  if (!absl::GetFlag(FLAGS_skip_recheck_1024)) {
+    // 1,024-Rollout Re-check Pass on Disagreement Roots
+    std::vector<int> disagreement_root_indices;
+    for (size_t r_idx = 0; r_idx < sampled_roots.size(); ++r_idx) {
+      const auto& ref_vr = all_results[r_idx][ref_idx];
+      bool has_disagreement = false;
+      for (size_t v_idx = 0; v_idx < ref_idx; ++v_idx) {
+        if (all_results[r_idx][v_idx].chosen_action != ref_vr.chosen_action) {
+          has_disagreement = true;
+          break;
+        }
+      }
+      if (has_disagreement) {
+        disagreement_root_indices.push_back(static_cast<int>(r_idx));
       }
     }
-    if (has_disagreement) {
-      disagreement_root_indices.push_back(static_cast<int>(r_idx));
+
+    std::cout << absl::StrFormat(
+        "[RE-CHECK] Identified %zu disagreement roots. Running 1,024-rollout paired re-check (domain 0x050B)...\n",
+        disagreement_root_indices.size());
+
+    recheck_1024_results.resize(sampled_roots.size());
+    for (size_t d_idx = 0; d_idx < disagreement_root_indices.size(); ++d_idx) {
+      int r_idx = disagreement_root_indices[d_idx];
+      const auto& root = sampled_roots[r_idx];
+      std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+      for (int64_t a : root.action_history) {
+        state->ApplyAction(a);
+      }
+
+      if (d_idx % 10 == 0 || d_idx + 1 == disagreement_root_indices.size()) {
+        std::cout << absl::StrFormat("  Re-checking disagreement root %zu / %zu (Root %d, Game %d)...\n",
+                                     d_idx + 1, disagreement_root_indices.size(), root.root_id, root.game_id);
+      }
+
+      uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, benchmark_domains::kDomainRecheck1024, root.root_id);
+      uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
+      auto t_start = std::chrono::steady_clock::now();
+      auto s_res = CompoundRolloutSearchDecision(
+          *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+          reference_top_k, 1024, min_override_margin,
+          TreeReuseMode::kTargetFill, dec_seed,
+          SearchPairingMode::kPaired, SearchTruncationMode::kTerminal);
+      auto t_end = std::chrono::steady_clock::now();
+      uint64_t evals_after = open_spiel::GetTotalNetworkEvaluations();
+
+      VariantResult vr;
+      vr.chosen_action = s_res.action;
+      vr.overridden = s_res.overridden;
+      vr.raw_mean_utility = s_res.raw_mean_utility;
+      vr.chosen_mean_utility = s_res.chosen_mean_utility;
+      vr.decision_seed = dec_seed;
+      vr.evaluations = evals_after - evals_before;
+      vr.duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+      for (const auto& cu : s_res.candidate_utilities) {
+        vr.candidate_utilities.push_back({cu.first, cu.second});
+      }
+      for (const auto& cru : s_res.candidate_rollout_utilities) {
+        vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
+      }
+      recheck_1024_results[r_idx] = std::move(vr);
+
+      if ((d_idx + 1) % 5 == 0 || d_idx + 1 == disagreement_root_indices.size()) {
+        SaveBenchmarkReceipt(output_path, root_out_json, sampled_roots, variants, all_results, recheck_1024_results, sampled_roots.size());
+      }
     }
+    std::cout << "[RE-CHECK] 1,024-rollout re-check complete!\n\n";
+  } else {
+    std::cout << "[RE-CHECK] Skipping 1,024-rollout re-check pass (--skip_recheck_1024=true).\n\n";
   }
-
-  std::cout << absl::StrFormat(
-      "[RE-CHECK] Identified %zu disagreement roots. Running 1,024-rollout paired re-check (domain 0x050B)...\n",
-      disagreement_root_indices.size());
-
-  std::vector<VariantResult> recheck_1024_results(sampled_roots.size());
-  for (size_t d_idx = 0; d_idx < disagreement_root_indices.size(); ++d_idx) {
-    int r_idx = disagreement_root_indices[d_idx];
-    const auto& root = sampled_roots[r_idx];
-    std::unique_ptr<open_spiel::State> state = game->NewInitialState();
-    for (int64_t a : root.action_history) {
-      state->ApplyAction(a);
-    }
-
-    if (d_idx % 10 == 0 || d_idx + 1 == disagreement_root_indices.size()) {
-      std::cout << absl::StrFormat("  Re-checking disagreement root %zu / %zu (Root %d, Game %d)...\n",
-                                   d_idx + 1, disagreement_root_indices.size(), root.root_id, root.game_id);
-    }
-
-    uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, benchmark_domains::kDomainRecheck1024, root.root_id);
-    uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
-    auto t_start = std::chrono::steady_clock::now();
-    auto s_res = CompoundRolloutSearchDecision(
-        *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
-        top_k, 1024, min_override_margin,
-        TreeReuseMode::kTargetFill, dec_seed,
-        SearchPairingMode::kPaired, SearchTruncationMode::kTerminal);
-    auto t_end = std::chrono::steady_clock::now();
-    uint64_t evals_after = open_spiel::GetTotalNetworkEvaluations();
-
-    VariantResult vr;
-    vr.chosen_action = s_res.action;
-    vr.overridden = s_res.overridden;
-    vr.raw_mean_utility = s_res.raw_mean_utility;
-    vr.chosen_mean_utility = s_res.chosen_mean_utility;
-    vr.decision_seed = dec_seed;
-    vr.evaluations = evals_after - evals_before;
-    vr.duration_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    for (const auto& cu : s_res.candidate_utilities) {
-      vr.candidate_utilities.push_back({cu.first, cu.second});
-    }
-    for (const auto& cru : s_res.candidate_rollout_utilities) {
-      vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
-    }
-    recheck_1024_results[r_idx] = std::move(vr);
-
-    if ((d_idx + 1) % 5 == 0 || d_idx + 1 == disagreement_root_indices.size()) {
-      SaveBenchmarkReceipt(output_path, root_out_json, sampled_roots, variants, all_results, recheck_1024_results, sampled_roots.size());
-    }
-  }
-  std::cout << "[RE-CHECK] 1,024-rollout re-check complete!\n\n";
 
   SaveBenchmarkReceipt(output_path, root_out_json, sampled_roots, variants, all_results, recheck_1024_results, sampled_roots.size());
   std::cout << "[RECEIPT] Saved finalized benchmark receipt JSON to " << output_path << "\n";

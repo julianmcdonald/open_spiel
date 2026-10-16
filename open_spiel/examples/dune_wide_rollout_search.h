@@ -526,7 +526,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     uint64_t decision_seed,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool unbiased_stage2_gate = false,
-    double max_time_ms = -1.0) {
+    double max_time_ms = -1.0,
+    bool fixed_top5_candidates = false) {
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -542,14 +543,22 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   }
 
   std::vector<Action> ordered_candidates;
-  ordered_candidates.reserve(4);
-  ordered_candidates.push_back(sorted_by_prior[0].first);
-  ordered_candidates.push_back(sorted_by_prior[1].first);
+  if (!fixed_top5_candidates) {
+    ordered_candidates.reserve(4);
+    ordered_candidates.push_back(sorted_by_prior[0].first);
+    ordered_candidates.push_back(sorted_by_prior[1].first);
 
-  if (sorted_by_prior.size() >= 3 && sorted_by_prior[2].second >= 0.025) {
-    ordered_candidates.push_back(sorted_by_prior[2].first);
-    if (sorted_by_prior.size() >= 4 && sorted_by_prior[3].second >= 0.08) {
-      ordered_candidates.push_back(sorted_by_prior[3].first);
+    if (sorted_by_prior.size() >= 3 && sorted_by_prior[2].second >= 0.025) {
+      ordered_candidates.push_back(sorted_by_prior[2].first);
+      if (sorted_by_prior.size() >= 4 && sorted_by_prior[3].second >= 0.08) {
+        ordered_candidates.push_back(sorted_by_prior[3].first);
+      }
+    }
+  } else {
+    const size_t k_max = std::min<size_t>(5, sorted_by_prior.size());
+    ordered_candidates.reserve(k_max);
+    for (size_t i = 0; i < k_max; ++i) {
+      ordered_candidates.push_back(sorted_by_prior[i].first);
     }
   }
 
