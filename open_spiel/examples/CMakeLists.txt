@@ -322,6 +322,17 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_compound_turn_search_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_compound_turn_search_test COMMAND dune_compound_turn_search_test)
 
+  add_executable(dune_belief_particles_test
+    dune_belief_particles_test.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_belief_particles_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_belief_particles_test COMMAND dune_belief_particles_test)
+
+  add_executable(dune_belief_prediction_check
+    dune_belief_prediction_check.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_belief_prediction_check dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_compound_search_benchmark
     dune_compound_search_benchmark.cc
     dune_ppo_training_utils.cc dune_ppo_training_flags.cc
