@@ -50,9 +50,11 @@ ABSL_FLAG(bool, rollout_amp, false, "Use AMP in evaluator rollouts (default fals
 ABSL_FLAG(bool, allow_tf32, false, "Allow TF32 in evaluator (default false).");
 ABSL_FLAG(double, temperature, 1.0, "Temperature applied to capped logits in replay mode.");
 ABSL_FLAG(bool, dump_per_state, false, "Dump per-state candidate probabilities and entropy in output JSON.");
-ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks in model (8 or 12).");
+ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks in model (8, 12, or 16).");
 ABSL_FLAG(bool, sh_offline_check, false,
           "Run R7-39 Step 6 Successive Halving exploratory offline check (raw, sh_192_incumbent, sh_384_incumbent, sh_384_k5, Ref512).");
+ABSL_FLAG(bool, sh_budget_check, false,
+          "Run fixed-position SH budget check (raw, sh_192, sh_384, sh_768, sh_768_k5, sh_768_rep, Ref2048).");
 ABSL_FLAG(bool, skip_game_string_check, false,
           "Allow mismatched game_string metadata; replay, seat and observation checks remain strict.");
 ABSL_FLAG(bool, skip_recheck_1024, false,
@@ -76,6 +78,10 @@ constexpr uint64_t kDomainSH192Incumbent = 0x0602;
 constexpr uint64_t kDomainSH384Incumbent = 0x0603;
 constexpr uint64_t kDomainSH384K5        = 0x0604;
 constexpr uint64_t kDomainSHRef512       = 0x0605;
+
+constexpr uint64_t kDomainSHBudgetShared  = 0x0701;
+constexpr uint64_t kDomainSHBudgetRep     = 0x0702;
+constexpr uint64_t kDomainSHBudgetRef2048 = 0x0703;
 }  // namespace benchmark_domains
 
 enum class BenchmarkVariantType {
@@ -83,6 +89,7 @@ enum class BenchmarkVariantType {
   kRaw,
   kSuccessiveHalvingDynamic,
   kSuccessiveHalvingFixedTop5,
+  kPairedReferenceOnChosenActions,
 };
 
 struct VariantConfig {
@@ -123,6 +130,12 @@ struct VariantResult {
   uint64_t decision_seed = 0;
   uint64_t evaluations = 0;
   double duration_ms = 0.0;
+  int stage1_planned_worlds = 0;
+  int stage1_kept_worlds = 0;
+  int stage2_planned_worlds = 0;
+  int stage2_kept_worlds = 0;
+  bool deadline_bound = false;
+  std::vector<std::pair<int, double>> candidate_pair_sd_vs_raw;
 };
 
 void SaveBenchmarkReceipt(
@@ -159,6 +172,20 @@ void SaveBenchmarkReceipt(
       vr_obj["decision_seed"] = open_spiel::json::Value(static_cast<int64_t>(vr.decision_seed));
       vr_obj["evaluations"] = open_spiel::json::Value(static_cast<int64_t>(vr.evaluations));
       vr_obj["duration_ms"] = open_spiel::json::Value(vr.duration_ms);
+      vr_obj["stage1_planned_worlds"] = open_spiel::json::Value(static_cast<int64_t>(vr.stage1_planned_worlds));
+      vr_obj["stage1_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(vr.stage1_kept_worlds));
+      vr_obj["stage2_planned_worlds"] = open_spiel::json::Value(static_cast<int64_t>(vr.stage2_planned_worlds));
+      vr_obj["stage2_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(vr.stage2_kept_worlds));
+      vr_obj["deadline_bound"] = open_spiel::json::Value(vr.deadline_bound);
+
+      open_spiel::json::Array sd_arr;
+      for (const auto& sd_pair : vr.candidate_pair_sd_vs_raw) {
+        open_spiel::json::Array pair_arr;
+        pair_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(sd_pair.first)));
+        pair_arr.push_back(open_spiel::json::Value(sd_pair.second));
+        sd_arr.push_back(open_spiel::json::Value(pair_arr));
+      }
+      vr_obj["candidate_pair_sd_vs_raw"] = open_spiel::json::Value(sd_arr);
 
       open_spiel::json::Array cu_arr;
       for (const auto& cu : vr.candidate_utilities) {
@@ -282,6 +309,30 @@ bool LoadBenchmarkCheckpoint(
           ? vr_obj.at("duration_ms").GetDouble()
           : static_cast<double>(vr_obj.at("duration_ms").GetInt());
 
+      if (vr_obj.find("stage1_planned_worlds") != vr_obj.end()) {
+        vr.stage1_planned_worlds = static_cast<int>(vr_obj.at("stage1_planned_worlds").GetInt());
+      }
+      if (vr_obj.find("stage1_kept_worlds") != vr_obj.end()) {
+        vr.stage1_kept_worlds = static_cast<int>(vr_obj.at("stage1_kept_worlds").GetInt());
+      }
+      if (vr_obj.find("stage2_planned_worlds") != vr_obj.end()) {
+        vr.stage2_planned_worlds = static_cast<int>(vr_obj.at("stage2_planned_worlds").GetInt());
+      }
+      if (vr_obj.find("stage2_kept_worlds") != vr_obj.end()) {
+        vr.stage2_kept_worlds = static_cast<int>(vr_obj.at("stage2_kept_worlds").GetInt());
+      }
+      if (vr_obj.find("deadline_bound") != vr_obj.end()) {
+        vr.deadline_bound = vr_obj.at("deadline_bound").GetBool();
+      }
+      if (vr_obj.find("candidate_pair_sd_vs_raw") != vr_obj.end()) {
+        for (const auto& sd_val : vr_obj.at("candidate_pair_sd_vs_raw").GetArray()) {
+          const auto& pair_arr = sd_val.GetArray();
+          int a = static_cast<int>(pair_arr[0].GetInt());
+          double sd = pair_arr[1].IsDouble() ? pair_arr[1].GetDouble() : static_cast<double>(pair_arr[1].GetInt());
+          vr.candidate_pair_sd_vs_raw.push_back({a, sd});
+        }
+      }
+
       if (vr_obj.find("candidate_utilities") != vr_obj.end()) {
         for (const auto& cu_val : vr_obj.at("candidate_utilities").GetArray()) {
           const auto& pair_arr = cu_val.GetArray();
@@ -357,7 +408,7 @@ int RunHeldOutReplayEvaluation(
       /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
       /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
   model->to(device);
-  torch::load(model, model_path, device);
+  open_spiel::LoadModelCheckpointRobust(model, model_path, device);
   model->eval();
 
   std::shared_mutex model_mutex;
@@ -796,7 +847,7 @@ int main(int argc, char** argv) {
   const int num_evals = absl::GetFlag(FLAGS_num_evaluators);
   const int target_batch_size = absl::GetFlag(FLAGS_target_batch_size);
   const int top_k = absl::GetFlag(FLAGS_top_k_actions);
-  const int reference_top_k = absl::GetFlag(FLAGS_sh_offline_check)
+  const int reference_top_k = (absl::GetFlag(FLAGS_sh_offline_check) || absl::GetFlag(FLAGS_sh_budget_check))
       ? std::max(top_k, 5) : top_k;
   const double min_override_margin = absl::GetFlag(FLAGS_min_override_margin);
   const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
@@ -927,7 +978,7 @@ int main(int argc, char** argv) {
         /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
     models[e]->to(device);
-    torch::load(models[e], model_path, device);
+    open_spiel::LoadModelCheckpointRobust(models[e], model_path, device);
     models[e]->eval();
 
     model_mutexes[e] = std::make_unique<std::shared_mutex>();
@@ -1013,7 +1064,24 @@ int main(int argc, char** argv) {
 
   // Configure Variants
   std::vector<VariantConfig> variants;
-  if (absl::GetFlag(FLAGS_sh_offline_check)) {
+  if (absl::GetFlag(FLAGS_sh_budget_check)) {
+    variants = {
+        {"raw", 0, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, false},
+        {"sh_192", 192, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, false},
+        {"sh_384", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, false},
+        {"sh_768", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, false},
+        {"sh_768_k5", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 256, true},
+        {"sh_768_rep", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetRep, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, false},
+        {"Ref2048", 2048, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetRef2048, BenchmarkVariantType::kPairedReferenceOnChosenActions, 0, false}
+    };
+  } else if (absl::GetFlag(FLAGS_sh_offline_check)) {
     variants = {
         {"raw", 0, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
          benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, false},
@@ -1122,6 +1190,88 @@ int main(int argc, char** argv) {
         for (const auto& cru : s_res.candidate_rollout_utilities) {
           vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
         }
+        vr.stage1_planned_worlds = s_res.stage1_planned_worlds;
+        vr.stage1_kept_worlds = s_res.stage1_kept_worlds;
+        vr.stage2_planned_worlds = s_res.stage2_planned_worlds;
+        vr.stage2_kept_worlds = s_res.stage2_kept_worlds;
+        vr.deadline_bound = false;
+      } else if (v_cfg.type == BenchmarkVariantType::kPairedReferenceOnChosenActions) {
+        const Action raw_a = all_results[r_idx][0].chosen_action;
+        std::vector<Action> distinct_actions;
+        distinct_actions.push_back(raw_a);
+        for (size_t prev_v = 0; prev_v < v_idx; ++prev_v) {
+          Action a = all_results[r_idx][prev_v].chosen_action;
+          if (std::find(distinct_actions.begin(), distinct_actions.end(), a) == distinct_actions.end()) {
+            distinct_actions.push_back(a);
+          }
+        }
+
+        if (distinct_actions.size() <= 1) {
+          vr.chosen_action = raw_a;
+          vr.overridden = false;
+          vr.raw_mean_utility = 0.0;
+          vr.chosen_mean_utility = 0.0;
+          vr.candidate_utilities.push_back({static_cast<int>(raw_a), 0.0});
+          vr.candidate_rollout_utilities.push_back({static_cast<int>(raw_a), {}});
+          vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(raw_a), 0.0});
+          vr.stage1_planned_worlds = 0;
+          vr.stage1_kept_worlds = 0;
+          vr.stage2_planned_worlds = 0;
+          vr.stage2_kept_worlds = 0;
+          vr.deadline_bound = false;
+        } else {
+          auto s_res = PairedPriorSortedRolloutSearchDecision(
+              *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+              distinct_actions, /*rollouts_per_action=*/v_cfg.rollouts, min_override_margin,
+              /*min_t_stat=*/1.0, dec_seed, SearchRolloutCrnMode::kSequential,
+              /*sample_opponent_leader_draft=*/false, /*max_time_ms=*/900000.0,
+              /*max_inflight_worlds=*/128);
+          vr.chosen_action = s_res.action;
+          vr.overridden = s_res.overridden;
+          vr.raw_mean_utility = s_res.raw_mean_utility;
+          vr.chosen_mean_utility = s_res.chosen_mean_utility;
+          for (const auto& cu : s_res.candidate_utilities) {
+            vr.candidate_utilities.push_back({cu.first, cu.second});
+          }
+          for (const auto& cru : s_res.candidate_rollout_utilities) {
+            vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
+          }
+          vr.stage1_planned_worlds = s_res.stage1_planned_worlds;
+          vr.stage1_kept_worlds = s_res.stage1_kept_worlds;
+          vr.stage2_planned_worlds = s_res.stage2_planned_worlds;
+          vr.stage2_kept_worlds = s_res.stage2_kept_worlds;
+          vr.deadline_bound = (s_res.stage1_kept_worlds < s_res.stage1_planned_worlds);
+
+          const std::vector<double>& raw_rollouts = s_res.candidate_rollout_utilities.empty()
+              ? std::vector<double>{}
+              : s_res.candidate_rollout_utilities.front().second;
+          for (const auto& cru : s_res.candidate_rollout_utilities) {
+            Action cand_a = cru.first;
+            if (cand_a == raw_a) {
+              vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), 0.0});
+            } else {
+              const auto& cand_rollouts = cru.second;
+              const size_t n = std::min(raw_rollouts.size(), cand_rollouts.size());
+              if (n < 2) {
+                vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), 0.0});
+              } else {
+                double sum_diff = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                  sum_diff += (cand_rollouts[i] - raw_rollouts[i]);
+                }
+                const double mean_diff = sum_diff / static_cast<double>(n);
+                double sum_sq = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                  double d = (cand_rollouts[i] - raw_rollouts[i]) - mean_diff;
+                  sum_sq += d * d;
+                }
+                const double var = sum_sq / static_cast<double>(n - 1);
+                const double sd = std::sqrt(std::max(0.0, var));
+                vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), sd});
+              }
+            }
+          }
+        }
       } else {
         const int eff_top_k = v_cfg.name == "Ref512" ? reference_top_k : top_k;
         auto s_res = CompoundRolloutSearchDecision(
@@ -1133,6 +1283,11 @@ int main(int argc, char** argv) {
         vr.overridden = s_res.overridden;
         vr.raw_mean_utility = s_res.raw_mean_utility;
         vr.chosen_mean_utility = s_res.chosen_mean_utility;
+        vr.stage1_planned_worlds = v_cfg.rollouts;
+        vr.stage1_kept_worlds = v_cfg.rollouts;
+        vr.stage2_planned_worlds = 0;
+        vr.stage2_kept_worlds = 0;
+        vr.deadline_bound = false;
         for (const auto& cu : s_res.candidate_utilities) {
           vr.candidate_utilities.push_back({cu.first, cu.second});
         }
@@ -1207,16 +1362,17 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::cout << "[BENCHMARK] All roots evaluated! Analyzing true gain against Ref512...\n\n";
+  const size_t ref_idx = variants.size() - 1;  // Reference is the last variant
+  SPIEL_CHECK_TRUE(variants[ref_idx].name == "Ref512" || variants[ref_idx].name == "Ref2048");
 
-  const size_t ref_idx = variants.size() - 1;  // Ref512 is the last variant
-  SPIEL_CHECK_EQ(variants[ref_idx].name, "Ref512");
+  std::cout << absl::StrFormat("[BENCHMARK] All roots evaluated! Analyzing true gain against %s...\n\n",
+                               variants[ref_idx].name);
 
   // Summarize metrics
   double total_weight_sum = 0.0;
   for (const auto& r : sampled_roots) total_weight_sum += r.stratum_weight;
 
-  // MUST FIX 4(b): Summary table drops / labels Ref512 and reports Evals/Decision
+  // MUST FIX 4(b): Summary table drops / labels reference baseline and reports Evals/Decision
   std::cout << "====================================================================================================\n";
   std::cout << "| Candidate Variant | Rollouts | Pairing  | Mode      | Agreement (%) | Mean True Gain* | Evals/Dec |\n";
   std::cout << "| :---              | :---     | :---     | :---      | :---          | :---            | :---      |\n";
@@ -1260,9 +1416,10 @@ int main(int argc, char** argv) {
       }
       if (!found_chosen) {
         open_spiel::SpielFatalError(absl::StrFormat(
-            "Fatal: Variant %s chosen action %d on root %d not found in Ref512 candidate_utilities! "
-            "Ref512 must evaluate all top candidate actions.",
-            v_cfg.name, vr.chosen_action, root.root_id));
+            "Fatal: Variant %s chosen action %d on root %d not found in %s candidate_utilities! "
+            "%s must evaluate all top candidate actions.",
+            v_cfg.name, vr.chosen_action, root.root_id,
+            variants[ref_idx].name, variants[ref_idx].name));
       }
       double true_gain = ref_chosen_u - ref_raw_u;
       weighted_true_gain += w * true_gain;
@@ -1293,7 +1450,7 @@ int main(int argc, char** argv) {
     variant_summaries.push_back(open_spiel::json::Value(v_sum_obj));
   }
 
-  // Ref512 reference statistics reported separately
+  // Reference statistics reported separately
   uint64_t ref_total_evals = 0;
   double ref_total_time_ms = 0.0;
   for (size_t r_idx = 0; r_idx < sampled_roots.size(); ++r_idx) {
@@ -1305,10 +1462,11 @@ int main(int argc, char** argv) {
 
   std::cout << "====================================================================================================\n";
   std::cout << absl::StrFormat(
-      "[Reference Baseline] %s: 512 rollouts | Paired | Terminal | Avg Evals/Dec: %.1f | Avg Time: %.1f ms\n",
-      variants[ref_idx].name, ref_avg_evals, ref_avg_time);
+      "[Reference Baseline] %s: %d rollouts | Paired | Terminal | Avg Evals/Dec: %.1f | Avg Time: %.1f ms\n",
+      variants[ref_idx].name, variants[ref_idx].rollouts, ref_avg_evals, ref_avg_time);
   std::cout << "====================================================================================================\n";
-  std::cout << "* True Gain is measured against independent 512-rollout paired reference utilities.\n\n";
+  std::cout << absl::StrFormat("* True Gain is measured against independent %d-rollout paired reference utilities.\n\n",
+                               variants[ref_idx].rollouts);
 
   root_out_json["variant_summaries"] = open_spiel::json::Value(variant_summaries);
 
@@ -1318,7 +1476,7 @@ int main(int argc, char** argv) {
 
 
   std::vector<VariantResult> recheck_1024_results;
-  if (!absl::GetFlag(FLAGS_skip_recheck_1024)) {
+  if (!absl::GetFlag(FLAGS_skip_recheck_1024) && !absl::GetFlag(FLAGS_sh_budget_check)) {
     // 1,024-Rollout Re-check Pass on Disagreement Roots
     std::vector<int> disagreement_root_indices;
     for (size_t r_idx = 0; r_idx < sampled_roots.size(); ++r_idx) {

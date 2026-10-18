@@ -89,7 +89,7 @@ ABSL_FLAG(std::string, pairing_mode, "unpaired",
           "Pairing mode: 'unpaired' or 'paired'.");
 ABSL_FLAG(std::string, truncation_mode, "terminal",
           "Truncation mode: 'terminal' or 'truncated'.");
-ABSL_FLAG(int, num_blocks, 8, "Residual blocks in --model_checkpoint (8 or 12).");
+ABSL_FLAG(int, num_blocks, 8, "Number of residual blocks in model (8, 12, or 16).");
 ABSL_FLAG(bool, search_leader_pick, false,
           "Search the searching seat's leader pick: every legal leader gets paired "
           "terminal rollouts with the raw greedy policy; the best mean utility wins.");
@@ -561,8 +561,8 @@ int main(int argc, char** argv) {
     std::cerr << "[ERROR] invalid --belief_* options\n";
     return 1;
   }
-  if (num_blocks != 8 && num_blocks != 12) {
-    std::cerr << "[ERROR] --num_blocks must be 8 or 12\n";
+  if (num_blocks != 8 && num_blocks != 12 && num_blocks != 16) {
+    std::cerr << "[ERROR] --num_blocks must be 8, 12, or 16\n";
     return 1;
   }
   if (search_leader_pick && leader_rollouts_per_leader < 1) {
@@ -621,7 +621,7 @@ int main(int argc, char** argv) {
         /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
     models[e]->to(device);
-    torch::load(models[e], model_path, device);
+    open_spiel::LoadModelCheckpointRobust(models[e], model_path, device);
     models[e]->eval();
 
     model_mutexes[e] = std::make_unique<std::shared_mutex>();
