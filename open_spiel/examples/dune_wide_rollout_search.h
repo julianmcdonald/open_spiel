@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -192,6 +194,132 @@ struct RolloutTask {
   uint64_t wseed;
 };
 
+inline int RunClockedPairedRolloutStage(
+    const State& state,
+    const DuneImperiumState* dune,
+    Player search_player,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    const std::vector<Action>& ordered_candidates,
+    const std::vector<size_t>& candidate_indices,
+    int planned_worlds,
+    int world_seed_offset,
+    uint64_t decision_seed,
+    SearchRolloutCrnMode crn_mode,
+    bool sample_opponent_leader_draft,
+    std::chrono::steady_clock::time_point stage_deadline_tp,
+    TurnSearchTree* active_tree,
+    std::vector<std::vector<double>>& per_candidate_rollouts,
+    int& new_rollouts_executed,
+    int max_inflight_worlds = 32) {
+  const size_t num_cands = candidate_indices.size();
+  if (planned_worlds <= 0 || num_cands == 0) return 0;
+  const int W = std::max(1, max_inflight_worlds);
+
+  std::vector<std::vector<RolloutTrajectory>> trajs(
+      planned_worlds, std::vector<RolloutTrajectory>(num_cands));
+  std::vector<int> world_remaining(planned_worlds, static_cast<int>(num_cands));
+  std::vector<std::future<void>> futures;
+  futures.reserve(planned_worlds * num_cands);
+
+  std::mutex cv_m;
+  std::condition_variable cv;
+  int active_worlds = 0;
+  std::atomic<bool> any_aborted{false};
+
+  int launched_worlds = 0;
+  for (int w = 0; w < planned_worlds; ++w) {
+    {
+      std::unique_lock<std::mutex> lock(cv_m);
+      cv.wait(lock, [&]() {
+        return active_worlds < W || any_aborted.load(std::memory_order_relaxed);
+      });
+      if (any_aborted.load(std::memory_order_relaxed) ||
+          std::chrono::steady_clock::now() >= stage_deadline_tp) {
+        break;
+      }
+      ++active_worlds;
+    }
+    launched_worlds = w + 1;
+
+    const uint64_t wseed = dune_seed::DeriveSeed(
+        decision_seed, static_cast<uint64_t>(world_seed_offset + w));
+    const uint64_t s_seed = wseed + 999;
+
+    for (size_t slot = 0; slot < num_cands; ++slot) {
+      const size_t c_idx = candidate_indices[slot];
+      const Action cand_a = ordered_candidates[c_idx];
+      std::unique_ptr<State> sim_state = nullptr;
+      if (dune) {
+        std::mt19937 wrng(wseed);
+        auto rng_func = [&wrng]() {
+          return std::generate_canonical<double, 53>(wrng);
+        };
+        sim_state = dune->ResampleFromInfostate(search_player, rng_func);
+      }
+      if (!sim_state) {
+        sim_state = state.Clone();
+      }
+      sim_state->ApplyAction(cand_a);
+      auto* s_ptr = sim_state.get();
+      size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
+      auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+
+      futures.push_back(std::async(
+          std::launch::async,
+          [s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
+           s_seed, crn_mode, sample_opponent_leader_draft, stage_deadline_tp,
+           &trajs, w, slot, &world_remaining, &active_worlds, &any_aborted,
+           &cv_m, &cv]() mutable {
+            trajs[w][slot] = SimulateRolloutWithTurnTrajectory(
+                s_ptr, search_player, active_evaluator, s_seed,
+                SearchTruncationMode::kTerminal, crn_mode,
+                sample_opponent_leader_draft, &stage_deadline_tp);
+            if (trajs[w][slot].aborted_by_deadline) {
+              any_aborted.store(true, std::memory_order_relaxed);
+            }
+            {
+              std::lock_guard<std::mutex> lock(cv_m);
+              if (--world_remaining[w] == 0) {
+                --active_worlds;
+              }
+              cv.notify_all();
+            }
+          }));
+    }
+  }
+
+  for (auto& f : futures) {
+    f.get();
+  }
+
+  int kept_worlds = 0;
+  for (int w = 0; w < launched_worlds; ++w) {
+    bool world_ok = true;
+    for (size_t slot = 0; slot < num_cands; ++slot) {
+      if (trajs[w][slot].aborted_by_deadline) {
+        world_ok = false;
+        break;
+      }
+    }
+    if (!world_ok) {
+      break;
+    }
+    for (size_t slot = 0; slot < num_cands; ++slot) {
+      const size_t c_idx = candidate_indices[slot];
+      if (active_tree) {
+        active_tree->RecordRollout(ordered_candidates[c_idx],
+                                   trajs[w][slot].intra_turn_actions,
+                                   trajs[w][slot].terminal_utility);
+      }
+      per_candidate_rollouts[c_idx].push_back(trajs[w][slot].terminal_utility);
+    }
+    ++kept_worlds;
+  }
+
+  new_rollouts_executed += kept_worlds * static_cast<int>(num_cands);
+  return kept_worlds;
+}
+
 inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     const State& state,
     Player search_player,
@@ -204,7 +332,8 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     uint64_t decision_seed,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool sample_opponent_leader_draft = false,
-    double max_time_ms = -1.0) {
+    double max_time_ms = -1.0,
+    int max_inflight_worlds = 32) {
   if (ordered_candidates.empty()) {
     return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   }
@@ -233,6 +362,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
 
   int new_rollouts_executed = 0;
 
+  const auto s1_t0 = std::chrono::steady_clock::now();
   if (max_time_ms <= 0.0) {
     std::vector<RolloutTask> tasks;
     tasks.reserve(K * rollouts_per_action);
@@ -294,88 +424,19 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double, std::milli>(max_time_ms));
 
-    int r_start = 0;
-    while (r_start < rollouts_per_action) {
-      if (std::chrono::steady_clock::now() >= deadline_tp) break;
-      const int wave_worlds = std::min(4, rollouts_per_action - r_start);
+    std::vector<size_t> candidate_indices(K);
+    std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
 
-      struct AsyncRollout {
-        size_t c_idx;
-        int r;
-        Action action;
-        std::future<RolloutTrajectory> future;
-      };
-
-      std::vector<AsyncRollout> wave_tasks;
-      wave_tasks.reserve(K * wave_worlds);
-
-      for (int w = 0; w < wave_worlds; ++w) {
-        const int r = r_start + w;
-        const uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r));
-        for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-          const Action cand_a = ordered_candidates[c_idx];
-          std::unique_ptr<State> sim_state = nullptr;
-          if (dune) {
-            std::mt19937 wrng(wseed);
-            auto rng_func = [&wrng]() {
-              return std::generate_canonical<double, 53>(wrng);
-            };
-            sim_state = dune->ResampleFromInfostate(search_player, rng_func);
-          }
-          if (!sim_state) {
-            sim_state = state.Clone();
-          }
-          sim_state->ApplyAction(cand_a);
-          auto* s_ptr = sim_state.get();
-          uint64_t s_seed = wseed + 999;
-          size_t eval_idx = (wave_tasks.size()) % (evaluators.empty() ? 1 : evaluators.size());
-          auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
-
-          wave_tasks.push_back({
-              c_idx, r, cand_a,
-              std::async(
-                  std::launch::async,
-                  [s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
-                   s_seed, crn_mode, sample_opponent_leader_draft, deadline_tp]() mutable {
-                    return SimulateRolloutWithTurnTrajectory(
-                        s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
-                        crn_mode, sample_opponent_leader_draft, &deadline_tp);
-                  })
-          });
-        }
-      }
-
-      std::vector<std::vector<RolloutTrajectory>> trajs(wave_worlds, std::vector<RolloutTrajectory>(K));
-      for (auto& task : wave_tasks) {
-        int w = task.r - r_start;
-        trajs[w][task.c_idx] = task.future.get();
-      }
-
-      bool hit_deadline = false;
-      for (int w = 0; w < wave_worlds; ++w) {
-        bool all_completed = true;
-        for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-          if (trajs[w][c_idx].aborted_by_deadline) {
-            all_completed = false;
-            hit_deadline = true;
-            break;
-          }
-        }
-        if (all_completed) {
-          new_rollouts_executed += static_cast<int>(K);
-          for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-            active_tree->RecordRollout(ordered_candidates[c_idx],
-                                       trajs[w][c_idx].intra_turn_actions,
-                                       trajs[w][c_idx].terminal_utility);
-            per_candidate_rollouts[c_idx].push_back(trajs[w][c_idx].terminal_utility);
-          }
-        }
-      }
-
-      if (hit_deadline) break;
-      r_start += wave_worlds;
-    }
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        candidate_indices, rollouts_per_action, /*world_seed_offset=*/0,
+        decision_seed, crn_mode, sample_opponent_leader_draft,
+        deadline_tp, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, max_inflight_worlds);
   }
+  const auto s1_t1 = std::chrono::steady_clock::now();
+  const double stage1_elapsed_ms =
+      std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
 
   const int r_completed = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
 
@@ -434,8 +495,23 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
   }
 
-  return {best_action, overridden, raw_mean_u, best_mean_u, prior_rollouts_reused,
-          new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+  CompoundSearchDecisionResult res;
+  res.action = best_action;
+  res.overridden = overridden;
+  res.raw_mean_utility = raw_mean_u;
+  res.chosen_mean_utility = best_mean_u;
+  res.prior_rollouts_reused = prior_rollouts_reused;
+  res.new_rollouts_executed = new_rollouts_executed;
+  res.candidate_utilities = std::move(candidate_utilities);
+  res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+  res.stage1_planned_worlds = rollouts_per_action;
+  res.stage1_kept_worlds = r_completed;
+  res.stage2_planned_worlds = 0;
+  res.stage2_kept_worlds = 0;
+  res.stage1_elapsed_ms = stage1_elapsed_ms;
+  res.stage2_elapsed_ms = 0.0;
+  res.termination_reason = (r_completed < 2) ? "stage1_starved" : (overridden ? "override" : "gate_failed");
+  return res;
 }
 
 inline CompoundSearchDecisionResult LeaderPickRolloutSearchDecision(
@@ -447,7 +523,8 @@ inline CompoundSearchDecisionResult LeaderPickRolloutSearchDecision(
     uint64_t decision_seed,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kDeckOrderCrn,
     bool sample_opponent_leader_draft = true,
-    double max_time_ms = -1.0) {
+    double max_time_ms = -1.0,
+    int max_inflight_worlds = 32) {
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -467,7 +544,7 @@ inline CompoundSearchDecisionResult LeaderPickRolloutSearchDecision(
       state, search_player, /*turn_tree=*/nullptr, evaluators,
       ordered_candidates, rollouts_per_leader, min_override_margin,
       /*min_t_stat=*/1.0, decision_seed, crn_mode, sample_opponent_leader_draft,
-      max_time_ms);
+      max_time_ms, max_inflight_worlds);
 }
 
 inline CompoundSearchDecisionResult AdaptiveRolloutSearchDecision(
@@ -479,7 +556,8 @@ inline CompoundSearchDecisionResult AdaptiveRolloutSearchDecision(
     double min_override_margin,
     uint64_t decision_seed,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
-    double max_time_ms = -1.0) {
+    double max_time_ms = -1.0,
+    int max_inflight_worlds = 32) {
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -513,7 +591,7 @@ inline CompoundSearchDecisionResult AdaptiveRolloutSearchDecision(
   return PairedPriorSortedRolloutSearchDecision(
       state, search_player, turn_tree, evaluators, ordered_candidates,
       rollouts_per_action, min_override_margin, /*min_t_stat=*/1.0, decision_seed,
-      crn_mode, /*sample_opponent_leader_draft=*/false, max_time_ms);
+      crn_mode, /*sample_opponent_leader_draft=*/false, max_time_ms, max_inflight_worlds);
 }
 
 inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
@@ -527,7 +605,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool unbiased_stage2_gate = false,
     double max_time_ms = -1.0,
-    bool fixed_top5_candidates = false) {
+    bool fixed_top5_candidates = false,
+    int max_inflight_worlds = 32) {
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
@@ -587,11 +666,21 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
 
   int new_rollouts_executed = 0;
   const bool has_deadline = (max_time_ms > 0.0);
-  const auto deadline_tp = has_deadline
-      ? (std::chrono::steady_clock::now() +
+  const auto start_time = std::chrono::steady_clock::now();
+  const auto stage1_deadline = has_deadline
+      ? (start_time +
+         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+             std::chrono::duration<double, std::milli>(0.5 * max_time_ms)))
+      : std::chrono::steady_clock::time_point{};
+  const auto final_deadline = has_deadline
+      ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
              std::chrono::duration<double, std::milli>(max_time_ms)))
       : std::chrono::steady_clock::time_point{};
+
+  int stage1_planned_worlds = r_stage1;
+  int stage1_kept_worlds = 0;
+  const auto s1_t0 = std::chrono::steady_clock::now();
 
   // --- STAGE 1: Broad Screen ---
   if (!has_deadline) {
@@ -647,90 +736,23 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       }
     }
   } else {
-    int r_start = 0;
-    while (r_start < r_stage1) {
-      if (std::chrono::steady_clock::now() >= deadline_tp) break;
-      const int wave_worlds = std::min(4, r_stage1 - r_start);
+    std::vector<size_t> candidate_indices(K);
+    std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
 
-      struct AsyncRollout {
-        size_t c_idx;
-        int r;
-        Action action;
-        std::future<RolloutTrajectory> future;
-      };
-
-      std::vector<AsyncRollout> wave_tasks;
-      wave_tasks.reserve(K * wave_worlds);
-
-      for (int w = 0; w < wave_worlds; ++w) {
-        const int r = r_start + w;
-        const uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r));
-        for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-          const Action cand_a = ordered_candidates[c_idx];
-          std::unique_ptr<State> sim_state = nullptr;
-          if (dune) {
-            std::mt19937 wrng(wseed);
-            auto rng_func = [&wrng]() {
-              return std::generate_canonical<double, 53>(wrng);
-            };
-            sim_state = dune->ResampleFromInfostate(search_player, rng_func);
-          }
-          if (!sim_state) {
-            sim_state = state.Clone();
-          }
-          sim_state->ApplyAction(cand_a);
-          auto* s_ptr = sim_state.get();
-          uint64_t s_seed = wseed + 999;
-          size_t eval_idx = (wave_tasks.size()) % (evaluators.empty() ? 1 : evaluators.size());
-          auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
-
-          wave_tasks.push_back({
-              c_idx, r, cand_a,
-              std::async(
-                  std::launch::async,
-                  [s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
-                   s_seed, crn_mode, deadline_tp]() mutable {
-                    return SimulateRolloutWithTurnTrajectory(
-                        s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
-                        crn_mode, /*sample_opponent_leader_draft=*/false, &deadline_tp);
-                  })
-          });
-        }
-      }
-
-      std::vector<std::vector<RolloutTrajectory>> trajs(wave_worlds, std::vector<RolloutTrajectory>(K));
-      for (auto& task : wave_tasks) {
-        int w = task.r - r_start;
-        trajs[w][task.c_idx] = task.future.get();
-      }
-
-      bool hit_deadline = false;
-      for (int w = 0; w < wave_worlds; ++w) {
-        bool all_completed = true;
-        for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-          if (trajs[w][c_idx].aborted_by_deadline) {
-            all_completed = false;
-            hit_deadline = true;
-            break;
-          }
-        }
-        if (all_completed) {
-          new_rollouts_executed += static_cast<int>(K);
-          for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-            active_tree->RecordRollout(ordered_candidates[c_idx],
-                                       trajs[w][c_idx].intra_turn_actions,
-                                       trajs[w][c_idx].terminal_utility);
-            per_candidate_rollouts[c_idx].push_back(trajs[w][c_idx].terminal_utility);
-          }
-        }
-      }
-
-      if (hit_deadline) break;
-      r_start += wave_worlds;
-    }
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        candidate_indices, r_stage1, /*world_seed_offset=*/0,
+        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+        stage1_deadline, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, max_inflight_worlds);
   }
 
+  const auto s1_t1 = std::chrono::steady_clock::now();
+  const double stage1_elapsed_ms =
+      std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
+
   const int r_stage1_done = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
+  stage1_kept_worlds = r_stage1_done;
 
   if (r_stage1_done < 2) {
     double raw_mean = 0.0;
@@ -748,8 +770,24 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     for (size_t c_idx = 0; c_idx < K; ++c_idx) {
       candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
     }
-    return {raw_action, /*overridden=*/false, raw_mean, raw_mean, prior_rollouts_reused,
-            new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean;
+    res.chosen_mean_utility = raw_mean;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = stage1_planned_worlds;
+    res.stage1_kept_worlds = stage1_kept_worlds;
+    res.stage2_planned_worlds = 0;
+    res.stage2_kept_worlds = 0;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = 0.0;
+    res.termination_reason = "stage1_starved";
+    return res;
   }
 
   double raw_mean_1 = 0.0;
@@ -792,14 +830,33 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
     }
 
-    return {raw_action, /*overridden=*/false, raw_mean_1, raw_mean_1, prior_rollouts_reused,
-            new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean_1;
+    res.chosen_mean_utility = raw_mean_1;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = stage1_planned_worlds;
+    res.stage1_kept_worlds = stage1_kept_worlds;
+    res.stage2_planned_worlds = 0;
+    res.stage2_kept_worlds = 0;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = 0.0;
+    res.termination_reason = "early_stop";
+    return res;
   }
 
   // --- STAGE 2: Deep Finale ---
   const int stage2_budget = std::max(2, total_budget - static_cast<int>(K) * r_stage1);
   const int r_stage2 = std::max(1, stage2_budget / 2);
   const std::array<size_t, 2> finalists = {0, best_c_idx};
+
+  int stage2_planned_worlds = r_stage2;
+  int stage2_kept_worlds = 0;
+  const auto s2_t0 = std::chrono::steady_clock::now();
 
   if (!has_deadline) {
     std::vector<RolloutTask> tasks_stage2;
@@ -855,86 +912,21 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       }
     }
   } else {
-    int r_start = 0;
-    while (r_start < r_stage2) {
-      if (std::chrono::steady_clock::now() >= deadline_tp) break;
-      const int wave_worlds = std::min(4, r_stage2 - r_start);
-
-      struct AsyncRollout {
-        size_t f_idx;
-        int r;
-        Action action;
-        std::future<RolloutTrajectory> future;
-      };
-
-      std::vector<AsyncRollout> wave_tasks;
-      wave_tasks.reserve(2 * wave_worlds);
-
-      for (int w = 0; w < wave_worlds; ++w) {
-        const int r = r_start + w;
-        const uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r_stage1 + r));
-        for (size_t f_idx : finalists) {
-          const Action cand_a = ordered_candidates[f_idx];
-          std::unique_ptr<State> sim_state = nullptr;
-          if (dune) {
-            std::mt19937 wrng(wseed);
-            auto rng_func = [&wrng]() {
-              return std::generate_canonical<double, 53>(wrng);
-            };
-            sim_state = dune->ResampleFromInfostate(search_player, rng_func);
-          }
-          if (!sim_state) {
-            sim_state = state.Clone();
-          }
-          sim_state->ApplyAction(cand_a);
-          auto* s_ptr = sim_state.get();
-          uint64_t s_seed = wseed + 999;
-          size_t eval_idx = (wave_tasks.size()) % (evaluators.empty() ? 1 : evaluators.size());
-          auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
-
-          wave_tasks.push_back({
-              f_idx, r, cand_a,
-              std::async(
-                  std::launch::async,
-                  [s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
-                   s_seed, crn_mode, deadline_tp]() mutable {
-                    return SimulateRolloutWithTurnTrajectory(
-                        s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
-                        crn_mode, /*sample_opponent_leader_draft=*/false, &deadline_tp);
-                  })
-          });
-        }
-      }
-
-      std::vector<std::array<RolloutTrajectory, 2>> trajs(wave_worlds);
-      for (auto& task : wave_tasks) {
-        int w = task.r - r_start;
-        size_t slot = (task.f_idx == finalists[0]) ? 0 : 1;
-        trajs[w][slot] = task.future.get();
-      }
-
-      bool hit_deadline = false;
-      for (int w = 0; w < wave_worlds; ++w) {
-        if (trajs[w][0].aborted_by_deadline || trajs[w][1].aborted_by_deadline) {
-          hit_deadline = true;
-          break;
-        }
-        new_rollouts_executed += 2;
-        for (size_t idx = 0; idx < 2; ++idx) {
-          size_t f_idx = finalists[idx];
-          active_tree->RecordRollout(ordered_candidates[f_idx],
-                                     trajs[w][idx].intra_turn_actions,
-                                     trajs[w][idx].terminal_utility);
-          per_candidate_rollouts[f_idx].push_back(trajs[w][idx].terminal_utility);
-        }
-      }
-
-      if (hit_deadline) break;
-      r_start += wave_worlds;
-    }
+    std::vector<size_t> stage2_cands = {0, best_c_idx};
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1,
+        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+        final_deadline, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, max_inflight_worlds);
   }
 
+  const auto s2_t1 = std::chrono::steady_clock::now();
+  const double stage2_elapsed_ms =
+      std::chrono::duration<double, std::milli>(s2_t1 - s2_t0).count();
+
   const int r_stage2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+  stage2_kept_worlds = r_stage2_done;
 
   if (r_stage2_done < 2) {
     const int R_tot = static_cast<int>(per_candidate_rollouts[0].size());
@@ -965,8 +957,23 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
     }
 
-    return {raw_action, /*overridden=*/false, raw_mean_tot, raw_mean_tot, prior_rollouts_reused,
-            new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean_tot;
+    res.chosen_mean_utility = raw_mean_tot;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = stage1_planned_worlds;
+    res.stage1_kept_worlds = stage1_kept_worlds;
+    res.stage2_planned_worlds = stage2_planned_worlds;
+    res.stage2_kept_worlds = stage2_kept_worlds;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = stage2_elapsed_ms;
+    res.termination_reason = "stage2_starved";
+    return res;
   }
 
   const int R_total = r_stage1_done + r_stage2_done;
@@ -1063,8 +1070,23 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
   }
 
-  return {best_action, overridden, raw_mean_total, best_mean_u, prior_rollouts_reused,
-          new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+  CompoundSearchDecisionResult res;
+  res.action = best_action;
+  res.overridden = overridden;
+  res.raw_mean_utility = raw_mean_total;
+  res.chosen_mean_utility = best_mean_u;
+  res.prior_rollouts_reused = prior_rollouts_reused;
+  res.new_rollouts_executed = new_rollouts_executed;
+  res.candidate_utilities = std::move(candidate_utilities);
+  res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+  res.stage1_planned_worlds = stage1_planned_worlds;
+  res.stage1_kept_worlds = stage1_kept_worlds;
+  res.stage2_planned_worlds = stage2_planned_worlds;
+  res.stage2_kept_worlds = stage2_kept_worlds;
+  res.stage1_elapsed_ms = stage1_elapsed_ms;
+  res.stage2_elapsed_ms = stage2_elapsed_ms;
+  res.termination_reason = overridden ? "override" : "stage2_no_override";
+  return res;
 }
 
 }  // namespace dune_imperium

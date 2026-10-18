@@ -680,7 +680,15 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("pass_prior_mass", &open_spiel::SearchDiagnostics::pass_prior_mass)
       .def_readonly("pass_meaningful_visits", &open_spiel::SearchDiagnostics::pass_meaningful_visits)
       .def_readonly("pass_q_margin", &open_spiel::SearchDiagnostics::pass_q_margin)
-      .def_readonly("pass_stability", &open_spiel::SearchDiagnostics::pass_stability);
+      .def_readonly("pass_stability", &open_spiel::SearchDiagnostics::pass_stability)
+      .def_readonly("stage1_planned_worlds", &open_spiel::SearchDiagnostics::stage1_planned_worlds)
+      .def_readonly("stage1_kept_worlds", &open_spiel::SearchDiagnostics::stage1_kept_worlds)
+      .def_readonly("stage2_planned_worlds", &open_spiel::SearchDiagnostics::stage2_planned_worlds)
+      .def_readonly("stage2_kept_worlds", &open_spiel::SearchDiagnostics::stage2_kept_worlds)
+      .def_readonly("stage1_elapsed_ms", &open_spiel::SearchDiagnostics::stage1_elapsed_ms)
+      .def_readonly("stage2_elapsed_ms", &open_spiel::SearchDiagnostics::stage2_elapsed_ms)
+      .def_readonly("termination_reason", &open_spiel::SearchDiagnostics::termination_reason)
+      .def_readonly("stage_outcome", &open_spiel::SearchDiagnostics::termination_reason);
 
   py::class_<open_spiel::DuneSearchResult>(di, "DuneSearchResult")
       .def_readonly("policy", &open_spiel::DuneSearchResult::policy)

@@ -503,13 +503,32 @@ inline void LoadModelCheckpointRobust(
     SpielFatalError("LoadModelCheckpointRobust: Mismatched input dimension in " + path);
   }
 
-  for (size_t i = 0; i < model->res_blocks.size(); ++i) {
+  const size_t N = model->res_blocks.size();
+  for (size_t i = 0; i < N; ++i) {
     torch::serialize::InputArchive b_arch;
     std::string b_name = "res" + std::to_string(i + 1);
     if (!archive.try_read(b_name, b_arch)) {
       SpielFatalError("LoadModelCheckpointRobust: Missing required residual block '" + b_name + "' in " + path);
     }
     model->res_blocks[i]->load(b_arch);
+  }
+
+  // Depth guard: raise error if archive contains any deeper residual block exceeding model capacity N
+  {
+    torch::serialize::InputArchive extra_arch;
+    if (archive.try_read("res0", extra_arch)) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                      " contains deeper residual block 'res0' exceeding model num_blocks (" +
+                      std::to_string(N) + ")");
+    }
+    for (size_t k = N + 1; k <= N + 64; ++k) {
+      std::string extra_name = "res" + std::to_string(k);
+      if (archive.try_read(extra_name, extra_arch)) {
+        SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                        " contains deeper residual block '" + extra_name +
+                        "' exceeding model num_blocks (" + std::to_string(N) + ")");
+      }
+    }
   }
 
   torch::serialize::InputArchive p_arch;
@@ -539,8 +558,49 @@ inline void LoadModelCheckpointRobust(
     if (archive.try_read("next_own_action_head", a3)) model->next_own_action_head->load(a3);
   }
 
-  // Find sidecar JSON by replacing any file extension
+  // Find sidecar JSON by replacing any file extension, including checking resolved symlink targets
   std::string json_path = std::filesystem::path(path).replace_extension(".json").string();
+  std::vector<std::string> candidate_json_paths;
+  candidate_json_paths.push_back(json_path);
+  std::error_code ec_sym;
+  if (std::filesystem::is_symlink(path, ec_sym)) {
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical(path, ec);
+    if (!ec) {
+      std::string resolved_json = resolved.replace_extension(".json").string();
+      if (resolved_json != json_path) {
+        candidate_json_paths.push_back(resolved_json);
+      }
+    }
+  }
+
+  // Validate num_blocks in sidecar JSON if present
+  for (const auto& jp : candidate_json_paths) {
+    std::ifstream jf_nb(jp);
+    if (jf_nb.good()) {
+      std::string jstr((std::istreambuf_iterator<char>(jf_nb)),
+                       std::istreambuf_iterator<char>());
+      auto jval = open_spiel::json::FromString(jstr);
+      if (jval.has_value() && jval->IsObject()) {
+        const auto& dict = jval->GetObject();
+        auto it_nb = dict.find("num_blocks");
+        if (it_nb != dict.end()) {
+          int64_t declared_blocks = -1;
+          if (it_nb->second.IsInt()) {
+            declared_blocks = it_nb->second.GetInt();
+          } else if (it_nb->second.IsString()) {
+            declared_blocks = std::stoll(it_nb->second.GetString());
+          }
+          if (declared_blocks != static_cast<int64_t>(N)) {
+            SpielFatalError("LoadModelCheckpointRobust: Declared num_blocks (" +
+                            std::to_string(declared_blocks) +
+                            ") does not match model num_blocks (" +
+                            std::to_string(N) + ") in " + jp);
+          }
+        }
+      }
+    }
+  }
 
   bool sidecar_found = false;
   bool obs_dim_found = false;
@@ -549,6 +609,10 @@ inline void LoadModelCheckpointRobust(
   std::string feature_schema_sha = "";
 
   std::ifstream jf(json_path);
+  if (!jf.good() && candidate_json_paths.size() > 1) {
+    json_path = candidate_json_paths[1];
+    jf.open(json_path);
+  }
   if (jf.good()) {
     sidecar_found = true;
     std::string jstr((std::istreambuf_iterator<char>(jf)),

@@ -397,6 +397,15 @@ struct SearchDiagnostics {
   // rather than copied from it, so that requiring the two to be equal is a real
   // cross-check of GetRootDiagnostics against this path instead of a tautology.
   std::vector<int> visit_counts_final;
+
+  // Stage-based wide rollout telemetry
+  int stage1_planned_worlds = 0;
+  int stage1_kept_worlds = 0;
+  int stage2_planned_worlds = 0;
+  int stage2_kept_worlds = 0;
+  double stage1_elapsed_ms = 0.0;
+  double stage2_elapsed_ms = 0.0;
+  std::string termination_reason = "none";
 };
 
 struct DuneSearchResult {

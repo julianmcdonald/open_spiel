@@ -1267,6 +1267,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     result.used_fallback = true;
     result.fallback_reason = (remaining_time_ms == 0.0) ? "live_deadline_reached" : "forced_or_bookkeeping";
     result.diagnostics.fallback_reason = result.fallback_reason;
+    result.diagnostics.termination_reason = result.diagnostics.fallback_reason;
     result.policy = raw_prior;
   } else if (is_leader) {
     const double kReserveMs = 10000.0;
@@ -1298,6 +1299,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       result.used_fallback = true;
       result.fallback_reason = "live_deadline_reached";
       result.diagnostics.fallback_reason = "live_deadline_reached";
+      result.diagnostics.termination_reason = result.diagnostics.fallback_reason;
       result.policy = raw_prior;
     } else {
       int num_cands = std::max(1, static_cast<int>(legal.size()));
@@ -1313,6 +1315,13 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       result.simulations_completed = c_res.new_rollouts_executed;
       result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
       result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+      result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
+      result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
+      result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
+      result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
+      result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
+      result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
+      result.diagnostics.termination_reason = c_res.termination_reason;
       result.policy = raw_prior;
 
       for (const auto& cu : c_res.candidate_utilities) {
@@ -1382,6 +1391,13 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           result.simulations_completed = c_res.new_rollouts_executed;
           result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
           result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+          result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
+          result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
+          result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
+          result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
+          result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
+          result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
+          result.diagnostics.termination_reason = c_res.termination_reason;
           result.policy = raw_prior;
 
           for (const auto& cu : c_res.candidate_utilities) {
@@ -1442,6 +1458,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         result.used_fallback = false;
         result.fallback_reason = "none";
         result.diagnostics.fallback_reason = "none";
+        result.diagnostics.termination_reason = "tree_reuse";
         result.diagnostics.inherited_root_visits = inherited_visits;
         result.policy = raw_prior;
       } else {
@@ -1453,6 +1470,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
             : "policy_only";
         result.fallback_reason = reason;
         result.diagnostics.fallback_reason = reason;
+        result.diagnostics.termination_reason = reason;
         result.policy = raw_prior;
       }
     }
@@ -1474,7 +1492,8 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
   session_elapsed_time_ms_ += elapsed_ms;
   turn_elapsed_search_time_ms_ += elapsed_ms;
   session_new_simulations_completed_ += result.simulations_completed;
-  if (result.simulations_completed >= 6 && !result.used_fallback && elapsed_ms > 0.0) {
+  if (remaining_time_ms >= 0.0 && result.simulations_completed >= 6 &&
+      !result.used_fallback && elapsed_ms > 0.0) {
     double current_rate = elapsed_ms / result.simulations_completed;
     ms_per_rollout_ema_ = 0.8 * ms_per_rollout_ema_ + 0.2 * current_rate;
   }

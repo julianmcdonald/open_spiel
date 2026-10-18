@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
 
+#include "open_spiel/examples/dune_network.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -802,6 +805,291 @@ void DeadlineEnforcementTest(const std::shared_ptr<const Game>& game) {
   }
 }
 
+class SleepingPayoffState : public State {
+ public:
+  SleepingPayoffState(std::shared_ptr<const Game> game, std::vector<Action> actions,
+                      Action boosted_action = kInvalidAction, double advantage = 1.0,
+                      int sleep_ms_per_step = 2)
+      : State(game), actions_(std::move(actions)),
+        boosted_action_(boosted_action), advantage_(advantage),
+        sleep_ms_(sleep_ms_per_step) {}
+
+  Player CurrentPlayer() const override {
+    return phase_ == 3 ? kTerminalPlayerId : (phase_ == 1 ? kChancePlayerId : 0);
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return actions_;
+    if (phase_ == 1) return {0, 1};
+    if (phase_ == 2) return {99};
+    return {};
+  }
+  ActionsAndProbs ChanceOutcomes() const override { return {{0, 0.5}, {1, 0.5}}; }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "SleepingPayoffState"; }
+  bool IsTerminal() const override { return phase_ == 3; }
+  std::vector<double> Returns() const override {
+    const double value = (selected_ == boosted_action_ ? advantage_ : 0.0);
+    return {value, -value, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<SleepingPayoffState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    if (sleep_ms_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms_));
+    }
+    if (phase_ == 0) selected_ = action;
+    ++phase_;
+  }
+
+ private:
+  std::vector<Action> actions_;
+  Action boosted_action_;
+  double advantage_;
+  int sleep_ms_;
+  int phase_ = 0;
+  Action selected_ = kInvalidAction;
+};
+
+void Stage1OverAllocationStage2ReservationTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(2);
+  const Action raw = actions[0];
+  const Action challenger = actions[1];
+
+  SleepingPayoffState state(game, actions, challenger, /*advantage=*/1.0, /*sleep_ms_per_step=*/2);
+  TurnSearchTree tree;
+  const auto result = SuccessiveHalvingRolloutSearchDecision(
+      state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/400,
+      /*min_override_margin=*/0.15, /*decision_seed=*/42,
+      SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+      /*max_time_ms=*/120.0);
+
+  SPIEL_CHECK_TRUE(result.overridden);
+  SPIEL_CHECK_EQ(result.action, challenger);
+  SPIEL_CHECK_EQ(result.termination_reason, "override");
+  SPIEL_CHECK_GE(result.stage1_kept_worlds, 2);
+  SPIEL_CHECK_LT(result.stage1_kept_worlds, result.stage1_planned_worlds);
+  SPIEL_CHECK_GE(result.stage2_kept_worlds, 2);
+}
+
+class PrefixState : public State {
+ public:
+  PrefixState(std::shared_ptr<const Game> game, std::vector<Action> actions,
+              int world_id = 0)
+      : State(game), actions_(std::move(actions)), world_id_(world_id) {}
+
+  Player CurrentPlayer() const override {
+    return phase_ == 3 ? kTerminalPlayerId : (phase_ == 1 ? kChancePlayerId : 0);
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return actions_;
+    if (phase_ == 1) return {0, 1};
+    if (phase_ == 2) return {99};
+    return {};
+  }
+  ActionsAndProbs ChanceOutcomes() const override { return {{0, 0.5}, {1, 0.5}}; }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "PrefixState"; }
+  bool IsTerminal() const override { return phase_ == 3; }
+  std::vector<double> Returns() const override {
+    const double val = (world_id_ >= 2) ? 9999.0 : 1.0;
+    return {val, -val, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    auto copy = std::make_unique<PrefixState>(*this);
+    // In PairedPriorSortedRolloutSearchDecision with 2 candidates, each world launches 2 rollouts
+    copy->world_id_ = (global_clone_counter_++) / 2;
+    return copy;
+  }
+
+  static void ResetCloneCounter() { global_clone_counter_ = 0; }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    if (world_id_ == 1 && phase_ > 0) {
+      // Sleep across steps past the 40ms deadline
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+    if (phase_ == 0) selected_ = action;
+    ++phase_;
+  }
+
+ private:
+  std::vector<Action> actions_;
+  int world_id_;
+  int phase_ = 0;
+  Action selected_ = kInvalidAction;
+  inline static std::atomic<int> global_clone_counter_{0};
+};
+
+void ContiguousPrefixOrderingTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(2);
+
+  PrefixState::ResetCloneCounter();
+  PrefixState state(game, actions);
+  TurnSearchTree tree;
+
+  const auto result = PairedPriorSortedRolloutSearchDecision(
+      state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/8,
+      /*min_override_margin=*/0.15, /*min_t_stat=*/1.0, /*decision_seed=*/42,
+      SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+      /*max_time_ms=*/40.0, /*max_inflight_worlds=*/32);
+
+  SPIEL_CHECK_EQ(result.stage1_kept_worlds, 1);
+  SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(), 1);
+  SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second[0], 1.0);
+  SPIEL_CHECK_EQ(tree.GetVisits(actions[0]), 1);
+  SPIEL_CHECK_EQ(tree.GetVisits(actions[1]), 1);
+}
+
+void ClockedVsUnclockedExactParityTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(4);
+
+  // 1. SuccessiveHalvingRolloutSearchDecision
+  {
+    PayoffState state_unclocked(game, actions, actions[2], /*advantage=*/1.0, /*noise_size=*/5.0);
+    PayoffState state_clocked(game, actions, actions[2], /*advantage=*/1.0, /*noise_size=*/5.0);
+    TurnSearchTree tree_unclocked;
+    TurnSearchTree tree_clocked;
+
+    const auto res_unclocked = SuccessiveHalvingRolloutSearchDecision(
+        state_unclocked, 0, &tree_unclocked, evaluators, /*reference_rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15, /*decision_seed=*/12345,
+        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+        /*max_time_ms=*/-1.0);
+
+    const auto res_clocked = SuccessiveHalvingRolloutSearchDecision(
+        state_clocked, 0, &tree_clocked, evaluators, /*reference_rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15, /*decision_seed=*/12345,
+        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+        /*max_time_ms=*/10000.0);
+
+    CheckSameResult(res_unclocked, res_clocked);
+    CheckSameTree(*tree_unclocked.current_node(), *tree_clocked.current_node());
+  }
+
+  // 2. PairedPriorSortedRolloutSearchDecision
+  {
+    PayoffState state_unclocked(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/5.0);
+    PayoffState state_clocked(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/5.0);
+    TurnSearchTree tree_unclocked;
+    TurnSearchTree tree_clocked;
+
+    const auto res_unclocked = PairedPriorSortedRolloutSearchDecision(
+        state_unclocked, 0, &tree_unclocked, evaluators, actions,
+        /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+        /*min_t_stat=*/1.0, /*decision_seed=*/54321,
+        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+        /*max_time_ms=*/-1.0);
+
+    const auto res_clocked = PairedPriorSortedRolloutSearchDecision(
+        state_clocked, 0, &tree_clocked, evaluators, actions,
+        /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+        /*min_t_stat=*/1.0, /*decision_seed=*/54321,
+        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+        /*max_time_ms=*/10000.0);
+
+    CheckSameResult(res_unclocked, res_clocked);
+    CheckSameTree(*tree_unclocked.current_node(), *tree_clocked.current_node());
+  }
+}
+
+void DepthGuardTest() {
+  const auto temp_dir = std::filesystem::temp_directory_path() / "depth_guard_test";
+  std::filesystem::remove_all(temp_dir);
+  std::filesystem::create_directories(temp_dir);
+
+  open_spiel::SetErrorHandler([](const std::string& err) {
+    throw std::runtime_error(err);
+  });
+
+  try {
+    // 1. Deep checkpoint (13 blocks) into shallow model (12 blocks) triggers SpielFatalError
+    const auto deep_pt = (temp_dir / "model_13.pt").string();
+    auto deep_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        /*input_dim=*/5000, /*hidden_dim=*/16, /*action_dim=*/100, /*num_blocks=*/13);
+    torch::save(deep_model, deep_pt);
+
+    auto shallow_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        /*input_dim=*/5000, /*hidden_dim=*/16, /*action_dim=*/100, /*num_blocks=*/12);
+
+    bool caught_deep = false;
+    try {
+      LoadModelCheckpointRobust(shallow_model, deep_pt, torch::kCPU);
+    } catch (const std::runtime_error& e) {
+      caught_deep = true;
+      SPIEL_CHECK_TRUE(std::string(e.what()).find("exceeding model num_blocks") != std::string::npos);
+    }
+    SPIEL_CHECK_TRUE(caught_deep);
+
+    // 2. Mismatched sidecar JSON (declared 16 != model 12) triggers SpielFatalError
+    const auto shallow_pt = (temp_dir / "model_12.pt").string();
+    const auto shallow_json = (temp_dir / "model_12.json").string();
+    torch::save(shallow_model, shallow_pt);
+    {
+      std::ofstream out(shallow_json);
+      out << "{\"num_blocks\": 16}\n";
+    }
+
+    bool caught_json_mismatch = false;
+    try {
+      LoadModelCheckpointRobust(shallow_model, shallow_pt, torch::kCPU);
+    } catch (const std::runtime_error& e) {
+      caught_json_mismatch = true;
+      SPIEL_CHECK_TRUE(std::string(e.what()).find("does not match model num_blocks") != std::string::npos);
+    }
+    SPIEL_CHECK_TRUE(caught_json_mismatch);
+
+    // 3. Symlink to pt with mismatched sidecar JSON triggers SpielFatalError
+    const auto symlink_pt = (temp_dir / "symlink_12.pt").string();
+    std::filesystem::create_symlink(shallow_pt, symlink_pt);
+
+    bool caught_symlink_mismatch = false;
+    try {
+      LoadModelCheckpointRobust(shallow_model, symlink_pt, torch::kCPU);
+    } catch (const std::runtime_error& e) {
+      caught_symlink_mismatch = true;
+      SPIEL_CHECK_TRUE(std::string(e.what()).find("does not match model num_blocks") != std::string::npos);
+    }
+    SPIEL_CHECK_TRUE(caught_symlink_mismatch);
+
+    // 4. Matching sidecar JSON (declared 12 == model 12) loads cleanly without error
+    {
+      std::ofstream out(shallow_json);
+      out << "{\"num_blocks\": 12}\n";
+    }
+    LoadModelCheckpointRobust(shallow_model, shallow_pt, torch::kCPU);
+    LoadModelCheckpointRobust(shallow_model, symlink_pt, torch::kCPU);
+
+    // 5. Matching deep model (13 blocks into 13 blocks) loads cleanly with matching sidecar
+    const auto deep_json = (temp_dir / "model_13.json").string();
+    {
+      std::ofstream out(deep_json);
+      out << "{\"num_blocks\": 13}\n";
+    }
+    LoadModelCheckpointRobust(deep_model, deep_pt, torch::kCPU);
+  } catch (...) {
+    open_spiel::SetErrorHandler(nullptr);
+    std::filesystem::remove_all(temp_dir);
+    throw;
+  }
+
+  open_spiel::SetErrorHandler(nullptr);
+  std::filesystem::remove_all(temp_dir);
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -820,4 +1108,8 @@ int main() {
   ReshuffleEpochCrnTest(game);
   SmallBudgetGuardTest(game);
   DeadlineEnforcementTest(game);
+  Stage1OverAllocationStage2ReservationTest(game);
+  ContiguousPrefixOrderingTest(game);
+  ClockedVsUnclockedExactParityTest(game);
+  DepthGuardTest();
 }

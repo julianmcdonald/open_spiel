@@ -389,6 +389,13 @@ struct CompoundSearchDecisionResult {
   int new_rollouts_executed = 0;
   std::vector<std::pair<Action, double>> candidate_utilities = {};
   std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities = {};
+  int stage1_planned_worlds = 0;
+  int stage1_kept_worlds = 0;
+  int stage2_planned_worlds = 0;
+  int stage2_kept_worlds = 0;
+  double stage1_elapsed_ms = 0.0;
+  double stage2_elapsed_ms = 0.0;
+  std::string termination_reason = "none";
 };
 
 // Optional source of search worlds, keyed by the world seed. Returning nullptr
