@@ -194,6 +194,34 @@ struct RolloutTask {
   uint64_t wseed;
 };
 
+struct ClockedStageSharedState {
+  ClockedStageSharedState(int worlds, size_t cands)
+      : trajs(worlds, std::vector<RolloutTrajectory>(cands)),
+        world_remaining(worlds, static_cast<int>(cands)) {}
+  std::vector<std::vector<RolloutTrajectory>> trajs;
+  std::vector<int> world_remaining;
+  std::mutex cv_m;
+  std::condition_variable cv;
+  int active_worlds = 0;
+  std::atomic<bool> any_aborted{false};
+};
+
+struct SlotReleaseGuard {
+  std::shared_ptr<ClockedStageSharedState> state;
+  int world_idx;
+  bool normal_finish = false;
+  ~SlotReleaseGuard() {
+    if (!normal_finish) {
+      state->any_aborted.store(true, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> lock(state->cv_m);
+    if (--state->world_remaining[world_idx] == 0) {
+      --state->active_worlds;
+    }
+    state->cv.notify_all();
+  }
+};
+
 inline int RunClockedPairedRolloutStage(
     const State& state,
     const DuneImperiumState* dune,
@@ -215,29 +243,23 @@ inline int RunClockedPairedRolloutStage(
   if (planned_worlds <= 0 || num_cands == 0) return 0;
   const int W = std::max(1, max_inflight_worlds);
 
-  std::vector<std::vector<RolloutTrajectory>> trajs(
-      planned_worlds, std::vector<RolloutTrajectory>(num_cands));
-  std::vector<int> world_remaining(planned_worlds, static_cast<int>(num_cands));
+  auto shared = std::make_shared<ClockedStageSharedState>(planned_worlds, num_cands);
   std::vector<std::future<void>> futures;
   futures.reserve(planned_worlds * num_cands);
 
-  std::mutex cv_m;
-  std::condition_variable cv;
-  int active_worlds = 0;
-  std::atomic<bool> any_aborted{false};
-
+  std::exception_ptr first_exception = nullptr;
   int launched_worlds = 0;
   for (int w = 0; w < planned_worlds; ++w) {
     {
-      std::unique_lock<std::mutex> lock(cv_m);
-      cv.wait(lock, [&]() {
-        return active_worlds < W || any_aborted.load(std::memory_order_relaxed);
+      std::unique_lock<std::mutex> lock(shared->cv_m);
+      shared->cv.wait(lock, [&]() {
+        return shared->active_worlds < W || shared->any_aborted.load(std::memory_order_relaxed);
       });
-      if (any_aborted.load(std::memory_order_relaxed) ||
+      if (shared->any_aborted.load(std::memory_order_relaxed) ||
           std::chrono::steady_clock::now() >= stage_deadline_tp) {
         break;
       }
-      ++active_worlds;
+      ++shared->active_worlds;
     }
     launched_worlds = w + 1;
 
@@ -245,58 +267,83 @@ inline int RunClockedPairedRolloutStage(
         decision_seed, static_cast<uint64_t>(world_seed_offset + w));
     const uint64_t s_seed = wseed + 999;
 
+    bool slot_launch_failed = false;
     for (size_t slot = 0; slot < num_cands; ++slot) {
-      const size_t c_idx = candidate_indices[slot];
-      const Action cand_a = ordered_candidates[c_idx];
-      std::unique_ptr<State> sim_state = nullptr;
-      if (dune) {
-        std::mt19937 wrng(wseed);
-        auto rng_func = [&wrng]() {
-          return std::generate_canonical<double, 53>(wrng);
-        };
-        sim_state = dune->ResampleFromInfostate(search_player, rng_func);
-      }
-      if (!sim_state) {
-        sim_state = state.Clone();
-      }
-      sim_state->ApplyAction(cand_a);
-      auto* s_ptr = sim_state.get();
-      size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
-      auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+      try {
+        const size_t c_idx = candidate_indices[slot];
+        const Action cand_a = ordered_candidates[c_idx];
+        std::unique_ptr<State> sim_state = nullptr;
+        if (dune) {
+          std::mt19937 wrng(wseed);
+          auto rng_func = [&wrng]() {
+            return std::generate_canonical<double, 53>(wrng);
+          };
+          sim_state = dune->ResampleFromInfostate(search_player, rng_func);
+        }
+        if (!sim_state) {
+          sim_state = state.Clone();
+        }
+        sim_state->ApplyAction(cand_a);
+        auto* s_ptr = sim_state.get();
+        size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
+        auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
 
-      futures.push_back(std::async(
-          std::launch::async,
-          [s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
-           s_seed, crn_mode, sample_opponent_leader_draft, stage_deadline_tp,
-           &trajs, w, slot, &world_remaining, &active_worlds, &any_aborted,
-           &cv_m, &cv]() mutable {
-            trajs[w][slot] = SimulateRolloutWithTurnTrajectory(
-                s_ptr, search_player, active_evaluator, s_seed,
-                SearchTruncationMode::kTerminal, crn_mode,
-                sample_opponent_leader_draft, &stage_deadline_tp);
-            if (trajs[w][slot].aborted_by_deadline) {
-              any_aborted.store(true, std::memory_order_relaxed);
-            }
-            {
-              std::lock_guard<std::mutex> lock(cv_m);
-              if (--world_remaining[w] == 0) {
-                --active_worlds;
+        futures.push_back(std::async(
+            std::launch::async,
+            [shared, s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
+             s_seed, crn_mode, sample_opponent_leader_draft, stage_deadline_tp,
+             w, slot]() mutable {
+              SlotReleaseGuard guard{shared, w, false};
+              shared->trajs[w][slot] = SimulateRolloutWithTurnTrajectory(
+                  s_ptr, search_player, active_evaluator, s_seed,
+                  SearchTruncationMode::kTerminal, crn_mode,
+                  sample_opponent_leader_draft, &stage_deadline_tp);
+              if (shared->trajs[w][slot].aborted_by_deadline) {
+                shared->any_aborted.store(true, std::memory_order_relaxed);
               }
-              cv.notify_all();
-            }
-          }));
+              guard.normal_finish = true;
+            }));
+      } catch (...) {
+        if (!first_exception) {
+          first_exception = std::current_exception();
+        }
+        shared->any_aborted.store(true, std::memory_order_relaxed);
+        {
+          std::lock_guard<std::mutex> lock(shared->cv_m);
+          shared->world_remaining[w] -= static_cast<int>(num_cands - slot);
+          if (shared->world_remaining[w] == 0) {
+            --shared->active_worlds;
+          }
+          shared->cv.notify_all();
+        }
+        slot_launch_failed = true;
+        break;
+      }
+    }
+    if (slot_launch_failed) {
+      break;
     }
   }
 
   for (auto& f : futures) {
-    f.get();
+    try {
+      f.get();
+    } catch (...) {
+      if (!first_exception) {
+        first_exception = std::current_exception();
+      }
+    }
+  }
+
+  if (first_exception) {
+    std::rethrow_exception(first_exception);
   }
 
   int kept_worlds = 0;
   for (int w = 0; w < launched_worlds; ++w) {
     bool world_ok = true;
     for (size_t slot = 0; slot < num_cands; ++slot) {
-      if (trajs[w][slot].aborted_by_deadline) {
+      if (shared->trajs[w][slot].aborted_by_deadline) {
         world_ok = false;
         break;
       }
@@ -308,10 +355,10 @@ inline int RunClockedPairedRolloutStage(
       const size_t c_idx = candidate_indices[slot];
       if (active_tree) {
         active_tree->RecordRollout(ordered_candidates[c_idx],
-                                   trajs[w][slot].intra_turn_actions,
-                                   trajs[w][slot].terminal_utility);
+                                   shared->trajs[w][slot].intra_turn_actions,
+                                   shared->trajs[w][slot].terminal_utility);
       }
-      per_candidate_rollouts[c_idx].push_back(trajs[w][slot].terminal_utility);
+      per_candidate_rollouts[c_idx].push_back(shared->trajs[w][slot].terminal_utility);
     }
     ++kept_worlds;
   }

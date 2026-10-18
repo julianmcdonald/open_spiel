@@ -1090,6 +1090,117 @@ void DepthGuardTest() {
   std::filesystem::remove_all(temp_dir);
 }
 
+class ThrowingRolloutState : public State {
+ public:
+  ThrowingRolloutState(std::shared_ptr<const Game> game, std::vector<Action> actions,
+                       int throw_world_id = 1, int sleep_ms = 2)
+      : State(game), actions_(std::move(actions)),
+        throw_world_id_(throw_world_id), sleep_ms_(sleep_ms) {}
+
+  Player CurrentPlayer() const override {
+    return phase_ == 3 ? kTerminalPlayerId : (phase_ == 1 ? kChancePlayerId : 0);
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return actions_;
+    if (phase_ == 1) return {0, 1};
+    if (phase_ == 2) return {99};
+    return {};
+  }
+  ActionsAndProbs ChanceOutcomes() const override { return {{0, 0.5}, {1, 0.5}}; }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "ThrowingRolloutState"; }
+  bool IsTerminal() const override { return phase_ == 3; }
+  std::vector<double> Returns() const override {
+    return {1.0, -1.0, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    auto copy = std::make_unique<ThrowingRolloutState>(*this);
+    copy->world_id_ = (global_clone_counter_++) / num_cands_;
+    return copy;
+  }
+
+  static void ResetCloneCounter(int num_cands = 2) {
+    global_clone_counter_ = 0;
+    num_cands_ = num_cands;
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    if (world_id_ == throw_world_id_ && phase_ > 0) {
+      throw std::runtime_error("simulated rollout exception");
+    }
+    if (sleep_ms_ > 0 && phase_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms_));
+    }
+    if (phase_ == 0) selected_ = action;
+    ++phase_;
+  }
+
+ private:
+  std::vector<Action> actions_;
+  int throw_world_id_;
+  int sleep_ms_;
+  int world_id_ = 0;
+  int phase_ = 0;
+  Action selected_ = kInvalidAction;
+  inline static std::atomic<int> global_clone_counter_{0};
+  inline static int num_cands_{2};
+};
+
+void ClockedExceptionSafetyTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+  const auto actions = Actions(2);
+
+  // 1. SuccessiveHalvingRolloutSearchDecision (50 iterations)
+  for (int i = 0; i < 50; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool caught = false;
+    try {
+      ThrowingRolloutState::ResetCloneCounter(2);
+      ThrowingRolloutState state(game, actions, /*throw_world_id=*/1, /*sleep_ms=*/2);
+      TurnSearchTree tree;
+      SuccessiveHalvingRolloutSearchDecision(
+          state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/16,
+          /*min_override_margin=*/0.15, /*decision_seed=*/42 + i,
+          SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+          /*max_time_ms=*/500.0);
+    } catch (const std::runtime_error& e) {
+      caught = true;
+      SPIEL_CHECK_EQ(std::string(e.what()), "simulated rollout exception");
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    SPIEL_CHECK_TRUE(caught);
+    SPIEL_CHECK_LT(elapsed_ms, 1000.0);
+  }
+
+  // 2. PairedPriorSortedRolloutSearchDecision (50 iterations)
+  for (int i = 0; i < 50; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool caught = false;
+    try {
+      ThrowingRolloutState::ResetCloneCounter(2);
+      ThrowingRolloutState state(game, actions, /*throw_world_id=*/1, /*sleep_ms=*/2);
+      TurnSearchTree tree;
+      PairedPriorSortedRolloutSearchDecision(
+          state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/16,
+          /*min_override_margin=*/0.15, /*min_t_stat=*/1.0, /*decision_seed=*/42 + i,
+          SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+          /*max_time_ms=*/500.0);
+    } catch (const std::runtime_error& e) {
+      caught = true;
+      SPIEL_CHECK_EQ(std::string(e.what()), "simulated rollout exception");
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    SPIEL_CHECK_TRUE(caught);
+    SPIEL_CHECK_LT(elapsed_ms, 1000.0);
+  }
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -1112,4 +1223,5 @@ int main() {
   ContiguousPrefixOrderingTest(game);
   ClockedVsUnclockedExactParityTest(game);
   DepthGuardTest();
+  ClockedExceptionSafetyTest(game);
 }
