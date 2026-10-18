@@ -31,6 +31,10 @@ ABSL_FLAG(std::string, src_optimizer,
 ABSL_FLAG(std::string, src_manifest,
           "/run/media/warcr/Storage/dune_drl_runtime/round7/u30650_12block_random_draft_overnight_20261006/checkpoints/ppo_model_update_31400.json",
           "Source JSON manifest path.");
+ABSL_FLAG(std::string, src_ema_model, "",
+          "Optional source EMA model path (if empty, auto-detects in src_model directory).");
+ABSL_FLAG(std::string, src_ema_manifest, "",
+          "Optional source EMA JSON manifest path (if empty, auto-detects in src_model directory).");
 ABSL_FLAG(std::string, out_dir,
           "/home/warcr/dune_drl_runtime/round7/u31400_16block_init",
           "Destination directory for 16-block model, optimizer and manifest.");
@@ -632,10 +636,12 @@ int main(int argc, char** argv) {
   std::string src_m_path = absl::GetFlag(FLAGS_src_model);
   std::string src_opt_path = absl::GetFlag(FLAGS_src_optimizer);
   std::string src_json_path = absl::GetFlag(FLAGS_src_manifest);
+  std::string src_ema_m_path = absl::GetFlag(FLAGS_src_ema_model);
+  std::string src_ema_json_path = absl::GetFlag(FLAGS_src_ema_manifest);
   std::string out_dir = absl::GetFlag(FLAGS_out_dir);
 
   std::cout << "======================================================================\n";
-  std::cout << "DUNE DRL CAPACITY PROBE: U31400 " << src_blocks << " -> " << dst_blocks << " RESIDUAL BLOCKS SURGERY TOOL\n";
+  std::cout << "DUNE DRL CAPACITY PROBE: " << src_blocks << " -> " << dst_blocks << " RESIDUAL BLOCKS SURGERY TOOL\n";
   std::cout << "======================================================================\n";
   std::cout << "Source model:     " << src_m_path << "\n";
   std::cout << "Source optimizer: " << src_opt_path << "\n";
@@ -662,6 +668,25 @@ int main(int argc, char** argv) {
   auto it_up = j_obj.find("global_update");
   if (it_up != j_obj.end() && it_up->second.IsInt()) {
     global_update = it_up->second.GetInt();
+  }
+
+  // Auto-detect sibling EMA model and manifest if not explicitly given
+  std::filesystem::path src_p(src_m_path);
+  std::filesystem::path parent_p = src_p.parent_path();
+  std::string auto_ema_m = (parent_p / ("ppo_model_ema_update_" + std::to_string(global_update) + ".pt")).string();
+  std::string auto_ema_j = (parent_p / ("ppo_model_ema_update_" + std::to_string(global_update) + ".json")).string();
+
+  if (src_ema_m_path.empty() && std::filesystem::exists(auto_ema_m)) {
+    src_ema_m_path = auto_ema_m;
+  }
+  if (src_ema_json_path.empty() && std::filesystem::exists(auto_ema_j)) {
+    src_ema_json_path = auto_ema_j;
+  }
+  if (!src_ema_m_path.empty()) {
+    std::cout << "Source EMA model:    " << src_ema_m_path << "\n";
+  }
+  if (!src_ema_json_path.empty()) {
+    std::cout << "Source EMA manifest: " << src_ema_json_path << "\n";
   }
 
   // 1. Build Source Model and Load
@@ -741,6 +766,116 @@ int main(int argc, char** argv) {
   std::string dst_m_sha = open_spiel::ComputeFileSHA256(dst_model_path, &dst_m_size);
   std::cout << "[B1 SURGERY] Saved " << dst_blocks << "-block model: " << dst_model_path
             << " (" << dst_m_size << " bytes, SHA=" << dst_m_sha << ")\n";
+
+  // 4b. EMA Model Surgery (if present)
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model_ema_src = nullptr;
+  std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model_ema_dst = nullptr;
+  std::string dst_ema_model_path = "";
+
+  if (!src_ema_m_path.empty() && std::filesystem::exists(src_ema_m_path)) {
+    std::cout << "\n[B1 EMA SURGERY] Loading source " << src_blocks << "-block EMA model: " << src_ema_m_path << "\n";
+    model_ema_src = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, src_blocks,
+        /*nonlinear=*/false, /*aux=*/false, /*seed=*/0, /*scorer=*/true);
+    open_spiel::LoadModelCheckpointRobust(model_ema_src, src_ema_m_path, device);
+    std::cout << "[B1 EMA SURGERY] Source " << src_blocks << "-block EMA model loaded successfully.\n";
+
+    std::cout << "[B1 EMA SURGERY] Constructing destination " << dst_blocks << "-block EMA model...\n";
+    model_ema_dst = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391, dst_blocks,
+        /*nonlinear=*/false, /*aux=*/false, /*seed=*/0, /*scorer=*/true);
+
+    {
+      torch::NoGradGuard no_grad;
+      // Input layer
+      model_ema_dst->input_layer->weight.copy_(model_ema_src->input_layer->weight);
+      if (model_ema_src->input_layer->bias.defined()) {
+        model_ema_dst->input_layer->bias.copy_(model_ema_src->input_layer->bias);
+      }
+
+      // Inherited residual blocks (0 .. src_blocks - 1)
+      for (int b = 0; b < src_blocks; ++b) {
+        model_ema_dst->res_blocks[b]->fc1->weight.copy_(model_ema_src->res_blocks[b]->fc1->weight);
+        model_ema_dst->res_blocks[b]->fc1->bias.copy_(model_ema_src->res_blocks[b]->fc1->bias);
+        model_ema_dst->res_blocks[b]->fc2->weight.copy_(model_ema_src->res_blocks[b]->fc2->weight);
+        model_ema_dst->res_blocks[b]->fc2->bias.copy_(model_ema_src->res_blocks[b]->fc2->bias);
+        model_ema_dst->res_blocks[b]->ln1->weight.copy_(model_ema_src->res_blocks[b]->ln1->weight);
+        model_ema_dst->res_blocks[b]->ln1->bias.copy_(model_ema_src->res_blocks[b]->ln1->bias);
+        model_ema_dst->res_blocks[b]->ln2->weight.copy_(model_ema_src->res_blocks[b]->ln2->weight);
+        model_ema_dst->res_blocks[b]->ln2->bias.copy_(model_ema_src->res_blocks[b]->ln2->bias);
+      }
+
+      // Copy the EXACT SAME newly initialized res_blocks[src_blocks..dst_blocks-1] from model_dst
+      for (int b = src_blocks; b < dst_blocks; ++b) {
+        model_ema_dst->res_blocks[b]->fc1->weight.copy_(model_dst->res_blocks[b]->fc1->weight);
+        model_ema_dst->res_blocks[b]->fc1->bias.copy_(model_dst->res_blocks[b]->fc1->bias);
+        model_ema_dst->res_blocks[b]->fc2->weight.copy_(model_dst->res_blocks[b]->fc2->weight);
+        model_ema_dst->res_blocks[b]->fc2->bias.copy_(model_dst->res_blocks[b]->fc2->bias);
+        model_ema_dst->res_blocks[b]->ln1->weight.copy_(model_dst->res_blocks[b]->ln1->weight);
+        model_ema_dst->res_blocks[b]->ln1->bias.copy_(model_dst->res_blocks[b]->ln1->bias);
+        model_ema_dst->res_blocks[b]->ln2->weight.copy_(model_dst->res_blocks[b]->ln2->weight);
+        model_ema_dst->res_blocks[b]->ln2->bias.copy_(model_dst->res_blocks[b]->ln2->bias);
+      }
+
+      // Policy head
+      model_ema_dst->policy_head->weight.copy_(model_ema_src->policy_head->weight);
+      if (model_ema_src->policy_head->bias.defined()) {
+        model_ema_dst->policy_head->bias.copy_(model_ema_src->policy_head->bias);
+      }
+
+      // Value head
+      model_ema_dst->value_head->weight.copy_(model_ema_src->value_head->weight);
+      if (model_ema_src->value_head->bias.defined()) {
+        model_ema_dst->value_head->bias.copy_(model_ema_src->value_head->bias);
+      }
+
+      // Semantic scorer
+      if (model_ema_src->semantic_scorer_ && model_ema_dst->semantic_scorer_) {
+        for (const auto& pair : model_ema_src->semantic_scorer_->named_parameters()) {
+          model_ema_dst->semantic_scorer_->named_parameters()[pair.key()].copy_(pair.value());
+        }
+        for (const auto& pair : model_ema_src->semantic_scorer_->named_buffers()) {
+          model_ema_dst->semantic_scorer_->named_buffers()[pair.key()].copy_(pair.value());
+        }
+      }
+    }
+    std::cout << "[B1 EMA SURGERY] Layers copied: input_layer, res1-" << src_blocks
+              << ", policy_head, value_head, semantic_scorer from source EMA.\n";
+    std::cout << "[B1 EMA SURGERY] res" << (src_blocks + 1) << "-res" << dst_blocks
+              << " copied identically from destination live model.\n";
+
+    dst_ema_model_path = out_dir + "/ppo_model_ema_update_" + std::to_string(global_update) + ".pt";
+    torch::save(model_ema_dst, dst_ema_model_path);
+    size_t dst_ema_m_size = 0;
+    std::string dst_ema_m_sha = open_spiel::ComputeFileSHA256(dst_ema_model_path, &dst_ema_m_size);
+    std::cout << "[B1 EMA SURGERY] Saved " << dst_blocks << "-block EMA model: " << dst_ema_model_path
+              << " (" << dst_ema_m_size << " bytes, SHA=" << dst_ema_m_sha << ")\n";
+
+    if (!src_ema_json_path.empty() && std::filesystem::exists(src_ema_json_path)) {
+      std::ifstream src_ema_jf(src_ema_json_path);
+      if (!src_ema_jf.is_open()) {
+        open_spiel::SpielFatalError("Cannot open src_ema_manifest: " + src_ema_json_path);
+      }
+      std::string j_ema_content((std::istreambuf_iterator<char>(src_ema_jf)), std::istreambuf_iterator<char>());
+      src_ema_jf.close();
+
+      auto j_ema_opt = open_spiel::json::FromString(j_ema_content);
+      if (!j_ema_opt) open_spiel::SpielFatalError("Failed parsing source EMA manifest JSON");
+      auto j_ema_obj = j_ema_opt->GetObject();
+
+      j_ema_obj["num_blocks"] = open_spiel::json::Value(static_cast<int64_t>(dst_blocks));
+      j_ema_obj["model_filename"] = open_spiel::json::Value("ppo_model_ema_update_" + std::to_string(global_update) + ".pt");
+      j_ema_obj["model_file_size"] = open_spiel::json::Value(static_cast<int64_t>(dst_ema_m_size));
+      j_ema_obj["model_sha256"] = open_spiel::json::Value(dst_ema_m_sha);
+
+      std::string dst_ema_json_path = out_dir + "/ppo_model_ema_update_" + std::to_string(global_update) + ".json";
+      std::ofstream out_ema_jf(dst_ema_json_path);
+      out_ema_jf << open_spiel::json::ToString(open_spiel::json::Value(j_ema_obj));
+      out_ema_jf.close();
+      std::cout << "[B1 EMA MANIFEST] Saved updated EMA manifest with num_blocks=" << dst_blocks
+                << ": " << dst_ema_json_path << "\n";
+    }
+  }
 
   // 5. Optimizer Migration
   std::cout << "\n[B2 OPTIMIZER] Setting up source and destination AdamW optimizers...\n";
@@ -967,11 +1102,21 @@ int main(int argc, char** argv) {
   // 8. Verify B3 Identity Checks
   std::string obs_bin = absl::GetFlag(FLAGS_test_obs_bin);
   int test_count = absl::GetFlag(FLAGS_test_states_count);
+  std::cout << "\n[B3 LIVE TEST] Verifying Forward Identity on Live models (" << test_count << " states)\n";
   VerifyB3Identity(model_src, model_dst, obs_bin, test_count);
+  if (model_ema_src && model_ema_dst) {
+    std::cout << "\n[B3 EMA TEST] Verifying Forward Identity on EMA models (" << test_count << " states)\n";
+    VerifyB3Identity(model_ema_src, model_ema_dst, obs_bin, test_count);
+  }
 
   // 9. Verify 3c Native Effect Check (Self-test on step-0 checkpoint: all zeros expected)
   std::string meta_jsonl = absl::GetFlag(FLAGS_test_meta_jsonl);
+  std::cout << "\n[3c LIVE NATIVE EFFECT CHECK] Auditing destination live model\n";
   RunNativeEffectCheck(dst_model_path, obs_bin, meta_jsonl, test_count, dst_blocks, src_blocks);
+  if (!dst_ema_model_path.empty()) {
+    std::cout << "\n[3c EMA NATIVE EFFECT CHECK] Auditing destination EMA model\n";
+    RunNativeEffectCheck(dst_ema_model_path, obs_bin, meta_jsonl, test_count, dst_blocks, src_blocks);
+  }
 
   std::cout << "\n======================================================================\n";
   std::cout << "ALL B1, B2, AND B3 SURGERY & IDENTITY VERIFICATIONS PASSED ("
