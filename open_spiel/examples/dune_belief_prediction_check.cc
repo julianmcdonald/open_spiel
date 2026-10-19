@@ -44,21 +44,6 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/utils/json.h"
 
-// Link satisfaction flags
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "");
-ABSL_FLAG(double, logit_cap, 10.0, "");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 0, "");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 
 ABSL_FLAG(std::string, model_checkpoint, "", "Opponent model used for the belief (and for play).");
 ABSL_FLAG(int, num_blocks, 12, "Residual blocks in --model_checkpoint (8 or 12).");

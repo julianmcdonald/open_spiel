@@ -6,26 +6,11 @@
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/spiel_utils.h"
 
 #include "dune_search_pi.h"
 
-// Link-only definitions required by dune_ppo_training_utils.cc.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "INERT test link flag");
-ABSL_FLAG(int, ppo_update_epochs, 4, "INERT test link flag");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "INERT test link flag");
-ABSL_FLAG(bool, normalize_advantages, true, "INERT test link flag");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "INERT test link flag");
-ABSL_FLAG(double, entropy_coef, 0.01, "INERT test link flag");
-ABSL_FLAG(double, value_coef, 0.5, "INERT test link flag");
-ABSL_FLAG(double, target_kl, 0.0, "INERT test link flag");
-ABSL_FLAG(bool, train_amp, true, "INERT test link flag");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "INERT test link flag");
-ABSL_FLAG(double, logit_cap, 10.0, "INERT test link flag");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
-          "INERT test link flag");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "INERT test link flag");
-ABSL_FLAG(bool, diagnostics_only, false, "INERT test link flag");
 
 namespace open_spiel {
 namespace {

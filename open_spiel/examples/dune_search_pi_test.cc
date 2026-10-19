@@ -21,6 +21,7 @@
 #include "open_spiel/spiel_utils.h"
 #include "dune_online_search_collector.h"
 #include "dune_ppo_training_utils.h"  // CenterAndCapLogitsTensor, for the
+#include "dune_ppo_training_flags.h"
                                       // independent gradient recomputation in
                                       // test 14
 #include "dune_search_session.h"
@@ -35,20 +36,6 @@
 // its CE runs on the same masked-logit convention as everything else. None of
 // these flags is read by the search-PI learner; they exist so TrainPpoUpdate,
 // which this test never calls, resolves at link time.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, logit_cap, 10.0, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 
 namespace open_spiel {
 namespace {

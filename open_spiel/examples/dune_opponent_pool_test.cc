@@ -24,48 +24,13 @@
 #include "dune_sha256.h"
 #include "dune_opponent_pool.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/utils/json.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.015, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, logit_cap, 10.0, "");
-ABSL_FLAG(double, target_kl, 0.01, "");
-ABSL_FLAG(bool, train_amp, false, "");
-ABSL_FLAG(bool, allow_tf32, false, "");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
-ABSL_FLAG(int, hidden_dim, 2048, "");
-ABSL_FLAG(int, num_blocks, 8, "");
 ABSL_FLAG(int, seed_scheme_version, 2, "");
 ABSL_FLAG(std::string, model_checkpoint, "", "");
 ABSL_FLAG(std::string, optim_checkpoint, "", "");
-ABSL_FLAG(bool, nonlinear_value_head, false, "");
-ABSL_FLAG(std::string, market_appendix_mode, "full_public_information_v3", "");
-ABSL_FLAG(uint64_t, head_init_constant, 0, "");
-ABSL_FLAG(bool, enable_semantic_scorer, true, "");
-ABSL_FLAG(double, specimen_exchange_penalty, 0.0, "");
-ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
-ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
-ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
-ABSL_FLAG(int, rollout_games, 256, "");
-ABSL_FLAG(bool, enable_ema_tracking, false, "");
-ABSL_FLAG(double, ema_half_life, 100.0, "");
-ABSL_FLAG(double, ema_decay, 0.0, "");
-ABSL_FLAG(std::string, ema_model_checkpoint, "", "");
-ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "");
-ABSL_FLAG(bool, allow_ema_magnet_transition, false, "");
-ABSL_FLAG(double, ema_magnet_transition_source_coef, 0.0, "");
-ABSL_FLAG(std::string, ema_magnet_transition_source_fingerprint, "", "");
-ABSL_FLAG(double, pool_game_fraction, 0.0, "");
-ABSL_FLAG(int, pool_opponents_per_game, 0, "");
-ABSL_FLAG(bool, allow_pool_transition, false, "");
-ABSL_FLAG(std::string, pool_transition_source_fingerprint, "", "");
 
 #define TEST_CHECK(cond)                                                       \
   do {                                                                         \

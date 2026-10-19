@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
+#include "dune_ppo_training_flags.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_split.h"
 #include "open_spiel/spiel_utils.h"
@@ -59,22 +60,6 @@ ABSL_FLAG(double, treatment_lambda, 1.0,
 
 // Link-only definitions required by dune_ppo_training_utils.cc.  The offline
 // lane calls only CenterAndCapLogitsTensor; none of these flags is read.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "INERT here (link satisfaction)");
-ABSL_FLAG(int, ppo_update_epochs, 4, "INERT here (link satisfaction)");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, normalize_advantages, true, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "INERT here (link satisfaction)");
-ABSL_FLAG(double, entropy_coef, 0.01, "INERT here (link satisfaction)");
-ABSL_FLAG(double, value_coef, 0.5, "INERT here (link satisfaction)");
-ABSL_FLAG(double, target_kl, 0.0, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, train_amp, true, "INERT here (link satisfaction)");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "INERT here (link satisfaction)");
-ABSL_FLAG(double, logit_cap, 10.0, "INERT here (link satisfaction)");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
-          "INERT here (link satisfaction)");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
-          "INERT here (link satisfaction)");
-ABSL_FLAG(bool, diagnostics_only, false, "INERT here (link satisfaction)");
 
 namespace open_spiel {
 namespace {

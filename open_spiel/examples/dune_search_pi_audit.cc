@@ -122,7 +122,6 @@ ABSL_FLAG(double, search_pi_unsearched_role_temperature, 1.0,
 ABSL_FLAG(uint64_t, search_pi_seed_domain, 0, "REQUIRED nonzero.");
 
 // --- Machinery -------------------------------------------------------------
-ABSL_FLAG(double, logit_cap, 10.0, "Evaluator logit cap. The trainer's default.");
 
 // dune_ppo_training_utils.cc DECLARES these and dune_ppo_train.cc defines them,
 // so a binary that links the former without the latter has to supply them --
@@ -130,19 +129,6 @@ ABSL_FLAG(double, logit_cap, 10.0, "Evaluator logit cap. The trainer's default."
 // dune_search_pi.cc needs CenterAndCapLogitsTensor from that translation unit,
 // which drags in TrainPpoUpdate, which this binary never calls. Only
 // --logit_cap above is read here; the rest exist to resolve at link time.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 ABSL_FLAG(int, seed, 20276001,
           "Master seed. Feeds torch::manual_seed exactly as the trainer does; "
           "it does not seed the game, which draws from --search_pi_seed_domain.");

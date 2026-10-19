@@ -99,20 +99,6 @@ ABSL_FLAG(std::string, diag_output_dir, "", "Output directory for diagnostic res
 
 
 // Link-only flag definitions required by dune_ppo_training_utils.cc
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "INERT here (link satisfaction)");
-ABSL_FLAG(int, ppo_update_epochs, 4, "INERT here (link satisfaction)");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, normalize_advantages, true, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "INERT here (link satisfaction)");
-ABSL_FLAG(double, entropy_coef, 0.01, "INERT here (link satisfaction)");
-ABSL_FLAG(double, value_coef, 0.5, "INERT here (link satisfaction)");
-ABSL_FLAG(double, target_kl, 0.0, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, train_amp, true, "INERT here (link satisfaction)");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "INERT here (link satisfaction)");
-ABSL_FLAG(double, logit_cap, 10.0, "INERT here (link satisfaction)");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543, "INERT here (link satisfaction)");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0, "INERT here (link satisfaction)");
-ABSL_FLAG(bool, diagnostics_only, false, "INERT here (link satisfaction)");
 
 namespace open_spiel {
 namespace dune_pilot {

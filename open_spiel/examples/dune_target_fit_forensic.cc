@@ -45,25 +45,9 @@ ABSL_FLAG(std::string, output, "", "Output JSON path.");
 ABSL_FLAG(int, observation_size, 5580, "Model input width.");
 ABSL_FLAG(int, action_dim, 2391, "Policy vocabulary size.");
 ABSL_FLAG(int, batch_size, 256, "Inference batch size.");
-ABSL_FLAG(double, logit_cap, 10.0, "Learner's legal-centered tanh logit cap.");
 
 // Link-only definitions required by dune_ppo_training_utils.cc. The forensic
 // calls only CenterAndCapLogitsTensor; none of these flags is read on its path.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "INERT here (link satisfaction).");
-ABSL_FLAG(int, ppo_update_epochs, 4, "INERT here (link satisfaction).");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "INERT here (link satisfaction).");
-ABSL_FLAG(bool, normalize_advantages, true, "INERT here (link satisfaction).");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "INERT here (link satisfaction).");
-ABSL_FLAG(double, entropy_coef, 0.01, "INERT here (link satisfaction).");
-ABSL_FLAG(double, value_coef, 0.5, "INERT here (link satisfaction).");
-ABSL_FLAG(double, target_kl, 0.0, "INERT here (link satisfaction).");
-ABSL_FLAG(bool, train_amp, true, "INERT here (link satisfaction).");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "INERT here (link satisfaction).");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
-          "INERT here (link satisfaction).");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
-          "INERT here (link satisfaction).");
-ABSL_FLAG(bool, diagnostics_only, false, "INERT here (link satisfaction).");
 
 namespace open_spiel {
 namespace {

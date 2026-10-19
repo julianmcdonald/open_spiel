@@ -80,8 +80,6 @@ ABSL_FLAG(double, weight_decay, 0.0, "Weight decay for AdamW (0.0).");
 ABSL_FLAG(int, minibatch_size, 256, "Minibatch size.");
 ABSL_FLAG(int, epochs, 1, "Training epochs.");
 ABSL_FLAG(double, policy_coef, 1.0, "Policy cross-entropy coefficient.");
-ABSL_FLAG(double, value_coef, 0.5, "Value MSE coefficient.");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "Gradient clipping norm.");
 
 // Output paths
 ABSL_FLAG(std::string, output_train_jsonl, "", "Path to write training rows JSONL.");
@@ -94,16 +92,6 @@ ABSL_FLAG(std::string, input_train_jsonl, "", "Path to read training rows for tr
 ABSL_FLAG(std::string, input_heldout_jsonl, "", "Path to read heldout rows for train mode.");
 
 // Link-only PPO flag definitions required by dune_ppo_training_utils.cc.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, logit_cap, 10.0, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 
 namespace open_spiel {
 namespace {

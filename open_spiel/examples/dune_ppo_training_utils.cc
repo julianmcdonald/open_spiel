@@ -25,20 +25,8 @@
 #include <cmath>
 
 
-ABSL_DECLARE_FLAG(int, ppo_minibatch_size);
-ABSL_DECLARE_FLAG(int, ppo_update_epochs);
-ABSL_FLAG(double, policy_kl_anchor_coeff, 0.0, "Coefficient for policy KL anchor penalty to prevent policy drift when unfreezing trunk in value-only training");
-ABSL_DECLARE_FLAG(double, ppo_clip_epsilon);
-ABSL_DECLARE_FLAG(bool, normalize_advantages);
-ABSL_DECLARE_FLAG(bool, ppo_clip_value_loss);
-ABSL_DECLARE_FLAG(double, entropy_coef);
-ABSL_DECLARE_FLAG(double, value_coef);
-ABSL_DECLARE_FLAG(double, logit_cap);
-ABSL_DECLARE_FLAG(double, target_kl);
-ABSL_DECLARE_FLAG(bool, train_amp);
-ABSL_DECLARE_FLAG(double, grad_clip_norm);
-ABSL_DECLARE_FLAG(bool, diagnostics_only);
 #include "dune_ppo_training_flags.h"
+ABSL_FLAG(double, policy_kl_anchor_coeff, 0.0, "Coefficient for policy KL anchor penalty to prevent policy drift when unfreezing trunk in value-only training");
 
 std::string g_reward_transition_source_fingerprint = "";
 int64_t g_reward_transition_source_update = -1;

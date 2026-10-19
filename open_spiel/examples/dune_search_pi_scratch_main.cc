@@ -26,24 +26,11 @@
 #include "dune_search_pi_replay.h"
 #include "dune_search_pi_scratch.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_training_flags.h"
 #include "dune_evaluator.h"
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
 #include "open_spiel/examples/dune_hotspot_profile.h"
-
-// Link-only PPO flag definitions required by dune_ppo_training_utils.cc. The
-// scratch learner never reads them; they keep this standalone executable from
-// depending on dune_ppo_train.cc (and therefore from acquiring PPO behavior).
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 
 ABSL_FLAG(std::string, profile, open_spiel::kWarmSearchPiProfile,
           "ppo_warm_q_v1, ppo_warm_cmpo_norm_v1, scratch_q_v1 or scratch_visit_v1");
@@ -59,9 +46,6 @@ ABSL_FLAG(int, generations, 5, "Total generation boundary to reach.");
 ABSL_FLAG(int, games_per_generation, 128, "Complete games per generation.");
 ABSL_FLAG(int64_t, first_episode_id, 0, "Initial episode cursor.");
 ABSL_FLAG(uint64_t, seed, 8271001, "Master seed and search stream domain.");
-ABSL_FLAG(int, hidden_dim, 2048, "Network width.");
-ABSL_FLAG(int, num_blocks, 8, "Residual blocks.");
-ABSL_FLAG(bool, nonlinear_value_head, false, "Nonlinear value head.");
 ABSL_FLAG(int, workers, 32, "Concurrent complete-game workers.");
 ABSL_FLAG(int, batch_target, 64, "Shared inference batch target.");
 ABSL_FLAG(int, inference_lanes, 1,
@@ -92,29 +76,8 @@ ABSL_FLAG(int, replay_generations, 4, "Recent shard window.");
 ABSL_FLAG(double, learning_rate, 1e-4, "Search learner AdamW LR.");
 ABSL_FLAG(int, minibatch_size, 256, "Search learner minibatch size.");
 ABSL_FLAG(int, epochs, 1, "Search learner epochs.");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "Gradient clip norm.");
-ABSL_FLAG(double, logit_cap, 10.0, "Legal-centered tanh logit cap.");
 ABSL_FLAG(double, intermediate_vp_breadcrumb_weight, 0.2,
           "Training-only intermediate VP breadcrumb weight.");
-ABSL_FLAG(double, specimen_exchange_penalty, 0.02,
-          "Positive training-only anti-breadcrumb penalty.");
-// The rest of the flags dune_ppo_training_utils.cc reads, with the trainer's
-// defaults. This binary defines them itself, rather than linking
-// dune_ppo_training_flags.cc, to keep its 0.02 specimen default above.
-ABSL_FLAG(int, rollout_games, 0, "Unused here; read by training utils.");
-ABSL_FLAG(std::string, market_appendix_mode, "none", "Card-slot input mode.");
-ABSL_FLAG(bool, allow_tf32, true, "Allow TF32 for CUDA CuBLAS/CuDNN.");
-ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the semantic action scorer.");
-ABSL_FLAG(double, family_atomics_penalty, 0.0, "Training-only Family Atomics penalty.");
-ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "Training-only plot intrigue penalty.");
-ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "Plot intrigue penalty exemption.");
-ABSL_FLAG(uint64_t, head_init_constant, 20260800, "PWO-5 kHeadInitConstant.");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
-          "Environment transition count at which shaping decay starts.");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 10000000,
-          "Environment transition count over which shaping decays.");
-ABSL_FLAG(bool, enable_ema_tracking, false, "Unused here; read by training utils.");
-ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "Unused here; read by training utils.");
 
 namespace open_spiel {
 namespace {
@@ -656,6 +619,9 @@ void ValidateCollection(const ConcurrentSearchPiCollectionResult& result,
 }  // namespace open_spiel
 
 int main(int argc, char** argv) {
+  absl::SetFlag(&FLAGS_specimen_exchange_penalty, 0.02);
+  absl::SetFlag(&FLAGS_shaping_start_env_steps, 0);
+  absl::SetFlag(&FLAGS_shaping_decay_env_steps, 10000000);
   absl::ParseCommandLine(argc, argv);
   using namespace open_spiel;
   const std::string profile = absl::GetFlag(FLAGS_profile);

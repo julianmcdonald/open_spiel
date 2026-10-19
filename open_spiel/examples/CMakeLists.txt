@@ -12,6 +12,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc dune_search_pi_scratch.cc dune_search_pi_replay.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
+  add_executable(dune_luck_variance_audit
+    dune_luck_variance_audit.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
+    dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_luck_variance_audit dune_search ${TORCH_LIBRARIES})
+
   add_executable(dune_evaluator dune_evaluator.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator ${TORCH_LIBRARIES})
 
@@ -100,7 +106,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_search_pi_scratch
     dune_search_pi_scratch_main.cc dune_search_pi_scratch.cc
     dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
-    dune_ppo_training_utils.cc dune_online_search_collector.cc
+    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_scratch dune_search ${TORCH_LIBRARIES})
 
@@ -490,7 +496,7 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_fidelity_seeds_test ${TORCH_LIBRARIES})
   add_test(NAME dune_fidelity_seeds_test COMMAND dune_fidelity_seeds_test)
 
-  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_training_utils_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_ppo_training_utils_test COMMAND dune_ppo_training_utils_test)
   set_tests_properties(dune_ppo_training_utils_test PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/..")
@@ -530,13 +536,13 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_test(NAME dune_offline_utils_test COMMAND dune_offline_utils_test)
 
   add_executable(dune_opponent_pool_test dune_opponent_pool_test.cc
-    dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_opponent_pool_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_opponent_pool_test COMMAND dune_opponent_pool_test)
 
   add_executable(dune_semantic_verification_test dune_semantic_verification_test.cc
     ../games/dune_imperium/dune_imperium_test_utils.cc
-    dune_ppo_training_utils.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_semantic_verification_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_semantic_verification_test COMMAND dune_semantic_verification_test)
 

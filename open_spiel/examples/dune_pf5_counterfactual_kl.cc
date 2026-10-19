@@ -78,9 +78,6 @@ ABSL_FLAG(std::string, search_label_dir,
 ABSL_FLAG(bool, with_aux_heads, true,
           "PWO-5 pilot checkpoints (P/T/H alike) carry the three auxiliary "
           "heads. torch::load fails loudly if this is wrong.");
-ABSL_FLAG(double, logit_cap, 10.0,
-          "MUST equal the value the arm trained under, or the statistic is "
-          "not the one diagnostics.csv reports. All six PWO-5 arms ran 10.0.");
 ABSL_FLAG(int, expect_validation_rows, 3541,
           "Registered. The pack manifest records validation_label_count=3541. "
           "Asserted, not assumed -- a silently smaller population would move "
@@ -106,21 +103,6 @@ ABSL_FLAG(int, update, -1, "Recorded verbatim (the checkpoint's update).");
 // defaults and are inert.
 //
 // dune_ppo_training_utils_test.cc carries the same block for the same reason.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "INERT here (link-satisfaction).");
-ABSL_FLAG(int, ppo_update_epochs, 4, "INERT here (link-satisfaction).");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "INERT here (link-satisfaction).");
-ABSL_FLAG(bool, normalize_advantages, true, "INERT here (link-satisfaction).");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "INERT here (link-satisfaction).");
-ABSL_FLAG(double, entropy_coef, 0.01, "INERT here (link-satisfaction).");
-ABSL_FLAG(double, value_coef, 0.5, "INERT here (link-satisfaction).");
-ABSL_FLAG(double, target_kl, 0.0, "INERT here (link-satisfaction).");
-ABSL_FLAG(bool, train_amp, true, "INERT here (link-satisfaction).");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "INERT here (link-satisfaction).");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
-          "INERT here (link-satisfaction).");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
-          "INERT here (link-satisfaction).");
-ABSL_FLAG(bool, diagnostics_only, false, "INERT here (link-satisfaction).");
 
 namespace {
 

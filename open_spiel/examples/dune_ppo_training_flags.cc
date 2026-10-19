@@ -71,6 +71,28 @@ ABSL_FLAG(uint64_t, head_init_constant, 20260800,
           "would give T1/P1/H1 one set and T2/P2/H2 another. Outside the "
           "reserved final-gate base-seed range by section 10.2's arithmetic.");
 
+// PPO optimization and loss hyperparameters.
+ABSL_FLAG(int, ppo_minibatch_size, 2048, "PPO minibatch size.");
+ABSL_FLAG(int, ppo_update_epochs, 4, "PPO epochs per rollout batch.");
+ABSL_FLAG(bool, normalize_advantages, true,
+          "Normalize advantages within each PPO minibatch.");
+ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "PPO surrogate/value clip epsilon.");
+ABSL_FLAG(bool, ppo_clip_value_loss, true, "Use clipped value loss.");
+ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient.");
+ABSL_FLAG(double, value_coef, 0.5, "Value loss coefficient.");
+ABSL_FLAG(double, grad_clip_norm, 0.5, "Maximum gradient norm.");
+ABSL_FLAG(double, target_kl, 0.0,
+          "Stop PPO epochs early if approximate KL exceeds this value. <=0 disables.");
+ABSL_FLAG(double, logit_cap, 10.0,
+          "Smooth tanh cap on legal-centered policy logits. <=0 disables.");
+ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
+ABSL_FLAG(bool, diagnostics_only, false,
+          "Collect one rollout, write diagnostics, and exit without optimization.");
+ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
+          "Environment steps at which shaped reward decay starts.");
+ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
+          "Environment steps duration for shaped reward decay (0 means no decay).");
+
 // 12-block H/J study flags.
 ABSL_FLAG(bool, enable_ema_tracking, false,
           "Enable persistent EMA tracking for evaluation and play.");

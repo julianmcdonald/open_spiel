@@ -98,8 +98,6 @@ ABSL_FLAG(int, threads, 64, "Rollout worker threads.");
 ABSL_FLAG(int, total_updates, 1000, "Number of PPO collect/update cycles.");
 ABSL_FLAG(int, rollout_transitions, 32768,
           "Minimum on-policy transitions collected before each PPO update.");
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "PPO minibatch size.");
-ABSL_FLAG(int, ppo_update_epochs, 4, "PPO epochs per rollout batch.");
 ABSL_FLAG(double, learning_rate, 2.5e-4, "AdamW learning rate.");
 ABSL_FLAG(double, new_block_lr, 0.0,
           "AdamW learning rate for newly appended residual blocks (<=0 disables).");
@@ -108,24 +106,12 @@ ABSL_FLAG(int, new_block_first_index, 8,
 ABSL_FLAG(bool, anneal_lr, true, "Linearly anneal learning rate over updates.");
 ABSL_FLAG(double, gamma, 1.0, "Discount factor.");
 ABSL_FLAG(double, gae_lambda, 1.0, "GAE lambda.");
-ABSL_FLAG(bool, normalize_advantages, true,
-          "Normalize advantages within each PPO minibatch.");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "PPO surrogate/value clip epsilon.");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "Use clipped value loss.");
-ABSL_FLAG(double, entropy_coef, 0.01, "Entropy bonus coefficient.");
-ABSL_FLAG(double, value_coef, 0.5, "Value loss coefficient.");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "Maximum gradient norm.");
-ABSL_FLAG(double, target_kl, 0.0,
-          "Stop PPO epochs early if approximate KL exceeds this value. <=0 disables.");
 ABSL_FLAG(double, weight_decay, 0.0, "AdamW weight decay for torso/value params.");
 ABSL_FLAG(double, policy_weight_decay, 0.0,
           "AdamW weight decay for policy-head params.");
 
 ABSL_FLAG(int, eval_batch_size, 32, "Target inference batch size.");
 ABSL_FLAG(int, eval_timeout_ms, 2, "Inference batch timeout in milliseconds.");
-ABSL_FLAG(double, logit_cap, 10.0,
-          "Smooth tanh cap on legal-centered policy logits. <=0 disables.");
-ABSL_FLAG(bool, train_amp, true, "Use CUDA BF16 autocast for PPO updates.");
 ABSL_FLAG(std::string, verification_sidecar_path, "",
           "Direct path for verification sidecar JSONL. Records full-precision KLs "
           "and complete input digests.");
@@ -133,7 +119,6 @@ ABSL_FLAG(bool, evaluator_device_synchronize, true,
           "Use whole-device CUDA synchronize after evaluator D2H copies.");
 ABSL_FLAG(bool, deterministic, true, "Enable strict PyTorch/LibTorch deterministic algorithms.");
 ABSL_FLAG(bool, deterministic_rollout_eval, false, "Use deterministic batch-1 rollout evaluation.");
-ABSL_FLAG(bool, diagnostics_only, false, "Collect one rollout, write diagnostics, and exit without optimization.");
 ABSL_FLAG(std::string, numerical_parity_output, "",
           "Fresh output JSON for the read-only rollout-BF16 versus learner-FP32 "
           "parity gate. Requires --diagnostics_only and --init_mode=diagnostic; "
@@ -740,10 +725,6 @@ ABSL_FLAG(std::string, search_pi_origin_config_fingerprint, "",
 
 ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 206830543,
-          "Environment steps at which shaped reward decay starts.");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 0,
-          "Environment steps duration for shaped reward decay (0 means no decay).");
 ABSL_FLAG(int, seed_scheme_version, 2, "Seed scheme version.");
 ABSL_FLAG(int, target_end_update, 2450, "Absolute target update number to train until.");
 ABSL_FLAG(int, start_update, 1, "Fallback start update for bootstrap mode.");

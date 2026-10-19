@@ -24,6 +24,22 @@ ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);
 ABSL_DECLARE_FLAG(int, plot_intrigue_exemption_threshold);
 ABSL_DECLARE_FLAG(uint64_t, head_init_constant);
 
+// PPO optimization and loss hyperparameters.
+ABSL_DECLARE_FLAG(int, ppo_minibatch_size);
+ABSL_DECLARE_FLAG(int, ppo_update_epochs);
+ABSL_DECLARE_FLAG(bool, normalize_advantages);
+ABSL_DECLARE_FLAG(double, ppo_clip_epsilon);
+ABSL_DECLARE_FLAG(bool, ppo_clip_value_loss);
+ABSL_DECLARE_FLAG(double, entropy_coef);
+ABSL_DECLARE_FLAG(double, value_coef);
+ABSL_DECLARE_FLAG(double, grad_clip_norm);
+ABSL_DECLARE_FLAG(double, target_kl);
+ABSL_DECLARE_FLAG(double, logit_cap);
+ABSL_DECLARE_FLAG(bool, train_amp);
+ABSL_DECLARE_FLAG(bool, diagnostics_only);
+ABSL_DECLARE_FLAG(uint64_t, shaping_start_env_steps);
+ABSL_DECLARE_FLAG(uint64_t, shaping_decay_env_steps);
+
 // 12-block H/J study flags.
 ABSL_DECLARE_FLAG(bool, enable_ema_tracking);
 ABSL_DECLARE_FLAG(double, ema_half_life);

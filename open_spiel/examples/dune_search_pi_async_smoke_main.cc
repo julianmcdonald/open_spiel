@@ -30,6 +30,7 @@
 #include "open_spiel/utils/json.h"
 #include "dune_batched_evaluator.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_training_flags.h"
 #include "dune_seed_utils.h"
 #include "dune_search_pi.h"
 #include "dune_search_pi_async_resume.h"
@@ -38,16 +39,6 @@
 #include "dune_split_evaluator.h"
 
 // Link-only PPO flag definitions required by dune_ppo_training_utils.cc.
-ABSL_FLAG(int, ppo_minibatch_size, 2048, "");
-ABSL_FLAG(int, ppo_update_epochs, 4, "");
-ABSL_FLAG(double, ppo_clip_epsilon, 0.2, "");
-ABSL_FLAG(bool, normalize_advantages, true, "");
-ABSL_FLAG(bool, ppo_clip_value_loss, true, "");
-ABSL_FLAG(double, entropy_coef, 0.01, "");
-ABSL_FLAG(double, value_coef, 0.5, "");
-ABSL_FLAG(double, target_kl, 0.0, "");
-ABSL_FLAG(bool, train_amp, true, "");
-ABSL_FLAG(bool, diagnostics_only, false, "");
 
 ABSL_FLAG(std::string, output_dir, "", "Async smoke runtime.");
 ABSL_FLAG(uint64_t, seed, 8291999, "Master seed.");
@@ -69,8 +60,6 @@ ABSL_FLAG(double, full_root_probability, 0.25, "Full root probability.");
 ABSL_FLAG(double, relative_time_budget_ms, 600000.0,
           "Per-root liveness watchdog.");
 ABSL_FLAG(int, minibatch_size, 256, "Learner minibatch size.");
-ABSL_FLAG(double, logit_cap, 10.0, "Learner logit cap.");
-ABSL_FLAG(double, grad_clip_norm, 0.5, "Learner gradient clip.");
 ABSL_FLAG(bool, reset_replay_buffer_on_resume, false,
           "Whether to reset the replay window on resume from production manifest.");
 ABSL_FLAG(bool, crash_after_update, false,
@@ -87,10 +76,6 @@ ABSL_FLAG(std::string, production_checkpoint_manifest, "",
 ABSL_FLAG(std::string, production_run_dir, "",
           "Standard production run root for checkpoints and telemetry.");
 ABSL_FLAG(size_t, replay_max_rows, 200000, "Maximum replay rows sampled per update.");
-ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
-          "Environment step at which shaping decay starts.");
-ABSL_FLAG(uint64_t, shaping_decay_env_steps, 10000000,
-          "Environment steps over which shaping decays.");
 
 namespace open_spiel {
 namespace {
