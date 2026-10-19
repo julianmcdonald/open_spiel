@@ -115,7 +115,7 @@ openspiel_optional_dependency(OPEN_SPIEL_BUILD_WITH_JULIA          OFF
   "Build binary for Julia.")
 openspiel_optional_dependency(OPEN_SPIEL_BUILD_WITH_LIBNOP         OFF
   "Build with support for libnop.")
-openspiel_optional_dependency(OPEN_SPIEL_BUILD_WITH_LIBTORCH       OFF
+openspiel_optional_dependency(OPEN_SPIEL_BUILD_WITH_LIBTORCH       ON
   "Build with support for libtorch.")
 openspiel_optional_dependency(OPEN_SPIEL_BUILD_WITH_PYTHON         ON
   "Build binary for Python.")
