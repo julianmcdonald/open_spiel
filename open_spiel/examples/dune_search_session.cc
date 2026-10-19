@@ -1394,8 +1394,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           ran_high_stakes = true;
           const uint64_t decision_seed =
               dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
-          const bool use_top5 = fixed_top5_candidates_ &&
-                                (remaining_time_ms < 0.0 || 3 * ref_rollouts >= top5_min_budget_);
+          const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= top5_min_budget_;
           int effective_top_k = use_top5 ? 5 : 0;
           if (use_top5 && all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state)) {
             effective_top_k = static_cast<int>(legal.size());

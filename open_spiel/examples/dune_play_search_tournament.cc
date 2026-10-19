@@ -371,7 +371,7 @@ CompoundSearchDecisionResult SearchDecision(
     return SuccessiveHalvingRolloutSearchDecision(
         state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
         o.crn_mode, o.unbiased_stage2_gate, /*max_time_ms=*/-1.0,
-        o.fixed_top5_candidates);
+        o.fixed_top5_candidates ? 5 : 0);
   }
   if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
     return AdaptiveRolloutSearchDecision(

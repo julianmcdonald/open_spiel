@@ -654,6 +654,9 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     double max_time_ms = -1.0,
     int fixed_top_k = 0,
     int max_inflight_worlds = 32) {
+  if (fixed_top_k == 1) {
+    SpielFatalError("SuccessiveHalvingRolloutSearchDecision: fixed_top_k cannot be 1 (requires at least 2 candidates).");
+  }
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
