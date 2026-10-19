@@ -56,6 +56,8 @@ ABSL_FLAG(double, family_atomics_penalty, 0.0, "");
 ABSL_FLAG(double, plot_intrigue_penalty, 0.0, "");
 ABSL_FLAG(int, plot_intrigue_exemption_threshold, 3, "");
 ABSL_FLAG(int, rollout_games, 256, "");
+ABSL_FLAG(bool, enable_ema_tracking, false, "");
+ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "");
 
 using namespace open_spiel;
 using namespace open_spiel::dune_imperium;

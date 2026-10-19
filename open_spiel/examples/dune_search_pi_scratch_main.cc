@@ -113,6 +113,8 @@ ABSL_FLAG(uint64_t, shaping_start_env_steps, 0,
           "Environment transition count at which shaping decay starts.");
 ABSL_FLAG(uint64_t, shaping_decay_env_steps, 10000000,
           "Environment transition count over which shaping decays.");
+ABSL_FLAG(bool, enable_ema_tracking, false, "Unused here; read by training utils.");
+ABSL_FLAG(double, ema_magnet_kl_coef, 0.0, "Unused here; read by training utils.");
 
 namespace open_spiel {
 namespace {
