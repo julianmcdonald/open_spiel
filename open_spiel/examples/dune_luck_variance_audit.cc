@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -14,6 +15,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <c10/util/Half.h>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -32,7 +35,7 @@
 #include "dune_specimen_conversion.h"
 
 ABSL_FLAG(std::string, mode, "all",
-          "Execution mode: all, step1, step2, collect_states_only");
+          "Execution mode: all, step1, step2, collect_states_only, collect_r7_44_critic_data");
 ABSL_FLAG(int, num_games, 200,
           "Total number of games (first half selection, second half confirmation)");
 ABSL_FLAG(uint64_t, master_seed, 34350, "Master seed for RNG derivation");
@@ -1286,6 +1289,297 @@ CheckpointPlasticityResult EvaluateCheckpointPlasticity(
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// R7-44 Critic Architecture Dataset Collection
+// ---------------------------------------------------------------------------
+
+constexpr int kR744SampledRowsPerGame = 32;
+
+#pragma pack(push, 1)
+struct R744RowMeta {
+  int32_t game_id = 0;
+  int8_t player = 0;
+  int8_t round = 0;
+  int8_t round_band = 0;
+  int8_t decision_role = 0;
+  float u34350_value = 0.0f;
+  float target = 0.0f;
+};
+#pragma pack(pop)
+static_assert(sizeof(R744RowMeta) == 16, "R744RowMeta size must be exactly 16 bytes");
+
+struct R744SampledRow {
+  std::array<uint16_t, kObsDim> obs_f16;
+  R744RowMeta meta;
+};
+
+struct R744GameRecord {
+  int32_t game_index = 0;
+  uint64_t episode_id = 0;
+  int32_t final_round = 1;
+  int32_t total_rows = 0;
+  int32_t eligible_rows = 0;
+  std::array<R744SampledRow, kR744SampledRowsPerGame> sampled_rows;
+};
+
+void RunCollectR744CriticData(
+    const open_spiel::Game& game,
+    int num_games,
+    uint64_t master_seed,
+    uint64_t episode_start,
+    int num_threads,
+    int eval_batch_size,
+    int eval_timeout_ms,
+    const std::string& output_dir,
+    const std::string& ckpt_path) {
+  std::cout << "\n>>> Starting R7-44 Critic Architecture Dataset Collection <<<\n";
+  std::cout << "Target games: " << num_games << " | Master Seed: " << master_seed
+            << " | Episode Start: " << episode_start << " | Threads: " << num_threads << "\n";
+  std::cout << "Output Directory: " << output_dir << "\n";
+
+  torch::Device device(torch::kCUDA);
+  auto model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      kObsDim, kHiddenDim, kActionDim, 16, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0,
+      /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+      "semantic_action_v3");
+
+  std::cout << "Loading U34350 live checkpoint from: " << ckpt_path << "\n";
+  open_spiel::LoadModelCheckpointRobust(model, ckpt_path, device);
+  model->to(device);
+  model->eval();
+
+  std::shared_mutex sync_mutex;
+  auto evaluator = std::make_shared<open_spiel::BatchedEvaluator>(
+      model, eval_batch_size, eval_timeout_ms, device, &sync_mutex,
+      /*logit_cap=*/10.0f, /*device_synchronize=*/true,
+      /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+      /*rollout_amp=*/false, /*allow_tf32=*/false);
+
+  std::vector<R744GameRecord> records(num_games);
+  std::atomic<int> next_game_idx{0};
+  std::atomic<int> completed_games{0};
+
+  auto wall_start = std::chrono::steady_clock::now();
+
+  auto worker_fn = [&]() {
+    while (true) {
+      int g = next_game_idx.fetch_add(1);
+      if (g >= num_games) break;
+      uint64_t ep_id = episode_start + static_cast<uint64_t>(g);
+
+      // Simulate trajectory without keeping intermediate clone states or chance events
+      Step1GameData gd = SimulateRealTrajectory(
+          g, ep_id, master_seed, game, evaluator, /*keep_states_and_chance=*/false);
+
+      // Terminal placement returns without penalties
+      float player_targets[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int p = 0; p < 4; ++p) {
+        if (!gd.player_rows[p].empty()) {
+          int last_idx = gd.player_rows[p].back();
+          player_targets[p] = gd.rows[last_idx].terminal_return / 4.0f;
+        }
+      }
+
+      // Find all policy-loss eligible rows (actions.size() > 1)
+      std::vector<int> eligible_indices;
+      eligible_indices.reserve(gd.rows.size());
+      for (size_t r = 0; r < gd.rows.size(); ++r) {
+        if (gd.rows[r].policy_loss_eligible) {
+          eligible_indices.push_back(static_cast<int>(r));
+        }
+      }
+
+      if (eligible_indices.size() < kR744SampledRowsPerGame) {
+        open_spiel::SpielFatalError(absl::StrFormat(
+            "Game %d (ep_id %llu) had only %zu eligible rows (< %d)",
+            g, static_cast<unsigned long long>(ep_id),
+            eligible_indices.size(), kR744SampledRowsPerGame));
+      }
+
+      // Sample 32 row indices uniformly at random without replacement
+      std::mt19937_64 row_rng = dune_seed::MakeRng64(
+          dune_seed::DeriveSeed(master_seed, 0x52373434ULL, ep_id, 0));
+      std::shuffle(eligible_indices.begin(), eligible_indices.end(), row_rng);
+
+      std::vector<int> sampled_indices(
+          eligible_indices.begin(),
+          eligible_indices.begin() + kR744SampledRowsPerGame);
+      std::sort(sampled_indices.begin(), sampled_indices.end());
+
+      records[g].game_index = static_cast<int32_t>(g);
+      records[g].episode_id = ep_id;
+      records[g].final_round = static_cast<int32_t>(gd.final_round);
+      records[g].total_rows = static_cast<int32_t>(gd.rows.size());
+      records[g].eligible_rows = static_cast<int32_t>(eligible_indices.size());
+
+      for (int k = 0; k < kR744SampledRowsPerGame; ++k) {
+        int r = sampled_indices[k];
+        const auto& row = gd.rows[r];
+        int p = row.player;
+        float target = (p >= 0 && p < 4) ? player_targets[p] : 0.0f;
+
+        records[g].sampled_rows[k].meta.game_id = static_cast<int32_t>(g);
+        records[g].sampled_rows[k].meta.player = static_cast<int8_t>(row.player);
+        records[g].sampled_rows[k].meta.round = static_cast<int8_t>(row.round);
+        records[g].sampled_rows[k].meta.round_band = static_cast<int8_t>(row.round_band);
+        records[g].sampled_rows[k].meta.decision_role = static_cast<int8_t>(row.decision_role);
+        records[g].sampled_rows[k].meta.u34350_value = row.value;
+        records[g].sampled_rows[k].meta.target = target;
+
+        for (int64_t i = 0; i < kObsDim; ++i) {
+          records[g].sampled_rows[k].obs_f16[i] = c10::Half(row.obs[i]).x;
+        }
+      }
+
+      int done = completed_games.fetch_add(1) + 1;
+      if (done % std::max(1, num_games / 10) == 0 || done == num_games) {
+        std::cout << "  [R7-44 Data Worker] Completed " << done << " / "
+                  << num_games << " games\n";
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(num_threads);
+  for (int t = 0; t < num_threads; ++t) {
+    workers.emplace_back(worker_fn);
+  }
+  for (auto& w : workers) w.join();
+
+  auto wall_end = std::chrono::steady_clock::now();
+  double wall_seconds =
+      std::chrono::duration<double>(wall_end - wall_start).count();
+
+  std::cout << "\nWriting binary dataset and summary to " << output_dir << "...\n";
+
+  // Write obs_f16.bin
+  std::string obs_path = output_dir + "/obs_f16.bin";
+  std::ofstream obs_out(obs_path, std::ios::binary);
+  if (!obs_out) {
+    open_spiel::SpielFatalError("Failed to open " + obs_path + " for writing");
+  }
+  for (int g = 0; g < num_games; ++g) {
+    for (int k = 0; k < kR744SampledRowsPerGame; ++k) {
+      obs_out.write(
+          reinterpret_cast<const char*>(records[g].sampled_rows[k].obs_f16.data()),
+          kObsDim * sizeof(uint16_t));
+    }
+  }
+  obs_out.close();
+
+  // Write metadata.bin
+  std::string meta_path = output_dir + "/metadata.bin";
+  std::ofstream meta_out(meta_path, std::ios::binary);
+  if (!meta_out) {
+    open_spiel::SpielFatalError("Failed to open " + meta_path + " for writing");
+  }
+  for (int g = 0; g < num_games; ++g) {
+    for (int k = 0; k < kR744SampledRowsPerGame; ++k) {
+      meta_out.write(
+          reinterpret_cast<const char*>(&records[g].sampled_rows[k].meta),
+          sizeof(R744RowMeta));
+    }
+  }
+  meta_out.close();
+
+  // Verify file sizes
+  uintmax_t obs_size = std::filesystem::file_size(obs_path);
+  uintmax_t expected_obs_size =
+      static_cast<uintmax_t>(num_games) * kR744SampledRowsPerGame * kObsDim * sizeof(uint16_t);
+  if (obs_size != expected_obs_size) {
+    open_spiel::SpielFatalError(absl::StrFormat(
+        "obs_f16.bin size mismatch: got %llu bytes, expected %llu bytes",
+        static_cast<unsigned long long>(obs_size),
+        static_cast<unsigned long long>(expected_obs_size)));
+  }
+
+  uintmax_t meta_size = std::filesystem::file_size(meta_path);
+  uintmax_t expected_meta_size =
+      static_cast<uintmax_t>(num_games) * kR744SampledRowsPerGame * sizeof(R744RowMeta);
+  if (meta_size != expected_meta_size) {
+    open_spiel::SpielFatalError(absl::StrFormat(
+        "metadata.bin size mismatch: got %llu bytes, expected %llu bytes",
+        static_cast<unsigned long long>(meta_size),
+        static_cast<unsigned long long>(expected_meta_size)));
+  }
+
+  // Compute slice round averages
+  auto compute_slice_avg_round = [&](int start_idx, int end_idx) -> double {
+    int actual_start = std::min(start_idx, num_games);
+    int actual_end = std::min(end_idx, num_games);
+    if (actual_end <= actual_start) return 0.0;
+    double sum = 0.0;
+    for (int i = actual_start; i < actual_end; ++i) {
+      sum += records[i].final_round;
+    }
+    return sum / (actual_end - actual_start);
+  };
+
+  double overall_avg_round = compute_slice_avg_round(0, num_games);
+  double train_10k_avg_round = compute_slice_avg_round(0, 10000);
+  double train_9k_avg_round = compute_slice_avg_round(0, 9000);
+  double val_1k_avg_round = compute_slice_avg_round(9000, 10000);
+  double test_2k_avg_round = compute_slice_avg_round(10000, 12000);
+  double train_2500_avg_round = compute_slice_avg_round(0, 2500);
+
+  int64_t total_rows_all = 0;
+  int64_t eligible_rows_all = 0;
+  for (int g = 0; g < num_games; ++g) {
+    total_rows_all += records[g].total_rows;
+    eligible_rows_all += records[g].eligible_rows;
+  }
+  double avg_total_rows = (num_games > 0)
+      ? (static_cast<double>(total_rows_all) / num_games) : 0.0;
+  double avg_eligible_rows = (num_games > 0)
+      ? (static_cast<double>(eligible_rows_all) / num_games) : 0.0;
+
+  open_spiel::json::Object summary_root;
+  summary_root["num_games"] = static_cast<int64_t>(num_games);
+  summary_root["master_seed"] = static_cast<int64_t>(master_seed);
+  summary_root["overall_avg_round_finished"] = overall_avg_round;
+  summary_root["train_10k_avg_round"] = train_10k_avg_round;
+  summary_root["train_9k_avg_round"] = train_9k_avg_round;
+  summary_root["val_1k_avg_round"] = val_1k_avg_round;
+  summary_root["test_2k_avg_round"] = test_2k_avg_round;
+  summary_root["train_2500_avg_round"] = train_2500_avg_round;
+  summary_root["avg_total_rows_per_game"] = avg_total_rows;
+  summary_root["avg_eligible_rows_per_game"] = avg_eligible_rows;
+  summary_root["wall_seconds"] = wall_seconds;
+
+  open_spiel::json::Array final_rounds_arr;
+  final_rounds_arr.reserve(num_games);
+  for (int g = 0; g < num_games; ++g) {
+    final_rounds_arr.push_back(static_cast<int64_t>(records[g].final_round));
+  }
+  summary_root["final_rounds"] = std::move(final_rounds_arr);
+
+  std::string summary_path = output_dir + "/games_summary.json";
+  std::ofstream json_out(summary_path);
+  json_out << open_spiel::json::ToString(open_spiel::json::Value(summary_root), true);
+  json_out.close();
+
+  std::cout << "\n========================================================================================\n";
+  std::cout << "                 R7-44 CRITIC DATA COLLECTION COMPLETE\n";
+  std::cout << "========================================================================================\n";
+  std::cout << "Total Games Collected:       " << num_games << "\n";
+  std::cout << "Total Rows Sampled:          " << num_games * kR744SampledRowsPerGame << " (32 per game)\n";
+  std::cout << "Overall Avg Round Finished:  " << std::fixed << std::setprecision(4) << overall_avg_round << "\n";
+  std::cout << "Train 10k Avg Round:         " << train_10k_avg_round << "\n";
+  std::cout << "Train 9k Avg Round:          " << train_9k_avg_round << "\n";
+  std::cout << "Val 1k Avg Round:            " << val_1k_avg_round << "\n";
+  std::cout << "Test 2k Avg Round:           " << test_2k_avg_round << "\n";
+  std::cout << "Train 2500 Avg Round:        " << train_2500_avg_round << "\n";
+  std::cout << "Avg Total Rows / Game:       " << std::setprecision(2) << avg_total_rows << "\n";
+  std::cout << "Avg Eligible Rows / Game:    " << avg_eligible_rows << "\n";
+  std::cout << "Wall Time:                   " << std::setprecision(2) << wall_seconds << " s ("
+            << (num_games > 0 ? (wall_seconds * 1000.0 / num_games) : 0.0) << " ms/game)\n";
+  std::cout << "Wrote obs_f16:               " << obs_path << " (" << obs_size << " bytes)\n";
+  std::cout << "Wrote metadata:              " << meta_path << " (" << meta_size << " bytes)\n";
+  std::cout << "Wrote summary:               " << summary_path << "\n";
+  std::cout << "========================================================================================\n\n";
+}
+
 } // namespace open_spiel
 
 int main(int argc, char** argv) {
@@ -1324,6 +1618,18 @@ int main(int argc, char** argv) {
 
   std::shared_ptr<const open_spiel::Game> game =
       open_spiel::LoadGame("dune_imperium");
+
+  if (mode == "collect_r7_44_critic_data") {
+    if (output_dir == "/home/warcr/dune_drl_runtime/round7/r7_43_luck_plasticity_audit_20261019") {
+      output_dir = "/home/warcr/dune_drl_runtime/round7/r7_44_critic_arch_test_20261019";
+      std::filesystem::create_directories(output_dir);
+    }
+    open_spiel::RunCollectR744CriticData(
+        *game, num_games, master_seed, episode_start, num_threads,
+        eval_batch_size, eval_timeout_ms, output_dir,
+        absl::GetFlag(FLAGS_checkpoint_u34350_live));
+    return 0;
+  }
 
   // Run Step 1 if mode is "all", "step1", or "collect_states_only"
   if (mode == "all" || mode == "step1" || mode == "collect_states_only") {
