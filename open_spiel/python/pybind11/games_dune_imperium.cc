@@ -353,6 +353,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("board_index"))
       .def("player_leader", &DuneImperiumState::PlayerLeader, py::arg("player"))
       .def("get_phase", &DuneImperiumState::phase)
+      .def("get_current_round", &DuneImperiumState::GetCurrentRound)
       .def("get_player_tech_tiles",
            &DuneImperiumState::GetPlayerTechTilesForTesting, py::arg("player"))
       .def("is_tech_flipped", &DuneImperiumState::IsTechFlippedForTesting,
@@ -753,25 +754,61 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_property_readonly("session_elapsed_time_ms", &open_spiel::DuneSearchSession::session_elapsed_time_ms);
 
   py::class_<open_spiel::DuneAdaptiveRolloutSession>(di, "DuneAdaptiveRolloutSession")
-      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t, bool>(),
+      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t, bool, bool, int, int, int, bool>(),
            py::arg("checkpoint_path"),
            py::arg("device_str") = "cuda",
            py::arg("hidden_dim") = 2048,
-           py::arg("num_blocks") = 12,
+           py::arg("num_blocks") = 16,
            py::arg("reference_rollouts_per_action") = 64,
            py::arg("leader_rollouts") = 32,
            py::arg("target_batch_size") = 256,
            py::arg("seed") = 20261014ULL,
-           py::arg("use_successive_halving") = true)
+           py::arg("use_successive_halving") = true,
+           py::arg("fixed_top5_candidates") = true,
+           py::arg("max_inflight_worlds") = 96,
+           py::arg("num_evaluators") = 1,
+           py::arg("top5_min_budget") = 576,
+           py::arg("all_buy_candidates") = true)
       .def("search", &open_spiel::DuneAdaptiveRolloutSession::Search,
            py::arg("state"), py::arg("remaining_time_ms") = -1.0)
       .def("discard_pending_action", &open_spiel::DuneAdaptiveRolloutSession::DiscardPendingAction)
       .def("reset_session", &open_spiel::DuneAdaptiveRolloutSession::ResetSession, py::arg("reason"))
+      .def("set_seed", &open_spiel::DuneAdaptiveRolloutSession::set_seed, py::arg("seed"))
       .def("has_active_session", &open_spiel::DuneAdaptiveRolloutSession::HasActiveSession)
       .def_property_readonly("session_new_simulations_completed",
                              &open_spiel::DuneAdaptiveRolloutSession::session_new_simulations_completed)
       .def_property_readonly("session_elapsed_time_ms",
-                             &open_spiel::DuneAdaptiveRolloutSession::session_elapsed_time_ms);
+                             &open_spiel::DuneAdaptiveRolloutSession::session_elapsed_time_ms)
+      .def_property("fixed_top5_candidates",
+                    &open_spiel::DuneAdaptiveRolloutSession::fixed_top5_candidates,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_fixed_top5_candidates)
+      .def("set_fixed_top5_candidates",
+           &open_spiel::DuneAdaptiveRolloutSession::set_fixed_top5_candidates,
+           py::arg("val"))
+      .def_property("max_inflight_worlds",
+                    &open_spiel::DuneAdaptiveRolloutSession::max_inflight_worlds,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_max_inflight_worlds)
+      .def("set_max_inflight_worlds",
+           &open_spiel::DuneAdaptiveRolloutSession::set_max_inflight_worlds,
+           py::arg("val"))
+      .def_property_readonly("num_evaluators",
+                             &open_spiel::DuneAdaptiveRolloutSession::num_evaluators)
+      .def_property("top5_min_budget",
+                    &open_spiel::DuneAdaptiveRolloutSession::top5_min_budget,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_top5_min_budget)
+      .def("set_top5_min_budget",
+           &open_spiel::DuneAdaptiveRolloutSession::set_top5_min_budget,
+           py::arg("val"))
+      .def_property("all_buy_candidates",
+                    &open_spiel::DuneAdaptiveRolloutSession::all_buy_candidates,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_all_buy_candidates)
+      .def("set_all_buy_candidates",
+           &open_spiel::DuneAdaptiveRolloutSession::set_all_buy_candidates,
+           py::arg("val"))
+      .def_property_readonly("ms_per_rollout_ema",
+                             &open_spiel::DuneAdaptiveRolloutSession::ms_per_rollout_ema)
+      .def_property_readonly("turn_elapsed_search_time_ms",
+                             &open_spiel::DuneAdaptiveRolloutSession::turn_elapsed_search_time_ms);
 
   di.def("make_dune_nn_evaluator", &open_spiel::MakeDuneNNEvaluator,
          py::arg("checkpoint_path"), py::arg("device_str"),

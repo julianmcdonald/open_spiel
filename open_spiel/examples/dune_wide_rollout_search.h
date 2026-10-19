@@ -652,7 +652,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool unbiased_stage2_gate = false,
     double max_time_ms = -1.0,
-    bool fixed_top5_candidates = false,
+    int fixed_top_k = 0,
     int max_inflight_worlds = 32) {
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
@@ -669,7 +669,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   }
 
   std::vector<Action> ordered_candidates;
-  if (!fixed_top5_candidates) {
+  if (fixed_top_k <= 0) {
     ordered_candidates.reserve(4);
     ordered_candidates.push_back(sorted_by_prior[0].first);
     ordered_candidates.push_back(sorted_by_prior[1].first);
@@ -681,7 +681,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       }
     }
   } else {
-    const size_t k_max = std::min<size_t>(5, sorted_by_prior.size());
+    const size_t k_max = std::min<size_t>(static_cast<size_t>(fixed_top_k), sorted_by_prior.size());
     ordered_candidates.reserve(k_max);
     for (size_t i = 0; i < k_max; ++i) {
       ordered_candidates.push_back(sorted_by_prior[i].first);

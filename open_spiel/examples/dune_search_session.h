@@ -216,22 +216,37 @@ class DuneAdaptiveRolloutSession {
       const std::string& checkpoint_path,
       const std::string& device_str = "cuda",
       int hidden_dim = 2048,
-      int num_blocks = 12,
+      int num_blocks = 16,
       int reference_rollouts_per_action = 64,
       int leader_rollouts = 32,
       int target_batch_size = 256,
       uint64_t seed = 20261014ULL,
-      bool use_successive_halving = true);
+      bool use_successive_halving = true,
+      bool fixed_top5_candidates = true,
+      int max_inflight_worlds = 96,
+      int num_evaluators = 1,
+      int top5_min_budget = 576,
+      bool all_buy_candidates = true);
   ~DuneAdaptiveRolloutSession();
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
   void DiscardPendingAction();
   void ResetSession(const std::string& reason);
   bool HasActiveSession() const { return has_active_session_; }
+  void set_seed(uint64_t seed) { seed_ = seed; search_seed_counter_ = 0; }
   int session_new_simulations_completed() const { return session_new_simulations_completed_; }
   double session_elapsed_time_ms() const { return session_elapsed_time_ms_; }
   double ms_per_rollout_ema() const { return ms_per_rollout_ema_; }
   double turn_elapsed_search_time_ms() const { return turn_elapsed_search_time_ms_; }
+  bool fixed_top5_candidates() const { return fixed_top5_candidates_; }
+  void set_fixed_top5_candidates(bool val) { fixed_top5_candidates_ = val; }
+  int max_inflight_worlds() const { return max_inflight_worlds_; }
+  void set_max_inflight_worlds(int val) { max_inflight_worlds_ = std::max(1, val); }
+  int num_evaluators() const { return num_evaluators_; }
+  int top5_min_budget() const { return top5_min_budget_; }
+  void set_top5_min_budget(int val) { top5_min_budget_ = val; }
+  bool all_buy_candidates() const { return all_buy_candidates_; }
+  void set_all_buy_candidates(bool val) { all_buy_candidates_ = val; }
 
  private:
   std::string checkpoint_path_;
@@ -243,6 +258,11 @@ class DuneAdaptiveRolloutSession {
   int target_batch_size_;
   uint64_t seed_;
   bool use_successive_halving_ = true;
+  bool fixed_top5_candidates_ = true;
+  int max_inflight_worlds_ = 96;
+  int num_evaluators_ = 1;
+  int top5_min_budget_ = 576;
+  bool all_buy_candidates_ = true;
   uint64_t search_seed_counter_ = 0;
 
   bool has_active_session_ = false;
@@ -256,7 +276,7 @@ class DuneAdaptiveRolloutSession {
   int session_new_simulations_completed_ = 0;
   double session_elapsed_time_ms_ = 0.0;
   double turn_elapsed_search_time_ms_ = 0.0;
-  double ms_per_rollout_ema_ = 14.0;
+  double ms_per_rollout_ema_ = 24.0;
 
   std::unique_ptr<State> last_search_state_;
   DuneSearchResult last_search_result_;

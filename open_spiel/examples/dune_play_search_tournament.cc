@@ -72,6 +72,8 @@ ABSL_FLAG(std::string, crn_mode, "sequential",
           "CRN mode: sequential or deck_order.");
 ABSL_FLAG(bool, unbiased_stage2_gate, false,
           "Use unbiased Stage-2 Successive Halving gate.");
+ABSL_FLAG(bool, fixed_top5_candidates, false,
+          "Use fixed top-5 candidates (up to min(5, legal)) in Successive Halving.");
 ABSL_FLAG(int, leader_rollouts, 32, "Leader pick rollout search rollouts.");
 ABSL_FLAG(bool, sample_opponent_leader_draft, false,
           "Sample opponent leader draft mixture in rollout search.");
@@ -120,6 +122,7 @@ struct Options {
   std::string config_key;
   SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential;
   bool unbiased_stage2_gate = false;
+  bool fixed_top5_candidates = false;
   int leader_rollouts = 32;
   bool sample_opponent_leader_draft = false;
   bool leader_rollouts_explicit = false;
@@ -242,6 +245,7 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
     throw std::runtime_error("--crn_mode must be sequential or deck_order");
   }
   o.unbiased_stage2_gate = absl::GetFlag(FLAGS_unbiased_stage2_gate);
+  o.fixed_top5_candidates = absl::GetFlag(FLAGS_fixed_top5_candidates);
   o.leader_rollouts = absl::GetFlag(FLAGS_leader_rollouts);
   o.sample_opponent_leader_draft = absl::GetFlag(FLAGS_sample_opponent_leader_draft);
   if (o.mode == Mode::kLeader && !o.leader_rollouts_explicit) {
@@ -269,6 +273,7 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
       {"target_batch_size", o.batch_size},
       {"crn_mode", CrnModeName(o.crn_mode)},
       {"unbiased_stage2_gate", o.unbiased_stage2_gate},
+      {"fixed_top5_candidates", o.fixed_top5_candidates},
       {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
       {"leader_rollouts", o.leader_rollouts}};
   o.config_key = ComputeStringSHA256(json::ToString(identity));
@@ -294,7 +299,7 @@ ModelBundle LoadFrozenModel(const std::string& path, const Options& o,
   const int hidden_dim = IntField(meta, "hidden_dim");
   const int num_blocks = IntField(meta, "num_blocks");
   if (observation_dim != kFullPublicInformationStateSize || hidden_dim != 2048 ||
-      (num_blocks != 8 && num_blocks != 12) ||
+      (num_blocks != 8 && num_blocks != 12 && num_blocks != 16) ||
       StringField(meta, "market_appendix_mode") != "full_public_information_v3" ||
       StringField(meta, "semantic_descriptor_schema") != "semantic_action_v3" ||
       !BoolField(meta, "enable_semantic_scorer", false) ||
@@ -365,7 +370,8 @@ CompoundSearchDecisionResult SearchDecision(
       o.mode == Mode::kFullShAdaptiveLeader) {
     return SuccessiveHalvingRolloutSearchDecision(
         state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
-        o.crn_mode, o.unbiased_stage2_gate);
+        o.crn_mode, o.unbiased_stage2_gate, /*max_time_ms=*/-1.0,
+        o.fixed_top5_candidates);
   }
   if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
     return AdaptiveRolloutSearchDecision(
@@ -594,6 +600,7 @@ json::Object BaseRecord(const Options& o, const std::string& kind) {
           {"threads", o.threads}, {"target_batch_size", o.batch_size},
           {"crn_mode", o.crn_mode == SearchRolloutCrnMode::kDeckOrderCrn ? "deck_order" : "sequential"},
           {"unbiased_stage2_gate", o.unbiased_stage2_gate},
+          {"fixed_top5_candidates", o.fixed_top5_candidates},
           {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
           {"leader_rollouts", o.leader_rollouts}};
 }

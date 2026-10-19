@@ -692,6 +692,23 @@ inline bool IsHighStakesStrategicState(const State& state, Player searched_playe
   return false;
 }
 
+inline bool IsPurchaseDecisionState(const State& state) {
+  const std::vector<Action> legal_actions = state.LegalActions();
+  if (legal_actions.size() < 2) return false;
+  for (Action a : legal_actions) {
+    if ((a >= kActionBuyImperiumRow0 && a < kActionBuyImperiumRow0 + 8) ||
+        (a >= kActionBuyHelenaReserve0 && a < kActionBuyHelenaReserve0 + 8) ||
+        (a == kActionBuyReserveArrakisLiaison) ||
+        (a == kActionBuyReserveTheSpiceMustFlow) ||
+        (a >= kActionTechAcquire0 && a <= kActionTechAcquireSkip) ||
+        (a >= kActionTleilaxuAcquire0 && a <= kActionTleilaxuAcquireSkip) ||
+        (a >= kActionTechAcquireWithSolari0 && a <= kActionTechAcquireWithSolariSkip)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Owned immutable snapshot of a pre-action decision visited by the learner
 struct SearchSnapshot {
   std::unique_ptr<State> sim_state;

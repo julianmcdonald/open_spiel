@@ -1048,8 +1048,8 @@ struct DuneAdaptiveRolloutSession::Impl {
   torch::Device device;
   std::shared_ptr<SharedDunePolicyValueNetImpl> model;
   std::unique_ptr<std::shared_mutex> mutex;
-  std::shared_ptr<BatchedEvaluator> coordinator;
-  std::shared_ptr<BatchedNNEvaluator> evaluator;
+  std::vector<std::shared_ptr<BatchedEvaluator>> coordinators;
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators;
   dune_imperium::TurnSearchTree tree;
 
   explicit Impl(torch::Device dev) : device(dev) {}
@@ -1064,7 +1064,12 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
     int leader_rollouts,
     int target_batch_size,
     uint64_t seed,
-    bool use_successive_halving)
+    bool use_successive_halving,
+    bool fixed_top5_candidates,
+    int max_inflight_worlds,
+    int num_evaluators,
+    int top5_min_budget,
+    bool all_buy_candidates)
     : checkpoint_path_(checkpoint_path),
       device_str_(device_str),
       hidden_dim_(hidden_dim),
@@ -1073,7 +1078,12 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
       leader_rollouts_(leader_rollouts),
       target_batch_size_(target_batch_size),
       seed_(seed),
-      use_successive_halving_(use_successive_halving) {
+      use_successive_halving_(use_successive_halving),
+      fixed_top5_candidates_(fixed_top5_candidates),
+      max_inflight_worlds_(std::max(1, max_inflight_worlds)),
+      num_evaluators_(std::max(1, num_evaluators)),
+      top5_min_budget_(top5_min_budget),
+      all_buy_candidates_(all_buy_candidates) {
   torch::Device device(torch::kCPU);
   if (device_str == "cuda" && torch::cuda::is_available()) {
     device = torch::Device(torch::kCUDA);
@@ -1160,11 +1170,16 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
   }
 
   impl_->mutex = std::make_unique<std::shared_mutex>();
-  impl_->coordinator = std::make_shared<BatchedEvaluator>(
-      impl_->model, target_batch_size_, 1, impl_->device,
-      impl_->mutex.get(), 10.0f, false, true, false,
-      /*rollout_amp=*/false, /*allow_tf32=*/false);
-  impl_->evaluator = std::make_shared<BatchedNNEvaluator>(impl_->coordinator, 10.0f, detected_mode);
+  impl_->coordinators.resize(num_evaluators_);
+  impl_->evaluators.resize(num_evaluators_);
+  for (int e = 0; e < num_evaluators_; ++e) {
+    impl_->coordinators[e] = std::make_shared<BatchedEvaluator>(
+        impl_->model, target_batch_size_, 1, impl_->device,
+        impl_->mutex.get(), 10.0f, false, true, false,
+        /*rollout_amp=*/false, /*allow_tf32=*/false);
+    impl_->evaluators[e] = std::make_shared<BatchedNNEvaluator>(
+        impl_->coordinators[e], 10.0f, detected_mode);
+  }
 
   ResetSession("initialization");
 }
@@ -1232,7 +1247,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
   last_history_ = state.History();
 
   const auto t_start = std::chrono::steady_clock::now();
-  auto [raw_prior, values] = impl_->evaluator->PriorAndEvaluate(state);
+  auto [raw_prior, values] = impl_->evaluators.front()->PriorAndEvaluate(state);
   std::vector<Action> legal = state.LegalActions();
   Action raw_action = legal.empty() ? kInvalidAction : dune_imperium::PickGreedyAction(raw_prior, legal);
 
@@ -1304,11 +1319,12 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     } else {
       int num_cands = std::max(1, static_cast<int>(legal.size()));
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
-          state, p, {impl_->evaluator}, effective_leader_rollouts, 0.10,
+          state, p, impl_->evaluators, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
           dune_imperium::SearchRolloutCrnMode::kSequential,
           /*sample_opponent_leader_draft=*/false,
-          /*max_time_ms=*/target_ms);
+          /*max_time_ms=*/target_ms,
+          max_inflight_worlds_);
       result.diagnostics.selected_action = c_res.action;
       result.diagnostics.mcts_proposed_action = c_res.action;
       result.diagnostics.mcts_overrode_raw = c_res.overridden;
@@ -1378,13 +1394,20 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           ran_high_stakes = true;
           const uint64_t decision_seed =
               dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
+          const bool use_top5 = fixed_top5_candidates_ &&
+                                (remaining_time_ms < 0.0 || 3 * ref_rollouts >= top5_min_budget_);
+          int effective_top_k = use_top5 ? 5 : 0;
+          if (use_top5 && all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state)) {
+            effective_top_k = static_cast<int>(legal.size());
+          }
           const auto c_res = use_successive_halving_
               ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
-                    state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false, target_ms)
+                    state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
+                    dune_imperium::SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+                    target_ms, effective_top_k, max_inflight_worlds_)
               : dune_imperium::AdaptiveRolloutSearchDecision(
-                    state, p, &(impl_->tree), {impl_->evaluator}, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kSequential, target_ms);
+                    state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
+                    dune_imperium::SearchRolloutCrnMode::kSequential, target_ms, max_inflight_worlds_);
           result.diagnostics.selected_action = c_res.action;
           result.diagnostics.mcts_proposed_action = c_res.action;
           result.diagnostics.mcts_overrode_raw = c_res.overridden;

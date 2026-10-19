@@ -59,6 +59,8 @@ ABSL_FLAG(bool, skip_game_string_check, false,
           "Allow mismatched game_string metadata; replay, seat and observation checks remain strict.");
 ABSL_FLAG(bool, skip_recheck_1024, false,
           "Skip the 1,024-rollout disagreement re-check pass.");
+ABSL_FLAG(std::string, base_receipt_json, "",
+          "Optional path to existing sh_budget_check_sweep_receipt.json to reuse completed variants and incrementally extend Ref2048.");
 
 namespace benchmark_domains {
 constexpr uint64_t kDomainV0_Run1        = 0x0501;
@@ -100,7 +102,8 @@ struct VariantConfig {
   uint64_t seed_domain;
   BenchmarkVariantType type = BenchmarkVariantType::kCompound;
   int reference_rollouts_per_action = 0;
-  bool fixed_top5 = false;
+  int fixed_top_k = 0;
+  bool all_buy = false;
 };
 
 struct SampledRoot {
@@ -264,6 +267,80 @@ void SaveBenchmarkReceipt(
   }
 }
 
+VariantResult ParseVariantResultFromJson(const open_spiel::json::Object& vr_obj) {
+  VariantResult vr;
+  if (vr_obj.find("chosen_action") != vr_obj.end()) {
+    vr.chosen_action = static_cast<int>(vr_obj.at("chosen_action").GetInt());
+  }
+  if (vr_obj.find("overridden") != vr_obj.end()) {
+    vr.overridden = vr_obj.at("overridden").GetBool();
+  }
+  if (vr_obj.find("raw_mean_utility") != vr_obj.end()) {
+    vr.raw_mean_utility = vr_obj.at("raw_mean_utility").IsDouble()
+        ? vr_obj.at("raw_mean_utility").GetDouble()
+        : static_cast<double>(vr_obj.at("raw_mean_utility").GetInt());
+  }
+  if (vr_obj.find("chosen_mean_utility") != vr_obj.end()) {
+    vr.chosen_mean_utility = vr_obj.at("chosen_mean_utility").IsDouble()
+        ? vr_obj.at("chosen_mean_utility").GetDouble()
+        : static_cast<double>(vr_obj.at("chosen_mean_utility").GetInt());
+  }
+  if (vr_obj.find("decision_seed") != vr_obj.end()) {
+    vr.decision_seed = static_cast<uint64_t>(vr_obj.at("decision_seed").GetInt());
+  }
+  if (vr_obj.find("evaluations") != vr_obj.end()) {
+    vr.evaluations = static_cast<uint64_t>(vr_obj.at("evaluations").GetInt());
+  }
+  if (vr_obj.find("duration_ms") != vr_obj.end()) {
+    vr.duration_ms = vr_obj.at("duration_ms").IsDouble()
+        ? vr_obj.at("duration_ms").GetDouble()
+        : static_cast<double>(vr_obj.at("duration_ms").GetInt());
+  }
+  if (vr_obj.find("stage1_planned_worlds") != vr_obj.end()) {
+    vr.stage1_planned_worlds = static_cast<int>(vr_obj.at("stage1_planned_worlds").GetInt());
+  }
+  if (vr_obj.find("stage1_kept_worlds") != vr_obj.end()) {
+    vr.stage1_kept_worlds = static_cast<int>(vr_obj.at("stage1_kept_worlds").GetInt());
+  }
+  if (vr_obj.find("stage2_planned_worlds") != vr_obj.end()) {
+    vr.stage2_planned_worlds = static_cast<int>(vr_obj.at("stage2_planned_worlds").GetInt());
+  }
+  if (vr_obj.find("stage2_kept_worlds") != vr_obj.end()) {
+    vr.stage2_kept_worlds = static_cast<int>(vr_obj.at("stage2_kept_worlds").GetInt());
+  }
+  if (vr_obj.find("deadline_bound") != vr_obj.end()) {
+    vr.deadline_bound = vr_obj.at("deadline_bound").GetBool();
+  }
+  if (vr_obj.find("candidate_pair_sd_vs_raw") != vr_obj.end()) {
+    for (const auto& sd_val : vr_obj.at("candidate_pair_sd_vs_raw").GetArray()) {
+      const auto& pair_arr = sd_val.GetArray();
+      int a = static_cast<int>(pair_arr[0].GetInt());
+      double sd = pair_arr[1].IsDouble() ? pair_arr[1].GetDouble() : static_cast<double>(pair_arr[1].GetInt());
+      vr.candidate_pair_sd_vs_raw.push_back({a, sd});
+    }
+  }
+  if (vr_obj.find("candidate_utilities") != vr_obj.end()) {
+    for (const auto& cu_val : vr_obj.at("candidate_utilities").GetArray()) {
+      const auto& pair_arr = cu_val.GetArray();
+      int a = static_cast<int>(pair_arr[0].GetInt());
+      double u = pair_arr[1].IsDouble() ? pair_arr[1].GetDouble() : static_cast<double>(pair_arr[1].GetInt());
+      vr.candidate_utilities.push_back({a, u});
+    }
+  }
+  if (vr_obj.find("candidate_rollout_utilities") != vr_obj.end()) {
+    for (const auto& cru_val : vr_obj.at("candidate_rollout_utilities").GetArray()) {
+      const auto& pair_arr = cru_val.GetArray();
+      int a = static_cast<int>(pair_arr[0].GetInt());
+      std::vector<double> vals;
+      for (const auto& u_val : pair_arr[1].GetArray()) {
+        vals.push_back(u_val.IsDouble() ? u_val.GetDouble() : static_cast<double>(u_val.GetInt()));
+      }
+      vr.candidate_rollout_utilities.push_back({a, vals});
+    }
+  }
+  return vr;
+}
+
 bool LoadBenchmarkCheckpoint(
     const std::string& ckpt_path,
     const std::vector<VariantConfig>& variants,
@@ -294,65 +371,7 @@ bool LoadBenchmarkCheckpoint(
         break;
       }
       const auto& vr_obj = var_map.at(v_name).GetObject();
-      VariantResult vr;
-      vr.chosen_action = static_cast<int>(vr_obj.at("chosen_action").GetInt());
-      vr.overridden = vr_obj.at("overridden").GetBool();
-      vr.raw_mean_utility = vr_obj.at("raw_mean_utility").IsDouble()
-          ? vr_obj.at("raw_mean_utility").GetDouble()
-          : static_cast<double>(vr_obj.at("raw_mean_utility").GetInt());
-      vr.chosen_mean_utility = vr_obj.at("chosen_mean_utility").IsDouble()
-          ? vr_obj.at("chosen_mean_utility").GetDouble()
-          : static_cast<double>(vr_obj.at("chosen_mean_utility").GetInt());
-      vr.decision_seed = static_cast<uint64_t>(vr_obj.at("decision_seed").GetInt());
-      vr.evaluations = static_cast<uint64_t>(vr_obj.at("evaluations").GetInt());
-      vr.duration_ms = vr_obj.at("duration_ms").IsDouble()
-          ? vr_obj.at("duration_ms").GetDouble()
-          : static_cast<double>(vr_obj.at("duration_ms").GetInt());
-
-      if (vr_obj.find("stage1_planned_worlds") != vr_obj.end()) {
-        vr.stage1_planned_worlds = static_cast<int>(vr_obj.at("stage1_planned_worlds").GetInt());
-      }
-      if (vr_obj.find("stage1_kept_worlds") != vr_obj.end()) {
-        vr.stage1_kept_worlds = static_cast<int>(vr_obj.at("stage1_kept_worlds").GetInt());
-      }
-      if (vr_obj.find("stage2_planned_worlds") != vr_obj.end()) {
-        vr.stage2_planned_worlds = static_cast<int>(vr_obj.at("stage2_planned_worlds").GetInt());
-      }
-      if (vr_obj.find("stage2_kept_worlds") != vr_obj.end()) {
-        vr.stage2_kept_worlds = static_cast<int>(vr_obj.at("stage2_kept_worlds").GetInt());
-      }
-      if (vr_obj.find("deadline_bound") != vr_obj.end()) {
-        vr.deadline_bound = vr_obj.at("deadline_bound").GetBool();
-      }
-      if (vr_obj.find("candidate_pair_sd_vs_raw") != vr_obj.end()) {
-        for (const auto& sd_val : vr_obj.at("candidate_pair_sd_vs_raw").GetArray()) {
-          const auto& pair_arr = sd_val.GetArray();
-          int a = static_cast<int>(pair_arr[0].GetInt());
-          double sd = pair_arr[1].IsDouble() ? pair_arr[1].GetDouble() : static_cast<double>(pair_arr[1].GetInt());
-          vr.candidate_pair_sd_vs_raw.push_back({a, sd});
-        }
-      }
-
-      if (vr_obj.find("candidate_utilities") != vr_obj.end()) {
-        for (const auto& cu_val : vr_obj.at("candidate_utilities").GetArray()) {
-          const auto& pair_arr = cu_val.GetArray();
-          int a = static_cast<int>(pair_arr[0].GetInt());
-          double u = pair_arr[1].IsDouble() ? pair_arr[1].GetDouble() : static_cast<double>(pair_arr[1].GetInt());
-          vr.candidate_utilities.push_back({a, u});
-        }
-      }
-      if (vr_obj.find("candidate_rollout_utilities") != vr_obj.end()) {
-        for (const auto& cru_val : vr_obj.at("candidate_rollout_utilities").GetArray()) {
-          const auto& pair_arr = cru_val.GetArray();
-          int a = static_cast<int>(pair_arr[0].GetInt());
-          std::vector<double> vals;
-          for (const auto& u_val : pair_arr[1].GetArray()) {
-            vals.push_back(u_val.IsDouble() ? u_val.GetDouble() : static_cast<double>(u_val.GetInt()));
-          }
-          vr.candidate_rollout_utilities.push_back({a, vals});
-        }
-      }
-      all_results[r_idx][v_idx] = std::move(vr);
+      all_results[r_idx][v_idx] = ParseVariantResultFromJson(vr_obj);
     }
     if (root_complete) {
       completed_roots = r_idx + 1;
@@ -361,6 +380,77 @@ bool LoadBenchmarkCheckpoint(
     }
   }
   return completed_roots > 0;
+}
+
+bool LoadBaseReceiptVariants(
+    const std::string& base_receipt_path,
+    const std::vector<SampledRoot>& sampled_roots,
+    const std::vector<VariantConfig>& variants,
+    std::vector<std::vector<VariantResult>>& all_results,
+    std::vector<std::vector<bool>>& has_base_variant) {
+  std::ifstream f(base_receipt_path);
+  if (!f.is_open()) {
+    std::cerr << "[BASE-RECEIPT] Error: Could not open " << base_receipt_path << "\n";
+    return false;
+  }
+  std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  f.close();
+  auto json_opt = open_spiel::json::FromString(content);
+  if (!json_opt || !json_opt->IsObject()) {
+    std::cerr << "[BASE-RECEIPT] Error: Failed to parse JSON in " << base_receipt_path << "\n";
+    return false;
+  }
+  const auto& obj = json_opt->GetObject();
+  if (obj.find("roots_results") == obj.end()) {
+    std::cerr << "[BASE-RECEIPT] Error: 'roots_results' key missing in " << base_receipt_path << "\n";
+    return false;
+  }
+  const auto& roots_arr = obj.at("roots_results").GetArray();
+  if (roots_arr.empty()) {
+    std::cerr << "[BASE-RECEIPT] Warning: 'roots_results' is empty in " << base_receipt_path << "\n";
+    return false;
+  }
+
+  std::unordered_map<int, size_t> root_id_to_idx;
+  for (size_t r = 0; r < sampled_roots.size(); ++r) {
+    root_id_to_idx[sampled_roots[r].root_id] = r;
+  }
+  std::unordered_map<std::string, size_t> variant_name_to_idx;
+  for (size_t v = 0; v < variants.size(); ++v) {
+    variant_name_to_idx[variants[v].name] = v;
+  }
+
+  size_t loaded_count = 0;
+  size_t root_match_count = 0;
+  for (size_t i = 0; i < roots_arr.size(); ++i) {
+    const auto& r_obj = roots_arr[i].GetObject();
+    if (r_obj.find("root_id") == r_obj.end() || r_obj.find("variants") == r_obj.end()) {
+      continue;
+    }
+    int root_id = static_cast<int>(r_obj.at("root_id").GetInt());
+    auto it_r = root_id_to_idx.find(root_id);
+    if (it_r == root_id_to_idx.end()) {
+      continue;
+    }
+    size_t r_idx = it_r->second;
+    root_match_count++;
+    const auto& var_map = r_obj.at("variants").GetObject();
+    for (const auto& [v_name, vr_val] : var_map) {
+      auto it_v = variant_name_to_idx.find(v_name);
+      if (it_v == variant_name_to_idx.end()) {
+        continue;
+      }
+      size_t v_idx = it_v->second;
+      all_results[r_idx][v_idx] = ParseVariantResultFromJson(vr_val.GetObject());
+      has_base_variant[r_idx][v_idx] = true;
+      loaded_count++;
+    }
+  }
+
+  std::cout << absl::StrFormat(
+      "[BASE-RECEIPT] Loaded %zu variant results across %zu matched roots from %s\n",
+      loaded_count, root_match_count, base_receipt_path);
+  return true;
 }
 
 int RunHeldOutReplayEvaluation(
@@ -1002,6 +1092,10 @@ int main(int argc, char** argv) {
   const size_t obs_byte_stride = obs_elem_count * sizeof(float);
   std::vector<float> rec_obs_buffer(obs_elem_count);
 
+  if (absl::GetFlag(FLAGS_sh_budget_check)) {
+    open_spiel::dune_imperium::DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands(false);
+  }
+
   std::cout << "[VERIFY] Replaying action histories and verifying observations against binary...\n";
   for (size_t i = 0; i < sampled_roots.size(); ++i) {
     const auto& root = sampled_roots[i];
@@ -1067,62 +1161,68 @@ int main(int argc, char** argv) {
   if (absl::GetFlag(FLAGS_sh_budget_check)) {
     variants = {
         {"raw", 0, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, false},
+         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, 0, false},
         {"sh_192", 192, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, false},
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, 0, false},
         {"sh_384", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, false},
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, 0, false},
+        {"sh_384_k5", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 128, 5, false},
         {"sh_768", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, false},
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, 0, false},
         {"sh_768_k5", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 256, true},
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 256, 5, false},
+        {"sh_768_k8", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 256, 8, false},
+        {"sh_768_k5_allbuy", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+         benchmark_domains::kDomainSHBudgetShared, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 256, 5, true},
         {"sh_768_rep", 768, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetRep, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, false},
+         benchmark_domains::kDomainSHBudgetRep, BenchmarkVariantType::kSuccessiveHalvingDynamic, 256, 0, false},
         {"Ref2048", 2048, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHBudgetRef2048, BenchmarkVariantType::kPairedReferenceOnChosenActions, 0, false}
+         benchmark_domains::kDomainSHBudgetRef2048, BenchmarkVariantType::kPairedReferenceOnChosenActions, 0, 0, false}
     };
   } else if (absl::GetFlag(FLAGS_sh_offline_check)) {
     variants = {
         {"raw", 0, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, false},
+         benchmark_domains::kDomainRaw, BenchmarkVariantType::kRaw, 0, 0, false},
         {"sh_192_incumbent", 192, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSH192Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, false},
+         benchmark_domains::kDomainSH192Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 64, 0, false},
         {"sh_384_incumbent", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSH384Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, false},
+         benchmark_domains::kDomainSH384Incumbent, BenchmarkVariantType::kSuccessiveHalvingDynamic, 128, 0, false},
         {"sh_384_k5", 384, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSH384K5, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 128, true},
+         benchmark_domains::kDomainSH384K5, BenchmarkVariantType::kSuccessiveHalvingFixedTop5, 128, 5, false},
         {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainSHRef512, BenchmarkVariantType::kCompound, 0, false}
+         benchmark_domains::kDomainSHRef512, BenchmarkVariantType::kCompound, 0, 0, false}
     };
   } else if (absl::GetFlag(FLAGS_leaf_check_only)) {
     variants = {
         {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, false}
+         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, 0, false}
     };
   } else {
     variants = {
         {"V0_Run1", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainV0_Run1, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV0_Run1, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V0_Run2", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainV0_Run2, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV0_Run2, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V1", 64, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainV1, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV1, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_16_Paired", 16, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_16_Paired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_16_Unpaired", 16, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_16_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_16_Unpaired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_32_Paired", 32, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_32_Paired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_32_Paired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_32_Unpaired", 32, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_32_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_32_Unpaired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_64_Paired", 64, SearchPairingMode::kPaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_64_Paired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_64_Paired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"V2_64_Unpaired", 64, SearchPairingMode::kUnpaired, SearchTruncationMode::kNextRoundSearchPlayer,
-         benchmark_domains::kDomainV2_64_Unpaired, BenchmarkVariantType::kCompound, 0, false},
+         benchmark_domains::kDomainV2_64_Unpaired, BenchmarkVariantType::kCompound, 0, 0, false},
         {"Ref512", 512, SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
-         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, false}
+         benchmark_domains::kDomainRef512, BenchmarkVariantType::kCompound, 0, 0, false}
     };
   }
 
@@ -1132,12 +1232,84 @@ int main(int argc, char** argv) {
   std::vector<std::vector<VariantResult>> all_results(sampled_roots.size(),
                                                       std::vector<VariantResult>(variants.size()));
 
+  std::vector<std::vector<bool>> has_base_variant(sampled_roots.size(),
+                                                  std::vector<bool>(variants.size(), false));
+  const std::string base_receipt_json = absl::GetFlag(FLAGS_base_receipt_json);
+  if (!base_receipt_json.empty()) {
+    if (!LoadBaseReceiptVariants(base_receipt_json, sampled_roots, variants, all_results, has_base_variant)) {
+      open_spiel::SpielFatalError(absl::StrFormat("Failed to load base receipt JSON: %s", base_receipt_json));
+    }
+  }
+
   const std::string checkpoint_path = output_path + ".checkpoint.json";
   size_t start_root_idx = 0;
   if (LoadBenchmarkCheckpoint(checkpoint_path, variants, all_results, start_root_idx)) {
     std::cout << absl::StrFormat("[RESUME] Resuming from checkpoint: %zu / %zu roots already completed!\n",
                                  start_root_idx, sampled_roots.size());
   }
+
+  if (!base_receipt_json.empty()) {
+    size_t ref_v_idx = variants.size();
+    for (size_t v = 0; v < variants.size(); ++v) {
+      if (variants[v].type == BenchmarkVariantType::kPairedReferenceOnChosenActions) {
+        ref_v_idx = v;
+        break;
+      }
+    }
+    if (ref_v_idx < variants.size()) {
+      int sanity_root_idx = -1;
+      for (size_t r = 0; r < sampled_roots.size(); ++r) {
+        if (has_base_variant[r][ref_v_idx] &&
+            all_results[r][ref_v_idx].evaluations > 0 &&
+            all_results[r][ref_v_idx].stage1_kept_worlds > 0) {
+          sanity_root_idx = static_cast<int>(r);
+          break;
+        }
+      }
+      if (sanity_root_idx >= 0) {
+        const auto& root = sampled_roots[sanity_root_idx];
+        const auto& cached_ref_vr = all_results[sanity_root_idx][ref_v_idx];
+        std::unique_ptr<open_spiel::State> sanity_state = game->NewInitialState();
+        for (int64_t a : root.action_history) {
+          sanity_state->ApplyAction(a);
+        }
+        std::vector<Action> distinct_actions;
+        for (const auto& cu : cached_ref_vr.candidate_utilities) {
+          distinct_actions.push_back(cu.first);
+        }
+        auto s_res = PairedPriorSortedRolloutSearchDecision(
+            *sanity_state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+            distinct_actions, /*rollouts_per_action=*/2048, min_override_margin,
+            /*min_t_stat=*/1.0, cached_ref_vr.decision_seed, SearchRolloutCrnMode::kSequential,
+            /*sample_opponent_leader_draft=*/false, /*max_time_ms=*/900000.0,
+            /*max_inflight_worlds=*/128);
+        double max_u_diff = std::abs(s_res.raw_mean_utility - cached_ref_vr.raw_mean_utility);
+        SPIEL_CHECK_EQ(s_res.candidate_utilities.size(), cached_ref_vr.candidate_utilities.size());
+        for (size_t i = 0; i < s_res.candidate_utilities.size(); ++i) {
+          SPIEL_CHECK_EQ(s_res.candidate_utilities[i].first, cached_ref_vr.candidate_utilities[i].first);
+          double diff = std::abs(s_res.candidate_utilities[i].second - cached_ref_vr.candidate_utilities[i].second);
+          if (diff > max_u_diff) max_u_diff = diff;
+        }
+        if (max_u_diff > 1e-5) {
+          open_spiel::SpielFatalError(absl::StrFormat(
+              "[SANITY-CHECK] Ref2048 reproduction failed on root %d: max_u_diff=%e > 1e-5",
+              root.root_id, max_u_diff));
+        }
+        std::cout << absl::StrFormat(
+            "[SANITY-CHECK] Verified Ref2048 reproduction on root %d (seed=%llu): max_u_diff=%e\n",
+            root.root_id, static_cast<unsigned long long>(cached_ref_vr.decision_seed), max_u_diff);
+      }
+    }
+  }
+
+  auto get_effective_top_k = [](const VariantConfig& vc, const SampledRoot& rt) -> int {
+    if (vc.type != BenchmarkVariantType::kSuccessiveHalvingFixedTop5) return 0;
+    if (vc.all_buy && rt.decision_type.rfind("Purchase", 0) == 0) {
+      return static_cast<int>(rt.legal_actions.size());
+    }
+    return vc.fixed_top_k;
+  };
+  bool verified_k_equivalence = false;
 
   for (size_t r_idx = start_root_idx; r_idx < sampled_roots.size(); ++r_idx) {
     const auto& root = sampled_roots[r_idx];
@@ -1155,7 +1327,239 @@ int main(int argc, char** argv) {
 
     for (size_t v_idx = 0; v_idx < variants.size(); ++v_idx) {
       const auto& v_cfg = variants[v_idx];
-      uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, v_cfg.seed_domain, root.root_id);
+
+      if (v_cfg.type != BenchmarkVariantType::kPairedReferenceOnChosenActions) {
+        if (has_base_variant[r_idx][v_idx]) {
+          continue;
+        }
+      }
+
+      uint64_t dec_seed = (v_cfg.type == BenchmarkVariantType::kPairedReferenceOnChosenActions &&
+                           has_base_variant[r_idx][v_idx] &&
+                           all_results[r_idx][v_idx].decision_seed != 0)
+          ? all_results[r_idx][v_idx].decision_seed
+          : dune_seed::DeriveSeed(master_seed, v_cfg.seed_domain, root.root_id);
+
+      if (v_cfg.type == BenchmarkVariantType::kPairedReferenceOnChosenActions &&
+          has_base_variant[r_idx][v_idx]) {
+        const Action raw_a = all_results[r_idx][0].chosen_action;
+        std::vector<Action> distinct_actions;
+        distinct_actions.push_back(raw_a);
+        for (size_t prev_v = 0; prev_v < v_idx; ++prev_v) {
+          Action a = all_results[r_idx][prev_v].chosen_action;
+          if (std::find(distinct_actions.begin(), distinct_actions.end(), a) == distinct_actions.end()) {
+            distinct_actions.push_back(a);
+          }
+        }
+
+        auto cached_ref = all_results[r_idx][v_idx];
+        // Case 1: distinct_actions.size() <= 1
+        if (distinct_actions.size() <= 1) {
+          continue;
+        }
+
+        // Case 2: distinct_actions.size() > 1 AND (cached_ref.evaluations == 0 || cached_ref.stage1_kept_worlds == 0)
+        if (cached_ref.evaluations == 0 || cached_ref.stage1_kept_worlds == 0) {
+          uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
+          auto t_start = std::chrono::steady_clock::now();
+
+          auto s_res = PairedPriorSortedRolloutSearchDecision(
+              *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+              distinct_actions, /*rollouts_per_action=*/v_cfg.rollouts, min_override_margin,
+              /*min_t_stat=*/1.0, dec_seed, SearchRolloutCrnMode::kSequential,
+              /*sample_opponent_leader_draft=*/false, /*max_time_ms=*/900000.0,
+              /*max_inflight_worlds=*/128);
+
+          auto t_end = std::chrono::steady_clock::now();
+          uint64_t evals_after = open_spiel::GetTotalNetworkEvaluations();
+          double dur_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+          VariantResult vr;
+          vr.decision_seed = dec_seed;
+          vr.chosen_action = s_res.action;
+          vr.overridden = s_res.overridden;
+          vr.raw_mean_utility = s_res.raw_mean_utility;
+          vr.chosen_mean_utility = s_res.chosen_mean_utility;
+          for (const auto& cu : s_res.candidate_utilities) {
+            vr.candidate_utilities.push_back({cu.first, cu.second});
+          }
+          for (const auto& cru : s_res.candidate_rollout_utilities) {
+            vr.candidate_rollout_utilities.push_back({cru.first, cru.second});
+          }
+          vr.stage1_planned_worlds = s_res.stage1_planned_worlds;
+          vr.stage1_kept_worlds = s_res.stage1_kept_worlds;
+          vr.stage2_planned_worlds = s_res.stage2_planned_worlds;
+          vr.stage2_kept_worlds = s_res.stage2_kept_worlds;
+          vr.deadline_bound = (s_res.stage1_kept_worlds < s_res.stage1_planned_worlds);
+
+          const std::vector<double>& raw_rollouts = s_res.candidate_rollout_utilities.empty()
+              ? std::vector<double>{}
+              : s_res.candidate_rollout_utilities.front().second;
+          for (const auto& cru : s_res.candidate_rollout_utilities) {
+            Action cand_a = cru.first;
+            if (cand_a == raw_a) {
+              vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), 0.0});
+            } else {
+              const auto& cand_rollouts = cru.second;
+              const size_t n = std::min(raw_rollouts.size(), cand_rollouts.size());
+              if (n < 2) {
+                vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), 0.0});
+              } else {
+                double sum_diff = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                  sum_diff += (cand_rollouts[i] - raw_rollouts[i]);
+                }
+                const double mean_diff = sum_diff / static_cast<double>(n);
+                double sum_sq = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                  double d = (cand_rollouts[i] - raw_rollouts[i]) - mean_diff;
+                  sum_sq += d * d;
+                }
+                const double var = sum_sq / static_cast<double>(n - 1);
+                const double sd = std::sqrt(std::max(0.0, var));
+                vr.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), sd});
+              }
+            }
+          }
+          vr.evaluations = evals_after - evals_before;
+          vr.duration_ms = dur_ms;
+          all_results[r_idx][v_idx] = std::move(vr);
+          std::cout << absl::StrFormat(
+              "[REF2048-EXTEND] Root %d: populated previously-empty Ref2048 for override actions\n",
+              root.root_id);
+          continue;
+        }
+
+        // Case 3: distinct_actions.size() > 1 AND cached_ref.evaluations > 0
+        std::vector<Action> missing_actions;
+        for (Action a : distinct_actions) {
+          bool found = false;
+          for (const auto& cu : cached_ref.candidate_utilities) {
+            if (cu.first == static_cast<int>(a)) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            missing_actions.push_back(a);
+          }
+        }
+
+        if (missing_actions.empty()) {
+          continue;
+        }
+
+        std::vector<Action> eval_actions = {raw_a};
+        for (Action ma : missing_actions) {
+          eval_actions.push_back(ma);
+        }
+
+        uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
+        auto t_start = std::chrono::steady_clock::now();
+
+        auto s_res = PairedPriorSortedRolloutSearchDecision(
+            *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+            eval_actions, /*rollouts_per_action=*/v_cfg.rollouts, min_override_margin,
+            /*min_t_stat=*/1.0, dec_seed, SearchRolloutCrnMode::kSequential,
+            /*sample_opponent_leader_draft=*/false, /*max_time_ms=*/900000.0,
+            /*max_inflight_worlds=*/128);
+
+        auto t_end = std::chrono::steady_clock::now();
+        uint64_t evals_after = open_spiel::GetTotalNetworkEvaluations();
+        double dur_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+        double raw_diff = std::abs(s_res.raw_mean_utility - cached_ref.raw_mean_utility);
+        if (raw_diff > 1e-5) {
+          open_spiel::SpielFatalError(absl::StrFormat(
+              "[REF2048-EXTEND] Raw mean utility diff %e > 1e-5 on root %d during extension",
+              raw_diff, root.root_id));
+        }
+
+        const std::vector<double>& raw_rollouts = s_res.candidate_rollout_utilities.empty()
+            ? std::vector<double>{}
+            : s_res.candidate_rollout_utilities.front().second;
+
+        for (const auto& cru : s_res.candidate_rollout_utilities) {
+          Action cand_a = cru.first;
+          if (cand_a == raw_a) continue;
+
+          for (const auto& cu : s_res.candidate_utilities) {
+            if (cu.first == cand_a) {
+              cached_ref.candidate_utilities.push_back({static_cast<int>(cand_a), cu.second});
+              break;
+            }
+          }
+
+          cached_ref.candidate_rollout_utilities.push_back({static_cast<int>(cand_a), cru.second});
+
+          const auto& cand_rollouts = cru.second;
+          const size_t n = std::min(raw_rollouts.size(), cand_rollouts.size());
+          if (n < 2) {
+            cached_ref.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), 0.0});
+          } else {
+            double sum_diff = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+              sum_diff += (cand_rollouts[i] - raw_rollouts[i]);
+            }
+            const double mean_diff = sum_diff / static_cast<double>(n);
+            double sum_sq = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+              double d = (cand_rollouts[i] - raw_rollouts[i]) - mean_diff;
+              sum_sq += d * d;
+            }
+            const double var = sum_sq / static_cast<double>(n - 1);
+            const double sd = std::sqrt(std::max(0.0, var));
+            cached_ref.candidate_pair_sd_vs_raw.push_back({static_cast<int>(cand_a), sd});
+          }
+        }
+
+        const size_t K = cached_ref.candidate_rollout_utilities.size();
+        const auto& base_raw_rollouts = cached_ref.candidate_rollout_utilities.front().second;
+        Action best_action = raw_a;
+        double best_mean_u = cached_ref.raw_mean_utility;
+        bool overridden = false;
+
+        for (size_t c_idx = 1; c_idx < K; ++c_idx) {
+          Action cand_a = static_cast<Action>(cached_ref.candidate_rollout_utilities[c_idx].first);
+          const auto& cand_rollouts = cached_ref.candidate_rollout_utilities[c_idx].second;
+          double sum_u = 0.0;
+          const int n_c = static_cast<int>(cand_rollouts.size());
+          for (int r = 0; r < n_c; ++r) {
+            sum_u += cand_rollouts[r];
+          }
+          double mean_u = (n_c > 0) ? (sum_u / n_c) : 0.0;
+          double mean_d = mean_u - cached_ref.raw_mean_utility;
+
+          const size_t n_pairs = std::min(base_raw_rollouts.size(), cand_rollouts.size());
+          double sum_sq_diff = 0.0;
+          for (size_t r = 0; r < n_pairs; ++r) {
+            double d_r = cand_rollouts[r] - base_raw_rollouts[r];
+            double diff = d_r - mean_d;
+            sum_sq_diff += diff * diff;
+          }
+          double var_d = (n_pairs > 1) ? (sum_sq_diff / (n_pairs - 1)) : 0.0;
+          double se_d = (n_pairs > 1) ? std::sqrt(var_d / n_pairs) : 0.0;
+          const double t_stat = (n_pairs >= 2) ? ((se_d > 1e-9) ? (mean_d / se_d) : (mean_d > 0.0 ? 100.0 : 0.0)) : 0.0;
+
+          if (mean_d > min_override_margin && t_stat >= 1.0 && mean_u > best_mean_u) {
+            best_mean_u = mean_u;
+            best_action = cand_a;
+            overridden = true;
+          }
+        }
+
+        cached_ref.chosen_action = best_action;
+        cached_ref.chosen_mean_utility = best_mean_u;
+        cached_ref.overridden = overridden;
+        cached_ref.evaluations += (evals_after - evals_before);
+        cached_ref.duration_ms += dur_ms;
+
+        all_results[r_idx][v_idx] = cached_ref;
+        std::cout << absl::StrFormat(
+            "[REF2048-EXTEND] Root %d: appended %zu new action(s) to populated Ref2048 (raw_u diff=%e)\n",
+            root.root_id, missing_actions.size(), raw_diff);
+        continue;
+      }
 
       uint64_t evals_before = open_spiel::GetTotalNetworkEvaluations();
       auto t_start = std::chrono::steady_clock::now();
@@ -1174,12 +1578,55 @@ int main(int argc, char** argv) {
         vr.chosen_mean_utility = 0.0;
       } else if (v_cfg.type == BenchmarkVariantType::kSuccessiveHalvingDynamic ||
                  v_cfg.type == BenchmarkVariantType::kSuccessiveHalvingFixedTop5) {
+        int eff_top_k = 0;
+        if (v_cfg.type == BenchmarkVariantType::kSuccessiveHalvingFixedTop5) {
+          eff_top_k = get_effective_top_k(v_cfg, root);
+          const int eff_K = std::min<int>(eff_top_k, static_cast<int>(root.legal_actions.size()));
+
+          int matched_prev_v = -1;
+          for (size_t prev_v = 0; prev_v < v_idx; ++prev_v) {
+            if (variants[prev_v].type == BenchmarkVariantType::kSuccessiveHalvingFixedTop5 &&
+                variants[prev_v].reference_rollouts_per_action == v_cfg.reference_rollouts_per_action &&
+                variants[prev_v].seed_domain == v_cfg.seed_domain &&
+                std::min<int>(get_effective_top_k(variants[prev_v], root), static_cast<int>(root.legal_actions.size())) == eff_K &&
+                all_results[r_idx][prev_v].stage1_planned_worlds > 0) {
+              matched_prev_v = static_cast<int>(prev_v);
+              break;
+            }
+          }
+
+          if (matched_prev_v >= 0) {
+            if (!verified_k_equivalence) {
+              auto s_res = SuccessiveHalvingRolloutSearchDecision(
+                  *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
+                  v_cfg.reference_rollouts_per_action, min_override_margin,
+                  dec_seed, SearchRolloutCrnMode::kSequential,
+                  /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0,
+                  eff_top_k);
+              if (s_res.action != all_results[r_idx][matched_prev_v].chosen_action ||
+                  std::abs(s_res.chosen_mean_utility - all_results[r_idx][matched_prev_v].chosen_mean_utility) > 1e-6) {
+                open_spiel::SpielFatalError(absl::StrFormat(
+                    "[SANITY-CHECK] K-equivalence mismatch between %s and %s on root %d: action %d vs %d, utility %f vs %f",
+                    v_cfg.name, variants[matched_prev_v].name, root.root_id,
+                    s_res.action, all_results[r_idx][matched_prev_v].chosen_action,
+                    s_res.chosen_mean_utility, all_results[r_idx][matched_prev_v].chosen_mean_utility));
+              }
+              std::cout << absl::StrFormat(
+                  "[SANITY-CHECK] Verified exact top-k equivalence between %s and %s on root %d (eff_K=%d)\n",
+                  v_cfg.name, variants[matched_prev_v].name, root.root_id, eff_K);
+              verified_k_equivalence = true;
+            }
+            all_results[r_idx][v_idx] = all_results[r_idx][matched_prev_v];
+            continue;
+          }
+        }
+
         auto s_res = SuccessiveHalvingRolloutSearchDecision(
             *state, root.search_seat, /*turn_tree=*/nullptr, evaluators,
             v_cfg.reference_rollouts_per_action, min_override_margin,
             dec_seed, SearchRolloutCrnMode::kSequential,
             /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0,
-            v_cfg.fixed_top5);
+            eff_top_k);
         vr.chosen_action = s_res.action;
         vr.overridden = s_res.overridden;
         vr.raw_mean_utility = s_res.raw_mean_utility;
