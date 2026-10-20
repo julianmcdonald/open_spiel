@@ -252,6 +252,9 @@ endif()
 
 list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium.cc
+  dune_imperium/dune_imperium_public_card_knowledge.cc
+  dune_imperium/dune_imperium_public_card_knowledge.h
+  dune_imperium/dune_imperium_public_card_state.cc
   dune_imperium/dune_imperium.h
   dune_imperium/dune_imperium_board.cc
   dune_imperium/dune_imperium_board.h
@@ -818,5 +821,16 @@ add_test(dune_imperium_leaders_test dune_imperium_leaders_test)
 add_executable(dune_imperium_resample_test dune_imperium/dune_imperium_resample_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_resample_test dune_imperium_resample_test)
+
+add_executable(dune_imperium_public_card_knowledge_test
+  dune_imperium/dune_imperium_public_card_knowledge_test.cc
+  dune_imperium/dune_imperium_public_card_knowledge.cc)
+add_test(dune_imperium_public_card_knowledge_test
+  dune_imperium_public_card_knowledge_test)
+
+add_executable(dune_imperium_public_card_native_test
+  dune_imperium/dune_imperium_public_card_native_test.cc
+  ${OPEN_SPIEL_OBJECTS} $<TARGET_OBJECTS:tests>)
+add_test(dune_imperium_public_card_native_test dune_imperium_public_card_native_test)
 
 

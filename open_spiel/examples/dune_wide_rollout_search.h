@@ -384,6 +384,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     int max_inflight_worlds = 32,
     bool resample_from_infostate = true,
     bool use_bounded_pool_when_unclocked = false) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   if (ordered_candidates.empty()) {
     return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   }
@@ -661,6 +662,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     int fixed_top_k = 0,
     int max_inflight_worlds = 32,
     bool use_bounded_pool_when_unclocked = false) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   if (fixed_top_k == 1) {
     SpielFatalError("SuccessiveHalvingRolloutSearchDecision: fixed_top_k cannot be 1 (requires at least 2 candidates).");
   }

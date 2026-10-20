@@ -69,6 +69,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
   py::class_<ImperiumCard>(di, "ImperiumCard")
       .def_readonly("id", &ImperiumCard::id)
       .def_readonly("name", &ImperiumCard::name)
+      .def_readonly("access_mask", &ImperiumCard::access_mask)
       .def_readonly("reveal_swords", &ImperiumCard::reveal_swords)
       .def_readonly("reveal_troops", &ImperiumCard::reveal_troops)
       .def_readonly("agent_troops", &ImperiumCard::agent_troops);
@@ -131,6 +132,54 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_player_deck_top_cards",
            &DuneImperiumState::SetPlayerDeckTopCardsForTesting,
            py::arg("player"), py::arg("cards"))
+      .def("get_player_deck_top_cards",
+           &DuneImperiumState::GetPlayerDeckTopCardsForTesting,
+           py::arg("player"))
+      .def("public_hand_card_arrived", &DuneImperiumState::PublicHandCardArrived,
+           py::arg("player"), py::arg("card_id"))
+      .def("public_hand_card_departed", &DuneImperiumState::PublicHandCardDeparted,
+           py::arg("player"), py::arg("card_id"))
+      .def("public_hand_cards_revealed", &DuneImperiumState::PublicHandCardsRevealed,
+           py::arg("player"))
+      .def("refresh_public_card_knowledge", &DuneImperiumState::RefreshPublicCardKnowledge,
+           py::arg("player"))
+      .def("begin_ilesa_public_knowledge", &DuneImperiumState::BeginIlesaPublicKnowledge,
+           py::arg("player"))
+      .def("return_ilesa_public_knowledge", &DuneImperiumState::ReturnIlesaPublicKnowledge,
+           py::arg("player"), py::arg("bonus_eligible"))
+      .def("synchronize_public_hand_knowledge",
+           &DuneImperiumState::SynchronizePublicHandKnowledge,
+           py::arg("player"), py::arg("cards"), py::arg("complete") = false,
+           py::arg("owned_pool_complete") = true)
+      .def("get_publicly_known_hand_cards", &DuneImperiumState::GetPubliclyKnownHandCards,
+           py::arg("player"))
+      .def("get_ilesa_public_candidates", &DuneImperiumState::GetIlesaPublicCandidates,
+           py::arg("player"))
+      .def("get_owned_imperium_card_pool", &DuneImperiumState::GetOwnedImperiumCardPool,
+           py::arg("player"))
+      .def("get_publicly_known_snooper_card", &DuneImperiumState::GetPubliclyKnownSnooperCard)
+      .def("public_card_knowledge_digest", &DuneImperiumState::PublicCardKnowledgeDigest)
+      .def("set_public_bonus_evidence_complete", &DuneImperiumState::SetPublicBonusEvidenceComplete,
+           py::arg("player"), py::arg("complete"))
+      .def("observe_ilesa_public_bonus", &DuneImperiumState::ObserveIlesaPublicBonus,
+           py::arg("player"), py::arg("played"), py::arg("reward"),
+           py::arg("complete"))
+      .def("reconcile_hidden_hand_copies", &DuneImperiumState::ReconcileHiddenHandCopies,
+           py::arg("player"), py::arg("required"),
+           py::arg("protected_cards") = std::vector<int>{})
+      .def("reconcile_hidden_hand_for_public_knowledge",
+           &DuneImperiumState::ReconcileHiddenHandForPublicKnowledge,
+           py::arg("player"))
+      .def("reconcile_revealed_card_copies", &DuneImperiumState::ReconcileRevealedCardCopies,
+           py::arg("player"), py::arg("cards"), py::arg("complete"))
+      .def("reconcile_discard_card_copies", &DuneImperiumState::ReconcileDiscardCardCopies,
+           py::arg("player"), py::arg("cards"), py::arg("complete"))
+      .def("reconcile_hand_and_ilesa_for_reveal", &DuneImperiumState::ReconcileHandAndIlesaForReveal,
+           py::arg("player"), py::arg("observed_cards"), py::arg("complete") = false)
+      .def("get_pending_graft_primary_id", &DuneImperiumState::GetPendingGraftPrimaryId)
+      .def("get_pending_graft_player", &DuneImperiumState::GetPendingGraftPlayer)
+      .def("get_ilesa_bonus_card", &DuneImperiumState::GetIlesaBonusCardForTesting,
+           py::arg("player"))
       .def("set_imperium_row", &DuneImperiumState::SetImperiumRowForTesting,
            py::arg("row"))
       .def("set_tleilaxu_row", &DuneImperiumState::SetTleilaxuRowForTesting,

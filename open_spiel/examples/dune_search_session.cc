@@ -120,6 +120,7 @@ void DuneSearchSession::ResetSession(const std::string& reason) {
   short_cumulative_counter_ = 0;
   session_history_.clear();
   last_input_history_.clear();
+  last_public_card_constraints_.clear();
   last_reset_reason_ = reason;
 
   has_pending_commit_ = false;
@@ -181,6 +182,14 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
   const dune_imperium::DuneImperiumState& dune_state =
       static_cast<const dune_imperium::DuneImperiumState&>(state);
+  const std::string public_constraints = dune_state.PublicCardKnowledgeDigest();
+  if (state.History() == last_input_history_ &&
+      !last_public_card_constraints_.empty() &&
+      public_constraints != last_public_card_constraints_) {
+    // A capture can correct knowledge without applying an action. Invalidate
+    // the cached worlds while retaining the current turn's clocks and budget.
+    HandleReRootMismatch("public_card_knowledge_correction");
+  }
 
   // Descendant re-root validation check
   if (has_active_session_ && state.History() != last_input_history_) {
@@ -227,6 +236,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
   }
 
   // Short window transition budget sharing
+  last_public_card_constraints_ = public_constraints;
   bool is_short_window_role = (role == DuneDecisionRole::kPurchase ||
                                role == DuneDecisionRole::kCombatIntrigue ||
                                role == DuneDecisionRole::kOtherOptional);
@@ -1017,6 +1027,10 @@ DuneSearchResult DuneSearchSession::CommitAction(const ControllerDecision& decis
 }
 
 void DuneSearchSession::DiscardPendingAction() {
+  if (last_search_state_) {
+    last_input_history_ = last_search_state_->History();
+    session_history_ = last_input_history_;
+  }
   last_search_state_.reset();
   has_pending_commit_ = false;
 }
@@ -1238,6 +1252,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     impl_->tree.Reset();
     turn_elapsed_search_time_ms_ = 0.0;
   }
+  impl_->tree.BindPublicCardKnowledge(state);
 
   has_active_session_ = true;
   last_player_ = p;

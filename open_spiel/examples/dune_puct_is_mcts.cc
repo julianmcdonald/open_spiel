@@ -282,6 +282,11 @@ std::pair<Player, std::string> DunePUCTISMCTSBot::GetStateKey(const State& state
       "|decision_depth_cap=", config_.max_search_decision_depth,
       "|actions=", actions_sig
   );
+  if (const auto* dune =
+          dynamic_cast<const dune_imperium::DuneImperiumState*>(&state)) {
+    absl::StrAppend(&full_key, "|public_card_knowledge=",
+                    dune->PublicCardKnowledgeRecordDigest());
+  }
   return {state.CurrentPlayer(), full_key};
 }
 
