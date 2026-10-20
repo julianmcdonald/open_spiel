@@ -396,6 +396,8 @@ struct CompoundSearchDecisionResult {
   double stage1_elapsed_ms = 0.0;
   double stage2_elapsed_ms = 0.0;
   std::string termination_reason = "none";
+  double mean_d_stage2 = 0.0;
+  double se_d_stage2 = 0.0;
 };
 
 // Optional source of search worlds, keyed by the world seed. Returning nullptr

@@ -13,6 +13,9 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
+#include <sstream>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -22,6 +25,7 @@
 #include "open_spiel/examples/dune_compound_turn_search.h"
 #include "open_spiel/examples/dune_network.h"
 #include "open_spiel/examples/dune_seed_utils.h"
+#include "open_spiel/examples/dune_semantic_action_scorer.h"
 #include "open_spiel/examples/dune_wide_rollout_search.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -61,6 +65,38 @@ ABSL_FLAG(bool, skip_recheck_1024, false,
           "Skip the 1,024-rollout disagreement re-check pass.");
 ABSL_FLAG(std::string, base_receipt_json, "",
           "Optional path to existing sh_budget_check_sweep_receipt.json to reuse completed variants and incrementally extend Ref2048.");
+
+// Mode 1: Raw Greedy Self-Play Root & Preservation Capture Mode
+ABSL_FLAG(int, capture_self_play_games, 0,
+          "Number of 4x greedy self-play games to capture placement roots and preservation pool from.");
+ABSL_FLAG(int, capture_roots_per_seat_game, 2, "Max placement roots sampled per seat-game.");
+ABSL_FLAG(int, capture_pres_per_seat_game, 4,
+          "Max preservation decisions sampled per seat-game across all non-forced decision types.");
+ABSL_FLAG(int, capture_max_placement_roots, 0,
+          "Optional cap on total sampled placement roots across all games (0 = no cap).");
+ABSL_FLAG(std::string, capture_out_dir, "",
+          "Output directory for captured roots and preservation dataset.");
+ABSL_FLAG(bool, auto_pass_empty_combat_intrigue, true,
+          "Value for DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands (false for legacy R7-41 roots).");
+
+// Mode 2: Parallel-Roots sh_768_k5_allbuy Labelling Mode
+ABSL_FLAG(bool, sh_distill_label, false, "Run parallel-roots sh_768_k5_allbuy labelling mode.");
+ABSL_FLAG(int, parallel_roots, 1, "Number of roots to search concurrently across worker threads.");
+ABSL_FLAG(bool, use_bounded_pool_when_unclocked, false,
+          "Use bounded world pool in RunClockedPairedRolloutStage when max_time_ms <= 0.");
+ABSL_FLAG(int, max_inflight_worlds, 32, "Max inflight worlds per root when using bounded pool.");
+ABSL_FLAG(bool, placement_roots_only, false,
+          "Filter loaded roots to AgentPrimary and AgentContinuation only.");
+ABSL_FLAG(uint64_t, label_seed_domain, 0x0701ULL, "Seed domain for sh_distill_label.");
+
+// Mode 3: True-State Tie-Breaker & History Replay Verification Mode
+ABSL_FLAG(std::string, tie_breaker_games_jsonl, "",
+          "Path to games.jsonl from dune_population_eval for history replay verification and Step 1.6 tie-breaker.");
+ABSL_FLAG(bool, tie_breaker_run_rollouts, false,
+          "If true (and r <= 1.5 or forced), run 512 paired true-state rollouts on up to 300 changed student decisions.");
+ABSL_FLAG(int, tie_breaker_max_sample, 300,
+          "Max changed student decisions to sample for true-state rollouts.");
+ABSL_FLAG(int, tie_breaker_rollouts, 512, "Paired full-game rollouts per move in tie-breaker.");
 
 namespace benchmark_domains {
 constexpr uint64_t kDomainV0_Run1        = 0x0501;
@@ -121,6 +157,8 @@ struct SampledRoot {
   int census_chosen_action = 0;
   bool census_overridden = false;
   std::vector<int64_t> action_history;
+  std::string split = "train";
+  std::vector<double> pi_parent;
 };
 
 struct VariantResult {
@@ -926,9 +964,1438 @@ int RunHeldOutReplayEvaluation(
   return 0;
 }
 
+namespace {
+template <typename T>
+void WritePod(std::ofstream& ofs, const T& val) {
+  ofs.write(reinterpret_cast<const char*>(&val), sizeof(T));
+}
+
+template <typename T>
+void ReadPod(std::ifstream& ifs, T& val) {
+  ifs.read(reinterpret_cast<char*>(&val), sizeof(T));
+}
+
+template <typename T>
+void WriteVector(std::ofstream& ofs, const std::vector<T>& vec) {
+  uint64_t sz = vec.size();
+  WritePod(ofs, sz);
+  if (sz > 0) {
+    ofs.write(reinterpret_cast<const char*>(vec.data()), sz * sizeof(T));
+  }
+}
+
+template <typename T>
+void ReadVector(std::ifstream& ifs, std::vector<T>& vec) {
+  uint64_t sz = 0;
+  ReadPod(ifs, sz);
+  vec.resize(sz);
+  if (sz > 0) {
+    ifs.read(reinterpret_cast<char*>(vec.data()), sz * sizeof(T));
+  }
+}
+}  // namespace
+
+int RunSelfPlayRootAndPreservationCapture() {
+  const int num_games = absl::GetFlag(FLAGS_capture_self_play_games);
+  const int roots_per_seat = absl::GetFlag(FLAGS_capture_roots_per_seat_game);
+  const int pres_per_seat = absl::GetFlag(FLAGS_capture_pres_per_seat_game);
+  const int max_placement_roots = absl::GetFlag(FLAGS_capture_max_placement_roots);
+  const std::string out_dir = absl::GetFlag(FLAGS_capture_out_dir);
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  const int num_threads = std::max(1, absl::GetFlag(FLAGS_threads));
+  const int num_evals = absl::GetFlag(FLAGS_num_evaluators);
+  const int target_batch_size = absl::GetFlag(FLAGS_target_batch_size);
+  const uint64_t base_seed = absl::GetFlag(FLAGS_master_seed);
+  const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+
+  if (out_dir.empty()) {
+    open_spiel::SpielFatalError("--capture_out_dir must be specified when --capture_self_play_games > 0");
+  }
+  if (model_path.empty()) {
+    open_spiel::SpielFatalError("--model_checkpoint must be specified when --capture_self_play_games > 0");
+  }
+
+  std::cout << "================================================================================\n";
+  std::cout << "MODE 1: RAW GREEDY SELF-PLAY ROOT & PRESERVATION CAPTURE\n";
+  std::cout << "================================================================================\n";
+  std::cout << "Model checkpoint:   " << model_path << "\n";
+  std::cout << "Output dir:         " << out_dir << "\n";
+  std::cout << "Games:              " << num_games << "\n";
+  std::cout << "Threads:            " << num_threads << "\n";
+  std::cout << "Roots / seat-game:  " << roots_per_seat << "\n";
+  std::cout << "Pres / seat-game:   " << pres_per_seat << "\n";
+  std::cout << "Max placement roots:" << max_placement_roots << "\n";
+  std::cout << "Master seed:        " << base_seed << "\n";
+  std::cout << "Num blocks:         " << num_blocks << "\n";
+
+  open_spiel::dune_imperium::DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands(
+      absl::GetFlag(FLAGS_auto_pass_empty_combat_intrigue));
+
+  at::globalContext().setAllowTF32CuBLAS(false);
+  at::globalContext().setAllowTF32CuDNN(false);
+
+  torch::Device device(torch::kCUDA, 0);
+  if (!torch::cuda::is_available()) {
+    device = torch::Device(torch::kCPU);
+  }
+  std::cout << "[DEVICE] Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+
+  std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> models(num_evals);
+  std::vector<std::unique_ptr<std::shared_mutex>> model_mutexes(num_evals);
+  std::vector<std::shared_ptr<open_spiel::BatchedEvaluator>> coords(num_evals);
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> evaluators(num_evals);
+
+  for (int e = 0; e < num_evals; ++e) {
+    models[e] = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391,
+        num_blocks,
+        /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
+        /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    models[e]->to(device);
+    open_spiel::LoadModelCheckpointRobust(models[e], model_path, device);
+    models[e]->eval();
+
+    model_mutexes[e] = std::make_unique<std::shared_mutex>();
+    coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
+        models[e], target_batch_size, /*timeout_ms=*/1, device, model_mutexes[e].get(), 10.0f,
+        /*device_synchronize=*/false, /*high_priority_stream=*/true,
+        /*emit_batch_membership=*/false,
+        /*rollout_amp=*/false,
+        /*allow_tf32=*/false);
+    evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(coords[e], 10.0f);
+  }
+
+  std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame("dune_imperium");
+
+  struct CapturedPlacementRoot {
+    int game_id = 0;
+    int decision_ordinal = 0;
+    int search_seat = 0;
+    int round = 0;
+    std::string round_band;
+    std::string decision_type;
+    std::vector<int> legal_actions;
+    int raw_action = 0;
+    std::vector<int64_t> action_history;
+    std::string split;
+    std::vector<double> pi_parent;
+    std::vector<float> obs;
+    dune_semantic::CandidateActionData cand_data;
+  };
+
+  struct CapturedPreservationItem {
+    int game_id = 0;
+    int split_id = 0;
+    int player = 0;
+    std::vector<float> obs;
+    dune_semantic::CandidateActionData cand_data;
+    std::vector<int> legal_actions;
+    std::vector<double> pi_parent;
+  };
+
+  std::vector<std::vector<CapturedPlacementRoot>> per_game_roots(num_games);
+  std::vector<std::vector<CapturedPreservationItem>> per_game_pres(num_games);
+
+  std::filesystem::create_directories(out_dir);
+  std::string ckpt_path = out_dir + "/preservation_pool.bin.ckpt";
+
+  std::unique_ptr<std::atomic<uint8_t>[]> game_completed(new std::atomic<uint8_t>[num_games]());
+  for (int i = 0; i < num_games; ++i) {
+    game_completed[i].store(0, std::memory_order_relaxed);
+  }
+  std::atomic<int> completed_games_count{0};
+  std::mutex ckpt_mutex;
+
+  if (roots_per_seat == 0 && std::filesystem::exists(ckpt_path)) {
+    std::ifstream ifs(ckpt_path, std::ios::binary);
+    if (ifs.is_open()) {
+      uint32_t magic = 0;
+      uint32_t version = 0;
+      ReadPod(ifs, magic);
+      ReadPod(ifs, version);
+      if (magic == 0x50434B50U && version == 1U) {
+        uint64_t saved_completed_games = 0;
+        ReadPod(ifs, saved_completed_games);
+        for (uint64_t i = 0; i < saved_completed_games; ++i) {
+          int g = -1;
+          ReadPod(ifs, g);
+          uint64_t num_items = 0;
+          ReadPod(ifs, num_items);
+          if (g >= 0 && g < num_games) {
+            per_game_pres[g].resize(num_items);
+            for (uint64_t item_idx = 0; item_idx < num_items; ++item_idx) {
+              auto& item = per_game_pres[g][item_idx];
+              ReadPod(ifs, item.game_id);
+              ReadPod(ifs, item.split_id);
+              ReadPod(ifs, item.player);
+              ReadVector(ifs, item.obs);
+              ReadVector(ifs, item.cand_data.actions);
+              ReadVector(ifs, item.cand_data.features);
+              ReadVector(ifs, item.cand_data.card_ids);
+              ReadVector(ifs, item.cand_data.space_ids);
+              ReadVector(ifs, item.cand_data.supported);
+              ReadVector(ifs, item.cand_data.roles);
+              ReadVector(ifs, item.legal_actions);
+              ReadVector(ifs, item.pi_parent);
+            }
+            if (game_completed[g].load(std::memory_order_relaxed) == 0) {
+              game_completed[g].store(1, std::memory_order_release);
+              completed_games_count.fetch_add(1, std::memory_order_relaxed);
+            }
+          } else {
+            for (uint64_t item_idx = 0; item_idx < num_items; ++item_idx) {
+              CapturedPreservationItem dummy;
+              ReadPod(ifs, dummy.game_id);
+              ReadPod(ifs, dummy.split_id);
+              ReadPod(ifs, dummy.player);
+              ReadVector(ifs, dummy.obs);
+              ReadVector(ifs, dummy.cand_data.actions);
+              ReadVector(ifs, dummy.cand_data.features);
+              ReadVector(ifs, dummy.cand_data.card_ids);
+              ReadVector(ifs, dummy.cand_data.space_ids);
+              ReadVector(ifs, dummy.cand_data.supported);
+              ReadVector(ifs, dummy.cand_data.roles);
+              ReadVector(ifs, dummy.legal_actions);
+              ReadVector(ifs, dummy.pi_parent);
+            }
+          }
+        }
+        std::cout << absl::StrFormat("[RESUME] Loaded %d completed games from %s\n",
+                                     completed_games_count.load(), ckpt_path);
+      } else {
+        std::cerr << "[RESUME] Warning: Checkpoint magic/version mismatch in " << ckpt_path << ", ignoring.\n";
+      }
+    }
+  }
+
+  if (completed_games_count.load() == num_games) {
+    std::cout << absl::StrFormat("[CAPTURE] All %d games already completed from checkpoint\n", num_games);
+  }
+
+  std::atomic<int> next_game{0};
+  std::vector<std::thread> workers;
+  workers.reserve(num_threads);
+
+  auto start_time = std::chrono::steady_clock::now();
+
+  for (int t = 0; t < num_threads; ++t) {
+    workers.emplace_back([&, t]() {
+      int eval_idx = t % num_evals;
+      while (true) {
+        int g = next_game.fetch_add(1);
+        if (g >= num_games) break;
+        if (game_completed[g].load(std::memory_order_acquire) != 0) continue;
+
+        int mod20 = g % 20;
+        std::string split = (mod20 < 14) ? "train" : (mod20 < 17 ? "val" : "test");
+        int split_id = (mod20 < 14) ? 0 : (mod20 < 17 ? 1 : 2);
+
+        uint64_t chance_seed = dune_seed::DeriveSeed(base_seed, 0x4501ULL, static_cast<uint64_t>(g));
+        std::mt19937 rng(chance_seed);
+        std::unique_ptr<State> state = game->NewInitialState();
+        std::vector<int64_t> history;
+
+        std::array<std::vector<CapturedPlacementRoot>, 4> seat_placements;
+        std::array<std::vector<CapturedPreservationItem>, 4> seat_all_decisions;
+        int decision_ordinal = 0;
+
+        while (!state->IsTerminal()) {
+          if (state->IsChanceNode()) {
+            auto outcomes = state->ChanceOutcomes();
+            double u = std::generate_canonical<double, 53>(rng);
+            Action ca = open_spiel::SampleAction(outcomes, u).first;
+            state->ApplyAction(ca);
+            history.push_back(ca);
+            continue;
+          }
+
+          Player cur = state->CurrentPlayer();
+          std::vector<Action> legals = state->LegalActions();
+          if (legals.empty()) break;
+
+          if (legals.size() == 1) {
+            Action a = legals.front();
+            state->ApplyAction(a);
+            history.push_back(a);
+            continue;
+          }
+
+          const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+          GamePhase phase = dune ? dune->phase() : GamePhase::kAgentTurns;
+
+          std::string dec_type;
+          bool has_tech = false, has_tleilaxu = false, has_imperium = false;
+          for (Action a : legals) {
+            if ((70 <= a && a <= 75) || (770 <= a && a <= 775)) has_tech = true;
+            if (90 <= a && a <= 95) has_tleilaxu = true;
+            if ((10 <= a && a < 18) || (572 <= a && a < 580) || a == 598 || a == 599) has_imperium = true;
+          }
+          if (has_tech || has_tleilaxu || has_imperium) {
+            if (has_tech) dec_type = "Purchase:Tech";
+            else if (has_tleilaxu) dec_type = "Purchase:Tleilaxu";
+            else if (has_imperium) dec_type = "Purchase:Imperium";
+            else dec_type = "Purchase:Other";
+          } else {
+            bool has_leader = false;
+            for (Action a : legals) {
+              if (558 <= a && a <= 571) { has_leader = true; break; }
+            }
+            if (has_leader) {
+              dec_type = "LeaderSelect";
+            } else {
+              bool has_combat_act = false;
+              for (Action a : legals) {
+                if (a == 40 || (1700 <= a && a < 1800) || (650 <= a && a < 698)) {
+                  has_combat_act = true;
+                  break;
+                }
+              }
+              if (phase == GamePhase::kCombat || has_combat_act) {
+                dec_type = "CombatIntrigue";
+              } else if (phase == GamePhase::kAgentTurns) {
+                bool has_card = false;
+                bool has_space = false;
+                for (Action a : legals) {
+                  if ((1800 <= a && a < 2056) || a == 3) has_card = true;
+                  if (600 <= a && a <= 621) has_space = true;
+                }
+                if (has_card && !has_space) dec_type = "AgentPrimary";
+                else if (has_space) dec_type = "AgentContinuation";
+                else dec_type = "Other";
+              } else {
+                dec_type = "Other";
+              }
+            }
+          }
+
+          auto prior = evaluators[eval_idx]->Prior(*state);
+          Action raw_action = legals.front();
+          double max_p = -1.0;
+          std::vector<double> pi_p(legals.size(), 0.0);
+          for (size_t i = 0; i < legals.size(); ++i) {
+            Action a = legals[i];
+            double p = 0.0;
+            for (const auto& ap : prior) {
+              if (ap.first == a) { p = ap.second; break; }
+            }
+            pi_p[i] = p;
+            if (p > max_p) {
+              max_p = p;
+              raw_action = a;
+            }
+          }
+
+          std::vector<float> obs = evaluators[eval_idx]->GetConsumedObservation(*state, cur);
+          dune_semantic::CandidateActionData cand_data;
+          if (dune) {
+            dune_semantic::ExtractCandidateDescriptors(*dune, legals, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
+          }
+          int cur_round = dune ? dune->GetCurrentRound() : 1;
+          std::string round_band = (cur_round <= 3) ? "R1-3" : (cur_round <= 6 ? "R4-6" : "R7+");
+
+          CapturedPreservationItem pres_item;
+          pres_item.game_id = g;
+          pres_item.split_id = split_id;
+          pres_item.player = cur;
+          pres_item.obs = obs;
+          pres_item.cand_data = cand_data;
+          pres_item.legal_actions.assign(legals.begin(), legals.end());
+          pres_item.pi_parent = pi_p;
+          seat_all_decisions[cur].push_back(std::move(pres_item));
+
+          if (roots_per_seat > 0 && (dec_type == "AgentPrimary" || dec_type == "AgentContinuation")) {
+            CapturedPlacementRoot pl_root;
+            pl_root.game_id = g;
+            pl_root.decision_ordinal = decision_ordinal;
+            pl_root.search_seat = cur;
+            pl_root.round = cur_round;
+            pl_root.round_band = round_band;
+            pl_root.decision_type = dec_type;
+            pl_root.legal_actions.assign(legals.begin(), legals.end());
+            pl_root.raw_action = raw_action;
+            pl_root.action_history = history;
+            pl_root.split = split;
+            pl_root.pi_parent = std::move(pi_p);
+            pl_root.obs = std::move(obs);
+            pl_root.cand_data = std::move(cand_data);
+            seat_placements[cur].push_back(std::move(pl_root));
+          }
+
+          decision_ordinal++;
+          state->ApplyAction(raw_action);
+          history.push_back(raw_action);
+        }
+
+        for (int s = 0; s < 4; ++s) {
+          auto& pl_list = seat_placements[s];
+          if (!pl_list.empty()) {
+            std::mt19937 seat_rng(dune_seed::DeriveSeed(base_seed, 0x4502ULL, static_cast<uint64_t>(g * 4 + s)));
+            std::vector<size_t> p_idx(pl_list.size());
+            std::iota(p_idx.begin(), p_idx.end(), 0);
+            std::shuffle(p_idx.begin(), p_idx.end(), seat_rng);
+            size_t k_take = std::min<size_t>(roots_per_seat, p_idx.size());
+            p_idx.resize(k_take);
+            std::sort(p_idx.begin(), p_idx.end());
+            for (size_t idx : p_idx) {
+              per_game_roots[g].push_back(std::move(pl_list[idx]));
+            }
+          }
+
+          auto& all_list = seat_all_decisions[s];
+          if (!all_list.empty()) {
+            std::mt19937 pres_rng(dune_seed::DeriveSeed(base_seed, 0x4503ULL, static_cast<uint64_t>(g * 4 + s)));
+            std::vector<size_t> a_idx(all_list.size());
+            std::iota(a_idx.begin(), a_idx.end(), 0);
+            std::shuffle(a_idx.begin(), a_idx.end(), pres_rng);
+            size_t k_take = std::min<size_t>(pres_per_seat, a_idx.size());
+            a_idx.resize(k_take);
+            std::sort(a_idx.begin(), a_idx.end());
+            for (size_t idx : a_idx) {
+              per_game_pres[g].push_back(std::move(all_list[idx]));
+            }
+          }
+        }
+
+        game_completed[g].store(1, std::memory_order_release);
+        int done = ++completed_games_count;
+
+        if (done % 10 == 0 || done == num_games) {
+          std::cout << absl::StrFormat("[CAPTURE] Completed %d / %d self-play games\n", done, num_games);
+        }
+
+        if (roots_per_seat == 0 && done % 200 == 0) {
+          std::lock_guard<std::mutex> lock(ckpt_mutex);
+          std::string tmp_ckpt = out_dir + "/preservation_pool.bin.ckpt.tmp";
+          std::string ckpt_file = out_dir + "/preservation_pool.bin.ckpt";
+          std::ofstream ofs(tmp_ckpt, std::ios::binary);
+          if (ofs.is_open()) {
+            WritePod(ofs, 0x50434B50U);
+            WritePod(ofs, 1U);
+            uint64_t completed_count = 0;
+            for (int i = 0; i < num_games; ++i) {
+              if (game_completed[i].load(std::memory_order_acquire) != 0) {
+                completed_count++;
+              }
+            }
+            WritePod(ofs, completed_count);
+            for (int i = 0; i < num_games; ++i) {
+              if (game_completed[i].load(std::memory_order_acquire) != 0) {
+                WritePod(ofs, i);
+                uint64_t n_items = per_game_pres[i].size();
+                WritePod(ofs, n_items);
+                for (const auto& item : per_game_pres[i]) {
+                  WritePod(ofs, item.game_id);
+                  WritePod(ofs, item.split_id);
+                  WritePod(ofs, item.player);
+                  WriteVector(ofs, item.obs);
+                  WriteVector(ofs, item.cand_data.actions);
+                  WriteVector(ofs, item.cand_data.features);
+                  WriteVector(ofs, item.cand_data.card_ids);
+                  WriteVector(ofs, item.cand_data.space_ids);
+                  WriteVector(ofs, item.cand_data.supported);
+                  WriteVector(ofs, item.cand_data.roles);
+                  WriteVector(ofs, item.legal_actions);
+                  WriteVector(ofs, item.pi_parent);
+                }
+              }
+            }
+            ofs.close();
+            std::error_code ec;
+            std::filesystem::rename(tmp_ckpt, ckpt_file, ec);
+            if (!ec) {
+              std::cout << absl::StrFormat("[CAPTURE] Checkpointed %zu completed games to %s\n",
+                                           completed_count, ckpt_file);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) {
+    w.join();
+  }
+
+  std::vector<CapturedPlacementRoot> all_sampled_roots;
+  for (int g = 0; g < num_games; ++g) {
+    for (auto& r : per_game_roots[g]) {
+      all_sampled_roots.push_back(std::move(r));
+    }
+  }
+
+  if (max_placement_roots > 0 && all_sampled_roots.size() > static_cast<size_t>(max_placement_roots)) {
+    std::mt19937 sub_rng(dune_seed::DeriveSeed(base_seed, 0x4504ULL, 0ULL));
+    std::vector<size_t> indices(all_sampled_roots.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), sub_rng);
+    indices.resize(max_placement_roots);
+    std::sort(indices.begin(), indices.end());
+    std::vector<CapturedPlacementRoot> trimmed;
+    trimmed.reserve(max_placement_roots);
+    for (size_t idx : indices) {
+      trimmed.push_back(std::move(all_sampled_roots[idx]));
+    }
+    all_sampled_roots = std::move(trimmed);
+  }
+
+  std::vector<CapturedPreservationItem> all_pres;
+  for (int g = 0; g < num_games; ++g) {
+    for (auto& p : per_game_pres[g]) {
+      all_pres.push_back(std::move(p));
+    }
+  }
+
+  std::filesystem::create_directories(out_dir);
+
+  // 1. Write sampled_roots.json
+  open_spiel::json::Object meta;
+  meta["game_string"] = open_spiel::json::Value(game->ToString());
+  meta["total_games"] = open_spiel::json::Value(static_cast<int64_t>(num_games));
+  meta["total_roots"] = open_spiel::json::Value(static_cast<int64_t>(all_sampled_roots.size()));
+  meta["master_seed"] = open_spiel::json::Value(static_cast<int64_t>(base_seed));
+
+  open_spiel::json::Array roots_arr;
+  roots_arr.reserve(all_sampled_roots.size());
+  for (size_t i = 0; i < all_sampled_roots.size(); ++i) {
+    const auto& r = all_sampled_roots[i];
+    open_spiel::json::Object r_obj;
+    r_obj["root_id"] = open_spiel::json::Value(static_cast<int64_t>(i));
+    r_obj["game_id"] = open_spiel::json::Value(static_cast<int64_t>(r.game_id));
+    r_obj["decision_ordinal"] = open_spiel::json::Value(static_cast<int64_t>(r.decision_ordinal));
+    r_obj["obs_row"] = open_spiel::json::Value(static_cast<int64_t>(i));
+    r_obj["search_seat"] = open_spiel::json::Value(static_cast<int64_t>(r.search_seat));
+    r_obj["round"] = open_spiel::json::Value(static_cast<int64_t>(r.round));
+    r_obj["round_band"] = open_spiel::json::Value(r.round_band);
+    r_obj["decision_type"] = open_spiel::json::Value(r.decision_type);
+    r_obj["stratum_weight"] = open_spiel::json::Value(1.0);
+    r_obj["raw_action"] = open_spiel::json::Value(static_cast<int64_t>(r.raw_action));
+    r_obj["census_chosen_action"] = open_spiel::json::Value(static_cast<int64_t>(r.raw_action));
+    r_obj["census_overridden"] = open_spiel::json::Value(false);
+
+    open_spiel::json::Array la_arr;
+    for (int a : r.legal_actions) la_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(a)));
+    r_obj["legal_actions"] = open_spiel::json::Value(la_arr);
+
+    open_spiel::json::Array ah_arr;
+    for (int64_t a : r.action_history) ah_arr.push_back(open_spiel::json::Value(a));
+    r_obj["action_history"] = open_spiel::json::Value(ah_arr);
+
+    r_obj["split"] = open_spiel::json::Value(r.split);
+
+    open_spiel::json::Array pi_arr;
+    for (double p : r.pi_parent) pi_arr.push_back(open_spiel::json::Value(p));
+    r_obj["pi_parent"] = open_spiel::json::Value(pi_arr);
+
+    roots_arr.push_back(open_spiel::json::Value(r_obj));
+  }
+
+  open_spiel::json::Object root_out_json;
+  root_out_json["metadata"] = open_spiel::json::Value(meta);
+  root_out_json["roots"] = open_spiel::json::Value(roots_arr);
+
+  std::string roots_json_path = out_dir + "/sampled_roots.json";
+  {
+    std::ofstream ofs(roots_json_path);
+    if (!ofs.is_open()) open_spiel::SpielFatalError("Failed to write to " + roots_json_path);
+    ofs << open_spiel::json::ToString(open_spiel::json::Value(root_out_json), true) << "\n";
+  }
+  std::cout << "[SAVED] " << roots_json_path << " (" << all_sampled_roots.size() << " roots)\n";
+
+  // 2. Write sampled_obs.bin
+  std::string obs_bin_path = out_dir + "/sampled_obs.bin";
+  {
+    std::ofstream ofs(obs_bin_path, std::ios::binary);
+    if (!ofs.is_open()) open_spiel::SpielFatalError("Failed to write to " + obs_bin_path);
+    for (size_t i = 0; i < all_sampled_roots.size(); ++i) {
+      ofs.write(reinterpret_cast<const char*>(all_sampled_roots[i].obs.data()),
+                all_sampled_roots[i].obs.size() * sizeof(float));
+    }
+  }
+  std::cout << "[SAVED] " << obs_bin_path << "\n";
+
+  // 3. Write sampled_cand.bin
+  std::string cand_bin_path = out_dir + "/sampled_cand.bin";
+  {
+    std::ofstream ofs(cand_bin_path, std::ios::binary);
+    if (!ofs.is_open()) open_spiel::SpielFatalError("Failed to write to " + cand_bin_path);
+    WritePod(ofs, 0x43414E44U);
+    WritePod(ofs, 1U);
+    uint64_t nr = all_sampled_roots.size();
+    WritePod(ofs, nr);
+    for (size_t i = 0; i < all_sampled_roots.size(); ++i) {
+      const auto& cd = all_sampled_roots[i].cand_data;
+      WriteVector(ofs, cd.actions);
+      WriteVector(ofs, cd.features);
+      WriteVector(ofs, cd.card_ids);
+      WriteVector(ofs, cd.space_ids);
+      WriteVector(ofs, cd.supported);
+      WriteVector(ofs, cd.roles);
+    }
+  }
+  std::cout << "[SAVED] " << cand_bin_path << "\n";
+
+  // 4. Write preservation_pool.bin
+  std::string pres_bin_path = out_dir + "/preservation_pool.bin";
+  {
+    std::ofstream ofs(pres_bin_path, std::ios::binary);
+    if (!ofs.is_open()) open_spiel::SpielFatalError("Failed to write to " + pres_bin_path);
+    WritePod(ofs, 0x50524553U);
+    WritePod(ofs, 1U);
+    uint64_t np = all_pres.size();
+    WritePod(ofs, np);
+    for (size_t i = 0; i < all_pres.size(); ++i) {
+      const auto& item = all_pres[i];
+      WritePod(ofs, item.game_id);
+      WritePod(ofs, item.split_id);
+      WritePod(ofs, item.player);
+      WriteVector(ofs, item.obs);
+      WriteVector(ofs, item.cand_data.actions);
+      WriteVector(ofs, item.cand_data.features);
+      WriteVector(ofs, item.cand_data.card_ids);
+      WriteVector(ofs, item.cand_data.space_ids);
+      WriteVector(ofs, item.cand_data.supported);
+      WriteVector(ofs, item.cand_data.roles);
+      WriteVector(ofs, item.legal_actions);
+      WriteVector(ofs, item.pi_parent);
+    }
+  }
+  std::cout << "[SAVED] " << pres_bin_path << " (" << all_pres.size() << " preservation decisions)\n";
+
+  std::remove((out_dir + "/preservation_pool.bin.ckpt").c_str());
+  std::remove((out_dir + "/preservation_pool.bin.ckpt.tmp").c_str());
+
+  auto end_time = std::chrono::steady_clock::now();
+  double elapsed_s = std::chrono::duration<double>(end_time - start_time).count();
+  std::cout << absl::StrFormat("[CAPTURE] Complete in %.1f s. Sampled %zu placement roots, %zu preservation decisions.\n",
+                               elapsed_s, all_sampled_roots.size(), all_pres.size());
+  return 0;
+}
+
+int RunSuccessiveHalvingDistillLabel() {
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  const std::string roots_path = absl::GetFlag(FLAGS_sampled_roots_json);
+  const std::string obs_path = absl::GetFlag(FLAGS_obs_binary);
+  const std::string output_path = absl::GetFlag(FLAGS_output_json);
+  const int parallel_roots = std::max(1, absl::GetFlag(FLAGS_parallel_roots));
+  const int num_evals = absl::GetFlag(FLAGS_num_evaluators);
+  const int target_batch_size = absl::GetFlag(FLAGS_target_batch_size);
+  const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
+  const uint64_t label_seed_domain = absl::GetFlag(FLAGS_label_seed_domain);
+  const bool use_bounded_pool = absl::GetFlag(FLAGS_use_bounded_pool_when_unclocked);
+  const int max_inflight = absl::GetFlag(FLAGS_max_inflight_worlds);
+  const bool placement_only = absl::GetFlag(FLAGS_placement_roots_only);
+  const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+
+  if (model_path.empty() || roots_path.empty() || obs_path.empty() || output_path.empty()) {
+    open_spiel::SpielFatalError("--model_checkpoint, --sampled_roots_json, --obs_binary, and --output_json must be specified.");
+  }
+
+  std::cout << "================================================================================\n";
+  std::cout << "MODE 2: PARALLEL-ROOTS SH_768_K5_ALLBUY LABELLING MODE\n";
+  std::cout << "================================================================================\n";
+  std::cout << "Model checkpoint:   " << model_path << "\n";
+  std::cout << "Sampled roots JSON: " << roots_path << "\n";
+  std::cout << "Observation bin:    " << obs_path << "\n";
+  std::cout << "Output JSON:        " << output_path << "\n";
+  std::cout << "Parallel roots:     " << parallel_roots << "\n";
+  std::cout << "Master seed:        " << master_seed << "\n";
+  std::cout << "Label seed domain:  " << label_seed_domain << "\n";
+  std::cout << "Placement only:     " << (placement_only ? "true" : "false") << "\n";
+
+  if (absl::GetFlag(FLAGS_sh_budget_check)) {
+    open_spiel::dune_imperium::DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands(false);
+  } else {
+    open_spiel::dune_imperium::DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands(
+        absl::GetFlag(FLAGS_auto_pass_empty_combat_intrigue));
+  }
+
+  at::globalContext().setAllowTF32CuBLAS(false);
+  at::globalContext().setAllowTF32CuDNN(false);
+
+  torch::Device device(torch::kCUDA, 0);
+  if (!torch::cuda::is_available()) {
+    device = torch::Device(torch::kCPU);
+  }
+  std::cout << "[DEVICE] Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+
+  std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> models(num_evals);
+  std::vector<std::unique_ptr<std::shared_mutex>> model_mutexes(num_evals);
+  std::vector<std::shared_ptr<open_spiel::BatchedEvaluator>> coords(num_evals);
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> evaluators(num_evals);
+
+  for (int e = 0; e < num_evals; ++e) {
+    models[e] = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+        open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391,
+        num_blocks,
+        /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
+        /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    models[e]->to(device);
+    open_spiel::LoadModelCheckpointRobust(models[e], model_path, device);
+    models[e]->eval();
+
+    model_mutexes[e] = std::make_unique<std::shared_mutex>();
+    coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
+        models[e], target_batch_size, /*timeout_ms=*/1, device, model_mutexes[e].get(), 10.0f,
+        /*device_synchronize=*/false, /*high_priority_stream=*/true,
+        /*emit_batch_membership=*/false,
+        /*rollout_amp=*/false,
+        /*allow_tf32=*/false);
+    evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(coords[e], 10.0f);
+  }
+
+  std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame("dune_imperium");
+
+  // Read roots
+  std::ifstream roots_file(roots_path);
+  if (!roots_file.is_open()) open_spiel::SpielFatalError("Failed to open " + roots_path);
+  std::string roots_content((std::istreambuf_iterator<char>(roots_file)), std::istreambuf_iterator<char>());
+  roots_file.close();
+  auto roots_json_opt = open_spiel::json::FromString(roots_content);
+  if (!roots_json_opt) open_spiel::SpielFatalError("Failed to parse " + roots_path);
+  const auto& roots_obj = roots_json_opt->GetObject();
+  const auto& roots_arr = roots_obj.at("roots").GetArray();
+
+  std::vector<SampledRoot> sampled_roots;
+  sampled_roots.reserve(roots_arr.size());
+  for (const auto& r_val : roots_arr) {
+    const auto& r = r_val.GetObject();
+    SampledRoot sr;
+    sr.root_id = static_cast<int>(r.at("root_id").GetInt());
+    sr.game_id = static_cast<int>(r.at("game_id").GetInt());
+    sr.decision_ordinal = static_cast<int>(r.at("decision_ordinal").GetInt());
+    sr.obs_row = static_cast<int>(r.at("obs_row").GetInt());
+    sr.search_seat = static_cast<int>(r.at("search_seat").GetInt());
+    sr.round = static_cast<int>(r.at("round").GetInt());
+    sr.round_band = r.at("round_band").GetString();
+    sr.decision_type = r.at("decision_type").GetString();
+    sr.stratum_weight = r.at("stratum_weight").GetDouble();
+    sr.raw_action = static_cast<int>(r.at("raw_action").GetInt());
+    sr.census_chosen_action = static_cast<int>(r.at("census_chosen_action").GetInt());
+    sr.census_overridden = r.at("census_overridden").GetBool();
+    for (const auto& a_val : r.at("legal_actions").GetArray()) {
+      sr.legal_actions.push_back(static_cast<int>(a_val.GetInt()));
+    }
+    for (const auto& a_val : r.at("action_history").GetArray()) {
+      sr.action_history.push_back(static_cast<int64_t>(a_val.GetInt()));
+    }
+    if (r.find("split") != r.end() && r.at("split").IsString()) {
+      sr.split = r.at("split").GetString();
+    } else {
+      sr.split = "train";
+    }
+    if (r.find("pi_parent") != r.end() && r.at("pi_parent").IsArray()) {
+      for (const auto& p_val : r.at("pi_parent").GetArray()) {
+        sr.pi_parent.push_back(p_val.GetDouble());
+      }
+    }
+    sampled_roots.push_back(std::move(sr));
+  }
+
+  if (placement_only) {
+    std::vector<SampledRoot> filtered;
+    for (auto& r : sampled_roots) {
+      if (r.decision_type == "AgentPrimary" || r.decision_type == "AgentContinuation") {
+        filtered.push_back(std::move(r));
+      }
+    }
+    sampled_roots = std::move(filtered);
+    std::cout << "[FILTER] Kept " << sampled_roots.size() << " placement roots (--placement_roots_only=true)\n";
+  }
+
+  if (absl::GetFlag(FLAGS_max_roots) > 0 &&
+      static_cast<size_t>(absl::GetFlag(FLAGS_max_roots)) < sampled_roots.size()) {
+    sampled_roots.resize(absl::GetFlag(FLAGS_max_roots));
+    std::cout << "[LOAD] Trimmed to " << sampled_roots.size() << " roots (--max_roots flag).\n";
+  }
+
+  // Replay and verify observation binary
+  std::ifstream obs_file(obs_path, std::ios::binary);
+  if (!obs_file.is_open()) open_spiel::SpielFatalError("Failed to open " + obs_path);
+  const size_t obs_elem_count = open_spiel::dune_imperium::kFullPublicInformationStateSize;
+  const size_t obs_byte_stride = obs_elem_count * sizeof(float);
+  std::vector<float> rec_obs_buffer(obs_elem_count);
+
+  std::cout << "[VERIFY] Replaying and verifying observation parity...\n";
+  for (size_t i = 0; i < sampled_roots.size(); ++i) {
+    auto& root = sampled_roots[i];
+    std::unique_ptr<State> state = game->NewInitialState();
+    for (int64_t a : root.action_history) {
+      state->ApplyAction(a);
+    }
+    if (state->CurrentPlayer() != root.search_seat) {
+      open_spiel::SpielFatalError(absl::StrFormat("Root %d seat mismatch: state=%d, root=%d",
+                                                 root.root_id, state->CurrentPlayer(), root.search_seat));
+    }
+    std::vector<float> recomputed_obs = evaluators[0]->GetConsumedObservation(*state, root.search_seat);
+    obs_file.seekg(root.obs_row * obs_byte_stride);
+    obs_file.read(reinterpret_cast<char*>(rec_obs_buffer.data()), obs_byte_stride);
+    float max_diff = 0.0f;
+    for (size_t j = 0; j < obs_elem_count; ++j) {
+      float d = std::abs(recomputed_obs[j] - rec_obs_buffer[j]);
+      if (d > max_diff) max_diff = d;
+    }
+    if (max_diff > 1e-4f) {
+      open_spiel::SpielFatalError(absl::StrFormat("Observation mismatch on root %d: max_diff=%e", root.root_id, max_diff));
+    }
+    if (root.pi_parent.empty()) {
+      auto prior = evaluators[0]->Prior(*state);
+      root.pi_parent.assign(root.legal_actions.size(), 0.0);
+      for (size_t idx = 0; idx < root.legal_actions.size(); ++idx) {
+        int a = root.legal_actions[idx];
+        for (const auto& ap : prior) {
+          if (ap.first == a) { root.pi_parent[idx] = ap.second; break; }
+        }
+      }
+    }
+  }
+  obs_file.close();
+  std::cout << "[VERIFY] Observation parity verified for all " << sampled_roots.size() << " roots.\n";
+
+  struct LabelledResult {
+    int root_id = 0;
+    int game_id = 0;
+    int obs_row = 0;
+    int search_seat = 0;
+    int round = 0;
+    std::string decision_type;
+    std::string split;
+    int raw_action = 0;
+    int chosen_action = 0;
+    bool overridden = false;
+    double d2 = 0.0;
+    double se2 = 0.0;
+    double w = 0.0;
+    std::vector<int> candidates;
+    std::vector<int> legal_actions;
+    std::vector<double> pi_parent;
+    double duration_ms = 0.0;
+    int stage1_kept_worlds = 0;
+    int stage2_kept_worlds = 0;
+  };
+
+  std::vector<LabelledResult> results(sampled_roots.size());
+  std::unique_ptr<std::atomic<uint8_t>[]> completed(new std::atomic<uint8_t>[sampled_roots.size()]());
+  std::atomic<int> completed_count{0};
+
+  std::string ckpt_path = output_path + ".checkpoint.json";
+  std::ifstream ckpt_file(ckpt_path);
+  if (ckpt_file.is_open()) {
+    std::string content((std::istreambuf_iterator<char>(ckpt_file)), std::istreambuf_iterator<char>());
+    auto json_opt = open_spiel::json::FromString(content);
+    if (json_opt && json_opt->IsObject()) {
+      const auto& c_obj = json_opt->GetObject();
+      if (c_obj.find("roots") != c_obj.end() && c_obj.at("roots").IsArray()) {
+        for (const auto& r_val : c_obj.at("roots").GetArray()) {
+          const auto& r = r_val.GetObject();
+          int rid = static_cast<int>(r.at("root_id").GetInt());
+          for (size_t i = 0; i < sampled_roots.size(); ++i) {
+            if (sampled_roots[i].root_id == rid) {
+              LabelledResult lr;
+              lr.root_id = rid;
+              lr.game_id = static_cast<int>(r.at("game_id").GetInt());
+              lr.obs_row = static_cast<int>(r.at("obs_row").GetInt());
+              lr.search_seat = static_cast<int>(r.at("search_seat").GetInt());
+              lr.round = static_cast<int>(r.at("round").GetInt());
+              lr.decision_type = r.at("decision_type").GetString();
+              lr.split = r.at("split").GetString();
+              lr.raw_action = static_cast<int>(r.at("raw_action").GetInt());
+              lr.chosen_action = static_cast<int>(r.at("chosen_action").GetInt());
+              lr.overridden = r.at("overridden").GetBool();
+              lr.d2 = r.at("d2").GetDouble();
+              lr.se2 = r.at("se2").GetDouble();
+              lr.w = r.at("w").GetDouble();
+              for (const auto& c_val : r.at("candidates").GetArray()) lr.candidates.push_back(static_cast<int>(c_val.GetInt()));
+              for (const auto& a_val : r.at("legal_actions").GetArray()) lr.legal_actions.push_back(static_cast<int>(a_val.GetInt()));
+              for (const auto& p_val : r.at("pi_parent").GetArray()) lr.pi_parent.push_back(p_val.GetDouble());
+              lr.duration_ms = r.at("duration_ms").GetDouble();
+              lr.stage1_kept_worlds = static_cast<int>(r.at("stage1_kept_worlds").GetInt());
+              lr.stage2_kept_worlds = static_cast<int>(r.at("stage2_kept_worlds").GetInt());
+              results[i] = std::move(lr);
+              completed[i].store(1, std::memory_order_release);
+              completed_count++;
+              break;
+            }
+          }
+        }
+        std::cout << absl::StrFormat("[RESUME] Loaded %d completed roots from checkpoint %s\n", completed_count.load(), ckpt_path);
+      }
+    }
+  }
+
+  std::mutex save_mutex;
+  auto save_checkpoint_fn = [&](const std::string& path) {
+    open_spiel::json::Object c_obj;
+    c_obj["total_roots"] = open_spiel::json::Value(static_cast<int64_t>(sampled_roots.size()));
+    c_obj["completed_roots"] = open_spiel::json::Value(static_cast<int64_t>(completed_count.load()));
+    open_spiel::json::Array arr;
+    for (size_t i = 0; i < sampled_roots.size(); ++i) {
+      if (completed[i].load(std::memory_order_acquire) == 0) continue;
+      const auto& lr = results[i];
+      open_spiel::json::Object r_obj;
+      r_obj["root_id"] = open_spiel::json::Value(static_cast<int64_t>(lr.root_id));
+      r_obj["game_id"] = open_spiel::json::Value(static_cast<int64_t>(lr.game_id));
+      r_obj["obs_row"] = open_spiel::json::Value(static_cast<int64_t>(lr.obs_row));
+      r_obj["search_seat"] = open_spiel::json::Value(static_cast<int64_t>(lr.search_seat));
+      r_obj["round"] = open_spiel::json::Value(static_cast<int64_t>(lr.round));
+      r_obj["decision_type"] = open_spiel::json::Value(lr.decision_type);
+      r_obj["split"] = open_spiel::json::Value(lr.split);
+      r_obj["raw_action"] = open_spiel::json::Value(static_cast<int64_t>(lr.raw_action));
+      r_obj["chosen_action"] = open_spiel::json::Value(static_cast<int64_t>(lr.chosen_action));
+      r_obj["overridden"] = open_spiel::json::Value(lr.overridden);
+      r_obj["d2"] = open_spiel::json::Value(lr.d2);
+      r_obj["se2"] = open_spiel::json::Value(lr.se2);
+      r_obj["w"] = open_spiel::json::Value(lr.w);
+      open_spiel::json::Array c_arr;
+      for (int a : lr.candidates) c_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(a)));
+      r_obj["candidates"] = open_spiel::json::Value(c_arr);
+      open_spiel::json::Array la_arr;
+      for (int a : lr.legal_actions) la_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(a)));
+      r_obj["legal_actions"] = open_spiel::json::Value(la_arr);
+      open_spiel::json::Array pi_arr;
+      for (double p : lr.pi_parent) pi_arr.push_back(open_spiel::json::Value(p));
+      r_obj["pi_parent"] = open_spiel::json::Value(pi_arr);
+      r_obj["duration_ms"] = open_spiel::json::Value(lr.duration_ms);
+      r_obj["stage1_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(lr.stage1_kept_worlds));
+      r_obj["stage2_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(lr.stage2_kept_worlds));
+      arr.push_back(open_spiel::json::Value(r_obj));
+    }
+    c_obj["roots"] = open_spiel::json::Value(arr);
+    std::string tmp_path = path + ".tmp";
+    std::ofstream ofs(tmp_path);
+    if (ofs.is_open()) {
+      ofs << open_spiel::json::ToString(open_spiel::json::Value(c_obj), true);
+      ofs.close();
+      std::filesystem::rename(tmp_path, path);
+    }
+  };
+
+  std::atomic<size_t> next_root_idx{0};
+  std::vector<std::thread> workers;
+  workers.reserve(parallel_roots);
+
+  auto search_start = std::chrono::steady_clock::now();
+
+  for (int w = 0; w < parallel_roots; ++w) {
+    workers.emplace_back([&, w]() {
+      while (true) {
+        size_t r_idx = next_root_idx.fetch_add(1);
+        if (r_idx >= sampled_roots.size()) break;
+        if (completed[r_idx].load(std::memory_order_acquire) != 0) continue;
+
+        const auto& root = sampled_roots[r_idx];
+        std::unique_ptr<State> state = game->NewInitialState();
+        for (int64_t a : root.action_history) {
+          state->ApplyAction(a);
+        }
+
+        uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, label_seed_domain, static_cast<uint64_t>(root.root_id));
+        int eff_top_k = (root.decision_type.rfind("Purchase", 0) == 0)
+            ? static_cast<int>(root.legal_actions.size()) : 5;
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto s_res = SuccessiveHalvingRolloutSearchDecision(
+            *state, root.search_seat, nullptr, evaluators,
+            /*reference_rollouts_per_action=*/256, /*min_override_margin=*/0.15,
+            dec_seed, SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+            /*max_time_ms=*/-1.0, eff_top_k, max_inflight, use_bounded_pool);
+        auto t1 = std::chrono::steady_clock::now();
+        double dur = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        LabelledResult lr;
+        lr.root_id = root.root_id;
+        lr.game_id = root.game_id;
+        lr.obs_row = root.obs_row;
+        lr.search_seat = root.search_seat;
+        lr.round = root.round;
+        lr.decision_type = root.decision_type;
+        lr.split = root.split;
+        lr.raw_action = root.raw_action;
+        lr.chosen_action = s_res.action;
+        lr.overridden = s_res.overridden;
+        lr.d2 = s_res.mean_d_stage2;
+        lr.se2 = s_res.se_d_stage2;
+        lr.w = s_res.overridden ? std::clamp((lr.d2 - lr.se2) / 0.15, 0.0, 1.0) : 0.0;
+        for (const auto& cu : s_res.candidate_utilities) {
+          lr.candidates.push_back(cu.first);
+        }
+        lr.legal_actions = root.legal_actions;
+        lr.pi_parent = root.pi_parent;
+        lr.duration_ms = dur;
+        lr.stage1_kept_worlds = s_res.stage1_kept_worlds;
+        lr.stage2_kept_worlds = s_res.stage2_kept_worlds;
+
+        results[r_idx] = std::move(lr);
+        completed[r_idx].store(1, std::memory_order_release);
+        int done = completed_count.fetch_add(1) + 1;
+
+        if (done % 10 == 0 || done == static_cast<int>(sampled_roots.size())) {
+          std::cout << absl::StrFormat("[LABEL] Completed %d / %zu roots (Root %d, over=%s, w=%.3f, dur=%.1f ms)\n",
+                                       done, sampled_roots.size(), root.root_id,
+                                       results[r_idx].overridden ? "true" : "false", results[r_idx].w, dur);
+        }
+        if (done % 20 == 0 || done == static_cast<int>(sampled_roots.size())) {
+          std::lock_guard<std::mutex> lock(save_mutex);
+          save_checkpoint_fn(ckpt_path);
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) {
+    w.join();
+  }
+
+  auto search_end = std::chrono::steady_clock::now();
+  double total_wall_s = std::chrono::duration<double>(search_end - search_start).count();
+  double roots_per_s = sampled_roots.size() / std::max(1e-4, total_wall_s);
+
+  int total_overrides = 0;
+  double sum_w = 0.0;
+  for (const auto& r : results) {
+    if (r.overridden) total_overrides++;
+    sum_w += r.w;
+  }
+  double override_rate = 100.0 * total_overrides / std::max<size_t>(1, results.size());
+  double mean_w = sum_w / std::max<size_t>(1, results.size());
+
+  open_spiel::json::Object meta_out;
+  meta_out["total_roots"] = open_spiel::json::Value(static_cast<int64_t>(results.size()));
+  meta_out["wall_time_sec"] = open_spiel::json::Value(total_wall_s);
+  meta_out["roots_per_sec"] = open_spiel::json::Value(roots_per_s);
+  meta_out["override_rate_pct"] = open_spiel::json::Value(override_rate);
+  meta_out["total_overrides"] = open_spiel::json::Value(static_cast<int64_t>(total_overrides));
+  meta_out["mean_weight_w"] = open_spiel::json::Value(mean_w);
+
+  open_spiel::json::Array arr_out;
+  for (const auto& lr : results) {
+    open_spiel::json::Object r_obj;
+    r_obj["root_id"] = open_spiel::json::Value(static_cast<int64_t>(lr.root_id));
+    r_obj["game_id"] = open_spiel::json::Value(static_cast<int64_t>(lr.game_id));
+    r_obj["obs_row"] = open_spiel::json::Value(static_cast<int64_t>(lr.obs_row));
+    r_obj["search_seat"] = open_spiel::json::Value(static_cast<int64_t>(lr.search_seat));
+    r_obj["round"] = open_spiel::json::Value(static_cast<int64_t>(lr.round));
+    r_obj["decision_type"] = open_spiel::json::Value(lr.decision_type);
+    r_obj["split"] = open_spiel::json::Value(lr.split);
+    r_obj["raw_action"] = open_spiel::json::Value(static_cast<int64_t>(lr.raw_action));
+    r_obj["chosen_action"] = open_spiel::json::Value(static_cast<int64_t>(lr.chosen_action));
+    r_obj["overridden"] = open_spiel::json::Value(lr.overridden);
+    r_obj["d2"] = open_spiel::json::Value(lr.d2);
+    r_obj["se2"] = open_spiel::json::Value(lr.se2);
+    r_obj["w"] = open_spiel::json::Value(lr.w);
+    open_spiel::json::Array c_arr;
+    for (int a : lr.candidates) c_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(a)));
+    r_obj["candidates"] = open_spiel::json::Value(c_arr);
+    open_spiel::json::Array la_arr;
+    for (int a : lr.legal_actions) la_arr.push_back(open_spiel::json::Value(static_cast<int64_t>(a)));
+    r_obj["legal_actions"] = open_spiel::json::Value(la_arr);
+    open_spiel::json::Array pi_arr;
+    for (double p : lr.pi_parent) pi_arr.push_back(open_spiel::json::Value(p));
+    r_obj["pi_parent"] = open_spiel::json::Value(pi_arr);
+    r_obj["duration_ms"] = open_spiel::json::Value(lr.duration_ms);
+    r_obj["stage1_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(lr.stage1_kept_worlds));
+    r_obj["stage2_kept_worlds"] = open_spiel::json::Value(static_cast<int64_t>(lr.stage2_kept_worlds));
+    arr_out.push_back(open_spiel::json::Value(r_obj));
+  }
+
+  open_spiel::json::Object final_out;
+  final_out["metadata"] = open_spiel::json::Value(meta_out);
+  final_out["roots"] = open_spiel::json::Value(arr_out);
+
+  {
+    std::ofstream ofs(output_path);
+    if (!ofs.is_open()) open_spiel::SpielFatalError("Failed to open " + output_path);
+    ofs << open_spiel::json::ToString(open_spiel::json::Value(final_out), true) << "\n";
+  }
+  std::remove(ckpt_path.c_str());
+  std::cout << absl::StrFormat("[LABEL] Finished labelling %zu roots in %.1f s (%.2f roots/s). Overrides: %d (%.1f%%), mean w = %.4f. Saved to %s\n",
+                               results.size(), total_wall_s, roots_per_s, total_overrides, override_rate, mean_w, output_path);
+  return 0;
+}
+
+int RunTrueStateTieBreakerAndHistoryReplay() {
+  const std::string games_jsonl_path = absl::GetFlag(FLAGS_tie_breaker_games_jsonl);
+  const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
+  const std::string output_path = absl::GetFlag(FLAGS_output_json);
+  const bool run_rollouts = absl::GetFlag(FLAGS_tie_breaker_run_rollouts);
+  const int max_sample = absl::GetFlag(FLAGS_tie_breaker_max_sample);
+  const int tie_breaker_rollouts = absl::GetFlag(FLAGS_tie_breaker_rollouts);
+  const int parallel_roots = std::max(1, absl::GetFlag(FLAGS_parallel_roots));
+  const int num_threads = std::max(1, absl::GetFlag(FLAGS_threads));
+  const uint64_t master_seed = absl::GetFlag(FLAGS_master_seed);
+  const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const int num_evals = absl::GetFlag(FLAGS_num_evaluators);
+  const int target_batch_size = absl::GetFlag(FLAGS_target_batch_size);
+
+  if (games_jsonl_path.empty()) {
+    open_spiel::SpielFatalError("--tie_breaker_games_jsonl must be specified.");
+  }
+
+  std::cout << "================================================================================\n";
+  std::cout << "MODE 3: TRUE-STATE TIE-BREAKER & HISTORY REPLAY VERIFICATION\n";
+  std::cout << "================================================================================\n";
+  std::cout << "Games JSONL:        " << games_jsonl_path << "\n";
+  std::cout << "Model checkpoint:   " << model_path << "\n";
+  std::cout << "Output JSON:        " << output_path << "\n";
+  std::cout << "Run rollouts:       " << (run_rollouts ? "true" : "false") << "\n";
+  std::cout << "Max sample:         " << max_sample << "\n";
+  std::cout << "Rollouts/action:    " << tie_breaker_rollouts << "\n";
+  std::cout << "Threads:            " << num_threads << "\n";
+  std::cout << "Parallel roots:     " << parallel_roots << "\n";
+
+  open_spiel::dune_imperium::DuneImperiumState::SetAutoPassEmptyCombatIntrigueHands(
+      absl::GetFlag(FLAGS_auto_pass_empty_combat_intrigue));
+
+  at::globalContext().setAllowTF32CuBLAS(false);
+  at::globalContext().setAllowTF32CuDNN(false);
+
+  torch::Device device(torch::kCUDA, 0);
+  if (!torch::cuda::is_available()) {
+    device = torch::Device(torch::kCPU);
+  }
+
+  std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> models;
+  std::vector<std::unique_ptr<std::shared_mutex>> model_mutexes;
+  std::vector<std::shared_ptr<open_spiel::BatchedEvaluator>> coords;
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> evaluators;
+
+  if (!model_path.empty()) {
+    models.resize(num_evals);
+    model_mutexes.resize(num_evals);
+    coords.resize(num_evals);
+    evaluators.resize(num_evals);
+
+    for (int e = 0; e < num_evals; ++e) {
+      models[e] = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+          open_spiel::dune_imperium::kFullPublicInformationStateSize, 2048, 2391,
+          num_blocks,
+          /*nonlinear_value_head=*/false, /*with_aux_heads=*/false,
+          /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+      models[e]->to(device);
+      open_spiel::LoadModelCheckpointRobust(models[e], model_path, device);
+      models[e]->eval();
+
+      model_mutexes[e] = std::make_unique<std::shared_mutex>();
+      coords[e] = std::make_shared<open_spiel::BatchedEvaluator>(
+          models[e], target_batch_size, /*timeout_ms=*/1, device, model_mutexes[e].get(), 10.0f,
+          /*device_synchronize=*/false, /*high_priority_stream=*/true,
+          /*emit_batch_membership=*/false,
+          /*rollout_amp=*/false,
+          /*allow_tf32=*/false);
+      evaluators[e] = std::make_shared<open_spiel::BatchedNNEvaluator>(coords[e], 10.0f);
+    }
+  }
+
+  std::shared_ptr<const open_spiel::Game> game = open_spiel::LoadGame("dune_imperium");
+
+  struct ParsedGame {
+    int episode_id = 0;
+    int seat = 0;
+    int placement = 0;
+    double recorded_return = 0.0;
+    int round = 0;
+    uint64_t seed = 0;
+    std::vector<int64_t> history;
+  };
+
+  std::vector<ParsedGame> parsed_games;
+  {
+    std::ifstream ifs(games_jsonl_path);
+    if (!ifs.is_open()) open_spiel::SpielFatalError("Failed to open " + games_jsonl_path);
+    std::string line;
+    while (std::getline(ifs, line)) {
+      if (line.empty()) continue;
+      uint64_t line_seed = 0;
+      size_t seed_pos = line.find("\"seed\":");
+      if (seed_pos != std::string::npos) {
+        size_t val_pos = seed_pos + 7;
+        while (val_pos < line.size() && (line[val_pos] == ' ' || line[val_pos] == '\t')) {
+          val_pos++;
+        }
+        if (val_pos < line.size() && (std::isdigit(line[val_pos]) || line[val_pos] == '-')) {
+          char* end_ptr = nullptr;
+          line_seed = std::strtoull(line.c_str() + val_pos, &end_ptr, 10);
+          size_t end_idx = (end_ptr != nullptr) ? (end_ptr - line.c_str()) : val_pos;
+          if (end_idx > val_pos) {
+            line.replace(val_pos, end_idx - val_pos, "0");
+          }
+        }
+      }
+      auto json_opt = open_spiel::json::FromString(line);
+      if (!json_opt || !json_opt->IsObject()) continue;
+      const auto& obj = json_opt->GetObject();
+      ParsedGame pg;
+      pg.seed = line_seed;
+      pg.episode_id = static_cast<int>(obj.at("episode_id").GetInt());
+      pg.seat = static_cast<int>(obj.at("seat").GetInt());
+      pg.placement = static_cast<int>(obj.at("placement").GetInt());
+      pg.recorded_return = obj.at("return").GetDouble();
+      if (obj.find("ending_round") != obj.end()) pg.round = static_cast<int>(obj.at("ending_round").GetInt());
+      else if (obj.find("round") != obj.end()) pg.round = static_cast<int>(obj.at("round").GetInt());
+      if (obj.find("history") != obj.end() && obj.at("history").IsArray()) {
+        for (const auto& h_val : obj.at("history").GetArray()) {
+          pg.history.push_back(static_cast<int64_t>(h_val.GetInt()));
+        }
+      }
+      parsed_games.push_back(std::move(pg));
+    }
+  }
+  std::cout << absl::StrFormat("[TIE-BREAKER] Loaded %zu games from %s\n", parsed_games.size(), games_jsonl_path);
+
+  struct ChangedDecision {
+    int game_idx = 0;
+    int seat = 0;
+    Action a_parent = 0;
+    Action a_student = 0;
+    std::vector<int64_t> history_prefix;
+  };
+
+  std::vector<std::vector<ChangedDecision>> per_game_changed(parsed_games.size());
+  std::atomic<size_t> next_g_idx{0};
+  std::vector<std::thread> workers;
+  workers.reserve(num_threads);
+
+  for (int t = 0; t < num_threads; ++t) {
+    workers.emplace_back([&, t]() {
+      int eval_idx = evaluators.empty() ? 0 : (t % evaluators.size());
+      while (true) {
+        size_t g = next_g_idx.fetch_add(1);
+        if (g >= parsed_games.size()) break;
+        const auto& pg = parsed_games[g];
+
+        std::unique_ptr<State> state = game->NewInitialState();
+        std::vector<int64_t> prefix;
+        prefix.reserve(pg.history.size());
+
+        for (size_t step = 0; step < pg.history.size(); ++step) {
+          int64_t a = pg.history[step];
+          if (!model_path.empty() && !state->IsChanceNode() && state->CurrentPlayer() == pg.seat) {
+            auto legals = state->LegalActions();
+            if (legals.size() > 1) {
+              auto prior = evaluators[eval_idx]->Prior(*state);
+              Action a_parent = legals.front();
+              double max_p = -1.0;
+              for (const auto& ap : prior) {
+                if (ap.second > max_p) {
+                  max_p = ap.second;
+                  a_parent = ap.first;
+                }
+              }
+              Action a_student = static_cast<Action>(a);
+              if (a_student != a_parent) {
+                ChangedDecision cd;
+                cd.game_idx = static_cast<int>(g);
+                cd.seat = pg.seat;
+                cd.a_parent = a_parent;
+                cd.a_student = a_student;
+                cd.history_prefix = prefix;
+                per_game_changed[g].push_back(std::move(cd));
+              }
+            }
+          }
+          state->ApplyAction(a);
+          prefix.push_back(a);
+        }
+
+        if (!state->IsTerminal()) {
+          open_spiel::SpielFatalError(absl::StrFormat("Game %d (episode %d) did not terminate at end of history!", g, pg.episode_id));
+        }
+        double r_ret = state->Returns()[pg.seat];
+        if (std::abs(r_ret - pg.recorded_return) >= 1e-4) {
+          open_spiel::SpielFatalError(absl::StrFormat("Game %d (episode %d) return mismatch: actual=%f, recorded=%f",
+                                                     g, pg.episode_id, r_ret, pg.recorded_return));
+        }
+        int comp_placement = 4;
+        if (std::abs(r_ret - 2.25) < 1e-4) comp_placement = 1;
+        else if (std::abs(r_ret - 0.25) < 1e-4) comp_placement = 2;
+        else if (std::abs(r_ret - (-0.75)) < 1e-4) comp_placement = 3;
+        else if (std::abs(r_ret - (-1.75)) < 1e-4) comp_placement = 4;
+        else {
+          int rank = 1;
+          for (int p = 0; p < 4; ++p) {
+            if (p != pg.seat && state->Returns()[p] > r_ret + 1e-4) rank++;
+          }
+          comp_placement = rank;
+        }
+        if (comp_placement != pg.placement) {
+          open_spiel::SpielFatalError(absl::StrFormat("Game %d (episode %d) placement mismatch: comp=%d, recorded=%d",
+                                                     g, pg.episode_id, comp_placement, pg.placement));
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) {
+    w.join();
+  }
+
+  std::cout << "[VERIFY] 100% replay match verified (terminal, returns, and placements matched across all games).\n";
+
+  std::vector<ChangedDecision> all_changed;
+  for (size_t g = 0; g < parsed_games.size(); ++g) {
+    for (auto& cd : per_game_changed[g]) {
+      all_changed.push_back(std::move(cd));
+    }
+  }
+
+  const size_t N_games = parsed_games.size();
+  const size_t N_changed = all_changed.size();
+  const double r = static_cast<double>(N_changed) / static_cast<double>(N_games);
+  std::cout << absl::StrFormat("[TIE-BREAKER] Found %zu changed decisions across %zu games (r = %.4f changed/game)\n",
+                               N_changed, N_games, r);
+
+  open_spiel::json::Object summary;
+  summary["total_games"] = open_spiel::json::Value(static_cast<int64_t>(N_games));
+  summary["total_changed_decisions"] = open_spiel::json::Value(static_cast<int64_t>(N_changed));
+  summary["r_changed_per_game"] = open_spiel::json::Value(r);
+  summary["replay_verified"] = open_spiel::json::Value(true);
+
+  if (run_rollouts && N_changed > 0 && !evaluators.empty()) {
+    size_t M = std::min<size_t>(static_cast<size_t>(max_sample), N_changed);
+    std::mt19937 rng(master_seed);
+    std::vector<size_t> perm(N_changed);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), rng);
+    perm.resize(M);
+    std::sort(perm.begin(), perm.end());
+
+    std::vector<ChangedDecision> sampled_decisions;
+    sampled_decisions.reserve(M);
+    for (size_t idx : perm) {
+      sampled_decisions.push_back(all_changed[idx]);
+    }
+
+    std::cout << absl::StrFormat("[TIE-BREAKER] Running %d paired true-state rollouts on %zu sampled changed decisions...\n",
+                                 tie_breaker_rollouts, M);
+
+    std::vector<double> deltas(M, 0.0);
+    std::atomic<size_t> next_sample_idx{0};
+    std::vector<std::thread> roll_workers;
+    roll_workers.reserve(parallel_roots);
+
+    for (int pw = 0; pw < parallel_roots; ++pw) {
+      roll_workers.emplace_back([&, pw]() {
+        while (true) {
+          size_t i = next_sample_idx.fetch_add(1);
+          if (i >= M) break;
+          const auto& cd = sampled_decisions[i];
+          std::unique_ptr<State> state = game->NewInitialState();
+          for (int64_t a : cd.history_prefix) {
+            state->ApplyAction(a);
+          }
+          uint64_t dec_seed = dune_seed::DeriveSeed(master_seed, 0x4509ULL, static_cast<uint64_t>(i));
+          std::vector<Action> cands = {cd.a_parent, cd.a_student};
+          auto s_res = PairedPriorSortedRolloutSearchDecision(
+              *state, cd.seat, nullptr, evaluators, cands,
+              tie_breaker_rollouts, /*min_override_margin=*/0.0, /*min_t_stat=*/0.0,
+              dec_seed, SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
+              /*max_time_ms=*/-1.0, absl::GetFlag(FLAGS_max_inflight_worlds),
+              /*resample_from_infostate=*/false, /*use_bounded_pool_when_unclocked=*/true);
+
+          double u_student = 0.0, u_parent = 0.0;
+          for (const auto& cu : s_res.candidate_utilities) {
+            if (cu.first == cd.a_student) u_student = cu.second;
+            if (cu.first == cd.a_parent) u_parent = cu.second;
+          }
+          deltas[i] = u_student - u_parent;
+
+          if ((i + 1) % 20 == 0 || i + 1 == M) {
+            std::cout << absl::StrFormat("  [TIE-BREAKER] Evaluated %zu / %zu changed moves (delta=%.4f)\n",
+                                         i + 1, M, deltas[i]);
+          }
+        }
+      });
+    }
+
+    for (auto& w : roll_workers) {
+      w.join();
+    }
+
+    double sum_delta = 0.0;
+    for (double d : deltas) sum_delta += d;
+    double mean_delta = sum_delta / static_cast<double>(M);
+    double dU = r * mean_delta;
+
+    // Game-clustered bootstrap
+    std::vector<double> sampled_delta_sum(N_games, 0.0);
+    std::vector<size_t> sampled_delta_cnt(N_games, 0);
+    for (size_t i = 0; i < M; ++i) {
+      int g = sampled_decisions[i].game_idx;
+      sampled_delta_sum[g] += deltas[i];
+      sampled_delta_cnt[g]++;
+    }
+
+    std::mt19937 boot_rng(master_seed + 12345);
+    std::uniform_int_distribution<size_t> g_dist(0, N_games - 1);
+    std::vector<double> boot_dU(10000);
+    for (int b = 0; b < 10000; ++b) {
+      double boot_c_sum = 0.0;
+      double boot_delta_sum = 0.0;
+      size_t boot_delta_cnt = 0;
+      for (size_t k = 0; k < N_games; ++k) {
+        size_t g = g_dist(boot_rng);
+        boot_c_sum += static_cast<double>(per_game_changed[g].size());
+        boot_delta_sum += sampled_delta_sum[g];
+        boot_delta_cnt += sampled_delta_cnt[g];
+      }
+      double r_boot = boot_c_sum / static_cast<double>(N_games);
+      double mean_delta_boot = (boot_delta_cnt > 0) ? (boot_delta_sum / static_cast<double>(boot_delta_cnt)) : mean_delta;
+      boot_dU[b] = r_boot * mean_delta_boot;
+    }
+    std::sort(boot_dU.begin(), boot_dU.end());
+    double ci_low = boot_dU[250];
+    double ci_high = boot_dU[9750];
+    double boot_mean = std::accumulate(boot_dU.begin(), boot_dU.end(), 0.0) / 10000.0;
+    double boot_var = 0.0;
+    for (double d : boot_dU) {
+      double diff = d - boot_mean;
+      boot_var += diff * diff;
+    }
+    double boot_se = std::sqrt(boot_var / 9999.0);
+
+    std::cout << "================================================================================\n";
+    std::cout << absl::StrFormat("  Tie-Breaker dU: %.4f (SE: %.4f, 95%% CI: [%.4f, %.4f])\n",
+                                 dU, boot_se, ci_low, ci_high);
+    std::cout << absl::StrFormat("  Mean Delta:     %.4f over %zu moves\n", mean_delta, M);
+    std::cout << "================================================================================\n";
+
+    summary["sampled_changed_decisions"] = open_spiel::json::Value(static_cast<int64_t>(M));
+    summary["mean_delta"] = open_spiel::json::Value(mean_delta);
+    summary["du_per_seat_game"] = open_spiel::json::Value(dU);
+    summary["du_bootstrap_se"] = open_spiel::json::Value(boot_se);
+    summary["du_bootstrap_ci_low"] = open_spiel::json::Value(ci_low);
+    summary["du_bootstrap_ci_high"] = open_spiel::json::Value(ci_high);
+    summary["rollouts_per_action"] = open_spiel::json::Value(static_cast<int64_t>(tie_breaker_rollouts));
+  }
+
+  if (!output_path.empty()) {
+    std::ofstream ofs(output_path);
+    if (ofs.is_open()) {
+      ofs << open_spiel::json::ToString(open_spiel::json::Value(summary), true) << "\n";
+      std::cout << "[SAVED] Summary written to " << output_path << "\n";
+    }
+  }
+
+  return 0;
+}
+
 
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
+
+  // Dispatch to R7-45 Step 1 Mode 1: Raw Greedy Self-Play Root & Preservation Capture Mode
+  if (absl::GetFlag(FLAGS_capture_self_play_games) > 0) {
+    return RunSelfPlayRootAndPreservationCapture();
+  }
+
+  // Dispatch to R7-45 Step 1 Mode 3: True-State Tie-Breaker & History Replay Verification Mode
+  if (!absl::GetFlag(FLAGS_tie_breaker_games_jsonl).empty()) {
+    return RunTrueStateTieBreakerAndHistoryReplay();
+  }
+
+  // Dispatch to R7-45 Step 1 Mode 2: Parallel-Roots sh_768_k5_allbuy Labelling Mode
+  if (absl::GetFlag(FLAGS_sh_distill_label)) {
+    return RunSuccessiveHalvingDistillLabel();
+  }
 
   const std::string model_path = absl::GetFlag(FLAGS_model_checkpoint);
   const std::string roots_path = absl::GetFlag(FLAGS_sampled_roots_json);
@@ -1038,6 +2505,16 @@ int main(int argc, char** argv) {
     }
     for (const auto& a_val : r.at("action_history").GetArray()) {
       sr.action_history.push_back(static_cast<int64_t>(a_val.GetInt()));
+    }
+    if (r.find("split") != r.end() && r.at("split").IsString()) {
+      sr.split = r.at("split").GetString();
+    } else {
+      sr.split = "train";
+    }
+    if (r.find("pi_parent") != r.end() && r.at("pi_parent").IsArray()) {
+      for (const auto& p_val : r.at("pi_parent").GetArray()) {
+        sr.pi_parent.push_back(p_val.GetDouble());
+      }
     }
     sampled_roots.push_back(std::move(sr));
   }

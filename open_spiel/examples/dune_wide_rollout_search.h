@@ -238,7 +238,8 @@ inline int RunClockedPairedRolloutStage(
     TurnSearchTree* active_tree,
     std::vector<std::vector<double>>& per_candidate_rollouts,
     int& new_rollouts_executed,
-    int max_inflight_worlds = 32) {
+    int max_inflight_worlds = 32,
+    bool resample_from_infostate = true) {
   const size_t num_cands = candidate_indices.size();
   if (planned_worlds <= 0 || num_cands == 0) return 0;
   const int W = std::max(1, max_inflight_worlds);
@@ -273,7 +274,7 @@ inline int RunClockedPairedRolloutStage(
         const size_t c_idx = candidate_indices[slot];
         const Action cand_a = ordered_candidates[c_idx];
         std::unique_ptr<State> sim_state = nullptr;
-        if (dune) {
+        if (dune && resample_from_infostate) {
           std::mt19937 wrng(wseed);
           auto rng_func = [&wrng]() {
             return std::generate_canonical<double, 53>(wrng);
@@ -380,7 +381,9 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool sample_opponent_leader_draft = false,
     double max_time_ms = -1.0,
-    int max_inflight_worlds = 32) {
+    int max_inflight_worlds = 32,
+    bool resample_from_infostate = true,
+    bool use_bounded_pool_when_unclocked = false) {
   if (ordered_candidates.empty()) {
     return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   }
@@ -410,7 +413,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
   int new_rollouts_executed = 0;
 
   const auto s1_t0 = std::chrono::steady_clock::now();
-  if (max_time_ms <= 0.0) {
+  if (max_time_ms <= 0.0 && !use_bounded_pool_when_unclocked) {
     std::vector<RolloutTask> tasks;
     tasks.reserve(K * rollouts_per_action);
 
@@ -419,7 +422,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
       for (int r = 0; r < rollouts_per_action; ++r) {
         uint64_t wseed = dune_seed::DeriveSeed(decision_seed, r);
         std::unique_ptr<State> sim_state = nullptr;
-        if (dune) {
+        if (dune && resample_from_infostate) {
           std::mt19937 wrng(wseed);
           auto rng_func = [&wrng]() {
             return std::generate_canonical<double, 53>(wrng);
@@ -467,9 +470,11 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
       }
     }
   } else {
-    const auto deadline_tp = std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double, std::milli>(max_time_ms));
+    const auto deadline_tp = (max_time_ms > 0.0)
+        ? (std::chrono::steady_clock::now() +
+           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+               std::chrono::duration<double, std::milli>(max_time_ms)))
+        : std::chrono::steady_clock::time_point::max();
 
     std::vector<size_t> candidate_indices(K);
     std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
@@ -479,7 +484,8 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
         candidate_indices, rollouts_per_action, /*world_seed_offset=*/0,
         decision_seed, crn_mode, sample_opponent_leader_draft,
         deadline_tp, active_tree, per_candidate_rollouts,
-        new_rollouts_executed, max_inflight_worlds);
+        new_rollouts_executed, max_inflight_worlds,
+        resample_from_infostate);
   }
   const auto s1_t1 = std::chrono::steady_clock::now();
   const double stage1_elapsed_ms =
@@ -653,7 +659,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     bool unbiased_stage2_gate = false,
     double max_time_ms = -1.0,
     int fixed_top_k = 0,
-    int max_inflight_worlds = 32) {
+    int max_inflight_worlds = 32,
+    bool use_bounded_pool_when_unclocked = false) {
   if (fixed_top_k == 1) {
     SpielFatalError("SuccessiveHalvingRolloutSearchDecision: fixed_top_k cannot be 1 (requires at least 2 candidates).");
   }
@@ -716,24 +723,29 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
 
   int new_rollouts_executed = 0;
   const bool has_deadline = (max_time_ms > 0.0);
+  const bool use_bounded_stage = has_deadline || use_bounded_pool_when_unclocked;
   const auto start_time = std::chrono::steady_clock::now();
   const auto stage1_deadline = has_deadline
       ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
              std::chrono::duration<double, std::milli>(0.5 * max_time_ms)))
-      : std::chrono::steady_clock::time_point{};
+      : (use_bounded_pool_when_unclocked
+             ? std::chrono::steady_clock::time_point::max()
+             : std::chrono::steady_clock::time_point{});
   const auto final_deadline = has_deadline
       ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
              std::chrono::duration<double, std::milli>(max_time_ms)))
-      : std::chrono::steady_clock::time_point{};
+      : (use_bounded_pool_when_unclocked
+             ? std::chrono::steady_clock::time_point::max()
+             : std::chrono::steady_clock::time_point{});
 
   int stage1_planned_worlds = r_stage1;
   int stage1_kept_worlds = 0;
   const auto s1_t0 = std::chrono::steady_clock::now();
 
   // --- STAGE 1: Broad Screen ---
-  if (!has_deadline) {
+  if (!use_bounded_stage) {
     std::vector<RolloutTask> tasks_stage1;
     tasks_stage1.reserve(K * r_stage1);
 
@@ -908,7 +920,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   int stage2_kept_worlds = 0;
   const auto s2_t0 = std::chrono::steady_clock::now();
 
-  if (!has_deadline) {
+  if (!use_bounded_stage) {
     std::vector<RolloutTask> tasks_stage2;
     tasks_stage2.reserve(2 * r_stage2);
 
@@ -1136,6 +1148,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   res.stage1_elapsed_ms = stage1_elapsed_ms;
   res.stage2_elapsed_ms = stage2_elapsed_ms;
   res.termination_reason = overridden ? "override" : "stage2_no_override";
+  res.mean_d_stage2 = mean_d_stage2;
+  res.se_d_stage2 = se_d_stage2;
   return res;
 }
 

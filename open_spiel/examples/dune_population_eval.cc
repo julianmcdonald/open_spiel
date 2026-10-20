@@ -126,6 +126,12 @@ ABSL_FLAG(std::string, market_diagnostics_games_jsonl, "",
           "<output_dir>/market_diagnostics_games.jsonl if --record_market_diagnostics is true and --output_dir is set.");
 ABSL_FLAG(int, trace_episode, -1,
           "If >= 0, print detailed action-by-action trace and VP breakdown for this episode ID (-2 for all).");
+ABSL_FLAG(bool, record_history, false,
+          "Record full action history per game in games.jsonl.");
+ABSL_FLAG(bool, rollout_amp, true,
+          "Use BF16 AMP autocast in evaluator forward pass.");
+ABSL_FLAG(bool, allow_tf32, true,
+          "Allow TF32 in CUDA matmuls/convolutions.");
 
 namespace open_spiel {
 namespace {
@@ -182,6 +188,7 @@ struct GameResult {
   int current_vp;
   int final_scored_vp;
   uint64_t chance_seed = 0;
+  std::vector<open_spiel::Action> history;
 
   // PWO-5 section 13.5. The registered VP-margin estimand is
   //
@@ -309,6 +316,14 @@ std::string JsonIntArray(const std::array<int, kNumPlayers>& v) {
   return s + "]";
 }
 std::string JsonIntVector(const std::vector<int>& v) {
+  std::string s = "[";
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) s += ",";
+    s += std::to_string(v[i]);
+  }
+  return s + "]";
+}
+std::string JsonActionVector(const std::vector<open_spiel::Action>& v) {
   std::string s = "[";
   for (size_t i = 0; i < v.size(); ++i) {
     if (i) s += ",";
@@ -721,7 +736,8 @@ void WorkerThread(
     std::ofstream* dump_out,
     std::vector<GameResult>& results,
     bool record_market_diagnostics,
-    std::vector<dune_market_diag::CompactPerGameMarketDiagnostics>* market_results) {
+    std::vector<dune_market_diag::CompactPerGameMarketDiagnostics>* market_results,
+    bool record_history) {
 
   // Pre-allocate observation buffers
   std::vector<float> cand_obs(candidate_input_dim, 0.0f);
@@ -1100,6 +1116,9 @@ void WorkerThread(
     GameResult& gr = results[result_index];
     gr.episode_id = episode_id;
     gr.seat = model_player;
+    if (record_history) {
+      gr.history = state->History();
+    }
 
     // Track opponent names for seats other than model_player
     gr.opponents.clear();
@@ -1423,14 +1442,23 @@ void RunEvaluation() {
   LoadModelCheckpointRobust(model, model_checkpoint, device);
   model->to(device);
 
+  const bool rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+  const bool allow_tf32 = absl::GetFlag(FLAGS_allow_tf32);
+  const bool record_history = absl::GetFlag(FLAGS_record_history);
+
+  if (device.is_cuda()) {
+    at::globalContext().setAllowTF32CuBLAS(allow_tf32);
+    at::globalContext().setAllowTF32CuDNN(allow_tf32);
+  }
+
   std::shared_ptr<IGameEvaluator> model_evaluator;
   if (deterministic) {
     model_evaluator = std::make_shared<DeterministicEvaluator>(
-        model, device, &eval_mutex);
+        model, device, &eval_mutex, nullptr, nullptr, rollout_amp);
   } else {
     model_evaluator = std::make_shared<BatchedEvaluator>(
         model, eval_batch_size, eval_timeout_ms, device,
-        &sync_mutex, 0.0f);
+        &sync_mutex, 0.0f, true, false, false, rollout_amp, allow_tf32);
   }
 
   // Load opponent models with auto-detected dimensions
@@ -1469,11 +1497,11 @@ void RunEvaluation() {
 
     if (deterministic) {
       opponent_evaluators.push_back(std::make_shared<DeterministicEvaluator>(
-          opp_model, device, &eval_mutex));
+          opp_model, device, &eval_mutex, nullptr, nullptr, rollout_amp));
     } else {
       opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
           opp_model, eval_batch_size, eval_timeout_ms, device,
-          &sync_mutex, 0.0f));
+          &sync_mutex, 0.0f, true, false, false, rollout_amp, allow_tf32));
     }
   }
 
@@ -1498,6 +1526,9 @@ void RunEvaluation() {
             << "OppCap:     " << opponent_logit_cap << "\n"
             << "Threads:    " << num_threads << "\n"
             << "Eval mode:  " << (deterministic ? "Deterministic (batch-1)" : "Batched") << "\n"
+            << "Rollout AMP:" << (rollout_amp ? "true" : "false") << "\n"
+            << "Allow TF32: " << (allow_tf32 ? "true" : "false") << "\n"
+            << "Record Hist:" << (record_history ? "true" : "false") << "\n"
             << "Nonlinear: "
             << (absl::GetFlag(FLAGS_nonlinear_value_head) ? "true" : "false")
             << "\n"
@@ -1562,7 +1593,8 @@ void RunEvaluation() {
         logit_dump_ptr,
         std::ref(results),
         record_market_diagnostics,
-        record_market_diagnostics ? &market_results : nullptr);
+        record_market_diagnostics ? &market_results : nullptr,
+        record_history);
   }
   for (auto& th : threads) {
     if (th.joinable()) th.join();
@@ -1712,8 +1744,11 @@ void RunEvaluation() {
                 << JsonIntArray(gr.reveals_with_agents_remaining)
                 << ",\"solari_end_by_round\":"
                 << JsonVpByRound(gr.rounds_captured, gr.solari_end_by_round)
-                << ",\"seed\":" << gr.chance_seed
-                << "}\n";
+                << ",\"seed\":" << gr.chance_seed;
+      if (record_history) {
+        jsonl_out << ",\"history\":" << JsonActionVector(gr.history);
+      }
+      jsonl_out << "}\n";
     }
   }
 

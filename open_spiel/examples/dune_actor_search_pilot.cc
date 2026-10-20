@@ -97,6 +97,17 @@ ABSL_FLAG(int, diag_continuations, 64, "Number of paired terminal continuations 
 ABSL_FLAG(int, diag_max_changed, 2000, "Maximum changed positions to evaluate.");
 ABSL_FLAG(std::string, diag_output_dir, "", "Output directory for diagnostic results.");
 
+// R7-45 Step 1 Distillation and network flags:
+ABSL_FLAG(bool, run_sh_distill_learner, false, "Run R7-45 offline SH distillation learner and test manipulation check.");
+ABSL_FLAG(std::string, distill_roots_json, "", "Path to sampled_roots.json.");
+ABSL_FLAG(std::string, distill_obs_bin, "", "Path to sampled_obs.bin.");
+ABSL_FLAG(std::string, distill_cand_bin, "", "Path to sampled_cand.bin.");
+ABSL_FLAG(std::string, distill_labels_json, "", "Path to sh_labels.json from sh_distill_label mode.");
+ABSL_FLAG(std::string, distill_pres_bin, "", "Path to preservation_pool.bin.");
+ABSL_FLAG(int, early_stop_patience, 5, "Epochs without val CE improvement before early stopping.");
+ABSL_FLAG(double, warmup_fraction, 0.10, "Fraction of total training steps for linear LR warmup.");
+ABSL_FLAG(double, lr_scale, 1.0, "Multiplier on base group LRs (5e-6, 5e-6, 5e-5).");
+
 
 // Link-only flag definitions required by dune_ppo_training_utils.cc
 
@@ -548,7 +559,7 @@ double SimulateTerminalRollout(
 std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> LoadActorModel(
     const std::string& path, torch::Device device) {
   auto model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(model, path, device);
@@ -1245,11 +1256,949 @@ SearchConfig RunConcurrencyBenchmark(
   return best_cfg;
 }
 
+struct DistillRoot {
+  int root_id = 0;
+  int game_id = 0;
+  int obs_row = 0;
+  int search_seat = 0;
+  int round = 0;
+  std::string decision_type;
+  std::string split;
+  int raw_action = 0;
+  int chosen_action = 0;
+  bool overridden = false;
+  double d2 = 0.0;
+  double se2 = 0.0;
+  double w = 0.0;
+  std::vector<int> candidates;
+  std::vector<int> legal_actions;
+  std::vector<double> pi_parent;
+};
+
+struct DistillPresItem {
+  int game_id = 0;
+  int split_id = 0;  // 0=train, 1=val, 2=test
+  int player = 0;
+  std::vector<float> obs;
+  open_spiel::dune_semantic::CandidateActionData cand_data;
+  std::vector<int> legal_actions;
+  std::vector<double> pi_parent;
+};
+
+int RunShDistillLearner() {
+  // Pure FP32 Context: disable TF32 on CuBLAS and CuDNN
+  at::globalContext().setAllowTF32CuBLAS(false);
+  at::globalContext().setAllowTF32CuDNN(false);
+
+  const std::string dev_str = absl::GetFlag(FLAGS_device);
+  torch::Device device = (dev_str == "cuda" && torch::cuda::is_available())
+      ? torch::Device(torch::kCUDA, 0)
+      : torch::Device(torch::kCPU);
+
+  std::string out_dir = absl::GetFlag(FLAGS_output_dir);
+  if (out_dir.empty()) {
+    out_dir = "sh_distill_output";
+  }
+  std::filesystem::create_directories(out_dir + "/checkpoints");
+
+  const std::string actor_ckpt = absl::GetFlag(FLAGS_actor_checkpoint);
+  if (actor_ckpt.empty() || !std::filesystem::exists(actor_ckpt)) {
+    open_spiel::SpielFatalError("Required --actor_checkpoint missing or not found: " + actor_ckpt);
+  }
+
+  const int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+
+  std::cout << "=================================================================\n";
+  std::cout << "  R7-45 Step 1 Offline Distillation Learner\n";
+  std::cout << "=================================================================\n";
+  std::cout << "  Actor checkpoint:  " << actor_ckpt << "\n";
+  std::cout << "  Output dir:        " << out_dir << "\n";
+  std::cout << "  Num blocks:        " << num_blocks << "\n";
+  std::cout << "  Device:            " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+
+  // Initialize parent model (frozen, eval)
+  auto parent_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      9182, 2048, 2391, num_blocks, false, false, 0, true);
+  parent_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
+  parent_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+  open_spiel::LoadModelCheckpointRobust(parent_model, actor_ckpt, device);
+  parent_model->to(device);
+  parent_model->eval();
+  for (auto& p : parent_model->parameters()) {
+    p.set_requires_grad(false);
+  }
+
+  // Initialize student model
+  auto student_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+      9182, 2048, 2391, num_blocks, false, false, 0, true);
+  student_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
+  student_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+  open_spiel::LoadModelCheckpointRobust(student_model, actor_ckpt, device);
+  student_model->to(device);
+
+  // Freeze student value head and verify requires_grad=false
+  for (auto& p : student_model->value_head->parameters()) {
+    p.set_requires_grad(false);
+  }
+
+  // Parameter groups: exclude value_head completely from AdamW param groups!
+  const int cutoff = std::max(0, num_blocks - 4);
+  std::vector<torch::Tensor> grp0_params = student_model->policy_head->parameters();
+  std::vector<torch::Tensor> grp1_params;
+  for (auto& p : student_model->input_layer->parameters()) grp1_params.push_back(p);
+  for (int b = 0; b < cutoff && b < static_cast<int>(student_model->res_blocks.size()); ++b) {
+    for (auto& p : student_model->res_blocks[b]->parameters()) grp1_params.push_back(p);
+  }
+  if (student_model->semantic_scorer_) {
+    for (auto& p : student_model->semantic_scorer_->parameters()) grp1_params.push_back(p);
+  }
+  std::vector<torch::Tensor> grp2_params;
+  for (size_t b = cutoff; b < student_model->res_blocks.size(); ++b) {
+    for (auto& p : student_model->res_blocks[b]->parameters()) grp2_params.push_back(p);
+  }
+
+  const double lr_scale = absl::GetFlag(FLAGS_lr_scale);
+  const double base_lr0 = 5e-6 * lr_scale;
+  const double base_lr1 = 5e-6 * lr_scale;
+  const double base_lr2 = 5e-5 * lr_scale;
+
+  std::vector<torch::optim::OptimizerParamGroup> param_groups = {
+      torch::optim::OptimizerParamGroup(grp0_params, std::make_unique<torch::optim::AdamWOptions>(base_lr0)),
+      torch::optim::OptimizerParamGroup(grp1_params, std::make_unique<torch::optim::AdamWOptions>(base_lr1)),
+      torch::optim::OptimizerParamGroup(grp2_params, std::make_unique<torch::optim::AdamWOptions>(base_lr2)),
+  };
+
+  auto optimizer = std::make_shared<torch::optim::AdamW>(
+      param_groups, torch::optim::AdamWOptions(base_lr0).weight_decay(1e-4).eps(1e-8));
+
+  // Resolve input files
+  std::string labels_json = absl::GetFlag(FLAGS_distill_labels_json);
+  if (labels_json.empty()) labels_json = absl::GetFlag(FLAGS_distill_roots_json);
+  if (labels_json.empty() || !std::filesystem::exists(labels_json)) {
+    open_spiel::SpielFatalError("Missing or non-existent labels/roots json: " + labels_json);
+  }
+
+  std::filesystem::path base_data_dir = std::filesystem::path(labels_json).parent_path();
+
+  std::string obs_bin = absl::GetFlag(FLAGS_distill_obs_bin);
+  if (obs_bin.empty()) {
+    std::string cand = (base_data_dir / "sampled_obs.bin").string();
+    if (std::filesystem::exists(cand)) obs_bin = cand;
+  }
+
+  std::string cand_bin = absl::GetFlag(FLAGS_distill_cand_bin);
+  if (cand_bin.empty()) {
+    std::string cand = (base_data_dir / "sampled_cand.bin").string();
+    if (std::filesystem::exists(cand)) cand_bin = cand;
+  }
+
+  std::string pres_bin = absl::GetFlag(FLAGS_distill_pres_bin);
+  if (pres_bin.empty()) {
+    std::string cand = (base_data_dir / "preservation_pool.bin").string();
+    if (std::filesystem::exists(cand)) pres_bin = cand;
+  }
+
+  // Load observations
+  std::vector<float> all_obs_data;
+  if (!obs_bin.empty() && std::filesystem::exists(obs_bin)) {
+    std::ifstream ifs(obs_bin, std::ios::binary);
+    ifs.seekg(0, std::ios::end);
+    size_t bytes = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    all_obs_data.resize(bytes / sizeof(float));
+    ifs.read(reinterpret_cast<char*>(all_obs_data.data()), bytes);
+    std::cout << "[DATA] Loaded " << (all_obs_data.size() / 9182) << " observation rows from " << obs_bin << "\n";
+  } else {
+    open_spiel::SpielFatalError("Required obs binary missing: " + obs_bin);
+  }
+
+  // Load candidate action descriptors
+  std::vector<open_spiel::dune_semantic::CandidateActionData> cand_datas;
+  if (!cand_bin.empty() && std::filesystem::exists(cand_bin)) {
+    std::ifstream ifs(cand_bin, std::ios::binary);
+    uint32_t magic = 0, version = 0;
+    ReadPod(ifs, magic);
+    ReadPod(ifs, version);
+    if (magic == 0x43414E44U && version == 1) {
+      uint64_t nr = 0;
+      ReadPod(ifs, nr);
+      cand_datas.resize(nr);
+      for (size_t i = 0; i < nr; ++i) {
+        ReadVector(ifs, cand_datas[i].actions);
+        ReadVector(ifs, cand_datas[i].features);
+        ReadVector(ifs, cand_datas[i].card_ids);
+        ReadVector(ifs, cand_datas[i].space_ids);
+        ReadVector(ifs, cand_datas[i].supported);
+        ReadVector(ifs, cand_datas[i].roles);
+      }
+      std::cout << "[DATA] Loaded " << cand_datas.size() << " semantic candidate sets from " << cand_bin << "\n";
+    }
+  }
+  static const open_spiel::dune_semantic::CandidateActionData dummy_cand;
+
+  // Load labelled roots JSON
+  std::ifstream ifs_lbl(labels_json);
+  if (!ifs_lbl.is_open()) {
+    open_spiel::SpielFatalError("Failed to open labels/roots json: " + labels_json);
+  }
+  std::string json_str((std::istreambuf_iterator<char>(ifs_lbl)), std::istreambuf_iterator<char>());
+  auto json_val = open_spiel::json::FromString(json_str);
+  if (!json_val) {
+    open_spiel::SpielFatalError("Failed to parse JSON from: " + labels_json);
+  }
+  open_spiel::json::Array roots_arr;
+  if (json_val->IsArray()) {
+    roots_arr = json_val->GetArray();
+  } else if (json_val->IsObject()) {
+    const auto& obj = json_val->GetObject();
+    if (obj.find("roots") != obj.end() && obj.at("roots").IsArray()) {
+      roots_arr = obj.at("roots").GetArray();
+    }
+  }
+
+  std::vector<DistillRoot> all_roots;
+  all_roots.reserve(roots_arr.size());
+
+  for (size_t i = 0; i < roots_arr.size(); ++i) {
+    const auto& r_obj = roots_arr[i].GetObject();
+    DistillRoot dr;
+    if (r_obj.find("root_id") != r_obj.end()) dr.root_id = static_cast<int>(r_obj.at("root_id").GetInt());
+    if (r_obj.find("game_id") != r_obj.end()) dr.game_id = static_cast<int>(r_obj.at("game_id").GetInt());
+    if (r_obj.find("obs_row") != r_obj.end()) dr.obs_row = static_cast<int>(r_obj.at("obs_row").GetInt());
+    if (r_obj.find("search_seat") != r_obj.end()) dr.search_seat = static_cast<int>(r_obj.at("search_seat").GetInt());
+    if (r_obj.find("round") != r_obj.end()) dr.round = static_cast<int>(r_obj.at("round").GetInt());
+    if (r_obj.find("decision_type") != r_obj.end()) dr.decision_type = r_obj.at("decision_type").GetString();
+    if (r_obj.find("split") != r_obj.end()) dr.split = r_obj.at("split").GetString();
+    if (dr.split.empty()) dr.split = "train";
+    if (r_obj.find("raw_action") != r_obj.end()) dr.raw_action = static_cast<int>(r_obj.at("raw_action").GetInt());
+    if (r_obj.find("chosen_action") != r_obj.end()) dr.chosen_action = static_cast<int>(r_obj.at("chosen_action").GetInt());
+    if (r_obj.find("overridden") != r_obj.end()) dr.overridden = r_obj.at("overridden").GetBool();
+    if (r_obj.find("d2") != r_obj.end()) dr.d2 = r_obj.at("d2").GetDouble();
+    if (r_obj.find("se2") != r_obj.end()) dr.se2 = r_obj.at("se2").GetDouble();
+    dr.w = dr.overridden ? std::clamp((dr.d2 - dr.se2) / 0.15, 0.0, 1.0) : 0.0;
+
+    if (r_obj.find("candidates") != r_obj.end() && r_obj.at("candidates").IsArray()) {
+      for (const auto& c_val : r_obj.at("candidates").GetArray()) {
+        dr.candidates.push_back(static_cast<int>(c_val.GetInt()));
+      }
+    }
+    if (r_obj.find("legal_actions") != r_obj.end() && r_obj.at("legal_actions").IsArray()) {
+      for (const auto& la_val : r_obj.at("legal_actions").GetArray()) {
+        dr.legal_actions.push_back(static_cast<int>(la_val.GetInt()));
+      }
+    }
+    if (r_obj.find("pi_parent") != r_obj.end() && r_obj.at("pi_parent").IsArray()) {
+      for (const auto& p_val : r_obj.at("pi_parent").GetArray()) {
+        dr.pi_parent.push_back(p_val.GetDouble());
+      }
+    }
+    all_roots.push_back(std::move(dr));
+  }
+
+  // Partition roots by split
+  std::vector<size_t> train_root_indices;
+  std::vector<size_t> val_root_indices;
+  std::vector<size_t> test_root_indices;
+
+  for (size_t i = 0; i < all_roots.size(); ++i) {
+    if (all_roots[i].split == "train") {
+      train_root_indices.push_back(i);
+    } else if (all_roots[i].split == "val") {
+      val_root_indices.push_back(i);
+    } else if (all_roots[i].split == "test") {
+      test_root_indices.push_back(i);
+    } else {
+      train_root_indices.push_back(i);
+    }
+  }
+  std::cout << absl::StrFormat("[DATA] Partitioned roots: %zu train, %zu val, %zu test (total %zu)\n",
+                               train_root_indices.size(), val_root_indices.size(),
+                               test_root_indices.size(), all_roots.size());
+
+  // Load preservation pool
+  std::vector<DistillPresItem> all_pres_items;
+  std::vector<size_t> train_pres_indices;
+  std::vector<size_t> val_pres_indices;
+  std::vector<size_t> test_pres_indices;
+
+  if (!pres_bin.empty() && std::filesystem::exists(pres_bin)) {
+    std::ifstream ifs(pres_bin, std::ios::binary);
+    uint32_t magic = 0, version = 0;
+    ReadPod(ifs, magic);
+    ReadPod(ifs, version);
+    if (magic == 0x50524553U && version == 1) {
+      uint64_t np = 0;
+      ReadPod(ifs, np);
+      all_pres_items.resize(np);
+      for (size_t i = 0; i < np; ++i) {
+        auto& item = all_pres_items[i];
+        ReadPod(ifs, item.game_id);
+        ReadPod(ifs, item.split_id);
+        ReadPod(ifs, item.player);
+        ReadVector(ifs, item.obs);
+        ReadVector(ifs, item.cand_data.actions);
+        ReadVector(ifs, item.cand_data.features);
+        ReadVector(ifs, item.cand_data.card_ids);
+        ReadVector(ifs, item.cand_data.space_ids);
+        ReadVector(ifs, item.cand_data.supported);
+        ReadVector(ifs, item.cand_data.roles);
+        ReadVector(ifs, item.legal_actions);
+        ReadVector(ifs, item.pi_parent);
+
+        if (item.split_id == 0) train_pres_indices.push_back(i);
+        else if (item.split_id == 1) val_pres_indices.push_back(i);
+        else if (item.split_id == 2) test_pres_indices.push_back(i);
+        else train_pres_indices.push_back(i);
+      }
+      std::cout << absl::StrFormat("[DATA] Loaded preservation pool: %zu train, %zu val, %zu test (total %zu)\n",
+                                   train_pres_indices.size(), val_pres_indices.size(),
+                                   test_pres_indices.size(), all_pres_items.size());
+    }
+  }
+
+  // Model parameters clone and restore helpers
+  auto clone_model_params = [](const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model) {
+    std::vector<torch::Tensor> cloned;
+    for (const auto& p : model->parameters()) {
+      cloned.push_back(p.clone().detach());
+    }
+    return cloned;
+  };
+
+  auto restore_model_params = [](const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model,
+                                 const std::vector<torch::Tensor>& saved) {
+    torch::NoGradGuard no_grad;
+    auto current = model->parameters();
+    for (size_t i = 0; i < current.size(); ++i) {
+      current[i].copy_(saved[i]);
+    }
+  };
+
+  // Deterministic validation evaluation helper
+  auto eval_val_ce = [&]() -> double {
+    if (val_root_indices.empty()) return 0.0;
+    student_model->eval();
+    torch::NoGradGuard no_grad;
+
+    double total_ce = 0.0;
+    size_t eval_batch_size = 256;
+    for (size_t start = 0; start < val_root_indices.size(); start += eval_batch_size) {
+      size_t cur_bs = std::min(eval_batch_size, val_root_indices.size() - start);
+      torch::Tensor obs_t = torch::empty({static_cast<int64_t>(cur_bs), 9182}, torch::kFloat32);
+      float* obs_ptr = obs_t.data_ptr<float>();
+      torch::Tensor mask_t = torch::zeros({static_cast<int64_t>(cur_bs), 2391},
+                                          torch::TensorOptions().dtype(torch::kBool).device(device));
+      torch::Tensor q_t = torch::zeros({static_cast<int64_t>(cur_bs), 2391},
+                                        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+      std::vector<const open_spiel::dune_semantic::CandidateActionData*> cands(cur_bs);
+
+      for (size_t b = 0; b < cur_bs; ++b) {
+        const auto& dr = all_roots[val_root_indices[start + b]];
+        if (dr.obs_row * 9182 + 9182 <= all_obs_data.size()) {
+          std::memcpy(obs_ptr + b * 9182, all_obs_data.data() + dr.obs_row * 9182, 9182 * sizeof(float));
+        } else {
+          std::memset(obs_ptr + b * 9182, 0, 9182 * sizeof(float));
+        }
+        cands[b] = (dr.obs_row >= 0 && static_cast<size_t>(dr.obs_row) < cand_datas.size())
+            ? &cand_datas[dr.obs_row] : &dummy_cand;
+
+        double w = dr.w;
+        for (size_t i = 0; i < dr.legal_actions.size(); ++i) {
+          int a = dr.legal_actions[i];
+          if (a >= 0 && a < 2391) {
+            mask_t[b][a] = true;
+            double p_val = (i < dr.pi_parent.size()) ? dr.pi_parent[i] : (1.0 / dr.legal_actions.size());
+            double target = (1.0 - w) * p_val + ((a == dr.chosen_action) ? w : 0.0);
+            q_t[b][a] = static_cast<float>(target);
+          }
+        }
+      }
+
+      torch::Tensor obs_dev = obs_t.to(device);
+      auto outputs = student_model->forward(obs_dev);
+      if (student_model->with_semantic_scorer_ && student_model->semantic_scorer_) {
+        open_spiel::dune_semantic::ApplySemanticScorerBatch(
+            student_model->semantic_scorer_, outputs.trunk, cands, outputs.logits, device);
+      }
+      torch::Tensor capped = open_spiel::CenterAndCapLogitsTensor(outputs.logits, mask_t, 10.0f);
+      torch::Tensor masked = torch::where(mask_t, capped, torch::full_like(capped, -1e9f));
+      torch::Tensor log_p = torch::log_softmax(masked, -1);
+      torch::Tensor batch_ce = -torch::sum(q_t * log_p, -1);
+      total_ce += batch_ce.sum().item<double>();
+    }
+    return total_ce / static_cast<double>(val_root_indices.size());
+  };
+
+  // Training parameters
+  const int epochs = absl::GetFlag(FLAGS_epochs);
+  const int batch_size = absl::GetFlag(FLAGS_batch_size);
+  const int patience = absl::GetFlag(FLAGS_early_stop_patience);
+  const double warmup_fraction = absl::GetFlag(FLAGS_warmup_fraction);
+  const uint64_t master_seed = absl::GetFlag(FLAGS_seed);
+
+  if (train_root_indices.empty()) {
+    open_spiel::SpielFatalError("No training roots available!");
+  }
+
+  size_t s_bs = std::min<size_t>(batch_size, train_root_indices.size());
+  size_t steps_per_epoch = (train_root_indices.size() + s_bs - 1) / s_bs;
+  int total_steps = static_cast<int>(epochs * steps_per_epoch);
+  int warmup_steps = std::max<int>(1, static_cast<int>(std::round(warmup_fraction * total_steps)));
+
+  std::cout << absl::StrFormat("[TRAIN] Epochs: %d, Batch Size: %zu, Steps/epoch: %zu, Total Steps: %d, Warmup Steps: %d\n",
+                               epochs, s_bs, steps_per_epoch, total_steps, warmup_steps);
+
+  double val_ce_init = eval_val_ce();
+  double best_val_ce = val_ce_init;
+  int best_epoch = 0;
+  int epochs_without_improvement = 0;
+  auto best_params = clone_model_params(student_model);
+
+  std::cout << absl::StrFormat("[VAL] Epoch 0 (pre-train): val_loss_ce = %.6f\n", val_ce_init);
+
+  struct EpochRecord {
+    int epoch = 0;
+    double train_ce = 0.0;
+    double train_kl = 0.0;
+    double train_loss = 0.0;
+    double val_ce = 0.0;
+    double lr = 0.0;
+  };
+  std::vector<EpochRecord> training_curve;
+  training_curve.push_back({0, 0.0, 0.0, 0.0, val_ce_init, 0.0});
+
+  std::mt19937_64 train_rng(master_seed);
+  if (!train_pres_indices.empty()) {
+    std::shuffle(train_pres_indices.begin(), train_pres_indices.end(), train_rng);
+  }
+  size_t pres_cursor = 0;
+  int current_step = 0;
+  int total_epochs_run = 0;
+
+  for (int ep = 1; ep <= epochs; ++ep) {
+    total_epochs_run = ep;
+    student_model->train();
+    student_model->value_head->eval();
+
+    std::shuffle(train_root_indices.begin(), train_root_indices.end(), train_rng);
+
+    double ep_sum_ce = 0.0;
+    double ep_sum_kl = 0.0;
+    double ep_sum_loss = 0.0;
+    int ep_steps = 0;
+
+    for (size_t start = 0; start < train_root_indices.size(); start += s_bs) {
+      current_step++;
+      ep_steps++;
+      size_t cur_s_bs = std::min(s_bs, train_root_indices.size() - start);
+
+      // Warmup LR calculation
+      double mult = (current_step <= warmup_steps)
+          ? (static_cast<double>(current_step) / static_cast<double>(warmup_steps))
+          : 1.0;
+      for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+        double base_lr = (g == 2) ? base_lr2 : base_lr0;
+        static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[g].options()).lr(base_lr * mult);
+      }
+
+      // 1. Materialize Batched Search Tensors
+      torch::Tensor s_obs = torch::empty({static_cast<int64_t>(cur_s_bs), 9182}, torch::kFloat32);
+      float* s_obs_ptr = s_obs.data_ptr<float>();
+      torch::Tensor s_mask = torch::zeros({static_cast<int64_t>(cur_s_bs), 2391},
+                                          torch::TensorOptions().dtype(torch::kBool).device(device));
+      torch::Tensor s_q = torch::zeros({static_cast<int64_t>(cur_s_bs), 2391},
+                                        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+      std::vector<const open_spiel::dune_semantic::CandidateActionData*> s_cands(cur_s_bs);
+
+      for (size_t b = 0; b < cur_s_bs; ++b) {
+        const auto& dr = all_roots[train_root_indices[start + b]];
+        if (dr.obs_row * 9182 + 9182 <= all_obs_data.size()) {
+          std::memcpy(s_obs_ptr + b * 9182, all_obs_data.data() + dr.obs_row * 9182, 9182 * sizeof(float));
+        } else {
+          std::memset(s_obs_ptr + b * 9182, 0, 9182 * sizeof(float));
+        }
+        s_cands[b] = (dr.obs_row >= 0 && static_cast<size_t>(dr.obs_row) < cand_datas.size())
+            ? &cand_datas[dr.obs_row] : &dummy_cand;
+
+        double w = dr.w;
+        for (size_t i = 0; i < dr.legal_actions.size(); ++i) {
+          int a = dr.legal_actions[i];
+          if (a >= 0 && a < 2391) {
+            s_mask[b][a] = true;
+            double p_val = (i < dr.pi_parent.size()) ? dr.pi_parent[i] : (1.0 / dr.legal_actions.size());
+            double target = (1.0 - w) * p_val + ((a == dr.chosen_action) ? w : 0.0);
+            s_q[b][a] = static_cast<float>(target);
+          }
+        }
+      }
+
+      torch::Tensor s_obs_dev = s_obs.to(device);
+      auto s_outputs = student_model->forward(s_obs_dev);
+      if (student_model->with_semantic_scorer_ && student_model->semantic_scorer_) {
+        open_spiel::dune_semantic::ApplySemanticScorerBatch(
+            student_model->semantic_scorer_, s_outputs.trunk, s_cands, s_outputs.logits, device);
+      }
+      torch::Tensor s_capped = open_spiel::CenterAndCapLogitsTensor(s_outputs.logits, s_mask, 10.0f);
+      torch::Tensor s_masked = torch::where(s_mask, s_capped, torch::full_like(s_capped, -1e9f));
+      torch::Tensor s_log_p = torch::log_softmax(s_masked, -1);
+      torch::Tensor ce_loss = -torch::sum(s_q * s_log_p, -1).mean();
+
+      // 2. Materialize Batched Preservation Tensors
+      torch::Tensor kl_loss = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+      if (!train_pres_indices.empty()) {
+        size_t p_bs = cur_s_bs;
+        torch::Tensor p_obs = torch::empty({static_cast<int64_t>(p_bs), 9182}, torch::kFloat32);
+        float* p_obs_ptr = p_obs.data_ptr<float>();
+        torch::Tensor p_mask = torch::zeros({static_cast<int64_t>(p_bs), 2391},
+                                            torch::TensorOptions().dtype(torch::kBool).device(device));
+        std::vector<const open_spiel::dune_semantic::CandidateActionData*> p_cands(p_bs);
+
+        for (size_t b = 0; b < p_bs; ++b) {
+          if (pres_cursor >= train_pres_indices.size()) {
+            std::shuffle(train_pres_indices.begin(), train_pres_indices.end(), train_rng);
+            pres_cursor = 0;
+          }
+          size_t p_idx = train_pres_indices[pres_cursor++];
+          const auto& item = all_pres_items[p_idx];
+          if (item.obs.size() == 9182) {
+            std::memcpy(p_obs_ptr + b * 9182, item.obs.data(), 9182 * sizeof(float));
+          } else {
+            std::memset(p_obs_ptr + b * 9182, 0, 9182 * sizeof(float));
+          }
+          p_cands[b] = &item.cand_data;
+          for (int a : item.legal_actions) {
+            if (a >= 0 && a < 2391) p_mask[b][a] = true;
+          }
+        }
+
+        torch::Tensor p_obs_dev = p_obs.to(device);
+        torch::Tensor p_ref;
+        {
+          torch::NoGradGuard no_grad;
+          auto ref_outputs = parent_model->forward(p_obs_dev);
+          if (parent_model->with_semantic_scorer_ && parent_model->semantic_scorer_) {
+            open_spiel::dune_semantic::ApplySemanticScorerBatch(
+                parent_model->semantic_scorer_, ref_outputs.trunk, p_cands, ref_outputs.logits, device);
+          }
+          torch::Tensor ref_capped = open_spiel::CenterAndCapLogitsTensor(ref_outputs.logits, p_mask, 10.0f);
+          torch::Tensor ref_masked = torch::where(p_mask, ref_capped, torch::full_like(ref_capped, -1e9f));
+          p_ref = torch::softmax(ref_masked, -1);
+        }
+
+        auto p_outputs = student_model->forward(p_obs_dev);
+        if (student_model->with_semantic_scorer_ && student_model->semantic_scorer_) {
+          open_spiel::dune_semantic::ApplySemanticScorerBatch(
+              student_model->semantic_scorer_, p_outputs.trunk, p_cands, p_outputs.logits, device);
+        }
+        torch::Tensor p_capped = open_spiel::CenterAndCapLogitsTensor(p_outputs.logits, p_mask, 10.0f);
+        torch::Tensor p_masked = torch::where(p_mask, p_capped, torch::full_like(p_capped, -1e9f));
+        torch::Tensor p_log_p = torch::log_softmax(p_masked, -1);
+        torch::Tensor p_ref_clamped = torch::clamp(p_ref, 1e-12, 1.0);
+        torch::Tensor p_log_ref = torch::log(p_ref_clamped);
+        kl_loss = torch::sum(torch::where(p_mask, p_ref * (p_log_ref - p_log_p), torch::zeros_like(p_ref)), -1).mean();
+      }
+
+      torch::Tensor total_loss = ce_loss + 0.1 * kl_loss;
+
+      optimizer->zero_grad();
+      total_loss.backward();
+      torch::nn::utils::clip_grad_norm_(student_model->parameters(), 0.5);
+      optimizer->step();
+
+      ep_sum_ce += ce_loss.item<double>();
+      ep_sum_kl += kl_loss.item<double>();
+      ep_sum_loss += total_loss.item<double>();
+    }
+
+    double ep_mean_ce = ep_sum_ce / ep_steps;
+    double ep_mean_kl = ep_sum_kl / ep_steps;
+    double ep_mean_loss = ep_sum_loss / ep_steps;
+
+    double cur_val_ce = eval_val_ce();
+    double current_lr = base_lr0 * ((current_step <= warmup_steps)
+        ? (static_cast<double>(current_step) / static_cast<double>(warmup_steps)) : 1.0);
+
+    training_curve.push_back({ep, ep_mean_ce, ep_mean_kl, ep_mean_loss, cur_val_ce, current_lr});
+
+    std::cout << absl::StrFormat("[EPOCH %d/%d] train_loss=%.6f (ce=%.6f, kl=%.6f) | val_loss_ce=%.6f | lr=%.2e\n",
+                                 ep, epochs, ep_mean_loss, ep_mean_ce, ep_mean_kl, cur_val_ce, current_lr);
+
+    if (cur_val_ce < best_val_ce) {
+      best_val_ce = cur_val_ce;
+      best_epoch = ep;
+      epochs_without_improvement = 0;
+      best_params = clone_model_params(student_model);
+      std::cout << absl::StrFormat("  [*] New best validation loss: %.6f (epoch %d)\n", best_val_ce, best_epoch);
+    } else {
+      epochs_without_improvement++;
+      std::cout << absl::StrFormat("  [!] Val loss did not improve (%d / %d patience)\n",
+                                   epochs_without_improvement, patience);
+      if (epochs_without_improvement >= patience) {
+        std::cout << absl::StrFormat("[EARLY STOP] Stopping training at epoch %d. Best epoch was %d (val_ce=%.6f)\n",
+                                     ep, best_epoch, best_val_ce);
+        break;
+      }
+    }
+  }
+
+  // Restore best validation weights
+  restore_model_params(student_model, best_params);
+  student_model->eval();
+
+  // Verify student_model->value_head parameters are bit-identical (max_diff == 0.0) to parent_model->value_head
+  double max_diff = 0.0;
+  auto s_v_params = student_model->value_head->parameters();
+  auto p_v_params = parent_model->value_head->parameters();
+  for (size_t i = 0; i < s_v_params.size(); ++i) {
+    double diff = (s_v_params[i].cpu() - p_v_params[i].cpu()).abs().max().item<double>();
+    if (diff > max_diff) max_diff = diff;
+  }
+  std::cout << absl::StrFormat("[VERIFY] Value head parity check vs parent: max_diff = %e\n", max_diff);
+  if (max_diff > 0.0) {
+    open_spiel::SpielFatalError(absl::StrFormat(
+        "Fatal: student value_head diverged from parent! max_diff = %e", max_diff));
+  }
+
+  // -------------------------------------------------------------------------
+  // Test Split Manipulation Check
+  // -------------------------------------------------------------------------
+  std::cout << "\n=================================================================\n";
+  std::cout << "  Test Split Manipulation Check\n";
+  std::cout << "=================================================================\n";
+
+  auto eval_policy = [&](const std::vector<float>& obs_flat,
+                         const std::vector<int>& legal_actions,
+                         const open_spiel::dune_semantic::CandidateActionData* cand_ptr,
+                         const std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>& model)
+      -> std::vector<float> {
+    torch::NoGradGuard no_grad;
+    torch::Tensor obs_t = torch::from_blob(
+        const_cast<float*>(obs_flat.data()), {1, 9182}, torch::kFloat32).clone().to(device);
+    torch::Tensor mask_t = torch::zeros(
+        {1, 2391}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    for (int a : legal_actions) {
+      if (a >= 0 && a < 2391) mask_t[0][a] = true;
+    }
+    std::vector<const open_spiel::dune_semantic::CandidateActionData*> cands = { cand_ptr };
+
+    auto out = model->forward(obs_t);
+    if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+      open_spiel::dune_semantic::ApplySemanticScorerBatch(
+          model->semantic_scorer_, out.trunk, cands, out.logits, device);
+    }
+    torch::Tensor capped = open_spiel::CenterAndCapLogitsTensor(out.logits, mask_t, 10.0f);
+    torch::Tensor masked = torch::where(mask_t, capped, torch::full_like(capped, -1e9f));
+    torch::Tensor prob = torch::softmax(masked, -1).cpu();
+    const float* p_ptr = prob.data_ptr<float>();
+    return std::vector<float>(p_ptr, p_ptr + 2391);
+  };
+
+  struct TestGameCluster {
+    int game_id = 0;
+    std::vector<double> diff_log_ratio;
+    std::vector<double> adopted;
+    std::vector<double> diff_log_odds;
+    std::vector<double> agree_flipped;
+    std::vector<double> pres_flipped;
+  };
+  std::map<int, TestGameCluster> cluster_map;
+
+  for (size_t idx : test_root_indices) {
+    const auto& dr = all_roots[idx];
+    cluster_map[dr.game_id].game_id = dr.game_id;
+
+    const float* obs_ptr = all_obs_data.data() + dr.obs_row * 9182;
+    std::vector<float> obs_vec(obs_ptr, obs_ptr + 9182);
+    const auto* c_ptr = (dr.obs_row >= 0 && static_cast<size_t>(dr.obs_row) < cand_datas.size())
+        ? &cand_datas[dr.obs_row] : &dummy_cand;
+
+    auto stud_probs = eval_policy(obs_vec, dr.legal_actions, c_ptr, student_model);
+    auto par_probs = eval_policy(obs_vec, dr.legal_actions, c_ptr, parent_model);
+
+    int g_stud = -1; float max_stud = -1e9f;
+    int g_par = -1; float max_par = -1e9f;
+    for (int a : dr.legal_actions) {
+      if (a >= 0 && a < 2391) {
+        if (stud_probs[a] > max_stud) { max_stud = stud_probs[a]; g_stud = a; }
+        if (par_probs[a] > max_par) { max_par = par_probs[a]; g_par = a; }
+      }
+    }
+
+    if (dr.overridden) {
+      // (a) diff log ratio
+      double p_s_astar = stud_probs[dr.chosen_action];
+      double p_s_raw = stud_probs[dr.raw_action];
+      double p_p_astar = par_probs[dr.chosen_action];
+      double p_p_raw = par_probs[dr.raw_action];
+      double dlr = (std::log(std::max(1e-12, p_s_astar)) - std::log(std::max(1e-12, p_s_raw))) -
+                   (std::log(std::max(1e-12, p_p_astar)) - std::log(std::max(1e-12, p_p_raw)));
+      cluster_map[dr.game_id].diff_log_ratio.push_back(dlr);
+
+      // (b) greedy adoption
+      double adopted = (g_stud == dr.chosen_action) ? 1.0 : 0.0;
+      cluster_map[dr.game_id].adopted.push_back(adopted);
+
+      // (c) diff log odds against C \ {raw, a*}
+      std::vector<int> other_cands;
+      for (int c : dr.candidates) {
+        if (c != dr.raw_action && c != dr.chosen_action) {
+          other_cands.push_back(c);
+        }
+      }
+      if (!other_cands.empty()) {
+        double sum_c_stud = 0.0;
+        double sum_c_par = 0.0;
+        for (int c : other_cands) {
+          if (c >= 0 && c < 2391) {
+            sum_c_stud += stud_probs[c];
+            sum_c_par += par_probs[c];
+          }
+        }
+        double lo_stud = std::log(std::max(1e-12, p_s_astar)) - std::log(std::max(1e-12, sum_c_stud));
+        double lo_par = std::log(std::max(1e-12, p_p_astar)) - std::log(std::max(1e-12, sum_c_par));
+        cluster_map[dr.game_id].diff_log_odds.push_back(lo_stud - lo_par);
+      }
+    } else {
+      // Agreement root: flip rate
+      double flip = (g_stud != g_par) ? 1.0 : 0.0;
+      cluster_map[dr.game_id].agree_flipped.push_back(flip);
+    }
+  }
+
+  for (size_t idx : test_pres_indices) {
+    const auto& item = all_pres_items[idx];
+    cluster_map[item.game_id].game_id = item.game_id;
+
+    auto stud_probs = eval_policy(item.obs, item.legal_actions, &item.cand_data, student_model);
+    auto par_probs = eval_policy(item.obs, item.legal_actions, &item.cand_data, parent_model);
+
+    int g_stud = -1; float max_stud = -1e9f;
+    int g_par = -1; float max_par = -1e9f;
+    for (int a : item.legal_actions) {
+      if (a >= 0 && a < 2391) {
+        if (stud_probs[a] > max_stud) { max_stud = stud_probs[a]; g_stud = a; }
+        if (par_probs[a] > max_par) { max_par = par_probs[a]; g_par = a; }
+      }
+    }
+    double flip = (g_stud != g_par) ? 1.0 : 0.0;
+    cluster_map[item.game_id].pres_flipped.push_back(flip);
+  }
+
+  std::vector<TestGameCluster> clusters;
+  for (auto& pair : cluster_map) {
+    clusters.push_back(std::move(pair.second));
+  }
+
+  struct MetricStat {
+    size_t count = 0;
+    double mean = 0.0;
+    double se = 0.0;
+    double ci_low = 0.0;
+    double ci_high = 0.0;
+  };
+
+  auto compute_bootstrap = [&](std::function<const std::vector<double>&(const TestGameCluster&)> getter) -> MetricStat {
+    MetricStat stat;
+    double total_sum = 0.0;
+    for (const auto& c : clusters) {
+      const auto& vals = getter(c);
+      for (double v : vals) total_sum += v;
+      stat.count += vals.size();
+    }
+    if (stat.count == 0) return stat;
+    stat.mean = total_sum / static_cast<double>(stat.count);
+
+    const int B = 2000;
+    std::mt19937_64 boot_rng(20261020ULL);
+    std::uniform_int_distribution<size_t> dist(0, clusters.size() - 1);
+    std::vector<double> boot_means(B, stat.mean);
+
+    for (int b = 0; b < B; ++b) {
+      double b_sum = 0.0;
+      size_t b_count = 0;
+      for (size_t k = 0; k < clusters.size(); ++k) {
+        size_t g_idx = dist(boot_rng);
+        const auto& c_vals = getter(clusters[g_idx]);
+        for (double v : c_vals) b_sum += v;
+        b_count += c_vals.size();
+      }
+      if (b_count > 0) {
+        boot_means[b] = b_sum / static_cast<double>(b_count);
+      }
+    }
+
+    double b_mean_sum = 0.0;
+    for (double bm : boot_means) b_mean_sum += bm;
+    double b_avg = b_mean_sum / B;
+    double b_sq_sum = 0.0;
+    for (double bm : boot_means) b_sq_sum += (bm - b_avg) * (bm - b_avg);
+    stat.se = std::sqrt(b_sq_sum / std::max(1, B - 1));
+
+    std::sort(boot_means.begin(), boot_means.end());
+    stat.ci_low = boot_means[static_cast<size_t>(0.025 * B)];
+    stat.ci_high = boot_means[static_cast<size_t>(0.975 * B)];
+    return stat;
+  };
+
+  auto stat_dlr = compute_bootstrap([](const TestGameCluster& c) -> const std::vector<double>& { return c.diff_log_ratio; });
+  auto stat_adopt = compute_bootstrap([](const TestGameCluster& c) -> const std::vector<double>& { return c.adopted; });
+  auto stat_dlo = compute_bootstrap([](const TestGameCluster& c) -> const std::vector<double>& { return c.diff_log_odds; });
+  auto stat_agree = compute_bootstrap([](const TestGameCluster& c) -> const std::vector<double>& { return c.agree_flipped; });
+  auto stat_pres = compute_bootstrap([](const TestGameCluster& c) -> const std::vector<double>& { return c.pres_flipped; });
+
+  std::cout << absl::StrFormat("  Test Game Clusters:            %zu\n", clusters.size());
+  std::cout << absl::StrFormat("  Override Roots (N=%zu):\n", stat_dlr.count);
+  std::cout << absl::StrFormat("    - Change in log(pi(a*)/pi(raw)):   %+.4f (SE %.4f, 95%% CI [%+.4f, %+.4f])\n",
+                               stat_dlr.mean, stat_dlr.se, stat_dlr.ci_low, stat_dlr.ci_high);
+  std::cout << absl::StrFormat("    - Greedy adoption of a*:           %.2f%% (SE %.2f%%, 95%% CI [%.2f%%, %.2f%%])\n",
+                               stat_adopt.mean * 100.0, stat_adopt.se * 100.0, stat_adopt.ci_low * 100.0, stat_adopt.ci_high * 100.0);
+  std::cout << absl::StrFormat("    - Change in log-odds vs C\\{raw,a*} (N=%zu): %+.4f (SE %.4f, 95%% CI [%+.4f, %+.4f])\n",
+                               stat_dlo.count, stat_dlo.mean, stat_dlo.se, stat_dlo.ci_low, stat_dlo.ci_high);
+  std::cout << absl::StrFormat("  Agreement Roots (N=%zu):\n", stat_agree.count);
+  std::cout << absl::StrFormat("    - Greedy flip rate away from raw:  %.2f%% (SE %.2f%%, 95%% CI [%.2f%%, %.2f%%])\n",
+                               stat_agree.mean * 100.0, stat_agree.se * 100.0, stat_agree.ci_low * 100.0, stat_agree.ci_high * 100.0);
+  std::cout << absl::StrFormat("  Preservation Decisions (N=%zu):\n", stat_pres.count);
+  std::cout << absl::StrFormat("    - Greedy flip rate away from raw:  %.2f%% (SE %.2f%%, 95%% CI [%.2f%%, %.2f%%])\n",
+                               stat_pres.mean * 100.0, stat_pres.se * 100.0, stat_pres.ci_low * 100.0, stat_pres.ci_high * 100.0);
+
+  // -------------------------------------------------------------------------
+  // Save Checkpoint, Manifest, and Summary
+  // -------------------------------------------------------------------------
+  std::string best_model_path = out_dir + "/checkpoints/ppo_model_step1_best.pt";
+  std::string best_opt_path = out_dir + "/checkpoints/ppo_optimizer_step1_best.pt";
+  std::string best_manifest_path = out_dir + "/checkpoints/ppo_model_step1_best.json";
+  torch::save(student_model, best_model_path);
+  torch::save(*optimizer, best_opt_path);
+
+  std::string model_hash = open_spiel::ComputeFileSHA256(best_model_path);
+  size_t model_sz = std::filesystem::file_size(best_model_path);
+  std::string opt_hash = open_spiel::ComputeFileSHA256(best_opt_path);
+  size_t opt_sz = std::filesystem::file_size(best_opt_path);
+
+  open_spiel::json::Object m_man;
+  m_man["schema_version"] = 2;
+  m_man["num_blocks"] = num_blocks;
+  m_man["hidden_dim"] = 2048;
+  m_man["observation_dim"] = 9182;
+  m_man["enable_semantic_scorer"] = true;
+  m_man["enable_zone_encoder"] = false;
+  m_man["semantic_descriptor_schema"] = "semantic_action_v3";
+  m_man["market_appendix_mode"] = "full_public_information_v3";
+  m_man["feature_schema_sha256"] = "1f91ede6656d792545589b69b39ed1209cb8255c3ba8dcae49726acde7388e7f";
+  m_man["rollout_amp"] = false;
+  m_man["allow_tf32"] = false;
+  m_man["model_filename"] = "ppo_model_step1_best.pt";
+  m_man["model_file_size"] = static_cast<int64_t>(model_sz);
+  m_man["model_sha256"] = model_hash;
+  m_man["optimizer_filename"] = "ppo_optimizer_step1_best.pt";
+  m_man["optimizer_file_size"] = static_cast<int64_t>(opt_sz);
+  m_man["optimizer_sha256"] = opt_hash;
+  m_man["early_stop_epoch"] = static_cast<int64_t>(best_epoch);
+  m_man["best_val_ce"] = best_val_ce;
+  {
+    std::ofstream ofs(best_manifest_path);
+    ofs << open_spiel::json::ToString(m_man, true);
+  }
+  std::cout << "[SAVED] Checkpoint: " << best_model_path << "\n";
+  std::cout << "[SAVED] Optimizer:  " << best_opt_path << "\n";
+  std::cout << "[SAVED] Manifest:   " << best_manifest_path << "\n";
+
+  open_spiel::json::Object summary_out;
+  summary_out["best_epoch"] = static_cast<int64_t>(best_epoch);
+  summary_out["best_val_ce"] = best_val_ce;
+  summary_out["total_epochs_run"] = static_cast<int64_t>(total_epochs_run);
+  summary_out["total_steps_run"] = static_cast<int64_t>(current_step);
+  summary_out["early_stopped"] = (epochs_without_improvement >= patience);
+
+  open_spiel::json::Array curve_arr;
+  for (const auto& rec : training_curve) {
+    open_spiel::json::Object rec_obj;
+    rec_obj["epoch"] = static_cast<int64_t>(rec.epoch);
+    rec_obj["train_ce"] = rec.train_ce;
+    rec_obj["train_kl"] = rec.train_kl;
+    rec_obj["train_loss"] = rec.train_loss;
+    rec_obj["val_ce"] = rec.val_ce;
+    rec_obj["lr"] = rec.lr;
+    curve_arr.push_back(rec_obj);
+  }
+  summary_out["training_curve"] = curve_arr;
+
+  open_spiel::json::Object test_manip;
+
+  open_spiel::json::Object over_obj;
+  over_obj["count"] = static_cast<int64_t>(stat_dlr.count);
+
+  open_spiel::json::Object dlr_obj;
+  dlr_obj["mean"] = stat_dlr.mean;
+  dlr_obj["se"] = stat_dlr.se;
+  open_spiel::json::Array dlr_ci;
+  dlr_ci.push_back(stat_dlr.ci_low);
+  dlr_ci.push_back(stat_dlr.ci_high);
+  dlr_obj["ci_95"] = dlr_ci;
+  over_obj["diff_log_ratio"] = dlr_obj;
+
+  open_spiel::json::Object adopt_obj;
+  adopt_obj["mean"] = stat_adopt.mean;
+  adopt_obj["se"] = stat_adopt.se;
+  open_spiel::json::Array adopt_ci;
+  adopt_ci.push_back(stat_adopt.ci_low);
+  adopt_ci.push_back(stat_adopt.ci_high);
+  adopt_obj["ci_95"] = adopt_ci;
+  over_obj["adoption_rate"] = adopt_obj;
+
+  open_spiel::json::Object dlo_obj;
+  dlo_obj["count"] = static_cast<int64_t>(stat_dlo.count);
+  dlo_obj["mean"] = stat_dlo.mean;
+  dlo_obj["se"] = stat_dlo.se;
+  open_spiel::json::Array dlo_ci;
+  dlo_ci.push_back(stat_dlo.ci_low);
+  dlo_ci.push_back(stat_dlo.ci_high);
+  dlo_obj["ci_95"] = dlo_ci;
+  over_obj["diff_log_odds"] = dlo_obj;
+
+  test_manip["override_roots"] = over_obj;
+
+  open_spiel::json::Object agree_obj;
+  agree_obj["count"] = static_cast<int64_t>(stat_agree.count);
+  agree_obj["flip_rate_mean"] = stat_agree.mean;
+  agree_obj["flip_rate_se"] = stat_agree.se;
+  open_spiel::json::Array agree_ci;
+  agree_ci.push_back(stat_agree.ci_low);
+  agree_ci.push_back(stat_agree.ci_high);
+  agree_obj["flip_rate_ci_95"] = agree_ci;
+  test_manip["agreement_roots"] = agree_obj;
+
+  open_spiel::json::Object pres_obj;
+  pres_obj["count"] = static_cast<int64_t>(stat_pres.count);
+  pres_obj["flip_rate_mean"] = stat_pres.mean;
+  pres_obj["flip_rate_se"] = stat_pres.se;
+  open_spiel::json::Array pres_ci;
+  pres_ci.push_back(stat_pres.ci_low);
+  pres_ci.push_back(stat_pres.ci_high);
+  pres_obj["flip_rate_ci_95"] = pres_ci;
+  test_manip["preservation_positions"] = pres_obj;
+
+  summary_out["test_manipulation_check"] = test_manip;
+
+  std::string summary_path = out_dir + "/learner_summary.json";
+  {
+    std::ofstream ofs(summary_path);
+    ofs << open_spiel::json::ToString(summary_out, true);
+  }
+  std::cout << "[SAVED] Summary:    " << summary_path << "\n";
+
+  return 0;
+}
+
 }  // namespace dune_pilot
 }  // namespace open_spiel
 
 int main(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
+
+  if (absl::GetFlag(FLAGS_run_sh_distill_learner)) {
+    return open_spiel::dune_pilot::RunShDistillLearner();
+  }
 
   if (absl::GetFlag(FLAGS_run_terminal_diagnostic)) {
     return open_spiel::dune_pilot::RunTerminalContinuationDiagnostic(
@@ -1310,23 +2259,23 @@ int main(int argc, char** argv) {
   auto game = open_spiel::LoadGame("dune_imperium");
   SPIEL_CHECK_TRUE(game != nullptr);
 
-  // Model instantiation: 12-block ResNet with semantic scorer and FullPublicInformationV3
+  // Model instantiation: ResNet with semantic scorer and FullPublicInformationV3
   auto learner_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   learner_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   learner_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(learner_model, actor_ckpt, device);
   learner_model->eval();
 
   auto cycle_start_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   cycle_start_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   cycle_start_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(cycle_start_model, actor_ckpt, device);
   cycle_start_model->eval();
 
   auto ema_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   ema_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   ema_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   if (!actor_ema.empty() && std::filesystem::exists(actor_ema)) {
@@ -1338,7 +2287,7 @@ int main(int argc, char** argv) {
   }
 
   auto critic_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   critic_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   critic_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(critic_model, critic_ckpt, device);
@@ -1346,12 +2295,13 @@ int main(int argc, char** argv) {
 
   // Optimizer setup matching inherited 3 parameter groups:
   // Group 0: policy head (5e-6)
-  // Group 1: torso (input layer, first 8 res blocks, value head, semantic scorer) (5e-6)
+  // Group 1: torso (input layer, first res blocks, value head, semantic scorer) (5e-6)
   // Group 2: remaining blocks (last 4 res blocks) (5e-5)
+  const int cutoff = std::max(0, absl::GetFlag(FLAGS_num_blocks) - 4);
   std::vector<torch::Tensor> grp0_params = learner_model->policy_head->parameters();
   std::vector<torch::Tensor> grp1_params;
   for (auto& p : learner_model->input_layer->parameters()) grp1_params.push_back(p);
-  for (int b = 0; b < 8 && b < static_cast<int>(learner_model->res_blocks.size()); ++b) {
+  for (int b = 0; b < cutoff && b < static_cast<int>(learner_model->res_blocks.size()); ++b) {
     for (auto& p : learner_model->res_blocks[b]->parameters()) grp1_params.push_back(p);
   }
   for (auto& p : learner_model->value_head->parameters()) grp1_params.push_back(p);
@@ -1359,7 +2309,7 @@ int main(int argc, char** argv) {
     for (auto& p : learner_model->semantic_scorer_->parameters()) grp1_params.push_back(p);
   }
   std::vector<torch::Tensor> grp2_params;
-  for (size_t b = 8; b < learner_model->res_blocks.size(); ++b) {
+  for (size_t b = cutoff; b < learner_model->res_blocks.size(); ++b) {
     for (auto& p : learner_model->res_blocks[b]->parameters()) grp2_params.push_back(p);
   }
 
@@ -2216,7 +3166,7 @@ int main(int argc, char** argv) {
 
   open_spiel::json::Object m_man;
   m_man["schema_version"] = 2;
-  m_man["num_blocks"] = 12;
+  m_man["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
   m_man["hidden_dim"] = 2048;
   m_man["observation_dim"] = 9182;
   m_man["enable_semantic_scorer"] = true;
@@ -2253,21 +3203,22 @@ int main(int argc, char** argv) {
 
   // Reload saved checkpoints and verify bit-for-bit parity
   auto reloaded_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   reloaded_model->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   reloaded_model->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(reloaded_model, pf_model_path, device);
 
   auto reloaded_ema = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-      9182, 2048, 2391, 12, false, false, 0, true);
+      9182, 2048, 2391, absl::GetFlag(FLAGS_num_blocks), false, false, 0, true);
   reloaded_ema->semantic_descriptor_schema_ = open_spiel::dune_semantic::kDescriptorSchemaVersionV3;
   reloaded_ema->market_appendix_mode_ = open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
   open_spiel::LoadModelCheckpointRobust(reloaded_ema, pf_ema_path, device);
 
+  const int r_cutoff = std::max(0, absl::GetFlag(FLAGS_num_blocks) - 4);
   std::vector<torch::Tensor> r_grp0 = reloaded_model->policy_head->parameters();
   std::vector<torch::Tensor> r_grp1;
   for (auto& p : reloaded_model->input_layer->parameters()) r_grp1.push_back(p);
-  for (int b = 0; b < 8 && b < static_cast<int>(reloaded_model->res_blocks.size()); ++b) {
+  for (int b = 0; b < r_cutoff && b < static_cast<int>(reloaded_model->res_blocks.size()); ++b) {
     for (auto& p : reloaded_model->res_blocks[b]->parameters()) r_grp1.push_back(p);
   }
   for (auto& p : reloaded_model->value_head->parameters()) r_grp1.push_back(p);
@@ -2275,7 +3226,7 @@ int main(int argc, char** argv) {
     for (auto& p : reloaded_model->semantic_scorer_->parameters()) r_grp1.push_back(p);
   }
   std::vector<torch::Tensor> r_grp2;
-  for (size_t b = 8; b < reloaded_model->res_blocks.size(); ++b) {
+  for (size_t b = r_cutoff; b < reloaded_model->res_blocks.size(); ++b) {
     for (auto& p : reloaded_model->res_blocks[b]->parameters()) r_grp2.push_back(p);
   }
 
