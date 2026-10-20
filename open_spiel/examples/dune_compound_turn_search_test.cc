@@ -3,9 +3,156 @@
 #include "open_spiel/examples/dune_compound_turn_search.h"
 #include "open_spiel/spiel_utils.h"
 
-int main() {
+namespace open_spiel {
+namespace dune_imperium {
+namespace {
+
+void DescendantPublicKnowledgeCorrectionTest() {
+  auto state = LoadGame("dune_imperium")->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+  const Player mover = state->CurrentPlayer();
+  const Player opponent = (mover + 1) % kNumPlayers;
+  Action prefix = kInvalidAction;
+  Action continuation = kInvalidAction;
+  std::unique_ptr<State> descendant;
+  for (Action candidate : state->LegalActions()) {
+    if (candidate < kActionSelectAgentCard0 ||
+        candidate >= kActionSelectAgentCard0 + kNumImperiumCardIds) continue;
+    auto next = state->Clone();
+    next->ApplyAction(candidate);
+    if (next->IsChanceNode() || next->CurrentPlayer() != mover) continue;
+    const auto legal = next->LegalActions();
+    for (const auto& space : kBoardSpaces) {
+      if (std::find(legal.begin(), legal.end(), space.action) != legal.end()) {
+        prefix = candidate;
+        continuation = space.action;
+        descendant = std::move(next);
+        break;
+      }
+    }
+    if (descendant) break;
+  }
+  SPIEL_CHECK_TRUE(descendant != nullptr);
+  const int observed = dune->GetPlayerHandForTesting(opponent).front();
+  auto corrected_same_history = state->Clone();
+  SPIEL_CHECK_TRUE(static_cast<DuneImperiumState*>(corrected_same_history.get())
+      ->SynchronizePublicHandKnowledge(opponent, {observed}));
+  auto corrected_descendant = descendant->Clone();
+  auto* corrected = static_cast<DuneImperiumState*>(corrected_descendant.get());
+  SPIEL_CHECK_TRUE(corrected->SynchronizePublicHandKnowledge(opponent, {observed}));
+  SPIEL_CHECK_TRUE(descendant->History() == corrected_descendant->History());
+  SPIEL_CHECK_EQ(descendant->ObservationString(), corrected_descendant->ObservationString());
+  SPIEL_CHECK_NE(static_cast<DuneImperiumState*>(descendant.get())
+      ->PublicCardKnowledgeRecordDigest(), corrected->PublicCardKnowledgeRecordDigest());
+
+  TurnSearchTree same_history;
+  same_history.BindPublicCardKnowledge(*state);
+  same_history.RecordRollout(prefix, {continuation}, 1.0);
+  same_history.BindPublicCardKnowledge(*corrected_same_history);
+  SPIEL_CHECK_EQ(same_history.GetVisits(prefix), 0);
+
+  TurnSearchTree ordinary;
+  ordinary.BindPublicCardKnowledge(*state);
+  ordinary.RecordRollout(prefix, {continuation}, 1.0);
+  ordinary.Advance(prefix);
+  ordinary.BindPublicCardKnowledge(*descendant);
+  SPIEL_CHECK_EQ(ordinary.GetVisits(continuation), 1);
+
+  auto completed = descendant->Clone();
+  completed->ApplyAction(continuation);
+  SPIEL_CHECK_FALSE(completed->IsChanceNode());
+  SPIEL_CHECK_EQ(completed->CurrentPlayer(), mover);
+  SPIEL_CHECK_FALSE(completed->LegalActions().empty());
+  SPIEL_CHECK_NE(dune->PublicCardKnowledgeDigest(),
+      static_cast<DuneImperiumState*>(completed.get())->PublicCardKnowledgeDigest());
+  const Action following = completed->LegalActions().front();
+  TurnSearchTree completed_action;
+  completed_action.BindPublicCardKnowledge(*state);
+  completed_action.RecordRollout(prefix, {continuation, following}, 1.0);
+  completed_action.Advance(prefix);
+  completed_action.Advance(continuation);
+  completed_action.BindPublicCardKnowledge(*completed);
+  SPIEL_CHECK_EQ(completed_action.GetVisits(following), 1);
+
+  TurnSearchTree recapture;
+  recapture.BindPublicCardKnowledge(*corrected_same_history);
+  recapture.RecordRollout(prefix, {continuation}, 1.0);
+  auto identical = corrected_same_history->Clone();
+  SPIEL_CHECK_TRUE(static_cast<DuneImperiumState*>(identical.get())
+      ->SynchronizePublicHandKnowledge(opponent, {observed}));
+  identical->ApplyAction(prefix);
+  recapture.Advance(prefix);
+  recapture.BindPublicCardKnowledge(*identical);
+  SPIEL_CHECK_EQ(recapture.GetVisits(continuation), 1);
+
+  TurnSearchTree stale;
+  stale.BindPublicCardKnowledge(*state);
+  stale.RecordRollout(prefix, {continuation}, 1.0);
+  stale.Advance(prefix);
+  stale.BindPublicCardKnowledge(*corrected_descendant);
+  SPIEL_CHECK_EQ(stale.GetVisits(continuation), 0);
+
+  // A public-zone correction can change the drawable pool without changing
+  // the knowledge records. Preserve the owned pool while correcting the row.
+  auto zone_base = state->Clone();
+  auto* zone = static_cast<DuneImperiumState*>(zone_base.get());
+  auto& initial_draw = zone->GetPlayerDrawDeckForTesting(opponent);
+  auto& initial_discard = zone->GetPlayerDiscardForTesting(opponent);
+  SPIEL_CHECK_GT(initial_draw.size(), 1);
+  initial_discard.push_back(initial_draw.back());
+  initial_draw.pop_back();
+  auto zone_descendant = zone_base->Clone();
+  zone_descendant->ApplyAction(prefix);
+  auto zone_corrected = zone_descendant->Clone();
+  auto* corrected_zone = static_cast<DuneImperiumState*>(zone_corrected.get());
+  auto& corrected_draw = corrected_zone->GetPlayerDrawDeckForTesting(opponent);
+  auto& corrected_discard = corrected_zone->GetPlayerDiscardForTesting(opponent);
+  auto replacement = std::find_if(corrected_draw.begin(), corrected_draw.end(),
+      [&](int card) { return card != corrected_discard.back(); });
+  SPIEL_CHECK_TRUE(replacement != corrected_draw.end());
+  std::swap(*replacement, corrected_discard.back());
+  const auto* uncorrected_zone = static_cast<DuneImperiumState*>(zone_descendant.get());
+  auto owned_before = uncorrected_zone->GetOwnedImperiumCardPool(opponent);
+  auto owned_after = corrected_zone->GetOwnedImperiumCardPool(opponent);
+  std::sort(owned_before.begin(), owned_before.end());
+  std::sort(owned_after.begin(), owned_after.end());
+  SPIEL_CHECK_TRUE(owned_before == owned_after);
+  SPIEL_CHECK_EQ(uncorrected_zone->PublicCardKnowledgeRecordDigest(),
+                 corrected_zone->PublicCardKnowledgeRecordDigest());
+  SPIEL_CHECK_NE(uncorrected_zone->PublicCardKnowledgeDigest(),
+                 corrected_zone->PublicCardKnowledgeDigest());
+
+  TurnSearchTree zone_ordinary;
+  zone_ordinary.BindPublicCardKnowledge(*zone_base);
+  zone_ordinary.RecordRollout(prefix, {continuation}, 1.0);
+  zone_ordinary.Advance(prefix);
+  zone_ordinary.BindPublicCardKnowledge(*zone_descendant);
+  SPIEL_CHECK_EQ(zone_ordinary.GetVisits(continuation), 1);
+
+  TurnSearchTree zone_correction;
+  zone_correction.BindPublicCardKnowledge(*zone_base);
+  zone_correction.RecordRollout(prefix, {continuation}, 1.0);
+  zone_correction.Advance(prefix);
+  zone_correction.BindPublicCardKnowledge(*zone_corrected);
+  SPIEL_CHECK_EQ(zone_correction.GetVisits(continuation), 0);
+}
+
+}  // namespace
+}  // namespace dune_imperium
+}  // namespace open_spiel
+
+int main(int argc, char** argv) {
   using namespace open_spiel;
   using namespace open_spiel::dune_imperium;
+
+  DescendantPublicKnowledgeCorrectionTest();
+  if (argc > 1 && std::string(argv[1]) == "public-card-descendant") return 0;
 
   TurnSearchTree tree;
 

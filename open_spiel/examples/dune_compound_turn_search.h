@@ -75,19 +75,44 @@ class TurnSearchTree {
     current_node_ = root_.get();
     constraint_history_.clear();
     public_card_constraints_.clear();
+    public_card_source_state_.reset();
   }
 
   void BindPublicCardKnowledge(const State& state) {
     const auto* dune = dynamic_cast<const DuneImperiumState*>(&state);
     if (dune == nullptr) return;
     const std::string digest = dune->PublicCardKnowledgeDigest();
-    if (!public_card_constraints_.empty() &&
-        constraint_history_ == state.History() &&
-        public_card_constraints_ != digest) {
-      Reset();
+    const auto& history = state.History();
+    if (!public_card_constraints_.empty()) {
+      bool matches = false;
+      if (constraint_history_ == history) {
+        matches = public_card_constraints_ == digest;
+      } else if (public_card_source_state_ != nullptr &&
+                 history.size() > constraint_history_.size() &&
+                 std::equal(constraint_history_.begin(), constraint_history_.end(),
+                            history.begin())) {
+        // Replay the authoritative source to distinguish ordinary action
+        // effects from additional captures that arrived between searches.
+        matches = true;
+        for (size_t i = constraint_history_.size(); i < history.size(); ++i) {
+          const auto legal = public_card_source_state_->LegalActions();
+          if (std::find(legal.begin(), legal.end(), history[i]) == legal.end()) {
+            matches = false;
+            break;
+          }
+          public_card_source_state_->ApplyAction(history[i]);
+        }
+        if (matches) {
+          const auto* expected = dynamic_cast<const DuneImperiumState*>(
+              public_card_source_state_.get());
+          matches = expected != nullptr && expected->PublicCardKnowledgeDigest() == digest;
+        }
+      }
+      if (!matches) Reset();
     }
-    constraint_history_ = state.History();
+    constraint_history_ = history;
     public_card_constraints_ = digest;
+    public_card_source_state_ = state.Clone();
   }
 
   // Advance the current root to child 'action' when that action is taken in the real game.
@@ -144,6 +169,7 @@ class TurnSearchTree {
   TurnSearchNode* current_node_ = nullptr;
   std::vector<Action> constraint_history_;
   std::string public_card_constraints_;
+  std::unique_ptr<State> public_card_source_state_;
 };
 
 // Search candidate pairing mode across rollouts

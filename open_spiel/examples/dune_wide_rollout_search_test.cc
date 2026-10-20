@@ -9,7 +9,10 @@
 #include <thread>
 #include <vector>
 
+#include <ATen/Parallel.h>
+
 #include "open_spiel/examples/dune_network.h"
+#include "open_spiel/examples/dune_search_session.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -1090,6 +1093,130 @@ void DepthGuardTest() {
   std::filesystem::remove_all(temp_dir);
 }
 
+void AdaptivePublicKnowledgeCorrectionTest() {
+  auto state = LoadGame("dune_imperium")->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+  const Player mover = state->CurrentPlayer();
+  const Player opponent = (mover + 1) % kNumPlayers;
+  const auto opponent_hand = dune->GetPlayerHandForTesting(opponent);
+  SPIEL_CHECK_GT(opponent_hand.size(), 1);
+  SPIEL_CHECK_TRUE(dune->SynchronizePublicHandKnowledge(opponent, {opponent_hand.front()}));
+
+  Action prefix = kInvalidAction;
+  std::unique_ptr<State> descendant;
+  for (Action action : state->LegalActions()) {
+    if (action < kActionSelectAgentCard0 ||
+        action >= kActionSelectAgentCard0 + kNumImperiumCardIds) continue;
+    auto next = state->Clone();
+    next->ApplyAction(action);
+    if (!next->IsChanceNode() && next->CurrentPlayer() == mover &&
+        next->LegalActions().size() > 1) {
+      prefix = action;
+      descendant = std::move(next);
+      break;
+    }
+  }
+  SPIEL_CHECK_TRUE(descendant != nullptr);
+  auto corrected_descendant = descendant->Clone();
+  auto* corrected = static_cast<DuneImperiumState*>(corrected_descendant.get());
+  SPIEL_CHECK_TRUE(corrected->SynchronizePublicHandKnowledge(opponent, opponent_hand));
+  SPIEL_CHECK_NE(static_cast<DuneImperiumState*>(descendant.get())
+      ->PublicCardKnowledgeRecordDigest(), corrected->PublicCardKnowledgeRecordDigest());
+
+  const auto temp_dir = std::filesystem::temp_directory_path() /
+      ("dune_adaptive_public_card_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(temp_dir);
+  const int previous_cpu_threads = at::get_num_threads();
+  at::set_num_threads(1);
+  try {
+    const auto checkpoint = (temp_dir / "tiny.pt").string();
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kLegacyInformationStateSize, /*hidden_dim=*/16,
+        kNumDistinctPlayerActions, /*num_blocks=*/1);
+    {
+      torch::NoGradGuard no_grad;
+      for (auto& parameter : model->parameters()) parameter.zero_();
+      model->policy_head->bias.index_put_({prefix}, 10.0);
+      model->policy_head->bias.index_put_({kActionReveal}, 9.0);
+    }
+    torch::save(model, checkpoint);
+    {
+      const auto schema = GetInformationStateSchema(MarketAppendixMode::kNone);
+      std::ofstream metadata(temp_dir / "tiny.json");
+      metadata << "{\"observation_dim\":" << kLegacyInformationStateSize
+               << ",\"hidden_dim\":16,\"num_blocks\":1,"
+               << "\"market_appendix_mode\":\"none\","
+               << "\"feature_schema_sha256\":\"" << schema.sha256 << "\","
+               << "\"enable_semantic_scorer\":false}\n";
+    }
+    DuneAdaptiveRolloutSession session(
+        checkpoint, "cpu", /*hidden_dim=*/16, /*num_blocks=*/1,
+        /*reference_rollouts_per_action=*/4, /*leader_rollouts=*/2,
+        /*target_batch_size=*/16, /*seed=*/1138,
+        /*use_successive_halving=*/false, /*fixed_top5_candidates=*/false,
+        /*max_inflight_worlds=*/1, /*num_evaluators=*/1);
+    const auto initial = session.Search(*state);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_GT(initial.simulations_completed, 0);
+
+    auto recaptured = state->Clone();
+    SPIEL_CHECK_TRUE(static_cast<DuneImperiumState*>(recaptured.get())
+        ->SynchronizePublicHandKnowledge(opponent, {opponent_hand.front()}));
+    const double before_recapture = session.turn_elapsed_search_time_ms();
+    const auto repeated = session.Search(*recaptured, /*remaining_time_ms=*/0.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_EQ(repeated.diagnostics.termination_reason, "tree_reuse");
+    SPIEL_CHECK_GT(repeated.diagnostics.inherited_root_visits, 0);
+    SPIEL_CHECK_EQ(repeated.simulations_completed, 0);
+    SPIEL_CHECK_FLOAT_EQ(session.turn_elapsed_search_time_ms(),
+                         before_recapture + repeated.elapsed_time_ms);
+
+    const double before_action = session.turn_elapsed_search_time_ms();
+    const auto ordinary = session.Search(*descendant, /*remaining_time_ms=*/0.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_EQ(ordinary.diagnostics.termination_reason, "tree_reuse");
+    SPIEL_CHECK_GT(ordinary.diagnostics.inherited_root_visits, 0);
+    SPIEL_CHECK_EQ(ordinary.simulations_completed, 0);
+    SPIEL_CHECK_FLOAT_EQ(session.turn_elapsed_search_time_ms(),
+                         before_action + ordinary.elapsed_time_ms);
+
+    const double before_same_history = session.turn_elapsed_search_time_ms();
+    const auto same_history = session.Search(*corrected_descendant, /*remaining_time_ms=*/0.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_EQ(same_history.diagnostics.inherited_root_visits, 0);
+    SPIEL_CHECK_EQ(same_history.simulations_completed, 0);
+    SPIEL_CHECK_EQ(same_history.fallback_reason, "live_deadline_reached");
+    SPIEL_CHECK_FLOAT_EQ(session.turn_elapsed_search_time_ms(),
+                         before_same_history + same_history.elapsed_time_ms);
+
+    session.ResetSession("descendant correction fixture");
+    session.Search(*state);
+    session.DiscardPendingAction();
+    const double before_correction = session.turn_elapsed_search_time_ms();
+    const auto advanced_correction = session.Search(
+        *corrected_descendant, /*remaining_time_ms=*/0.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_EQ(advanced_correction.diagnostics.inherited_root_visits, 0);
+    SPIEL_CHECK_EQ(advanced_correction.simulations_completed, 0);
+    SPIEL_CHECK_EQ(advanced_correction.fallback_reason, "live_deadline_reached");
+    SPIEL_CHECK_FLOAT_EQ(session.turn_elapsed_search_time_ms(),
+                         before_correction + advanced_correction.elapsed_time_ms);
+  } catch (...) {
+    std::filesystem::remove_all(temp_dir);
+    at::set_num_threads(previous_cpu_threads);
+    throw;
+  }
+  std::filesystem::remove_all(temp_dir);
+  at::set_num_threads(previous_cpu_threads);
+}
+
 class ThrowingRolloutState : public State {
  public:
   ThrowingRolloutState(std::shared_ptr<const Game> game, std::vector<Action> actions,
@@ -1205,8 +1332,12 @@ void ClockedExceptionSafetyTest(const std::shared_ptr<const Game>& game) {
 }  // namespace dune_imperium
 }  // namespace open_spiel
 
-int main() {
+int main(int argc, char** argv) {
   using namespace open_spiel::dune_imperium;
+  if (argc > 1 && std::string(argv[1]) == "public-card-adaptive") {
+    AdaptivePublicKnowledgeCorrectionTest();
+    return 0;
+  }
   const auto game = open_spiel::LoadGame("dune_imperium");
   NativeLegacyDelegationTest(game);
   NativeWideBudgetAndPairingTest(game);
@@ -1223,5 +1354,6 @@ int main() {
   ContiguousPrefixOrderingTest(game);
   ClockedVsUnclockedExactParityTest(game);
   DepthGuardTest();
+  AdaptivePublicKnowledgeCorrectionTest();
   ClockedExceptionSafetyTest(game);
 }
