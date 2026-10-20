@@ -191,6 +191,7 @@ class DuneSearchSession {
 
   std::vector<Action> session_history_;
   std::vector<Action> last_input_history_;
+  std::string last_public_card_constraints_;
 
   std::string last_reset_reason_ = "none";
 
@@ -272,6 +273,7 @@ class DuneAdaptiveRolloutSession {
   int last_hand_ = 0;
   int last_intrigues_ = 0;
   std::vector<Action> last_history_;
+  std::string last_public_card_constraints_;
 
   int session_new_simulations_completed_ = 0;
   double session_elapsed_time_ms_ = 0.0;

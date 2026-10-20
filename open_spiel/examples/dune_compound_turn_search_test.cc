@@ -101,6 +101,27 @@ int main() {
   // Initially identical: no new information
   SPIEL_CHECK_FALSE(HasNewInformation(*s_before, *s_after, 0));
 
+  // Repeated and reordered captures preserve reuse. A correction that changes
+  // the public hand constraints without an action invalidates cached worlds.
+  auto knowledge_state = std::unique_ptr<DuneImperiumState>(
+      static_cast<DuneImperiumState*>(s_before->Clone().release()));
+  knowledge_state->SetPlayerHandForTesting(1, {0, 1});
+  knowledge_state->SetPlayerDrawDeckForTesting(1, {2, 3});
+  SPIEL_CHECK_TRUE(knowledge_state->SynchronizePublicHandKnowledge(1, {0}, false, false));
+  TurnSearchTree knowledge_tree;
+  knowledge_tree.BindPublicCardKnowledge(*knowledge_state);
+  knowledge_tree.RecordRollout(10, {}, 1.0);
+  const auto digest = knowledge_state->PublicCardKnowledgeDigest();
+  knowledge_state->SetPlayerHandForTesting(1, {1, 0});
+  SPIEL_CHECK_TRUE(knowledge_state->SynchronizePublicHandKnowledge(1, {0}, false, false));
+  SPIEL_CHECK_EQ(digest, knowledge_state->PublicCardKnowledgeDigest());
+  knowledge_tree.BindPublicCardKnowledge(*knowledge_state);
+  SPIEL_CHECK_EQ(knowledge_tree.GetVisits(10), 1);
+  SPIEL_CHECK_TRUE(knowledge_state->SynchronizePublicHandKnowledge(1, {0, 1}, true, false));
+  SPIEL_CHECK_NE(digest, knowledge_state->PublicCardKnowledgeDigest());
+  knowledge_tree.BindPublicCardKnowledge(*knowledge_state);
+  SPIEL_CHECK_EQ(knowledge_tree.GetVisits(10), 0);
+
   // Case 1: Draw a card from deck
   s_after->GetPlayerDrawDeckForTesting(0).pop_back();
   SPIEL_CHECK_TRUE(HasNewInformation(*s_before, *s_after, 0));

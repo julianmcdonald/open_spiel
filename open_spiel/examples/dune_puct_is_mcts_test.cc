@@ -445,6 +445,77 @@ void TestCanonicalObservationSorting() {
   std::cout << "Test 8 Passed!\n\n";
 }
 
+void TestPublicCardKnowledgeStateKeys() {
+  using namespace dune_imperium;
+  auto state = LoadGame("dune_imperium")->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0; ; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                            : state->LegalActions().front());
+  }
+  auto evaluator = std::make_shared<MockEvaluator>(
+      ActionsAndProbs{}, std::vector<double>(4, 0.0));
+  auto check_separate_keys = [&](const State& before, const State& after) {
+    SPIEL_CHECK_TRUE(before.History() == after.History());
+    SPIEL_CHECK_EQ(before.ObservationString(), after.ObservationString());
+    SPIEL_CHECK_EQ(before.InformationStateString(), after.InformationStateString());
+    for (bool observation_key : {true, false}) {
+      DuneSearchConfig config;
+      config.use_observation_string = observation_key;
+      DunePUCTISMCTSBot bot(config, evaluator);
+      SPIEL_CHECK_TRUE(bot.GetStateKey(before) != bot.GetStateKey(after));
+      TestBotAccessor::InjectMockNode(bot, before, 7);
+      SPIEL_CHECK_TRUE(TestBotAccessor::CallLookupNode(bot, after) == nullptr);
+    }
+  };
+
+  auto known = state->Clone();
+  auto* known_dune = static_cast<DuneImperiumState*>(known.get());
+  const int observed_card = known_dune->GetPlayerHandForTesting(1).front();
+  SPIEL_CHECK_TRUE(known_dune->SynchronizePublicHandKnowledge(1, {observed_card}));
+  check_separate_keys(*state, *known);
+  DunePUCTISMCTSBot bot(DuneSearchConfig{}, evaluator);
+  const auto known_key = bot.GetStateKey(*known);
+  SPIEL_CHECK_TRUE(known_dune->SynchronizePublicHandKnowledge(1, {observed_card}));
+  SPIEL_CHECK_TRUE(bot.GetStateKey(*known) == known_key);
+  auto reordered = known->Clone();
+  auto* reordered_dune = static_cast<DuneImperiumState*>(reordered.get());
+  auto hand = reordered_dune->GetPlayerHandForTesting(1);
+  std::reverse(hand.begin(), hand.end());
+  reordered_dune->SetPlayerHandForTesting(1, hand);
+  SPIEL_CHECK_TRUE(bot.GetStateKey(*reordered) == known_key);
+
+  auto alternatives = state->Clone();
+  auto* ambiguous = static_cast<DuneImperiumState*>(alternatives.get());
+  ambiguous->SetLeaderForTesting(1, static_cast<int>(LeaderId::kIlesaEcaz));
+  ambiguous->SetPlayerHandForTesting(1, {kCardDagger});
+  ambiguous->SetPlayerDrawDeckForTesting(1, {kCardDiplomacy});
+  ambiguous->SetPlayerDiscardForTesting(1, {});
+  ambiguous->SetIlesaSetAsideCardForTesting(1, kCardReconnaissance);
+  ambiguous->BeginIlesaPublicKnowledge(1);
+  ambiguous->SetPlayerHandForTesting(1, {kCardDagger, kCardReconnaissance});
+  ambiguous->SetIlesaSetAsideCardForTesting(1, kInvalidCard);
+  ambiguous->ReturnIlesaPublicKnowledge(1, true);
+  ambiguous->SetIlesaBonusCardForTesting(1, kCardReconnaissance);
+  // The public play has happened; its delayed bonus log supplies the new
+  // evidence without applying another action or changing physical zones.
+  ambiguous->SetPlayerHandForTesting(1, {kCardDagger});
+  ambiguous->SetPlayedAgentCardsForTesting(1, {kCardReconnaissance});
+  ambiguous->PublicHandCardDeparted(1, kCardReconnaissance);
+  ambiguous->SetIlesaBonusCardForTesting(1, kInvalidCard);
+  auto narrowed = alternatives->Clone();
+  auto* certain = static_cast<DuneImperiumState*>(narrowed.get());
+  certain->ObserveIlesaPublicBonus(1, {kCardReconnaissance}, 1, false);
+  SPIEL_CHECK_GT(ambiguous->GetIlesaPublicCandidates(1).size(), 1);
+  SPIEL_CHECK_TRUE(certain->GetIlesaPublicCandidates(1) ==
+                   std::vector<int>({kCardReconnaissance}));
+  SPIEL_CHECK_TRUE(ambiguous->GetPubliclyKnownHandCards(1) ==
+                   certain->GetPubliclyKnownHandCards(1));
+  check_separate_keys(*alternatives, *narrowed);
+}
+
 // Test 9: Opponent Model Path MCTS Search
 void TestOpponentModelPath() {
   std::cout << "Running Test 9: Opponent Model Path...\n";
@@ -680,6 +751,13 @@ void TestHiddenInformationInvariance() {
   DuneSearchConfig config;
   config.seed = 999;
   config.max_simulations = 20;
+
+  for (bool observation_key : {true, false}) {
+    config.use_observation_string = observation_key;
+    DunePUCTISMCTSBot key_bot(config, evaluator);
+    SPIEL_CHECK_TRUE(key_bot.GetStateKey(*state1) == key_bot.GetStateKey(*state2));
+  }
+  config.use_observation_string = true;
 
   DunePUCTISMCTSBot bot1(config, evaluator);
   DunePUCTISMCTSBot bot2(config, evaluator);
@@ -4646,11 +4724,62 @@ void TestPreserveRawGreedyActionSelection() {
   std::cout << "TestPreserveRawGreedyActionSelection Passed!\n\n";
 }
 
+void TestPublicKnowledgeCorrectionPreservesLiveBudget() {
+  auto game = LoadGame("dune_imperium");
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<dune_imperium::DuneImperiumState*>(state.get());
+  while (!state->IsTerminal()) {
+    if (!state->IsChanceNode() &&
+        dune->phase() == dune_imperium::GamePhase::kAgentTurns &&
+        state->LegalActions().size() > 1) break;
+    state->ApplyAction(state->IsChanceNode()
+        ? state->ChanceOutcomes().front().first : state->LegalActions().front());
+  }
+  ActionsAndProbs priors;
+  for (Action action : state->LegalActions()) {
+    priors.push_back({action, 1.0 / state->LegalActions().size()});
+  }
+  auto evaluator = std::make_shared<MockEvaluator>(
+      priors, std::vector<double>(4, 0.0), 1);
+  DuneSearchConfig config;
+  config.max_simulations = 2;
+  config.live_continuation_reserve_seconds = 0.0;
+  DuneSearchSession session(config, evaluator, DuneSearchBudgetMode::kLiveDeadline);
+  const auto initial = session.Search(*state, 20000.0);
+  session.DiscardPendingAction();
+  const auto repeated = session.Search(*state, -1.0);
+  session.DiscardPendingAction();
+  SPIEL_CHECK_EQ(repeated.diagnostics.hard_time_limit_ms, 20000.0);
+  SPIEL_CHECK_GE(repeated.diagnostics.session_cumulative_simulations,
+                 initial.diagnostics.session_cumulative_simulations);
+  SPIEL_CHECK_GT(repeated.diagnostics.inherited_root_visits, 0);
+  const Player opponent = (state->CurrentPlayer() + 1) % 4;
+  const auto hand = dune->GetPlayerHandForTesting(opponent);
+  SPIEL_CHECK_FALSE(hand.empty());
+  SPIEL_CHECK_TRUE(dune->SynchronizePublicHandKnowledge(
+      opponent, {hand.front()}, false, false));
+  const auto corrected = session.Search(*state, -1.0);
+  session.DiscardPendingAction();
+  SPIEL_CHECK_EQ(corrected.diagnostics.hard_time_limit_ms, 20000.0);
+  SPIEL_CHECK_EQ(corrected.diagnostics.inherited_root_visits, 0);
+  SPIEL_CHECK_EQ(corrected.diagnostics.reset_reason,
+                 "public_card_knowledge_correction");
+  SPIEL_CHECK_GE(corrected.diagnostics.session_cumulative_search_time_ms,
+                 repeated.diagnostics.session_cumulative_search_time_ms);
+  SPIEL_CHECK_GE(corrected.diagnostics.session_cumulative_simulations,
+                 repeated.diagnostics.session_cumulative_simulations);
+}
+
 }  // namespace
 
 } // namespace open_spiel
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "public-card-key") {
+    open_spiel::TestPublicCardKnowledgeStateKeys();
+    return 0;
+  }
+  open_spiel::TestPublicCardKnowledgeStateKeys();
   open_spiel::TestKeyUniqueness();
   open_spiel::TestDeterministicPUCT();
   open_spiel::TestPriorRenormalization();
@@ -4677,6 +4806,7 @@ int main() {
   open_spiel::TestRootPriorTemperatureScaling();
   open_spiel::TestClassifierSearchRouting();
   open_spiel::TestSearchSessionControls();
+  open_spiel::TestPublicKnowledgeCorrectionPreservesLiveBudget();
   open_spiel::TestTransactionalMCTSAndTreeFallback();
   open_spiel::TestInvariantGatesAndScenarios();
   open_spiel::TestMoreRoutingAndScenarioInvariants();

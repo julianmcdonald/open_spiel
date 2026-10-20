@@ -73,6 +73,21 @@ class TurnSearchTree {
   void Reset() {
     root_ = std::make_unique<TurnSearchNode>();
     current_node_ = root_.get();
+    constraint_history_.clear();
+    public_card_constraints_.clear();
+  }
+
+  void BindPublicCardKnowledge(const State& state) {
+    const auto* dune = dynamic_cast<const DuneImperiumState*>(&state);
+    if (dune == nullptr) return;
+    const std::string digest = dune->PublicCardKnowledgeDigest();
+    if (!public_card_constraints_.empty() &&
+        constraint_history_ == state.History() &&
+        public_card_constraints_ != digest) {
+      Reset();
+    }
+    constraint_history_ = state.History();
+    public_card_constraints_ = digest;
   }
 
   // Advance the current root to child 'action' when that action is taken in the real game.
@@ -127,6 +142,8 @@ class TurnSearchTree {
  private:
   std::unique_ptr<TurnSearchNode> root_;
   TurnSearchNode* current_node_ = nullptr;
+  std::vector<Action> constraint_history_;
+  std::string public_card_constraints_;
 };
 
 // Search candidate pairing mode across rollouts
@@ -418,6 +435,7 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     const SearchWorldSampler& world_sampler = nullptr) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   std::vector<Action> legal_actions = state.LegalActions();
   if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
   if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0, {}, {}};
