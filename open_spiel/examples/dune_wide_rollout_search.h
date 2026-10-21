@@ -661,7 +661,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     double max_time_ms = -1.0,
     int fixed_top_k = 0,
     int max_inflight_worlds = 32,
-    bool use_bounded_pool_when_unclocked = false) {
+    bool use_bounded_pool_when_unclocked = false,
+    bool full_clock_stage2 = false) {
   if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   if (fixed_top_k == 1) {
     SpielFatalError("SuccessiveHalvingRolloutSearchDecision: fixed_top_k cannot be 1 (requires at least 2 candidates).");
@@ -716,7 +717,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
 
   const int total_budget = 3 * reference_rollouts_per_action;
   const int stage1_budget = total_budget / 2;
-  const int r_stage1 = std::max(1, stage1_budget / static_cast<int>(K));
+  const int r_stage1 = std::max(2, stage1_budget / static_cast<int>(K));
 
   std::vector<std::vector<double>> per_candidate_rollouts(K);
   for (size_t c_idx = 0; c_idx < K; ++c_idx) {
@@ -727,17 +728,19 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   const bool has_deadline = (max_time_ms > 0.0);
   const bool use_bounded_stage = has_deadline || use_bounded_pool_when_unclocked;
   const auto start_time = std::chrono::steady_clock::now();
+  const double s1_deadline_frac = full_clock_stage2 ? 0.72 : 0.50;
+  const double final_deadline_frac = full_clock_stage2 ? 1.015 : 1.00;
   const auto stage1_deadline = has_deadline
       ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-             std::chrono::duration<double, std::milli>(0.5 * max_time_ms)))
+             std::chrono::duration<double, std::milli>(s1_deadline_frac * max_time_ms)))
       : (use_bounded_pool_when_unclocked
              ? std::chrono::steady_clock::time_point::max()
              : std::chrono::steady_clock::time_point{});
   const auto final_deadline = has_deadline
       ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-             std::chrono::duration<double, std::milli>(max_time_ms)))
+             std::chrono::duration<double, std::milli>(final_deadline_frac * max_time_ms)))
       : (use_bounded_pool_when_unclocked
              ? std::chrono::steady_clock::time_point::max()
              : std::chrono::steady_clock::time_point{});
@@ -802,13 +805,16 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   } else {
     std::vector<size_t> candidate_indices(K);
     std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
+    const int s1_inflight = full_clock_stage2
+        ? std::max(max_inflight_worlds, 384 / static_cast<int>(K))
+        : max_inflight_worlds;
 
     RunClockedPairedRolloutStage(
         state, dune, search_player, evaluators, ordered_candidates,
         candidate_indices, r_stage1, /*world_seed_offset=*/0,
         decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
         stage1_deadline, active_tree, per_candidate_rollouts,
-        new_rollouts_executed, max_inflight_worlds);
+        new_rollouts_executed, s1_inflight);
   }
 
   const auto s1_t1 = std::chrono::steady_clock::now();
@@ -882,7 +888,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   }
 
   // Stage 1 Early-Stop Gate: If no challenger beat raw_action in Stage 1, stop early.
-  if (mean_d_1[best_c_idx] <= 0.0) {
+  if (!full_clock_stage2 && mean_d_1[best_c_idx] <= 0.0) {
     std::vector<std::pair<Action, double>> candidate_utilities;
     candidate_utilities.reserve(K);
     for (size_t c_idx = 0; c_idx < K; ++c_idx) {
@@ -915,7 +921,15 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
 
   // --- STAGE 2: Deep Finale ---
   const int stage2_budget = std::max(2, total_budget - static_cast<int>(K) * r_stage1);
-  const int r_stage2 = std::max(1, stage2_budget / 2);
+  int r_stage2 = std::max(2, stage2_budget / 2);
+  if (full_clock_stage2 && has_deadline && stage1_elapsed_ms > 0.0) {
+    const double s1_ms_per_sim =
+        stage1_elapsed_ms / std::max(1.0, static_cast<double>(K * r_stage1_done));
+    const double rem_stage2_ms = std::max(0.0, 0.965 * max_time_ms - stage1_elapsed_ms);
+    const double est_s2_sims = rem_stage2_ms / std::max(0.5, s1_ms_per_sim);
+    const double batch_factor = (est_s2_sims < 220.0) ? 1.12 : 1.0;
+    r_stage2 = std::max(2, static_cast<int>(est_s2_sims / (2.0 * batch_factor)));
+  }
   const std::array<size_t, 2> finalists = {0, best_c_idx};
 
   int stage2_planned_worlds = r_stage2;
@@ -977,12 +991,13 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     }
   } else {
     std::vector<size_t> stage2_cands = {0, best_c_idx};
+    const int s2_inflight = full_clock_stage2 ? std::max(max_inflight_worlds, 192) : max_inflight_worlds;
     RunClockedPairedRolloutStage(
         state, dune, search_player, evaluators, ordered_candidates,
         stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1,
         decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
         final_deadline, active_tree, per_candidate_rollouts,
-        new_rollouts_executed, max_inflight_worlds);
+        new_rollouts_executed, s2_inflight);
   }
 
   const auto s2_t1 = std::chrono::steady_clock::now();

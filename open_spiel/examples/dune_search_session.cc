@@ -1300,9 +1300,8 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     result.diagnostics.termination_reason = result.diagnostics.fallback_reason;
     result.policy = raw_prior;
   } else if (is_leader) {
-    const double kReserveMs = 10000.0;
     const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
-        ? (remaining_time_ms - kReserveMs)
+        ? (remaining_time_ms - reserve_ms_)
         : -1.0;
 
     int effective_leader_rollouts = leader_rollouts_;
@@ -1313,15 +1312,26 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       if (available_after_reserve_ms <= 0.0) {
         deadline_reached = true;
       } else {
-        target_ms = std::min(25000.0, available_after_reserve_ms);
+        double usable_leader_ms = full_search_
+            ? (0.985 * available_after_reserve_ms)
+            : available_after_reserve_ms;
+        target_ms = std::min(25000.0, usable_leader_ms);
         int num_cands = std::max(1, static_cast<int>(legal.size()));
-        int total_leader_rollout_budget = static_cast<int>(target_ms / std::max(2.0, ms_per_rollout_ema_));
-        effective_leader_rollouts = std::min(2 * leader_rollouts_, total_leader_rollout_budget / num_cands);
+        double leader_ms_est = full_search_
+            ? std::max(2.0, ms_per_rollout_by_round_[0])
+            : std::max(2.0, ms_per_rollout_ema_);
+        double plan_ms = full_search_ ? (0.975 * target_ms) : target_ms;
+        int total_leader_rollout_budget = static_cast<int>(plan_ms / leader_ms_est);
+        effective_leader_rollouts = full_search_
+            ? std::max(2, total_leader_rollout_budget / num_cands)
+            : std::min(2 * leader_rollouts_, total_leader_rollout_budget / num_cands);
         if (effective_leader_rollouts < 2) {
           deadline_reached = true;
         }
       }
     }
+    result.diagnostics.hard_time_limit_ms = target_ms;
+    result.diagnostics.soft_time_limit_ms = remaining_time_ms;
 
     if (deadline_reached) {
       result.diagnostics.selected_action = raw_action;
@@ -1333,13 +1343,17 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       result.policy = raw_prior;
     } else {
       int num_cands = std::max(1, static_cast<int>(legal.size()));
+      int leader_inflight = full_search_
+          ? std::max(max_inflight_worlds_, 384 / num_cands)
+          : max_inflight_worlds_;
+      double leader_deadline_ms = (full_search_ && target_ms > 0.0) ? (1.015 * target_ms) : target_ms;
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
           state, p, impl_->evaluators, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
           dune_imperium::SearchRolloutCrnMode::kSequential,
           /*sample_opponent_leader_draft=*/false,
-          /*max_time_ms=*/target_ms,
-          max_inflight_worlds_);
+          /*max_time_ms=*/leader_deadline_ms,
+          leader_inflight);
       result.diagnostics.selected_action = c_res.action;
       result.diagnostics.mcts_proposed_action = c_res.action;
       result.diagnostics.mcts_overrode_raw = c_res.overridden;
@@ -1381,26 +1395,193 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       }
     }
   } else {
-    const double kReserveMs = 10000.0;
     const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
-        ? (remaining_time_ms - kReserveMs)
+        ? (remaining_time_ms - reserve_ms_)
         : -1.0;
 
     bool ran_high_stakes = false;
     bool live_deadline_starved = false;
 
-    if (dune_imperium::IsHighStakesStrategicState(state, p)) {
+    bool should_search = dune_imperium::IsHighStakesStrategicState(state, p);
+    if (full_search_ && !should_search && state.CurrentPlayer() == p && legal.size() >= 2) {
+      if (dune_imperium::IsPurchaseDecisionState(state) ||
+          dune_state.phase() == dune_imperium::GamePhase::kCombat) {
+        should_search = true;
+      } else {
+        bool has_end_or_reveal = false;
+        for (Action a : legal) {
+          if (a == dune_imperium::kActionEndTurn || a == dune_imperium::kActionReveal) {
+            has_end_or_reveal = true;
+            break;
+          }
+        }
+        bool has_tree_reuse = false;
+        if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
+          for (Action a : legal) {
+            if (impl_->tree.HasPriorData(a)) {
+              has_tree_reuse = true;
+              break;
+            }
+          }
+        }
+        if (!has_end_or_reveal && !has_tree_reuse) {
+          should_search = true;
+        } else if (has_end_or_reveal &&
+                   dune_imperium::IsFullStrategicState(state, p, raw_prior, 0.020)) {
+          should_search = true;
+        }
+      }
+    }
+
+    if (should_search) {
       if (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0) {
         live_deadline_starved = true;
       } else {
         int ref_rollouts = reference_rollouts_per_action_;
         double target_ms = -1.0;
+        const bool is_agent_turn_phase =
+            (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns &&
+             !dune_state.IsPlayerInRevealTurn(p));
+
+        int eff_r = dune_state.GetCurrentRound();
+        if (dune_state.phase() == dune_imperium::GamePhase::kCombat ||
+            dune_state.phase() == dune_imperium::GamePhase::kRevealTurns ||
+            dune_state.IsPlayerInRevealTurn(p)) {
+          eff_r += 1;
+        }
+        const int r_bucket = std::clamp(eff_r, 1, 11);
+        const double round_ms_est = full_search_
+            ? std::max(1.5, ms_per_rollout_by_round_[r_bucket])
+            : std::max(2.0, ms_per_rollout_ema_);
+
         if (remaining_time_ms >= 0.0) {
-          double frac = (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns) ? 0.60 : 0.75;
-          double cap = (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns) ? 25000.0 : 30000.0;
-          target_ms = std::min(cap, frac * available_after_reserve_ms);
-          int total_rollout_budget = static_cast<int>(target_ms / std::max(2.0, ms_per_rollout_ema_));
-          ref_rollouts = std::min(4 * reference_rollouts_per_action_, total_rollout_budget / 3);
+          double usable_ms = full_search_
+              ? ((is_agent_turn_phase ? 0.975 : 0.985) * available_after_reserve_ms)
+              : available_after_reserve_ms;
+          double frac = is_agent_turn_phase ? 0.60 : (full_search_ ? 1.0 : 0.75);
+          double cap = is_agent_turn_phase ? 25000.0 : 30000.0;
+          if (full_search_ && is_agent_turn_phase) {
+            bool is_combat_commit = false;
+            for (Action a : legal) {
+              std::string s = dune_state.ActionToString(p, a);
+              if (s.rfind("Deploy ", 0) == 0 || s.rfind("CombatCommit", 0) == 0) {
+                is_combat_commit = true;
+                break;
+              }
+            }
+            const int hand0 = dune_state.GetPlayerCardsInHand(p);
+            const int int0 = static_cast<int>(dune_state.GetPlayerIntrigues(p).size());
+            auto count_branch_searched = [&](Action first_action, int max_count) -> int {
+              auto sim = state.Clone();
+              sim->ApplyAction(first_action);
+              bool tree_broken = false;
+              int rem_searched = 0;
+              for (int step = 0; step < 16 && !sim->IsTerminal(); ++step) {
+                if (sim->IsChanceNode()) {
+                  tree_broken = true;
+                  auto outs = sim->ChanceOutcomes();
+                  if (outs.empty()) break;
+                  sim->ApplyAction(outs[0].first);
+                  continue;
+                }
+                if (sim->CurrentPlayer() != p) break;
+                const auto& sim_d = static_cast<const dune_imperium::DuneImperiumState&>(*sim);
+                if (sim_d.phase() != dune_imperium::GamePhase::kAgentTurns ||
+                    sim_d.IsPlayerInRevealTurn(p)) {
+                  break;
+                }
+                if (sim_d.GetPlayerCardsInHand(p) > hand0 ||
+                    static_cast<int>(sim_d.GetPlayerIntrigues(p).size()) > int0) {
+                  tree_broken = true;
+                }
+                std::vector<Action> nl = sim->LegalActions();
+                if (nl.empty()) break;
+                if (nl.size() == 1) {
+                  if (nl[0] == dune_imperium::kActionEndTurn ||
+                      nl[0] == dune_imperium::kActionReveal) {
+                    break;
+                  }
+                  sim->ApplyAction(nl[0]);
+                  continue;
+                }
+                bool has_end_or_reveal = false;
+                int non_spec = 0;
+                for (Action na : nl) {
+                  if (na == dune_imperium::kActionEndTurn ||
+                      na == dune_imperium::kActionReveal) {
+                    has_end_or_reveal = true;
+                  }
+                  if (!dune_imperium::IsConvertSpecimenAction(na)) {
+                    non_spec++;
+                  }
+                }
+                if (has_end_or_reveal && non_spec < 2) {
+                  break;
+                }
+                bool hs_or_buy = dune_imperium::IsHighStakesStrategicState(*sim, p) ||
+                                 dune_imperium::IsPurchaseDecisionState(*sim);
+                ActionsAndProbs sub_prior = impl_->evaluators.front()->Prior(*sim);
+                bool sub_search = hs_or_buy;
+                if (!sub_search) {
+                  if (!has_end_or_reveal && tree_broken) {
+                    sub_search = true;
+                  } else if (has_end_or_reveal &&
+                             dune_imperium::IsFullStrategicState(*sim, p, sub_prior, 0.020)) {
+                    sub_search = true;
+                  }
+                }
+                if (sub_search) {
+                  rem_searched++;
+                  if (rem_searched >= max_count) break;
+                }
+                Action next_a = dune_imperium::PickGreedyAction(sub_prior, nl);
+                if (next_a == dune_imperium::kActionEndTurn ||
+                    next_a == dune_imperium::kActionReveal) {
+                  break;
+                }
+                sim->ApplyAction(next_a);
+              }
+              return rem_searched;
+            };
+
+            int rem_0 = 0;
+            int max_other_rem = 0;
+            if (!is_combat_commit) {
+              const auto sorted_cands = dune_imperium::GetSortedCandidatesByPrior(raw_prior, legal);
+              if (!sorted_cands.empty()) {
+                rem_0 = count_branch_searched(sorted_cands[0].first, 3);
+              }
+              const size_t k_check = std::min<size_t>(5, sorted_cands.size());
+              for (size_t ci = 1; ci < k_check; ++ci) {
+                int r_ci = count_branch_searched(sorted_cands[ci].first, 1);
+                max_other_rem = std::max(max_other_rem, r_ci);
+                if (max_other_rem >= 1) break;
+              }
+            }
+
+            cap = 49000.0;
+            if (rem_0 == 0) {
+              frac = (max_other_rem == 0) ? 1.0 : 0.94;
+            } else if (rem_0 == 1) {
+              if (usable_ms >= 38000.0) {
+                frac = 0.50;
+              } else {
+                frac = (max_other_rem == 0) ? 0.70 : 0.67;
+              }
+            } else if (rem_0 == 2) {
+              frac = (usable_ms >= 38000.0) ? 0.46 : 0.56;
+            } else {
+              frac = 0.40;
+            }
+          }
+          target_ms = std::min(cap, frac * usable_ms);
+          result.diagnostics.hard_time_limit_ms = target_ms;
+          result.diagnostics.soft_time_limit_ms = remaining_time_ms;
+          double plan_ms = full_search_ ? (0.94 * target_ms) : target_ms;
+          int total_rollout_budget = static_cast<int>(plan_ms / round_ms_est);
+          ref_rollouts = full_search_
+              ? std::max(4, total_rollout_budget / 3)
+              : std::min(4 * reference_rollouts_per_action_, total_rollout_budget / 3);
         }
 
         if (remaining_time_ms >= 0.0 && ref_rollouts < 4) {
@@ -1409,16 +1590,20 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           ran_high_stakes = true;
           const uint64_t decision_seed =
               dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
-          const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= top5_min_budget_;
+          const int min_top5_budget = full_search_ ? std::min(top5_min_budget_, 96) : top5_min_budget_;
+          const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= min_top5_budget;
           int effective_top_k = use_top5 ? 5 : 0;
-          if (use_top5 && all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state)) {
+          if (all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state) &&
+              (use_top5 || (full_search_ && 3 * ref_rollouts >= 48))) {
             effective_top_k = static_cast<int>(legal.size());
           }
           const auto c_res = use_successive_halving_
               ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
                     state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
                     dune_imperium::SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
-                    target_ms, effective_top_k, max_inflight_worlds_)
+                    target_ms, effective_top_k, max_inflight_worlds_,
+                    /*use_bounded_pool_when_unclocked=*/false,
+                    /*full_clock_stage2=*/full_search_)
               : dune_imperium::AdaptiveRolloutSearchDecision(
                     state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
                     dune_imperium::SearchRolloutCrnMode::kSequential, target_ms, max_inflight_worlds_);
@@ -1533,6 +1718,21 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       !result.used_fallback && elapsed_ms > 0.0) {
     double current_rate = elapsed_ms / result.simulations_completed;
     ms_per_rollout_ema_ = 0.8 * ms_per_rollout_ema_ + 0.2 * current_rate;
+    if (result.simulations_completed >= 160) {
+      int r_bucket = 0;
+      if (!is_leader) {
+        int eff_r = dune_state.GetCurrentRound();
+        if (dune_state.phase() == dune_imperium::GamePhase::kCombat ||
+            dune_state.phase() == dune_imperium::GamePhase::kRevealTurns ||
+            dune_state.IsPlayerInRevealTurn(p)) {
+          eff_r += 1;
+        }
+        r_bucket = std::clamp(eff_r, 1, 11);
+      }
+      double clamped_rate = std::clamp(current_rate, 1.5, 35.0);
+      ms_per_rollout_by_round_[r_bucket] =
+          0.8 * ms_per_rollout_by_round_[r_bucket] + 0.2 * clamped_rate;
+    }
   }
 
   last_search_state_ = state.Clone();

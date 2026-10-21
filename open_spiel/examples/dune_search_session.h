@@ -1,6 +1,7 @@
 #ifndef OPEN_SPIEL_EXAMPLES_DUNE_SEARCH_SESSION_H_
 #define OPEN_SPIEL_EXAMPLES_DUNE_SEARCH_SESSION_H_
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -248,6 +249,10 @@ class DuneAdaptiveRolloutSession {
   void set_top5_min_budget(int val) { top5_min_budget_ = val; }
   bool all_buy_candidates() const { return all_buy_candidates_; }
   void set_all_buy_candidates(bool val) { all_buy_candidates_ = val; }
+  double reserve_ms() const { return reserve_ms_; }
+  void set_reserve_ms(double val) { reserve_ms_ = std::max(0.0, val); }
+  bool full_search() const { return full_search_; }
+  void set_full_search(bool val) { full_search_ = val; }
 
  private:
   std::string checkpoint_path_;
@@ -264,6 +269,8 @@ class DuneAdaptiveRolloutSession {
   int num_evaluators_ = 1;
   int top5_min_budget_ = 576;
   bool all_buy_candidates_ = true;
+  double reserve_ms_ = 10000.0;
+  bool full_search_ = false;
   uint64_t search_seed_counter_ = 0;
 
   bool has_active_session_ = false;
@@ -278,6 +285,8 @@ class DuneAdaptiveRolloutSession {
   double session_elapsed_time_ms_ = 0.0;
   double turn_elapsed_search_time_ms_ = 0.0;
   double ms_per_rollout_ema_ = 24.0;
+  std::array<double, 12> ms_per_rollout_by_round_{
+      {20.2, 18.5, 17.3, 15.2, 13.4, 10.6, 8.5, 6.1, 4.3, 3.2, 2.5, 2.0}};
 
   std::unique_ptr<State> last_search_state_;
   DuneSearchResult last_search_result_;

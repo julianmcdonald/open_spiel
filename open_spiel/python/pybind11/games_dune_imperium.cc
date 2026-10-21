@@ -445,6 +445,10 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetTopdeckAcquireForTesting, py::arg("player"))
       .def("get_reveal_done", &DuneImperiumState::GetRevealDoneForTesting,
            py::arg("player"))
+      .def("get_player_revealed", &DuneImperiumState::GetPlayerRevealedForTesting,
+           py::arg("player"))
+      .def("is_player_in_reveal_turn", &DuneImperiumState::IsPlayerInRevealTurn,
+           py::arg("player"))
       .def("get_pending_armand_reveal_trash_active",
            &DuneImperiumState::GetPendingArmandRevealTrashActive)
       .def("get_pending_armand_reveal_trash_player",
@@ -853,6 +857,18 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                     &open_spiel::DuneAdaptiveRolloutSession::set_all_buy_candidates)
       .def("set_all_buy_candidates",
            &open_spiel::DuneAdaptiveRolloutSession::set_all_buy_candidates,
+           py::arg("val"))
+      .def_property("reserve_ms",
+                    &open_spiel::DuneAdaptiveRolloutSession::reserve_ms,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_reserve_ms)
+      .def("set_reserve_ms",
+           &open_spiel::DuneAdaptiveRolloutSession::set_reserve_ms,
+           py::arg("val"))
+      .def_property("full_search",
+                    &open_spiel::DuneAdaptiveRolloutSession::full_search,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_full_search)
+      .def("set_full_search",
+           &open_spiel::DuneAdaptiveRolloutSession::set_full_search,
            py::arg("val"))
       .def_property_readonly("ms_per_rollout_ema",
                              &open_spiel::DuneAdaptiveRolloutSession::ms_per_rollout_ema)
