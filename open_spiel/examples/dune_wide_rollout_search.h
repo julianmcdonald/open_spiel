@@ -472,7 +472,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     }
   } else {
     const auto deadline_tp = (max_time_ms > 0.0)
-        ? (std::chrono::steady_clock::now() +
+        ? (s1_t0 +
            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                std::chrono::duration<double, std::milli>(max_time_ms)))
         : std::chrono::steady_clock::time_point::max();
@@ -480,13 +480,53 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
     std::vector<size_t> candidate_indices(K);
     std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
 
+    int seed_offset = 0;
+    int first_wave = (max_time_ms > 0.0) ? std::min(rollouts_per_action, 512) : rollouts_per_action;
+    const auto w0_t0 = std::chrono::steady_clock::now();
     RunClockedPairedRolloutStage(
         state, dune, search_player, evaluators, ordered_candidates,
-        candidate_indices, rollouts_per_action, /*world_seed_offset=*/0,
+        candidate_indices, first_wave, /*world_seed_offset=*/seed_offset,
         decision_seed, crn_mode, sample_opponent_leader_draft,
         deadline_tp, active_tree, per_candidate_rollouts,
         new_rollouts_executed, max_inflight_worlds,
         resample_from_infostate);
+    seed_offset += first_wave;
+
+    if (max_time_ms > 0.0 && !per_candidate_rollouts.empty()) {
+      int done_w = static_cast<int>(per_candidate_rollouts[0].size());
+      double w_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - w0_t0).count();
+      double cur_ms_per_sim = (done_w > 0 && w_ms > 0.0)
+          ? (w_ms / static_cast<double>(K * done_w))
+          : 10.0;
+      while (done_w >= first_wave) {
+        const double total_elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - s1_t0).count();
+        if (total_elapsed_ms >= 0.935 * max_time_ms) break;
+        const double rem_ms = std::max(0.0, 0.968 * max_time_ms - total_elapsed_ms);
+        const double est_sims = rem_ms / std::max(0.05, cur_ms_per_sim);
+        int wave_worlds = std::clamp(
+            static_cast<int>(est_sims / static_cast<double>(K)), 2, 512);
+        const int before_w = static_cast<int>(per_candidate_rollouts[0].size());
+        const auto wt0 = std::chrono::steady_clock::now();
+        RunClockedPairedRolloutStage(
+            state, dune, search_player, evaluators, ordered_candidates,
+            candidate_indices, wave_worlds, /*world_seed_offset=*/seed_offset,
+            decision_seed, crn_mode, sample_opponent_leader_draft,
+            deadline_tp, active_tree, per_candidate_rollouts,
+            new_rollouts_executed, max_inflight_worlds,
+            resample_from_infostate);
+        const int kept_w = static_cast<int>(per_candidate_rollouts[0].size()) - before_w;
+        const double wt_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wt0).count();
+        seed_offset += wave_worlds;
+        if (kept_w < wave_worlds || kept_w <= 0) break;
+        if (wt_ms > 0.0) {
+          cur_ms_per_sim = 0.3 * cur_ms_per_sim +
+                           0.7 * (wt_ms / static_cast<double>(K * kept_w));
+        }
+      }
+    }
   }
   const auto s1_t1 = std::chrono::steady_clock::now();
   const double stage1_elapsed_ms =
@@ -558,7 +598,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
   res.new_rollouts_executed = new_rollouts_executed;
   res.candidate_utilities = std::move(candidate_utilities);
   res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
-  res.stage1_planned_worlds = rollouts_per_action;
+  res.stage1_planned_worlds = std::max(rollouts_per_action, r_completed);
   res.stage1_kept_worlds = r_completed;
   res.stage2_planned_worlds = 0;
   res.stage2_kept_worlds = 0;
@@ -729,7 +769,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   const bool use_bounded_stage = has_deadline || use_bounded_pool_when_unclocked;
   const auto start_time = std::chrono::steady_clock::now();
   const double s1_deadline_frac = full_clock_stage2 ? 0.72 : 0.50;
-  const double final_deadline_frac = full_clock_stage2 ? 1.015 : 1.00;
+  const double final_deadline_frac = full_clock_stage2 ? 1.008 : 1.00;
   const auto stage1_deadline = has_deadline
       ? (start_time +
          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -925,8 +965,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   if (full_clock_stage2 && has_deadline && stage1_elapsed_ms > 0.0) {
     const double s1_ms_per_sim =
         stage1_elapsed_ms / std::max(1.0, static_cast<double>(K * r_stage1_done));
-    const double rem_stage2_ms = std::max(0.0, 0.965 * max_time_ms - stage1_elapsed_ms);
-    const double est_s2_sims = rem_stage2_ms / std::max(0.5, s1_ms_per_sim);
+    const double rem_stage2_ms = std::max(0.0, 0.968 * max_time_ms - stage1_elapsed_ms);
+    const double est_s2_sims = rem_stage2_ms / std::max(0.1, s1_ms_per_sim);
     const double batch_factor = (est_s2_sims < 220.0) ? 1.12 : 1.0;
     r_stage2 = std::max(2, static_cast<int>(est_s2_sims / (2.0 * batch_factor)));
   }
@@ -992,12 +1032,55 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   } else {
     std::vector<size_t> stage2_cands = {0, best_c_idx};
     const int s2_inflight = full_clock_stage2 ? std::max(max_inflight_worlds, 192) : max_inflight_worlds;
-    RunClockedPairedRolloutStage(
-        state, dune, search_player, evaluators, ordered_candidates,
-        stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1,
-        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
-        final_deadline, active_tree, per_candidate_rollouts,
-        new_rollouts_executed, s2_inflight);
+    if (!full_clock_stage2 || !has_deadline) {
+      RunClockedPairedRolloutStage(
+          state, dune, search_player, evaluators, ordered_candidates,
+          stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1,
+          decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+          final_deadline, active_tree, per_candidate_rollouts,
+          new_rollouts_executed, s2_inflight);
+    } else {
+      stage2_planned_worlds = 0;
+      int seed_offset = r_stage1;
+      double cur_ms_per_sim =
+          stage1_elapsed_ms / std::max(1.0, static_cast<double>(K * r_stage1_done));
+      while (true) {
+        const double total_elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start_time).count();
+        const int s2_done_now =
+            static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+        if (s2_done_now >= 2 && total_elapsed_ms >= 0.935 * max_time_ms) {
+          break;
+        }
+        const double rem_ms = std::max(0.0, 0.968 * max_time_ms - total_elapsed_ms);
+        const double est_sims = rem_ms / std::max(0.05, cur_ms_per_sim);
+        const double batch_factor = (est_sims < 220.0) ? 1.12 : 1.0;
+        const int wave_worlds = std::clamp(
+            static_cast<int>(est_sims / (2.0 * batch_factor)), 2, 1024);
+        stage2_planned_worlds += wave_worlds;
+        const int before_size = static_cast<int>(per_candidate_rollouts[0].size());
+        const auto wt0 = std::chrono::steady_clock::now();
+        RunClockedPairedRolloutStage(
+            state, dune, search_player, evaluators, ordered_candidates,
+            stage2_cands, wave_worlds, /*world_seed_offset=*/seed_offset,
+            decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+            final_deadline, active_tree, per_candidate_rollouts,
+            new_rollouts_executed, s2_inflight);
+        const int wave_kept =
+            static_cast<int>(per_candidate_rollouts[0].size()) - before_size;
+        const double wt_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wt0).count();
+        seed_offset += wave_worlds;
+        if (wave_kept < wave_worlds || wave_kept <= 0) {
+          break;
+        }
+        if (wt_ms > 0.0) {
+          cur_ms_per_sim = 0.25 * cur_ms_per_sim +
+                           0.75 * (wt_ms / static_cast<double>(2 * wave_kept));
+        }
+      }
+    }
   }
 
   const auto s2_t1 = std::chrono::steady_clock::now();

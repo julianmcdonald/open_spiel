@@ -1220,6 +1220,7 @@ void DuneAdaptiveRolloutSession::ResetSession(const std::string& reason) {
   session_new_simulations_completed_ = 0;
   session_elapsed_time_ms_ = 0.0;
   turn_elapsed_search_time_ms_ = 0.0;
+  ms_per_rollout_by_round_ = {20.2, 18.5, 17.3, 15.2, 13.4, 10.6, 8.5, 6.1, 4.3, 3.2, 2.5, 2.0};
 }
 
 DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double remaining_time_ms) {
@@ -1313,7 +1314,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         deadline_reached = true;
       } else {
         double usable_leader_ms = full_search_
-            ? (0.985 * available_after_reserve_ms)
+            ? (0.965 * available_after_reserve_ms)
             : available_after_reserve_ms;
         target_ms = std::min(25000.0, usable_leader_ms);
         int num_cands = std::max(1, static_cast<int>(legal.size()));
@@ -1323,7 +1324,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         double plan_ms = full_search_ ? (0.975 * target_ms) : target_ms;
         int total_leader_rollout_budget = static_cast<int>(plan_ms / leader_ms_est);
         effective_leader_rollouts = full_search_
-            ? std::max(2, total_leader_rollout_budget / num_cands)
+            ? (total_leader_rollout_budget / num_cands)
             : std::min(2 * leader_rollouts_, total_leader_rollout_budget / num_cands);
         if (effective_leader_rollouts < 2) {
           deadline_reached = true;
@@ -1346,7 +1347,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       int leader_inflight = full_search_
           ? std::max(max_inflight_worlds_, 384 / num_cands)
           : max_inflight_worlds_;
-      double leader_deadline_ms = (full_search_ && target_ms > 0.0) ? (1.015 * target_ms) : target_ms;
+      double leader_deadline_ms = (full_search_ && target_ms > 0.0) ? (1.008 * target_ms) : target_ms;
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
           state, p, impl_->evaluators, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
@@ -1451,24 +1452,16 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         }
         const int r_bucket = std::clamp(eff_r, 1, 11);
         const double round_ms_est = full_search_
-            ? std::max(1.5, ms_per_rollout_by_round_[r_bucket])
+            ? std::max(0.4, ms_per_rollout_by_round_[r_bucket])
             : std::max(2.0, ms_per_rollout_ema_);
 
         if (remaining_time_ms >= 0.0) {
           double usable_ms = full_search_
-              ? ((is_agent_turn_phase ? 0.975 : 0.985) * available_after_reserve_ms)
+              ? ((is_agent_turn_phase ? 0.980 : 0.980) * available_after_reserve_ms)
               : available_after_reserve_ms;
           double frac = is_agent_turn_phase ? 0.60 : (full_search_ ? 1.0 : 0.75);
           double cap = is_agent_turn_phase ? 25000.0 : 30000.0;
           if (full_search_ && is_agent_turn_phase) {
-            bool is_combat_commit = false;
-            for (Action a : legal) {
-              std::string s = dune_state.ActionToString(p, a);
-              if (s.rfind("Deploy ", 0) == 0 || s.rfind("CombatCommit", 0) == 0) {
-                is_combat_commit = true;
-                break;
-              }
-            }
             const int hand0 = dune_state.GetPlayerCardsInHand(p);
             const int int0 = static_cast<int>(dune_state.GetPlayerIntrigues(p).size());
             auto count_branch_searched = [&](Action first_action, int max_count) -> int {
@@ -1546,30 +1539,28 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
 
             int rem_0 = 0;
             int max_other_rem = 0;
-            if (!is_combat_commit) {
-              const auto sorted_cands = dune_imperium::GetSortedCandidatesByPrior(raw_prior, legal);
-              if (!sorted_cands.empty()) {
-                rem_0 = count_branch_searched(sorted_cands[0].first, 3);
-              }
-              const size_t k_check = std::min<size_t>(5, sorted_cands.size());
-              for (size_t ci = 1; ci < k_check; ++ci) {
-                int r_ci = count_branch_searched(sorted_cands[ci].first, 1);
-                max_other_rem = std::max(max_other_rem, r_ci);
-                if (max_other_rem >= 1) break;
-              }
+            const auto sorted_cands = dune_imperium::GetSortedCandidatesByPrior(raw_prior, legal);
+            if (!sorted_cands.empty()) {
+              rem_0 = count_branch_searched(sorted_cands[0].first, 3);
+            }
+            const size_t k_check = std::min<size_t>(5, sorted_cands.size());
+            for (size_t ci = 1; ci < k_check; ++ci) {
+              int r_ci = count_branch_searched(sorted_cands[ci].first, 1);
+              max_other_rem = std::max(max_other_rem, r_ci);
+              if (max_other_rem >= 1) break;
             }
 
-            cap = 49000.0;
+            cap = 49200.0;
             if (rem_0 == 0) {
               frac = (max_other_rem == 0) ? 1.0 : 0.94;
             } else if (rem_0 == 1) {
               if (usable_ms >= 38000.0) {
                 frac = 0.50;
               } else {
-                frac = (max_other_rem == 0) ? 0.70 : 0.67;
+                frac = (max_other_rem == 0) ? 0.68 : 0.65;
               }
             } else if (rem_0 == 2) {
-              frac = (usable_ms >= 38000.0) ? 0.46 : 0.56;
+              frac = (usable_ms >= 38000.0) ? 0.45 : 0.54;
             } else {
               frac = 0.40;
             }
@@ -1580,8 +1571,12 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           double plan_ms = full_search_ ? (0.94 * target_ms) : target_ms;
           int total_rollout_budget = static_cast<int>(plan_ms / round_ms_est);
           ref_rollouts = full_search_
-              ? std::max(4, total_rollout_budget / 3)
+              ? (total_rollout_budget / 3)
               : std::min(4 * reference_rollouts_per_action_, total_rollout_budget / 3);
+          if (full_search_ && is_agent_turn_phase &&
+              usable_ms < std::max(1800.0, 24.0 * round_ms_est)) {
+            ref_rollouts = 0;
+          }
         }
 
         if (remaining_time_ms >= 0.0 && ref_rollouts < 4) {
@@ -1729,7 +1724,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         }
         r_bucket = std::clamp(eff_r, 1, 11);
       }
-      double clamped_rate = std::clamp(current_rate, 1.5, 35.0);
+      double clamped_rate = std::clamp(current_rate, 0.4, 35.0);
       ms_per_rollout_by_round_[r_bucket] =
           0.8 * ms_per_rollout_by_round_[r_bucket] + 0.2 * clamped_rate;
     }
