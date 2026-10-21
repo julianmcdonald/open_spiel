@@ -238,7 +238,12 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     if (!semantic_descriptor_schema.empty()) {
       semantic_descriptor_schema_ = semantic_descriptor_schema;
     }
-    if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
+    if (input_dim == dune_imperium::kFullPublicInformationV4StateSize) {
+      market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV4;
+      if (with_semantic_scorer_ && semantic_descriptor_schema.empty()) {
+        semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+      }
+    } else if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
       market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
       if (with_semantic_scorer_ && semantic_descriptor_schema.empty()) {
         semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
@@ -483,6 +488,26 @@ inline void CopyInputToFullPublicInformation(
   torch::NoGradGuard no_grad;
   target.zero_();
   target.slice(1, 0, copied_columns).copy_(source.slice(1, 0, copied_columns));
+}
+
+inline void CopyInputToFullPublicInformationV4(
+    torch::Tensor target, const torch::Tensor& source,
+    dune_imperium::MarketAppendixMode source_mode) {
+  const auto schema = dune_imperium::GetInformationStateSchema(source_mode);
+  SPIEL_CHECK_EQ(target.dim(), 2);
+  SPIEL_CHECK_EQ(source.dim(), 2);
+  SPIEL_CHECK_EQ(target.size(0), source.size(0));
+  SPIEL_CHECK_EQ(target.size(1),
+                 dune_imperium::kFullPublicInformationV4StateSize);
+  SPIEL_CHECK_EQ(source.size(1), schema.size);
+  const int64_t copied_columns =
+      source_mode == dune_imperium::MarketAppendixMode::kZeros
+          ? dune_imperium::kLegacyInformationStateSize
+          : schema.size;
+  torch::NoGradGuard no_grad;
+  target.zero_();
+  target.slice(1, 0, copied_columns)
+      .copy_(source.slice(1, 0, copied_columns));
 }
 
 inline void LoadModelCheckpointRobust(
@@ -733,19 +758,25 @@ inline void LoadModelCheckpointRobust(
     }
   }
 
-  if (expected_input_dim == dune_imperium::kFullPublicInformationStateSize) {
-    if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV3) {
-      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires market_appendix_mode='full_public_information_v3': " + path);
+  if (dune_imperium::IsFullPublicInformationStateSize(expected_input_dim)) {
+    if (expected_input_dim == dune_imperium::kFullPublicInformationStateSize) {
+      if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV3) {
+        SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires market_appendix_mode='full_public_information_v3': " + path);
+      }
+    } else if (expected_input_dim == dune_imperium::kFullPublicInformationV4StateSize) {
+      if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV4) {
+        SpielFatalError("LoadModelCheckpointRobust: 9941 checkpoint requires market_appendix_mode='full_public_information_v4': " + path);
+      }
     }
     if (!checkpoint_has_scorer) {
-      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires trained semantic scorer: " + path);
+      SpielFatalError("LoadModelCheckpointRobust: Full public information checkpoint requires trained semantic scorer: " + path);
     }
     if (sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
         sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
-      SpielFatalError("LoadModelCheckpointRobust: 9182 checkpoint requires semantic_descriptor_schema='semantic_action_v3' or 'semantic_action_v4': " + path);
+      SpielFatalError("LoadModelCheckpointRobust: Full public information checkpoint requires semantic_descriptor_schema='semantic_action_v3' or 'semantic_action_v4': " + path);
     }
     if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
-      SpielFatalError("LoadModelCheckpointRobust: 9182 model requires with_semantic_scorer=true: " + path);
+      SpielFatalError("LoadModelCheckpointRobust: Full public information model requires with_semantic_scorer=true: " + path);
     }
   }
 
@@ -880,6 +911,23 @@ inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
   return optimizer;
 }
 
+inline std::unique_ptr<torch::optim::AdamW> BuildAdamWOptimizer(
+    SharedDunePolicyValueNetImpl& model,
+    double lr = 2.5e-4, double weight_decay = 0.0,
+    double policy_weight_decay = 0.0, double new_block_lr = 0.0,
+    int new_block_first_idx = 8) {
+  auto shared_ptr = std::shared_ptr<SharedDunePolicyValueNetImpl>(&model, [](SharedDunePolicyValueNetImpl*){});
+  return MakeDuneOptimizer(shared_ptr, lr, weight_decay, policy_weight_decay, new_block_lr, new_block_first_idx);
+}
+
+inline std::unique_ptr<torch::optim::AdamW> BuildAdamWOptimizer(
+    std::shared_ptr<SharedDunePolicyValueNetImpl> model,
+    double lr = 2.5e-4, double weight_decay = 0.0,
+    double policy_weight_decay = 0.0, double new_block_lr = 0.0,
+    int new_block_first_idx = 8) {
+  return MakeDuneOptimizer(model, lr, weight_decay, policy_weight_decay, new_block_lr, new_block_first_idx);
+}
+
 inline bool LoadOptimizerCheckpointMigrating(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     torch::optim::AdamW& optimizer, const std::string& path,
@@ -935,8 +983,10 @@ inline bool LoadOptimizerCheckpointMigrating(
       if (p_arch.try_read("exp_avg", exp_avg)) {
         if (exp_avg.dim() == 2 && exp_avg.size(0) == hidden_dim) {
           int64_t cols = exp_avg.size(1);
-          if (cols == 5580 || cols == 6215 || cols == 6255 || cols == 9182 ||
-              (cols != hidden_dim && cols != 1 && cols != 3 && cols != 2391)) {
+          if ((cols == 5580 || cols == 6215 || cols == 6255 ||
+               cols == dune_imperium::kFullPublicInformationStateSize ||
+               cols == dune_imperium::kFullPublicInformationV4StateSize) &&
+              exp_avg.size(0) == hidden_dim) {
             ckpt_input_dim = cols;
             break;
           }
@@ -950,6 +1000,19 @@ inline bool LoadOptimizerCheckpointMigrating(
     }
     ckpt_input_dim = target_input_dim;
   }
+
+  const int target_blocks = static_cast<int>(model->res_blocks.size());
+  int ckpt_blocks = target_blocks;
+  if (ckpt_num_groups == 3 && group_param_counts.size() == 3) {
+    ckpt_blocks = 8 + static_cast<int>(group_param_counts[2] / 8);
+  } else if (group_param_counts.size() > 1) {
+    int64_t ckpt_torso_params = group_param_counts[1];
+    if (ckpt_torso_params == 86 || ckpt_torso_params == 84 || ckpt_torso_params == 68) {
+      ckpt_blocks = 8;
+    }
+  }
+  const bool requires_width_or_block_migration =
+      (ckpt_input_dim != target_input_dim) || (ckpt_blocks != target_blocks);
 
   bool groups_match = (ckpt_num_groups == optimizer.param_groups().size());
   bool input_dim_matches = (ckpt_input_dim == target_input_dim);
@@ -971,6 +1034,87 @@ inline bool LoadOptimizerCheckpointMigrating(
               << ckpt_num_groups << " groups, " << total_ckpt_params
               << " parameters). Taking direct torch::load path (no migration).\n";
     return false;
+  }
+
+  if (groups_match && params_match && !input_dim_matches) {
+    const int64_t target_hidden_dim = model->input_layer->weight.size(0);
+    std::vector<torch::optim::OptimizerParamGroup> src_groups;
+    for (size_t g = 0; g < optimizer.param_groups().size(); ++g) {
+      std::vector<torch::Tensor> group_params;
+      for (size_t i = 0; i < optimizer.param_groups()[g].params().size(); ++i) {
+        const auto& p = optimizer.param_groups()[g].params()[i];
+        if (p.unsafeGetTensorImpl() == model->input_layer->weight.unsafeGetTensorImpl()) {
+          group_params.push_back(torch::zeros(
+              {target_hidden_dim, ckpt_input_dim},
+              torch::TensorOptions().dtype(p.dtype()).device(device).requires_grad(true)));
+        } else {
+          group_params.push_back(torch::zeros_like(
+              p, torch::TensorOptions().dtype(p.dtype()).device(device).requires_grad(true)));
+        }
+      }
+      src_groups.emplace_back(group_params, std::make_unique<torch::optim::AdamWOptions>(1e-4));
+    }
+
+    torch::optim::AdamW src_optimizer(src_groups, torch::optim::AdamWOptions(1e-4));
+    try {
+      torch::load(src_optimizer, path, device);
+    } catch (const std::exception& e) {
+      if (requires_width_or_block_migration) {
+        SpielFatalError(absl::StrCat(
+            "LoadOptimizerCheckpointMigrating: Failed to load source optimizer for input_dim migration (",
+            ckpt_input_dim, " -> ", target_input_dim, "): ", e.what()));
+      }
+      return false;
+    }
+
+    optimizer.state().clear();
+    for (size_t g = 0; g < optimizer.param_groups().size(); ++g) {
+      for (size_t i = 0; i < optimizer.param_groups()[g].params().size(); ++i) {
+        const auto& src_p = src_optimizer.param_groups()[g].params()[i];
+        const auto& dst_p = optimizer.param_groups()[g].params()[i];
+        auto src_key = src_p.unsafeGetTensorImpl();
+        auto state_it = src_optimizer.state().find(src_key);
+        if (state_it == src_optimizer.state().end()) {
+          continue;
+        }
+        if (dst_p.unsafeGetTensorImpl() == model->input_layer->weight.unsafeGetTensorImpl()) {
+          auto* src_adam_state = dynamic_cast<torch::optim::AdamWParamState*>(state_it->second.get());
+          if (src_adam_state) {
+            auto new_state = std::make_unique<torch::optim::AdamWParamState>();
+            new_state->step(src_adam_state->step());
+            if (src_adam_state->exp_avg().defined()) {
+              torch::Tensor new_exp_avg = torch::zeros(
+                  {target_hidden_dim, target_input_dim}, src_adam_state->exp_avg().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_exp_avg.slice(1, 0, copy_cols).copy_(src_adam_state->exp_avg().slice(1, 0, copy_cols));
+              new_state->exp_avg(new_exp_avg);
+            }
+            if (src_adam_state->exp_avg_sq().defined()) {
+              torch::Tensor new_exp_avg_sq = torch::zeros(
+                  {target_hidden_dim, target_input_dim}, src_adam_state->exp_avg_sq().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_exp_avg_sq.slice(1, 0, copy_cols).copy_(src_adam_state->exp_avg_sq().slice(1, 0, copy_cols));
+              new_state->exp_avg_sq(new_exp_avg_sq);
+            }
+            if (src_adam_state->max_exp_avg_sq().defined()) {
+              torch::Tensor new_max = torch::zeros(
+                  {target_hidden_dim, target_input_dim}, src_adam_state->max_exp_avg_sq().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_max.slice(1, 0, copy_cols).copy_(src_adam_state->max_exp_avg_sq().slice(1, 0, copy_cols));
+              new_state->max_exp_avg_sq(new_max);
+            }
+            optimizer.state()[dst_p.unsafeGetTensorImpl()] = std::move(new_state);
+          }
+        } else {
+          optimizer.state()[dst_p.unsafeGetTensorImpl()] = std::move(state_it->second);
+        }
+      }
+    }
+    std::cout << "[INFO] Migrated optimizer checkpoint across input_dim "
+              << ckpt_input_dim << " -> " << target_input_dim
+              << " (preserving all " << optimizer.param_groups().size()
+              << " parameter groups).\n";
+    return true;
   }
 
   const int dst_num_blocks = static_cast<int>(model->res_blocks.size());
@@ -1045,6 +1189,9 @@ inline bool LoadOptimizerCheckpointMigrating(
       torch::load(src_optimizer, path, device);
     } catch (const c10::Error& e) {
       std::cerr << "[MIGRATION ERROR] U31400 source optimizer torch::load failed: " << e.msg() << std::endl;
+      if (requires_width_or_block_migration) {
+        SpielFatalError(absl::StrCat("LoadOptimizerCheckpointMigrating: U31400 source optimizer torch::load failed: ", e.msg()));
+      }
       return false;
     }
 
@@ -1217,6 +1364,9 @@ inline bool LoadOptimizerCheckpointMigrating(
     torch::load(src_optimizer, path, device);
   } catch (const c10::Error& e) {
     std::cerr << "[MIGRATION ERROR] Temporary source optimizer torch::load failed: " << e.msg() << std::endl;
+    if (requires_width_or_block_migration) {
+      SpielFatalError(absl::StrCat("LoadOptimizerCheckpointMigrating: Temporary source optimizer torch::load failed: ", e.msg()));
+    }
     return false;
   }
 
@@ -1665,11 +1815,11 @@ public:
           sync_mutex_(sync_mutex), rollout_amp_(rollout_amp) {
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
-        if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
+        if (dune_imperium::IsFullPublicInformationStateSize(model_input_dim_)) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
                 (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
                  model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
-                SpielFatalError("DeterministicEvaluator: 9182 actor requires an active semantic scorer with schema v3 or v4");
+                SpielFatalError("DeterministicEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
             }
         }
     }
@@ -1906,11 +2056,11 @@ public:
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
         model_action_dim_ = model_->policy_head->weight.size(0);
-        if (model_input_dim_ == dune_imperium::kFullPublicInformationStateSize) {
+        if (dune_imperium::IsFullPublicInformationStateSize(model_input_dim_)) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
                 (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
                  model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
-                SpielFatalError("BatchedEvaluator: 9182 actor requires an active semantic scorer with schema v3 or v4");
+                SpielFatalError("BatchedEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
             }
         }
 

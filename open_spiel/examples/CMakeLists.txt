@@ -559,8 +559,10 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_test(NAME dune_purchase_identity_test COMMAND dune_purchase_identity_test)
 
   add_executable(dune_purchase_identity_network_test
-    dune_purchase_identity_network_test.cc ${OPEN_SPIEL_OBJECTS})
-  target_link_libraries(dune_purchase_identity_network_test ${TORCH_LIBRARIES})
+    dune_purchase_identity_network_test.cc
+    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_purchase_identity_network_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_purchase_identity_network_test COMMAND dune_purchase_identity_network_test)
 
   add_executable(dune_market_diagnostics_test

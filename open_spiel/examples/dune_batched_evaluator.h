@@ -33,11 +33,11 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         market_mode_(market_mode) {
     if (batched_eval_) {
       obs_size_ = batched_eval_->ModelInputDim();
-      if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+      if (dune_imperium::IsFullPublicInformationStateSize(obs_size_)) {
         if (!batched_eval_->HasSemanticScorer() ||
             (batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV3 &&
              batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV4)) {
-          SpielFatalError("BatchedNNEvaluator: 9182 actor requires an active semantic scorer with schema v3 or v4");
+          SpielFatalError("BatchedNNEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
         }
       }
       if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
@@ -45,7 +45,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         market_mode_ = batched_eval_->MarketMode();
       }
       if (market_mode_ == dune_imperium::MarketAppendixMode::kNone) {
-        if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
+        if (obs_size_ == dune_imperium::kFullPublicInformationV4StateSize) {
+          market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV4;
+        } else if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
           market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
         } else if (obs_size_ == dune_imperium::kOrderedCardSlotsInformationStateSize) {
           market_mode_ = dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2;

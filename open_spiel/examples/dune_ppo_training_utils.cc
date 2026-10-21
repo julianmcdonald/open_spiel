@@ -42,6 +42,8 @@ std::string g_ema_magnet_transition_source_fingerprint = "";
 int64_t g_ema_magnet_transition_source_update = -1;
 std::string g_pool_transition_source_fingerprint = "";
 int64_t g_pool_transition_source_update = -1;
+std::string g_market_appendix_transition_source_fingerprint = "";
+int64_t g_market_appendix_transition_source_update = -1;
 
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
@@ -1274,6 +1276,12 @@ void SaveDualCheckpoint(
         manifest_obj["ema_magnet_transition_source_update"] = g_ema_magnet_transition_source_update;
       }
     }
+    if (!g_market_appendix_transition_source_fingerprint.empty()) {
+      manifest_obj["market_appendix_transition_source_fingerprint"] = g_market_appendix_transition_source_fingerprint;
+      if (g_market_appendix_transition_source_update >= 0) {
+        manifest_obj["market_appendix_transition_source_update"] = g_market_appendix_transition_source_update;
+      }
+    }
     if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {
       manifest_obj["ema_magnet_kl_coef"] = absl::GetFlag(FLAGS_ema_magnet_kl_coef);
     }
@@ -1378,10 +1386,10 @@ bool LoadModelCheckpointMigrating(
   if (model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4) {
     model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV4);
   }
-  int64_t input_dim = model->input_layer->weight.size(1);
-  int64_t hidden_dim = absl::GetFlag(FLAGS_hidden_dim);
-  int64_t action_dim = model->policy_head->weight.size(0);
-  int num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const int64_t input_dim = model->input_layer->weight.size(1);
+  const int64_t hidden_dim = model->input_layer->weight.size(0);
+  const int64_t action_dim = model->policy_head->weight.size(0);
+  const int num_blocks = static_cast<int>(model->res_blocks.size());
   const bool use_nonlinear = absl::GetFlag(FLAGS_nonlinear_value_head);
   if (CheckpointHasSemanticScorer(path) && !model->with_semantic_scorer_ &&
       !allow_skip_semantic_scorer) {
@@ -1399,6 +1407,34 @@ bool LoadModelCheckpointMigrating(
       const auto metadata = open_spiel::json::FromString(content);
       if (metadata && metadata->IsObject()) {
         const auto& object = metadata->GetObject();
+        auto nb_entry = object.find("num_blocks");
+        if (nb_entry != object.end()) {
+          int json_blocks = -1;
+          if (nb_entry->second.IsInt()) {
+            json_blocks = nb_entry->second.GetInt();
+          } else if (nb_entry->second.IsString()) {
+            json_blocks = std::stoi(nb_entry->second.GetString());
+          }
+          if (json_blocks != -1 && json_blocks != num_blocks) {
+            SpielFatalError(absl::StrFormat(
+                "LoadModelCheckpointMigrating: Checkpoint %s metadata num_blocks (%d) does not match target model num_blocks (%d)",
+                metadata_path.string(), json_blocks, num_blocks));
+          }
+        }
+        auto hd_entry = object.find("hidden_dim");
+        if (hd_entry != object.end()) {
+          int json_hidden = -1;
+          if (hd_entry->second.IsInt()) {
+            json_hidden = hd_entry->second.GetInt();
+          } else if (hd_entry->second.IsString()) {
+            json_hidden = std::stoi(hd_entry->second.GetString());
+          }
+          if (json_hidden != -1 && json_hidden != hidden_dim) {
+            SpielFatalError(absl::StrFormat(
+                "LoadModelCheckpointMigrating: Checkpoint %s metadata hidden_dim (%d) does not match target model hidden_dim (%d)",
+                metadata_path.string(), json_hidden, hidden_dim));
+          }
+        }
         auto schema_entry = object.find("semantic_descriptor_schema");
         if (schema_entry != object.end() && schema_entry->second.IsString()) {
           source_schema = schema_entry->second.GetString();
@@ -1439,7 +1475,28 @@ bool LoadModelCheckpointMigrating(
     if (archive.try_read("input_layer", in_archive)) {
       torch::Tensor w;
       if (in_archive.try_read("weight", w)) {
+        if (w.size(0) != hidden_dim) {
+          SpielFatalError(absl::StrFormat(
+              "LoadModelCheckpointMigrating: Checkpoint %s input_layer hidden_dim (%d) does not match target model hidden_dim (%d)",
+              path, w.size(0), hidden_dim));
+        }
         ckpt_input_dim = w.size(1);
+      }
+    }
+    for (int b = 1; b <= num_blocks; ++b) {
+      torch::serialize::InputArchive block_arch;
+      if (!archive.try_read("res" + std::to_string(b), block_arch)) {
+        SpielFatalError(absl::StrFormat(
+            "LoadModelCheckpointMigrating: Checkpoint %s is missing residual block 'res%d' required by target model num_blocks (%d)",
+            path, b, num_blocks));
+      }
+    }
+    for (int b = num_blocks + 1; b <= num_blocks + 64; ++b) {
+      torch::serialize::InputArchive extra_arch;
+      if (archive.try_read("res" + std::to_string(b), extra_arch)) {
+        SpielFatalError(absl::StrFormat(
+            "LoadModelCheckpointMigrating: Checkpoint %s contains deeper residual block 'res%d' exceeding target model num_blocks (%d)",
+            path, b, num_blocks));
       }
     }
   }
@@ -1452,7 +1509,18 @@ bool LoadModelCheckpointMigrating(
 
   torch::NoGradGuard no_grad;
   // Trunk.
-  if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
+  if (input_dim == dune_imperium::kFullPublicInformationV4StateSize) {
+    const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
+    CopyInputToFullPublicInformationV4(model->input_layer->weight,
+                                       temp_model->input_layer->weight, source_mode);
+    model->market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV4;
+    update_semantic_schema();
+    std::cout << "[INFO] Migrated model checkpoint input_dim from "
+              << ckpt_input_dim << " ("
+              << dune_imperium::MarketAppendixModeToString(source_mode)
+              << ") to " << input_dim
+              << " (full_public_information_v4).\n";
+  } else if (input_dim == dune_imperium::kFullPublicInformationStateSize) {
     const auto source_mode = ReadCheckpointInputMode(path, ckpt_input_dim);
     CopyInputToFullPublicInformation(model->input_layer->weight,
                                      temp_model->input_layer->weight, source_mode);
@@ -1510,6 +1578,7 @@ bool LoadModelCheckpointMigrating(
       temp_model->input_layer->bias.defined()) {
     model->input_layer->bias.copy_(temp_model->input_layer->bias);
   }
+  SPIEL_CHECK_EQ(model->res_blocks.size(), temp_model->res_blocks.size());
   for (size_t i = 0; i < model->res_blocks.size(); ++i) {
     auto source_params = temp_model->res_blocks[i]->parameters();
     auto target_params = model->res_blocks[i]->parameters();

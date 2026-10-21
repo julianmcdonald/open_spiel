@@ -1665,7 +1665,13 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
   }
 
-  if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v3") {
+  if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v4") {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::MarketAppendixMode::kFullPublicInformationV4);
+    config_obj["market_appendix_mode"] = std::string("full_public_information_v4");
+    config_obj["observation_dim"] = schema.size;
+    config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  } else if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v3") {
     const auto schema = dune_imperium::GetInformationStateSchema(
         dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
     config_obj["market_appendix_mode"] = std::string("full_public_information_v3");
@@ -2217,6 +2223,75 @@ std::string ValidateAndComputePoolTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_market_appendix_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+
+  std::string source_mode = absl::GetFlag(FLAGS_market_appendix_transition_source_mode);
+  if (source_mode.empty()) {
+    auto mode_it = manifest_obj.find("market_appendix_mode");
+    if (mode_it != manifest_obj.end() && mode_it->second.IsString()) {
+      source_mode = mode_it->second.GetString();
+    }
+  }
+  if (source_mode.empty()) {
+    source_mode = "none";
+  }
+
+  if (source_mode == "none") {
+    source_config_obj.erase("market_appendix_mode");
+    source_config_obj.erase("observation_dim");
+    source_config_obj.erase("feature_schema_sha256");
+  } else {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::ParseMarketAppendixMode(source_mode));
+    source_config_obj["market_appendix_mode"] = source_mode;
+    source_config_obj["observation_dim"] = schema.size;
+    source_config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  }
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_market_appendix_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Market appendix transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Market appendix transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_market_appendix_transition permits market_appendix_mode to differ from parent manifest.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+  std::cout << absl::StrFormat(
+      "[market_appendix-transition] Validated intentional market appendix transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Market appendix mode: '%s' -> '%s'\n",
+      computed_source_fp, current_config_fingerprint,
+      source_mode, absl::GetFlag(FLAGS_market_appendix_mode)) << std::endl;
+  return computed_source_fp;
+}
+
 void UpdateEmaWeights(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
@@ -2401,6 +2476,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["pool_transition_source_fingerprint"] = g_pool_transition_source_fingerprint;
       if (g_pool_transition_source_update >= 0) {
         manifest_obj["pool_transition_source_update"] = g_pool_transition_source_update;
+      }
+    }
+    if (!g_market_appendix_transition_source_fingerprint.empty()) {
+      manifest_obj["market_appendix_transition_source_fingerprint"] = g_market_appendix_transition_source_fingerprint;
+      if (g_market_appendix_transition_source_update >= 0) {
+        manifest_obj["market_appendix_transition_source_update"] = g_market_appendix_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
@@ -8514,8 +8595,8 @@ int main(int argc, char** argv) {
   const bool enable_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer);
   const bool enable_zone_enc = absl::GetFlag(FLAGS_enable_zone_encoder);
   const std::string sem_schema = absl::GetFlag(FLAGS_semantic_descriptor_schema);
-  if (obs_size == dune_imperium::kFullPublicInformationStateSize && !enable_scorer) {
-    SpielFatalError("9,182 actor requires --enable_semantic_scorer=true");
+  if (dune_imperium::IsFullPublicInformationStateSize(obs_size) && !enable_scorer) {
+    SpielFatalError("Full public information actor requires --enable_semantic_scorer=true");
   }
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
@@ -9997,6 +10078,12 @@ int main(int argc, char** argv) {
                     ValidateAndComputePoolTransitionFingerprint(manifest_path, config_fingerprint);
                 if (!permitted_transition_source_fingerprint.empty()) {
                   g_pool_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                } else {
+                  permitted_transition_source_fingerprint =
+                      ValidateAndComputeMarketAppendixTransitionFingerprint(manifest_path, config_fingerprint);
+                  if (!permitted_transition_source_fingerprint.empty()) {
+                    g_market_appendix_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                  }
                 }
               }
             }
@@ -10047,6 +10134,9 @@ int main(int argc, char** argv) {
       if (!g_pool_transition_source_fingerprint.empty()) {
         g_pool_transition_source_update = manifest.global_update;
       }
+      if (!g_market_appendix_transition_source_fingerprint.empty()) {
+        g_market_appendix_transition_source_update = manifest.global_update;
+      }
     }
 
     // Verify market_appendix_mode matches the current run's flag
@@ -10064,9 +10154,11 @@ int main(int argc, char** argv) {
         }
         std::string current_mode = absl::GetFlag(FLAGS_market_appendix_mode);
         if (manifest_mode != current_mode) {
-          SpielFatalError(absl::StrFormat(
-              "market_appendix_mode mismatch on resume. Manifest: '%s', Flag: '%s'",
-              manifest_mode, current_mode));
+          if (!absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
+            SpielFatalError(absl::StrFormat(
+                "market_appendix_mode mismatch on resume. Manifest: '%s', Flag: '%s'",
+                manifest_mode, current_mode));
+          }
         }
       }
     }
@@ -10988,6 +11080,12 @@ int main(int argc, char** argv) {
                       ValidateAndComputePoolTransitionFingerprint(manifest_path, config_fingerprint);
                   if (!permitted_transition_source_fingerprint.empty()) {
                     g_pool_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                  } else {
+                    permitted_transition_source_fingerprint =
+                        ValidateAndComputeMarketAppendixTransitionFingerprint(manifest_path, config_fingerprint);
+                    if (!permitted_transition_source_fingerprint.empty()) {
+                      g_market_appendix_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    }
                   }
                 }
               }
@@ -11035,6 +11133,9 @@ int main(int argc, char** argv) {
         if (!g_pool_transition_source_fingerprint.empty()) {
           g_pool_transition_source_update = shared_manifest.global_update;
         }
+        if (!g_market_appendix_transition_source_fingerprint.empty()) {
+          g_market_appendix_transition_source_update = shared_manifest.global_update;
+        }
       }
 
       // Verify market_appendix_mode and feature_schema match the current run's flags
@@ -11052,11 +11153,13 @@ int main(int argc, char** argv) {
           }
           std::string current_mode = absl::GetFlag(FLAGS_market_appendix_mode);
           if (manifest_mode != current_mode) {
-            SpielFatalError(absl::StrFormat(
-                "market_appendix_mode mismatch on study_resume. Manifest: '%s', Flag: '%s'",
-                manifest_mode, current_mode));
+            if (!absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
+              SpielFatalError(absl::StrFormat(
+                  "market_appendix_mode mismatch on study_resume. Manifest: '%s', Flag: '%s'",
+                  manifest_mode, current_mode));
+            }
           }
-          if (current_mode != "none") {
+          if (current_mode != "none" && !absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
             auto it_schema = obj.find("feature_schema_sha256");
             std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
             const auto schema = dune_imperium::GetInformationStateSchema(
@@ -11071,7 +11174,10 @@ int main(int argc, char** argv) {
       }
 
       LoadModelCheckpoint(training_model, model_path, device);
-      torch::load(*optimizer, optim_path, device);
+      if (!open_spiel::LoadOptimizerCheckpointMigrating(
+              training_model, *optimizer, optim_path, device)) {
+        torch::load(*optimizer, optim_path, device);
+      }
 
       auto* te_flag = absl::FindCommandLineFlag("target_end_update");
       if (te_flag && te_flag->CurrentValue() != te_flag->DefaultValue() &&
@@ -11156,8 +11262,8 @@ int main(int argc, char** argv) {
           SpielFatalError("Training opponent pool checkpoint does not exist: " + opp_path);
         }
         const bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path);
-        if (obs_size == dune_imperium::kFullPublicInformationStateSize && !opp_has_scorer) {
-          SpielFatalError("Opponent pool 9,182 actor requires an active semantic scorer with schema v3: " + opp_path);
+        if (dune_imperium::IsFullPublicInformationStateSize(obs_size) && !opp_has_scorer) {
+          SpielFatalError("Opponent pool full public information actor requires an active semantic scorer with schema v3: " + opp_path);
         }
         auto opp_model = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
             obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,

@@ -610,14 +610,14 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
               }
             }
           }
-          if (input_dim != nullptr && *input_dim == dune_imperium::kFullPublicInformationStateSize) {
+          if (input_dim != nullptr && dune_imperium::IsFullPublicInformationStateSize(*input_dim)) {
             auto it_ess_9182 = obj.find("enable_semantic_scorer");
             bool enabled = it_ess_9182 != obj.end() &&
                            ((it_ess_9182->second.IsBool() && it_ess_9182->second.GetBool()) ||
                             (it_ess_9182->second.IsString() && it_ess_9182->second.GetString() == "true"));
             if (!enabled) {
               SpielFatalError(absl::StrFormat(
-                  "Model checkpoint %s with 9182 input dim requires enable_semantic_scorer=true",
+                  "Model checkpoint %s with full public information input dim requires enable_semantic_scorer=true",
                   model_path));
             }
             if (it_sds == obj.end() || !it_sds->second.IsString() ||
@@ -1432,8 +1432,8 @@ void RunEvaluation() {
   }
 
   bool cand_has_scorer = absl::GetFlag(FLAGS_enable_semantic_scorer) || CheckpointHasSemanticScorer(model_checkpoint, device);
-  if (main_input_dim == dune_imperium::kFullPublicInformationStateSize && !cand_has_scorer) {
-    SpielFatalError("Candidate 9,182 actor requires an active semantic scorer with schema v3 or v4");
+  if (dune_imperium::IsFullPublicInformationStateSize(main_input_dim) && !cand_has_scorer) {
+    SpielFatalError("Candidate full public information actor requires an active semantic scorer with schema v3 or v4");
   }
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
       main_input_dim, main_hidden_dim, action_size, main_num_blocks,
@@ -1485,8 +1485,8 @@ void RunEvaluation() {
     opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks, opp_detected_input_dim, opp_market_mode, MarketModeToString(opp_market_mode)});
 
     bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path, device);
-    if (opp_detected_input_dim == dune_imperium::kFullPublicInformationStateSize && !opp_has_scorer) {
-      SpielFatalError("Opponent 9,182 actor requires an active semantic scorer with schema v3 or v4: " + opp_path);
+    if (dune_imperium::IsFullPublicInformationStateSize(opp_detected_input_dim) && !opp_has_scorer) {
+      SpielFatalError("Opponent full public information actor requires an active semantic scorer with schema v3 or v4: " + opp_path);
     }
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
         opp_detected_input_dim, opp_detected_hidden, action_size, opp_detected_blocks,

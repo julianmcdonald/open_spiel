@@ -8,9 +8,15 @@
 #include <shared_mutex>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_batched_evaluator.h"
+#include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
@@ -40,6 +46,22 @@ void TestInputMigration() {
     SPIEL_CHECK_TRUE(torch::equal(target_v3.slice(1, 0, prefix), source.slice(1, 0, prefix)));
     if (prefix < kFullPublicInformationStateSize) {
       SPIEL_CHECK_EQ(target_v3.slice(1, prefix).count_nonzero().item<int64_t>(), 0);
+    }
+  }
+
+  for (auto mode : {MarketAppendixMode::kNone, MarketAppendixMode::kZeros,
+                    MarketAppendixMode::kOrderedMarket,
+                    MarketAppendixMode::kOrderedCardSlotsV2,
+                    MarketAppendixMode::kFullPublicInformationV3}) {
+    const auto schema = GetInformationStateSchema(mode);
+    auto source = torch::randn({8, schema.size});
+    auto target_v4 = torch::empty({8, kFullPublicInformationV4StateSize});
+    CopyInputToFullPublicInformationV4(target_v4, source, mode);
+    const int prefix = mode == MarketAppendixMode::kZeros
+                           ? kLegacyInformationStateSize : schema.size;
+    SPIEL_CHECK_TRUE(torch::equal(target_v4.slice(1, 0, prefix), source.slice(1, 0, prefix)));
+    if (prefix < kFullPublicInformationV4StateSize) {
+      SPIEL_CHECK_EQ(target_v4.slice(1, prefix).count_nonzero().item<int64_t>(), 0);
     }
   }
 }
@@ -854,6 +876,330 @@ void TestOptimizerMigration6255To9182(const std::filesystem::path& temp_dir) {
   std::cout << "6255-to-9182 optimizer migration verification passed: moments expanded and target step succeeded.\n";
 }
 
+void TestModelAndOptimizerMigration9182To9941(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+  torch::Device cpu_device(torch::kCPU);
+
+  // 1. Create a >=9-block v3 model (10 blocks) with semantic scorer
+  auto v3_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+
+  // Build a real 3-group AdamW optimizer
+  auto v3_opt = BuildAdamWOptimizer(
+      *v3_model, /*lr=*/5e-6, /*weight_decay=*/0.0, /*policy_weight_decay=*/0.0,
+      /*new_block_lr=*/5e-5, /*new_block_first_index=*/8);
+  SPIEL_CHECK_EQ(v3_opt->param_groups().size(), 3);
+
+  // Step v3_opt to populate moments
+  torch::Tensor dummy_input = torch::randn({2, kFullPublicInformationStateSize});
+  auto out = v3_model->forward(dummy_input);
+  torch::Tensor loss = out.logits.sum() + out.values.sum();
+  for (const auto& group : v3_opt->param_groups()) {
+    for (const auto& p : group.params()) {
+      loss = loss + p.sum();
+    }
+  }
+  loss.backward();
+  v3_opt->step();
+
+  const std::filesystem::path model_path = temp_dir / "ppo_model_update_100.pt";
+  const std::filesystem::path optim_path = temp_dir / "ppo_optimizer_update_100.pt";
+  const std::filesystem::path manifest_path = temp_dir / "ppo_model_update_100.json";
+  torch::save(v3_model, model_path.string());
+  torch::save(*v3_opt, optim_path.string());
+
+  const auto v3_schema = GetInformationStateSchema(MarketAppendixMode::kFullPublicInformationV3);
+  json::Object manifest_obj;
+  manifest_obj["global_update"] = 100;
+  manifest_obj["market_appendix_mode"] = "full_public_information_v3";
+  manifest_obj["observation_dim"] = static_cast<int64_t>(kFullPublicInformationStateSize);
+  manifest_obj["feature_schema_sha256"] = std::string(v3_schema.sha256);
+  manifest_obj["enable_semantic_scorer"] = true;
+  manifest_obj["semantic_descriptor_schema"] = "semantic_action_v3";
+  manifest_obj["model_filename"] = model_path.filename().string();
+  manifest_obj["optimizer_filename"] = optim_path.filename().string();
+  manifest_obj["num_blocks"] = 10;
+  manifest_obj["hidden_dim"] = 64;
+  std::ofstream mfs(manifest_path);
+  mfs << json::ToString(json::Value(manifest_obj));
+  mfs.close();
+
+  // 2. Load v4_model (9941 input dim, 10 blocks) via LoadModelCheckpoint
+  auto v4_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationV4StateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  LoadModelCheckpoint(v4_model, model_path.string(), cpu_device);
+  SPIEL_CHECK_TRUE(v4_model->market_appendix_mode_ == MarketAppendixMode::kFullPublicInformationV4);
+
+  // Build 3-group target optimizer
+  auto v4_opt = BuildAdamWOptimizer(
+      *v4_model, /*lr=*/5e-6, /*weight_decay=*/0.0, /*policy_weight_decay=*/0.0,
+      /*new_block_lr=*/5e-5, /*new_block_first_index=*/8);
+  SPIEL_CHECK_EQ(v4_opt->param_groups().size(), 3);
+
+  bool migrated = LoadOptimizerCheckpointMigrating(
+      v4_model, *v4_opt, optim_path.string(), cpu_device);
+  SPIEL_CHECK_TRUE(migrated);
+  SPIEL_CHECK_EQ(v4_opt->param_groups().size(), 3);
+
+  // 3. Assertions on moments
+  auto input_w_key = v4_model->input_layer->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(v4_opt->state().count(input_w_key), 0);
+  auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      v4_opt->state()[input_w_key].get());
+  SPIEL_CHECK_TRUE(adam_state != nullptr);
+  SPIEL_CHECK_TRUE(adam_state->exp_avg().defined());
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 64);
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(1), kFullPublicInformationV4StateSize);
+  SPIEL_CHECK_EQ(adam_state->exp_avg_sq().size(0), 64);
+  SPIEL_CHECK_EQ(adam_state->exp_avg_sq().size(1), kFullPublicInformationV4StateSize);
+
+  auto* src_input_adam = dynamic_cast<torch::optim::AdamWParamState*>(
+      v3_opt->state()[v3_model->input_layer->weight.unsafeGetTensorImpl()].get());
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg().slice(1, 0, kFullPublicInformationStateSize),
+      src_input_adam->exp_avg()));
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg_sq().slice(1, 0, kFullPublicInformationStateSize),
+      src_input_adam->exp_avg_sq()));
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg().slice(1, kFullPublicInformationStateSize, kFullPublicInformationV4StateSize).abs().sum().item<double>(), 0.0);
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg_sq().slice(1, kFullPublicInformationStateSize, kFullPublicInformationV4StateSize).abs().sum().item<double>(), 0.0);
+
+  // Verify EVERY other parameter across all 3 groups has identical step, exp_avg, exp_avg_sq
+  for (size_t g = 0; g < 3; ++g) {
+    SPIEL_CHECK_EQ(v3_opt->param_groups()[g].params().size(), v4_opt->param_groups()[g].params().size());
+    for (size_t i = 0; i < v4_opt->param_groups()[g].params().size(); ++i) {
+      const auto& p3 = v3_opt->param_groups()[g].params()[i];
+      const auto& p4 = v4_opt->param_groups()[g].params()[i];
+      if (p4.unsafeGetTensorImpl() == v4_model->input_layer->weight.unsafeGetTensorImpl()) {
+        continue;
+      }
+      auto k3 = p3.unsafeGetTensorImpl();
+      auto k4 = p4.unsafeGetTensorImpl();
+      SPIEL_CHECK_GT(v3_opt->state().count(k3), 0);
+      SPIEL_CHECK_GT(v4_opt->state().count(k4), 0);
+      auto* s3 = dynamic_cast<torch::optim::AdamWParamState*>(v3_opt->state()[k3].get());
+      auto* s4 = dynamic_cast<torch::optim::AdamWParamState*>(v4_opt->state()[k4].get());
+      SPIEL_CHECK_TRUE(s3 != nullptr && s4 != nullptr);
+      SPIEL_CHECK_EQ(s3->step(), s4->step());
+      SPIEL_CHECK_TRUE(torch::equal(s3->exp_avg(), s4->exp_avg()));
+      SPIEL_CHECK_TRUE(torch::equal(s3->exp_avg_sq(), s4->exp_avg_sq()));
+    }
+  }
+
+  // 4. Verify forward, backward, and v4_opt->step() succeeds
+  v4_model->train();
+  v4_opt->zero_grad();
+  torch::Tensor t_v4 = torch::randn({2, kFullPublicInformationV4StateSize});
+  auto train_out = v4_model->forward(t_v4);
+  torch::Tensor train_loss = train_out.logits.sum() + train_out.values.sum();
+  train_loss.backward();
+
+  auto grad_new_cols = v4_model->input_layer->weight.grad().slice(
+      1, kFullPublicInformationStateSize, kFullPublicInformationV4StateSize);
+  SPIEL_CHECK_GT(grad_new_cols.abs().sum().item<double>(), 0.0);
+  v4_opt->step();
+
+  // 5. Fail-closed test:
+  // When ckpt_input_dim (9182) differs from target_input_dim (9941) and migration fails
+  // (e.g. passing a 2-group target optimizer to load a 3-group checkpoint),
+  // LoadOptimizerCheckpointMigrating MUST terminate fatally via SpielFatalError.
+  bool caught_bad_opt = false;
+  open_spiel::SetErrorHandler(ThrowingErrorHandler);
+  try {
+    auto bad_opt = MakeDuneOptimizer(v4_model, /*lr=*/5e-6, /*weight_decay=*/0.0,
+                                     /*policy_weight_decay=*/0.0, /*new_block_lr=*/0.0);
+    LoadOptimizerCheckpointMigrating(v4_model, *bad_opt, optim_path.string(), cpu_device);
+  } catch (const std::exception& e) {
+    caught_bad_opt = true;
+    std::cout << "Fail-closed check passed: mismatched optimizer layout rejected: " << e.what() << "\n";
+  }
+  open_spiel::SetErrorHandler(ExitingErrorHandler);
+  SPIEL_CHECK_TRUE(caught_bad_opt);
+
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
+  std::cout << "3-group 9182-to-9941 model and optimizer migration and fatal fail-closed verification passed successfully.\n";
+}
+
+void TestModelMigrationDepthGuards(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+  torch::Device cpu_device(torch::kCPU);
+
+  const auto v3_schema = GetInformationStateSchema(MarketAppendixMode::kFullPublicInformationV3);
+
+  // 1. Create a 12-block model and a 16-block model
+  auto m12 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 64, 2391, /*num_blocks=*/12, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/12, /*with_semantic_scorer=*/true);
+  const auto p12 = temp_dir / "model_12b.pt";
+  const auto j12 = temp_dir / "model_12b.json";
+  torch::save(m12, p12.string());
+  {
+    std::ofstream jf(j12);
+    jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+       << "\"observation_dim\": 9182,"
+       << "\"feature_schema_sha256\": \"" << v3_schema.sha256 << "\","
+       << "\"num_blocks\": 12,"
+       << "\"hidden_dim\": 64,"
+       << "\"enable_semantic_scorer\": true,"
+       << "\"semantic_descriptor_schema\": \"semantic_action_v3\"}\n";
+  }
+
+  auto m16 = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationStateSize, 64, 2391, /*num_blocks=*/16, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/16, /*with_semantic_scorer=*/true);
+  const auto p16 = temp_dir / "model_16b.pt";
+  const auto j16 = temp_dir / "model_16b.json";
+  torch::save(m16, p16.string());
+  {
+    std::ofstream jf(j16);
+    jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+       << "\"observation_dim\": 9182,"
+       << "\"feature_schema_sha256\": \"" << v3_schema.sha256 << "\","
+       << "\"num_blocks\": 16,"
+       << "\"hidden_dim\": 64,"
+       << "\"enable_semantic_scorer\": true,"
+       << "\"semantic_descriptor_schema\": \"semantic_action_v3\"}\n";
+  }
+
+  // Also create archives without JSON to test raw InputArchive block inspection
+  const auto p12_nojson = temp_dir / "model_12b_nojson.pt";
+  torch::save(m12, p12_nojson.string());
+  const auto p16_nojson = temp_dir / "model_16b_nojson.pt";
+  torch::save(m16, p16_nojson.string());
+
+  // Test 1: 12-block checkpoint into a 16-block model -> fatal
+  {
+    auto target_16 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationV4StateSize, 64, 2391, /*num_blocks=*/16, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    bool caught_json = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      LoadModelCheckpoint(target_16, p12.string(), cpu_device);
+    } catch (const std::exception& e) {
+      caught_json = true;
+      std::cout << "Depth guard passed (12b into 16b with JSON rejected): " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_json);
+
+    bool caught_raw = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      LoadModelCheckpoint(target_16, p12_nojson.string(), cpu_device);
+    } catch (const std::exception& e) {
+      caught_raw = true;
+      std::cout << "Depth guard passed (12b into 16b without JSON rejected): " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_raw);
+  }
+
+  // Test 2: 16-block checkpoint into a 12-block model -> fatal
+  {
+    auto target_12 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationV4StateSize, 64, 2391, /*num_blocks=*/12, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    bool caught_json = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      LoadModelCheckpoint(target_12, p16.string(), cpu_device);
+    } catch (const std::exception& e) {
+      caught_json = true;
+      std::cout << "Depth guard passed (16b into 12b with JSON rejected): " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_json);
+
+    bool caught_raw = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      LoadModelCheckpoint(target_12, p16_nojson.string(), cpu_device);
+    } catch (const std::exception& e) {
+      caught_raw = true;
+      std::cout << "Depth guard passed (16b into 12b without JSON rejected): " << e.what() << "\n";
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_raw);
+  }
+
+  // Test 3: Equal depth
+  // 3a. 12-block into 12-block: every parameter equal
+  {
+    auto target_12 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 64, 2391, /*num_blocks=*/12, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    LoadModelCheckpoint(target_12, p12.string(), cpu_device);
+    SPIEL_CHECK_EQ(target_12->res_blocks.size(), m12->res_blocks.size());
+    for (size_t b = 0; b < 12; ++b) {
+      auto p_tgt = target_12->res_blocks[b]->parameters();
+      auto p_src = m12->res_blocks[b]->parameters();
+      SPIEL_CHECK_EQ(p_tgt.size(), p_src.size());
+      for (size_t i = 0; i < p_tgt.size(); ++i) {
+        SPIEL_CHECK_TRUE(torch::equal(p_tgt[i], p_src[i]));
+      }
+    }
+    SPIEL_CHECK_TRUE(torch::equal(target_12->input_layer->weight, m12->input_layer->weight));
+    SPIEL_CHECK_TRUE(torch::equal(target_12->policy_head->weight, m12->policy_head->weight));
+    SPIEL_CHECK_TRUE(torch::equal(target_12->value_head->weight, m12->value_head->weight));
+    std::cout << "Equal depth 12b-to-12b migration verified: all parameters identical.\n";
+  }
+
+  // 3b. 10-block v3 into 10-block v4: prefix columns 0..9181 equal, 9182..9940 zero, all others equal
+  {
+    auto m10_v3 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/10, /*with_semantic_scorer=*/true);
+    const auto p10 = temp_dir / "model_10b.pt";
+    const auto j10 = temp_dir / "model_10b.json";
+    torch::save(m10_v3, p10.string());
+    {
+      std::ofstream jf(j10);
+      jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+         << "\"observation_dim\": 9182,"
+         << "\"feature_schema_sha256\": \"" << v3_schema.sha256 << "\","
+         << "\"num_blocks\": 10,"
+         << "\"hidden_dim\": 64,"
+         << "\"enable_semantic_scorer\": true,"
+         << "\"semantic_descriptor_schema\": \"semantic_action_v3\"}\n";
+    }
+
+    auto target_10_v4 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationV4StateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+    LoadModelCheckpoint(target_10_v4, p10.string(), cpu_device);
+
+    SPIEL_CHECK_TRUE(torch::equal(
+        target_10_v4->input_layer->weight.slice(1, 0, kFullPublicInformationStateSize),
+        m10_v3->input_layer->weight));
+    SPIEL_CHECK_EQ(
+        target_10_v4->input_layer->weight.slice(1, kFullPublicInformationStateSize, kFullPublicInformationV4StateSize)
+            .abs().sum().item<double>(), 0.0);
+
+    SPIEL_CHECK_EQ(target_10_v4->res_blocks.size(), m10_v3->res_blocks.size());
+    for (size_t b = 0; b < 10; ++b) {
+      auto p_tgt = target_10_v4->res_blocks[b]->parameters();
+      auto p_src = m10_v3->res_blocks[b]->parameters();
+      SPIEL_CHECK_EQ(p_tgt.size(), p_src.size());
+      for (size_t i = 0; i < p_tgt.size(); ++i) {
+        SPIEL_CHECK_TRUE(torch::equal(p_tgt[i], p_src[i]));
+      }
+    }
+    SPIEL_CHECK_TRUE(torch::equal(target_10_v4->policy_head->weight, m10_v3->policy_head->weight));
+    SPIEL_CHECK_TRUE(torch::equal(target_10_v4->value_head->weight, m10_v3->value_head->weight));
+    std::cout << "Equal depth 10b v3-to-v4 migration verified: prefix columns equal, suffix zero, all parameters identical.\n";
+  }
+
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
+  std::cout << "TestModelMigrationDepthGuards passed successfully.\n";
+}
+
 void TestBootstrappedBundleVerification(const std::filesystem::path& bundle_dir) {
   const std::filesystem::path model_path = bundle_dir / "ppo_model_update_400.pt";
   const std::filesystem::path optim_path = bundle_dir / "ppo_optimizer_update_400.pt";
@@ -945,6 +1291,8 @@ int main(int argc, char** argv) {
   open_spiel::TestFailClosedValidation(artifacts_dir / "fail_closed");
   open_spiel::TestPopulatedOptimizerMigration(artifacts_dir / "optim_mig");
   open_spiel::TestOptimizerMigration6255To9182(artifacts_dir / "optim_mig_6255");
+  open_spiel::TestModelAndOptimizerMigration9182To9941(artifacts_dir / "optim_mig_9182");
+  open_spiel::TestModelMigrationDepthGuards(artifacts_dir / "depth_guards");
   if (argc > 2) {
     const std::filesystem::path b400_dir(argv[2]);
     open_spiel::TestBootstrappedBundleVerification(b400_dir);

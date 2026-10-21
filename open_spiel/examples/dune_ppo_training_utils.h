@@ -59,6 +59,8 @@ extern std::string g_ema_magnet_transition_source_fingerprint;
 extern int64_t g_ema_magnet_transition_source_update;
 extern std::string g_pool_transition_source_fingerprint;
 extern int64_t g_pool_transition_source_update;
+extern std::string g_market_appendix_transition_source_fingerprint;
+extern int64_t g_market_appendix_transition_source_update;
 
 namespace open_spiel {
 
