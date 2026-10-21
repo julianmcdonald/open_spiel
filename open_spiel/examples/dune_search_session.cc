@@ -1568,7 +1568,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           target_ms = std::min(cap, frac * usable_ms);
           result.diagnostics.hard_time_limit_ms = target_ms;
           result.diagnostics.soft_time_limit_ms = remaining_time_ms;
-          double plan_ms = full_search_ ? (0.94 * target_ms) : target_ms;
+          double plan_ms = full_search_ ? (0.82 * target_ms) : target_ms;
           int total_rollout_budget = static_cast<int>(plan_ms / round_ms_est);
           ref_rollouts = full_search_
               ? (total_rollout_budget / 3)

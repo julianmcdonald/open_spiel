@@ -2113,6 +2113,24 @@ public:
         dispatch_rejection_hook_ = std::move(on_rejection_hook);
     }
 
+    void AdjustActiveRollouts(int delta) {
+        int prev = active_rollouts_.fetch_add(delta, std::memory_order_relaxed);
+        if (delta < 0 && prev + delta > 0) {
+            cv_.notify_one();
+        }
+    }
+
+    size_t EffectiveTargetBatchSize() const {
+        size_t eff = static_cast<size_t>(target_batch_size_);
+        int act = active_rollouts_.load(std::memory_order_relaxed);
+        if (act > 0) {
+            size_t cap = std::max<size_t>(
+                1, static_cast<size_t>((act * 3 + 3) / 4));
+            eff = std::min(eff, cap);
+        }
+        return eff;
+    }
+
     EvalResult Evaluate(const std::vector<float>& obs) override {
         return EvaluateWithActions(obs, nullptr);
     }
@@ -2150,7 +2168,7 @@ public:
             single_row_calls_.fetch_add(1, std::memory_order_relaxed);
 
             // Only wake the Runner on the first arrival or when the batch is full
-            if (requests_.size() == 1 || requests_.size() >= (size_t)target_batch_size_) {
+            if (requests_.size() == 1 || requests_.size() >= EffectiveTargetBatchSize()) {
                 cv_.notify_one();
             }
         }
@@ -2199,7 +2217,7 @@ public:
             requests_.push_back(req);
             single_row_calls_.fetch_add(1, std::memory_order_relaxed);
             if (requests_.size() == 1 ||
-                requests_.size() >= static_cast<size_t>(target_batch_size_)) {
+                requests_.size() >= EffectiveTargetBatchSize()) {
                 cv_.notify_one();
             }
         }
@@ -2281,7 +2299,7 @@ public:
             requests_.push_back(std::move(req));
             single_row_calls_.fetch_add(1, std::memory_order_relaxed);
             if (requests_.size() == 1 ||
-                requests_.size() >= static_cast<size_t>(target_batch_size_)) {
+                requests_.size() >= EffectiveTargetBatchSize()) {
                 cv_.notify_one();
             }
         }
@@ -2634,6 +2652,7 @@ private:
 
     bool stop_;
     std::thread runner_thread_;
+    std::atomic<int> active_rollouts_{0};
     std::atomic<uint64_t> total_batches_{0};
     std::atomic<uint64_t> total_requests_{0};
     std::atomic<uint64_t> max_batch_size_seen_{0};
@@ -2775,8 +2794,7 @@ private:
                 const auto deadline =
                     first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
                 cv_.wait_until(lock, deadline, [this, deadline]() {
-                    return stop_ || requests_.size() >=
-                                      static_cast<size_t>(target_batch_size_) ||
+                    return stop_ || requests_.size() >= EffectiveTargetBatchSize() ||
                            std::chrono::steady_clock::now() >= deadline;
                 });
                 if (stop_ && requests_.empty()) return batch;
@@ -3250,7 +3268,7 @@ private:
 
                 // 3. Wait until the batch is full OR the timeout expires (Deadlock fix!)
                 cv_.wait_until(lock, deadline, [this, deadline]() {
-                    return stop_ || requests_.size() >= (size_t)target_batch_size_ ||
+                    return stop_ || requests_.size() >= EffectiveTargetBatchSize() ||
                            std::chrono::steady_clock::now() >= deadline;
                 });
 

@@ -209,8 +209,12 @@ struct ClockedStageSharedState {
 struct SlotReleaseGuard {
   std::shared_ptr<ClockedStageSharedState> state;
   int world_idx;
+  BatchedNNEvaluator* evaluator = nullptr;
   bool normal_finish = false;
   ~SlotReleaseGuard() {
+    if (evaluator) {
+      evaluator->AdjustActiveRollouts(-1);
+    }
     if (!normal_finish) {
       state->any_aborted.store(true, std::memory_order_relaxed);
     }
@@ -294,7 +298,10 @@ inline int RunClockedPairedRolloutStage(
             [shared, s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
              s_seed, crn_mode, sample_opponent_leader_draft, stage_deadline_tp,
              w, slot]() mutable {
-              SlotReleaseGuard guard{shared, w, false};
+              if (active_evaluator) {
+                active_evaluator->AdjustActiveRollouts(1);
+              }
+              SlotReleaseGuard guard{shared, w, active_evaluator, false};
               shared->trajs[w][slot] = SimulateRolloutWithTurnTrajectory(
                   s_ptr, search_player, active_evaluator, s_seed,
                   SearchTruncationMode::kTerminal, crn_mode,
@@ -768,7 +775,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   const bool has_deadline = (max_time_ms > 0.0);
   const bool use_bounded_stage = has_deadline || use_bounded_pool_when_unclocked;
   const auto start_time = std::chrono::steady_clock::now();
-  const double s1_deadline_frac = full_clock_stage2 ? 0.72 : 0.50;
+  const double s1_deadline_frac = full_clock_stage2 ? 0.56 : 0.50;
   const double final_deadline_frac = full_clock_stage2 ? 1.008 : 1.00;
   const auto stage1_deadline = has_deadline
       ? (start_time +
@@ -967,8 +974,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
         stage1_elapsed_ms / std::max(1.0, static_cast<double>(K * r_stage1_done));
     const double rem_stage2_ms = std::max(0.0, 0.968 * max_time_ms - stage1_elapsed_ms);
     const double est_s2_sims = rem_stage2_ms / std::max(0.1, s1_ms_per_sim);
-    const double batch_factor = (est_s2_sims < 220.0) ? 1.12 : 1.0;
-    r_stage2 = std::max(2, static_cast<int>(est_s2_sims / (2.0 * batch_factor)));
+    r_stage2 = std::max(2, static_cast<int>(est_s2_sims / 2.0));
   }
   const std::array<size_t, 2> finalists = {0, best_c_idx};
 
@@ -1054,10 +1060,12 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
           break;
         }
         const double rem_ms = std::max(0.0, 0.968 * max_time_ms - total_elapsed_ms);
-        const double est_sims = rem_ms / std::max(0.05, cur_ms_per_sim);
-        const double batch_factor = (est_sims < 220.0) ? 1.12 : 1.0;
+        const double wave_target_ms = (s2_done_now == 0 && rem_ms < 4500.0)
+            ? (0.65 * rem_ms)
+            : rem_ms;
+        const double est_sims = wave_target_ms / std::max(0.05, cur_ms_per_sim);
         const int wave_worlds = std::clamp(
-            static_cast<int>(est_sims / (2.0 * batch_factor)), 2, 1024);
+            static_cast<int>(est_sims / 2.0), 2, 1024);
         stage2_planned_worlds += wave_worlds;
         const int before_size = static_cast<int>(per_candidate_rollouts[0].size());
         const auto wt0 = std::chrono::steady_clock::now();
