@@ -1715,17 +1715,24 @@ void TestInvariantGatesAndScenarios() {
     auto state_combat = state->Clone();
     while (!state_combat->IsTerminal()) {
       const dune_imperium::DuneImperiumState& ds = static_cast<const dune_imperium::DuneImperiumState&>(*state_combat);
-      if (ds.phase() == dune_imperium::GamePhase::kRevealTurns) {
+      if (ds.IsPlayerInRevealTurn(ds.CurrentPlayer())) {
         break;
       }
       if (state_combat->IsChanceNode()) {
         state_combat->ApplyAction(state_combat->ChanceOutcomes().front().first);
       } else {
-        Action chosen = state_combat->LegalActions().front();
-        for (Action a : state_combat->LegalActions()) {
-          if (a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256) {
-            chosen = a;
-            break;
+        const auto legal = state_combat->LegalActions();
+        Action chosen = legal.front();
+        if (std::find(legal.begin(), legal.end(), dune_imperium::kActionReveal) != legal.end()) {
+          chosen = dune_imperium::kActionReveal;
+        } else if (std::find(legal.begin(), legal.end(), dune_imperium::kActionEndTurn) != legal.end()) {
+          chosen = dune_imperium::kActionEndTurn;
+        } else {
+          for (Action a : legal) {
+            if (a >= dune_imperium::kActionSelectAgentCard0 && a < dune_imperium::kActionSelectAgentCard0 + 256) {
+              chosen = a;
+              break;
+            }
           }
         }
         state_combat->ApplyAction(chosen);
@@ -3132,8 +3139,8 @@ void TestShortWindowRNGSeedContinuity() {
   auto game = open_spiel::LoadGame("dune_imperium");
   TestRoutingState state(game);
 
-  // Set to a short window role (e.g. kPurchase role: agents remaining = 0)
-  state.SetPhaseForTesting(dune_imperium::GamePhase::kRevealTurns);
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+  state.SetPlayerRevealedForTesting(0, true);
   state.SetPlayerAgentsRemainingForTesting(0, 0);
   state.SetMockLegalActions({
     dune_imperium::kActionBuyImperiumRow0,
@@ -3205,7 +3212,8 @@ void TestShortWindowExhaustedBudgetFallsBackToPrior() {
   TestRoutingState state(game);
 
   // A multi-action kPurchase short-window state (all purchase actions).
-  state.SetPhaseForTesting(dune_imperium::GamePhase::kRevealTurns);
+  state.SetPhaseForTesting(dune_imperium::GamePhase::kAgentTurns);
+  state.SetPlayerRevealedForTesting(0, true);
   state.SetPlayerAgentsRemainingForTesting(0, 0);
   const Action a0 = dune_imperium::kActionBuyImperiumRow0 + 0;
   const Action a1 = dune_imperium::kActionBuyImperiumRow0 + 1;

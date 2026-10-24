@@ -198,17 +198,7 @@ void TestFamilyAtomicsEngineStateLogic() {
   impl->SetCurrentPlayerForTesting((p0 + 1) % 4);
   Check(!impl->IsPlayerInRevealTurn(p0), "after turn advances: IsPlayerInRevealTurn(p0) is FALSE");
 
-  // (4) In kRevealTurns:
-  impl->SetCurrentPlayerForTesting(p0);
-  // Temporarily set phase to kRevealTurns:
-  impl->SetPhaseForTesting(open_spiel::dune_imperium::GamePhase::kRevealTurns);
-  impl->SetRevealDoneForTesting(p0, false);
-  Check(impl->IsPlayerInRevealTurn(p0), "in kRevealTurns with !reveal_done: IsPlayerInRevealTurn(p0) is TRUE");
-
-  impl->SetRevealDoneForTesting(p0, true);
-  Check(!impl->IsPlayerInRevealTurn(p0), "in kRevealTurns with reveal_done: IsPlayerInRevealTurn(p0) is FALSE");
-
-  // (5) In kCombat:
+  // (4) In kCombat:
   impl->SetPhaseForTesting(open_spiel::dune_imperium::GamePhase::kCombat);
   Check(!impl->IsPlayerInRevealTurn(p0), "in kCombat: IsPlayerInRevealTurn(p0) is FALSE");
 

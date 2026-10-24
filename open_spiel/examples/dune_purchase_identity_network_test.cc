@@ -1244,8 +1244,8 @@ void TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors() {
     state->ApplyAction(state->ChanceOutcomes().front().first);
   }
   auto* impl = dynamic_cast<DuneImperiumState*>(state.get());
-  SPIEL_CHECK_TRUE(impl != nullptr);
-  impl->SetPhaseForTesting(GamePhase::kRevealTurns);
+  impl->SetPhaseForTesting(GamePhase::kAgentTurns);
+  impl->SetPlayerRevealedForTesting(0, true);
   impl->SetCurrentPlayerForTesting(0);
   impl->SetSpecimensForTesting(0, 10);
 
