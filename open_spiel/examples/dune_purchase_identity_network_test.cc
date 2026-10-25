@@ -19,7 +19,9 @@
 #include "dune_compound_turn_search.h"
 #include "dune_opponent_pool.h"
 #include "dune_ppo_training_utils.h"
+#include "dune_ppo_training_flags.h"
 #include "dune_sha256.h"
+#include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -1608,6 +1610,82 @@ void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
     SPIEL_CHECK_EQ(
         open_spiel::ValidateResumeDeckPoolSemanticsOrDie(default_legacy_manifest_obj, "legacy"),
         "legacy");
+
+    // Test one-time deck_pool_semantics resume transition:
+    // a) Fails without allow_deck_pool_semantics_transition
+    // b) Passes on segment 1 (global_update=34350 == source_update=34350)
+    // c) Fails on later update (legacy at 34400 or already transitioned at 34400)
+    {
+      absl::SetFlag(&FLAGS_allow_deck_pool_semantics_transition, false);
+      absl::SetFlag(&FLAGS_deck_pool_semantics_transition_source_update, -1);
+
+      json::Object legacy_u34350;
+      legacy_u34350["global_update"] = 34350;
+      // no deck_pool_semantics key -> defaults to "legacy"
+
+      // a) Fails without allow_deck_pool_semantics_transition
+      bool caught_no_trans = false;
+      open_spiel::SetErrorHandler(ThrowingErrorHandler);
+      try {
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(legacy_u34350, "fixed");
+      } catch (const std::exception& e) {
+        caught_no_trans = true;
+      }
+      open_spiel::SetErrorHandler(ExitingErrorHandler);
+      SPIEL_CHECK_TRUE(caught_no_trans);
+
+      // b) Passes on segment 1
+      absl::SetFlag(&FLAGS_allow_deck_pool_semantics_transition, true);
+      absl::SetFlag(&FLAGS_deck_pool_semantics_transition_source_update, 34350);
+      std::string validated_sem = open_spiel::ValidateResumeDeckPoolSemanticsOrDie(legacy_u34350, "fixed");
+      SPIEL_CHECK_EQ(validated_sem, "legacy");
+
+      // c1) Fails on later update with legacy manifest (global_update=34400 != source_update=34350)
+      json::Object legacy_u34400;
+      legacy_u34400["global_update"] = 34400;
+      bool caught_later_mismatch = false;
+      open_spiel::SetErrorHandler(ThrowingErrorHandler);
+      try {
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(legacy_u34400, "fixed");
+      } catch (const std::exception& e) {
+        caught_later_mismatch = true;
+      }
+      open_spiel::SetErrorHandler(ExitingErrorHandler);
+      SPIEL_CHECK_TRUE(caught_later_mismatch);
+
+      // c2) Fails on post-transition manifest at global_update=34400 with transition keys present
+      json::Object transitioned_manifest_obj;
+      transitioned_manifest_obj["global_update"] = 34400;
+      transitioned_manifest_obj["deck_pool_semantics"] = "fixed";
+      transitioned_manifest_obj["deck_pool_semantics_transition_source_update"] = 34350;
+      bool caught_already_transitioned = false;
+      open_spiel::SetErrorHandler(ThrowingErrorHandler);
+      try {
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(transitioned_manifest_obj, "fixed");
+      } catch (const std::exception& e) {
+        caught_already_transitioned = true;
+      }
+      open_spiel::SetErrorHandler(ExitingErrorHandler);
+      SPIEL_CHECK_TRUE(caught_already_transitioned);
+
+      // c3) Fails when manifest semantics already match flag semantics under allow_transition
+      json::Object fixed_manifest_obj;
+      fixed_manifest_obj["global_update"] = 34400;
+      fixed_manifest_obj["deck_pool_semantics"] = "fixed";
+      bool caught_matching_sem = false;
+      open_spiel::SetErrorHandler(ThrowingErrorHandler);
+      try {
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(fixed_manifest_obj, "fixed");
+      } catch (const std::exception& e) {
+        caught_matching_sem = true;
+      }
+      open_spiel::SetErrorHandler(ExitingErrorHandler);
+      SPIEL_CHECK_TRUE(caught_matching_sem);
+
+      // Reset absl flags back to defaults
+      absl::SetFlag(&FLAGS_allow_deck_pool_semantics_transition, false);
+      absl::SetFlag(&FLAGS_deck_pool_semantics_transition_source_update, -1);
+    }
 
     // Warm-start override: update model's deck_pool_semantics_ to target_semantics
     model->deck_pool_semantics_ = target_semantics;

@@ -27,6 +27,13 @@ ABSL_FLAG(std::string, market_appendix_mode, "none",
           "or 'full_public_information_v4' (9941).");
 ABSL_FLAG(std::string, deck_pool_semantics, "fixed",
           "Observation semantics for deck pool features: 'fixed' (default) or 'legacy'.");
+ABSL_FLAG(bool, allow_deck_pool_semantics_transition, false,
+          "Permit a one-time deck_pool_semantics transition on resume at the source update.");
+ABSL_FLAG(std::string, deck_pool_semantics_transition_source_fingerprint, "",
+          "Expected source config fingerprint for deck_pool_semantics transition validation.");
+ABSL_FLAG(int64_t, deck_pool_semantics_transition_source_update, -1,
+          "Expected source global_update for one-time deck_pool_semantics transition.");
+ABSL_FLAG(int, start_update, 1, "Fallback start update for bootstrap mode.");
 ABSL_FLAG(bool, allow_market_appendix_transition, false,
           "Permit initializing a run from a checkpoint with a different market_appendix_mode.");
 ABSL_FLAG(std::string, market_appendix_transition_source_mode, "",

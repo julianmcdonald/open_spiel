@@ -727,7 +727,7 @@ ABSL_FLAG(std::string, init_mode, "",
           "Initialization mode (required): random, checkpoint, bootstrap, validate_legacy.");
 ABSL_FLAG(int, seed_scheme_version, 2, "Seed scheme version.");
 ABSL_FLAG(int, target_end_update, 2450, "Absolute target update number to train until.");
-ABSL_FLAG(int, start_update, 1, "Fallback start update for bootstrap mode.");
+// start_update is defined in dune_ppo_training_flags.cc
 ABSL_FLAG(uint64_t, start_env_steps, 0, "Fallback start environment steps for bootstrap mode.");
 ABSL_FLAG(uint64_t, start_episode_id, 0, "Fallback start episode ID for bootstrap mode.");
 ABSL_FLAG(std::string, diagnostics_path, "",
@@ -2313,6 +2313,102 @@ std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_deck_pool_semantics_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
+      manifest_obj, absl::GetFlag(FLAGS_deck_pool_semantics), "resume");
+
+  dune_imperium::DeckPoolSemantics source_sem = dune_imperium::DeckPoolSemantics::kLegacy;
+  auto sem_it = manifest_obj.find("deck_pool_semantics");
+  if (sem_it != manifest_obj.end() && sem_it->second.IsString()) {
+    source_sem = dune_imperium::ParseDeckPoolSemanticsOrDie(sem_it->second.GetString());
+  }
+
+  std::string source_mode = "";
+  auto mode_it = manifest_obj.find("market_appendix_mode");
+  if (mode_it != manifest_obj.end() && mode_it->second.IsString()) {
+    source_mode = mode_it->second.GetString();
+  } else {
+    source_mode = absl::GetFlag(FLAGS_market_appendix_mode);
+  }
+  if (source_mode.empty()) {
+    source_mode = "none";
+  }
+
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+
+  if (source_mode == "full_public_information_v4" ||
+      source_mode == "full_public_information_v3" ||
+      source_mode == "ordered_card_slots_v2") {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::ParseMarketAppendixMode(source_mode), source_sem);
+    source_config_obj["market_appendix_mode"] = source_mode;
+    source_config_obj["observation_dim"] = schema.size;
+    source_config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  } else if (source_mode == "none") {
+    source_config_obj.erase("market_appendix_mode");
+    source_config_obj.erase("observation_dim");
+    source_config_obj.erase("feature_schema_sha256");
+  }
+
+  if (source_sem == dune_imperium::DeckPoolSemantics::kFixed) {
+    source_config_obj["deck_pool_semantics"] = std::string("fixed");
+  } else {
+    source_config_obj.erase("deck_pool_semantics");
+  }
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_deck_pool_semantics_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_deck_pool_semantics_transition permits deck_pool_semantics to differ from parent manifest.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+
+  int64_t source_global_update = -1;
+  auto gu_it = manifest_obj.find("global_update");
+  if (gu_it != manifest_obj.end() && gu_it->second.IsInt()) {
+    source_global_update = gu_it->second.GetInt();
+  }
+
+  std::cout << absl::StrFormat(
+      "[deck_pool_semantics-transition] Validated intentional deck_pool_semantics transition:\n"
+      "  Source update:       %lld\n"
+      "  Source fingerprint:  %s\n"
+      "  Target fingerprint:  %s\n"
+      "  Deck pool semantics: '%s' -> '%s'\n",
+      static_cast<long long>(source_global_update),
+      computed_source_fp, current_config_fingerprint,
+      dune_imperium::DeckPoolSemanticsToString(source_sem),
+      absl::GetFlag(FLAGS_deck_pool_semantics)) << std::endl;
+  return computed_source_fp;
+}
+
 void UpdateEmaWeights(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
@@ -2505,6 +2601,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["market_appendix_transition_source_fingerprint"] = g_market_appendix_transition_source_fingerprint;
       if (g_market_appendix_transition_source_update >= 0) {
         manifest_obj["market_appendix_transition_source_update"] = g_market_appendix_transition_source_update;
+      }
+    }
+    if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
+      manifest_obj["deck_pool_semantics_transition_source_fingerprint"] = g_deck_pool_semantics_transition_source_fingerprint;
+      if (g_deck_pool_semantics_transition_source_update >= 0) {
+        manifest_obj["deck_pool_semantics_transition_source_update"] = g_deck_pool_semantics_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
@@ -10135,6 +10237,12 @@ int main(int argc, char** argv) {
                       ValidateAndComputeMarketAppendixTransitionFingerprint(manifest_path, config_fingerprint);
                   if (!permitted_transition_source_fingerprint.empty()) {
                     g_market_appendix_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                  } else {
+                    permitted_transition_source_fingerprint =
+                        ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(manifest_path, config_fingerprint);
+                    if (!permitted_transition_source_fingerprint.empty()) {
+                      g_deck_pool_semantics_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    }
                   }
                 }
               }
@@ -10188,6 +10296,9 @@ int main(int argc, char** argv) {
       }
       if (!g_market_appendix_transition_source_fingerprint.empty()) {
         g_market_appendix_transition_source_update = manifest.global_update;
+      }
+      if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
+        g_deck_pool_semantics_transition_source_update = manifest.global_update;
       }
     }
 
@@ -11158,6 +11269,12 @@ int main(int argc, char** argv) {
                         ValidateAndComputeMarketAppendixTransitionFingerprint(manifest_path, config_fingerprint);
                     if (!permitted_transition_source_fingerprint.empty()) {
                       g_market_appendix_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    } else {
+                      permitted_transition_source_fingerprint =
+                          ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(manifest_path, config_fingerprint);
+                      if (!permitted_transition_source_fingerprint.empty()) {
+                        g_deck_pool_semantics_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                      }
                     }
                   }
                 }
@@ -11208,6 +11325,9 @@ int main(int argc, char** argv) {
         }
         if (!g_market_appendix_transition_source_fingerprint.empty()) {
           g_market_appendix_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
+          g_deck_pool_semantics_transition_source_update = shared_manifest.global_update;
         }
       }
 

@@ -44,6 +44,8 @@ std::string g_pool_transition_source_fingerprint = "";
 int64_t g_pool_transition_source_update = -1;
 std::string g_market_appendix_transition_source_fingerprint = "";
 int64_t g_market_appendix_transition_source_update = -1;
+std::string g_deck_pool_semantics_transition_source_fingerprint = "";
+int64_t g_deck_pool_semantics_transition_source_update = -1;
 
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
@@ -452,8 +454,10 @@ bool ValidatePpoPrecisionManifestCompatibility(
 
 std::string ValidateResumeDeckPoolSemanticsOrDie(
     const json::Object& manifest_obj,
-    absl::string_view flag_semantics,
-    absl::string_view resume_label) {
+    const std::string& flag_semantics,
+    const std::string& context_label,
+    bool allow_transition,
+    int64_t source_update) {
   std::string manifest_sem = "legacy";
   auto sem_it = manifest_obj.find("deck_pool_semantics");
   if (sem_it != manifest_obj.end() && sem_it->second.IsString()) {
@@ -461,11 +465,56 @@ std::string ValidateResumeDeckPoolSemanticsOrDie(
   }
   (void)dune_imperium::ParseDeckPoolSemanticsOrDie(manifest_sem);
   (void)dune_imperium::ParseDeckPoolSemanticsOrDie(flag_semantics);
-  if (manifest_sem != flag_semantics) {
-    SpielFatalError(absl::StrFormat(
-        "deck_pool_semantics mismatch on %s. Manifest: '%s', Flag: '%s'",
-        resume_label, manifest_sem, flag_semantics));
+
+  bool effective_allow =
+      allow_transition || absl::GetFlag(FLAGS_allow_deck_pool_semantics_transition);
+
+  int64_t effective_source_update = source_update;
+  if (effective_source_update < 0) {
+    effective_source_update = absl::GetFlag(FLAGS_deck_pool_semantics_transition_source_update);
   }
+  if (effective_source_update < 0 && absl::GetFlag(FLAGS_start_update) > 0) {
+    effective_source_update = absl::GetFlag(FLAGS_start_update);
+  }
+
+  if (!effective_allow) {
+    if (manifest_sem != flag_semantics) {
+      SpielFatalError(absl::StrFormat(
+          "deck_pool_semantics mismatch on %s. Manifest: '%s', Flag: '%s'",
+          context_label, manifest_sem, flag_semantics));
+    }
+    return manifest_sem;
+  }
+
+  // effective_allow is true. Validate one-time transition on segment 1.
+  if (manifest_obj.find("deck_pool_semantics_transition_source_update") != manifest_obj.end() ||
+      manifest_obj.find("deck_pool_semantics_transition_source_fingerprint") != manifest_obj.end()) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics transition on %s is invalid: deck_pool_semantics transition already occurred in a prior segment",
+        context_label));
+  }
+
+  int64_t manifest_update = -1;
+  auto up_it = manifest_obj.find("global_update");
+  if (up_it != manifest_obj.end() && up_it->second.IsInt()) {
+    manifest_update = up_it->second.GetInt();
+  }
+
+  if (effective_source_update < 0 || manifest_update < 0 ||
+      manifest_update != effective_source_update) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics transition on %s is only valid when manifest global_update (%lld) equals source_update (%lld)",
+        context_label, static_cast<long long>(manifest_update),
+        static_cast<long long>(effective_source_update)));
+  }
+
+  if (manifest_sem == flag_semantics) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics transition flag set on %s at update %lld, but manifest semantics ('%s') already match flag ('%s')",
+        context_label, static_cast<long long>(manifest_update),
+        manifest_sem, flag_semantics));
+  }
+
   return manifest_sem;
 }
 
@@ -1300,6 +1349,12 @@ void SaveDualCheckpoint(
       manifest_obj["market_appendix_transition_source_fingerprint"] = g_market_appendix_transition_source_fingerprint;
       if (g_market_appendix_transition_source_update >= 0) {
         manifest_obj["market_appendix_transition_source_update"] = g_market_appendix_transition_source_update;
+      }
+    }
+    if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
+      manifest_obj["deck_pool_semantics_transition_source_fingerprint"] = g_deck_pool_semantics_transition_source_fingerprint;
+      if (g_deck_pool_semantics_transition_source_update >= 0) {
+        manifest_obj["deck_pool_semantics_transition_source_update"] = g_deck_pool_semantics_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {

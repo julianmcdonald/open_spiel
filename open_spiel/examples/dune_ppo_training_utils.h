@@ -62,6 +62,8 @@ extern std::string g_pool_transition_source_fingerprint;
 extern int64_t g_pool_transition_source_update;
 extern std::string g_market_appendix_transition_source_fingerprint;
 extern int64_t g_market_appendix_transition_source_update;
+extern std::string g_deck_pool_semantics_transition_source_fingerprint;
+extern int64_t g_deck_pool_semantics_transition_source_update;
 
 namespace open_spiel {
 
@@ -1062,11 +1064,14 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
 
 // Reads the manifest's "deck_pool_semantics" field (defaulting to "legacy" when
 // absent), validates both manifest and flag semantics, and calls SpielFatalError
-// when they differ. Returns the validated semantics string.
+// when they differ (unless allow_transition is true at source_update). Returns
+// the validated semantics string.
 std::string ValidateResumeDeckPoolSemanticsOrDie(
     const json::Object& manifest_obj,
-    absl::string_view flag_semantics,
-    absl::string_view resume_label = "resume");
+    const std::string& flag_semantics,
+    const std::string& context_label = "resume",
+    bool allow_transition = false,
+    int64_t source_update = -1);
 
 // Verifies that manifest_path exists, is valid JSON, and that the referenced
 // model_path (and optional optim_path) match the file size and SHA256 recorded
