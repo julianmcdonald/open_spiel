@@ -289,6 +289,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"), py::arg("col"), py::arg("row"))
       .def("set_reserve_supply", &DuneImperiumState::SetReserveSupplyForTesting,
            py::arg("tsmf"), py::arg("al"))
+      .def("set_helena_reserved_cards",
+           &DuneImperiumState::SetHelenaReservedCardsForTesting,
+           py::arg("player"), py::arg("cards"))
+      .def("get_helena_reserved_cards",
+           &DuneImperiumState::GetHelenaReservedCards, py::arg("player"),
+           py::return_value_policy::reference_internal)
 
       // --- Getters (sync validation) ---
       .def("get_player_hand",
