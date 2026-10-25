@@ -591,6 +591,7 @@ int RunSmokeTest() {
   std::string ckpt_path = absl::GetFlag(FLAGS_model_checkpoint);
   auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_dim, num_blocks);
   if (!ckpt_path.empty() && std::filesystem::exists(ckpt_path)) {
+    open_spiel::RequireLegacy5580CheckpointOrDie(ckpt_path);
     torch::serialize::InputArchive archive;
     archive.load_from(ckpt_path, device);
     model_a->load(archive);
@@ -718,6 +719,8 @@ int RunVerifyParity() {
     std::cerr << "FATAL: Opponent model not found at " << opp_path << "\n";
     return 1;
   }
+  open_spiel::RequireLegacy5580CheckpointOrDie(cand_path);
+  open_spiel::RequireLegacy5580CheckpointOrDie(opp_path);
 
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
@@ -836,6 +839,8 @@ int RunCollect() {
 
   std::string cand_path = absl::GetFlag(FLAGS_model_checkpoint);
   std::string opp_path = absl::GetFlag(FLAGS_opponent_checkpoint);
+  open_spiel::RequireLegacy5580CheckpointOrDie(cand_path);
+  open_spiel::RequireLegacy5580CheckpointOrDie(opp_path);
 
   torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
 
@@ -993,6 +998,7 @@ int RunTrain() {
   std::string in_train = absl::GetFlag(FLAGS_input_train_jsonl);
   std::string in_heldout = absl::GetFlag(FLAGS_input_heldout_jsonl);
   std::string cand_path = absl::GetFlag(FLAGS_model_checkpoint);
+  open_spiel::RequireLegacy5580CheckpointOrDie(cand_path);
   std::string out_model = absl::GetFlag(FLAGS_output_model_path);
   std::string out_optim = absl::GetFlag(FLAGS_output_optim_path);
 

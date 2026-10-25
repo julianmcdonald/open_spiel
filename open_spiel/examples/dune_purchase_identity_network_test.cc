@@ -1568,24 +1568,46 @@ void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
     LoadModelCheckpointRobust(model, legacy_pt, torch::kCPU);
     SPIEL_CHECK_TRUE(model->deck_pool_semantics_ == DeckPoolSemantics::kLegacy);
 
-    // Verify resume mismatch check triggers when target deck_pool_semantics is fixed
     const DeckPoolSemantics target_semantics = DeckPoolSemantics::kFixed;
     const DeckPoolSemantics checkpoint_semantics = ReadCheckpointDeckPoolSemantics(legacy_pt);
     SPIEL_CHECK_TRUE(checkpoint_semantics == DeckPoolSemantics::kLegacy);
+
+    // Verify ValidateResumeDeckPoolSemanticsOrDie on legacy manifest and default manifest
+    const std::string legacy_json_path = (temp_dir / "ppo_model_2.json").string();
+    std::ifstream legacy_jf(legacy_json_path);
+    std::string legacy_content((std::istreambuf_iterator<char>(legacy_jf)),
+                               std::istreambuf_iterator<char>());
+    auto parsed_legacy_json = json::FromString(legacy_content);
+    SPIEL_CHECK_TRUE(parsed_legacy_json.has_value() && parsed_legacy_json->IsObject());
+    const json::Object legacy_manifest_obj = parsed_legacy_json->GetObject();
+    const json::Object default_legacy_manifest_obj;
+
     bool caught_resume_mismatch = false;
     open_spiel::SetErrorHandler(ThrowingErrorHandler);
     try {
-      if (checkpoint_semantics != target_semantics) {
-        SpielFatalError(absl::StrFormat(
-            "deck_pool_semantics mismatch on resume. Manifest: '%s', Flag: '%s'",
-            dune_imperium::DeckPoolSemanticsToString(checkpoint_semantics),
-            dune_imperium::DeckPoolSemanticsToString(target_semantics)));
-      }
+      open_spiel::ValidateResumeDeckPoolSemanticsOrDie(legacy_manifest_obj, "fixed");
     } catch (const std::exception& e) {
       caught_resume_mismatch = true;
     }
     open_spiel::SetErrorHandler(ExitingErrorHandler);
     SPIEL_CHECK_TRUE(caught_resume_mismatch);
+
+    bool caught_default_legacy_mismatch = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      open_spiel::ValidateResumeDeckPoolSemanticsOrDie(default_legacy_manifest_obj, "fixed");
+    } catch (const std::exception& e) {
+      caught_default_legacy_mismatch = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_default_legacy_mismatch);
+
+    SPIEL_CHECK_EQ(
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(legacy_manifest_obj, "legacy"),
+        "legacy");
+    SPIEL_CHECK_EQ(
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(default_legacy_manifest_obj, "legacy"),
+        "legacy");
 
     // Warm-start override: update model's deck_pool_semantics_ to target_semantics
     model->deck_pool_semantics_ = target_semantics;
@@ -1614,6 +1636,73 @@ void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
     // Verify ReadCheckpointDeckPoolSemantics parses it back as kFixed
     DeckPoolSemantics parsed_warmstart = ReadCheckpointDeckPoolSemantics(warmstart_pt);
     SPIEL_CHECK_TRUE(parsed_warmstart == DeckPoolSemantics::kFixed);
+
+    // Verify ValidateResumeDeckPoolSemanticsOrDie on warmstart manifest
+    auto parsed_warmstart_json = json::FromString(content);
+    SPIEL_CHECK_TRUE(parsed_warmstart_json.has_value() && parsed_warmstart_json->IsObject());
+    const json::Object warmstart_manifest_obj = parsed_warmstart_json->GetObject();
+    SPIEL_CHECK_EQ(
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(warmstart_manifest_obj, "fixed"),
+        "fixed");
+
+    bool caught_warmstart_mismatch = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      open_spiel::ValidateResumeDeckPoolSemanticsOrDie(warmstart_manifest_obj, "legacy");
+    } catch (const std::exception& e) {
+      caught_warmstart_mismatch = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_warmstart_mismatch);
+
+    // Verify RequireLegacy5580CheckpointOrDie and RequireLegacy5580ManifestOrDie
+    const std::string fixed_pt = (temp_dir / "ppo_model_1.pt").string();
+    const std::string missing_json_pt = (temp_dir / "missing_json.pt").string();
+
+    // 1. legacy_pt succeeds
+    RequireLegacy5580CheckpointOrDie(legacy_pt);
+
+    // 2. fixed_pt throws SpielFatalError
+    bool caught_fixed_legacy_check = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      RequireLegacy5580CheckpointOrDie(fixed_pt);
+    } catch (const std::exception& e) {
+      caught_fixed_legacy_check = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_fixed_legacy_check);
+
+    // 3. missing_json_pt throws SpielFatalError
+    bool caught_missing_json_legacy_check = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      RequireLegacy5580CheckpointOrDie(missing_json_pt);
+    } catch (const std::exception& e) {
+      caught_missing_json_legacy_check = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_missing_json_legacy_check);
+
+    // 4. RequireLegacy5580ManifestOrDie behavior
+    json::Object fixed_manifest;
+    fixed_manifest["deck_pool_semantics"] = std::string("fixed");
+    bool caught_fixed_manifest = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      RequireLegacy5580ManifestOrDie(fixed_manifest, "fixed_test");
+    } catch (const std::exception& e) {
+      caught_fixed_manifest = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_fixed_manifest);
+
+    json::Object legacy_manifest;
+    legacy_manifest["deck_pool_semantics"] = std::string("legacy");
+    RequireLegacy5580ManifestOrDie(legacy_manifest, "legacy_test");
+
+    json::Object empty_manifest;
+    RequireLegacy5580ManifestOrDie(empty_manifest, "empty_test");
   }
 
   // (g) Mixed 1-vs-3 game test with search
@@ -1746,11 +1835,12 @@ void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
         0, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kFixed);
     SPIEL_CHECK_TRUE(obs_seat0 == expected_obs0);
 
-    // Test RunCompoundTurnSearch with Seat 0 evaluator
-    auto search_res_0 = RunCompoundTurnSearch(
-        *s, /*search_player=*/0, batched_nn_fixed,
+    // Test CompoundRolloutSearchDecision with Seat 0 evaluator
+    TurnSearchTree tree0;
+    auto search_res_0 = dune_imperium::CompoundRolloutSearchDecision(
+        *s, /*search_player=*/0, &tree0, {batched_nn_fixed},
         /*top_k=*/2, /*rollouts_per_action=*/1, /*min_override_margin=*/0.15,
-        /*decision_seed=*/12345);
+        dune_imperium::TreeReuseMode::kTargetFill, /*decision_seed=*/12345);
     SPIEL_CHECK_NE(search_res_0.action, kInvalidAction);
 
     // Advance game state until Seat 1's turn
@@ -1773,19 +1863,28 @@ void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
         1, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kLegacy);
     SPIEL_CHECK_TRUE(obs_seat1 == expected_obs1);
 
-    // Test RunCompoundTurnSearch with Seat 1 evaluator
-    auto search_res_1 = RunCompoundTurnSearch(
-        *s, /*search_player=*/1, batched_nn_legacy,
+    // Test CompoundRolloutSearchDecision with Seat 1 evaluator
+    TurnSearchTree tree1;
+    auto search_res_1 = dune_imperium::CompoundRolloutSearchDecision(
+        *s, /*search_player=*/1, &tree1, {batched_nn_legacy},
         /*top_k=*/2, /*rollouts_per_action=*/1, /*min_override_margin=*/0.15,
-        /*decision_seed=*/54321);
+        dune_imperium::TreeReuseMode::kTargetFill, /*decision_seed=*/54321);
     SPIEL_CHECK_NE(search_res_1.action, kInvalidAction);
 
-    // Run EvaluateFixedSeatConfigurationBatched to completion
-    std::vector<std::shared_ptr<IGameEvaluator>> opponent_evaluators = {
-        b_eval_legacy, b_eval_legacy, b_eval_legacy};
-    auto final_returns = dune_opponent_pool::EvaluateFixedSeatConfigurationBatched(
-        *game, b_eval_fixed, opponent_evaluators, /*candidate_seat=*/0, /*seed=*/42);
-    SPIEL_CHECK_EQ(final_returns.size(), 4);
+    // Run SimulateMixedPoolRollout to completion
+    std::vector<PpoTransition> mixed_traj;
+    std::atomic<uint64_t> total_steps{0};
+    int game_len = dune_opponent_pool::SimulateMixedPoolRollout(
+        /*master=*/42, /*episode_id=*/0, *game,
+        b_eval_fixed,
+        {b_eval_legacy, b_eval_legacy, b_eval_legacy},
+        kFullPublicInformationStateSize,
+        /*pool_game_fraction=*/1.0,
+        /*pool_opponents_per_game=*/3,
+        &mixed_traj, &total_steps);
+    SPIEL_CHECK_GT(game_len, 0);
+    SPIEL_CHECK_GT(total_steps.load(), 0u);
+    SPIEL_CHECK_FALSE(mixed_traj.empty());
   }
 
   std::cout << "PASS: TestDeckPoolSemanticsIntegration\n";

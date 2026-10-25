@@ -1382,22 +1382,6 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
   }
   return result;
 }
-
-inline CompoundSearchDecisionResult RunCompoundTurnSearch(
-    const State& state,
-    Player search_player,
-    std::shared_ptr<BatchedNNEvaluator> evaluator,
-    int top_k = 3,
-    int rollouts_per_action = 4,
-    double min_override_margin = 0.15,
-    uint64_t decision_seed = 42) {
-  std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {evaluator};
-  return CompoundRolloutSearchDecision(
-      state, search_player, /*turn_tree=*/nullptr, evaluators,
-      top_k, rollouts_per_action, min_override_margin,
-      TreeReuseMode::kTargetFill, decision_seed);
-}
-
 }  // namespace dune_imperium
 }  // namespace open_spiel
 

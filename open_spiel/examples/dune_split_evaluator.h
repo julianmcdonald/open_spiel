@@ -129,12 +129,6 @@ class SplitPolicyValueEvaluator : public open_spiel::algorithms::Evaluator {
   const std::shared_ptr<open_spiel::algorithms::Evaluator>& value_source() const {
     return value_source_;
   }
-  const std::shared_ptr<open_spiel::algorithms::Evaluator>& PolicySource() const {
-    return policy_source_;
-  }
-  const std::shared_ptr<open_spiel::algorithms::Evaluator>& ValueSource() const {
-    return value_source_;
-  }
 
   dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
     if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {

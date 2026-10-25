@@ -1084,6 +1084,7 @@ inline bool InitializeVrpoPpoPilot(
     return false;
   };
   if (state == nullptr || actor == nullptr || q == nullptr ||
+      actor->deck_pool_semantics_ != dune_imperium::DeckPoolSemantics::kLegacy ||
       !ValidateVrpoPpoPilotStartupConfig(startup, error,
                                          layout.test_fixture) ||
       startup.origin_archive_sha256 != input_identity.combined_sha256 ||

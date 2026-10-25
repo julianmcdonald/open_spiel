@@ -132,9 +132,6 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
     return deck_pool_semantics_;
   }
-  void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
-    deck_pool_semantics_ = semantics;
-  }
   dune_imperium::MarketAppendixMode MarketMode() const {
     return market_mode_;
   }

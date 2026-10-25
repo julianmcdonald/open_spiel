@@ -185,6 +185,7 @@ int main(int argc, char** argv) {
       obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
       absl::GetFlag(FLAGS_num_blocks),
       absl::GetFlag(FLAGS_nonlinear_value_head));
+  open_spiel::RequireLegacy5580CheckpointOrDie(model_checkpoint);
   try {
     torch::load(model, model_checkpoint, device);
   } catch (const std::exception& e) {

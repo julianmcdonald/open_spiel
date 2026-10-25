@@ -10212,17 +10212,8 @@ int main(int argc, char** argv) {
                 manifest_mode, current_mode));
           }
         }
-        auto sem_it = obj.find("deck_pool_semantics");
-        std::string manifest_sem = "legacy";
-        if (sem_it != obj.end() && sem_it->second.IsString()) {
-          manifest_sem = sem_it->second.GetString();
-        }
-        std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
-        if (manifest_sem != current_sem) {
-          SpielFatalError(absl::StrFormat(
-              "deck_pool_semantics mismatch on resume. Manifest: '%s', Flag: '%s'",
-              manifest_sem, current_sem));
-        }
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
+            obj, absl::GetFlag(FLAGS_deck_pool_semantics), "resume");
       }
     }
 
@@ -11062,17 +11053,8 @@ int main(int argc, char** argv) {
       auto m_json = json::FromString(m_text);
       if (m_json.has_value() && m_json->IsObject()) {
         const auto& obj = m_json->GetObject();
-        auto sem_it = obj.find("deck_pool_semantics");
-        std::string manifest_sem = "legacy";
-        if (sem_it != obj.end() && sem_it->second.IsString()) {
-          manifest_sem = sem_it->second.GetString();
-        }
-        std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
-        if (manifest_sem != current_sem) {
-          SpielFatalError(absl::StrFormat(
-              "deck_pool_semantics mismatch on study_resume. Manifest: '%s', Flag: '%s'",
-              manifest_sem, current_sem));
-        }
+        open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
+            obj, absl::GetFlag(FLAGS_deck_pool_semantics), "study_resume");
       }
     }
 
@@ -11250,17 +11232,8 @@ int main(int argc, char** argv) {
                   manifest_mode, current_mode));
             }
           }
-          auto sem_it = obj.find("deck_pool_semantics");
-          std::string manifest_sem = "legacy";
-          if (sem_it != obj.end() && sem_it->second.IsString()) {
-            manifest_sem = sem_it->second.GetString();
-          }
-          std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
-          if (manifest_sem != current_sem) {
-            SpielFatalError(absl::StrFormat(
-                "deck_pool_semantics mismatch on study_resume. Manifest: '%s', Flag: '%s'",
-                manifest_sem, current_sem));
-          }
+          std::string manifest_sem = open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
+              obj, absl::GetFlag(FLAGS_deck_pool_semantics), "study_resume");
           if (current_mode != "none" && !absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
             auto it_schema = obj.find("feature_schema_sha256");
             std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";

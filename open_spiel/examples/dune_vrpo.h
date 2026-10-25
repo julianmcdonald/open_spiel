@@ -2149,6 +2149,12 @@ inline bool ValidateVrpoPhase4ManifestStrict(
     if (error != nullptr) *error = message;
     return false;
   };
+  auto it_dps = actual.find("deck_pool_semantics");
+  if (it_dps != actual.end() && it_dps->second.IsString() &&
+      dune_imperium::ParseDeckPoolSemanticsOrDie(it_dps->second.GetString()) !=
+          dune_imperium::DeckPoolSemantics::kLegacy) {
+    return fail("Legacy 5580 tool does not support fixed deck_pool_semantics checkpoint");
+  }
   std::string contract_error;
   if (!ValidateVrpoPhase4ArmConfig(config, &contract_error)) {
     return fail(contract_error);

@@ -444,6 +444,7 @@ inline bool ReadVrpoPhase4eExternalBinding(
       !ReadVrpoExpandedManifest(input_archive, manifest, error)) {
     return false;
   }
+  open_spiel::RequireLegacy5580ManifestOrDie(*manifest, input_archive.string());
   const auto contract_it = manifest->find("phase4_contract");
   if (contract_it == manifest->end() || !contract_it->second.IsObject()) {
     return fail("phase4e input has no strict phase4 contract");

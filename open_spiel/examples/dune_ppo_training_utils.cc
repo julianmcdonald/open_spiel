@@ -450,6 +450,25 @@ bool ValidatePpoPrecisionManifestCompatibility(
                  current_legacy_config_fingerprint));
 }
 
+std::string ValidateResumeDeckPoolSemanticsOrDie(
+    const json::Object& manifest_obj,
+    absl::string_view flag_semantics,
+    absl::string_view resume_label) {
+  std::string manifest_sem = "legacy";
+  auto sem_it = manifest_obj.find("deck_pool_semantics");
+  if (sem_it != manifest_obj.end() && sem_it->second.IsString()) {
+    manifest_sem = sem_it->second.GetString();
+  }
+  (void)dune_imperium::ParseDeckPoolSemanticsOrDie(manifest_sem);
+  (void)dune_imperium::ParseDeckPoolSemanticsOrDie(flag_semantics);
+  if (manifest_sem != flag_semantics) {
+    SpielFatalError(absl::StrFormat(
+        "deck_pool_semantics mismatch on %s. Manifest: '%s', Flag: '%s'",
+        resume_label, manifest_sem, flag_semantics));
+  }
+  return manifest_sem;
+}
+
 bool ParseAndValidateManifest(const std::string& manifest_path,
                               const std::string& model_path,
                               const std::string& optim_path,

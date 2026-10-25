@@ -184,6 +184,7 @@ void LoadCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                     const std::string& optim_path,
                     torch::Device device) {
   if (std::filesystem::exists(model_path)) {
+    open_spiel::RequireLegacy5580CheckpointOrDie(model_path);
     try {
       torch::load(model, model_path, device);
       std::cout << "Successfully loaded model weights from " << model_path << "\n";
@@ -1810,6 +1811,7 @@ int main(int argc, char** argv) {
             obs_size, opponent_hidden_dims[i], action_size, opponent_num_blocks[i]);
         opp_model->eval();
         
+        open_spiel::RequireLegacy5580CheckpointOrDie(opponent_paths[i]);
         try {
           torch::serialize::InputArchive archive;
           archive.load_from(opponent_paths[i], train_device);

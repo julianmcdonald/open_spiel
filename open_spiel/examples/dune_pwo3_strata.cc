@@ -271,6 +271,7 @@ std::shared_ptr<SharedDunePolicyValueNetImpl> LoadModel(
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
       obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
       absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
+  open_spiel::RequireLegacy5580CheckpointOrDie(path);
   try {
     torch::load(model, path, device);
   } catch (const std::exception& e) {

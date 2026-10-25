@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdint>
 
+#include "open_spiel/abseil-cpp/absl/strings/string_view.h"
 #include "open_spiel/spiel.h"       // Action, ActionsAndProbs
 #include "open_spiel/utils/json.h"  // json::Object for manifest online-collection state
 #include "dune_specimen_conversion.h"  // the single 741-752 conversion predicate
@@ -1058,6 +1059,14 @@ bool ParseAndValidateManifest(const std::string& manifest_path,
                               std::string& error_msg,
                               const std::string& current_legacy_config_fingerprint = "",
                               const std::string& permitted_transition_source_fingerprint = "");
+
+// Reads the manifest's "deck_pool_semantics" field (defaulting to "legacy" when
+// absent), validates both manifest and flag semantics, and calls SpielFatalError
+// when they differ. Returns the validated semantics string.
+std::string ValidateResumeDeckPoolSemanticsOrDie(
+    const json::Object& manifest_obj,
+    absl::string_view flag_semantics,
+    absl::string_view resume_label = "resume");
 
 // Verifies that manifest_path exists, is valid JSON, and that the referenced
 // model_path (and optional optim_path) match the file size and SHA256 recorded

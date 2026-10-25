@@ -393,35 +393,6 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     }
   }
 
-  std::shared_ptr<SharedDunePolicyValueNetImpl> CloneToDevice(torch::Device device) {
-    auto cloned = std::make_shared<SharedDunePolicyValueNetImpl>(
-        input_layer->weight.size(1),
-        input_layer->weight.size(0),
-        policy_head->weight.size(0),
-        res_blocks.size(),
-        use_nonlinear_value_head_,
-        has_aux_heads_,
-        0,
-        with_semantic_scorer_,
-        enable_zone_encoder_,
-        semantic_descriptor_schema_);
-    cloned->market_appendix_mode_ = market_appendix_mode_;
-    cloned->deck_pool_semantics_ = deck_pool_semantics_;
-    torch::NoGradGuard no_grad;
-    auto src_params = named_parameters();
-    for (auto& item : cloned->named_parameters()) {
-      auto* src = src_params.find(item.key());
-      if (src != nullptr) item.value().copy_(src->to(device));
-    }
-    auto src_bufs = named_buffers();
-    for (auto& item : cloned->named_buffers()) {
-      auto* src = src_bufs.find(item.key());
-      if (src != nullptr) item.value().copy_(src->to(device));
-    }
-    cloned->to(device);
-    return cloned;
-  }
-
   struct ModelOutputs {
     torch::Tensor logits;
     torch::Tensor values;
@@ -858,6 +829,35 @@ inline bool CheckpointHasSemanticScorer(const std::string& path, torch::Device d
   } catch (...) {
     return false;
   }
+}
+
+inline void RequireLegacy5580ManifestOrDie(const json::Object& object,
+                                          const std::string& context) {
+  auto it = object.find("deck_pool_semantics");
+  if (it != object.end() && it->second.IsString()) {
+    const auto sem = dune_imperium::ParseDeckPoolSemanticsOrDie(it->second.GetString());
+    if (sem != dune_imperium::DeckPoolSemantics::kLegacy) {
+      SpielFatalError("Legacy 5580 tool does not support fixed deck_pool_semantics checkpoint: " + context);
+    }
+  }
+}
+
+inline void RequireLegacy5580CheckpointOrDie(const std::string& checkpoint_path) {
+  std::filesystem::path metadata_path(checkpoint_path);
+  metadata_path.replace_extension(".json");
+  if (!std::filesystem::exists(metadata_path)) {
+    SpielFatalError("Missing checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  std::ifstream input(metadata_path);
+  if (!input) {
+    SpielFatalError("Cannot open checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  const std::string content((std::istreambuf_iterator<char>(input)), {});
+  const auto metadata = open_spiel::json::FromString(content);
+  if (!metadata || !metadata->IsObject()) {
+    SpielFatalError("Invalid checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  RequireLegacy5580ManifestOrDie(metadata->GetObject(), checkpoint_path);
 }
 
 inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
@@ -2005,9 +2005,6 @@ public:
     dune_imperium::DeckPoolSemantics DeckPoolSemantics() const override {
         return deck_pool_semantics_;
     }
-    void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
-        deck_pool_semantics_ = semantics;
-    }
     dune_imperium::MarketAppendixMode MarketMode() const override {
         if (model_ != nullptr) return model_->market_appendix_mode_;
         return dune_imperium::MarketAppendixMode::kNone;
@@ -2169,9 +2166,6 @@ public:
     std::shared_ptr<SharedDunePolicyValueNetImpl> Model() const { return model_; }
     dune_imperium::DeckPoolSemantics DeckPoolSemantics() const override {
         return deck_pool_semantics_;
-    }
-    void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
-        deck_pool_semantics_ = semantics;
     }
     dune_imperium::MarketAppendixMode MarketMode() const override {
         if (model_ != nullptr) return model_->market_appendix_mode_;

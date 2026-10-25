@@ -152,6 +152,7 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/utils/json.h"
 
+#include "dune_network.h"
 #include "dune_ppo_training_utils.h"  // ComputeLabelFnv1a / IsValidationLabel
 #include "dune_sha256.h"              // ComputeFileSHA256 / ComputeStringSHA256
 
@@ -836,6 +837,20 @@ int main(int argc, char** argv) {
               labels_path.substr(labels_path.size() - 3) != ".gz",
           "--labels_path must be a PLAIN .jsonl. Decompress labels.jsonl.gz "
           "first; this binary links no decompressor.");
+
+  const std::filesystem::path corpus_manifest_path =
+      std::filesystem::path(labels_path).parent_path() / "manifest.json";
+  if (std::filesystem::exists(corpus_manifest_path)) {
+    std::ifstream mf(corpus_manifest_path);
+    if (mf) {
+      const std::string mstr((std::istreambuf_iterator<char>(mf)),
+                             std::istreambuf_iterator<char>());
+      const auto mval = open_spiel::json::FromString(mstr);
+      if (mval && mval->IsObject()) {
+        open_spiel::RequireLegacy5580ManifestOrDie(mval->GetObject(), labels_path);
+      }
+    }
+  }
 
   std::filesystem::create_directories(out_dir);
   const std::filesystem::path pack_dir = std::filesystem::path(out_dir) / "search_labels";

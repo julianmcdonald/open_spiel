@@ -33,6 +33,7 @@ void RunDiagnostic(const std::string& model_checkpoint,
                    int num_games,
                    int hidden_dim,
                    int num_blocks) {
+  open_spiel::RequireLegacy5580CheckpointOrDie(model_checkpoint);
   std::shared_ptr<const Game> game = LoadGame("dune_imperium");
   int64_t obs_size = game->InformationStateTensorSize();
   int64_t action_size = game->NumDistinctActions();

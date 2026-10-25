@@ -43,6 +43,7 @@ std::shared_mutex g_sync_mutex;
 std::string g_actor_sha256;
 
 void InitializeActor(const std::string& path, const torch::Device& device, int batch_size, int timeout_ms) {
+  open_spiel::RequireLegacy5580CheckpointOrDie(path);
   std::cout << "Loading frozen actor from: " << path << std::endl;
   g_actor_sha256 = ComputeFileSHA256(path);
   std::cout << "Actor SHA256: " << g_actor_sha256 << std::endl;

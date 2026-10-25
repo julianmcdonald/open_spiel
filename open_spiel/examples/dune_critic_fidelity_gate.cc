@@ -2386,6 +2386,7 @@ int main(int argc, char** argv) {
     std::cout << "[Self Test] Bypassing model loading, using MockEvaluator\n";
     global_evaluator = std::make_shared<MockEvaluator>();
   } else {
+    open_spiel::RequireLegacy5580CheckpointOrDie(model_checkpoint);
     torch::Device device = torch::cuda::is_available() ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU);
     std::cout << "Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
     model = std::make_shared<SharedDunePolicyValueNetImpl>(

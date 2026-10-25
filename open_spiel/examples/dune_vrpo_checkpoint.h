@@ -1120,6 +1120,7 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
   }
   json::Object manifest;
   if (!ReadVrpoExpandedManifest(directory, &manifest, error)) return false;
+  open_spiel::RequireLegacy5580ManifestOrDie(manifest, directory.string());
   const auto contract = manifest.find("phase4_contract");
   if (contract == manifest.end() || !contract->second.IsObject()) {
     return fail("expanded phase4 contract is missing or malformed");
@@ -1172,6 +1173,8 @@ inline bool LoadAndValidateVrpoExpandedCheckpoint(
       return fail(error == nullptr ? "expanded module placement restore failed"
                                    : *error);
     }
+    SPIEL_CHECK_TRUE(actor_model->deck_pool_semantics_ ==
+                     dune_imperium::DeckPoolSemantics::kLegacy);
     torch::load(*optimizers.actor, paths.actor_optimizer.string());
     torch::load(*optimizers.q, paths.q_optimizer.string());
     if (!vrpo_training_internal::MigrateAdamWOptimizerStateToParameterDevices(
