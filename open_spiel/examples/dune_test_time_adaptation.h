@@ -349,8 +349,13 @@ class TestTimeAdaptationController {
     }
     result.legal_actions = legal_actions;
 
+    auto market_mode = evaluator_ ? evaluator_->MarketMode() : dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    if (market_mode == dune_imperium::MarketAppendixMode::kNone) {
+      market_mode = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+    }
+    auto semantics = evaluator_ ? evaluator_->DeckPoolSemantics() : dune_imperium::DeckPoolSemantics::kLegacy;
     std::vector<float> obs = dune->InformationStateTensorWithAppendix(
-        player, dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
+        player, market_mode, semantics);
     torch::Tensor obs_tensor = torch::from_blob(
         obs.data(), {1, static_cast<int64_t>(obs.size())}, torch::kFloat32).to(device_);
     torch::Tensor mask_tensor = torch::zeros({1, 2391}, torch::TensorOptions().dtype(torch::kBool).device(device_));

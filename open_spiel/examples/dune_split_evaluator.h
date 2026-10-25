@@ -59,6 +59,8 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 #include "open_spiel/algorithms/mcts.h"
+#include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
 
 namespace open_spiel {
 
@@ -126,6 +128,42 @@ class SplitPolicyValueEvaluator : public open_spiel::algorithms::Evaluator {
   }
   const std::shared_ptr<open_spiel::algorithms::Evaluator>& value_source() const {
     return value_source_;
+  }
+  const std::shared_ptr<open_spiel::algorithms::Evaluator>& PolicySource() const {
+    return policy_source_;
+  }
+  const std::shared_ptr<open_spiel::algorithms::Evaluator>& ValueSource() const {
+    return value_source_;
+  }
+
+  dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
+    if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
+      return nn->DeckPoolSemantics();
+    }
+    if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(policy_source_.get())) {
+      return batched->DeckPoolSemantics();
+    }
+    return dune_imperium::DeckPoolSemantics::kLegacy;
+  }
+
+  dune_imperium::MarketAppendixMode MarketMode() const {
+    if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
+      return nn->MarketMode();
+    }
+    if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(policy_source_.get())) {
+      return batched->MarketMode();
+    }
+    return dune_imperium::MarketAppendixMode::kNone;
+  }
+
+  std::vector<float> GetConsumedObservation(const State& state, Player player) const {
+    if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
+      return nn->GetConsumedObservation(state, player);
+    }
+    if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(policy_source_.get())) {
+      return batched->GetConsumedObservation(state, player);
+    }
+    return {};
   }
 
  private:

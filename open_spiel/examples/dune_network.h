@@ -230,6 +230,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   bool enable_zone_encoder_ = false;
   std::shared_ptr<ZoneEncoderImpl> zone_encoder_{nullptr};
   dune_imperium::MarketAppendixMode market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
+  dune_imperium::DeckPoolSemantics deck_pool_semantics_ = dune_imperium::DeckPoolSemantics::kLegacy;
   std::string semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
 
   SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false, bool enable_zone_encoder = false, std::string semantic_descriptor_schema = "") {
@@ -390,6 +391,35 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
       zone_encoder_ = std::make_shared<ZoneEncoderImpl>();
       register_module("zone_encoder", zone_encoder_);
     }
+  }
+
+  std::shared_ptr<SharedDunePolicyValueNetImpl> CloneToDevice(torch::Device device) {
+    auto cloned = std::make_shared<SharedDunePolicyValueNetImpl>(
+        input_layer->weight.size(1),
+        input_layer->weight.size(0),
+        policy_head->weight.size(0),
+        res_blocks.size(),
+        use_nonlinear_value_head_,
+        has_aux_heads_,
+        0,
+        with_semantic_scorer_,
+        enable_zone_encoder_,
+        semantic_descriptor_schema_);
+    cloned->market_appendix_mode_ = market_appendix_mode_;
+    cloned->deck_pool_semantics_ = deck_pool_semantics_;
+    torch::NoGradGuard no_grad;
+    auto src_params = named_parameters();
+    for (auto& item : cloned->named_parameters()) {
+      auto* src = src_params.find(item.key());
+      if (src != nullptr) item.value().copy_(src->to(device));
+    }
+    auto src_bufs = named_buffers();
+    for (auto& item : cloned->named_buffers()) {
+      auto* src = src_bufs.find(item.key());
+      if (src != nullptr) item.value().copy_(src->to(device));
+    }
+    cloned->to(device);
+    return cloned;
   }
 
   struct ModelOutputs {
@@ -638,76 +668,84 @@ inline void LoadModelCheckpointRobust(
     json_path = candidate_json_paths[1];
     jf.open(json_path);
   }
-  if (jf.good()) {
-    sidecar_found = true;
-    std::string jstr((std::istreambuf_iterator<char>(jf)),
-                     std::istreambuf_iterator<char>());
-    auto jval = open_spiel::json::FromString(jstr);
-    if (!jval.has_value() || !jval->IsObject()) {
-      SpielFatalError("LoadModelCheckpointRobust: Malformed sidecar JSON in " + json_path);
+  if (!jf.good()) {
+    SpielFatalError(absl::StrCat("Missing checkpoint sidecar JSON: ", json_path));
+  }
+  sidecar_found = true;
+  std::string jstr((std::istreambuf_iterator<char>(jf)),
+                   std::istreambuf_iterator<char>());
+  auto jval = open_spiel::json::FromString(jstr);
+  if (!jval.has_value() || !jval->IsObject()) {
+    SpielFatalError("LoadModelCheckpointRobust: Malformed sidecar JSON in " + json_path);
+  }
+  const auto& dict = jval->GetObject();
+  auto it_sds = dict.find("semantic_descriptor_schema");
+  if (it_sds != dict.end() && it_sds->second.IsString()) {
+    sds_found = it_sds->second.GetString();
+    if (sds_found != dune_semantic::kDescriptorSchemaVersionV2 &&
+        sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
+        sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                      " has invalid semantic_descriptor_schema ('" + sds_found + "')");
     }
-    const auto& dict = jval->GetObject();
-    auto it_sds = dict.find("semantic_descriptor_schema");
-    if (it_sds != dict.end() && it_sds->second.IsString()) {
-      sds_found = it_sds->second.GetString();
-      if (sds_found != dune_semantic::kDescriptorSchemaVersionV2 &&
-          sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
-          sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
-        SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
-                        " has invalid semantic_descriptor_schema ('" + sds_found + "')");
-      }
-      if (sds_found == dune_semantic::kDescriptorSchemaVersionV4 ||
-          model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
-        model->SetSemanticDescriptorSchema(sds_found);
-      }
+    if (sds_found == dune_semantic::kDescriptorSchemaVersionV4 ||
+        model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
+      model->SetSemanticDescriptorSchema(sds_found);
     }
+  }
 
-    auto it_eze = dict.find("enable_zone_encoder");
-    if (it_eze != dict.end()) {
-      bool enabled = (it_eze->second.IsBool() && it_eze->second.GetBool()) ||
-                     (it_eze->second.IsString() && it_eze->second.GetString() == "true");
-      if (enabled) {
-        model->EnableZoneEncoder();
-      } else {
-        model->enable_zone_encoder_ = false;
-      }
+  auto it_eze = dict.find("enable_zone_encoder");
+  if (it_eze != dict.end()) {
+    bool enabled = (it_eze->second.IsBool() && it_eze->second.GetBool()) ||
+                   (it_eze->second.IsString() && it_eze->second.GetString() == "true");
+    if (enabled) {
+      model->EnableZoneEncoder();
+    } else {
+      model->enable_zone_encoder_ = false;
     }
+  }
 
-    auto it_ess = dict.find("enable_semantic_scorer");
-    if (it_ess != dict.end()) {
-      bool enabled = (it_ess->second.IsBool() && it_ess->second.GetBool()) ||
-                     (it_ess->second.IsString() && it_ess->second.GetString() == "true");
-      if (enabled && sds_found.empty()) {
-        SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
-                        " has enable_semantic_scorer=true but missing or invalid semantic_descriptor_schema");
-      }
+  auto it_ess = dict.find("enable_semantic_scorer");
+  if (it_ess != dict.end()) {
+    bool enabled = (it_ess->second.IsBool() && it_ess->second.GetBool()) ||
+                   (it_ess->second.IsString() && it_ess->second.GetString() == "true");
+    if (enabled && sds_found.empty()) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                      " has enable_semantic_scorer=true but missing or invalid semantic_descriptor_schema");
     }
+  }
 
-    auto it_mode = dict.find("market_appendix_mode");
-    if (it_mode != dict.end() && it_mode->second.IsString()) {
-      mode_found = dune_imperium::ParseMarketAppendixMode(it_mode->second.GetString());
-      model->market_appendix_mode_ = mode_found;
+  auto it_mode = dict.find("market_appendix_mode");
+  if (it_mode != dict.end() && it_mode->second.IsString()) {
+    mode_found = dune_imperium::ParseMarketAppendixMode(it_mode->second.GetString());
+    model->market_appendix_mode_ = mode_found;
+  }
+
+  dune_imperium::DeckPoolSemantics resolved_semantics = dune_imperium::DeckPoolSemantics::kLegacy;
+  auto it_dps = dict.find("deck_pool_semantics");
+  if (it_dps != dict.end() && it_dps->second.IsString()) {
+    resolved_semantics = dune_imperium::ParseDeckPoolSemanticsOrDie(it_dps->second.GetString());
+  }
+  model->deck_pool_semantics_ = resolved_semantics;
+
+  auto it_hash = dict.find("feature_schema_sha256");
+  if (it_hash != dict.end() && it_hash->second.IsString()) {
+    feature_schema_sha = it_hash->second.GetString();
+  }
+
+  auto it_obs = dict.find("observation_dim");
+  if (it_obs != dict.end()) {
+    obs_dim_found = true;
+    int64_t obs_dim = -1;
+    if (it_obs->second.IsInt()) {
+      obs_dim = it_obs->second.GetInt();
+    } else if (it_obs->second.IsString()) {
+      obs_dim = std::stoll(it_obs->second.GetString());
     }
-
-    auto it_hash = dict.find("feature_schema_sha256");
-    if (it_hash != dict.end() && it_hash->second.IsString()) {
-      feature_schema_sha = it_hash->second.GetString();
-    }
-
-    auto it_obs = dict.find("observation_dim");
-    if (it_obs != dict.end()) {
-      obs_dim_found = true;
-      int64_t obs_dim = -1;
-      if (it_obs->second.IsInt()) {
-        obs_dim = it_obs->second.GetInt();
-      } else if (it_obs->second.IsString()) {
-        obs_dim = std::stoll(it_obs->second.GetString());
-      }
-      if (obs_dim != expected_input_dim) {
-        SpielFatalError("LoadModelCheckpointRobust: Declared observation_dim (" +
-                        std::to_string(obs_dim) + ") does not match model input dimension (" +
-                        std::to_string(expected_input_dim) + ") in " + path);
-      }
+    if (obs_dim != expected_input_dim) {
+      SpielFatalError("LoadModelCheckpointRobust: Declared observation_dim (" +
+                      std::to_string(obs_dim) + ") does not match model input dimension (" +
+                      std::to_string(expected_input_dim) + ") in " + path);
     }
   }
 
@@ -730,6 +768,7 @@ inline void LoadModelCheckpointRobust(
     }
   }
 
+  const auto schema = dune_imperium::GetInformationStateSchema(mode_found, resolved_semantics);
   if (dune_imperium::IsExtendedInformationStateSize(expected_input_dim)) {
     if (!sidecar_found) {
       SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires valid sidecar metadata: " + path);
@@ -740,7 +779,6 @@ inline void LoadModelCheckpointRobust(
     if (mode_found == dune_imperium::MarketAppendixMode::kNone) {
       SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint requires explicit market_appendix_mode: " + path);
     }
-    const auto schema = dune_imperium::GetInformationStateSchema(mode_found);
     if (expected_input_dim != schema.size) {
       SpielFatalError("LoadModelCheckpointRobust: Input dimension mismatch with schema in " + path);
     }
@@ -748,6 +786,18 @@ inline void LoadModelCheckpointRobust(
       SpielFatalError("LoadModelCheckpointRobust: Extended checkpoint " + path +
                       " requires valid feature_schema_sha256 matching schema ('" +
                       schema.sha256 + "')");
+    }
+  } else if (!feature_schema_sha.empty() && feature_schema_sha != schema.sha256) {
+    SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                    " requires valid feature_schema_sha256 matching schema ('" +
+                    schema.sha256 + "')");
+  }
+  auto it_label = dict.find("feature_schema_label");
+  if (it_label != dict.end() && it_label->second.IsString()) {
+    if (it_label->second.GetString() != schema.label) {
+      SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
+                      " feature_schema_label mismatch: got '" + it_label->second.GetString() +
+                      "', expected '" + schema.label + "'");
     }
   }
 
@@ -1801,6 +1851,12 @@ public:
     virtual std::string SemanticDescriptorSchema() const {
         return dune_semantic::kDescriptorSchemaVersionV3;
     }
+    virtual dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
+        return dune_imperium::DeckPoolSemantics::kLegacy;
+    }
+    virtual dune_imperium::MarketAppendixMode MarketMode() const {
+        return dune_imperium::MarketAppendixMode::kNone;
+    }
 };
 
 class DeterministicEvaluator : public IGameEvaluator {
@@ -1813,6 +1869,9 @@ public:
                            bool rollout_amp = true)
         : model_(model), critic_model_(critic_model), device_(device), mutex_(mutex),
           sync_mutex_(sync_mutex), rollout_amp_(rollout_amp) {
+        if (model_) {
+            deck_pool_semantics_ = model_->deck_pool_semantics_;
+        }
         model_input_dim_ = model_->input_layer->weight.size(1);
         action_dim_ = model_->policy_head->weight.size(0);
         if (dune_imperium::IsFullPublicInformationStateSize(model_input_dim_)) {
@@ -1943,6 +2002,17 @@ public:
         return s;
     }
 
+    dune_imperium::DeckPoolSemantics DeckPoolSemantics() const override {
+        return deck_pool_semantics_;
+    }
+    void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
+        deck_pool_semantics_ = semantics;
+    }
+    dune_imperium::MarketAppendixMode MarketMode() const override {
+        if (model_ != nullptr) return model_->market_appendix_mode_;
+        return dune_imperium::MarketAppendixMode::kNone;
+    }
+
 private:
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model_{nullptr};
@@ -1952,6 +2022,7 @@ private:
     int64_t model_input_dim_;
     int64_t action_dim_;
     bool rollout_amp_{true};
+    dune_imperium::DeckPoolSemantics deck_pool_semantics_ = dune_imperium::DeckPoolSemantics::kLegacy;
     // Per-instance staging buffers, allocated lazily under mutex_ and freed once
     // by the owning (main) thread at destruction. Replaces the thread_local map
     // whose 64-way concurrent pinned-tensor free at thread exit segfaulted libcuda.
@@ -2051,7 +2122,10 @@ public:
           high_priority_stream_(high_priority_stream),
           emit_batch_membership_(emit_batch_membership),
           rollout_amp_(rollout_amp), allow_tf32_(allow_tf32),
-          stop_(false) {
+        stop_(false) {
+        if (model_) {
+            deck_pool_semantics_ = model_->deck_pool_semantics_;
+        }
 
         // Dynamically get the input layer dimension from the model's weights
         model_input_dim_ = model_->input_layer->weight.size(1);
@@ -2093,7 +2167,13 @@ public:
     bool AllowTf32ForTesting() const { return allow_tf32_; }
     int64_t ModelInputDim() const { return model_input_dim_; }
     std::shared_ptr<SharedDunePolicyValueNetImpl> Model() const { return model_; }
-    dune_imperium::MarketAppendixMode MarketMode() const {
+    dune_imperium::DeckPoolSemantics DeckPoolSemantics() const override {
+        return deck_pool_semantics_;
+    }
+    void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
+        deck_pool_semantics_ = semantics;
+    }
+    dune_imperium::MarketAppendixMode MarketMode() const override {
         if (model_ != nullptr) return model_->market_appendix_mode_;
         return dune_imperium::MarketAppendixMode::kNone;
     }
@@ -2632,6 +2712,7 @@ private:
 
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model_{nullptr};
+    dune_imperium::DeckPoolSemantics deck_pool_semantics_{dune_imperium::DeckPoolSemantics::kLegacy};
     int target_batch_size_;
     int timeout_ms_;
     torch::Device device_;

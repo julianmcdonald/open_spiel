@@ -23,6 +23,9 @@
 #include "dune_ppo_training_utils.h"       // CenterAndCapLogitsTensor
 #include "dune_seed_utils.h"
 #include "dune_sha256.h"
+#include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
+#include "dune_split_evaluator.h"
 
 namespace open_spiel {
 namespace {
@@ -1367,8 +1370,20 @@ void SearchPiGenerator::GenerateGeneration(
                                                  : res.diagnostics.raw_priors;
 
           SearchPiRow row;
-          row.observation = provides_istate ? state->InformationStateTensor(cur)
-                                            : state->ObservationTensor(cur);
+          if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(search_evaluator.get())) {
+            row.observation = nn->GetConsumedObservation(*state, cur);
+          } else if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(search_evaluator.get())) {
+            row.observation = batched->GetConsumedObservation(*state, cur);
+          } else if (const auto* split = dynamic_cast<const SplitPolicyValueEvaluator*>(search_evaluator.get())) {
+            row.observation = split->GetConsumedObservation(*state, cur);
+          } else if (const auto* b_nn = dynamic_cast<const DuneNNEvaluator*>(behavior_evaluator.get())) {
+            row.observation = b_nn->GetConsumedObservation(*state, cur);
+          } else if (const auto* b_batched = dynamic_cast<const BatchedNNEvaluator*>(behavior_evaluator.get())) {
+            row.observation = b_batched->GetConsumedObservation(*state, cur);
+          } else {
+            row.observation = provides_istate ? state->InformationStateTensor(cur)
+                                              : state->ObservationTensor(cur);
+          }
           row.observation_is_information_state = provides_istate;
           row.player = cur;
           row.role = role;

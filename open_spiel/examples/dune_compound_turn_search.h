@@ -947,10 +947,11 @@ inline std::vector<double> ComputeMpoRelativeTarget(
 inline std::vector<float> ExtractObservationTensor(
     const State& state,
     Player player,
-    dune_imperium::MarketAppendixMode mode = dune_imperium::MarketAppendixMode::kFullPublicInformationV3) {
+    dune_imperium::MarketAppendixMode mode = dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+    dune_imperium::DeckPoolSemantics deck_pool_semantics = dune_imperium::DeckPoolSemantics::kLegacy) {
   const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
-  if (dune && mode != dune_imperium::MarketAppendixMode::kNone) {
-    return dune->InformationStateTensorWithAppendix(player, mode);
+  if (dune) {
+    return dune->InformationStateTensorWithAppendix(player, mode, deck_pool_semantics);
   }
   return state.InformationStateTensor(player);
 }
@@ -1226,7 +1227,13 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
             agr_ex.observation = snap.observation;
             agr_ex.candidate_data = snap.candidate_data;
           } else {
-            agr_ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player);
+            const auto active_mode = (!evaluators.empty() && evaluators.front())
+                                         ? evaluators.front()->MarketMode()
+                                         : dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+            const auto active_semantics = (!evaluators.empty() && evaluators.front())
+                                              ? evaluators.front()->DeckPoolSemantics()
+                                              : dune_imperium::DeckPoolSemantics::kLegacy;
+            agr_ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player, active_mode, active_semantics);
             const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(snap.sim_state.get());
             if (dune_s) {
               const std::string cand_schema = (!evaluators.empty() && evaluators.front())
@@ -1269,7 +1276,13 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
           ex.observation = snap.observation;
           ex.candidate_data = snap.candidate_data;
         } else {
-          ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player);
+          const auto active_mode = (!evaluators.empty() && evaluators.front())
+                                       ? evaluators.front()->MarketMode()
+                                       : dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+          const auto active_semantics = (!evaluators.empty() && evaluators.front())
+                                            ? evaluators.front()->DeckPoolSemantics()
+                                            : dune_imperium::DeckPoolSemantics::kLegacy;
+          ex.observation = ExtractObservationTensor(*snap.sim_state, snap.player, active_mode, active_semantics);
           const auto* dune_s = dynamic_cast<const dune_imperium::DuneImperiumState*>(snap.sim_state.get());
           if (dune_s) {
             const std::string cand_schema = (!evaluators.empty() && evaluators.front())
@@ -1368,6 +1381,21 @@ inline SearchSupervisionResult BatchCompoundSearchSupervision(
     result.mean_target_prob_search_move = total_target_prob_search_move / result.examples.size();
   }
   return result;
+}
+
+inline CompoundSearchDecisionResult RunCompoundTurnSearch(
+    const State& state,
+    Player search_player,
+    std::shared_ptr<BatchedNNEvaluator> evaluator,
+    int top_k = 3,
+    int rollouts_per_action = 4,
+    double min_override_margin = 0.15,
+    uint64_t decision_seed = 42) {
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {evaluator};
+  return CompoundRolloutSearchDecision(
+      state, search_player, /*turn_tree=*/nullptr, evaluators,
+      top_k, rollouts_per_action, min_override_margin,
+      TreeReuseMode::kTargetFill, decision_seed);
 }
 
 }  // namespace dune_imperium

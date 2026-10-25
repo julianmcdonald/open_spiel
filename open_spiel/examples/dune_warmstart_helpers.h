@@ -184,7 +184,17 @@ inline bool CanAffordSwordmaster(const dune_imperium::DuneImperiumState& state,
 // feeds the same network must agree: sizing to InformationStateTensorSize while
 // filling via ObservationTensor overruns the engine's `offset == values.size()`
 // check and aborts the run.
-inline std::vector<float> NetworkObservation(const State& state, Player player) {
+inline std::vector<float> NetworkObservation(
+    const State& state, Player player,
+    dune_imperium::MarketAppendixMode market_mode = dune_imperium::MarketAppendixMode::kNone,
+    dune_imperium::DeckPoolSemantics deck_pool_semantics = dune_imperium::DeckPoolSemantics::kLegacy) {
+  const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  if (dune_state != nullptr) {
+    const auto schema = dune_imperium::GetInformationStateSchema(market_mode, deck_pool_semantics);
+    std::vector<float> obs(schema.size, 0.0f);
+    dune_state->InformationStateTensorWithAppendix(player, market_mode, absl::MakeSpan(obs), deck_pool_semantics);
+    return obs;
+  }
   std::shared_ptr<const Game> game = state.GetGame();
   const bool provides_istate =
       game->GetType().provides_information_state_tensor;
@@ -573,7 +583,8 @@ inline double RolloutSwordmasterRace(
       if (cfg.use_policy_for_owner && evaluator != nullptr) {
         action = FindActionOrCardPathToSpace(*state, owner, dune_imperium::kActionAgentSpaceSwordmaster, rng);
         if (action == kInvalidAction) {
-          std::vector<float> obs = NetworkObservation(*state, cur_player);
+          std::vector<float> obs = NetworkObservation(
+              *state, cur_player, evaluator->MarketMode(), evaluator->DeckPoolSemantics());
           if (eval_requests_out) (*eval_requests_out)++;
           EvalResult res = evaluator->Evaluate(obs);
           std::vector<float> logits = std::move(res.logits);
@@ -603,7 +614,8 @@ inline double RolloutSwordmasterRace(
       }
       if (!block_taken) {
         if (cfg.use_policy_for_opponents && evaluator != nullptr) {
-          std::vector<float> obs = NetworkObservation(*state, cur_player);
+          std::vector<float> obs = NetworkObservation(
+              *state, cur_player, evaluator->MarketMode(), evaluator->DeckPoolSemantics());
           if (eval_requests_out) (*eval_requests_out)++;
           EvalResult res = evaluator->Evaluate(obs);
           std::vector<float> logits = std::move(res.logits);

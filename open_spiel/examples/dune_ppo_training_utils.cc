@@ -1220,13 +1220,14 @@ void SaveDualCheckpoint(
     manifest_obj["num_blocks"] = static_cast<int64_t>(actor_model->res_blocks.size());
     manifest_obj["observation_dim"] = static_cast<int64_t>(actor_model->input_layer->weight.size(1));
     manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
-    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
-      const auto schema = dune_imperium::GetInformationStateSchema(
-          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
-      if (static_cast<int64_t>(actor_model->input_layer->weight.size(1)) == schema.size) {
-        manifest_obj["feature_schema_label"] = std::string(schema.label);
-        manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
-      }
+    const auto resolved_deck_pool_semantics = dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
+    manifest_obj["deck_pool_semantics"] = dune_imperium::DeckPoolSemanticsToString(resolved_deck_pool_semantics);
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)),
+        resolved_deck_pool_semantics);
+    if (static_cast<int64_t>(actor_model->input_layer->weight.size(1)) == schema.size) {
+      manifest_obj["feature_schema_label"] = std::string(schema.label);
+      manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
     }
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
@@ -1347,22 +1348,107 @@ std::vector<std::pair<int64_t, int64_t>> ComputeAuxSlices(
   return out;
 }
 
-dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
-    const std::string& checkpoint_path, int input_dim) {
-  if (input_dim == dune_imperium::kLegacyInformationStateSize) {
-    return dune_imperium::MarketAppendixMode::kNone;
+void WriteCheckpointMetadataFile(const std::string& json_path,
+                                 const CheckpointMetadataSpec& spec) {
+  json::Object manifest_obj;
+  manifest_obj["observation_dim"] = spec.observation_dim;
+  manifest_obj["hidden_dim"] = spec.hidden_dim;
+  manifest_obj["num_blocks"] = spec.num_blocks;
+  manifest_obj["market_appendix_mode"] = spec.market_appendix_mode;
+  manifest_obj["deck_pool_semantics"] = dune_imperium::DeckPoolSemanticsToString(spec.deck_pool_semantics);
+  const auto schema = dune_imperium::GetInformationStateSchema(
+      dune_imperium::ParseMarketAppendixMode(spec.market_appendix_mode),
+      spec.deck_pool_semantics);
+  manifest_obj["feature_schema_label"] = spec.feature_schema_label.empty()
+      ? std::string(schema.label)
+      : spec.feature_schema_label;
+  manifest_obj["feature_schema_sha256"] = spec.feature_schema_sha256.empty()
+      ? std::string(schema.sha256)
+      : spec.feature_schema_sha256;
+  manifest_obj["enable_semantic_scorer"] = spec.enable_semantic_scorer;
+  if (spec.enable_semantic_scorer && !spec.semantic_descriptor_schema.empty()) {
+    manifest_obj["semantic_descriptor_schema"] = spec.semantic_descriptor_schema;
   }
-  SPIEL_CHECK_TRUE(dune_imperium::IsExtendedInformationStateSize(input_dim));
+  manifest_obj["enable_zone_encoder"] = spec.enable_zone_encoder;
+  std::ofstream ofs(json_path);
+  if (!ofs) {
+    SpielFatalError("WriteCheckpointMetadataFile: Failed to open " + json_path);
+  }
+  ofs << json::ToString(manifest_obj, true);
+}
+
+dune_imperium::DeckPoolSemantics ReadCheckpointDeckPoolSemantics(
+    const std::string& checkpoint_path) {
   std::filesystem::path metadata_path(checkpoint_path);
   metadata_path.replace_extension(".json");
+  if (!std::filesystem::exists(metadata_path)) {
+    SpielFatalError("Missing checkpoint sidecar JSON: " + metadata_path.string());
+  }
   std::ifstream input(metadata_path);
-  if (!input) SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
+  if (!input) {
+    SpielFatalError("Missing checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  const std::string content((std::istreambuf_iterator<char>(input)), {});
+  const auto metadata = open_spiel::json::FromString(content);
+  if (!metadata || !metadata->IsObject()) {
+    SpielFatalError("Invalid checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  const auto& object = metadata->GetObject();
+  dune_imperium::DeckPoolSemantics sem = dune_imperium::DeckPoolSemantics::kLegacy;
+  auto it = object.find("deck_pool_semantics");
+  if (it != object.end() && it->second.IsString()) {
+    sem = dune_imperium::ParseDeckPoolSemanticsOrDie(it->second.GetString());
+  }
+  auto mode_it = object.find("market_appendix_mode");
+  auto hash_it = object.find("feature_schema_sha256");
+  if (mode_it != object.end() && mode_it->second.IsString() &&
+      hash_it != object.end() && hash_it->second.IsString()) {
+    const auto mode = dune_imperium::ParseMarketAppendixMode(mode_it->second.GetString());
+    const auto schema = dune_imperium::GetInformationStateSchema(mode, sem);
+    if (hash_it->second.GetString() != schema.sha256) {
+      SpielFatalError("ReadCheckpointDeckPoolSemantics: Checkpoint " + checkpoint_path +
+                      " feature_schema_sha256 (" + hash_it->second.GetString() +
+                      ") does not match schema (" + std::string(schema.sha256) + ")");
+    }
+  }
+  return sem;
+}
+
+dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
+    const std::string& checkpoint_path, int input_dim) {
+  std::filesystem::path metadata_path(checkpoint_path);
+  metadata_path.replace_extension(".json");
+  if (!std::filesystem::exists(metadata_path)) {
+    SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
+  }
+  std::ifstream input(metadata_path);
+  if (!input) {
+    SpielFatalError("Missing card-slot checkpoint metadata: " + metadata_path.string());
+  }
   const std::string content((std::istreambuf_iterator<char>(input)), {});
   const auto metadata = open_spiel::json::FromString(content);
   if (!metadata || !metadata->IsObject()) {
     SpielFatalError("Invalid card-slot checkpoint metadata: " + metadata_path.string());
   }
   const auto& object = metadata->GetObject();
+
+  if (input_dim == dune_imperium::kLegacyInformationStateSize) {
+    dune_imperium::DeckPoolSemantics sem = dune_imperium::DeckPoolSemantics::kLegacy;
+    auto sem_entry = object.find("deck_pool_semantics");
+    if (sem_entry != object.end() && sem_entry->second.IsString()) {
+      sem = dune_imperium::ParseDeckPoolSemanticsOrDie(sem_entry->second.GetString());
+    }
+    auto hash_entry = object.find("feature_schema_sha256");
+    if (hash_entry != object.end() && hash_entry->second.IsString()) {
+      const auto schema = dune_imperium::GetInformationStateSchema(dune_imperium::MarketAppendixMode::kNone, sem);
+      if (hash_entry->second.GetString() != schema.sha256) {
+        SpielFatalError("ReadCheckpointInputMode: Schema hash mismatch for legacy input");
+      }
+    }
+    return dune_imperium::MarketAppendixMode::kNone;
+  }
+
+  SPIEL_CHECK_TRUE(dune_imperium::IsExtendedInformationStateSize(input_dim));
   auto mode_entry = object.find("market_appendix_mode");
   auto dim_entry = object.find("observation_dim");
   auto hash_entry = object.find("feature_schema_sha256");
@@ -1372,7 +1458,12 @@ dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
     SpielFatalError("Incomplete card-slot checkpoint schema: " + metadata_path.string());
   }
   const auto mode = dune_imperium::ParseMarketAppendixMode(mode_entry->second.GetString());
-  const auto schema = dune_imperium::GetInformationStateSchema(mode);
+  dune_imperium::DeckPoolSemantics sem = dune_imperium::DeckPoolSemantics::kLegacy;
+  auto sem_entry = object.find("deck_pool_semantics");
+  if (sem_entry != object.end() && sem_entry->second.IsString()) {
+    sem = dune_imperium::ParseDeckPoolSemanticsOrDie(sem_entry->second.GetString());
+  }
+  const auto schema = dune_imperium::GetInformationStateSchema(mode, sem);
   SPIEL_CHECK_EQ(schema.size, input_dim);
   SPIEL_CHECK_EQ(dim_entry->second.GetInt(), input_dim);
   SPIEL_CHECK_EQ(hash_entry->second.GetString(), std::string(schema.sha256));
@@ -1400,12 +1491,14 @@ bool LoadModelCheckpointMigrating(
   std::filesystem::path metadata_path(path);
   metadata_path.replace_extension(".json");
   std::string source_schema;
+  bool metadata_valid = false;
   if (std::filesystem::exists(metadata_path)) {
     std::ifstream input(metadata_path);
     if (input) {
       const std::string content((std::istreambuf_iterator<char>(input)), {});
       const auto metadata = open_spiel::json::FromString(content);
       if (metadata && metadata->IsObject()) {
+        metadata_valid = true;
         const auto& object = metadata->GetObject();
         auto nb_entry = object.find("num_blocks");
         if (nb_entry != object.end()) {
@@ -1452,8 +1545,31 @@ bool LoadModelCheckpointMigrating(
             model->EnableZoneEncoder();
           }
         }
+        auto sem_entry = object.find("deck_pool_semantics");
+        if (sem_entry != object.end() && sem_entry->second.IsString()) {
+          model->deck_pool_semantics_ = dune_imperium::ParseDeckPoolSemanticsOrDie(
+              sem_entry->second.GetString());
+        } else {
+          model->deck_pool_semantics_ = dune_imperium::DeckPoolSemantics::kLegacy;
+        }
+        auto mode_entry = object.find("market_appendix_mode");
+        auto mode = dune_imperium::MarketAppendixMode::kNone;
+        if (mode_entry != object.end() && mode_entry->second.IsString()) {
+          mode = dune_imperium::ParseMarketAppendixMode(mode_entry->second.GetString());
+        }
+        auto hash_entry = object.find("feature_schema_sha256");
+        if (hash_entry != object.end() && hash_entry->second.IsString()) {
+          const auto schema = dune_imperium::GetInformationStateSchema(mode, model->deck_pool_semantics_);
+          if (hash_entry->second.GetString() != schema.sha256) {
+            SpielFatalError("LoadModelCheckpointMigrating: Checkpoint " + path +
+                            " feature_schema_sha256 (" + hash_entry->second.GetString() +
+                            ") does not match schema (" + std::string(schema.sha256) + ")");
+          }
+        }
       }
     }
+  } else {
+    model->deck_pool_semantics_ = dune_imperium::DeckPoolSemantics::kLegacy;
   }
 
   auto update_semantic_schema = [&]() {
@@ -1499,6 +1615,13 @@ bool LoadModelCheckpointMigrating(
             path, b, num_blocks));
       }
     }
+  }
+
+  if (!std::filesystem::exists(metadata_path)) {
+    SpielFatalError("LoadModelCheckpointMigrating: Missing checkpoint sidecar JSON: " + metadata_path.string());
+  }
+  if (!metadata_valid) {
+    SpielFatalError("LoadModelCheckpointMigrating: Invalid checkpoint sidecar JSON: " + metadata_path.string());
   }
 
   auto temp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
@@ -1678,6 +1801,7 @@ void LoadModelCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     LoadModelCheckpointMigrating(model, path, device, allow_skip_semantic_scorer);
     return;
   }
+  model->deck_pool_semantics_ = ReadCheckpointDeckPoolSemantics(path);
   if (!absl::GetFlag(FLAGS_nonlinear_value_head)) {
     const int64_t expected_input_dim = model->input_layer->weight.size(1);
     torch::load(model, path, device);

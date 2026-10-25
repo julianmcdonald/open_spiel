@@ -717,7 +717,7 @@ void DiagnosticWorkerThread(
       std::fill(obs.begin(), obs.end(), 0.0f);
       dune_state->InformationStateTensorWithAppendix(
           current_player, MarketAppendixMode::kFullPublicInformationV3,
-          absl::MakeSpan(obs));
+          absl::MakeSpan(obs), evaluator->DeckPoolSemantics());
 
       dune_semantic::CandidateActionData cand_data;
       dune_semantic::ExtractCandidateDescriptors(

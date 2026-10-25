@@ -117,14 +117,6 @@ void BatchedWorkerThread(
       bool use_opponent_model = (!use_model && !opponent_evaluators.empty());
 
       if (use_model || use_opponent_model) {
-        // Fill observation buffer
-        std::fill(obs.begin(), obs.end(), 0.0f);
-        if (provides_info_state_tensor) {
-          state->InformationStateTensor(current_player, absl::MakeSpan(obs));
-        } else if (provides_observations_tensor) {
-          state->ObservationTensor(current_player, absl::MakeSpan(obs));
-        }
-
         // Submit to BatchedEvaluator — this thread sleeps until the batch fires
         std::shared_ptr<BatchedEvaluator> evaluator = model_evaluator;
         if (!use_model) {
@@ -132,6 +124,22 @@ void BatchedWorkerThread(
               static_cast<size_t>(g + current_player) % opponent_evaluators.size();
           evaluator = opponent_evaluators[opponent_index];
         }
+
+        const auto mode = evaluator ? evaluator->MarketMode() : dune_imperium::MarketAppendixMode::kNone;
+        const auto semantics = evaluator ? evaluator->DeckPoolSemantics() : dune_imperium::DeckPoolSemantics::kLegacy;
+        const int active_obs_size = dune_imperium::GetInformationStateSchema(mode, semantics).size;
+        obs.resize(active_obs_size, 0.0f);
+        std::fill(obs.begin(), obs.end(), 0.0f);
+
+        const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+        if (dune_state != nullptr) {
+          dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs), semantics);
+        } else if (provides_info_state_tensor) {
+          state->InformationStateTensor(current_player, absl::MakeSpan(obs));
+        } else if (provides_observations_tensor) {
+          state->ObservationTensor(current_player, absl::MakeSpan(obs));
+        }
+
         EvalResult result = evaluator->Evaluate(obs);
         CenterAndCapLegalLogits(result.logits, legal_actions, logit_cap);
 

@@ -182,7 +182,8 @@ double EvaluateCriticLeafValue(
   std::vector<float> obs(9182, 0.0f);
   if (dune != nullptr) {
     dune->InformationStateTensorWithAppendix(
-        player, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+        player, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+        critic_batcher->DeckPoolSemantics());
   } else {
     obs = state.InformationStateTensor(player);
   }
@@ -201,7 +202,8 @@ double EvaluateCriticDirect(
   std::vector<float> obs(9182, 0.0f);
   if (dune != nullptr) {
     dune->InformationStateTensorWithAppendix(
-        player, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+        player, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+        critic->deck_pool_semantics_);
   } else {
     obs = state.InformationStateTensor(player);
   }
@@ -257,7 +259,8 @@ double SimulateTruncatedRollout(
       std::vector<float> obs(9182, 0.0f);
       if (cur_dune != nullptr) {
         cur_dune->InformationStateTensorWithAppendix(
-            cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+            cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+            actor_batcher->DeckPoolSemantics());
         dune_semantic::ExtractCandidateDescriptors(
             *cur_dune, legals, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
       }
@@ -528,15 +531,16 @@ double SimulateTerminalRollout(
 
     Action chosen = legals[0];
     if (legals.size() > 1) {
+      auto batcher = (cur == cand_player) ? u31900_batcher : opp_batcher;
       std::vector<float> obs(9182, 0.0f);
       dune_semantic::CandidateActionData cand_data;
       if (dune != nullptr) {
         dune->InformationStateTensorWithAppendix(
-            cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+            cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+            batcher->DeckPoolSemantics());
         dune_semantic::ExtractCandidateDescriptors(
             *dune, legals, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
       }
-      auto batcher = (cur == cand_player) ? u31900_batcher : opp_batcher;
       auto probs = ComputePolicyProbabilities(batcher, obs, cand_data, legals);
       double best_p = -1.0;
       for (size_t k = 0; k < legals.size(); ++k) {
@@ -671,7 +675,8 @@ int RunTerminalContinuationDiagnostic(
           dune_semantic::CandidateActionData cand_data;
           if (dune_state != nullptr) {
             dune_state->InformationStateTensorWithAppendix(
-                cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+                cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+                cand_batcher->DeckPoolSemantics());
             dune_semantic::ExtractCandidateDescriptors(
                 *dune_state, legals, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
           }
@@ -707,7 +712,8 @@ int RunTerminalContinuationDiagnostic(
           dune_semantic::CandidateActionData cand_data;
           if (dune_state != nullptr) {
             dune_state->InformationStateTensorWithAppendix(
-                cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs));
+                cur, dune_imperium::MarketAppendixMode::kFullPublicInformationV3, absl::MakeSpan(obs),
+                opp_batcher->DeckPoolSemantics());
             dune_semantic::ExtractCandidateDescriptors(
                 *dune_state, legals, &cand_data, dune_semantic::kDescriptorSchemaVersionV3);
           }
@@ -2075,16 +2081,21 @@ int RunShDistillLearner() {
   std::string opt_hash = open_spiel::ComputeFileSHA256(best_opt_path);
   size_t opt_sz = std::filesystem::file_size(best_opt_path);
 
+  auto s_schema = open_spiel::dune_imperium::GetInformationStateSchema(
+      open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+      student_model->deck_pool_semantics_);
   open_spiel::json::Object m_man;
   m_man["schema_version"] = 2;
   m_man["num_blocks"] = num_blocks;
   m_man["hidden_dim"] = 2048;
-  m_man["observation_dim"] = 9182;
+  m_man["observation_dim"] = static_cast<int64_t>(s_schema.size);
   m_man["enable_semantic_scorer"] = true;
   m_man["enable_zone_encoder"] = false;
   m_man["semantic_descriptor_schema"] = "semantic_action_v3";
   m_man["market_appendix_mode"] = "full_public_information_v3";
-  m_man["feature_schema_sha256"] = "1f91ede6656d792545589b69b39ed1209cb8255c3ba8dcae49726acde7388e7f";
+  m_man["deck_pool_semantics"] = open_spiel::dune_imperium::DeckPoolSemanticsToString(student_model->deck_pool_semantics_);
+  m_man["feature_schema_label"] = s_schema.label;
+  m_man["feature_schema_sha256"] = s_schema.sha256;
   m_man["rollout_amp"] = false;
   m_man["allow_tf32"] = false;
   m_man["model_filename"] = "ppo_model_step1_best.pt";
@@ -2436,7 +2447,7 @@ int main(int argc, char** argv) {
             if (dune_state != nullptr) {
               dune_state->InformationStateTensorWithAppendix(
                   cur, open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-                  absl::MakeSpan(dec.obs));
+                  absl::MakeSpan(dec.obs), coll_actor_batcher->DeckPoolSemantics());
               open_spiel::dune_semantic::ExtractCandidateDescriptors(
                   *dune_state, legals, &dec.cand_data,
                   open_spiel::dune_semantic::kDescriptorSchemaVersionV3);
@@ -3164,16 +3175,21 @@ int main(int argc, char** argv) {
   size_t pf_opt_sz = std::filesystem::file_size(pf_opt_path);
   size_t pf_ema_sz = std::filesystem::file_size(pf_ema_path);
 
+  auto pf_schema = open_spiel::dune_imperium::GetInformationStateSchema(
+      open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+      learner_model->deck_pool_semantics_);
   open_spiel::json::Object m_man;
   m_man["schema_version"] = 2;
   m_man["num_blocks"] = absl::GetFlag(FLAGS_num_blocks);
   m_man["hidden_dim"] = 2048;
-  m_man["observation_dim"] = 9182;
+  m_man["observation_dim"] = static_cast<int64_t>(pf_schema.size);
   m_man["enable_semantic_scorer"] = true;
   m_man["enable_zone_encoder"] = false;
   m_man["semantic_descriptor_schema"] = "semantic_action_v3";
   m_man["market_appendix_mode"] = "full_public_information_v3";
-  m_man["feature_schema_sha256"] = "1f91ede6656d792545589b69b39ed1209cb8255c3ba8dcae49726acde7388e7f";
+  m_man["deck_pool_semantics"] = open_spiel::dune_imperium::DeckPoolSemanticsToString(learner_model->deck_pool_semantics_);
+  m_man["feature_schema_label"] = pf_schema.label;
+  m_man["feature_schema_sha256"] = pf_schema.sha256;
   m_man["rollout_amp"] = false;
   m_man["allow_tf32"] = false;
   m_man["model_filename"] = "ppo_model_update_" + ckpt_tag + ".pt";

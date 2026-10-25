@@ -452,7 +452,7 @@ int main(int argc, char** argv) {
       if (dune_st != nullptr && (dune_st->phase() == GamePhase::kAgentTurns || dune_st->phase() == GamePhase::kRevealTurns)) {
         const Player p = dune_st->CurrentPlayer();
         std::vector<float> obs = dune_st->InformationStateTensorWithAppendix(
-            p, MarketAppendixMode::kFullPublicInformationV3);
+            p, MarketAppendixMode::kFullPublicInformationV3, source_model->deck_pool_semantics_);
         torch::Tensor obs_t = torch::from_blob(obs.data(), {1, static_cast<long>(obs.size())}, torch::kFloat32).to(device);
 
         dune_semantic::CandidateActionData cand_data;
@@ -521,7 +521,7 @@ int main(int argc, char** argv) {
       if (dune_st != nullptr && (dune_st->phase() == GamePhase::kAgentTurns || dune_st->phase() == GamePhase::kRevealTurns)) {
         const Player p = dune_st->CurrentPlayer();
         std::vector<float> obs = dune_st->InformationStateTensorWithAppendix(
-            p, MarketAppendixMode::kFullPublicInformationV3);
+            p, MarketAppendixMode::kFullPublicInformationV3, source_model->deck_pool_semantics_);
         torch::Tensor obs_t = torch::from_blob(obs.data(), {1, static_cast<long>(obs.size())}, torch::kFloat32).to(device);
 
         dune_semantic::CandidateActionData cand_src;
@@ -613,7 +613,7 @@ int main(int argc, char** argv) {
       CHECK_ASSERT(std::find(legal.begin(), legal.end(), 92) != legal.end(), "Action 92 must be legal");
 
       std::vector<float> obs = dune_st->InformationStateTensorWithAppendix(
-          p, MarketAppendixMode::kFullPublicInformationV3);
+          p, MarketAppendixMode::kFullPublicInformationV3, source_model->deck_pool_semantics_);
       torch::Tensor obs_t = torch::from_blob(obs.data(), {1, static_cast<long>(obs.size())}, torch::kFloat32).to(device);
 
       dune_semantic::CandidateActionData cand_src;
@@ -743,7 +743,7 @@ int main(int argc, char** argv) {
 
     auto legal = dune_st->LegalActions();
     std::vector<float> obs = dune_st->InformationStateTensorWithAppendix(
-        p, MarketAppendixMode::kFullPublicInformationV3);
+        p, MarketAppendixMode::kFullPublicInformationV3, target_model->deck_pool_semantics_);
     torch::Tensor obs_t = torch::from_blob(obs.data(), {1, static_cast<long>(obs.size())}, torch::kFloat32).to(device);
 
     dune_semantic::CandidateActionData cand_tgt;

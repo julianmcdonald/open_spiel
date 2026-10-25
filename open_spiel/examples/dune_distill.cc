@@ -564,7 +564,8 @@ std::vector<StateTransition> CollectRolloutGames(
           dune_state->InformationStateTensorWithAppendix(
               current_player,
               dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-              absl::MakeSpan(trans.obs));
+              absl::MakeSpan(trans.obs),
+              acting_evaluator->DeckPoolSemantics());
           dune_semantic::ExtractCandidateDescriptors(
               *dune_state, legal_actions, &trans.cand_data,
               dune_semantic::kDescriptorSchemaVersionV3);
@@ -861,8 +862,11 @@ void SaveDistillCheckpointBundle(
   size_t optim_size = 0;
   std::string optim_hash = open_spiel::ComputeFileSHA256(optim_tmp, &optim_size);
 
-  std::string schema_label = "dune_imperium_full_public_information_v3|prefix=ordered_card_slots_v2:6255|opp_revealed=3x126|consumed_conflicts=22|ordered_topdeck=4x4x127|water_overflow=4|pending_graft=127|pending_hundro=2x63|pending_tech=4|pending_ceremony=2x63|pending_intrigue=108|size=9182";
-  std::string schema_sha256 = "1f91ede6656d792545589b69b39ed1209cb8255c3ba8dcae49726acde7388e7f";
+  auto schema = dune_imperium::GetInformationStateSchema(
+      dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+      model->deck_pool_semantics_);
+  std::string schema_label = schema.label;
+  std::string schema_sha256 = schema.sha256;
 
   json::Object manifest_obj;
   manifest_obj["schema_version"] = static_cast<int64_t>(2);
@@ -888,8 +892,9 @@ void SaveDistillCheckpointBundle(
   manifest_obj["optimizer_sha256"] = optim_hash;
   manifest_obj["hidden_dim"] = static_cast<int64_t>(2048);
   manifest_obj["num_blocks"] = static_cast<int64_t>(12);
-  manifest_obj["observation_dim"] = static_cast<int64_t>(9182);
+  manifest_obj["observation_dim"] = static_cast<int64_t>(schema.size);
   manifest_obj["market_appendix_mode"] = "full_public_information_v3";
+  manifest_obj["deck_pool_semantics"] = dune_imperium::DeckPoolSemanticsToString(model->deck_pool_semantics_);
   manifest_obj["feature_schema_label"] = schema_label;
   manifest_obj["feature_schema_sha256"] = schema_sha256;
   manifest_obj["enable_semantic_scorer"] = true;

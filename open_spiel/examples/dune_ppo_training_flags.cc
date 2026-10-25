@@ -25,6 +25,8 @@ ABSL_FLAG(std::string, market_appendix_mode, "none",
           "Card-slot input mode: 'none' (5580), 'zeros' or 'ordered_market' (6215), "
           "'ordered_card_slots_v2' (6255), 'full_public_information_v3' (9182), "
           "or 'full_public_information_v4' (9941).");
+ABSL_FLAG(std::string, deck_pool_semantics, "fixed",
+          "Observation semantics for deck pool features: 'fixed' (default) or 'legacy'.");
 ABSL_FLAG(bool, allow_market_appendix_transition, false,
           "Permit initializing a run from a checkpoint with a different market_appendix_mode.");
 ABSL_FLAG(std::string, market_appendix_transition_source_mode, "",

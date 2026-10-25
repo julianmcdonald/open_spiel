@@ -344,23 +344,46 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("get_deck_pool_cards_drawn",
            &DuneImperiumState::GetDeckPoolCardsDrawnForTesting,
            py::arg("player"))
+      .def("set_fixed_deck_pool_discard",
+           &DuneImperiumState::SetFixedDeckPoolDiscardForTesting, py::arg("player"),
+           py::arg("cards"))
+      .def("get_fixed_deck_pool_discard",
+           &DuneImperiumState::GetFixedDeckPoolDiscardForTesting, py::arg("player"))
+      .def("set_fixed_deck_pool_draw_deck",
+           &DuneImperiumState::SetFixedDeckPoolDrawDeckForTesting, py::arg("player"),
+           py::arg("cards"))
+      .def("get_fixed_deck_pool_draw_deck",
+           &DuneImperiumState::GetFixedDeckPoolDrawDeckForTesting, py::arg("player"))
+      .def("set_fixed_deck_pool_cards_drawn",
+           &DuneImperiumState::SetFixedDeckPoolCardsDrawnForTesting,
+           py::arg("player"), py::arg("count"))
+      .def("get_fixed_deck_pool_cards_drawn",
+           &DuneImperiumState::GetFixedDeckPoolCardsDrawnForTesting,
+           py::arg("player"))
        .def("get_imperium_row", &DuneImperiumState::GetImperiumRowForTesting,
             py::return_value_policy::reference_internal)
        .def("get_imperium_market_appendix",
             &DuneImperiumState::GetImperiumMarketAppendix)
        .def("information_state_tensor_with_appendix",
             [](const DuneImperiumState &s, Player player,
-               open_spiel::dune_imperium::MarketAppendixMode mode) -> std::vector<float> {
-              return s.InformationStateTensorWithAppendix(player, mode);
+               open_spiel::dune_imperium::MarketAppendixMode mode,
+               const std::string &deck_pool_semantics) -> std::vector<float> {
+              return s.InformationStateTensorWithAppendix(
+                  player, mode,
+                  dune_imperium::ParseDeckPoolSemanticsOrDie(deck_pool_semantics));
             },
-            py::arg("player"), py::arg("mode"))
+            py::arg("player"), py::arg("mode"),
+            py::arg("deck_pool_semantics") = "legacy")
        .def("information_state_tensor_with_appendix",
             [](const DuneImperiumState &s, Player player,
-               const std::string &mode_str) -> std::vector<float> {
+               const std::string &mode_str,
+               const std::string &deck_pool_semantics) -> std::vector<float> {
               return s.InformationStateTensorWithAppendix(
-                  player, dune_imperium::ParseMarketAppendixMode(mode_str));
+                  player, dune_imperium::ParseMarketAppendixMode(mode_str),
+                  dune_imperium::ParseDeckPoolSemanticsOrDie(deck_pool_semantics));
             },
-            py::arg("player"), py::arg("mode") = "ordered_market")
+            py::arg("player"), py::arg("mode") = "ordered_market",
+            py::arg("deck_pool_semantics") = "legacy")
        .def("get_tleilaxu_row", &DuneImperiumState::GetTleilaxuRowForTesting,
            py::return_value_policy::reference_internal)
       .def("get_imperium_draw_deck",

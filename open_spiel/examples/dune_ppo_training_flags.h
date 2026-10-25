@@ -14,6 +14,7 @@ ABSL_DECLARE_FLAG(int, hidden_dim);
 ABSL_DECLARE_FLAG(int, num_blocks);
 ABSL_DECLARE_FLAG(bool, nonlinear_value_head);
 ABSL_DECLARE_FLAG(std::string, market_appendix_mode);
+ABSL_DECLARE_FLAG(std::string, deck_pool_semantics);
 ABSL_DECLARE_FLAG(bool, allow_market_appendix_transition);
 ABSL_DECLARE_FLAG(std::string, market_appendix_transition_source_mode);
 ABSL_DECLARE_FLAG(std::string, market_appendix_transition_source_fingerprint);

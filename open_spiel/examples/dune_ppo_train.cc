@@ -1053,6 +1053,7 @@ void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
     item.value().copy_(src->to(item.value().device()));
   }
   target->market_appendix_mode_ = source->market_appendix_mode_;
+  target->deck_pool_semantics_ = source->deck_pool_semantics_;
   target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
   target->enable_zone_encoder_ = source->enable_zone_encoder_;
 }
@@ -1665,24 +1666,33 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
     config_obj["training_opponent_pool"] = absl::GetFlag(FLAGS_training_opponent_pool);
   }
 
+  const auto resolved_deck_pool_semantics =
+      dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
   if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v4") {
     const auto schema = dune_imperium::GetInformationStateSchema(
-        dune_imperium::MarketAppendixMode::kFullPublicInformationV4);
+        dune_imperium::MarketAppendixMode::kFullPublicInformationV4,
+        resolved_deck_pool_semantics);
     config_obj["market_appendix_mode"] = std::string("full_public_information_v4");
     config_obj["observation_dim"] = schema.size;
     config_obj["feature_schema_sha256"] = std::string(schema.sha256);
   } else if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v3") {
     const auto schema = dune_imperium::GetInformationStateSchema(
-        dune_imperium::MarketAppendixMode::kFullPublicInformationV3);
+        dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
+        resolved_deck_pool_semantics);
     config_obj["market_appendix_mode"] = std::string("full_public_information_v3");
     config_obj["observation_dim"] = schema.size;
     config_obj["feature_schema_sha256"] = std::string(schema.sha256);
   } else if (absl::GetFlag(FLAGS_market_appendix_mode) == "ordered_card_slots_v2") {
     const auto schema = dune_imperium::GetInformationStateSchema(
-        dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2);
+        dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2,
+        resolved_deck_pool_semantics);
     config_obj["market_appendix_mode"] = std::string("ordered_card_slots_v2");
     config_obj["observation_dim"] = schema.size;
     config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  }
+
+  if (resolved_deck_pool_semantics == dune_imperium::DeckPoolSemantics::kFixed) {
+    config_obj["deck_pool_semantics"] = std::string("fixed");
   }
 
   if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
@@ -2250,16 +2260,27 @@ std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
     source_mode = "none";
   }
 
+  dune_imperium::DeckPoolSemantics source_sem = dune_imperium::DeckPoolSemantics::kLegacy;
+  auto sem_it = manifest_obj.find("deck_pool_semantics");
+  if (sem_it != manifest_obj.end() && sem_it->second.IsString()) {
+    source_sem = dune_imperium::ParseDeckPoolSemanticsOrDie(sem_it->second.GetString());
+  }
+
   if (source_mode == "none") {
     source_config_obj.erase("market_appendix_mode");
     source_config_obj.erase("observation_dim");
     source_config_obj.erase("feature_schema_sha256");
   } else {
     const auto schema = dune_imperium::GetInformationStateSchema(
-        dune_imperium::ParseMarketAppendixMode(source_mode));
+        dune_imperium::ParseMarketAppendixMode(source_mode), source_sem);
     source_config_obj["market_appendix_mode"] = source_mode;
     source_config_obj["observation_dim"] = schema.size;
     source_config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  }
+  if (source_sem == dune_imperium::DeckPoolSemantics::kFixed) {
+    source_config_obj["deck_pool_semantics"] = std::string("fixed");
+  } else {
+    source_config_obj.erase("deck_pool_semantics");
   }
 
   const std::string computed_source_fp =
@@ -2415,10 +2436,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
     manifest_obj["observation_dim"] = static_cast<int64_t>(model->input_layer->weight.size(1));
     manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
-    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
-      const auto schema = dune_imperium::GetInformationStateSchema(
-          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
-      SPIEL_CHECK_EQ(model->input_layer->weight.size(1), schema.size);
+    const auto resolved_deck_pool_semantics = dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
+    manifest_obj["deck_pool_semantics"] = dune_imperium::DeckPoolSemanticsToString(resolved_deck_pool_semantics);
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)),
+        resolved_deck_pool_semantics);
+    if (static_cast<int64_t>(model->input_layer->weight.size(1)) == schema.size) {
       manifest_obj["feature_schema_label"] = std::string(schema.label);
       manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
     }
@@ -2974,20 +2997,28 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       const bool is_learner = (current_player >= 0 && current_player < 4) &&
                               seat_assignment.is_learner_seat[current_player];
 
-      std::vector<float> obs(obs_size, 0.0f);
-      if (dune_state != nullptr && dune_imperium::IsExtendedInformationStateSize(obs_size)) {
-        dune_imperium::MarketAppendixMode mode =
-            dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode));
-        dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs));
+      std::shared_ptr<IGameEvaluator> active_evaluator =
+          dune_opponent_pool::ResolveEvaluator(current_player, seat_assignment,
+                                               evaluator, opponent_evaluators);
+
+      dune_imperium::MarketAppendixMode eval_market_mode =
+          active_evaluator ? active_evaluator->MarketMode()
+                           : dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode));
+      dune_imperium::DeckPoolSemantics eval_deck_semantics =
+          active_evaluator ? active_evaluator->DeckPoolSemantics()
+                           : dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
+
+      const int active_obs_size =
+          dune_imperium::GetInformationStateSchema(eval_market_mode, eval_deck_semantics).size;
+      std::vector<float> obs(active_obs_size, 0.0f);
+      if (dune_state != nullptr) {
+        dune_state->InformationStateTensorWithAppendix(
+            current_player, eval_market_mode, absl::MakeSpan(obs), eval_deck_semantics);
       } else if (provides_info_state_tensor && current_player >= 0) {
         state->InformationStateTensor(current_player, absl::MakeSpan(obs));
       } else if (provides_observations_tensor && current_player >= 0) {
         state->ObservationTensor(current_player, absl::MakeSpan(obs));
       }
-
-      std::shared_ptr<IGameEvaluator> active_evaluator =
-          dune_opponent_pool::ResolveEvaluator(current_player, seat_assignment,
-                                               evaluator, opponent_evaluators);
       dune_semantic::CandidateActionData cand_data;
       const dune_semantic::CandidateActionData* p_cand_data = nullptr;
       if (dune_state != nullptr) {
@@ -3574,7 +3605,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
           float succ_val = 0.0f;
           float target_return = 0.0f;
           if (!succ_state->IsTerminal()) {
-            if (provides_info_state_tensor) {
+            const auto* d_succ = dynamic_cast<const dune_imperium::DuneImperiumState*>(succ_state.get());
+            if (d_succ != nullptr) {
+              d_succ->InformationStateTensorWithAppendix(
+                  current_player, evaluator->MarketMode(), absl::MakeSpan(succ_obs),
+                  evaluator->DeckPoolSemantics());
+              valid = true;
+            } else if (provides_info_state_tensor) {
               succ_state->InformationStateTensor(current_player, absl::MakeSpan(succ_obs));
               valid = true;
             } else if (provides_observations_tensor) {
@@ -3616,7 +3653,12 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                 Player curr_p = roll_state->CurrentPlayer();
                 std::vector<Action> curr_acts = roll_state->LegalActions();
                 std::vector<float> curr_obs(obs_size, 0.0f);
-                if (provides_info_state_tensor) {
+                const auto* d_roll = dynamic_cast<const dune_imperium::DuneImperiumState*>(roll_state.get());
+                if (d_roll != nullptr) {
+                  d_roll->InformationStateTensorWithAppendix(
+                      curr_p, evaluator->MarketMode(), absl::MakeSpan(curr_obs),
+                      evaluator->DeckPoolSemantics());
+                } else if (provides_info_state_tensor) {
                   roll_state->InformationStateTensor(curr_p, absl::MakeSpan(curr_obs));
                 } else {
                   roll_state->ObservationTensor(curr_p, absl::MakeSpan(curr_obs));
@@ -8626,6 +8668,11 @@ int main(int argc, char** argv) {
     inference_model->market_appendix_mode_ = parsed_mode;
   }
 
+  const auto resolved_target_deck_pool_semantics =
+      dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
+  training_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  inference_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> ema_model = nullptr;
   int64_t ema_updates_absorbed = 0;
   double ema_half_life = absl::GetFlag(FLAGS_ema_half_life);
@@ -8645,6 +8692,7 @@ int main(int argc, char** argv) {
     if (m_mode_str != "none") {
       ema_model->market_appendix_mode_ = training_model->market_appendix_mode_;
     }
+    ema_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
     std::cout << absl::StrFormat(
         "[EMA] Initialized EMA tracking model: half_life=%.1f, decay=%.8f\n",
         ema_half_life, ema_decay);
@@ -8686,6 +8734,8 @@ int main(int argc, char** argv) {
             absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head));
     training_critic->to(device);
     inference_critic->to(device);
+    training_critic->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+    inference_critic->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
   }
 
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> collection_model = nullptr;
@@ -8696,6 +8746,7 @@ int main(int argc, char** argv) {
             absl::GetFlag(FLAGS_num_blocks), absl::GetFlag(FLAGS_nonlinear_value_head),
             /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer);
     collection_model->to(device);
+    collection_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
   }
 
   if (absl::GetFlag(FLAGS_sample_counterfactual_states) && !absl::GetFlag(FLAGS_train_value_only)) {
@@ -9004,6 +9055,7 @@ int main(int argc, char** argv) {
       anchor_model->SetSemanticDescriptorSchema(sem_schema);
     }
     anchor_model->to(device);
+    anchor_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
   }
 
   std::string init_mode = absl::GetFlag(FLAGS_init_mode);
@@ -10160,6 +10212,17 @@ int main(int argc, char** argv) {
                 manifest_mode, current_mode));
           }
         }
+        auto sem_it = obj.find("deck_pool_semantics");
+        std::string manifest_sem = "legacy";
+        if (sem_it != obj.end() && sem_it->second.IsString()) {
+          manifest_sem = sem_it->second.GetString();
+        }
+        std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
+        if (manifest_sem != current_sem) {
+          SpielFatalError(absl::StrFormat(
+              "deck_pool_semantics mismatch on resume. Manifest: '%s', Flag: '%s'",
+              manifest_sem, current_sem));
+        }
       }
     }
 
@@ -10528,8 +10591,10 @@ int main(int argc, char** argv) {
 
     try {
       LoadModelCheckpoint(training_model, model_path, device);
+      training_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
       if (anchor_model) {
         LoadModelCheckpoint(anchor_model, model_path, device);
+        anchor_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
         anchor_model->eval();
         for (auto& p : anchor_model->parameters()) {
           p.set_requires_grad(false);
@@ -10634,10 +10699,12 @@ int main(int argc, char** argv) {
     manifest_obj["num_blocks"] = static_cast<int64_t>(absl::GetFlag(FLAGS_num_blocks));
     manifest_obj["observation_dim"] = static_cast<int64_t>(training_model->input_layer->weight.size(1));
     manifest_obj["market_appendix_mode"] = absl::GetFlag(FLAGS_market_appendix_mode);
-    if (absl::GetFlag(FLAGS_market_appendix_mode) != "none") {
-      const auto schema = dune_imperium::GetInformationStateSchema(
-          dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)));
-      SPIEL_CHECK_EQ(training_model->input_layer->weight.size(1), schema.size);
+    const auto resolved_deck_pool_semantics = dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
+    manifest_obj["deck_pool_semantics"] = dune_imperium::DeckPoolSemanticsToString(resolved_deck_pool_semantics);
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::ParseMarketAppendixMode(absl::GetFlag(FLAGS_market_appendix_mode)),
+        resolved_deck_pool_semantics);
+    if (static_cast<int64_t>(training_model->input_layer->weight.size(1)) == schema.size) {
       manifest_obj["feature_schema_label"] = std::string(schema.label);
       manifest_obj["feature_schema_sha256"] = std::string(schema.sha256);
     }
@@ -10912,8 +10979,10 @@ int main(int argc, char** argv) {
       SpielFatalError("Model file not found for study: " + model_path);
     }
     LoadModelCheckpoint(training_model, model_path, device);
+    training_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
     if (anchor_model) {
       LoadModelCheckpoint(anchor_model, model_path, device);
+      anchor_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
       anchor_model->eval();
       for (auto& p : anchor_model->parameters()) p.set_requires_grad(false);
     }
@@ -10925,6 +10994,7 @@ int main(int argc, char** argv) {
         SpielFatalError("Critic file not found for study: " + critic_path);
       }
       LoadModelCheckpoint(training_critic, critic_path, device);
+      training_critic->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
 
       for (auto& item : training_model->named_parameters()) {
         if (item.key().find("value_head") != std::string::npos) {
@@ -10983,6 +11053,27 @@ int main(int argc, char** argv) {
 
     if (!std::filesystem::exists(manifest_path)) {
       SpielFatalError("Study resume: manifest not found: " + manifest_path);
+    }
+
+    {
+      std::ifstream m_in(manifest_path);
+      std::string m_text((std::istreambuf_iterator<char>(m_in)),
+                         std::istreambuf_iterator<char>());
+      auto m_json = json::FromString(m_text);
+      if (m_json.has_value() && m_json->IsObject()) {
+        const auto& obj = m_json->GetObject();
+        auto sem_it = obj.find("deck_pool_semantics");
+        std::string manifest_sem = "legacy";
+        if (sem_it != obj.end() && sem_it->second.IsString()) {
+          manifest_sem = sem_it->second.GetString();
+        }
+        std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
+        if (manifest_sem != current_sem) {
+          SpielFatalError(absl::StrFormat(
+              "deck_pool_semantics mismatch on study_resume. Manifest: '%s', Flag: '%s'",
+              manifest_sem, current_sem));
+        }
+      }
     }
 
     if (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr) {
@@ -11159,11 +11250,23 @@ int main(int argc, char** argv) {
                   manifest_mode, current_mode));
             }
           }
+          auto sem_it = obj.find("deck_pool_semantics");
+          std::string manifest_sem = "legacy";
+          if (sem_it != obj.end() && sem_it->second.IsString()) {
+            manifest_sem = sem_it->second.GetString();
+          }
+          std::string current_sem = absl::GetFlag(FLAGS_deck_pool_semantics);
+          if (manifest_sem != current_sem) {
+            SpielFatalError(absl::StrFormat(
+                "deck_pool_semantics mismatch on study_resume. Manifest: '%s', Flag: '%s'",
+                manifest_sem, current_sem));
+          }
           if (current_mode != "none" && !absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
             auto it_schema = obj.find("feature_schema_sha256");
             std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
             const auto schema = dune_imperium::GetInformationStateSchema(
-                dune_imperium::ParseMarketAppendixMode(current_mode));
+                dune_imperium::ParseMarketAppendixMode(current_mode),
+                dune_imperium::ParseDeckPoolSemanticsOrDie(manifest_sem));
             if (manifest_schema != schema.sha256) {
               SpielFatalError(absl::StrFormat(
                   "feature_schema_sha256 mismatch on study_resume. Manifest: '%s', Expected: '%s'",
@@ -11213,6 +11316,14 @@ int main(int argc, char** argv) {
                     "vrpo_schedule_screen, vrpo_ppo_pilot, or "
                     "vrpo_ppo_continuation, or vrpo_q_warmup)");
   }
+
+  if (training_model) training_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (inference_model) inference_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (ema_model) ema_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (collection_model) collection_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (anchor_model) anchor_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (training_critic) training_critic->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
+  if (inference_critic) inference_critic->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
 
   std::shared_mutex sync_mutex;
   std::mutex eval_mutex;

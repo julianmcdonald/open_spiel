@@ -1165,6 +1165,25 @@ void SaveDualCheckpoint(
     const std::string& input_model_to_protect = "",
     const std::string& input_optim_to_protect = "");
 
+struct CheckpointMetadataSpec {
+  std::string market_appendix_mode = "none";
+  dune_imperium::DeckPoolSemantics deck_pool_semantics = dune_imperium::DeckPoolSemantics::kLegacy;
+  int64_t observation_dim = 5580;
+  int64_t hidden_dim = 2048;
+  int64_t num_blocks = 8;
+  std::string feature_schema_label;
+  std::string feature_schema_sha256;
+  bool enable_semantic_scorer = false;
+  std::string semantic_descriptor_schema;
+  bool enable_zone_encoder = false;
+};
+
+void WriteCheckpointMetadataFile(const std::string& json_path,
+                                 const CheckpointMetadataSpec& spec);
+
+dune_imperium::DeckPoolSemantics ReadCheckpointDeckPoolSemantics(
+    const std::string& checkpoint_path);
+
 dune_imperium::MarketAppendixMode ReadCheckpointInputMode(
     const std::string& checkpoint_path, int input_dim);
 

@@ -97,6 +97,9 @@ class DuneNNEvaluator : public algorithms::Evaluator {
         SpielFatalError("DuneNNEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
       }
     }
+    if (model_) {
+      deck_pool_semantics_ = model_->deck_pool_semantics_;
+    }
     if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
         model_->market_appendix_mode_ != dune_imperium::MarketAppendixMode::kNone) {
       market_mode_ = model_->market_appendix_mode_;
@@ -125,6 +128,15 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   std::string SemanticDescriptorSchema() const {
     if (model_ != nullptr) return model_->semantic_descriptor_schema_;
     return dune_semantic::kDescriptorSchemaVersionV3;
+  }
+  dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
+    return deck_pool_semantics_;
+  }
+  void SetDeckPoolSemantics(dune_imperium::DeckPoolSemantics semantics) {
+    deck_pool_semantics_ = semantics;
+  }
+  dune_imperium::MarketAppendixMode MarketMode() const {
+    return market_mode_;
   }
   std::vector<float> GetConsumedObservation(const State& state, Player player) const {
     return ModelObservation(state, player);
@@ -357,10 +369,9 @@ class DuneNNEvaluator : public algorithms::Evaluator {
 
  private:
   std::vector<float> ModelObservation(const State& state, Player player) const {
-    if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
-      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
-      SPIEL_CHECK_TRUE(dune != nullptr);
-      return dune->InformationStateTensorWithAppendix(player, market_mode_);
+    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    if (dune != nullptr) {
+      return dune->InformationStateTensorWithAppendix(player, market_mode_, deck_pool_semantics_);
     }
     return state.InformationStateTensor(player);
   }
@@ -385,6 +396,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
   float logit_cap_;
   int64_t obs_size_;
   dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
+  dune_imperium::DeckPoolSemantics deck_pool_semantics_{dune_imperium::DeckPoolSemantics::kLegacy};
   bool rollout_amp_{true};
   bool allow_tf32_{false};
 };

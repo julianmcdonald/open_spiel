@@ -603,7 +603,7 @@ std::vector<RootRecord> CollectRootsSet(
                 std::fill(local_obs.begin(), local_obs.end(), 0.0f);
                 dune_state->InformationStateTensorWithAppendix(
                     cur_player, open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-                    absl::MakeSpan(local_obs));
+                    absl::MakeSpan(local_obs), evaluator->DeckPoolSemantics());
                 rec.obs = local_obs;
 
                 dune_semantic::CandidateActionData cand_data;

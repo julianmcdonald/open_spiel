@@ -29,6 +29,9 @@
 // IsStrategicState, SampleActionFromPrior, DuneDecisionRole/ClassifyDuneDecisionRole,
 // and (transitively) open_spiel::algorithms::Evaluator.
 #include "dune_search_session.h"
+#include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
+#include "dune_split_evaluator.h"
 
 namespace open_spiel {
 namespace {
@@ -711,8 +714,16 @@ void OnlineSearchCollector::CollectUpdate(
             target = SharpenVisitTarget(target, config_.target_sharpen_exponent);
 
             SearchTrainingExample ex;
-            ex.observation = provides_istate ? state->InformationStateTensor(cur)
-                                             : state->ObservationTensor(cur);
+            if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(evaluator.get())) {
+              ex.observation = nn->GetConsumedObservation(*state, cur);
+            } else if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(evaluator.get())) {
+              ex.observation = batched->GetConsumedObservation(*state, cur);
+            } else if (const auto* split = dynamic_cast<const SplitPolicyValueEvaluator*>(evaluator.get())) {
+              ex.observation = split->GetConsumedObservation(*state, cur);
+            } else {
+              ex.observation = provides_istate ? state->InformationStateTensor(cur)
+                                               : state->ObservationTensor(cur);
+            }
             ex.player = cur;
             ex.legal_actions = diag.actions;      // aligned to normalized_visits
             ex.normalized_visits = target;        // CE target (pruned when noised)

@@ -674,13 +674,7 @@ int main(int argc, char** argv) {
                 }
               }
 
-              std::vector<float> obs;
-              if (game->GetType().provides_information_state_tensor) {
-                obs = state->InformationStateTensor(cur_player);
-              } else {
-                obs.resize(obs_size);
-                state->ObservationTensor(cur_player, absl::MakeSpan(obs));
-              }
+              std::vector<float> obs = evaluator->GetConsumedObservation(*state, cur_player);
 
               {
                 LabelData lbl;

@@ -16,6 +16,8 @@
 #include "dune_network.h"
 #include "dune_evaluator.h"
 #include "dune_batched_evaluator.h"
+#include "dune_compound_turn_search.h"
+#include "dune_opponent_pool.h"
 #include "dune_ppo_training_utils.h"
 #include "dune_sha256.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -1275,6 +1277,520 @@ void TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors() {
   std::cout << "PASS: TestScientificBreakthroughAndStitchedHorrorSemanticDescriptors\n";
 }
 
+void TestDeckPoolSemanticsIntegration(const std::filesystem::path& temp_dir) {
+  std::cout << "--- Testing DeckPoolSemantics Integration ---\n";
+  std::filesystem::create_directories(temp_dir);
+
+  // (a) Round-trip sidecar serialization/deserialization of deck_pool_semantics
+  {
+    auto m_fixed = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_fixed->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_fixed->deck_pool_semantics_ = DeckPoolSemantics::kFixed;
+
+    const std::string fixed_pt = (temp_dir / "ppo_model_1.pt").string();
+    const std::string fixed_json = (temp_dir / "ppo_model_1.json").string();
+    torch::save(m_fixed, fixed_pt);
+    CheckpointMetadataSpec spec_fixed;
+    spec_fixed.market_appendix_mode = "full_public_information_v3";
+    spec_fixed.deck_pool_semantics = DeckPoolSemantics::kFixed;
+    spec_fixed.observation_dim = kFullPublicInformationStateSize;
+    spec_fixed.hidden_dim = 32;
+    spec_fixed.num_blocks = 1;
+    spec_fixed.enable_semantic_scorer = true;
+    spec_fixed.semantic_descriptor_schema = dune_semantic::kDescriptorSchemaVersionV3;
+    WriteCheckpointMetadataFile(fixed_json, spec_fixed);
+
+    SPIEL_CHECK_TRUE(std::filesystem::exists(fixed_json));
+
+    DeckPoolSemantics parsed_fixed = ReadCheckpointDeckPoolSemantics(fixed_pt);
+    SPIEL_CHECK_TRUE(parsed_fixed == DeckPoolSemantics::kFixed);
+
+    auto m_legacy = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_legacy->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_legacy->deck_pool_semantics_ = DeckPoolSemantics::kLegacy;
+
+    const std::string legacy_pt = (temp_dir / "ppo_model_2.pt").string();
+    const std::string legacy_json = (temp_dir / "ppo_model_2.json").string();
+    torch::save(m_legacy, legacy_pt);
+    CheckpointMetadataSpec spec_legacy;
+    spec_legacy.market_appendix_mode = "full_public_information_v3";
+    spec_legacy.deck_pool_semantics = DeckPoolSemantics::kLegacy;
+    spec_legacy.observation_dim = kFullPublicInformationStateSize;
+    spec_legacy.hidden_dim = 32;
+    spec_legacy.num_blocks = 1;
+    spec_legacy.enable_semantic_scorer = true;
+    spec_legacy.semantic_descriptor_schema = dune_semantic::kDescriptorSchemaVersionV3;
+    WriteCheckpointMetadataFile(legacy_json, spec_legacy);
+
+    SPIEL_CHECK_TRUE(std::filesystem::exists(legacy_json));
+
+    DeckPoolSemantics parsed_legacy = ReadCheckpointDeckPoolSemantics(legacy_pt);
+    SPIEL_CHECK_TRUE(parsed_legacy == DeckPoolSemantics::kLegacy);
+
+    // Verify default fallback to kLegacy if deck_pool_semantics is omitted in sidecar JSON
+    const std::string no_sem_pt = (temp_dir / "ppo_model_no_sem.pt").string();
+    const std::string no_sem_json = (temp_dir / "ppo_model_no_sem.json").string();
+    torch::save(m_legacy, no_sem_pt);
+    {
+      const auto legacy_schema = GetInformationStateSchema(
+          MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kLegacy);
+      std::ofstream jf(no_sem_json);
+      jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+         << "\"observation_dim\": 9182,"
+         << "\"feature_schema_sha256\": \"" << legacy_schema.sha256 << "\","
+         << "\"semantic_descriptor_schema\": \"semantic_action_v3\","
+         << "\"enable_semantic_scorer\": true}\n";
+    }
+    DeckPoolSemantics parsed_no_sem = ReadCheckpointDeckPoolSemantics(no_sem_pt);
+    SPIEL_CHECK_TRUE(parsed_no_sem == DeckPoolSemantics::kLegacy);
+  }
+
+  // (b) Fail-closed behavior on sidecar schema hash mismatch with deck_pool_semantics
+  {
+    const auto fixed_schema = GetInformationStateSchema(
+        MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kFixed);
+    const auto legacy_schema = GetInformationStateSchema(
+        MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kLegacy);
+    SPIEL_CHECK_TRUE(fixed_schema.sha256 != legacy_schema.sha256);
+
+    auto m = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+
+    // Mismatch 1: deck_pool_semantics says fixed, but hash is legacy hash
+    const std::string bad1_pt = (temp_dir / "mismatch_fixed_with_legacy_hash.pt").string();
+    const std::string bad1_json = (temp_dir / "mismatch_fixed_with_legacy_hash.json").string();
+    torch::save(m, bad1_pt);
+    {
+      std::ofstream jf(bad1_json);
+      jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+         << "\"observation_dim\": 9182,"
+         << "\"deck_pool_semantics\": \"fixed\","
+         << "\"feature_schema_sha256\": \"" << legacy_schema.sha256 << "\","
+         << "\"semantic_descriptor_schema\": \"semantic_action_v3\","
+         << "\"enable_semantic_scorer\": true}\n";
+    }
+    bool caught1 = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, bad1_pt, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught1 = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught1);
+
+    // Mismatch 2: deck_pool_semantics says legacy, but hash is fixed hash
+    const std::string bad2_pt = (temp_dir / "mismatch_legacy_with_fixed_hash.pt").string();
+    const std::string bad2_json = (temp_dir / "mismatch_legacy_with_fixed_hash.json").string();
+    torch::save(m, bad2_pt);
+    {
+      std::ofstream jf(bad2_json);
+      jf << "{\"market_appendix_mode\": \"full_public_information_v3\","
+         << "\"observation_dim\": 9182,"
+         << "\"deck_pool_semantics\": \"legacy\","
+         << "\"feature_schema_sha256\": \"" << fixed_schema.sha256 << "\","
+         << "\"semantic_descriptor_schema\": \"semantic_action_v3\","
+         << "\"enable_semantic_scorer\": true}\n";
+    }
+    bool caught2 = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, bad2_pt, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught2 = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught2);
+
+    // Missing sidecar json check: fails closed via SpielFatalError
+    const std::string missing_json_pt = (temp_dir / "missing_json.pt").string();
+    torch::save(m, missing_json_pt);
+    bool caught_missing = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      auto load_target = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+      LoadModelCheckpointRobust(load_target, missing_json_pt, torch::kCPU);
+    } catch (const std::exception& e) {
+      caught_missing = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_missing);
+
+    bool caught_missing_semantics = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      ReadCheckpointDeckPoolSemantics(missing_json_pt);
+    } catch (const std::exception& e) {
+      caught_missing_semantics = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_missing_semantics);
+
+    bool caught_missing_mode = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      ReadCheckpointInputMode(missing_json_pt, kLegacyInformationStateSize);
+    } catch (const std::exception& e) {
+      caught_missing_mode = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_missing_mode);
+
+    // Invalid sidecar json check: fails closed via SpielFatalError
+    const std::string invalid_json_pt = (temp_dir / "invalid_json.pt").string();
+    const std::string invalid_json_path = (temp_dir / "invalid_json.json").string();
+    torch::save(m, invalid_json_pt);
+    {
+      std::ofstream jf(invalid_json_path);
+      jf << "{ unparseable json content";
+    }
+    bool caught_invalid_semantics = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      ReadCheckpointDeckPoolSemantics(invalid_json_pt);
+    } catch (const std::exception& e) {
+      caught_invalid_semantics = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_invalid_semantics);
+
+    bool caught_invalid_mode = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      ReadCheckpointInputMode(invalid_json_pt, kLegacyInformationStateSize);
+    } catch (const std::exception& e) {
+      caught_invalid_mode = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_invalid_mode);
+  }
+
+  // (c) LoadModelCheckpointRobust setting model's deck_pool_semantics_
+  {
+    const std::string fixed_pt = (temp_dir / "ppo_model_1.pt").string();
+    const std::string legacy_pt = (temp_dir / "ppo_model_2.pt").string();
+
+    auto loaded_fixed = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    LoadModelCheckpointRobust(loaded_fixed, fixed_pt, torch::kCPU);
+    SPIEL_CHECK_TRUE(loaded_fixed->deck_pool_semantics_ == DeckPoolSemantics::kFixed);
+
+    auto loaded_legacy = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    LoadModelCheckpointRobust(loaded_legacy, legacy_pt, torch::kCPU);
+    SPIEL_CHECK_TRUE(loaded_legacy->deck_pool_semantics_ == DeckPoolSemantics::kLegacy);
+  }
+
+  // (d) DeterministicEvaluator and BatchedEvaluator DeckPoolSemantics() matching model
+  {
+    auto m_fixed = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_fixed->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_fixed->deck_pool_semantics_ = DeckPoolSemantics::kFixed;
+    std::mutex eval_mutex;
+    DeterministicEvaluator det_fixed(m_fixed, torch::kCPU, &eval_mutex);
+    SPIEL_CHECK_TRUE(det_fixed.DeckPoolSemantics() == DeckPoolSemantics::kFixed);
+
+    std::shared_mutex sync_mutex;
+    BatchedEvaluator batched_fixed(m_fixed, 1, 5, torch::kCPU, &sync_mutex);
+    SPIEL_CHECK_TRUE(batched_fixed.DeckPoolSemantics() == DeckPoolSemantics::kFixed);
+
+    auto m_legacy = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_legacy->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_legacy->deck_pool_semantics_ = DeckPoolSemantics::kLegacy;
+    DeterministicEvaluator det_legacy(m_legacy, torch::kCPU, &eval_mutex);
+    SPIEL_CHECK_TRUE(det_legacy.DeckPoolSemantics() == DeckPoolSemantics::kLegacy);
+
+    BatchedEvaluator batched_legacy(m_legacy, 1, 5, torch::kCPU, &sync_mutex);
+    SPIEL_CHECK_TRUE(batched_legacy.DeckPoolSemantics() == DeckPoolSemantics::kLegacy);
+  }
+
+  // (e) DuneNNEvaluator and BatchedNNEvaluator generating observations matching evaluator's DeckPoolSemantics
+  {
+    auto game = LoadGame("dune_imperium(enable_immortality=true)");
+    auto state = game->NewInitialState();
+    auto* dune = dynamic_cast<DuneImperiumState*>(state.get());
+    SPIEL_CHECK_TRUE(dune != nullptr);
+
+    auto m_fixed = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_fixed->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_fixed->deck_pool_semantics_ = DeckPoolSemantics::kFixed;
+    DuneNNEvaluator nn_fixed(m_fixed, torch::kCPU);
+    SPIEL_CHECK_TRUE(nn_fixed.DeckPoolSemantics() == DeckPoolSemantics::kFixed);
+
+    auto m_legacy = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    m_legacy->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_legacy->deck_pool_semantics_ = DeckPoolSemantics::kLegacy;
+    DuneNNEvaluator nn_legacy(m_legacy, torch::kCPU);
+    SPIEL_CHECK_TRUE(nn_legacy.DeckPoolSemantics() == DeckPoolSemantics::kLegacy);
+
+    std::vector<float> obs_nn_fixed = nn_fixed.GetConsumedObservation(*dune, 0);
+    std::vector<float> obs_nn_legacy = nn_legacy.GetConsumedObservation(*dune, 0);
+    SPIEL_CHECK_EQ(obs_nn_fixed.size(), kFullPublicInformationStateSize);
+    SPIEL_CHECK_EQ(obs_nn_legacy.size(), kFullPublicInformationStateSize);
+
+    std::shared_mutex sync_mutex;
+    auto b_eval_fixed = std::make_shared<BatchedEvaluator>(m_fixed, 1, 5, torch::kCPU, &sync_mutex);
+    BatchedNNEvaluator batched_nn_fixed(b_eval_fixed);
+    SPIEL_CHECK_TRUE(batched_nn_fixed.DeckPoolSemantics() == DeckPoolSemantics::kFixed);
+
+    auto b_eval_legacy = std::make_shared<BatchedEvaluator>(m_legacy, 1, 5, torch::kCPU, &sync_mutex);
+    BatchedNNEvaluator batched_nn_legacy(b_eval_legacy);
+    SPIEL_CHECK_TRUE(batched_nn_legacy.DeckPoolSemantics() == DeckPoolSemantics::kLegacy);
+
+    std::vector<float> obs_batched_fixed = batched_nn_fixed.GetConsumedObservation(*dune, 0);
+    std::vector<float> obs_batched_legacy = batched_nn_legacy.GetConsumedObservation(*dune, 0);
+    SPIEL_CHECK_EQ(obs_batched_fixed.size(), kFullPublicInformationStateSize);
+    SPIEL_CHECK_EQ(obs_batched_legacy.size(), kFullPublicInformationStateSize);
+
+    // Verify bit-for-bit parity between DuneNNEvaluator and BatchedNNEvaluator under fixed
+    SPIEL_CHECK_TRUE(std::equal(obs_nn_fixed.begin(), obs_nn_fixed.end(), obs_batched_fixed.begin()));
+    // Verify bit-for-bit parity between DuneNNEvaluator and BatchedNNEvaluator under legacy
+    SPIEL_CHECK_TRUE(std::equal(obs_nn_legacy.begin(), obs_nn_legacy.end(), obs_batched_legacy.begin()));
+  }
+
+  // (f) Warm-start vs resume semantics test
+  {
+    const std::string legacy_pt = (temp_dir / "ppo_model_2.pt").string();
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 32, 2391, 1, false, false, 0, true);
+    LoadModelCheckpointRobust(model, legacy_pt, torch::kCPU);
+    SPIEL_CHECK_TRUE(model->deck_pool_semantics_ == DeckPoolSemantics::kLegacy);
+
+    // Verify resume mismatch check triggers when target deck_pool_semantics is fixed
+    const DeckPoolSemantics target_semantics = DeckPoolSemantics::kFixed;
+    const DeckPoolSemantics checkpoint_semantics = ReadCheckpointDeckPoolSemantics(legacy_pt);
+    SPIEL_CHECK_TRUE(checkpoint_semantics == DeckPoolSemantics::kLegacy);
+    bool caught_resume_mismatch = false;
+    open_spiel::SetErrorHandler(ThrowingErrorHandler);
+    try {
+      if (checkpoint_semantics != target_semantics) {
+        SpielFatalError(absl::StrFormat(
+            "deck_pool_semantics mismatch on resume. Manifest: '%s', Flag: '%s'",
+            dune_imperium::DeckPoolSemanticsToString(checkpoint_semantics),
+            dune_imperium::DeckPoolSemanticsToString(target_semantics)));
+      }
+    } catch (const std::exception& e) {
+      caught_resume_mismatch = true;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    SPIEL_CHECK_TRUE(caught_resume_mismatch);
+
+    // Warm-start override: update model's deck_pool_semantics_ to target_semantics
+    model->deck_pool_semantics_ = target_semantics;
+    SPIEL_CHECK_TRUE(model->deck_pool_semantics_ == DeckPoolSemantics::kFixed);
+
+    // Save checkpoint and sidecar metadata
+    const std::string warmstart_pt = (temp_dir / "ppo_model_warmstart.pt").string();
+    const std::string warmstart_json = (temp_dir / "ppo_model_warmstart.json").string();
+    torch::save(model, warmstart_pt);
+    CheckpointMetadataSpec spec_warmstart;
+    spec_warmstart.market_appendix_mode = "full_public_information_v3";
+    spec_warmstart.deck_pool_semantics = model->deck_pool_semantics_;
+    spec_warmstart.observation_dim = kFullPublicInformationStateSize;
+    spec_warmstart.hidden_dim = 32;
+    spec_warmstart.num_blocks = 1;
+    spec_warmstart.enable_semantic_scorer = true;
+    spec_warmstart.semantic_descriptor_schema = dune_semantic::kDescriptorSchemaVersionV3;
+    WriteCheckpointMetadataFile(warmstart_json, spec_warmstart);
+
+    // Verify sidecar JSON contents
+    std::ifstream jf(warmstart_json);
+    std::string content((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+    SPIEL_CHECK_TRUE(content.find("\"deck_pool_semantics\": \"fixed\"") != std::string::npos);
+    SPIEL_CHECK_TRUE(content.find("|deck_pool=fixed_v1") != std::string::npos);
+
+    // Verify ReadCheckpointDeckPoolSemantics parses it back as kFixed
+    DeckPoolSemantics parsed_warmstart = ReadCheckpointDeckPoolSemantics(warmstart_pt);
+    SPIEL_CHECK_TRUE(parsed_warmstart == DeckPoolSemantics::kFixed);
+  }
+
+  // (g) Mixed 1-vs-3 game test with search
+  {
+    auto game = LoadGame("dune_imperium(enable_immortality=true)");
+    auto fresh_state = game->NewInitialState();
+    auto* s = static_cast<DuneImperiumState*>(fresh_state.get());
+
+    // Advance state to round-start draw chance nodes (CurrentChanceStreamId() in [10, 13])
+    while ((s->CurrentChanceStreamId() < 10 || s->CurrentChanceStreamId() > 13) && !s->IsTerminal()) {
+      if (s->IsChanceNode()) {
+        auto outcomes = s->ChanceOutcomes();
+        SPIEL_CHECK_FALSE(outcomes.empty());
+        s->ApplyAction(outcomes[0].first);
+      } else {
+        auto legal = s->LegalActions();
+        SPIEL_CHECK_FALSE(legal.empty());
+        s->ApplyAction(legal[0]);
+      }
+    }
+
+    // Step through player 0's 5 draws
+    for (int i = 0; i < 5; ++i) {
+      SPIEL_CHECK_TRUE(s->IsChanceNode());
+      SPIEL_CHECK_EQ(s->CurrentChanceStreamId(), 10);
+      auto outcomes = s->ChanceOutcomes();
+      SPIEL_CHECK_FALSE(outcomes.empty());
+      s->ApplyAction(outcomes[0].first);
+    }
+
+    // Now player 1 is drawing cards (stream 11)
+    const Player opp = 1;
+    SPIEL_CHECK_EQ(s->CurrentChanceStreamId(), 10 + opp);
+
+    s->SetPlayerDrawDeckForTesting(opp, {kCardDagger, kCardDiplomacy});
+    const std::vector<int> discard_8 = {
+        kCardDagger, kCardDagger, kCardDiplomacy, kCardDuneTheDesertPlanet,
+        kCardDuneTheDesertPlanet, kCardSeekAllies, kCardSignetRing, kCardConvincingArgument};
+    s->SetPlayerDiscardForTesting(opp, discard_8);
+
+    std::vector<int> discard_pool(kNumImperiumCardIds, 0);
+    for (int c : discard_8) {
+      discard_pool[c]++;
+    }
+    s->SetDeckPoolDiscardForTesting(opp, discard_pool);
+    s->SetFixedDeckPoolDiscardForTesting(opp, discard_pool);
+
+    // Step through 5 draws for player 1 (draw 3 triggers reshuffle)
+    for (int i = 0; i < 5; ++i) {
+      SPIEL_CHECK_TRUE(s->IsChanceNode());
+      SPIEL_CHECK_EQ(s->CurrentChanceStreamId(), 10 + opp);
+      auto outcomes = s->ChanceOutcomes();
+      SPIEL_CHECK_FALSE(outcomes.empty());
+      s->ApplyAction(outcomes[0].first);
+    }
+    SPIEL_CHECK_TRUE(s->IsDeckPoolDrawDeckStaleForTesting(opp));
+
+    // Verify observation difference in [2067, 3204) between kLegacy and kFixed for observer 0
+    const auto tensor_legacy = s->InformationStateTensorWithAppendix(
+        0, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kLegacy);
+    const auto tensor_fixed = s->InformationStateTensorWithAppendix(
+        0, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kFixed);
+
+    SPIEL_CHECK_EQ(tensor_legacy.size(), kFullPublicInformationStateSize);
+    SPIEL_CHECK_EQ(tensor_fixed.size(), kFullPublicInformationStateSize);
+
+    int first_diff = -1;
+    int last_diff = -1;
+    for (size_t i = 0; i < tensor_legacy.size(); ++i) {
+      if (tensor_legacy[i] != tensor_fixed[i]) {
+        if (first_diff == -1) first_diff = static_cast<int>(i);
+        last_diff = static_cast<int>(i);
+      }
+    }
+
+    SPIEL_CHECK_NE(first_diff, -1);
+    SPIEL_CHECK_GE(first_diff, kNumImperiumCardIds);
+    const size_t opp_pool_start = static_cast<size_t>(first_diff) - kNumImperiumCardIds;
+    const size_t opp_pool_size = (kNumPlayers - 1) * (3 * kNumImperiumCardIds + 1);
+    const size_t opp_pool_end = opp_pool_start + opp_pool_size;
+    SPIEL_CHECK_EQ(opp_pool_size, 1137);
+    SPIEL_CHECK_LT(static_cast<size_t>(last_diff), opp_pool_end);
+    SPIEL_CHECK_LT(last_diff - first_diff, static_cast<int>(opp_pool_size));
+
+    // Verify all floats outside that 1137-float Opponent Deck Pool block are identical.
+    for (size_t i = 0; i < opp_pool_start; ++i) {
+      SPIEL_CHECK_FLOAT_EQ(tensor_legacy[i], tensor_fixed[i]);
+    }
+    for (size_t i = opp_pool_end; i < tensor_legacy.size(); ++i) {
+      SPIEL_CHECK_FLOAT_EQ(tensor_legacy[i], tensor_fixed[i]);
+    }
+
+    // Step through remaining chance nodes until agent turns begin
+    while (s->IsChanceNode() && !s->IsTerminal()) {
+      auto outcomes = s->ChanceOutcomes();
+      SPIEL_CHECK_FALSE(outcomes.empty());
+      s->ApplyAction(outcomes[0].first);
+    }
+    SPIEL_CHECK_FALSE(s->IsTerminal());
+    SPIEL_CHECK_EQ(s->CurrentPlayer(), 0);
+
+    // Create 1 kFixed evaluator (Seat 0) and 3 kLegacy evaluators (Seats 1, 2, 3)
+    auto m_fixed = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 2048, 2391, 1, false, false, 0, true);
+    m_fixed->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_fixed->deck_pool_semantics_ = DeckPoolSemantics::kFixed;
+
+    auto m_legacy = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationStateSize, 2048, 2391, 1, false, false, 0, true);
+    m_legacy->semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+    m_legacy->deck_pool_semantics_ = DeckPoolSemantics::kLegacy;
+
+    std::shared_mutex sync_mutex_fixed;
+    std::shared_mutex sync_mutex_legacy;
+    auto b_eval_fixed = std::make_shared<BatchedEvaluator>(
+        m_fixed, 16, 5, torch::kCPU, &sync_mutex_fixed);
+    auto b_eval_legacy = std::make_shared<BatchedEvaluator>(
+        m_legacy, 16, 5, torch::kCPU, &sync_mutex_legacy);
+
+    auto batched_nn_fixed = std::make_shared<BatchedNNEvaluator>(b_eval_fixed);
+    auto batched_nn_legacy = std::make_shared<BatchedNNEvaluator>(b_eval_legacy);
+
+    // Verify Evaluate on Seat 0 evaluator evaluates all 4 seats without mismatch error
+    auto eval_values = batched_nn_fixed->Evaluate(*s);
+    SPIEL_CHECK_EQ(eval_values.size(), 4);
+
+    // Verify GetConsumedObservation matches kFixed appendix for Seat 0
+    std::vector<float> obs_seat0 = batched_nn_fixed->GetConsumedObservation(*s, 0);
+    std::vector<float> expected_obs0 = s->InformationStateTensorWithAppendix(
+        0, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kFixed);
+    SPIEL_CHECK_TRUE(obs_seat0 == expected_obs0);
+
+    // Test RunCompoundTurnSearch with Seat 0 evaluator
+    auto search_res_0 = RunCompoundTurnSearch(
+        *s, /*search_player=*/0, batched_nn_fixed,
+        /*top_k=*/2, /*rollouts_per_action=*/1, /*min_override_margin=*/0.15,
+        /*decision_seed=*/12345);
+    SPIEL_CHECK_NE(search_res_0.action, kInvalidAction);
+
+    // Advance game state until Seat 1's turn
+    while (!s->IsTerminal() && s->CurrentPlayer() != 1) {
+      if (s->IsChanceNode()) {
+        auto outcomes = s->ChanceOutcomes();
+        SPIEL_CHECK_FALSE(outcomes.empty());
+        s->ApplyAction(outcomes[0].first);
+      } else {
+        auto legal = s->LegalActions();
+        SPIEL_CHECK_FALSE(legal.empty());
+        s->ApplyAction(legal[0]);
+      }
+    }
+    SPIEL_CHECK_EQ(s->CurrentPlayer(), 1);
+
+    // Verify GetConsumedObservation matches kLegacy appendix for Seat 1
+    std::vector<float> obs_seat1 = batched_nn_legacy->GetConsumedObservation(*s, 1);
+    std::vector<float> expected_obs1 = s->InformationStateTensorWithAppendix(
+        1, MarketAppendixMode::kFullPublicInformationV3, DeckPoolSemantics::kLegacy);
+    SPIEL_CHECK_TRUE(obs_seat1 == expected_obs1);
+
+    // Test RunCompoundTurnSearch with Seat 1 evaluator
+    auto search_res_1 = RunCompoundTurnSearch(
+        *s, /*search_player=*/1, batched_nn_legacy,
+        /*top_k=*/2, /*rollouts_per_action=*/1, /*min_override_margin=*/0.15,
+        /*decision_seed=*/54321);
+    SPIEL_CHECK_NE(search_res_1.action, kInvalidAction);
+
+    // Run EvaluateFixedSeatConfigurationBatched to completion
+    std::vector<std::shared_ptr<IGameEvaluator>> opponent_evaluators = {
+        b_eval_legacy, b_eval_legacy, b_eval_legacy};
+    auto final_returns = dune_opponent_pool::EvaluateFixedSeatConfigurationBatched(
+        *game, b_eval_fixed, opponent_evaluators, /*candidate_seat=*/0, /*seed=*/42);
+    SPIEL_CHECK_EQ(final_returns.size(), 4);
+  }
+
+  std::cout << "PASS: TestDeckPoolSemanticsIntegration\n";
+}
+
 }  // namespace
 }  // namespace open_spiel
 
@@ -1293,6 +1809,7 @@ int main(int argc, char** argv) {
   open_spiel::TestOptimizerMigration6255To9182(artifacts_dir / "optim_mig_6255");
   open_spiel::TestModelAndOptimizerMigration9182To9941(artifacts_dir / "optim_mig_9182");
   open_spiel::TestModelMigrationDepthGuards(artifacts_dir / "depth_guards");
+  open_spiel::TestDeckPoolSemanticsIntegration(artifacts_dir / "deck_pool_sem");
   if (argc > 2) {
     const std::filesystem::path b400_dir(argv[2]);
     open_spiel::TestBootstrappedBundleVerification(b400_dir);

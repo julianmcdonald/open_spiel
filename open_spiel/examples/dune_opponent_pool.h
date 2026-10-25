@@ -203,15 +203,25 @@ inline int SimulateSingleLearnerRollout(
 
     const bool is_learner = (current_player == learner_seat);
 
-    std::vector<float> obs(obs_size, 0.0f);
-    if (provides_info_state_tensor && current_player >= 0) {
+    std::shared_ptr<IGameEvaluator> active_evaluator =
+        ResolveEvaluator(current_player, seat_assignment, learner_evaluator, opponent_evaluators);
+
+    const auto mode = active_evaluator ? active_evaluator->MarketMode()
+                                       : dune_imperium::MarketAppendixMode::kNone;
+    const auto semantics = active_evaluator ? active_evaluator->DeckPoolSemantics()
+                                           : dune_imperium::DeckPoolSemantics::kLegacy;
+    const int active_obs_size = dune_imperium::GetInformationStateSchema(mode, semantics).size;
+    std::vector<float> obs(active_obs_size, 0.0f);
+
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    if (dune_state != nullptr) {
+      dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs), semantics);
+    } else if (provides_info_state_tensor && current_player >= 0) {
       state->InformationStateTensor(current_player, absl::MakeSpan(obs));
     } else if (provides_observations_tensor && current_player >= 0) {
       state->ObservationTensor(current_player, absl::MakeSpan(obs));
     }
 
-    std::shared_ptr<IGameEvaluator> active_evaluator =
-        ResolveEvaluator(current_player, seat_assignment, learner_evaluator, opponent_evaluators);
     EvalResult result = active_evaluator->Evaluate(obs);
     std::vector<float> logits = std::move(result.logits);
     CenterAndCapLegalLogits(logits, actions, 10.0f);
@@ -328,15 +338,25 @@ inline int SimulateMixedPoolRollout(
     const bool is_learner = (current_player >= 0 && current_player < 4) &&
                             seat_assignment.is_learner_seat[current_player];
 
-    std::vector<float> obs(obs_size, 0.0f);
-    if (provides_info_state_tensor && current_player >= 0) {
+    std::shared_ptr<IGameEvaluator> active_evaluator =
+        ResolveEvaluator(current_player, seat_assignment, learner_evaluator, opponent_evaluators);
+
+    const auto mode = active_evaluator ? active_evaluator->MarketMode()
+                                       : dune_imperium::MarketAppendixMode::kNone;
+    const auto semantics = active_evaluator ? active_evaluator->DeckPoolSemantics()
+                                           : dune_imperium::DeckPoolSemantics::kLegacy;
+    const int active_obs_size = dune_imperium::GetInformationStateSchema(mode, semantics).size;
+    std::vector<float> obs(active_obs_size, 0.0f);
+
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    if (dune_state != nullptr) {
+      dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs), semantics);
+    } else if (provides_info_state_tensor && current_player >= 0) {
       state->InformationStateTensor(current_player, absl::MakeSpan(obs));
     } else if (provides_observations_tensor && current_player >= 0) {
       state->ObservationTensor(current_player, absl::MakeSpan(obs));
     }
 
-    std::shared_ptr<IGameEvaluator> active_evaluator =
-        ResolveEvaluator(current_player, seat_assignment, learner_evaluator, opponent_evaluators);
     EvalResult result = active_evaluator->Evaluate(obs);
     std::vector<float> logits = std::move(result.logits);
     CenterAndCapLegalLogits(logits, actions, 10.0f);
@@ -390,6 +410,82 @@ inline int SimulateMixedPoolRollout(
   }
 
   return game_length;
+}
+
+// Evaluate a full 4-player game with a fixed seat configuration to completion.
+inline std::vector<double> EvaluateFixedSeatConfigurationBatched(
+    const Game& game,
+    std::shared_ptr<IGameEvaluator> candidate_evaluator,
+    const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
+    int candidate_seat = 0,
+    uint64_t seed = 42) {
+  auto chance_rng = dune_seed::MakeRng64(seed);
+  std::mt19937_64 policy_rng[4];
+  for (int p = 0; p < 4; ++p) {
+    policy_rng[p] = dune_seed::MakeRng64(seed + 1 + p);
+  }
+
+  std::unique_ptr<State> state = game.NewInitialState();
+  int game_length = 0;
+  while (!state->IsTerminal()) {
+    ++game_length;
+    if (game_length > 5000) std::abort();
+
+    if (state->IsChanceNode()) {
+      auto outcomes = state->ChanceOutcomes();
+      Action action = SampleAction(outcomes, chance_rng).first;
+      state->ApplyAction(action);
+      continue;
+    }
+    if (state->CurrentPlayer() == kSimultaneousPlayerId) {
+      std::vector<Action> joint_action;
+      for (int p = 0; p < game.NumPlayers(); ++p) {
+        std::vector<Action> actions = state->LegalActions(p);
+        if (actions.empty()) {
+          joint_action.push_back(0);
+        } else {
+          std::uniform_int_distribution<int> dis(0, actions.size() - 1);
+          joint_action.push_back(actions[dis(policy_rng[p])]);
+        }
+      }
+      state->ApplyActions(joint_action);
+      continue;
+    }
+    Player current_player = state->CurrentPlayer();
+    std::vector<Action> actions = state->LegalActions();
+    if (actions.empty()) break;
+
+    std::shared_ptr<IGameEvaluator> active_evaluator =
+        (current_player == candidate_seat)
+            ? candidate_evaluator
+            : (opponent_evaluators.empty()
+                   ? candidate_evaluator
+                   : opponent_evaluators[std::min(static_cast<size_t>(std::max(0, current_player - 1)),
+                                                  opponent_evaluators.size() - 1)]);
+
+    const auto mode = active_evaluator ? active_evaluator->MarketMode()
+                                       : dune_imperium::MarketAppendixMode::kNone;
+    const auto semantics = active_evaluator ? active_evaluator->DeckPoolSemantics()
+                                           : dune_imperium::DeckPoolSemantics::kLegacy;
+    const int active_obs_size = dune_imperium::GetInformationStateSchema(mode, semantics).size;
+    std::vector<float> obs(active_obs_size, 0.0f);
+
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    if (dune_state != nullptr) {
+      dune_state->InformationStateTensorWithAppendix(current_player, mode, absl::MakeSpan(obs), semantics);
+    } else {
+      state->InformationStateTensor(current_player, absl::MakeSpan(obs));
+    }
+
+    EvalResult result = active_evaluator->Evaluate(obs);
+    std::vector<float> logits = std::move(result.logits);
+    CenterAndCapLegalLogits(logits, actions, 10.0f);
+
+    const PolicyDistributionSample policy_sample =
+        SamplePolicyDistribution(&policy_rng[current_player], logits, actions, nullptr);
+    state->ApplyAction(policy_sample.action);
+  }
+  return state->Returns();
 }
 
 }  // namespace dune_opponent_pool

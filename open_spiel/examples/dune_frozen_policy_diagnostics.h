@@ -827,6 +827,7 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
         obs_dim_, hidden_dim_, kActionDim, num_blocks_,
         /*use_nonlinear=*/false, /*with_aux_heads=*/false,
         /*head_init_seed=*/0, with_semantic_scorer_);
+    model_->deck_pool_semantics_ = deck_pool_semantics_;
 
     torch::serialize::InputArchive archive;
     archive.load_from(checkpoint_path, device_);
@@ -847,6 +848,7 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
   int NumBlocks() const { return num_blocks_; }
   bool WithSemanticScorer() const { return with_semantic_scorer_; }
   dune_imperium::MarketAppendixMode MarketMode() const { return market_mode_; }
+  dune_imperium::DeckPoolSemantics DeckPoolSemantics() const { return deck_pool_semantics_; }
   bool HasSemanticScorer() const { return evaluator_ != nullptr && evaluator_->HasSemanticScorer(); }
   std::string SemanticDescriptorSchema() const {
     return evaluator_ != nullptr ? evaluator_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
@@ -858,11 +860,8 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
     snap.legal_actions = GetPlayerLegalActions(state, player);
     const auto* dune = dynamic_cast<const DuneImperiumState*>(&state);
     if (dune != nullptr) {
-      if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
-        snap.observation_tensor = dune->InformationStateTensorWithAppendix(player, market_mode_);
-      } else {
-        snap.observation_tensor = state.InformationStateTensor(player);
-      }
+      snap.observation_tensor = dune->InformationStateTensorWithAppendix(
+          player, market_mode_, DeckPoolSemantics());
       if (evaluator_ != nullptr && evaluator_->HasSemanticScorer() && !snap.legal_actions.empty()) {
         dune_semantic::CandidateActionData cand_data;
         dune_semantic::ExtractCandidateDescriptors(
@@ -882,8 +881,8 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
   std::vector<float> GetRawLogits(const State& state, Player player) override {
     const auto* dune = dynamic_cast<const DuneImperiumState*>(&state);
     std::vector<float> obs;
-    if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
-      obs = dune->InformationStateTensorWithAppendix(player, market_mode_);
+    if (dune != nullptr) {
+      obs = dune->InformationStateTensorWithAppendix(player, market_mode_, DeckPoolSemantics());
     } else {
       obs = state.InformationStateTensor(player);
     }
@@ -978,6 +977,10 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
           if (it_mm != obj.end() && it_mm->second.IsString()) {
             market_mode_str_ = it_mm->second.GetString();
           }
+          auto it_sem = obj.find("deck_pool_semantics");
+          if (it_sem != obj.end() && it_sem->second.IsString()) {
+            deck_pool_semantics_ = dune_imperium::ParseDeckPoolSemanticsOrDie(it_sem->second.GetString());
+          }
         }
       }
     }
@@ -1004,6 +1007,8 @@ class NeuralPolicyDiagnosticsEvaluator : public IPolicyDiagnosticsEvaluator {
   std::string market_mode_str_ = "full_public_information_v3";
   dune_imperium::MarketAppendixMode market_mode_ =
       dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
+  dune_imperium::DeckPoolSemantics deck_pool_semantics_ =
+      dune_imperium::DeckPoolSemantics::kLegacy;
 
   std::mutex eval_mutex_;
   std::shared_ptr<SharedDunePolicyValueNetImpl> model_;

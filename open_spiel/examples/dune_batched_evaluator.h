@@ -68,6 +68,14 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
   }
 
+  dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
+    return batched_eval_ ? batched_eval_->DeckPoolSemantics() : dune_imperium::DeckPoolSemantics::kLegacy;
+  }
+
+  dune_imperium::MarketAppendixMode MarketMode() const {
+    return market_mode_;
+  }
+
   void AdjustActiveRollouts(int delta) {
     if (batched_eval_) batched_eval_->AdjustActiveRollouts(delta);
   }
@@ -186,10 +194,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
 
  private:
   std::vector<float> ModelObservation(const State& state, Player player) const {
-    if (market_mode_ != dune_imperium::MarketAppendixMode::kNone) {
-      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
-      SPIEL_CHECK_TRUE(dune != nullptr);
-      return dune->InformationStateTensorWithAppendix(player, market_mode_);
+    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    if (dune != nullptr) {
+      return dune->InformationStateTensorWithAppendix(player, market_mode_, DeckPoolSemantics());
     }
     return state.InformationStateTensor(player);
   }

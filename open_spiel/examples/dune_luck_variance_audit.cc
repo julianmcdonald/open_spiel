@@ -382,7 +382,7 @@ Step1GameData SimulateRealTrajectory(
     std::vector<float> obs(kObsDim, 0.0f);
     dune_state->InformationStateTensorWithAppendix(
         p, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-        absl::MakeSpan(obs));
+        absl::MakeSpan(obs), evaluator->DeckPoolSemantics());
 
     dune_semantic::CandidateActionData cand_data;
     dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data,
@@ -569,7 +569,7 @@ void SimulateVariantFForRow(
           std::vector<float> obs_q(kObsDim, 0.0f);
           dune_alt->InformationStateTensorWithAppendix(
               q, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-              absl::MakeSpan(obs_q));
+              absl::MakeSpan(obs_q), evaluator->DeckPoolSemantics());
           dune_semantic::CandidateActionData cand_q;
           dune_semantic::ExtractCandidateDescriptors(
               *dune_alt, actions_q, &cand_q, "semantic_action_v3");
@@ -600,7 +600,7 @@ void SimulateVariantFForRow(
         std::vector<float> obs_p(kObsDim, 0.0f);
         dune_alt->InformationStateTensorWithAppendix(
             p, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-            absl::MakeSpan(obs_p));
+            absl::MakeSpan(obs_p), evaluator->DeckPoolSemantics());
         open_spiel::EvalResult val_res = evaluator->EvaluateValues(obs_p);
         val_calls++;
         float alt_rew = std::clamp(row.raw_row_reward / 4.0f, -1.0f, 1.0f);
@@ -648,7 +648,7 @@ void RunVariantCOnGame(
                 ev.real_endpoint.get());
         dune_real->InformationStateTensorWithAppendix(
             q, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-            absl::MakeSpan(obs_real));
+            absl::MakeSpan(obs_real), evaluator->DeckPoolSemantics());
       }
 
       std::vector<bool> matches_real(8, false);
@@ -669,7 +669,7 @@ void RunVariantCOnGame(
                   alt_endpoints[a].get());
           dune_alt->InformationStateTensorWithAppendix(
               q, dune_imperium::MarketAppendixMode::kFullPublicInformationV3,
-              absl::MakeSpan(obs_alt[a]));
+              absl::MakeSpan(obs_alt[a]), evaluator->DeckPoolSemantics());
           matches_real[a] =
               (std::memcmp(obs_real.data(), obs_alt[a].data(),
                            kObsDim * sizeof(float)) == 0);
