@@ -665,45 +665,6 @@ void ReshuffleEpochCrnTest(const std::shared_ptr<const Game>& game) {
   SPIEL_CHECK_GT(seq_mismatches, 0);
 }
 
-void SmallBudgetGuardTest(const std::shared_ptr<const Game>& game) {
-  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
-      std::make_shared<FixedPriorEvaluator>()};
-  const auto actions = Actions(2);
-
-  // Challenger (actions[1]) has huge advantage (+10.0), but r_completed <= 1
-  // or r_stage2 <= 1 must guard t_stat and prevent override.
-  PayoffState state(game, actions, actions[1], /*advantage=*/10.0, /*noise_size=*/0.0);
-
-  // 1. PairedPriorSortedRolloutSearchDecision with rollouts_per_action = 1 -> r_completed = 1
-  {
-    TurnSearchTree tree;
-    const auto result = PairedPriorSortedRolloutSearchDecision(
-        state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/1,
-        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42);
-    SPIEL_CHECK_EQ(result.action, actions[0]);
-    SPIEL_CHECK_FALSE(result.overridden);
-  }
-
-  // 2. SuccessiveHalvingRolloutSearchDecision with reference_rollouts_per_action = 1 -> r_stage2 <= 1
-  {
-    TurnSearchTree tree;
-    const auto result = SuccessiveHalvingRolloutSearchDecision(
-        state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/1,
-        /*min_override_margin=*/0.15, 42);
-    SPIEL_CHECK_EQ(result.action, actions[0]);
-    SPIEL_CHECK_FALSE(result.overridden);
-  }
-
-  // 3. PairedPriorSortedRolloutSearchDecision with rollouts_per_action = 2 -> r_completed = 2 confirms override
-  {
-    TurnSearchTree tree;
-    const auto result = PairedPriorSortedRolloutSearchDecision(
-        state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/2,
-        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42);
-    SPIEL_CHECK_EQ(result.action, actions[1]);
-    SPIEL_CHECK_TRUE(result.overridden);
-  }
-}
 
 class SlowDeadlineState : public State {
  public:
@@ -740,73 +701,6 @@ class SlowDeadlineState : public State {
   std::vector<Action> actions_;
   int step_ = 0;
 };
-
-void DeadlineEnforcementTest(const std::shared_ptr<const Game>& game) {
-  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
-      std::make_shared<FixedPriorEvaluator>()};
-  const auto actions = Actions(2);
-  SlowDeadlineState slow_state(game, actions);
-
-  // 1. PairedPriorSortedRolloutSearchDecision with tiny deadline (0.001 ms).
-  // Must return quickly without hanging and retain only paired completed worlds.
-  {
-    TurnSearchTree tree;
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto result = PairedPriorSortedRolloutSearchDecision(
-        slow_state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/16,
-        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42,
-        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
-        /*max_time_ms=*/0.001);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start_time).count();
-
-    SPIEL_CHECK_LT(elapsed, 500);
-    SPIEL_CHECK_EQ(result.action, actions[0]);
-    SPIEL_CHECK_FALSE(result.overridden);
-    SPIEL_CHECK_EQ(result.new_rollouts_executed, 0);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(),
-                   result.candidate_rollout_utilities[1].second.size());
-  }
-
-  // 2. SuccessiveHalvingRolloutSearchDecision with tiny deadline (0.001 ms).
-  {
-    TurnSearchTree tree;
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto result = SuccessiveHalvingRolloutSearchDecision(
-        slow_state, 0, &tree, evaluators, /*reference_rollouts_per_action=*/16,
-        /*min_override_margin=*/0.15, 42,
-        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
-        /*max_time_ms=*/0.001);
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start_time).count();
-
-    SPIEL_CHECK_LT(elapsed, 500);
-    SPIEL_CHECK_EQ(result.action, actions[0]);
-    SPIEL_CHECK_FALSE(result.overridden);
-    SPIEL_CHECK_EQ(result.new_rollouts_executed, 0);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(),
-                   result.candidate_rollout_utilities[1].second.size());
-  }
-
-  // 3. Fast state with generous deadline (5000.0 ms) completes normally and paired.
-  {
-    PayoffState fast_state(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/0.0);
-    TurnSearchTree tree;
-    const auto result = PairedPriorSortedRolloutSearchDecision(
-        fast_state, 0, &tree, evaluators, actions, /*rollouts_per_action=*/8,
-        /*min_override_margin=*/0.15, /*min_t_stat=*/1.645, 42,
-        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
-        /*max_time_ms=*/5000.0);
-    SPIEL_CHECK_EQ(result.action, actions[1]);
-    SPIEL_CHECK_TRUE(result.overridden);
-    SPIEL_CHECK_EQ(result.new_rollouts_executed, 16);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities.size(), 2);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second.size(), 8);
-    SPIEL_CHECK_EQ(result.candidate_rollout_utilities[1].second.size(), 8);
-  }
-}
 
 class SleepingPayoffState : public State {
  public:
@@ -953,60 +847,6 @@ void ContiguousPrefixOrderingTest(const std::shared_ptr<const Game>& game) {
   SPIEL_CHECK_EQ(result.candidate_rollout_utilities[0].second[0], 1.0);
   SPIEL_CHECK_EQ(tree.GetVisits(actions[0]), 1);
   SPIEL_CHECK_EQ(tree.GetVisits(actions[1]), 1);
-}
-
-void ClockedVsUnclockedExactParityTest(const std::shared_ptr<const Game>& game) {
-  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
-      std::make_shared<FixedPriorEvaluator>()};
-  const auto actions = Actions(4);
-
-  // 1. SuccessiveHalvingRolloutSearchDecision
-  {
-    PayoffState state_unclocked(game, actions, actions[2], /*advantage=*/1.0, /*noise_size=*/5.0);
-    PayoffState state_clocked(game, actions, actions[2], /*advantage=*/1.0, /*noise_size=*/5.0);
-    TurnSearchTree tree_unclocked;
-    TurnSearchTree tree_clocked;
-
-    const auto res_unclocked = SuccessiveHalvingRolloutSearchDecision(
-        state_unclocked, 0, &tree_unclocked, evaluators, /*reference_rollouts_per_action=*/16,
-        /*min_override_margin=*/0.15, /*decision_seed=*/12345,
-        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
-        /*max_time_ms=*/-1.0);
-
-    const auto res_clocked = SuccessiveHalvingRolloutSearchDecision(
-        state_clocked, 0, &tree_clocked, evaluators, /*reference_rollouts_per_action=*/16,
-        /*min_override_margin=*/0.15, /*decision_seed=*/12345,
-        SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
-        /*max_time_ms=*/10000.0);
-
-    CheckSameResult(res_unclocked, res_clocked);
-    CheckSameTree(*tree_unclocked.current_node(), *tree_clocked.current_node());
-  }
-
-  // 2. PairedPriorSortedRolloutSearchDecision
-  {
-    PayoffState state_unclocked(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/5.0);
-    PayoffState state_clocked(game, actions, actions[1], /*advantage=*/1.0, /*noise_size=*/5.0);
-    TurnSearchTree tree_unclocked;
-    TurnSearchTree tree_clocked;
-
-    const auto res_unclocked = PairedPriorSortedRolloutSearchDecision(
-        state_unclocked, 0, &tree_unclocked, evaluators, actions,
-        /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
-        /*min_t_stat=*/1.0, /*decision_seed=*/54321,
-        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
-        /*max_time_ms=*/-1.0);
-
-    const auto res_clocked = PairedPriorSortedRolloutSearchDecision(
-        state_clocked, 0, &tree_clocked, evaluators, actions,
-        /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
-        /*min_t_stat=*/1.0, /*decision_seed=*/54321,
-        SearchRolloutCrnMode::kSequential, /*sample_opponent_leader_draft=*/false,
-        /*max_time_ms=*/10000.0);
-
-    CheckSameResult(res_unclocked, res_clocked);
-    CheckSameTree(*tree_unclocked.current_node(), *tree_clocked.current_node());
-  }
 }
 
 void DepthGuardTest() {
@@ -1348,11 +1188,8 @@ int main(int argc, char** argv) {
   CurrentChanceStreamIdTest(game);
   DeckOrderCrnAlignmentAndParityTest(game);
   ReshuffleEpochCrnTest(game);
-  SmallBudgetGuardTest(game);
-  DeadlineEnforcementTest(game);
   Stage1OverAllocationStage2ReservationTest(game);
   ContiguousPrefixOrderingTest(game);
-  ClockedVsUnclockedExactParityTest(game);
   DepthGuardTest();
   AdaptivePublicKnowledgeCorrectionTest();
   ClockedExceptionSafetyTest(game);

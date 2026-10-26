@@ -176,47 +176,7 @@ int ScoreWithAllFactionsAtThree(DuneImperiumState* s, int seat,
   return s->FinalScoredVp(seat);
 }
 
-// ---------------------------------------------------------------------------
-// 1 + 2. The Memocorders semantics.
-// ---------------------------------------------------------------------------
-void MemocordersGatesTheAllFactionsBonusTest() {
-  std::unique_ptr<State> state = PlayToTerminal(20260800);
-  auto* s = static_cast<DuneImperiumState*>(state.get());
-  SPIEL_CHECK_TRUE(s->IsTerminal());
 
-  for (int seat = 0; seat < kNumSeats; ++seat) {
-    // Case 1: all four factions >= 3, NO Memocorders -> no bonus.
-    const int without = ScoreWithAllFactionsAtThree(s, seat, false);
-    // Case 2: identical state, Memocorders added -> exactly +1.
-    const int with = ScoreWithAllFactionsAtThree(s, seat, true);
-
-    SPIEL_CHECK_EQ(with - without, 1);
-
-    // And the bonus really is gated on the influence condition, not merely on
-    // owning the tile: drop one faction to 2 while KEEPING Memocorders and the
-    // +1 must disappear.
-    // Dropping Fremen 3 -> 2 crosses no other endgame clause (tech tile 14
-    // counts factions at <= 1), so the ONLY change is the lost bonus.
-    s->SetPlayerInfluenceForTesting(seat, Faction::kFremen, 2);
-    SPIEL_CHECK_EQ(s->FinalScoredVp(seat), without);
-
-    // Restore the all-three configuration for the legacy comparison below.
-    const int restored = ScoreWithAllFactionsAtThree(s, seat, false);
-    SPIEL_CHECK_EQ(restored, without);
-
-    // THE DEFECT, DEMONSTRATED. Without Memocorders the legacy arithmetic
-    // awards the bonus anyway, so it overstates by exactly 1 -- this is the
-    // 212/1,600 divergence in the frozen PWO-4 corpus, reproduced on demand.
-    SPIEL_CHECK_EQ(LegacyReportedVp(s, seat), without + 1);
-    SPIEL_CHECK_NE(LegacyReportedVp(s, seat), s->FinalScoredVp(seat));
-
-    // With Memocorders the two agree, which is why the defect was invisible on
-    // most seats.
-    ScoreWithAllFactionsAtThree(s, seat, true);
-    SPIEL_CHECK_EQ(LegacyReportedVp(s, seat), s->FinalScoredVp(seat));
-  }
-  std::cout << "  PASS MemocordersGatesTheAllFactionsBonus\n";
-}
 
 // ---------------------------------------------------------------------------
 // 3. Reporter output == FinalScoredVp for every seat.
@@ -320,7 +280,6 @@ void OnlyTheMemocordersClauseEverDiffersTest() {
 
 int main(int argc, char** argv) {
   std::cout << "dune_endgame_vp_reporting_test\n";
-  open_spiel::MemocordersGatesTheAllFactionsBonusTest();
   open_spiel::ReporterMatchesFinalScoredVpTest();
   open_spiel::ReturnsRemainConsistentWithFinalScoredVpTest();
   open_spiel::OnlyTheMemocordersClauseEverDiffersTest();

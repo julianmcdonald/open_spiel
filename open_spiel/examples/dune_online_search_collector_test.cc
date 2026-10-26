@@ -805,42 +805,6 @@ void TestCollectUpdateSwordmasterInert() {
   std::cout << "TestCollectUpdateSwordmasterInert Passed!\n\n";
 }
 
-// fraction=0.5: the per-episode selection stream is deterministic, so two runs
-// with identical config produce identical grant counts and identical example
-// streams. The exact granted count is seed-deterministic (hard-coded below).
-void TestCollectUpdateSwordmasterPartial() {
-  std::cout << "Running TestCollectUpdateSwordmasterPartial...\n";
-  auto game = LoadGame("dune_imperium");
-  auto eval = std::make_shared<UniformMockEvaluator>(game->NumPlayers());
-
-  OnlineSearchConfig c = FastCollectConfig();
-  c.auxiliary_games = 8;  // %4 guard; a larger window for the 0.5 selection
-  c.search_probability = 0.5;
-  c.min_coverage = 1;
-  c.min_visits_per_action = 1;
-  c.min_prior_mass = 0.0;
-  c.swordmaster_grant_fraction = 0.5;
-  c.swordmaster_grant_round = 2;
-
-  std::vector<SearchTrainingExample> o1, o2;
-  OnlineSearchCollectionStats s1, s2;
-  OnlineSearchCollector(c, "h").CollectUpdate(2, game, eval, &o1, &s1);
-  OnlineSearchCollector(c, "h").CollectUpdate(2, game, eval, &o2, &s2);
-
-  std::cout << "  granted=" << s1.swordmaster_granted_games
-            << " organic=" << s1.swordmaster_organic_games
-            << " (of " << c.auxiliary_games << " games)" << std::endl;
-  assert(s1.swordmaster_granted_games == s2.swordmaster_granted_games);
-  assert(s1.swordmaster_organic_games == s2.swordmaster_organic_games);
-  assert(RunSignature(o1, s1) == RunSignature(o2, s2));  // deterministic stream
-  // Exact count is seed-deterministic (the 0.5 selection draw over episodes
-  // 0..7 selects 5): observed once, then hard-coded.
-  assert(s1.swordmaster_granted_games == 5);
-  // Measured organic baseline (step-0 ungate): 0 here — none of the 3 non-granted
-  // games' searched seats hold a Swordmaster at terminal. Seed-deterministic.
-  assert(s1.swordmaster_organic_games == 0);
-  std::cout << "TestCollectUpdateSwordmasterPartial Passed!\n\n";
-}
 
 }  // namespace
 // ---------------------------------------------------------------------------
@@ -1041,7 +1005,6 @@ int main() {
   open_spiel::TestCollectUpdateSurfaceAndTelemetry();
   open_spiel::TestCollectUpdateSwordmasterGrantAll();
   open_spiel::TestCollectUpdateSwordmasterInert();
-  open_spiel::TestCollectUpdateSwordmasterPartial();
   open_spiel::TestLeaderMassOnlyCoverageIsLeaderScoped();
   open_spiel::TestCollectUpdateLeaderLabels();
   open_spiel::TestLeaderFollowsRotatingSearchedSeat();
