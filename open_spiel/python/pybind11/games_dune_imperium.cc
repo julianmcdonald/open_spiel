@@ -496,6 +496,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("pending_reward_shipping", &DuneImperiumState::pending_reward_shipping)
       .def("pending_reward_research", &DuneImperiumState::pending_reward_research)
       .def("pending_reward_influence_amount", &DuneImperiumState::PendingRewardInfluenceAmount)
+      .def("pending_acquire_influence_amount", &DuneImperiumState::PendingAcquireInfluenceAmount)
       .def("pending_reward_influence_faction", &DuneImperiumState::pending_reward_influence_faction)
       .def("pending_reward_scarab", &DuneImperiumState::pending_reward_scarab)
       .def("pending_reward_control_bonus", &DuneImperiumState::pending_reward_control_bonus)
