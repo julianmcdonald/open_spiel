@@ -626,6 +626,11 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"))
       .def("get_pending_intrigue_choice_player",
            &DuneImperiumState::GetPendingIntrigueChoicePlayerForTesting)
+      .def("get_pending_ceremony_peek_cards",
+           &DuneImperiumState::GetPendingCeremonyPeekCardsForTesting)
+      .def("set_pending_ceremony_peek_cards",
+           &DuneImperiumState::SetPendingCeremonyPeekForTesting,
+           py::arg("player"), py::arg("cards"))
 
       // --- Action helpers ---
       .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
