@@ -518,7 +518,66 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("pending_reward_slig_farmer", &DuneImperiumState::pending_reward_slig_farmer)
       .def("pending_reward_firm_grip", &DuneImperiumState::pending_reward_firm_grip)
       .def("pending_reward_shifting_allegiances", &DuneImperiumState::pending_reward_shifting_allegiances)
-      .def("pending_reward_in_the_shadows", &DuneImperiumState::pending_reward_in_the_shadows)
+      .def("pending_reward_in_the_shadows",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_reward_in_the_shadows))
+      .def("pending_reward_in_the_shadows",
+           &DuneImperiumState::GetPendingRewardInTheShadows, py::arg("player"))
+      .def("pending_armand_acquire",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_armand_acquire))
+      .def("pending_armand_acquire",
+           &DuneImperiumState::GetPendingArmandAcquire, py::arg("player"))
+      .def("pending_helena_reserve",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_helena_reserve))
+      .def("pending_helena_reserve",
+           &DuneImperiumState::GetPendingHelenaReserve, py::arg("player"))
+      .def("pending_rhombur_signet",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_rhombur_signet))
+      .def("pending_rhombur_signet",
+           &DuneImperiumState::GetPendingRhomburSignet, py::arg("player"))
+      .def("pending_tessia_signet",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_tessia_signet))
+      .def("pending_tessia_signet",
+           &DuneImperiumState::GetPendingTessiaSignet, py::arg("player"))
+      .def("pending_tessia_first_reward_choice",
+           static_cast<std::vector<bool> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_tessia_first_reward_choice))
+      .def("pending_tessia_first_reward_choice",
+           &DuneImperiumState::GetPendingTessiaFirstRewardChoice, py::arg("player"))
+      .def("pending_ixian_engineer_tech",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_ixian_engineer_tech))
+      .def("pending_ixian_engineer_tech",
+           &DuneImperiumState::GetPendingIxianEngineerTech, py::arg("player"))
+      .def("pending_memnon_high_council",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_memnon_high_council))
+      .def("pending_memnon_high_council",
+           &DuneImperiumState::GetPendingMemnonHighCouncil, py::arg("player"))
+      .def("pending_court_intrigue_return",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_court_intrigue_return))
+      .def("pending_court_intrigue_return",
+           &DuneImperiumState::GetPendingCourtIntrigueReturn, py::arg("player"))
+      .def("pending_high_priority_travel",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_high_priority_travel))
+      .def("pending_high_priority_travel",
+           &DuneImperiumState::GetPendingHighPriorityTravel, py::arg("player"))
+      .def("pending_guild_chief_admin_discard",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_guild_chief_admin_discard))
+      .def("pending_guild_chief_admin_discard",
+           &DuneImperiumState::GetPendingGuildChiefAdminDiscard, py::arg("player"))
+      .def("pending_ix_guild_compact_discard",
+           static_cast<std::vector<int> (DuneImperiumState::*)() const>(
+               &DuneImperiumState::pending_ix_guild_compact_discard))
+      .def("pending_ix_guild_compact_discard",
+           &DuneImperiumState::GetPendingIxGuildCompactDiscard, py::arg("player"))
       .def("pending_reward_web_of_power_1", &DuneImperiumState::pending_reward_web_of_power_1)
       .def("pending_reward_web_of_power_2", &DuneImperiumState::pending_reward_web_of_power_2)
       .def("pending_reward_web_of_power_3", &DuneImperiumState::pending_reward_web_of_power_3)
