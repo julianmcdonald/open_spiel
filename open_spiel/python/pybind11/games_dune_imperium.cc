@@ -578,6 +578,15 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                &DuneImperiumState::pending_ix_guild_compact_discard))
       .def("pending_ix_guild_compact_discard",
            &DuneImperiumState::GetPendingIxGuildCompactDiscard, py::arg("player"))
+      .def("set_pending_reward_in_the_shadows",
+           &DuneImperiumState::SetPendingRewardInTheShadowsForTesting,
+           py::arg("player"), py::arg("val"))
+      .def("set_pending_guild_chief_admin_discard",
+           &DuneImperiumState::SetPendingGuildChiefAdminDiscardForTesting,
+           py::arg("player"), py::arg("val"))
+      .def("set_pending_ix_guild_compact_discard",
+           &DuneImperiumState::SetPendingIxGuildCompactDiscardForTesting,
+           py::arg("player"), py::arg("val"))
       .def("pending_reward_web_of_power_1", &DuneImperiumState::pending_reward_web_of_power_1)
       .def("pending_reward_web_of_power_2", &DuneImperiumState::pending_reward_web_of_power_2)
       .def("pending_reward_web_of_power_3", &DuneImperiumState::pending_reward_web_of_power_3)
