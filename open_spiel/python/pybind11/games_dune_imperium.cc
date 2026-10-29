@@ -689,6 +689,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetPlayerTrashedCards, py::arg("player"))
       .def("get_pending_intrigue_choice_kind",
            &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
+      .def("get_pending_intrigue_choice_card_id",
+           &DuneImperiumState::GetPendingIntrigueChoiceCardId)
       .def("bene_gesserit_sister_choice_available",
            &DuneImperiumState::BeneGesseritSisterChoiceAvailable,
            py::arg("player"))
@@ -727,6 +729,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("acquire_imperium_card",
            &DuneImperiumState::AcquireImperiumCardForTesting, py::arg("player"),
            py::arg("card_id"), py::arg("to_topdeck"))
+      .def("acquire_tleilaxu_imperium_card",
+           &DuneImperiumState::AcquireTleilaxuImperiumCardForTesting,
+           py::arg("player"), py::arg("card_id"))
       .def("begin_pending_combat_commit",
            &DuneImperiumState::BeginPendingCombatCommitForTesting,
            py::arg("player"))
