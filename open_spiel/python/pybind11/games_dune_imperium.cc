@@ -689,6 +689,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetPlayerTrashedCards, py::arg("player"))
       .def("get_pending_intrigue_choice_kind",
            &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
+      .def("bene_gesserit_sister_choice_available",
+           &DuneImperiumState::BeneGesseritSisterChoiceAvailable,
+           py::arg("player"))
+      .def("bene_gesserit_sister_choice_pending",
+           &DuneImperiumState::BeneGesseritSisterChoicePending,
+           py::arg("player"))
       .def("prioritize_winning_dreadnought_choice_for_steam",
            &DuneImperiumState::PrioritizeWinningDreadnoughtChoiceForSteam,
            py::arg("player"))
