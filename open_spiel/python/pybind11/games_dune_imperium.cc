@@ -700,8 +700,14 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetPlayerTrashedCards, py::arg("player"))
       .def("get_pending_intrigue_choice_kind",
            &DuneImperiumState::GetPendingIntrigueChoiceKindForTesting)
+      .def("get_active_intrigue_choice_kind",
+           &DuneImperiumState::GetActiveIntrigueChoiceKind)
       .def("get_pending_intrigue_choice_card_id",
            &DuneImperiumState::GetPendingIntrigueChoiceCardId)
+      .def("reveal_retreat_available",
+           &DuneImperiumState::RevealRetreatAvailable, py::arg("player"))
+      .def("reveal_retreat_actions",
+           &DuneImperiumState::RevealRetreatActions, py::arg("player"))
       .def("bene_gesserit_sister_choice_available",
            &DuneImperiumState::BeneGesseritSisterChoiceAvailable,
            py::arg("player"))
