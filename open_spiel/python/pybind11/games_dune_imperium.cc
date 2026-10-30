@@ -413,6 +413,17 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"))
       .def("get_player_vp", &DuneImperiumState::GetPlayerVpForTesting,
            py::arg("player"))
+      .def("get_final_scored_vp", &DuneImperiumState::FinalScoredVp,
+           py::arg("player"),
+           "Return the player's scored VP, including final bonuses. Terminal states only.")
+      .def("get_endgame_intrigue_vp_bonus",
+           &DuneImperiumState::EndgameIntrigueVpBonusForTesting,
+           py::arg("player"), py::arg("card_id"),
+           "Return this card's final VP bonus for the player, regardless of ownership.")
+      .def("get_endgame_intrigue_spice_bonus",
+           &DuneImperiumState::EndgameIntrigueSpiceBonusForTesting,
+           py::arg("player"), py::arg("card_id"),
+           "Return this card's final spice tiebreaker bonus, regardless of ownership.")
       .def("get_player_persuasion",
            &DuneImperiumState::GetPlayerPersuasionForTesting, py::arg("player"))
       .def("get_player_influence",
