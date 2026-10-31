@@ -611,34 +611,45 @@ inline void ApplySemanticScorerBatch(
   }
   if (total_cands == 0) return;
 
-  std::vector<int64_t> batch_indices;
-  std::vector<int64_t> action_indices;
-  std::vector<float> features;
-  std::vector<int64_t> card_ids;
-  std::vector<int64_t> space_ids;
-  std::vector<float> supported;
-  std::vector<uint8_t> is_ext;
-  std::vector<uint8_t> is_f;
+  const bool on_cuda = device.is_cuda();
+  const int64_t m = static_cast<int64_t>(total_cands);
 
-  batch_indices.reserve(total_cands);
-  action_indices.reserve(total_cands);
-  features.reserve(total_cands * kSemanticFeatDim);
-  card_ids.reserve(total_cands);
-  space_ids.reserve(total_cands);
-  supported.reserve(total_cands);
-  is_ext.reserve(total_cands);
-  is_f.reserve(total_cands);
+  torch::Tensor ints_host = torch::empty(
+      {4, m},
+      torch::TensorOptions().dtype(torch::kInt64).pinned_memory(on_cuda));
+  torch::Tensor bools_host = torch::empty(
+      {2, m},
+      torch::TensorOptions().dtype(torch::kBool).pinned_memory(on_cuda));
+  torch::Tensor supp_host = torch::empty(
+      {m},
+      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(on_cuda));
+  torch::Tensor feat_host = torch::empty(
+      {m, static_cast<int64_t>(kSemanticFeatDim)},
+      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(on_cuda));
 
+  int64_t* b_ptr = ints_host.data_ptr<int64_t>();
+  int64_t* a_ptr = b_ptr + total_cands;
+  int64_t* c_ptr = b_ptr + 2 * total_cands;
+  int64_t* s_ptr = b_ptr + 3 * total_cands;
+
+  bool* is_ext_ptr = bools_host.data_ptr<bool>();
+  bool* is_f_ptr = is_ext_ptr + total_cands;
+
+  float* supp_ptr = supp_host.data_ptr<float>();
+  float* feat_ptr = feat_host.data_ptr<float>();
+
+  size_t cursor = 0;
   for (size_t b = 0; b < batch_actions.size(); ++b) {
     const auto* data = batch_actions[b];
     if (data == nullptr || data->empty()) continue;
     const size_t sz = data->size();
     for (size_t j = 0; j < sz; ++j) {
-      batch_indices.push_back(static_cast<int64_t>(b));
-      action_indices.push_back(static_cast<int64_t>(data->actions[j]));
-      card_ids.push_back(data->card_ids[j]);
-      space_ids.push_back(data->space_ids[j]);
-      supported.push_back(data->supported[j] ? 1.0f : 0.0f);
+      const size_t idx = cursor + j;
+      b_ptr[idx] = static_cast<int64_t>(b);
+      a_ptr[idx] = static_cast<int64_t>(data->actions[j]);
+      c_ptr[idx] = data->card_ids[j];
+      s_ptr[idx] = data->space_ids[j];
+      supp_ptr[idx] = data->supported[j] ? 1.0f : 0.0f;
       bool ext = false;
       bool f_role = false;
       if (j < data->roles.size()) {
@@ -647,36 +658,28 @@ inline void ApplySemanticScorerBatch(
                data->roles[j] == ActionRole::kHundroOffer);
         f_role = (data->roles[j] == ActionRole::kTleilaxuPurchase);
       }
-      is_ext.push_back(ext ? 1 : 0);
-      is_f.push_back(f_role ? 1 : 0);
+      is_ext_ptr[idx] = ext;
+      is_f_ptr[idx] = f_role;
     }
-    features.insert(features.end(), data->features.begin(), data->features.end());
+    if (!data->features.empty()) {
+      std::memcpy(feat_ptr + cursor * kSemanticFeatDim,
+                  data->features.data(),
+                  data->features.size() * sizeof(float));
+    }
+    cursor += sz;
   }
 
-  // Stage each input in pinned host memory and copy it asynchronously on the
-  // current stream. A blocking (or pageable) host-to-device copy synchronizes
-  // the stream, which stalls the caller until the trunk forward has finished.
-  const bool on_cuda = device.is_cuda();
-  auto upload = [&](const auto& vec, torch::ScalarType dtype) {
-    using T = typename std::decay_t<decltype(vec)>::value_type;
-    torch::Tensor host = torch::empty(
-        {static_cast<int64_t>(vec.size())},
-        torch::TensorOptions().dtype(dtype).pinned_memory(on_cuda));
-    if (!vec.empty()) {
-      std::memcpy(host.data_ptr(), vec.data(), vec.size() * sizeof(T));
-    }
-    return on_cuda ? host.to(device, /*non_blocking=*/true) : host;
-  };
+  torch::Tensor ints_dev = on_cuda ? ints_host.to(device, /*non_blocking=*/true) : ints_host;
+  torch::Tensor bools_dev = on_cuda ? bools_host.to(device, /*non_blocking=*/true) : bools_host;
+  torch::Tensor supp_t = on_cuda ? supp_host.to(device, /*non_blocking=*/true) : supp_host;
+  torch::Tensor feat_t = on_cuda ? feat_host.to(device, /*non_blocking=*/true) : feat_host;
 
-  torch::Tensor b_t = upload(batch_indices, torch::kInt64);
-  torch::Tensor a_t = upload(action_indices, torch::kInt64);
-  torch::Tensor c_t = upload(card_ids, torch::kInt64);
-  torch::Tensor s_t = upload(space_ids, torch::kInt64);
-  torch::Tensor supp_t = upload(supported, torch::kFloat32);
-  torch::Tensor is_ext_t = upload(is_ext, torch::kUInt8).to(torch::kBool);
-  torch::Tensor is_f_t = upload(is_f, torch::kUInt8).to(torch::kBool);
-  torch::Tensor feat_t = upload(features, torch::kFloat32)
-                             .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(kSemanticFeatDim)});
+  torch::Tensor b_t = ints_dev[0];
+  torch::Tensor a_t = ints_dev[1];
+  torch::Tensor c_t = ints_dev[2];
+  torch::Tensor s_t = ints_dev[3];
+  torch::Tensor is_ext_t = bools_dev[0];
+  torch::Tensor is_f_t = bools_dev[1];
 
   scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t, is_f_t);
 }

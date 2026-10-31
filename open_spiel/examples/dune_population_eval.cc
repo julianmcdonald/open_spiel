@@ -1372,6 +1372,17 @@ void RunEvaluation() {
   }
   int64_t action_size = game->NumDistinctActions();
 
+  // Device setup
+  torch::InferenceMode inference_guard;
+  torch::Device device = torch::cuda::is_available()
+                         ? torch::Device(torch::kCUDA)
+                         : torch::Device(torch::kCPU);
+
+  bool deterministic = absl::GetFlag(FLAGS_deterministic_eval);
+  if (deterministic) {
+    std::cout << "INFO: Running in deterministic mode (default). Use --deterministic_eval=false for faster batched evaluation.\n";
+  }
+
   // Determine thread count
   unsigned int hw_threads = std::thread::hardware_concurrency();
   if (hw_threads == 0) hw_threads = 4;
@@ -1380,29 +1391,27 @@ void RunEvaluation() {
     num_threads = static_cast<unsigned int>(requested_threads);
   } else {
     num_threads = hw_threads * 4;
+    if (device.is_cuda() && !deterministic && total_games > 0) {
+      num_threads = std::max(
+          num_threads,
+          std::min(256u, static_cast<unsigned int>(total_games)));
+    }
   }
 
-  // Device setup
-  torch::InferenceMode inference_guard;
-  torch::Device device = torch::cuda::is_available()
-                         ? torch::Device(torch::kCUDA)
-                         : torch::Device(torch::kCPU);
-
   int eval_batch_size;
+  int opp_eval_batch_size;
   int eval_timeout_ms;
   if (device.is_cuda()) {
-    eval_batch_size = std::min(64u, num_threads);
+    eval_batch_size = std::min(64u, std::max(1u, num_threads / 5));
+    opp_eval_batch_size = std::min(128u, std::max(1u, num_threads / 2));
     eval_timeout_ms = 1;
   } else {
     eval_batch_size = std::min(32u, num_threads);
+    opp_eval_batch_size = std::min(32u, num_threads);
     eval_timeout_ms = 2;
   }
 
   std::string device_name = device.is_cuda() ? "CUDA (GPU)" : "CPU";
-  bool deterministic = absl::GetFlag(FLAGS_deterministic_eval);
-  if (deterministic) {
-    std::cout << "INFO: Running in deterministic mode (default). Use --deterministic_eval=false for faster batched evaluation.\n";
-  }
 
   // Synchronization primitives (only used for the active evaluator mode)
   std::shared_mutex sync_mutex;  // For BatchedEvaluator (shared read lock)
@@ -1473,13 +1482,23 @@ void RunEvaluation() {
   } else {
     model_evaluator = std::make_shared<BatchedEvaluator>(
         model, eval_batch_size, eval_timeout_ms, device,
-        &sync_mutex, 0.0f, true, false, false, rollout_amp, allow_tf32);
+        &sync_mutex, 0.0f, /*device_synchronize=*/false, false, false,
+        rollout_amp, allow_tf32, /*critic_model=*/nullptr,
+        /*clear_autocast_cache_per_batch=*/false);
   }
 
   // Load opponent models with auto-detected dimensions
   std::vector<OpponentMetadata> opp_metadata;
   std::vector<std::shared_ptr<IGameEvaluator>> opponent_evaluators;
+  std::unordered_map<std::string, size_t> seen_opp_path_to_idx;
   for (const std::string& opp_path : opponent_paths) {
+    auto it = seen_opp_path_to_idx.find(opp_path);
+    if (it != seen_opp_path_to_idx.end()) {
+      size_t prev_idx = it->second;
+      opp_metadata.push_back(opp_metadata[prev_idx]);
+      opponent_evaluators.push_back(opponent_evaluators[prev_idx]);
+      continue;
+    }
     int opp_detected_hidden = opp_hidden_dim;
     int opp_detected_blocks = opp_num_blocks;
     int opp_detected_input_dim = static_cast<int>(obs_size);
@@ -1498,6 +1517,7 @@ void RunEvaluation() {
       SPIEL_CHECK_EQ(opp_detected_input_dim,
                      dune_imperium::GetInformationStateSchema(opp_market_mode, opp_detected_semantics).size);
     }
+    size_t new_idx = opp_metadata.size();
     opp_metadata.push_back({opp_path, opp_detected_hidden, opp_detected_blocks, opp_detected_input_dim, opp_market_mode, MarketModeToString(opp_market_mode), opp_detected_semantics});
 
     bool opp_has_scorer = CheckpointHasSemanticScorer(opp_path, device);
@@ -1516,9 +1536,12 @@ void RunEvaluation() {
           opp_model, device, &eval_mutex, nullptr, nullptr, rollout_amp));
     } else {
       opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
-          opp_model, eval_batch_size, eval_timeout_ms, device,
-          &sync_mutex, 0.0f, true, false, false, rollout_amp, allow_tf32));
+          opp_model, opp_eval_batch_size, eval_timeout_ms, device,
+          &sync_mutex, 0.0f, /*device_synchronize=*/false, false, false,
+          rollout_amp, allow_tf32, /*critic_model=*/nullptr,
+          /*clear_autocast_cache_per_batch=*/false));
     }
+    seen_opp_path_to_idx[opp_path] = new_idx;
   }
 
   // --- Print configuration ---

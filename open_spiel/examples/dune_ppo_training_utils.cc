@@ -7,11 +7,13 @@
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
+#include <ATen/Parallel.h>
 #include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_seed_utils.h"
@@ -126,6 +128,8 @@ ABSL_FLAG(double, advantage_filtering_quantile, 0.25,
           "Quantile cutoff for advantage filtering (default 0.25).");
 ABSL_FLAG(bool, enable_study_readouts, false,
           "When true, logs unfiltered KL diagnostic and single-action value error readouts.");
+ABSL_FLAG(bool, use_legacy_unoptimized_reads, false,
+          "Internal test flag to exercise legacy sync/upload path in TrainPpoUpdate.");
 #endif
 
 namespace open_spiel {
@@ -188,6 +192,155 @@ float ApplyPlotIntrigueShaping(float reward, Action action,
   if (!IsPlotIntrigueAction(action)) return reward;
   if (intrigue_hand_size_before_play >= exemption_threshold) return reward;
   return reward - static_cast<float>(plot_intrigue_penalty) * reward_lambda;
+}
+
+DuneDecisionRole ClassifyTransitionDecisionRole(const PpoTransition& t) {
+  if (t.legal_actions.size() <= 1) {
+    return DuneDecisionRole::kForcedOrBookkeeping;
+  }
+  if (t.decision_role >= 1 && t.decision_role <= 6) {
+    return static_cast<DuneDecisionRole>(t.decision_role);
+  }
+
+  // 1. Leader selection
+  for (Action a : t.legal_actions) {
+    if (a >= dune_imperium::kActionLeaderPick0 &&
+        a < dune_imperium::kActionLeaderPick0 + 30) {
+      return DuneDecisionRole::kLeaderSelection;
+    }
+  }
+
+  // 2. Purchase
+  bool has_purchase = false;
+  bool all_purchase_or_end_turn = true;
+  for (Action a : t.legal_actions) {
+    bool is_purchase_action =
+        (a >= dune_imperium::kActionBuyImperiumRow0 &&
+         a < dune_imperium::kActionBuyImperiumRow0 + 8) ||
+        (a >= dune_imperium::kActionBuyHelenaReserve0 &&
+         a < dune_imperium::kActionBuyHelenaReserve0 + 8) ||
+        (a == dune_imperium::kActionBuyReserveArrakisLiaison) ||
+        (a == dune_imperium::kActionBuyReserveTheSpiceMustFlow) ||
+        (a >= dune_imperium::kActionTechAcquire0 &&
+         a <= dune_imperium::kActionTechAcquireSkip) ||
+        (a >= dune_imperium::kActionTleilaxuAcquire0 &&
+         a <= dune_imperium::kActionTleilaxuAcquireSkip) ||
+        (a >= dune_imperium::kActionTechAcquireWithSolari0 &&
+         a <= dune_imperium::kActionTechAcquireWithSolariSkip);
+    if (is_purchase_action) {
+      has_purchase = true;
+    }
+    if (!is_purchase_action && a != dune_imperium::kActionEndTurn) {
+      all_purchase_or_end_turn = false;
+      break;
+    }
+  }
+  if (has_purchase && all_purchase_or_end_turn) {
+    return DuneDecisionRole::kPurchase;
+  }
+
+  // 3. CombatIntrigue
+  for (Action a : t.legal_actions) {
+    if (a == dune_imperium::kActionCombatPass ||
+        (a >= dune_imperium::kActionPlayIntrigueCombatCard0 &&
+         a < dune_imperium::kActionPlayIntrigueCombatCard0 + dune_imperium::kMaxIntrigueCards) ||
+        (a >= dune_imperium::kActionCombatCommit0 &&
+         a < dune_imperium::kActionCombatCommit0 + 48)) {
+      return DuneDecisionRole::kCombatIntrigue;
+    }
+  }
+
+  // 4. AgentPrimary vs AgentContinuation
+  bool has_agent_card_play = false;
+  bool has_space_place = false;
+  for (Action a : t.legal_actions) {
+    if ((a >= dune_imperium::kActionSelectAgentCard0 &&
+         a < dune_imperium::kActionSelectAgentCard0 + 256) ||
+        a == dune_imperium::kActionPlayKwisatzHaderach) {
+      has_agent_card_play = true;
+    }
+    if (a >= dune_imperium::kActionAgentSpaceConspire &&
+        a <= dune_imperium::kActionAgentSpaceSietchTabr) {
+      has_space_place = true;
+    }
+  }
+  if (has_agent_card_play && !has_space_place) {
+    return DuneDecisionRole::kAgentPrimary;
+  }
+  if (has_space_place) {
+    return DuneDecisionRole::kAgentContinuation;
+  }
+
+  // 5. OtherOptional
+  return DuneDecisionRole::kOtherOptional;
+}
+
+void StandardizeAdvantagesPhaseStratified(
+    std::vector<PpoTransition>* batch,
+    const std::vector<int64_t>& mc_indices,
+    int64_t min_stratum_count) {
+  if (batch == nullptr || mc_indices.empty()) {
+    return;
+  }
+
+  // Compute global adv_mean and adv_std as fallback.
+  double global_sum = 0.0;
+  for (int64_t idx : mc_indices) {
+    global_sum += (*batch)[idx].advantage;
+  }
+  const double global_mean = global_sum / mc_indices.size();
+  double global_sq_sum = 0.0;
+  for (int64_t idx : mc_indices) {
+    double diff = (*batch)[idx].advantage - global_mean;
+    global_sq_sum += diff * diff;
+  }
+  const double global_std = std::sqrt(global_sq_sum / mc_indices.size());
+  const double global_denom = global_std + 1e-8;
+
+  // Group mc_indices into strata 0..6.
+  std::array<std::vector<int64_t>, 7> strata;
+  for (int64_t idx : mc_indices) {
+    DuneDecisionRole role = ClassifyTransitionDecisionRole((*batch)[idx]);
+    int s = static_cast<int>(role);
+    if (s >= 0 && s < 7) {
+      strata[s].push_back(idx);
+    } else {
+      strata[static_cast<int>(DuneDecisionRole::kOtherOptional)].push_back(idx);
+    }
+  }
+
+  // For each stratum s with count >= min_stratum_count and std_s > 1e-8,
+  // standardize: (*batch)[idx].advantage = (adv - mean_s) / (std_s + 1e-8).
+  // Otherwise use: (adv - global_mean) / (global_std + 1e-8).
+  for (int s = 0; s < 7; ++s) {
+    const auto& s_indices = strata[s];
+    if (s_indices.empty()) continue;
+    const int64_t count = static_cast<int64_t>(s_indices.size());
+    if (count >= min_stratum_count) {
+      double s_sum = 0.0;
+      for (int64_t idx : s_indices) {
+        s_sum += (*batch)[idx].advantage;
+      }
+      const double s_mean = s_sum / count;
+      double s_sq_sum = 0.0;
+      for (int64_t idx : s_indices) {
+        double diff = (*batch)[idx].advantage - s_mean;
+        s_sq_sum += diff * diff;
+      }
+      const double s_std = std::sqrt(s_sq_sum / count);
+      if (s_std > 1e-8) {
+        const double s_denom = s_std + 1e-8;
+        for (int64_t idx : s_indices) {
+          (*batch)[idx].advantage = static_cast<float>(((*batch)[idx].advantage - s_mean) / s_denom);
+        }
+        continue;
+      }
+    }
+    // Fallback to global standardization.
+    for (int64_t idx : s_indices) {
+      (*batch)[idx].advantage = static_cast<float>(((*batch)[idx].advantage - global_mean) / global_denom);
+    }
+  }
 }
 
 std::string ComputeRolloutHash(const std::vector<PpoTransition>& batch) {
@@ -2298,25 +2451,38 @@ PpoUpdateStats TrainPpoUpdate(
       std::min<int64_t>(::absl::GetFlag(::FLAGS_ppo_minibatch_size), n);
   int64_t max_mb = minibatch_size;
 
-  // Pre-allocate reusable CPU staging tensors sized to the active minibatch capacity.
-  torch::Tensor staging_states_cpu = torch::empty({max_mb, obs_size}, cpu_float);
-  torch::Tensor staging_masks_cpu = torch::empty({max_mb, action_dim}, cpu_bool);
-  torch::Tensor staging_actions_cpu = torch::empty({max_mb}, cpu_long);
-  torch::Tensor staging_old_log_probs_cpu = torch::empty({max_mb}, cpu_float);
-  torch::Tensor staging_advantages_cpu = torch::empty({max_mb}, cpu_float);
-  torch::Tensor staging_returns_cpu = torch::empty({max_mb}, cpu_float);
-  torch::Tensor staging_old_values_cpu = torch::empty({max_mb}, cpu_float);
-  torch::Tensor staging_nontrivial_cpu = torch::empty({max_mb}, cpu_bool);
+  // Pre-allocate reusable 2-slot double-buffered CPU staging tensors sized to the active minibatch capacity.
+  const bool use_pinned = device.is_cuda();
+  auto staging_float_opts = cpu_float.pinned_memory(use_pinned);
+  auto staging_bool_opts = cpu_bool.pinned_memory(use_pinned);
+  auto staging_long_opts = cpu_long.pinned_memory(use_pinned);
 
-  float* staging_states_ptr = staging_states_cpu.data_ptr<float>();
-  bool* staging_masks_ptr = staging_masks_cpu.data_ptr<bool>();
-  int64_t* staging_actions_ptr = staging_actions_cpu.data_ptr<int64_t>();
-  float* staging_old_log_probs_ptr = staging_old_log_probs_cpu.data_ptr<float>();
-  float* staging_advantages_ptr = staging_advantages_cpu.data_ptr<float>();
-  float* staging_returns_ptr = staging_returns_cpu.data_ptr<float>();
-  float* staging_old_values_ptr = staging_old_values_cpu.data_ptr<float>();
-  bool* staging_nontrivial_ptr = staging_nontrivial_cpu.data_ptr<bool>();
+  torch::Tensor staging_states_cpu[2] = {
+      torch::empty({max_mb, obs_size}, staging_float_opts),
+      torch::empty({max_mb, obs_size}, staging_float_opts)};
+  torch::Tensor staging_masks_cpu[2] = {
+      torch::empty({max_mb, action_dim}, staging_bool_opts),
+      torch::empty({max_mb, action_dim}, staging_bool_opts)};
+  torch::Tensor staging_actions_cpu[2] = {
+      torch::empty({max_mb}, staging_long_opts),
+      torch::empty({max_mb}, staging_long_opts)};
+  torch::Tensor staging_old_log_probs_cpu[2] = {
+      torch::empty({max_mb}, staging_float_opts),
+      torch::empty({max_mb}, staging_float_opts)};
+  torch::Tensor staging_advantages_cpu[2] = {
+      torch::empty({max_mb}, staging_float_opts),
+      torch::empty({max_mb}, staging_float_opts)};
+  torch::Tensor staging_returns_cpu[2] = {
+      torch::empty({max_mb}, staging_float_opts),
+      torch::empty({max_mb}, staging_float_opts)};
+  torch::Tensor staging_old_values_cpu[2] = {
+      torch::empty({max_mb}, staging_float_opts),
+      torch::empty({max_mb}, staging_float_opts)};
+  torch::Tensor staging_nontrivial_cpu[2] = {
+      torch::empty({max_mb}, staging_bool_opts),
+      torch::empty({max_mb}, staging_bool_opts)};
 
+  int staging_slot = 0;
   std::vector<PpoTransition>* train_batch_ptr = &batch;
 
   // Staging helper that packs active rows, clears legal masks, and uploads
@@ -2331,36 +2497,57 @@ PpoUpdateStats TrainPpoUpdate(
                               std::vector<const dune_semantic::CandidateActionData*>* out_cands,
                               torch::Tensor* out_advantages = nullptr,
                               torch::Tensor* out_returns = nullptr,
-                              torch::Tensor* out_old_values = nullptr) {
-    // Explicitly zero the legal masks for the active rows in this minibatch.
-    // This guarantees no stale mask entries from previous minibatches persist.
-    std::memset(staging_masks_ptr, 0, mb_len * action_dim * sizeof(bool));
+                              torch::Tensor* out_old_values = nullptr,
+                              int64_t* out_num_nontrivial = nullptr) {
+    const int s = staging_slot;
+    staging_slot ^= 1;
+
+    float* staging_states_ptr = staging_states_cpu[s].data_ptr<float>();
+    bool* staging_masks_ptr = staging_masks_cpu[s].data_ptr<bool>();
+    int64_t* staging_actions_ptr = staging_actions_cpu[s].data_ptr<int64_t>();
+    float* staging_old_log_probs_ptr = staging_old_log_probs_cpu[s].data_ptr<float>();
+    float* staging_advantages_ptr = staging_advantages_cpu[s].data_ptr<float>();
+    float* staging_returns_ptr = staging_returns_cpu[s].data_ptr<float>();
+    float* staging_old_values_ptr = staging_old_values_cpu[s].data_ptr<float>();
+    bool* staging_nontrivial_ptr = staging_nontrivial_cpu[s].data_ptr<bool>();
 
     if (out_cands) {
       out_cands->resize(mb_len);
     }
 
-    for (int64_t i = 0; i < mb_len; ++i) {
-      int64_t idx = mb_indices ? mb_indices[i] : (start_seq + i);
-      const PpoTransition& transition = (*train_batch_ptr)[idx];
-      std::memcpy(staging_states_ptr + i * obs_size, transition.state.data(),
-                  obs_size * sizeof(float));
-      for (Action action : transition.legal_actions) {
-        if (action >= 0 && action < action_dim) {
-          staging_masks_ptr[i * action_dim + action] = true;
+    at::parallel_for(0, mb_len, 64, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        std::memset(staging_masks_ptr + i * action_dim, 0, action_dim * sizeof(bool));
+        int64_t idx = mb_indices ? mb_indices[i] : (start_seq + i);
+        const PpoTransition& transition = (*train_batch_ptr)[idx];
+        std::memcpy(staging_states_ptr + i * obs_size, transition.state.data(),
+                    obs_size * sizeof(float));
+        for (Action action : transition.legal_actions) {
+          if (action >= 0 && action < action_dim) {
+            staging_masks_ptr[i * action_dim + action] = true;
+          }
+        }
+        staging_actions_ptr[i] = transition.action;
+        staging_old_log_probs_ptr[i] = transition.old_log_prob;
+        const bool is_nt = (transition.legal_actions.size() > 1 && !transition.mask_policy_loss);
+        staging_nontrivial_ptr[i] = is_nt;
+        if (out_cands) {
+          (*out_cands)[i] = &transition.candidate_data;
+        }
+        if (full_ppo_fields) {
+          staging_advantages_ptr[i] = transition.advantage;
+          staging_returns_ptr[i] = transition.return_value;
+          staging_old_values_ptr[i] = transition.value;
         }
       }
-      staging_actions_ptr[i] = transition.action;
-      staging_old_log_probs_ptr[i] = transition.old_log_prob;
-      staging_nontrivial_ptr[i] = (transition.legal_actions.size() > 1 && !transition.mask_policy_loss);
-      if (out_cands) {
-        (*out_cands)[i] = &transition.candidate_data;
+    });
+
+    if (out_num_nontrivial != nullptr) {
+      int64_t num_nontrivial = 0;
+      for (int64_t i = 0; i < mb_len; ++i) {
+        if (staging_nontrivial_ptr[i]) ++num_nontrivial;
       }
-      if (full_ppo_fields) {
-        staging_advantages_ptr[i] = transition.advantage;
-        staging_returns_ptr[i] = transition.return_value;
-        staging_old_values_ptr[i] = transition.value;
-      }
+      *out_num_nontrivial = num_nontrivial;
     }
 
     if (::absl::GetFlag(::FLAGS_verify_packing_alignment)) {
@@ -2376,15 +2563,15 @@ PpoUpdateStats TrainPpoUpdate(
 
     // Narrow buffers to [0, mb_len] on CPU before upload so only active rows
     // are uploaded and consumed by PyTorch.
-    out_states = staging_states_cpu.narrow(0, 0, mb_len).to(device);
-    out_masks = staging_masks_cpu.narrow(0, 0, mb_len).to(device);
-    out_actions = staging_actions_cpu.narrow(0, 0, mb_len).to(device);
-    out_old_log_probs = staging_old_log_probs_cpu.narrow(0, 0, mb_len).to(device);
-    out_nontrivial = staging_nontrivial_cpu.narrow(0, 0, mb_len).to(device);
+    out_states = staging_states_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+    out_masks = staging_masks_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+    out_actions = staging_actions_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+    out_old_log_probs = staging_old_log_probs_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+    out_nontrivial = staging_nontrivial_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
     if (full_ppo_fields) {
-      if (out_advantages) *out_advantages = staging_advantages_cpu.narrow(0, 0, mb_len).to(device);
-      if (out_returns) *out_returns = staging_returns_cpu.narrow(0, 0, mb_len).to(device);
-      if (out_old_values) *out_old_values = staging_old_values_cpu.narrow(0, 0, mb_len).to(device);
+      if (out_advantages) *out_advantages = staging_advantages_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+      if (out_returns) *out_returns = staging_returns_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
+      if (out_old_values) *out_old_values = staging_old_values_cpu[s].narrow(0, 0, mb_len).to(device, /*non_blocking=*/use_pinned);
     }
   };
   int update_epochs = std::max(1, ::absl::GetFlag(::FLAGS_ppo_update_epochs));
@@ -2861,6 +3048,9 @@ PpoUpdateStats TrainPpoUpdate(
   const bool do_filtering = ::absl::GetFlag(::FLAGS_advantage_filtering);
   const double filter_quantile = ::absl::GetFlag(::FLAGS_advantage_filtering_quantile);
   const bool study_readouts = ::absl::GetFlag(::FLAGS_enable_study_readouts) || do_filtering;
+  const bool actor_only_filtering = ::absl::GetFlag(::FLAGS_actor_only_advantage_filtering);
+  double actor_adv_threshold = 0.0;
+  const bool phase_stratified_norm = ::absl::GetFlag(::FLAGS_phase_stratified_advantage_norm);
 
   std::vector<int64_t> sa_indices;
   auto compute_value_mse = [&](const std::vector<int64_t>& indices) -> double {
@@ -2921,77 +3111,104 @@ PpoUpdateStats TrainPpoUpdate(
       }
     }
     if (!mc_indices.empty()) {
-      double adv_sum = 0.0;
-      for (int64_t idx : mc_indices) {
-        adv_sum += batch[idx].advantage;
-      }
-      double adv_mean = adv_sum / mc_indices.size();
-      double adv_sq_sum = 0.0;
-      for (int64_t idx : mc_indices) {
-        double diff = batch[idx].advantage - adv_mean;
-        adv_sq_sum += diff * diff;
-      }
-      double adv_std = std::sqrt(adv_sq_sum / mc_indices.size()) + 1e-8;
-
       std::vector<std::pair<double, int64_t>> abs_std_adv_and_idx;
       abs_std_adv_and_idx.reserve(mc_indices.size());
-      for (int64_t idx : mc_indices) {
-        double std_adv = (batch[idx].advantage - adv_mean) / adv_std;
-        batch[idx].advantage = static_cast<float>(std_adv);
-        abs_std_adv_and_idx.push_back({std::abs(std_adv), idx});
+      if (phase_stratified_norm) {
+        StandardizeAdvantagesPhaseStratified(&batch, mc_indices, /*min_stratum_count=*/2);
+        for (int64_t idx : mc_indices) {
+          abs_std_adv_and_idx.push_back({std::abs(static_cast<double>(batch[idx].advantage)), idx});
+        }
+      } else {
+        double adv_sum = 0.0;
+        for (int64_t idx : mc_indices) {
+          adv_sum += batch[idx].advantage;
+        }
+        double adv_mean = adv_sum / mc_indices.size();
+        double adv_sq_sum = 0.0;
+        for (int64_t idx : mc_indices) {
+          double diff = batch[idx].advantage - adv_mean;
+          adv_sq_sum += diff * diff;
+        }
+        double adv_std = std::sqrt(adv_sq_sum / mc_indices.size()) + 1e-8;
+
+        for (int64_t idx : mc_indices) {
+          double std_adv = (batch[idx].advantage - adv_mean) / adv_std;
+          batch[idx].advantage = static_cast<float>(std_adv);
+          abs_std_adv_and_idx.push_back({std::abs(std_adv), idx});
+        }
       }
 
       int64_t k_retained = std::max<int64_t>(1, std::round(filter_quantile * mc_indices.size()));
-      if (k_retained < static_cast<int64_t>(abs_std_adv_and_idx.size())) {
-        std::nth_element(
-            abs_std_adv_and_idx.begin(),
-            abs_std_adv_and_idx.begin() + k_retained,
-            abs_std_adv_and_idx.end(),
-            [](const std::pair<double, int64_t>& a, const std::pair<double, int64_t>& b) {
-              return a.first > b.first;
-            });
-        abs_std_adv_and_idx.resize(k_retained);
-      }
-      std::vector<int64_t> retained_indices;
-      retained_indices.reserve(abs_std_adv_and_idx.size());
-      for (const auto& item : abs_std_adv_and_idx) {
-        retained_indices.push_back(item.second);
-      }
-      std::sort(retained_indices.begin(), retained_indices.end());
-
-      filtered_batch.reserve(retained_indices.size());
-      for (int64_t idx : retained_indices) {
-        filtered_batch.push_back(batch[idx]);
-      }
-      train_batch_ptr = &filtered_batch;
-      stats.retained_transitions = static_cast<int64_t>(filtered_batch.size());
-      normalize_advantages = false;  // Do not recenter or rescale selected rows!
-
-      if (!retained_indices.empty() && static_cast<int64_t>(retained_indices.size()) < n) {
-        if (reverse_kl_active) {
-          auto retained_idx_t = torch::tensor(
-              retained_indices,
-              torch::TensorOptions().dtype(torch::kInt64).device(device));
-          collection_log_probs = collection_log_probs.index_select(0, retained_idx_t);
+      if (actor_only_filtering) {
+        // EasyPPO (arXiv:2609.36802v1): keep 100% of transitions for critic value_loss
+        // regression (train_batch_ptr remains &batch), and apply top-quantile |A| filter
+        // strictly to actor policy loss in compute_loss().
+        if (k_retained < static_cast<int64_t>(abs_std_adv_and_idx.size())) {
+          std::nth_element(
+              abs_std_adv_and_idx.begin(),
+              abs_std_adv_and_idx.begin() + (k_retained - 1),
+              abs_std_adv_and_idx.end(),
+              [](const std::pair<double, int64_t>& a, const std::pair<double, int64_t>& b) {
+                return a.first > b.first;
+              });
+          actor_adv_threshold = abs_std_adv_and_idx[k_retained - 1].first;
+        } else {
+          actor_adv_threshold = 0.0;
         }
-        const int64_t num_mb_train =
-            (static_cast<int64_t>(filtered_batch.size()) + minibatch_size - 1) / minibatch_size;
-        if (aux_active) {
-          auto slices = ComputeAuxSlices(aux_n, num_mb_train);
-          aux_slice_start.assign(num_mb_train, 0);
-          aux_slice_len.assign(num_mb_train, 0);
-          for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(slices.size()); ++k) {
-            aux_slice_start[k] = slices[k].first;
-            aux_slice_len[k] = slices[k].second;
+        stats.retained_transitions = k_retained;
+        normalize_advantages = false;  // mc_indices advantages are already standardized!
+      } else {
+        if (k_retained < static_cast<int64_t>(abs_std_adv_and_idx.size())) {
+          std::nth_element(
+              abs_std_adv_and_idx.begin(),
+              abs_std_adv_and_idx.begin() + k_retained,
+              abs_std_adv_and_idx.end(),
+              [](const std::pair<double, int64_t>& a, const std::pair<double, int64_t>& b) {
+                return a.first > b.first;
+              });
+          abs_std_adv_and_idx.resize(k_retained);
+        }
+        std::vector<int64_t> retained_indices;
+        retained_indices.reserve(abs_std_adv_and_idx.size());
+        for (const auto& item : abs_std_adv_and_idx) {
+          retained_indices.push_back(item.second);
+        }
+        std::sort(retained_indices.begin(), retained_indices.end());
+
+        filtered_batch.reserve(retained_indices.size());
+        for (int64_t idx : retained_indices) {
+          filtered_batch.push_back(batch[idx]);
+        }
+        train_batch_ptr = &filtered_batch;
+        stats.retained_transitions = static_cast<int64_t>(filtered_batch.size());
+        normalize_advantages = false;  // Do not recenter or rescale selected rows!
+
+        if (!retained_indices.empty() && static_cast<int64_t>(retained_indices.size()) < n) {
+          if (reverse_kl_active) {
+            auto retained_idx_t = torch::tensor(
+                retained_indices,
+                torch::TensorOptions().dtype(torch::kInt64).device(device));
+            collection_log_probs = collection_log_probs.index_select(0, retained_idx_t);
           }
-        }
-        if (pwo5_active) {
-          auto pslices = ComputeAuxSlices(pwo5_n, num_mb_train);
-          pwo5_slice_start.assign(num_mb_train, 0);
-          pwo5_slice_len.assign(num_mb_train, 0);
-          for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(pslices.size()); ++k) {
-            pwo5_slice_start[k] = pslices[k].first;
-            pwo5_slice_len[k] = pslices[k].second;
+          const int64_t num_mb_train =
+              (static_cast<int64_t>(filtered_batch.size()) + minibatch_size - 1) / minibatch_size;
+          if (aux_active) {
+            auto slices = ComputeAuxSlices(aux_n, num_mb_train);
+            aux_slice_start.assign(num_mb_train, 0);
+            aux_slice_len.assign(num_mb_train, 0);
+            for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(slices.size()); ++k) {
+              aux_slice_start[k] = slices[k].first;
+              aux_slice_len[k] = slices[k].second;
+            }
+          }
+          if (pwo5_active) {
+            auto pslices = ComputeAuxSlices(pwo5_n, num_mb_train);
+            pwo5_slice_start.assign(num_mb_train, 0);
+            pwo5_slice_len.assign(num_mb_train, 0);
+            for (int64_t k = 0; k < num_mb_train && k < static_cast<int64_t>(pslices.size()); ++k) {
+              pwo5_slice_start[k] = pslices[k].first;
+              pwo5_slice_len[k] = pslices[k].second;
+            }
           }
         }
       }
@@ -3000,8 +3217,25 @@ PpoUpdateStats TrainPpoUpdate(
     }
   } else {
     stats.retained_transitions = n;
+    if (phase_stratified_norm && normalize_advantages) {
+      std::vector<int64_t> mc_indices;
+      mc_indices.reserve(nontrivial_count);
+      for (int64_t i = 0; i < n; ++i) {
+        if (batch[i].legal_actions.size() > 1) {
+          mc_indices.push_back(i);
+        }
+      }
+      if (!mc_indices.empty()) {
+        StandardizeAdvantagesPhaseStratified(&batch, mc_indices, /*min_stratum_count=*/2);
+        normalize_advantages = false;
+      }
+    }
   }
   const int64_t n_train = static_cast<int64_t>(train_batch_ptr->size());
+  const bool use_ema_cache =
+      (ema_magnet_active && update_epochs > 1 &&
+       !::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads));
+  torch::Tensor ema_logits_cache;
 
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
@@ -3009,7 +3243,7 @@ PpoUpdateStats TrainPpoUpdate(
     torch::Tensor permutation_cpu =
         torch::randperm(n_train, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
     torch::Tensor permutation_device;
-    if (reverse_kl_active) {
+    if (reverse_kl_active || use_ema_cache) {
       permutation_device = permutation_cpu.to(device);
     }
     const int64_t* perm_ptr = permutation_cpu.data_ptr<int64_t>();
@@ -3027,11 +3261,13 @@ PpoUpdateStats TrainPpoUpdate(
       torch::Tensor mb_states, mb_masks, mb_actions, mb_old_log_probs, mb_nontrivial;
       torch::Tensor mb_advantages, mb_returns, mb_old_values;
       std::vector<const dune_semantic::CandidateActionData*> mb_candidate_actions;
+      int64_t mb_num_nontrivial = 0;
 
       stage_and_upload(mb_indices, /*start_seq=*/0, mb_len, /*full_ppo_fields=*/true,
                        mb_states, mb_masks, mb_actions, mb_old_log_probs, mb_nontrivial,
                        model->with_semantic_scorer_ ? &mb_candidate_actions : nullptr,
-                       &mb_advantages, &mb_returns, &mb_old_values);
+                       &mb_advantages, &mb_returns, &mb_old_values,
+                       &mb_num_nontrivial);
 
       torch::Tensor mb_coll_lp;
       if (reverse_kl_active) {
@@ -3040,7 +3276,9 @@ PpoUpdateStats TrainPpoUpdate(
       }
       phase_timer.End(kPhaseTensorPackH2D);
 
-      int64_t mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
+      if (::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
+        mb_num_nontrivial = mb_nontrivial.sum().item<int64_t>();
+      }
 
       optimizer.zero_grad();
 
@@ -3343,19 +3581,21 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor std = nontrivial_adv.std(/*unbiased=*/false) + 1e-8f;
             mb_adv = (mb_advantages - mean) / std;
 
-            float mb_mean_val = mean.item<float>();
-            float mb_std_val = std.item<float>();
-            for (int64_t i = 0; i < mb_len; ++i) {
-              auto& trans = (*train_batch_ptr)[mb_indices[i]];
-              if (trans.targeted_buy_forced) {
-                if (epoch == 0) {
-                  trans.norm_advantage = (trans.advantage - mb_mean_val) / mb_std_val;
+            if (!forced_indices.empty() || ::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
+              float mb_mean_val = mean.item<float>();
+              float mb_std_val = std.item<float>();
+              for (int64_t i = 0; i < mb_len; ++i) {
+                auto& trans = (*train_batch_ptr)[mb_indices[i]];
+                if (trans.targeted_buy_forced) {
+                  if (epoch == 0) {
+                    trans.norm_advantage = (trans.advantage - mb_mean_val) / mb_std_val;
+                  }
+                  open_spiel::dune_targeted_buy::RecordForcedNormalization(
+                      global_update, epoch, mb_index,
+                      trans.targeted_buy_card, trans.targeted_buy_round,
+                      trans.gae_advantage, trans.advantage, trans.mc_return, trans.value,
+                      mb_mean_val, mb_std_val);
                 }
-                open_spiel::dune_targeted_buy::RecordForcedNormalization(
-                    global_update, epoch, mb_index,
-                    trans.targeted_buy_card, trans.targeted_buy_round,
-                    trans.gae_advantage, trans.advantage, trans.mc_return, trans.value,
-                    mb_mean_val, mb_std_val);
               }
             }
           }
@@ -3363,15 +3603,38 @@ PpoUpdateStats TrainPpoUpdate(
         mb_adv = mb_adv.detach();
 
         // 2. PPO surrogate loss
-        torch::Tensor pg_loss1 = -mb_adv * ratio;
+        const double acpo_clip = ::absl::GetFlag(::FLAGS_acpo_surrogate_clip);
+        const double acpo_clip_neg = ::absl::GetFlag(::FLAGS_acpo_surrogate_clip_neg);
+        const double acpo_clip_pos = ::absl::GetFlag(::FLAGS_acpo_surrogate_clip_pos);
+        const double eff_neg = (acpo_clip_neg > 0.0) ? acpo_clip_neg : acpo_clip;
+        const double eff_pos = (acpo_clip_pos > 0.0) ? acpo_clip_pos : acpo_clip;
+        torch::Tensor mb_adv_surrogate = mb_adv;
+        if (eff_neg > 0.0 && eff_pos > 0.0) {
+          mb_adv_surrogate = mb_adv.clamp(static_cast<float>(-eff_neg), static_cast<float>(eff_pos));
+        } else if (eff_neg > 0.0) {
+          mb_adv_surrogate = mb_adv.clamp_min(static_cast<float>(-eff_neg));
+        } else if (eff_pos > 0.0) {
+          mb_adv_surrogate = mb_adv.clamp_max(static_cast<float>(eff_pos));
+        }
+        torch::Tensor pg_loss1 = -mb_adv_surrogate * ratio;
         torch::Tensor pg_loss2 =
-            -mb_adv * ratio.clamp(1.0f - clip_epsilon,
-                                  1.0f + clip_epsilon);
+            -mb_adv_surrogate * ratio.clamp(1.0f - clip_epsilon,
+                                            1.0f + clip_epsilon);
         torch::Tensor pg_loss = torch::max(pg_loss1, pg_loss2);
 
         // 4. Actor metrics and entropy
         if (mb_num_nontrivial > 0) {
-          policy_loss = pg_loss.masked_select(mb_nontrivial).mean();
+          if (do_filtering && actor_only_filtering) {
+            torch::Tensor actor_active_mask =
+                mb_nontrivial & (mb_adv.abs() >= static_cast<float>(actor_adv_threshold));
+            if (actor_active_mask.any().item<bool>()) {
+              policy_loss = pg_loss.masked_select(actor_active_mask).mean();
+            } else {
+              policy_loss = torch::tensor(0.0f, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+            }
+          } else {
+            policy_loss = pg_loss.masked_select(mb_nontrivial).mean();
+          }
           entropy = -(probs * log_probs).sum(-1).masked_select(mb_nontrivial).mean();
           approx_kl = ((ratio - 1.0f) - log_ratio).masked_select(mb_nontrivial).mean();
           clip_fraction =
@@ -3389,7 +3652,10 @@ PpoUpdateStats TrainPpoUpdate(
           }
           if (ema_magnet_active) {
             torch::Tensor ema_logits;
-            {
+            if (use_ema_cache && epoch > 0) {
+              torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+              ema_logits = ema_logits_cache.index_select(0, mb_idx_dev);
+            } else {
               torch::NoGradGuard no_grad;
               auto ema_out = ema_model->forward(mb_states);
               if (ema_model->with_semantic_scorer_ && ema_model->semantic_scorer_) {
@@ -3398,6 +3664,14 @@ PpoUpdateStats TrainPpoUpdate(
                     ema_out.logits, device);
               }
               ema_logits = CenterAndCapLogitsTensor(ema_out.logits, mb_masks, logit_cap);
+              if (use_ema_cache && epoch == 0) {
+                if (!ema_logits_cache.defined()) {
+                  ema_logits_cache =
+                      torch::zeros({n_train, action_dim}, ema_logits.options());
+                }
+                torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+                ema_logits_cache.index_copy_(0, mb_idx_dev, ema_logits);
+              }
             }
             torch::Tensor masked_ema_logits =
                 ema_logits.masked_fill(mb_masks.logical_not(), -1e9f);
@@ -3561,36 +3835,111 @@ PpoUpdateStats TrainPpoUpdate(
       // clip_grad_norm_ returns the norm as measured BEFORE clipping, so this
       // max tracks the same unclipped quantity grad_norm_sum accumulates.
       if (grad_norm > stats.grad_norm_max) stats.grad_norm_max = grad_norm;
+
+      double kl = 0.0;
+      if (!::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
+        phase_timer.Begin(kPhaseScalarReads);
+        torch::Tensor zero_dev;
+        auto ensure_zero = [&]() -> const torch::Tensor& {
+          if (!zero_dev.defined()) {
+            zero_dev = torch::zeros({1}, device);
+          }
+          return zero_dev;
+        };
+
+        torch::Tensor s_kl = approx_kl.reshape({1});
+        torch::Tensor s_val = value_loss.reshape({1});
+        torch::Tensor s_vc = value_clip_frac_t.defined() ? value_clip_frac_t.reshape({1}) : ensure_zero();
+        torch::Tensor s_pi = (mb_num_nontrivial > 0 && policy_loss.defined()) ? policy_loss.reshape({1}) : ensure_zero();
+        torch::Tensor s_ent = (mb_num_nontrivial > 0 && entropy.defined()) ? entropy.reshape({1}) : ensure_zero();
+        torch::Tensor s_cf = (mb_num_nontrivial > 0 && clip_fraction.defined()) ? clip_fraction.reshape({1}) : ensure_zero();
+        torch::Tensor s_rkl = (mb_num_nontrivial > 0 && reverse_kl_active && reverse_kl_penalty_t.defined()) ? reverse_kl_penalty_t.reshape({1}) : ensure_zero();
+        torch::Tensor s_mag = (mb_num_nontrivial > 0 && ema_magnet_active && ema_magnet_kl_t.defined()) ? ema_magnet_kl_t.reshape({1}) : ensure_zero();
+
+        torch::Tensor packed_scalars = torch::cat({s_kl, s_val, s_vc, s_pi, s_ent, s_cf, s_rkl, s_mag}).to(torch::kFloat64).to(torch::kCPU);
+        const double* sc = packed_scalars.data_ptr<double>();
+        kl = sc[0];
+        double v_loss = sc[1];
+        double v_clip = sc[2];
+        double p_loss = sc[3];
+        double ent = sc[4];
+        double c_frac = sc[5];
+        double r_kl = sc[6];
+        double mag_kl = sc[7];
+
+        value_loss_sum += v_loss;
+        if (value_clip_frac_t.defined()) {
+          value_clip_frac_sum += v_clip;
+        }
+        stats.minibatches += 1;
+
+        if (mb_num_nontrivial > 0) {
+          weighted_policy_loss_sum += p_loss * mb_num_nontrivial;
+          weighted_entropy_sum += ent * mb_num_nontrivial;
+          weighted_kl_sum += kl * mb_num_nontrivial;
+          weighted_clip_fraction_sum += c_frac * mb_num_nontrivial;
+          total_nontrivial_count += mb_num_nontrivial;
+
+          epoch_kl_sum += kl * mb_num_nontrivial;
+          epoch_kl_nontrivial_count += mb_num_nontrivial;
+          if (reverse_kl_active && reverse_kl_penalty_t.defined()) {
+            weighted_reverse_kl_sum += r_kl * mb_num_nontrivial;
+          }
+          if (ema_magnet_active && ema_magnet_kl_t.defined()) {
+            weighted_ema_magnet_kl_sum += mag_kl * mb_num_nontrivial;
+            ema_magnet_nontrivial_count += mb_num_nontrivial;
+          }
+        }
+        phase_timer.End(kPhaseScalarReads);
+      }
+
+      const double v4_lr_mult = ::absl::GetFlag(::FLAGS_v4_appendix_lr_mult);
+      const bool scale_v4 =
+          (v4_lr_mult > 1.0 && model->input_layer &&
+           model->input_layer->weight.defined() &&
+           model->input_layer->weight.size(1) >= 9941);
+      torch::Tensor v4_w_before;
+      if (scale_v4) {
+        v4_w_before = model->input_layer->weight.narrow(1, 9182, 759).clone();
+      }
+
       phase_timer.Begin(kPhaseOptimizerStep);
       optimizer.step();
+      if (scale_v4) {
+        torch::NoGradGuard no_grad;
+        torch::Tensor v4_slice = model->input_layer->weight.narrow(1, 9182, 759);
+        v4_slice.copy_(v4_w_before + static_cast<float>(v4_lr_mult) * (v4_slice - v4_w_before));
+      }
       phase_timer.End(kPhaseOptimizerStep);
 
-      phase_timer.Begin(kPhaseScalarReads);
-      double kl = approx_kl.item<double>();
-      value_loss_sum += value_loss.item<double>();
-      if (value_clip_frac_t.defined()) {
-        value_clip_frac_sum += value_clip_frac_t.item<double>();
-      }
-      stats.minibatches += 1;
-
-      if (mb_num_nontrivial > 0) {
-        weighted_policy_loss_sum += policy_loss.item<double>() * mb_num_nontrivial;
-        weighted_entropy_sum += entropy.item<double>() * mb_num_nontrivial;
-        weighted_kl_sum += kl * mb_num_nontrivial;
-        weighted_clip_fraction_sum += clip_fraction.item<double>() * mb_num_nontrivial;
-        total_nontrivial_count += mb_num_nontrivial;
-
-        epoch_kl_sum += kl * mb_num_nontrivial;
-        epoch_kl_nontrivial_count += mb_num_nontrivial;
-        if (reverse_kl_active && reverse_kl_penalty_t.defined()) {
-          weighted_reverse_kl_sum += reverse_kl_penalty_t.item<double>() * mb_num_nontrivial;
+      if (::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
+        phase_timer.Begin(kPhaseScalarReads);
+        kl = approx_kl.item<double>();
+        value_loss_sum += value_loss.item<double>();
+        if (value_clip_frac_t.defined()) {
+          value_clip_frac_sum += value_clip_frac_t.item<double>();
         }
-        if (ema_magnet_active && ema_magnet_kl_t.defined()) {
-          weighted_ema_magnet_kl_sum += ema_magnet_kl_t.item<double>() * mb_num_nontrivial;
-          ema_magnet_nontrivial_count += mb_num_nontrivial;
+        stats.minibatches += 1;
+
+        if (mb_num_nontrivial > 0) {
+          weighted_policy_loss_sum += policy_loss.item<double>() * mb_num_nontrivial;
+          weighted_entropy_sum += entropy.item<double>() * mb_num_nontrivial;
+          weighted_kl_sum += kl * mb_num_nontrivial;
+          weighted_clip_fraction_sum += clip_fraction.item<double>() * mb_num_nontrivial;
+          total_nontrivial_count += mb_num_nontrivial;
+
+          epoch_kl_sum += kl * mb_num_nontrivial;
+          epoch_kl_nontrivial_count += mb_num_nontrivial;
+          if (reverse_kl_active && reverse_kl_penalty_t.defined()) {
+            weighted_reverse_kl_sum += reverse_kl_penalty_t.item<double>() * mb_num_nontrivial;
+          }
+          if (ema_magnet_active && ema_magnet_kl_t.defined()) {
+            weighted_ema_magnet_kl_sum += ema_magnet_kl_t.item<double>() * mb_num_nontrivial;
+            ema_magnet_nontrivial_count += mb_num_nontrivial;
+          }
         }
+        phase_timer.End(kPhaseScalarReads);
       }
-      phase_timer.End(kPhaseScalarReads);
 
       if (target_kl > 0.0 && kl > target_kl) {
         stats.early_stopped = true;
@@ -3604,6 +3953,7 @@ PpoUpdateStats TrainPpoUpdate(
 
     if (stats.early_stopped) break;
   }
+  ema_logits_cache = torch::Tensor();
 
   // Step 3 update-path telemetry: evaluate post-update log probabilities and record telemetry.
   if (!forced_indices.empty()) {

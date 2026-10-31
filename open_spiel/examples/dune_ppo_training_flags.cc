@@ -118,6 +118,18 @@ ABSL_FLAG(double, ema_decay, 0.0,
           "Explicit EMA decay factor per update. If <= 0, computed from ema_half_life: pow(0.5, 1/half_life).");
 ABSL_FLAG(std::string, ema_model_checkpoint, "",
           "Optional path to existing EMA model checkpoint to resume.");
+ABSL_FLAG(double, v4_appendix_lr_mult, 1.0,
+          "Multiplier applied to the Adam parameter update on the 759 full_public_information_v4 input columns (9182..9940). Set to 10.0 to match new_block_lr=5e-5 when base_lr=5e-6.");
+ABSL_FLAG(bool, actor_only_advantage_filtering, false,
+          "EasyPPO (arXiv:2609.36802v1): when true with --advantage_filtering, keep 100% of transitions for critic value_loss regression and apply the top-quantile |A| filter strictly to the actor policy loss.");
+ABSL_FLAG(double, acpo_surrogate_clip, 0.0,
+          "ACPO (arXiv:2609.36816v2): when > 0.0, clamp standardized minibatch advantages in the PPO surrogate loss to [-acpo_surrogate_clip, +acpo_surrogate_clip] to bound outlier policy gradient spikes.");
+ABSL_FLAG(double, acpo_surrogate_clip_neg, 0.0,
+          "DAZ-PPO (arXiv:2610.32194): when > 0, clips negative standardized advantages at -acpo_surrogate_clip_neg (e.g. 1.5 -> lower bound -1.5) inside the PPO policy surrogate loss.");
+ABSL_FLAG(double, acpo_surrogate_clip_pos, 0.0,
+          "DAZ-PPO (arXiv:2610.32194): when > 0, clips positive standardized advantages at +acpo_surrogate_clip_pos (e.g. 2.5 -> upper bound +2.5) inside the PPO policy surrogate loss.");
+ABSL_FLAG(bool, phase_stratified_advantage_norm, false,
+          "When true, standardizes GAE advantages within each decision-role stratum across multi-choice rollout rows before top-quantile filtering or minibatch updates.");
 
 // EMAgnet forward KL regularization flags.
 ABSL_FLAG(double, ema_magnet_kl_coef, 0.0,

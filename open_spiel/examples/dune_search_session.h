@@ -253,6 +253,12 @@ class DuneAdaptiveRolloutSession {
   void set_reserve_ms(double val) { reserve_ms_ = std::max(0.0, val); }
   bool full_search() const { return full_search_; }
   void set_full_search(bool val) { full_search_ = val; }
+  double prior_log_ratio_weight() const { return prior_log_ratio_weight_; }
+  void set_prior_log_ratio_weight(double val) { prior_log_ratio_weight_ = std::max(0.0, val); }
+  double stage1_high_conf_prior_skip() const { return stage1_high_conf_prior_skip_; }
+  void set_stage1_high_conf_prior_skip(double val) { stage1_high_conf_prior_skip_ = std::max(0.0, val); }
+  bool use_event_keyed_crn() const { return use_event_keyed_crn_; }
+  void set_use_event_keyed_crn(bool val) { use_event_keyed_crn_ = val; }
 
  private:
   std::string checkpoint_path_;
@@ -271,6 +277,9 @@ class DuneAdaptiveRolloutSession {
   bool all_buy_candidates_ = true;
   double reserve_ms_ = 10000.0;
   bool full_search_ = false;
+  double prior_log_ratio_weight_ = 0.02;
+  double stage1_high_conf_prior_skip_ = 0.95;
+  bool use_event_keyed_crn_ = true;
   uint64_t search_seed_counter_ = 0;
 
   bool has_active_session_ = false;

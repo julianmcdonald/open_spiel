@@ -665,6 +665,314 @@ void ReshuffleEpochCrnTest(const std::shared_ptr<const Game>& game) {
   SPIEL_CHECK_GT(seq_mismatches, 0);
 }
 
+class InsertedCardEventKeyedCrnTestState : public DuneImperiumState {
+ public:
+  InsertedCardEventKeyedCrnTestState(const std::shared_ptr<const Game>& game,
+                                     bool is_branch_a)
+      : DuneImperiumState(game), is_branch_a_(is_branch_a) {
+    SetPhaseForTesting(GamePhase::kRoundStart);
+    SetRoundStartConflictDoneForTesting(true);
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+    SetPendingPlayerDrawPlayerForTesting(0);
+    SetPlayerDrawDeckForTesting(0, {});
+    if (is_branch_a_) {
+      // Branch A: extra card 45 inserted into discard pile
+      SetPlayerDiscardForTesting(0, {10, 11, 12, 13, 45});
+      SetPlayerHandForTesting(0, {});  // draws 5 cards (target hand size 5)
+    } else {
+      // Branch B: 4 cards in discard pile
+      SetPlayerDiscardForTesting(0, {10, 11, 12, 13});
+      SetPlayerHandForTesting(0, {1});  // draws 4 cards (target hand size 5)
+    }
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<InsertedCardEventKeyedCrnTestState>(*this);
+  }
+
+  bool is_done() const {
+    return static_cast<int>(History().size() - initial_history_size_) >=
+           (is_branch_a_ ? 5 : 4);
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool is_branch_a_ = true;
+  size_t initial_history_size_ = 0;
+};
+
+class MidRoundReshuffleCrnTestState : public DuneImperiumState {
+ public:
+  MidRoundReshuffleCrnTestState(const std::shared_ptr<const Game>& game,
+                                bool is_branch_b)
+      : DuneImperiumState(game), is_branch_b_(is_branch_b) {
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+    SetPlayerDiscardForTesting(0, {10, 11, 12, 13});
+    SetPlayerDrawDeckForTesting(0, {});
+    SetPlayerHandForTesting(0, {1, 2, 3});
+
+    if (!is_branch_b_) {
+      // Branch A: triggers mid-round reshuffle via DrawPlayerCards before rollout starts
+      SetPhaseForTesting(GamePhase::kAgentTurns);
+      DrawPlayerCardsForTesting(0, 2);
+      SPIEL_CHECK_EQ(deck_reshuffle_count(0), 1);
+    } else {
+      // Branch B: reshuffles at kRoundStart during rollout
+      SetPhaseForTesting(GamePhase::kRoundStart);
+      SetRoundStartConflictDoneForTesting(true);
+      SetPendingPlayerDrawPlayerForTesting(0);
+      SPIEL_CHECK_EQ(deck_reshuffle_count(0), 0);
+    }
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<MidRoundReshuffleCrnTestState>(*this);
+  }
+
+  bool is_done() const {
+    return static_cast<int>(History().size() - initial_history_size_) >= 2;
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool is_branch_b_ = false;
+  size_t initial_history_size_ = 0;
+};
+
+void EventKeyedCrnExtraDrawAndInsertedCardTest(
+    const std::shared_ptr<const Game>& game) {
+  const int num_seeds = 50;
+
+  // 1. Inserted card test:
+  // Branch A has card 45 inserted into discard {10, 11, 12, 13, 45}.
+  // Branch B has discard {10, 11, 12, 13}.
+  // Relative order of the 4 shared cards {10, 11, 12, 13} must be 100% identical under kEventKeyedCrn.
+  int event_keyed_matches_part1 = 0;
+  int deck_order_mismatches_part1 = 0;
+  for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+    InsertedCardEventKeyedCrnTestState state_a_evk(game, /*is_branch_a=*/true);
+    InsertedCardEventKeyedCrnTestState state_b_evk(game, /*is_branch_a=*/false);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_evk, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_evk, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+
+    SPIEL_CHECK_EQ(state_a_evk.history_actions().size(), 5);
+    SPIEL_CHECK_EQ(state_b_evk.history_actions().size(), 4);
+
+    std::vector<Action> shared_a_evk;
+    for (Action a : state_a_evk.history_actions()) {
+      if (a != 45) shared_a_evk.push_back(a);
+    }
+    SPIEL_CHECK_EQ(shared_a_evk.size(), 4);
+    if (shared_a_evk == state_b_evk.history_actions()) {
+      event_keyed_matches_part1++;
+    }
+
+    // Compare against kDeckOrderCrn (which suffers desync from the extra card draw)
+    InsertedCardEventKeyedCrnTestState state_a_doc(game, /*is_branch_a=*/true);
+    InsertedCardEventKeyedCrnTestState state_b_doc(game, /*is_branch_a=*/false);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_doc, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_doc, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+
+    std::vector<Action> shared_a_doc;
+    for (Action a : state_a_doc.history_actions()) {
+      if (a != 45) shared_a_doc.push_back(a);
+    }
+    if (shared_a_doc != state_b_doc.history_actions()) {
+      deck_order_mismatches_part1++;
+    }
+  }
+  SPIEL_CHECK_EQ(event_keyed_matches_part1, num_seeds);
+  SPIEL_CHECK_GT(deck_order_mismatches_part1, 0);
+
+  // 2. Mid-round reshuffle synchronization test:
+  // Branch A reshuffles mid-round via DrawPlayerCards before rollout starts (deck_reshuffle_count(0) == 1).
+  // Branch B reshuffles at kRoundStart during rollout.
+  // Both synchronize to effective_epoch == 1 and draw the exact same sequence of cards.
+  int event_keyed_matches_part2 = 0;
+  int deck_order_mismatches_part2 = 0;
+  for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+    MidRoundReshuffleCrnTestState state_a_evk(game, /*is_branch_b=*/false);
+    MidRoundReshuffleCrnTestState state_b_evk(game, /*is_branch_b=*/true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_evk, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_evk, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+
+    SPIEL_CHECK_EQ(state_a_evk.history_actions().size(), 2);
+    SPIEL_CHECK_EQ(state_b_evk.history_actions().size(), 2);
+    if (state_a_evk.history_actions() == state_b_evk.history_actions()) {
+      event_keyed_matches_part2++;
+    }
+
+    // Compare against kDeckOrderCrn (which desynchronizes because Branch A's reshuffle occurred before rollout)
+    MidRoundReshuffleCrnTestState state_a_doc(game, /*is_branch_b=*/false);
+    MidRoundReshuffleCrnTestState state_b_doc(game, /*is_branch_b=*/true);
+
+    SimulateRolloutWithTurnTrajectory(
+        &state_a_doc, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+    SimulateRolloutWithTurnTrajectory(
+        &state_b_doc, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kDeckOrderCrn);
+
+    if (state_a_doc.history_actions() != state_b_doc.history_actions()) {
+      deck_order_mismatches_part2++;
+    }
+  }
+  SPIEL_CHECK_EQ(event_keyed_matches_part2, num_seeds);
+  SPIEL_CHECK_GT(deck_order_mismatches_part2, 0);
+}
+
+void CrnDiagnostic30RootsBenchmark(const std::shared_ptr<const Game>& game) {
+  std::cout << "\n=== Running 30-Root CRN Diagnostic Benchmark ===" << std::endl;
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+
+  // 1. Generate 30 mid-game high-stakes root states from real games:
+  std::vector<std::unique_ptr<State>> roots;
+  uint64_t game_seed = 20261030ULL;
+  while (roots.size() < 30) {
+    auto state = game->NewInitialState();
+    std::mt19937_64 rng(game_seed++);
+    while (!state->IsTerminal()) {
+      if (state->IsChanceNode()) {
+        auto outcomes = state->ChanceOutcomes();
+        double u = std::generate_canonical<double, 53>(rng);
+        Action a = open_spiel::SampleAction(outcomes, u).first;
+        state->ApplyAction(a);
+        continue;
+      }
+      const auto* dune = dynamic_cast<const DuneImperiumState*>(state.get());
+      if (dune && dune->GetCurrentRound() >= 3 &&
+          dune->phase() == GamePhase::kAgentTurns) {
+        auto legals = state->LegalActions();
+        if (legals.size() >= 3) {
+          roots.push_back(state->Clone());
+          if (roots.size() >= 30) break;
+        }
+      }
+      auto legals = state->LegalActions();
+      if (legals.empty()) break;
+      std::uniform_int_distribution<size_t> dist(0, legals.size() - 1);
+      state->ApplyAction(legals[dist(rng)]);
+    }
+  }
+  SPIEL_CHECK_EQ(roots.size(), 30);
+  std::cout << "Successfully sampled " << roots.size()
+            << " mid-game roots (Round >= 3, kAgentTurns, >= 3 legal actions)."
+            << std::endl;
+
+  struct ModeStats {
+    std::string name;
+    double mean_paired_corr = 0.0;
+    double mean_paired_diff_var = 0.0;
+    int pair_count = 0;
+    double elapsed_ms = 0.0;
+  };
+
+  std::vector<ModeStats> results;
+  const std::vector<SearchRolloutCrnMode> modes = {
+      SearchRolloutCrnMode::kSequential,
+      SearchRolloutCrnMode::kDeckOrderCrn,
+      SearchRolloutCrnMode::kEventKeyedCrn};
+
+  for (auto mode : modes) {
+    const auto t0 = std::chrono::steady_clock::now();
+    double total_sum_corr = 0.0;
+    int total_corr_pairs = 0;
+    double total_sum_diff_var = 0.0;
+    int total_diff_var_pairs = 0;
+
+    for (size_t r = 0; r < roots.size(); ++r) {
+      const uint64_t dec_seed = 10007ULL + r * 137ULL;
+      const auto legals = roots[r]->LegalActions();
+      const std::vector<Action> candidates(
+          legals.begin(), legals.begin() + std::min<size_t>(3, legals.size()));
+      const Player seat = roots[r]->CurrentPlayer();
+      const auto result = PairedPriorSortedRolloutSearchDecision(
+          *roots[r], seat, /*turn_tree=*/nullptr, evaluators,
+          candidates, /*rollouts_per_action=*/16,
+          /*min_override_margin=*/0.15, /*min_t_stat=*/1.0, dec_seed,
+          mode, /*sample_opponent_leader_draft=*/false,
+          /*max_time_ms=*/-1.0, /*max_inflight_worlds=*/32,
+          /*resample_from_infostate=*/false);
+      const auto stats =
+          ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
+      total_sum_corr += stats.sum_corr;
+      total_corr_pairs += stats.corr_pair_count;
+      total_sum_diff_var += stats.sum_diff_var;
+      total_diff_var_pairs += stats.diff_var_pair_count;
+    }
+
+    const double elapsed = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+    std::string mode_str = (mode == SearchRolloutCrnMode::kSequential)
+                               ? "sequential"
+                               : (mode == SearchRolloutCrnMode::kDeckOrderCrn)
+                                     ? "deck_order"
+                                     : "event_keyed";
+    const double mean_corr =
+        total_corr_pairs > 0 ? (total_sum_corr / total_corr_pairs) : 0.0;
+    const double mean_diff_var = total_diff_var_pairs > 0
+                                     ? (total_sum_diff_var / total_diff_var_pairs)
+                                     : 0.0;
+    results.push_back(
+        {mode_str, mean_corr, mean_diff_var, total_corr_pairs, elapsed});
+  }
+
+  std::cout << "\n--- Diagnostic Results (30 roots, 16 rollouts/candidate, K=3) ---"
+            << std::endl;
+  for (const auto& r : results) {
+    std::cout << "Mode: " << r.name
+              << " | mean_paired_corr: " << r.mean_paired_corr
+              << " | mean_paired_diff_var: " << r.mean_paired_diff_var
+              << " | pairs: " << r.pair_count
+              << " | time: " << r.elapsed_ms << " ms" << std::endl;
+  }
+}
+
 
 class SlowDeadlineState : public State {
  public:
@@ -1188,6 +1496,8 @@ int main(int argc, char** argv) {
   CurrentChanceStreamIdTest(game);
   DeckOrderCrnAlignmentAndParityTest(game);
   ReshuffleEpochCrnTest(game);
+  EventKeyedCrnExtraDrawAndInsertedCardTest(game);
+  CrnDiagnostic30RootsBenchmark(game);
   Stage1OverAllocationStage2ReservationTest(game);
   ContiguousPrefixOrderingTest(game);
   DepthGuardTest();

@@ -11,6 +11,7 @@
 #include "open_spiel/spiel.h"       // Action, ActionsAndProbs
 #include "open_spiel/utils/json.h"  // json::Object for manifest online-collection state
 #include "dune_specimen_conversion.h"  // the single 741-752 conversion predicate
+#include "dune_search_routing.h"
 
 
 
@@ -45,6 +46,7 @@ ABSL_DECLARE_FLAG(double, search_aux_beta);
 ABSL_DECLARE_FLAG(double, search_aux_alpha);
 ABSL_DECLARE_FLAG(double, search_aux_rail_kl_target);
 ABSL_DECLARE_FLAG(bool, search_research_diagnostic);
+ABSL_DECLARE_FLAG(bool, use_legacy_unoptimized_reads);
 
 extern std::string g_reward_transition_source_fingerprint;
 extern int64_t g_reward_transition_source_update;
@@ -130,6 +132,13 @@ inline bool IsAcquisitionAction(Action a) {
   if (a >= dune_imperium::kActionTechAcquireWithSolari0 && a < dune_imperium::kActionTechAcquireWithSolariSkip) return true;
   return false;
 }
+
+DuneDecisionRole ClassifyTransitionDecisionRole(const PpoTransition& t);
+
+void StandardizeAdvantagesPhaseStratified(
+    std::vector<PpoTransition>* batch,
+    const std::vector<int64_t>& mc_indices,
+    int64_t min_stratum_count = 2);
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 

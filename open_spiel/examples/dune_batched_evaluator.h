@@ -108,6 +108,26 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return val;
   }
 
+  open_spiel::CompactEvalResult PriorWithDetails(
+      const State& state, const std::vector<Action>& legal_actions) {
+    if (!batched_eval_ || state.IsTerminal() || legal_actions.empty()) {
+      return {};
+    }
+    Player current_player = state.CurrentPlayer();
+    if (current_player < 0 || current_player >= state.NumPlayers()) {
+      return {};
+    }
+    std::vector<float> obs = ModelObservation(state, current_player);
+    dune_semantic::CandidateActionData cand_data;
+    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+    if (dune != nullptr) {
+      const std::string schema = batched_eval_->SemanticDescriptorSchema();
+      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
+    }
+    g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
+    return batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
+  }
+
   open_spiel::CompactEvalResult PriorWithDetails(const State& state) {
     if (state.IsTerminal()) {
       return {};
@@ -117,18 +137,24 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       return {};
     }
     std::vector<Action> legal_actions = state.LegalActions();
-    if (legal_actions.empty()) {
+    return PriorWithDetails(state, legal_actions);
+  }
+
+  ActionsAndProbs PriorWithLegals(
+      const State& state, const std::vector<Action>& legal_actions) {
+    if (!batched_eval_) {
+      return Prior(state);
+    }
+    open_spiel::CompactEvalResult result = PriorWithDetails(state, legal_actions);
+    if (!result.ok || result.probabilities.empty()) {
       return {};
     }
-    std::vector<float> obs = ModelObservation(state, current_player);
-    dune_semantic::CandidateActionData cand_data;
-    const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
-    if (dune != nullptr) {
-      const std::string schema = batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
-      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
+    ActionsAndProbs policy;
+    policy.reserve(result.actions.size());
+    for (size_t i = 0; i < result.actions.size(); ++i) {
+      policy.push_back({result.actions[i], result.probabilities[i]});
     }
-    g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
-    return batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
+    return policy;
   }
 
   ActionsAndProbs Prior(const State& state) override {

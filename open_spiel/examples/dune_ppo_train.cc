@@ -1016,47 +1016,7 @@ struct WorkerStats {
 // in the SOURCE's range, so a source with 6 extra tensors would have walked off
 // the end of the target.
 //
-// Name-based copy is also strictly safer than positional in general: it cannot
-// silently pair `policy_head.weight` with `value_head.weight` if a future
-// registration order changes. When the module sets DO match it copies exactly
-// the same tensors as before, so this is behaviour-preserving for every
-// pre-PWO-5 caller.
-void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
-                      std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
-  torch::NoGradGuard no_grad;
-  target->SetSemanticDescriptorSchema(source->semantic_descriptor_schema_);
-  if (source->enable_zone_encoder_ && !target->enable_zone_encoder_) {
-    target->EnableZoneEncoder();
-  }
-  if (!source->parameters().empty()) {
-    target->to(source->parameters().front().device());
-  }
-  auto source_params = source->named_parameters();
-  auto source_buffers = source->named_buffers();
-  for (auto& item : target->named_parameters()) {
-    auto* src = source_params.find(item.key());
-    if (src == nullptr) {
-      SpielFatalError(
-          "CopyModelWeights: target parameter '" + item.key() +
-          "' has no counterpart in the source model. The inference model may "
-          "be a SUBSET of the training model (PWO-5 auxiliary heads), never a "
-          "superset.");
-    }
-    item.value().copy_(src->to(item.value().device()));
-  }
-  for (auto& item : target->named_buffers()) {
-    auto* src = source_buffers.find(item.key());
-    if (src == nullptr) {
-      SpielFatalError("CopyModelWeights: target buffer '" + item.key() +
-                      "' has no counterpart in the source model.");
-    }
-    item.value().copy_(src->to(item.value().device()));
-  }
-  target->market_appendix_mode_ = source->market_appendix_mode_;
-  target->deck_pool_semantics_ = source->deck_pool_semantics_;
-  target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
-  target->enable_zone_encoder_ = source->enable_zone_encoder_;
-}
+// CopyModelWeights is declared and defined inline in dune_network.h
 
 void SyncModels(std::shared_ptr<SharedDunePolicyValueNetImpl> training_model,
                 std::shared_ptr<SharedDunePolicyValueNetImpl> inference_model,
@@ -11461,6 +11421,16 @@ int main(int argc, char** argv) {
     std::string pool_str = absl::GetFlag(FLAGS_training_opponent_pool);
     if (!pool_str.empty()) {
       std::vector<std::string> opp_paths = dune_opponent_pool::ParseOpponentPoolPaths(pool_str);
+      int opp_batch_size = absl::GetFlag(FLAGS_eval_batch_size);
+      if (is_mixed_pool && !opp_paths.empty()) {
+        double expected_active =
+            static_cast<double>(absl::GetFlag(FLAGS_threads)) *
+            absl::GetFlag(FLAGS_pool_game_fraction) *
+            (static_cast<double>(absl::GetFlag(FLAGS_pool_opponents_per_game)) / 4.0) /
+            static_cast<double>(opp_paths.size());
+        int scaled_batch = std::max(1, static_cast<int>(std::ceil(expected_active)));
+        opp_batch_size = std::min(opp_batch_size, scaled_batch);
+      }
       for (const auto& opp_path : opp_paths) {
         if (!std::filesystem::exists(opp_path)) {
           SpielFatalError("Training opponent pool checkpoint does not exist: " + opp_path);
@@ -11490,7 +11460,7 @@ int main(int argc, char** argv) {
               opp_model, device, &eval_mutex);
         } else {
           opp_eval = std::make_shared<open_spiel::BatchedEvaluator>(
-              opp_model, absl::GetFlag(FLAGS_eval_batch_size),
+              opp_model, opp_batch_size,
               absl::GetFlag(FLAGS_eval_timeout_ms), device, &sync_mutex, 0.0f,
               absl::GetFlag(FLAGS_evaluator_device_synchronize),
               /*high_priority_stream=*/false,
@@ -14776,7 +14746,8 @@ int main(int argc, char** argv) {
 
     double collect_elapsed = current_collect.elapsed_seconds;
     double wall_elapsed =
-        std::chrono::duration<double>(wall_end - wall_start).count();
+        std::chrono::duration<double>(wall_end - wall_start).count() +
+        (have_bg ? 0.0 : collect_elapsed);
     double sps = collect_elapsed > 0.0
                      ? current_collect.rollout.size() / collect_elapsed
                      : 0.0;

@@ -68,6 +68,7 @@
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
 #include "dune_network.h"
+#include "dune_semantic_action_scorer.h"
 #include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_ppo_training_flags.h"
@@ -80,6 +81,7 @@ ABSL_DECLARE_FLAG(bool, train_value_only);
 ABSL_DECLARE_FLAG(std::string, diag_prepass_mode);
 ABSL_DECLARE_FLAG(int, diag_prepass_interval);
 ABSL_DECLARE_FLAG(std::string, grad_telemetry_mode);
+ABSL_DECLARE_FLAG(bool, use_legacy_unoptimized_reads);
 #endif
 
 using namespace open_spiel;
@@ -9383,6 +9385,454 @@ void TestVrpoQOfflineTargetLrScreenContracts() {
                 std::string::npos);
   } TEST_END();
 }
+
+static void ApplySemanticScorerBatchLegacy(
+    const std::shared_ptr<dune_semantic::SemanticActionScorerImpl>& scorer,
+    const torch::Tensor& trunk,
+    const std::vector<const dune_semantic::CandidateActionData*>& batch_actions,
+    torch::Tensor& inout_logits,
+    torch::Device device) {
+  if (!scorer) return;
+  size_t total_cands = 0;
+  for (const auto* data : batch_actions) {
+    if (data != nullptr) total_cands += data->size();
+  }
+  if (total_cands == 0) return;
+
+  std::vector<int64_t> batch_indices;
+  std::vector<int64_t> action_indices;
+  std::vector<float> features;
+  std::vector<int64_t> card_ids;
+  std::vector<int64_t> space_ids;
+  std::vector<float> supported;
+  std::vector<uint8_t> is_ext;
+  std::vector<uint8_t> is_f;
+
+  batch_indices.reserve(total_cands);
+  action_indices.reserve(total_cands);
+  features.reserve(total_cands * dune_semantic::kSemanticFeatDim);
+  card_ids.reserve(total_cands);
+  space_ids.reserve(total_cands);
+  supported.reserve(total_cands);
+  is_ext.reserve(total_cands);
+  is_f.reserve(total_cands);
+
+  for (size_t b = 0; b < batch_actions.size(); ++b) {
+    const auto* data = batch_actions[b];
+    if (data == nullptr || data->empty()) continue;
+    const size_t sz = data->size();
+    for (size_t j = 0; j < sz; ++j) {
+      batch_indices.push_back(static_cast<int64_t>(b));
+      action_indices.push_back(static_cast<int64_t>(data->actions[j]));
+      card_ids.push_back(data->card_ids[j]);
+      space_ids.push_back(data->space_ids[j]);
+      supported.push_back(data->supported[j] ? 1.0f : 0.0f);
+      bool ext = false;
+      bool f_role = false;
+      if (j < data->roles.size()) {
+        ext = (data->roles[j] == dune_semantic::ActionRole::kIndexedIntrigue ||
+               data->roles[j] == dune_semantic::ActionRole::kGraftSolo ||
+               data->roles[j] == dune_semantic::ActionRole::kHundroOffer);
+        f_role = (data->roles[j] == dune_semantic::ActionRole::kTleilaxuPurchase);
+      }
+      is_ext.push_back(ext ? 1 : 0);
+      is_f.push_back(f_role ? 1 : 0);
+    }
+    features.insert(features.end(), data->features.begin(), data->features.end());
+  }
+
+  const bool on_cuda = device.is_cuda();
+  auto upload = [&](const auto& vec, torch::ScalarType dtype) {
+    using T = typename std::decay_t<decltype(vec)>::value_type;
+    torch::Tensor host = torch::empty(
+        {static_cast<int64_t>(vec.size())},
+        torch::TensorOptions().dtype(dtype).pinned_memory(on_cuda));
+    if (!vec.empty()) {
+      std::memcpy(host.data_ptr(), vec.data(), vec.size() * sizeof(T));
+    }
+    return on_cuda ? host.to(device, /*non_blocking=*/true) : host;
+  };
+
+  torch::Tensor b_t = upload(batch_indices, torch::kInt64);
+  torch::Tensor a_t = upload(action_indices, torch::kInt64);
+  torch::Tensor c_t = upload(card_ids, torch::kInt64);
+  torch::Tensor s_t = upload(space_ids, torch::kInt64);
+  torch::Tensor supp_t = upload(supported, torch::kFloat32);
+  torch::Tensor is_ext_t = upload(is_ext, torch::kUInt8).to(torch::kBool);
+  torch::Tensor is_f_t = upload(is_f, torch::kUInt8).to(torch::kBool);
+  torch::Tensor feat_t = upload(features, torch::kFloat32)
+                             .reshape({static_cast<int64_t>(total_cands), static_cast<int64_t>(dune_semantic::kSemanticFeatDim)});
+
+  scorer->ComputeAndAddCorrections(trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits, is_ext_t, is_f_t);
+}
+
+void TestStep1And2ParityAndBenchmark() {
+  TEST_BEGIN("Step 1 and 2: ApplySemanticScorerBatch and TrainPpoUpdate parity and benchmark") {
+    // -------------------------------------------------------------------------
+    // 1. Semantic Scorer Bitwise Parity (CPU and CUDA)
+    // -------------------------------------------------------------------------
+    std::vector<torch::Device> devices = {torch::Device(torch::kCPU)};
+    if (torch::cuda::is_available()) {
+      devices.push_back(torch::Device(torch::kCUDA));
+    }
+
+    auto create_synthetic_candidate_data = [](size_t num_cands, int seed_offset, int64_t max_action = 2391) {
+      dune_semantic::CandidateActionData cad;
+      cad.actions.resize(num_cands);
+      cad.card_ids.resize(num_cands);
+      cad.space_ids.resize(num_cands);
+      cad.supported.resize(num_cands);
+      cad.roles.resize(num_cands);
+      cad.features.resize(num_cands * dune_semantic::kSemanticFeatDim);
+
+      dune_semantic::ActionRole roles[] = {
+        dune_semantic::ActionRole::kBoardSpace,
+        dune_semantic::ActionRole::kIndexedIntrigue,
+        dune_semantic::ActionRole::kGraftSolo,
+        dune_semantic::ActionRole::kHundroOffer,
+        dune_semantic::ActionRole::kTleilaxuPurchase
+      };
+
+      for (size_t i = 0; i < num_cands; ++i) {
+        cad.actions[i] = static_cast<Action>((seed_offset + i * 17) % max_action);
+        cad.card_ids[i] = (seed_offset + i * 7) % dune_semantic::kCardVocabSize;
+        cad.space_ids[i] = (seed_offset + i * 13) % dune_semantic::kSpaceVocabSize;
+        cad.supported[i] = (i % 2 == 0) ? 1 : 0;
+        cad.roles[i] = roles[(seed_offset + i) % 5];
+        for (int f = 0; f < dune_semantic::kSemanticFeatDim; ++f) {
+          cad.features[i * dune_semantic::kSemanticFeatDim + f] = 0.01f * ((seed_offset + i + f) % 100);
+        }
+      }
+      return cad;
+    };
+
+    for (const auto& dev : devices) {
+      torch::manual_seed(42);
+      auto scorer = std::make_shared<dune_semantic::SemanticActionScorerImpl>(/*enable_f=*/true);
+      scorer->to(dev);
+      scorer->eval();
+
+      const int B = 16;
+      std::vector<dune_semantic::CandidateActionData> cad_storage(B);
+      std::vector<const dune_semantic::CandidateActionData*> batch_actions(B);
+      for (int b = 0; b < B; ++b) {
+        if (b % 3 == 0) {
+          batch_actions[b] = nullptr;
+        } else if (b % 5 == 0) {
+          cad_storage[b] = create_synthetic_candidate_data(0, b);
+          batch_actions[b] = &cad_storage[b];
+        } else {
+          cad_storage[b] = create_synthetic_candidate_data(4 + (b % 6), b * 10);
+          batch_actions[b] = &cad_storage[b];
+        }
+      }
+
+      torch::Tensor trunk = torch::randn({B, 2048}, dev);
+      torch::Tensor logits_leg = torch::randn({B, 2391}, dev);
+      torch::Tensor logits_new = logits_leg.clone();
+
+      ApplySemanticScorerBatchLegacy(scorer, trunk, batch_actions, logits_leg, dev);
+      dune_semantic::ApplySemanticScorerBatch(scorer, trunk, batch_actions, logits_new, dev);
+
+      torch::Tensor l_cpu = logits_leg.contiguous().cpu();
+      torch::Tensor n_cpu = logits_new.contiguous().cpu();
+      UTILS_CHECK(std::memcmp(l_cpu.data_ptr<float>(), n_cpu.data_ptr<float>(),
+                              l_cpu.numel() * sizeof(float)) == 0);
+    }
+
+    // Benchmark Semantic Scorer on CUDA if available
+    if (torch::cuda::is_available()) {
+      torch::Device dev(torch::kCUDA);
+      torch::manual_seed(101);
+      auto scorer = std::make_shared<dune_semantic::SemanticActionScorerImpl>(/*enable_f=*/true);
+      scorer->to(dev);
+      scorer->eval();
+
+      const int bench_B = 512;
+      const int cands = 8;
+      std::vector<dune_semantic::CandidateActionData> bench_cads(bench_B);
+      std::vector<const dune_semantic::CandidateActionData*> bench_actions(bench_B);
+      for (int b = 0; b < bench_B; ++b) {
+        bench_cads[b] = create_synthetic_candidate_data(cands, b * 3);
+        bench_actions[b] = &bench_cads[b];
+      }
+
+      torch::Tensor bench_trunk = torch::randn({bench_B, 2048}, dev);
+      torch::Tensor bench_base_logits = torch::randn({bench_B, 2391}, dev);
+
+      // Warmup 50 iterations
+      for (int i = 0; i < 50; ++i) {
+        torch::Tensor l1 = bench_base_logits.clone();
+        ApplySemanticScorerBatchLegacy(scorer, bench_trunk, bench_actions, l1, dev);
+        torch::Tensor l2 = bench_base_logits.clone();
+        dune_semantic::ApplySemanticScorerBatch(scorer, bench_trunk, bench_actions, l2, dev);
+      }
+      c10::cuda::getCurrentCUDAStream().synchronize();
+
+      const int timed_iters = 300;
+      auto t0 = std::chrono::high_resolution_clock::now();
+      for (int i = 0; i < timed_iters; ++i) {
+        torch::Tensor l1 = bench_base_logits.clone();
+        ApplySemanticScorerBatchLegacy(scorer, bench_trunk, bench_actions, l1, dev);
+      }
+      c10::cuda::getCurrentCUDAStream().synchronize();
+      auto t1 = std::chrono::high_resolution_clock::now();
+      for (int i = 0; i < timed_iters; ++i) {
+        torch::Tensor l2 = bench_base_logits.clone();
+        dune_semantic::ApplySemanticScorerBatch(scorer, bench_trunk, bench_actions, l2, dev);
+      }
+      c10::cuda::getCurrentCUDAStream().synchronize();
+      auto t2 = std::chrono::high_resolution_clock::now();
+
+      double leg_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      double new_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+      std::cout << "\n  [ApplySemanticScorerBatch Benchmark (CUDA B=512, 8 cands/row)]"
+                << "\n    Legacy 8-vector + upload: " << leg_ms << " ms (" << leg_ms / timed_iters << " ms/iter)"
+                << "\n    Optimized direct pinned:  " << new_ms << " ms (" << new_ms / timed_iters << " ms/iter)"
+                << "\n    Speedup: " << (leg_ms / new_ms) << "x\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. TrainPpoUpdate Bitwise Parity across CPU and CUDA
+    // -------------------------------------------------------------------------
+    auto copy_weights = [](auto& src, auto& dst) {
+      torch::NoGradGuard no_grad;
+      auto src_params = src->named_parameters();
+      auto dst_params = dst->named_parameters();
+      for (const auto& item : src_params) {
+        dst_params[item.key()].copy_(item.value());
+      }
+    };
+
+    const int64_t obs_size = 64;
+    const int64_t action_dim = 16;
+    const int batch_size = 32;
+
+    for (const auto& dev : devices) {
+      for (bool has_forced_buy : {false, true}) {
+      for (double target_kl : {0.005, 0.0}) {
+        // Construct deterministic batch with forced and nontrivial rows
+        std::vector<PpoTransition> batch_leg(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+          PpoTransition& t = batch_leg[i];
+          t.episode_id = i + 1;
+          t.player_id = i % 4;
+          t.state = std::vector<float>(obs_size, 0.02f * (i + 1));
+          if (i % 4 == 0) {
+            t.legal_actions = {1};
+            t.action = 1;
+            t.targeted_buy_forced = has_forced_buy;
+            t.targeted_buy_card = 5;
+            t.targeted_buy_round = 2;
+            t.gae_advantage = 0.2f;
+            t.old_log_prob = 0.0f;
+            t.advantage = 0.5f;
+            t.return_value = 0.8f;
+            t.value = 0.3f;
+          } else if (i % 4 == 1) {
+            t.legal_actions = {0};
+            t.action = 0;
+            t.old_log_prob = 0.0f;
+            t.advantage = -0.2f;
+            t.return_value = 0.1f;
+            t.value = 0.3f;
+          } else {
+            t.legal_actions = {0, 1, 2, 3};
+            t.action = i % 4;
+            t.old_log_prob = -1.386f;
+            t.advantage = (i % 2 == 0) ? 0.4f : -0.3f;
+            t.return_value = 0.5f;
+            t.value = 0.1f;
+          }
+          t.candidate_data = create_synthetic_candidate_data(3, i, action_dim);
+        }
+        std::vector<PpoTransition> batch_opt = batch_leg;
+
+        torch::manual_seed(999);
+        auto m_leg = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
+            /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
+            /*with_semantic_scorer=*/true);
+        m_leg->to(dev);
+
+        auto m_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
+            /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
+            /*with_semantic_scorer=*/true);
+        m_opt->to(dev);
+        copy_weights(m_leg, m_opt);
+
+        auto ema_leg = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
+            /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
+            /*with_semantic_scorer=*/true);
+        ema_leg->to(dev);
+        copy_weights(m_leg, ema_leg);
+
+        auto ema_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
+            /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
+            /*with_semantic_scorer=*/true);
+        ema_opt->to(dev);
+        copy_weights(m_leg, ema_opt);
+
+        torch::optim::AdamW opt_leg(m_leg->parameters(), torch::optim::AdamWOptions(1e-3));
+        torch::optim::AdamW opt_opt(m_opt->parameters(), torch::optim::AdamWOptions(1e-3));
+
+        absl::SetFlag(&FLAGS_ppo_minibatch_size, 8);
+        absl::SetFlag(&FLAGS_ppo_update_epochs, 3);
+        absl::SetFlag(&FLAGS_target_kl, target_kl);
+        absl::SetFlag(&FLAGS_normalize_advantages, true);
+        absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+
+        // Run Legacy Path
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, true);
+        PpoUpdateStats stats_leg = TrainPpoUpdate(
+            m_leg, opt_leg, batch_leg, obs_size, action_dim, dev,
+            /*master=*/54321ULL, /*global_update=*/1,
+            /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+            /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+            /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+            /*compute_diagnostics=*/false, ema_leg, /*ema_magnet_kl_coef=*/0.02);
+
+        // Run Optimized Path
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
+        PpoUpdateStats stats_opt = TrainPpoUpdate(
+            m_opt, opt_opt, batch_opt, obs_size, action_dim, dev,
+            /*master=*/54321ULL, /*global_update=*/1,
+            /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+            /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+            /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+            /*compute_diagnostics=*/false, ema_opt, /*ema_magnet_kl_coef=*/0.02);
+
+        // Reset flag to false (default)
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
+
+        // Assert Model Hash parity
+        CHECK_EQ(HashModelParams(m_leg), HashModelParams(m_opt));
+
+        // Assert Optimizer State parity
+        auto params_leg = m_leg->parameters();
+        auto params_opt = m_opt->parameters();
+        CHECK_EQ(params_leg.size(), params_opt.size());
+        for (size_t p = 0; p < params_leg.size(); ++p) {
+          auto* st_leg = dynamic_cast<torch::optim::AdamWParamState*>(
+              opt_leg.state()[params_leg[p].unsafeGetTensorImpl()].get());
+          auto* st_opt = dynamic_cast<torch::optim::AdamWParamState*>(
+              opt_opt.state()[params_opt[p].unsafeGetTensorImpl()].get());
+          if (st_leg != nullptr || st_opt != nullptr) {
+            UTILS_CHECK(st_leg != nullptr);
+            UTILS_CHECK(st_opt != nullptr);
+            CHECK_EQ(st_leg->step(), st_opt->step());
+            UTILS_CHECK(torch::equal(st_leg->exp_avg(), st_opt->exp_avg()));
+            UTILS_CHECK(torch::equal(st_leg->exp_avg_sq(), st_opt->exp_avg_sq()));
+          }
+        }
+
+        // Assert every single field of PpoUpdateStats
+        CHECK_EQ(stats_leg.policy_loss, stats_opt.policy_loss);
+        CHECK_EQ(stats_leg.value_loss, stats_opt.value_loss);
+        CHECK_EQ(stats_leg.entropy, stats_opt.entropy);
+        CHECK_EQ(stats_leg.approx_kl, stats_opt.approx_kl);
+        CHECK_EQ(stats_leg.clip_fraction, stats_opt.clip_fraction);
+        CHECK_EQ(stats_leg.value_clip_fraction, stats_opt.value_clip_fraction);
+        CHECK_EQ(stats_leg.ema_magnet_kl, stats_opt.ema_magnet_kl);
+        CHECK_EQ(stats_leg.grad_norm_sum, stats_opt.grad_norm_sum);
+        CHECK_EQ(stats_leg.grad_norm_max, stats_opt.grad_norm_max);
+        CHECK_EQ(stats_leg.minibatches, stats_opt.minibatches);
+        CHECK_EQ(stats_leg.early_stopped, stats_opt.early_stopped);
+        CHECK_EQ(stats_leg.kl_early_stop_epoch, stats_opt.kl_early_stop_epoch);
+        CHECK_EQ(stats_leg.epoch_kls.size(), stats_opt.epoch_kls.size());
+        for (size_t k = 0; k < stats_leg.epoch_kls.size(); ++k) {
+          CHECK_EQ(stats_leg.epoch_kls[k], stats_opt.epoch_kls[k]);
+        }
+      }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Short, Light Warmed-Up CUDA Benchmark (< 300 MB VRAM, 2 warmup + 5 timed)
+    // -------------------------------------------------------------------------
+    if (torch::cuda::is_available()) {
+      torch::Device dev(torch::kCUDA);
+      const int64_t b_obs = 512;
+      const int64_t b_hidden = 2048;
+      const int64_t b_blocks = 2;
+      const int64_t b_act = 2391;
+      const int b_batch_size = 2048;
+      const int b_mb_size = 256;
+
+      auto make_bench_model = [&]() {
+        auto m = std::make_shared<SharedDunePolicyValueNetImpl>(
+            b_obs, b_hidden, b_act, b_blocks,
+            /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
+            /*with_semantic_scorer=*/true);
+        m->to(dev);
+        return m;
+      };
+
+      std::vector<PpoTransition> bench_batch(b_batch_size);
+      for (int i = 0; i < b_batch_size; ++i) {
+        PpoTransition& t = bench_batch[i];
+        t.episode_id = i + 1;
+        t.player_id = i % 4;
+        t.state = std::vector<float>(b_obs, 0.01f * (i % 50));
+        t.legal_actions = {0, 1, 2, 3, 4, 5};
+        t.action = i % 6;
+        t.old_log_prob = -1.79f;
+        t.advantage = (i % 2 == 0) ? 0.5f : -0.5f;
+        t.return_value = 0.2f;
+        t.value = 0.1f;
+        t.candidate_data = create_synthetic_candidate_data(6, i, b_act);
+      }
+
+      absl::SetFlag(&FLAGS_ppo_minibatch_size, b_mb_size);
+      absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+      absl::SetFlag(&FLAGS_target_kl, 0.0);
+      absl::SetFlag(&FLAGS_normalize_advantages, true);
+
+      auto run_bench = [&](bool legacy, int iters) -> double {
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, legacy);
+        auto m = make_bench_model();
+        auto ema = make_bench_model();
+        copy_weights(m, ema);
+        torch::optim::AdamW opt(m->parameters(), torch::optim::AdamWOptions(1e-4));
+        c10::cuda::getCurrentCUDAStream().synchronize();
+        auto t_start = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iters; ++it) {
+          TrainPpoUpdate(
+              m, opt, bench_batch, b_obs, b_act, dev,
+              /*master=*/1000 + it, /*global_update=*/it,
+              /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+              /*abort_grad_norm_ratio=*/0.0, Pwo5AuxBatch(), Pwo5AuxConfig(),
+              /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+              /*compute_diagnostics=*/false, ema, /*ema_magnet_kl_coef=*/0.02);
+        }
+        c10::cuda::getCurrentCUDAStream().synchronize();
+        auto t_end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(t_end - t_start).count();
+      };
+
+      // Warmup (2 updates each)
+      run_bench(true, 2);
+      run_bench(false, 2);
+
+      // Timed (5 updates each)
+      const int timed_updates = 5;
+      double legacy_ms = run_bench(true, timed_updates);
+      double opt_ms = run_bench(false, timed_updates);
+
+      std::cout << "\n  [TrainPpoUpdate Benchmark (CUDA obs=512, hidden=2048, blocks=2, batch=2048, mb=256, epochs=2, ema=true, scorer=true)]"
+                << "\n    Legacy (unoptimized syncs + no EMA cache): " << legacy_ms << " ms (" << legacy_ms / timed_updates << " ms/update)"
+                << "\n    Optimized (zero-sync reads + EMA cache):   " << opt_ms << " ms (" << opt_ms / timed_updates << " ms/update)"
+                << "\n    Speedup: " << (legacy_ms / opt_ms) << "x ("
+                << ((legacy_ms - opt_ms) / legacy_ms * 100.0) << "% faster)\n";
+
+      absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
+      c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+  } TEST_END();
+}
 #endif
 
 int main() {
@@ -9393,6 +9843,7 @@ int main() {
   // Run the new test functions
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
   TestTrainPpoUpdateParityGoldenHash();
+  TestStep1And2ParityAndBenchmark();
   TestAuxSliceScheduling();
   TestAuxGradients();
   TestAuxRatioAbort();
@@ -11260,6 +11711,461 @@ int main() {
       auto out_after = model->forward(torch::zeros({1, obs_size}));
       float diff_after = (out_after.logits[0][0] - out_after.logits[0][1]).item<float>();
       UTILS_CHECK(diff_after > diff_before + 1e-3f);
+    }
+  } TEST_END();
+
+  TEST_BEGIN("DAZ-PPO asymmetric advantage clipping") {
+    const int64_t obs_size = 8, action_dim = 2;
+
+    auto make_zero_model_and_opt = [&]() {
+      auto m = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 16, action_dim, 1);
+      m->train();
+      {
+        torch::NoGradGuard no_grad;
+        for (auto& p : m->parameters()) p.zero_();
+      }
+      auto o = std::make_unique<torch::optim::AdamW>(m->parameters(), torch::optim::AdamWOptions(1e-3));
+      return std::make_pair(m, std::move(o));
+    };
+
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+    absl::SetFlag(&FLAGS_ppo_clip_epsilon, 1.0);  // wide ratio clip so surrogate loss is unclipped by epsilon
+    absl::SetFlag(&FLAGS_normalize_advantages, false);
+    absl::SetFlag(&FLAGS_value_coef, 0.0);
+    absl::SetFlag(&FLAGS_entropy_coef, 0.0);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_amp, false);
+    absl::SetFlag(&FLAGS_acpo_surrogate_clip, 0.0);
+    absl::SetFlag(&FLAGS_acpo_surrogate_clip_neg, 1.5);
+    absl::SetFlag(&FLAGS_acpo_surrogate_clip_pos, 2.5);
+
+    // Case 1: Outlier negative advantage (-10.0) and outlier positive advantage (+10.0)
+    // ratio = exp(old_log_prob - old_log_prob) = 1.0
+    // surrogate loss for negative advantage clamped at -1.5: pg = -(-1.5) * 1.0 = +1.5
+    // surrogate loss for positive advantage clamped at +2.5: pg = -(+2.5) * 1.0 = -2.5
+    {
+      auto [model, opt] = make_zero_model_and_opt();
+      std::vector<PpoTransition> batch(2);
+      for (int i = 0; i < 2; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.0f);
+        batch[i].legal_actions = {0, 1};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.69314718f;  // ln(0.5)
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = i;
+      }
+      batch[0].advantage = -10.0f;  // Should clamp to -1.5 -> policy loss +1.5
+      batch[1].advantage = +10.0f;  // Should clamp to +2.5 -> policy loss -2.5
+
+      PpoUpdateStats stats = TrainPpoUpdate(
+          model, *opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/nullptr, /*ema_magnet_kl_coef=*/0.0);
+
+      // Mean policy loss should be (1.5 + (-2.5)) / 2 = -0.5
+      CHECK_NEAR(stats.policy_loss, -0.5, 1e-4);
+    }
+
+    // Case 2: Negative outlier (-10.0) with a non-outlier (+0.5)
+    {
+      auto [model, opt] = make_zero_model_and_opt();
+      std::vector<PpoTransition> batch(2);
+      for (int i = 0; i < 2; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.0f);
+        batch[i].legal_actions = {0, 1};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.69314718f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = i;
+      }
+      batch[0].advantage = -10.0f;  // Clamps to -1.5 -> pg = +1.5
+      batch[1].advantage = +0.5f;   // Within [-1.5, +2.5] -> pg = -0.5
+
+      PpoUpdateStats stats = TrainPpoUpdate(
+          model, *opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/nullptr, /*ema_magnet_kl_coef=*/0.0);
+
+      // Mean policy loss should be (1.5 + (-0.5)) / 2 = +0.5
+      CHECK_NEAR(stats.policy_loss, 0.5, 1e-4);
+    }
+
+    // Case 3: Positive outlier (+10.0) with a non-outlier (-0.5)
+    {
+      auto [model, opt] = make_zero_model_and_opt();
+      std::vector<PpoTransition> batch(2);
+      for (int i = 0; i < 2; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.0f);
+        batch[i].legal_actions = {0, 1};
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.69314718f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = i;
+      }
+      batch[0].advantage = +10.0f;  // Clamps to +2.5 -> pg = -2.5
+      batch[1].advantage = -0.5f;   // Within [-1.5, +2.5] -> pg = +0.5
+
+      PpoUpdateStats stats = TrainPpoUpdate(
+          model, *opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/nullptr, /*ema_magnet_kl_coef=*/0.0);
+
+      // Mean policy loss should be (-2.5 + 0.5) / 2 = -1.0
+      CHECK_NEAR(stats.policy_loss, -1.0, 1e-4);
+    }
+
+    // Reset flags
+    absl::SetFlag(&FLAGS_acpo_surrogate_clip_neg, 0.0);
+    absl::SetFlag(&FLAGS_acpo_surrogate_clip_pos, 0.0);
+    absl::SetFlag(&FLAGS_normalize_advantages, true);
+  } TEST_END();
+
+  TEST_BEGIN("Phase-stratified advantage normalization") {
+    // 1. Verify ClassifyTransitionDecisionRole
+    {
+      PpoTransition t_forced;
+      t_forced.legal_actions = {dune_imperium::kActionSelectAgentCard0};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_forced)),
+               static_cast<int>(DuneDecisionRole::kForcedOrBookkeeping));
+
+      PpoTransition t_explicit_role;
+      t_explicit_role.legal_actions = {0, 1};
+      t_explicit_role.decision_role = static_cast<int>(DuneDecisionRole::kPurchase);
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_explicit_role)),
+               static_cast<int>(DuneDecisionRole::kPurchase));
+
+      PpoTransition t_leader;
+      t_leader.legal_actions = {dune_imperium::kActionLeaderPick0 + 1,
+                                dune_imperium::kActionLeaderPick0 + 5};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_leader)),
+               static_cast<int>(DuneDecisionRole::kLeaderSelection));
+
+      PpoTransition t_purchase;
+      t_purchase.legal_actions = {dune_imperium::kActionBuyImperiumRow0,
+                                  dune_imperium::kActionBuyReserveTheSpiceMustFlow,
+                                  dune_imperium::kActionEndTurn};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_purchase)),
+               static_cast<int>(DuneDecisionRole::kPurchase));
+
+      PpoTransition t_combat;
+      t_combat.legal_actions = {dune_imperium::kActionCombatPass,
+                                dune_imperium::kActionCombatCommit0 + 4};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_combat)),
+               static_cast<int>(DuneDecisionRole::kCombatIntrigue));
+
+      PpoTransition t_agent_primary;
+      t_agent_primary.legal_actions = {dune_imperium::kActionSelectAgentCard0 + 2,
+                                       dune_imperium::kActionPlayKwisatzHaderach};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_agent_primary)),
+               static_cast<int>(DuneDecisionRole::kAgentPrimary));
+
+      PpoTransition t_agent_cont;
+      t_agent_cont.legal_actions = {dune_imperium::kActionAgentSpaceConspire,
+                                    dune_imperium::kActionAgentSpaceSietchTabr};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_agent_cont)),
+               static_cast<int>(DuneDecisionRole::kAgentContinuation));
+
+      PpoTransition t_other;
+      t_other.legal_actions = {1234, 1235};
+      CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_other)),
+               static_cast<int>(DuneDecisionRole::kOtherOptional));
+    }
+
+    // 2. Verify StandardizeAdvantagesPhaseStratified normalizes strata independently
+    {
+      std::vector<PpoTransition> batch(9);
+      // Stratum 2: AgentPrimary (high variance raw advantages: 100, 200, 300)
+      for (int i = 0; i < 3; ++i) {
+        batch[i].legal_actions = {dune_imperium::kActionSelectAgentCard0 + 1,
+                                  dune_imperium::kActionSelectAgentCard0 + 2};
+        batch[i].advantage = 100.0f * (i + 1);  // 100, 200, 300
+      }
+      // Stratum 4: Purchase (low variance raw advantages: 1.0, 2.0, 3.0)
+      for (int i = 3; i < 6; ++i) {
+        batch[i].legal_actions = {dune_imperium::kActionBuyImperiumRow0,
+                                  dune_imperium::kActionEndTurn};
+        batch[i].advantage = 1.0f * (i - 2);  // 1.0, 2.0, 3.0
+      }
+      // Stratum 5: CombatIntrigue (medium variance: 10.0, 20.0, 30.0)
+      for (int i = 6; i < 9; ++i) {
+        batch[i].legal_actions = {dune_imperium::kActionCombatPass,
+                                  dune_imperium::kActionCombatCommit0 + 1};
+        batch[i].advantage = 10.0f * (i - 5);  // 10.0, 20.0, 30.0
+      }
+
+      std::vector<int64_t> mc_indices = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+      StandardizeAdvantagesPhaseStratified(&batch, mc_indices, /*min_stratum_count=*/2);
+
+      // Check Stratum 2 (AgentPrimary): mean 200, std sqrt((100^2 + 0 + 100^2)/3) = 81.649658
+      // Standardized values: -1.2247, 0.0, +1.2247
+      CHECK_NEAR(batch[0].advantage, -1.2247f, 1e-3);
+      CHECK_NEAR(batch[1].advantage, 0.0f, 1e-3);
+      CHECK_NEAR(batch[2].advantage, +1.2247f, 1e-3);
+
+      // Check Stratum 4 (Purchase): mean 2, std sqrt((1^2 + 0 + 1^2)/3) = 0.81649658
+      // Standardized values should match AgentPrimary: -1.2247, 0.0, +1.2247
+      CHECK_NEAR(batch[3].advantage, -1.2247f, 1e-3);
+      CHECK_NEAR(batch[4].advantage, 0.0f, 1e-3);
+      CHECK_NEAR(batch[5].advantage, +1.2247f, 1e-3);
+
+      // Check Stratum 5 (CombatIntrigue): mean 20, std 8.1649658
+      // Standardized values should also match: -1.2247, 0.0, +1.2247
+      CHECK_NEAR(batch[6].advantage, -1.2247f, 1e-3);
+      CHECK_NEAR(batch[7].advantage, 0.0f, 1e-3);
+      CHECK_NEAR(batch[8].advantage, +1.2247f, 1e-3);
+
+      // Notice how before stratification, Purchase max raw advantage was 3.0 vs AgentPrimary 300.0.
+      // After stratification, Purchase max advantage is 1.2247 == AgentPrimary max advantage 1.2247!
+    }
+
+    // 3. End-to-end TrainPpoUpdate with advantage_filtering + actor_only_advantage_filtering + phase_stratified_advantage_norm
+    {
+      const int64_t obs_size = 8, action_dim = 2;
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 16, action_dim, 1);
+      model->train();
+      torch::optim::AdamW opt(model->parameters(), torch::optim::AdamWOptions(1e-3));
+
+      std::vector<PpoTransition> batch(6);
+      for (int i = 0; i < 6; ++i) {
+        batch[i].state = std::vector<float>(obs_size, 0.0f);
+        batch[i].action = 0;
+        batch[i].old_log_prob = -0.693147f;
+        batch[i].reward = 0.0f;
+        batch[i].value = 0.0f;
+        batch[i].return_value = 0.0f;
+        batch[i].episode_id = i;
+      }
+      // Rows 0..2: AgentPrimary (high raw advantage 100, 200, 300)
+      for (int i = 0; i < 3; ++i) {
+        batch[i].legal_actions = {dune_imperium::kActionSelectAgentCard0,
+                                  dune_imperium::kActionSelectAgentCard0 + 1};
+        batch[i].advantage = 100.0f * (i + 1);
+      }
+      // Rows 3..5: Purchase (low raw advantage 1, 2, 3)
+      for (int i = 3; i < 6; ++i) {
+        batch[i].legal_actions = {dune_imperium::kActionBuyImperiumRow0,
+                                  dune_imperium::kActionEndTurn};
+        batch[i].advantage = 1.0f * (i - 2);
+      }
+
+      absl::SetFlag(&FLAGS_ppo_minibatch_size, 6);
+      absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+      absl::SetFlag(&FLAGS_advantage_filtering, true);
+      absl::SetFlag(&FLAGS_actor_only_advantage_filtering, true);
+      absl::SetFlag(&FLAGS_phase_stratified_advantage_norm, true);
+      absl::SetFlag(&FLAGS_advantage_filtering_quantile, 0.34);  // retain top 2 of 6 (std::round(0.34 * 6) = 2)
+
+      PpoUpdateStats stats = TrainPpoUpdate(
+          model, opt, batch, obs_size, action_dim, torch::kCPU,
+          /*master=*/12345, /*global_update=*/1, /*anchor_model=*/nullptr,
+          /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+          /*abort_grad_norm_ratio=*/0.0,
+          Pwo5AuxBatch(), Pwo5AuxConfig(),
+          /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+          /*compute_diagnostics=*/false,
+          /*ema_model=*/nullptr, /*ema_magnet_kl_coef=*/0.0);
+
+      CHECK_EQ(stats.retained_transitions, int64_t{2});
+
+      // Reset flags
+      absl::SetFlag(&FLAGS_advantage_filtering, false);
+      absl::SetFlag(&FLAGS_actor_only_advantage_filtering, false);
+      absl::SetFlag(&FLAGS_phase_stratified_advantage_norm, false);
+      absl::SetFlag(&FLAGS_advantage_filtering_quantile, 0.25);
+    }
+  } TEST_END();
+
+  TEST_BEGIN("BatchedEvaluator with CUDAGraph: bitwise parity, compact prior parity, and live weight mutation propagation") {
+    if (!torch::cuda::is_available()) {
+      std::cout << "[CUDA unavailable, skipping CUDAGraph test] ";
+    } else {
+      torch::Device cuda_device(torch::kCUDA);
+      const int64_t obs_size = 5580;
+
+      // Part 1: Verify parity with and without semantic scorer across multiple batch sizes
+      for (bool with_scorer : {false, true}) {
+        const int hidden_dim = with_scorer ? 2048 : 64;
+        const int num_blocks = 1;
+        auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, hidden_dim, 2391, num_blocks, /*use_nonlinear=*/false,
+            /*with_aux_heads=*/false, /*head_init_seed=*/0,
+            /*with_semantic_scorer=*/with_scorer, /*enable_zone_encoder=*/false,
+            with_scorer ? dune_semantic::kDescriptorSchemaVersionV3 : "");
+        model->to(cuda_device);
+        model->eval();
+
+        std::shared_mutex sync_mutex;
+        const int target_batch = 16;
+        BatchedEvaluator evaluator(
+            model, target_batch, /*timeout_ms=*/1, cuda_device, &sync_mutex,
+            /*logit_cap=*/10.0f, /*device_synchronize=*/false,
+            /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+            /*rollout_amp=*/false, /*allow_tf32=*/false);
+
+        // Test multiple batch sizes: e.g. 1, 4, target_batch (16)
+        for (int batch_size : {1, 4, target_batch}) {
+          std::vector<std::vector<float>> obs_batch(batch_size, std::vector<float>(obs_size, 0.0f));
+          std::vector<dune_semantic::CandidateActionData> cand_batch(batch_size);
+          std::vector<std::vector<open_spiel::Action>> legal_actions_batch(batch_size);
+
+          for (int b = 0; b < batch_size; ++b) {
+            for (int k = 0; k < obs_size; ++k) {
+              obs_batch[b][k] = static_cast<float>((b * 17 + k * 31) % 1000) / 1000.0f;
+            }
+            legal_actions_batch[b] = {
+                dune_imperium::kActionSelectAgentCard0,
+                dune_imperium::kActionSelectAgentCard0 + 1,
+                dune_imperium::kActionBuyImperiumRow0};
+            if (with_scorer) {
+              cand_batch[b].actions = legal_actions_batch[b];
+              cand_batch[b].features.resize(3 * dune_semantic::kSemanticFeatDim, 0.0f);
+              cand_batch[b].card_ids.resize(3, 1);
+              cand_batch[b].space_ids.resize(3, 1);
+              cand_batch[b].supported.resize(3, 1);
+              cand_batch[b].roles.resize(3, dune_semantic::ActionRole::kPrimaryCard);
+            }
+          }
+
+          // Evaluate with BatchedEvaluator (which captures and replays CUDA Graph)
+          std::vector<open_spiel::CompactEvalResult> compact_results(batch_size);
+          // Evaluate first time (captures graph)
+          for (int b = 0; b < batch_size; ++b) {
+            compact_results[b] = evaluator.EvaluateCompact(
+                obs_batch[b], legal_actions_batch[b], with_scorer ? &cand_batch[b] : nullptr);
+          }
+          // Evaluate second time (replays graph)
+          for (int b = 0; b < batch_size; ++b) {
+            compact_results[b] = evaluator.EvaluateCompact(
+                obs_batch[b], legal_actions_batch[b], with_scorer ? &cand_batch[b] : nullptr);
+          }
+
+          // Compute ground truth eager forward pass
+          torch::Tensor eager_input = torch::empty({batch_size, obs_size}, torch::TensorOptions().dtype(torch::kFloat32).device(cuda_device));
+          for (int b = 0; b < batch_size; ++b) {
+            eager_input[b].copy_(torch::from_blob(obs_batch[b].data(), {obs_size}, torch::kFloat32));
+          }
+          auto eager_out = model->forward(eager_input);
+          if (with_scorer) {
+            std::vector<const dune_semantic::CandidateActionData*> ptrs(batch_size);
+            for (int b = 0; b < batch_size; ++b) ptrs[b] = &cand_batch[b];
+            dune_semantic::ApplySemanticScorerBatch(
+                model->semantic_scorer_, eager_out.trunk, ptrs, eager_out.logits, cuda_device);
+          }
+          torch::Tensor eager_logits = eager_out.logits.to(torch::kCPU);
+          torch::Tensor eager_values = eager_out.values.to(torch::kCPU);
+
+          for (int b = 0; b < batch_size; ++b) {
+            UTILS_CHECK(compact_results[b].ok);
+            // Check value parity
+            float eager_val = eager_values[b].item<float>();
+            float graph_val = compact_results[b].value;
+            CHECK_NEAR(eager_val, graph_val, 1e-6f);
+
+            // Check compact probabilities match eager computation
+            torch::Tensor eager_row_logits = eager_logits[b];
+            std::vector<float> row_legals;
+            for (auto a : legal_actions_batch[b]) {
+              row_legals.push_back(eager_row_logits[a].item<float>());
+            }
+            float mean_legal = 0.0f;
+            for (float v : row_legals) mean_legal += v;
+            mean_legal /= row_legals.size();
+            for (float& v : row_legals) {
+              v -= mean_legal;
+              v = 10.0f * std::tanh(v / 10.0f);
+            }
+            float max_v = -1e9f;
+            for (float v : row_legals) if (v > max_v) max_v = v;
+            float sum_exp = 0.0f;
+            for (float v : row_legals) sum_exp += std::exp(v - max_v);
+            for (size_t a = 0; a < row_legals.size(); ++a) {
+              float expected_prob = std::exp(row_legals[a] - max_v) / sum_exp;
+              CHECK_NEAR(expected_prob, compact_results[b].probabilities[a], 1e-5f);
+            }
+          }
+        }
+      }
+
+      // Part 2: Verify live weight mutation via CopyModelWeights
+      {
+        const int p2_hidden_dim = 64;
+        const int p2_num_blocks = 1;
+        auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, p2_hidden_dim, 2391, p2_num_blocks);
+        auto model_b = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, p2_hidden_dim, 2391, p2_num_blocks);
+        model_a->to(cuda_device);
+        model_b->to(cuda_device);
+        model_a->eval();
+        model_b->eval();
+
+        // Give model_b distinctly different weights
+        {
+          torch::NoGradGuard no_grad;
+          for (auto& p : model_b->parameters()) {
+            p.add_(1.5f);
+          }
+        }
+
+        std::shared_mutex sync_mutex;
+        BatchedEvaluator evaluator(
+            model_a, /*target_batch_size=*/4, /*timeout_ms=*/1, cuda_device, &sync_mutex,
+            /*logit_cap=*/10.0f, /*device_synchronize=*/false,
+            /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
+            /*rollout_amp=*/false, /*allow_tf32=*/false);
+
+        std::vector<float> sample_obs(obs_size, 0.5f);
+
+        // 1. Initial evaluation under model_a weights (captures graph)
+        auto res_init = evaluator.Evaluate(sample_obs);
+        UTILS_CHECK(res_init.ok);
+
+        // 2. Mutate model_a weights in-place using CopyModelWeights(model_b, model_a)
+        {
+          std::unique_lock<std::shared_mutex> writer_lock(sync_mutex);
+          CopyModelWeights(model_b, model_a);
+        }
+
+        // 3. Evaluate again with evaluator (replays graph)
+        auto res_mut = evaluator.Evaluate(sample_obs);
+        UTILS_CHECK(res_mut.ok);
+
+        // Value must have changed
+        UTILS_CHECK(res_init.value != res_mut.value);
+
+        // Ground truth eager evaluation with updated model_a
+        torch::Tensor eager_input = torch::from_blob(sample_obs.data(), {1, obs_size}, torch::kFloat32).to(cuda_device);
+        auto eager_out = model_a->forward(eager_input);
+        float eager_val = eager_out.values.to(torch::kCPU).data_ptr<float>()[0];
+        CHECK_NEAR(res_mut.value, eager_val, 1e-6f);
+
+        torch::Tensor eager_logits = eager_out.logits.squeeze(0).to(torch::kCPU);
+        for (int i = 0; i < eager_logits.size(0); ++i) {
+          CHECK_NEAR(res_mut.logits[i], eager_logits[i].item<float>(), 1e-5f);
+        }
+      }
     }
   } TEST_END();
 

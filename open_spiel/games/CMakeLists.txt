@@ -275,6 +275,7 @@ list(APPEND GAME_SOURCES
 )
 
 add_library (games OBJECT ${GAME_SOURCES})
+add_dependencies(games open_spiel_core)
 
 target_include_directories (games PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories (games PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}../pybind11_abseil)
@@ -794,31 +795,35 @@ add_executable(yacht_test yacht/yacht_test.cc ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(yacht_test yacht_test)
 
-add_executable(dune_imperium_test dune_imperium/dune_imperium_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_library(dune_imperium_test_utils_obj OBJECT dune_imperium/dune_imperium_test_utils.cc)
+add_dependencies(dune_imperium_test_utils_obj games open_spiel_core)
+target_include_directories(dune_imperium_test_utils_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(dune_imperium_test dune_imperium/dune_imperium_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_test dune_imperium_test)
 
-add_executable(dune_imperium_board_spaces_test dune_imperium/dune_imperium_board_spaces_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_board_spaces_test dune_imperium/dune_imperium_board_spaces_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_board_spaces_test dune_imperium_board_spaces_test)
 
-add_executable(dune_imperium_cards_test dune_imperium/dune_imperium_cards_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_cards_test dune_imperium/dune_imperium_cards_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_cards_test dune_imperium_cards_test)
 
-add_executable(dune_imperium_cards2_test dune_imperium/dune_imperium_cards2_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_cards2_test dune_imperium/dune_imperium_cards2_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_cards2_test dune_imperium_cards2_test)
 
-add_executable(dune_imperium_intrigue_test dune_imperium/dune_imperium_intrigue_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_intrigue_test dune_imperium/dune_imperium_intrigue_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_intrigue_test dune_imperium_intrigue_test)
 
-add_executable(dune_imperium_leaders_test dune_imperium/dune_imperium_leaders_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_leaders_test dune_imperium/dune_imperium_leaders_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_leaders_test dune_imperium_leaders_test)
 
-add_executable(dune_imperium_resample_test dune_imperium/dune_imperium_resample_test.cc dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS}
+add_executable(dune_imperium_resample_test dune_imperium/dune_imperium_resample_test.cc $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS}
                $<TARGET_OBJECTS:tests>)
 add_test(dune_imperium_resample_test dune_imperium_resample_test)
 

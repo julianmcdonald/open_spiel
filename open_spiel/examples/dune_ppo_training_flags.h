@@ -56,6 +56,12 @@ ABSL_DECLARE_FLAG(std::string, ema_model_checkpoint);
 ABSL_DECLARE_FLAG(bool, advantage_filtering);
 ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
 ABSL_DECLARE_FLAG(bool, enable_study_readouts);
+ABSL_DECLARE_FLAG(double, v4_appendix_lr_mult);
+ABSL_DECLARE_FLAG(bool, actor_only_advantage_filtering);
+ABSL_DECLARE_FLAG(double, acpo_surrogate_clip);
+ABSL_DECLARE_FLAG(double, acpo_surrogate_clip_neg);
+ABSL_DECLARE_FLAG(double, acpo_surrogate_clip_pos);
+ABSL_DECLARE_FLAG(bool, phase_stratified_advantage_norm);
 
 // EMAgnet forward KL regularization flags.
 ABSL_DECLARE_FLAG(double, ema_magnet_kl_coef);

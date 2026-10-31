@@ -5,16 +5,69 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_benchmark ${TORCH_LIBRARIES})
 
+  add_library(dune_search STATIC dune_puct_is_mcts.cc dune_search_routing.cc dune_search_session.cc)
+  target_link_libraries(dune_search PRIVATE ${TORCH_LIBRARIES})
+  target_include_directories(dune_search PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search games open_spiel_core)
+
+  add_library(dune_collector_obj OBJECT dune_online_search_collector.cc)
+  target_link_libraries(dune_collector_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_collector_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_collector_obj dune_search games open_spiel_core)
+
+  add_library(dune_ppo_utils_obj OBJECT dune_ppo_training_utils.cc dune_ppo_training_flags.cc)
+  target_link_libraries(dune_ppo_utils_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_ppo_utils_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_ppo_utils_obj dune_search games open_spiel_core)
+
+  add_library(dune_search_pi_obj OBJECT dune_search_pi.cc)
+  target_link_libraries(dune_search_pi_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_search_pi_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search_pi_obj dune_search games open_spiel_core)
+
+  add_library(dune_search_pi_concurrent_obj OBJECT dune_search_pi_concurrent.cc)
+  target_link_libraries(dune_search_pi_concurrent_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_search_pi_concurrent_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search_pi_concurrent_obj dune_search games open_spiel_core)
+
+  add_library(dune_search_pi_scratch_obj OBJECT dune_search_pi_scratch.cc)
+  target_link_libraries(dune_search_pi_scratch_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_search_pi_scratch_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search_pi_scratch_obj dune_search games open_spiel_core)
+
+  add_library(dune_search_pi_replay_obj OBJECT dune_search_pi_replay.cc)
+  target_link_libraries(dune_search_pi_replay_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_search_pi_replay_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search_pi_replay_obj dune_search games open_spiel_core)
+
+  add_library(dune_search_pi_async_resume_obj OBJECT dune_search_pi_async_resume.cc)
+  target_link_libraries(dune_search_pi_async_resume_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_search_pi_async_resume_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_search_pi_async_resume_obj dune_search games open_spiel_core)
+
+  add_library(dune_offline_changed_state_obj OBJECT dune_offline_changed_state.cc)
+  target_link_libraries(dune_offline_changed_state_obj PUBLIC dune_search ${TORCH_LIBRARIES})
+  target_include_directories(dune_offline_changed_state_obj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_dependencies(dune_offline_changed_state_obj dune_search games open_spiel_core)
+
   # dune_search_pi_replay.cc joins this target for the rung-4 replay profile: the
   # trainer both WRITES a cohort shard after collection and READS a replay window
   # back in its train-only invocation, so the row codec has to live in the same
   # binary as the learner that consumes the rows.
-  add_executable(dune_ppo_train dune_ppo_train.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc dune_search_pi.cc dune_search_pi_concurrent.cc dune_search_pi_scratch.cc dune_search_pi_replay.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_train dune_ppo_train.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_train dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_luck_variance_audit
-    dune_luck_variance_audit.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    dune_luck_variance_audit.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_luck_variance_audit dune_search ${TORCH_LIBRARIES})
 
@@ -24,29 +77,25 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   add_executable(dune_evaluator_test dune_evaluator_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_evaluator_test ${TORCH_LIBRARIES})
 
-  add_library(dune_search STATIC dune_puct_is_mcts.cc dune_search_routing.cc dune_search_session.cc)
-  target_link_libraries(dune_search PRIVATE ${TORCH_LIBRARIES})
-  target_include_directories(dune_search PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-
   add_executable(dune_puct_is_mcts_test dune_puct_is_mcts_test.cc ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_puct_is_mcts_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_puct_is_mcts_test COMMAND dune_puct_is_mcts_test)
 
   # WO-1 Phase 4: teacher/collector acceptance parity on a shared fixture.
   add_executable(dune_acceptance_parity_test
-    dune_acceptance_parity_test.cc dune_online_search_collector.cc
+    dune_acceptance_parity_test.cc $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_acceptance_parity_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_acceptance_parity_test COMMAND dune_acceptance_parity_test)
 
   add_executable(dune_online_search_collector_test
-    dune_online_search_collector_test.cc dune_online_search_collector.cc
+    dune_online_search_collector_test.cc $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_online_search_collector_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_online_search_collector_test COMMAND dune_online_search_collector_test)
 
   add_executable(dune_collector_smoke
-    dune_collector_smoke.cc dune_online_search_collector.cc
+    dune_collector_smoke.cc $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_collector_smoke dune_search ${TORCH_LIBRARIES})
 
@@ -60,16 +109,21 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # which in turn needs dune_online_search_collector.cc for the flag definitions
   # it declares -- the same pairing every other training-utils consumer uses.
   add_executable(dune_search_pi_test
-    dune_search_pi_test.cc dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    dune_search_pi_test.cc
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_test COMMAND dune_search_pi_test)
 
   add_executable(dune_search_pi_concurrent_test
-    dune_search_pi_concurrent_test.cc dune_search_pi_concurrent.cc
-    dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc dune_search_pi_scratch.cc
+    dune_search_pi_concurrent_test.cc
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_concurrent_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_concurrent_test COMMAND dune_search_pi_concurrent_test)
@@ -95,25 +149,36 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # sampler. Same source pairing as dune_search_pi_test because SearchPiRow and
   # its enums are defined alongside the generator.
   add_executable(dune_search_pi_replay_test
-    dune_search_pi_replay_test.cc dune_search_pi_replay.cc
-    dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_search_pi_replay_test.cc
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_replay_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_search_pi_replay_test COMMAND dune_search_pi_replay_test)
 
   # Search-PI v2 reusable Q-target/weighted-learner lane. Historical v1 shard
   # and learner entry points remain separate and are linked unchanged above.
   add_executable(dune_search_pi_scratch
-    dune_search_pi_scratch_main.cc dune_search_pi_scratch.cc
-    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    dune_search_pi_scratch_main.cc
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_scratch dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_search_pi_scratch_test
-    dune_search_pi_scratch_test.cc dune_search_pi_scratch.cc
-    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    dune_search_pi_scratch_test.cc
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_scratch_test
     dune_search ${TORCH_LIBRARIES})
@@ -121,19 +186,26 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   # Bounded search-training transfer pilot runner from placement U200
   add_executable(dune_search_transfer_pilot
-    dune_search_transfer_pilot.cc dune_search_pi_scratch.cc
-    dune_search_pi_replay.cc dune_search_pi_concurrent.cc dune_search_pi.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    dune_search_transfer_pilot.cc
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_transfer_pilot dune_search ${TORCH_LIBRARIES})
 
   # Bounded persistent actor-learner smoke. This is an experimental target,
   # separate from the production generation-barrier trainer.
   add_executable(dune_search_pi_async_smoke
-    dune_search_pi_async_smoke_main.cc dune_search_pi_async_resume.cc
-    dune_search_pi_scratch.cc
-    dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    dune_search_pi_async_smoke_main.cc
+    $<TARGET_OBJECTS:dune_search_pi_async_resume_obj>
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_async_smoke
     dune_search ${TORCH_LIBRARIES})
@@ -143,16 +215,20 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # launcher invokes this distinct target with a production checkpoint
   # manifest and target generation.
   add_executable(dune_search_pi_async_train
-    dune_search_pi_async_smoke_main.cc dune_search_pi_async_resume.cc
-    dune_search_pi_scratch.cc
-    dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    dune_search_pi_async_smoke_main.cc
+    $<TARGET_OBJECTS:dune_search_pi_async_resume_obj>
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_async_train
     dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_search_pi_async_resume_test
-    dune_search_pi_async_resume_test.cc dune_search_pi_async_resume.cc
+    dune_search_pi_async_resume_test.cc
+    $<TARGET_OBJECTS:dune_search_pi_async_resume_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_async_resume_test
     dune_search ${TORCH_LIBRARIES})
@@ -164,9 +240,12 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # to a completed F/W update, then brackets that update with its archived
   # parent and child checkpoints. It is never linked into the frozen trainer.
   add_executable(dune_target_fit_forensic
-    dune_target_fit_forensic.cc dune_search_pi_replay.cc
-    dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_target_fit_forensic.cc
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_target_fit_forensic dune_search ${TORCH_LIBRARIES})
 
   # Frozen post-Rung-4N offline changed-state weighting experiment.  This is
@@ -175,16 +254,23 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # exact legal-centering transform.  Its own learner constructs fresh AdamW
   # state and changes only per-row CE weights between C and T.
   add_executable(dune_offline_changed_state
-    dune_offline_changed_state_main.cc dune_offline_changed_state.cc
-    dune_search_pi_replay.cc dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_offline_changed_state_main.cc
+    $<TARGET_OBJECTS:dune_offline_changed_state_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_changed_state
     dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_offline_changed_state_test
-    dune_offline_changed_state_test.cc dune_offline_changed_state.cc
-    dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    dune_offline_changed_state_test.cc
+    $<TARGET_OBJECTS:dune_offline_changed_state_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_changed_state_test
     dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_offline_changed_state_test
@@ -196,8 +282,13 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # smoke a proof about collection instead of about a copy of it. No add_test --
   # it loads a checkpoint and plays complete games, which is not a unit test.
   add_executable(dune_search_pi_audit
-    dune_search_pi_audit.cc dune_search_pi_concurrent.cc dune_search_pi.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc dune_search_pi_replay.cc dune_search_pi_scratch.cc
+    dune_search_pi_audit.cc
+    $<TARGET_OBJECTS:dune_search_pi_concurrent_obj>
+    $<TARGET_OBJECTS:dune_search_pi_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    $<TARGET_OBJECTS:dune_search_pi_replay_obj>
+    $<TARGET_OBJECTS:dune_search_pi_scratch_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_pi_audit dune_search ${TORCH_LIBRARIES})
 
@@ -217,8 +308,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_population_eval ${TORCH_LIBRARIES})
 
   add_executable(dune_distill
-    dune_distill.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    dune_distill.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_distill dune_search ${TORCH_LIBRARIES})
 
@@ -234,7 +326,10 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # dune_online_search_collector.cc carries the SHARED acceptance rule
   # (ComputeSearchAcceptance / SelectAcceptancePriors, WO-1 Phase 4) that the
   # offline teacher and the online collector both call.
-  add_executable(dune_search_teacher dune_search_teacher.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_search_teacher
+    dune_search_teacher.cc
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_search_teacher dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_sm_value_probe dune_sm_value_probe.cc ${OPEN_SPIEL_OBJECTS})
@@ -256,7 +351,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_create_corpus dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_actor_search_pilot
-    dune_actor_search_pilot.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc
+    dune_actor_search_pilot.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_actor_search_pilot dune_search ${TORCH_LIBRARIES})
 
@@ -289,15 +385,15 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_test_time_adaptation_runner
     dune_test_time_adaptation_runner.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_test_time_adaptation_runner dune_search ${TORCH_LIBRARIES})
 
   add_executable(dune_rollout_search_tournament
     dune_rollout_search_tournament.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_rollout_search_tournament dune_search ${TORCH_LIBRARIES})
 
@@ -341,8 +437,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   add_executable(dune_compound_search_benchmark
     dune_compound_search_benchmark.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc
-    dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_compound_search_benchmark dune_search ${TORCH_LIBRARIES})
 
@@ -419,7 +515,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # for the same reason it does in dune_ppo_training_utils_test: it satisfies
   # the flag definitions training utils declares.
   add_executable(dune_pf5_counterfactual_kl dune_pf5_counterfactual_kl.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pf5_counterfactual_kl dune_search ${TORCH_LIBRARIES})
 
@@ -433,7 +530,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # PWO-5 gate 3: the NUMERICS of the three auxiliary head losses, against the
   # shared pwo5loss:: definitions the trainer and the evaluator both call.
   add_executable(dune_pwo5_head_loss_test dune_pwo5_head_loss_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_head_loss_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo5_head_loss_test COMMAND dune_pwo5_head_loss_test)
@@ -441,7 +539,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # PWO-5 gate 3: the auxiliary-label loader's manifest FILE ROLES
   # (amendment 1 ruling 5) and the numeric head losses.
   add_executable(dune_pwo5_loader_roles_test dune_pwo5_loader_roles_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_loader_roles_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo5_loader_roles_test COMMAND dune_pwo5_loader_roles_test)
@@ -454,7 +553,8 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
 
   # PWO-5 gate 3: diagnostics schema v5 and the section 14.1c partition identity.
   add_executable(dune_pwo5_schema_test dune_pwo5_schema_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_pwo5_schema_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_pwo5_schema_test COMMAND dune_pwo5_schema_test)
@@ -496,7 +596,10 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_fidelity_seeds_test ${TORCH_LIBRARIES})
   add_test(NAME dune_fidelity_seeds_test COMMAND dune_fidelity_seeds_test)
 
-  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+  add_executable(dune_ppo_training_utils_test dune_ppo_training_utils_test.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_ppo_training_utils_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_ppo_training_utils_test COMMAND dune_ppo_training_utils_test)
   set_tests_properties(dune_ppo_training_utils_test PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/..")
@@ -509,8 +612,9 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   # dune_ppo_training_utils.cc so it exercises ApplySpecimenExchangeShaping --
   # the function dune_ppo_train's rollout loop actually calls, not a copy.
   add_executable(dune_shaping_sign_test dune_shaping_sign_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_shaping_sign_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_shaping_sign_test COMMAND dune_shaping_sign_test)
@@ -525,61 +629,68 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
            COMMAND dune_eval_action_selection_test)
 
   add_executable(dune_targeted_buy_test dune_targeted_buy_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_targeted_buy_test ${TORCH_LIBRARIES})
   add_test(NAME dune_targeted_buy_test COMMAND dune_targeted_buy_test)
 
 
   add_executable(dune_offline_utils_test dune_offline_utils_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_offline_utils_test ${TORCH_LIBRARIES})
   add_test(NAME dune_offline_utils_test COMMAND dune_offline_utils_test)
 
   add_executable(dune_opponent_pool_test dune_opponent_pool_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_opponent_pool_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_opponent_pool_test COMMAND dune_opponent_pool_test)
 
   add_executable(dune_semantic_verification_test dune_semantic_verification_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_semantic_verification_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_semantic_verification_test COMMAND dune_semantic_verification_test)
 
   add_executable(dune_f_verification dune_f_verification.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_f_verification dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_f_verification COMMAND dune_f_verification)
 
   add_executable(dune_purchase_identity_test
     ../games/dune_imperium/dune_purchase_identity_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_purchase_identity_test ${TORCH_LIBRARIES})
   add_test(NAME dune_purchase_identity_test COMMAND dune_purchase_identity_test)
 
   add_executable(dune_purchase_identity_network_test
     dune_purchase_identity_network_test.cc
-    dune_ppo_training_utils.cc dune_ppo_training_flags.cc dune_online_search_collector.cc
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
     ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_purchase_identity_network_test dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_purchase_identity_network_test COMMAND dune_purchase_identity_network_test)
 
   add_executable(dune_market_diagnostics_test
     dune_market_diagnostics_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_market_diagnostics_test ${TORCH_LIBRARIES})
   add_test(NAME dune_market_diagnostics_test COMMAND dune_market_diagnostics_test)
 
   add_executable(dune_frozen_policy_diagnostics_test
     dune_frozen_policy_diagnostics_test.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_frozen_policy_diagnostics_test ${TORCH_LIBRARIES})
   add_test(NAME dune_frozen_policy_diagnostics_test COMMAND dune_frozen_policy_diagnostics_test)
 
   add_executable(dune_frozen_policy_diagnostics
     dune_frozen_policy_diagnostics_main.cc
-    ../games/dune_imperium/dune_imperium_test_utils.cc ${OPEN_SPIEL_OBJECTS})
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})
   target_link_libraries(dune_frozen_policy_diagnostics ${TORCH_LIBRARIES})
 else()
   add_executable(dune_benchmark dune_benchmark.cc ${OPEN_SPIEL_OBJECTS})

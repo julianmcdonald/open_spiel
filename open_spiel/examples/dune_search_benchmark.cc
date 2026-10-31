@@ -2513,7 +2513,9 @@ int RunCorpusRootBenchmark(
         double r_val = absl::Uniform(step_rng, 0.0, 1.0);
         ControllerDecision decision =
             session.SelectControllerAction(*state, sr, r_val);
-        benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
+        if (sr.raw_policy.empty()) {
+          benchmark_raw_prior_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         DuneSearchResult committed = session.CommitAction(decision);
         oc.selected_action = committed.diagnostics.selected_action;
         oc.root_wall_ms = std::chrono::duration<double, std::milli>(

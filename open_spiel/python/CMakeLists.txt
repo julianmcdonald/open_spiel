@@ -136,6 +136,7 @@ endif()
 
 
 add_library(pyspiel MODULE ${PYTHON_BINDINGS} ${OPEN_SPIEL_OBJECTS})
+add_dependencies(pyspiel games open_spiel_core)
 target_link_directories(pyspiel PUBLIC ${Python3_LIBRARY_DIRS})
 target_compile_options(pyspiel PRIVATE -Wno-deprecated-declarations -Wno-attributes -fno-var-tracking-assignments)
 

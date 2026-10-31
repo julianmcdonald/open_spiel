@@ -151,7 +151,7 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (device_.is_cuda()) {
       options = options.pinned_memory(true);
     }
-    torch::Tensor input_tensor = torch::zeros({num_players, obs_size_}, options);
+    torch::Tensor input_tensor = torch::empty({num_players, obs_size_}, options);
 
     // Note: IS-MCTS normally handles chance states recursively without calling
     // Evaluate() on them. However, if defensively called on a chance node,
@@ -162,8 +162,12 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     for (int p = 0; p < num_players; ++p) {
       std::vector<float> obs = ModelObservation(state, p);
       CheckObsSize(obs.size());
-      
-      std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+      float* row_ptr = input_tensor.data_ptr<float>() + p * obs_size_;
+      size_t copy_bytes = std::min<size_t>(obs.size(), obs_size_) * sizeof(float);
+      std::memcpy(row_ptr, obs.data(), copy_bytes);
+      if (obs.size() < static_cast<size_t>(obs_size_)) {
+        std::memset(row_ptr + obs.size(), 0, (obs_size_ - obs.size()) * sizeof(float));
+      }
     }
     
     torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
@@ -199,9 +203,14 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (device_.is_cuda()) {
       options = options.pinned_memory(true);
     }
-    torch::Tensor input_tensor = torch::zeros({1, obs_size_}, options);
+    torch::Tensor input_tensor = torch::empty({1, obs_size_}, options);
 
-    std::memcpy(input_tensor.data_ptr<float>(), obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+    float* row_ptr = input_tensor.data_ptr<float>();
+    size_t copy_bytes = std::min<size_t>(obs.size(), obs_size_) * sizeof(float);
+    std::memcpy(row_ptr, obs.data(), copy_bytes);
+    if (obs.size() < static_cast<size_t>(obs_size_)) {
+      std::memset(row_ptr + obs.size(), 0, (obs_size_ - obs.size()) * sizeof(float));
+    }
     torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;
 
     auto outputs = model_->forward(device_tensor);
@@ -284,13 +293,18 @@ class DuneNNEvaluator : public algorithms::Evaluator {
     if (device_.is_cuda()) {
       options = options.pinned_memory(true);
     }
-    torch::Tensor input_tensor = torch::zeros({num_players, obs_size_}, options);
+    torch::Tensor input_tensor = torch::empty({num_players, obs_size_}, options);
 
     // Stack all players' observations
     for (int p = 0; p < num_players; ++p) {
       std::vector<float> obs = ModelObservation(state, p);
       CheckObsSize(obs.size());
-      std::memcpy(input_tensor.data_ptr<float>() + p * obs_size_, obs.data(), std::min<size_t>(obs.size(), obs_size_) * sizeof(float));
+      float* row_ptr = input_tensor.data_ptr<float>() + p * obs_size_;
+      size_t copy_bytes = std::min<size_t>(obs.size(), obs_size_) * sizeof(float);
+      std::memcpy(row_ptr, obs.data(), copy_bytes);
+      if (obs.size() < static_cast<size_t>(obs_size_)) {
+        std::memset(row_ptr + obs.size(), 0, (obs_size_ - obs.size()) * sizeof(float));
+      }
     }
 
     torch::Tensor device_tensor = device_.is_cuda() ? input_tensor.to(device_, /*non_blocking=*/true) : input_tensor;

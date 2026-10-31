@@ -303,6 +303,7 @@ DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_
     } else {
       res.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
     }
+    res.raw_policy = res.policy;
     res.simulations_completed = 0;
     res.elapsed_time_ms = 0.0;
     res.timeout_status = false;
@@ -858,9 +859,13 @@ ControllerDecision DuneSearchSession::SelectControllerAction(
   if (state.IsChanceNode()) {
     raw_prior = state.ChanceOutcomes();
   } else {
-    Player p = state.CurrentPlayer();
-    if (p >= 0 && p < evaluators_.size()) {
-      raw_prior = evaluators_[p]->Prior(state);
+    if (!search_result.raw_policy.empty()) {
+      raw_prior = search_result.raw_policy;
+    } else {
+      Player p = state.CurrentPlayer();
+      if (p >= 0 && p < evaluators_.size()) {
+        raw_prior = evaluators_[p]->Prior(state);
+      }
     }
     if (raw_prior.empty()) {
       std::vector<Action> legals = state.LegalActions();
@@ -1351,10 +1356,11 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
           state, p, impl_->evaluators, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
-          dune_imperium::SearchRolloutCrnMode::kSequential,
+          use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential,
           /*sample_opponent_leader_draft=*/false,
           /*max_time_ms=*/leader_deadline_ms,
-          leader_inflight);
+          leader_inflight,
+          /*precomputed_raw_prior=*/&raw_prior);
       result.diagnostics.selected_action = c_res.action;
       result.diagnostics.mcts_proposed_action = c_res.action;
       result.diagnostics.mcts_overrode_raw = c_res.overridden;
@@ -1595,13 +1601,17 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           const auto c_res = use_successive_halving_
               ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
                     state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kSequential, /*unbiased_stage2_gate=*/false,
+                    (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), /*unbiased_stage2_gate=*/false,
                     target_ms, effective_top_k, max_inflight_worlds_,
                     /*use_bounded_pool_when_unclocked=*/false,
-                    /*full_clock_stage2=*/full_search_)
+                    /*full_clock_stage2=*/full_search_,
+                    prior_log_ratio_weight_,
+                    stage1_high_conf_prior_skip_,
+                    /*precomputed_raw_prior=*/&raw_prior)
               : dune_imperium::AdaptiveRolloutSearchDecision(
                     state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
-                    dune_imperium::SearchRolloutCrnMode::kSequential, target_ms, max_inflight_worlds_);
+                    (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), target_ms, max_inflight_worlds_,
+                    /*precomputed_raw_prior=*/&raw_prior);
           result.diagnostics.selected_action = c_res.action;
           result.diagnostics.mcts_proposed_action = c_res.action;
           result.diagnostics.mcts_overrode_raw = c_res.overridden;

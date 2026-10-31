@@ -292,8 +292,8 @@ include_directories(..)
 add_subdirectory (algorithms)
 add_subdirectory (bots)
 add_subdirectory (evaluation)
-add_subdirectory (examples)
 add_subdirectory (games)
+add_subdirectory (examples)
 add_subdirectory (game_transforms)
 
 if (OPEN_SPIEL_BUILD_WITH_PYTHON)
@@ -304,6 +304,39 @@ add_subdirectory (utils)
 
 if (OPEN_SPIEL_BUILD_WITH_JULIA)
   add_subdirectory (julia)
+endif()
+
+add_custom_target(dune_core_tests
+  DEPENDS
+    dune_imperium_test
+    dune_imperium_board_spaces_test
+    dune_imperium_cards_test
+    dune_imperium_cards2_test
+    dune_imperium_intrigue_test
+    dune_imperium_leaders_test
+)
+
+if (OPEN_SPIEL_BUILD_WITH_LIBTORCH AND OPEN_SPIEL_BUILD_WITH_PYTHON)
+  add_custom_target(dune_engine
+    DEPENDS
+      games
+      dune_search
+      pyspiel
+      dune_core_tests
+  )
+elseif (OPEN_SPIEL_BUILD_WITH_PYTHON)
+  add_custom_target(dune_engine
+    DEPENDS
+      games
+      pyspiel
+      dune_core_tests
+  )
+else()
+  add_custom_target(dune_engine
+    DEPENDS
+      games
+      dune_core_tests
+  )
 endif()
 
 # Build a shared library, i.e. libopen_spiel.so. We generally only enable this

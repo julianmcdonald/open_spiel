@@ -539,6 +539,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                &DuneImperiumState::pending_armand_acquire))
       .def("pending_armand_acquire",
            &DuneImperiumState::GetPendingArmandAcquire, py::arg("player"))
+      .def("set_pending_armand_acquire",
+           &DuneImperiumState::SetPendingArmandAcquireForTesting,
+           py::arg("player"), py::arg("val"))
       .def("pending_helena_reserve",
            static_cast<std::vector<int> (DuneImperiumState::*)() const>(
                &DuneImperiumState::pending_helena_reserve))
@@ -1003,6 +1006,24 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                     &open_spiel::DuneAdaptiveRolloutSession::set_full_search)
       .def("set_full_search",
            &open_spiel::DuneAdaptiveRolloutSession::set_full_search,
+           py::arg("val"))
+      .def_property("prior_log_ratio_weight",
+                    &open_spiel::DuneAdaptiveRolloutSession::prior_log_ratio_weight,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_prior_log_ratio_weight)
+      .def("set_prior_log_ratio_weight",
+           &open_spiel::DuneAdaptiveRolloutSession::set_prior_log_ratio_weight,
+           py::arg("val"))
+      .def_property("stage1_high_conf_prior_skip",
+                    &open_spiel::DuneAdaptiveRolloutSession::stage1_high_conf_prior_skip,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_stage1_high_conf_prior_skip)
+      .def("set_stage1_high_conf_prior_skip",
+           &open_spiel::DuneAdaptiveRolloutSession::set_stage1_high_conf_prior_skip,
+           py::arg("val"))
+      .def_property("use_event_keyed_crn",
+                    &open_spiel::DuneAdaptiveRolloutSession::use_event_keyed_crn,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_use_event_keyed_crn)
+      .def("set_use_event_keyed_crn",
+           &open_spiel::DuneAdaptiveRolloutSession::set_use_event_keyed_crn,
            py::arg("val"))
       .def_property_readonly("ms_per_rollout_ema",
                              &open_spiel::DuneAdaptiveRolloutSession::ms_per_rollout_ema)

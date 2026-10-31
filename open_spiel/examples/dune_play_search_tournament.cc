@@ -55,7 +55,7 @@ ABSL_FLAG(bool, allow_tf32, false, "Allow TF32 for every candidate and opponent 
 ABSL_FLAG(std::string, roots_json, "", "Optional census_sampled_roots.json for serial root timing.");
 ABSL_FLAG(int, max_roots, 12, "Maximum balanced roots; -1 selects all.");
 ABSL_FLAG(std::string, crn_mode, "sequential",
-          "CRN mode: sequential or deck_order.");
+          "CRN mode: sequential, deck_order, or event_keyed.");
 ABSL_FLAG(bool, unbiased_stage2_gate, false,
           "Use unbiased Stage-2 Successive Halving gate.");
 ABSL_FLAG(bool, fixed_top5_candidates, false,
@@ -63,6 +63,10 @@ ABSL_FLAG(bool, fixed_top5_candidates, false,
 ABSL_FLAG(int, leader_rollouts, 32, "Leader pick rollout search rollouts.");
 ABSL_FLAG(bool, sample_opponent_leader_draft, false,
           "Sample opponent leader draft mixture in rollout search.");
+ABSL_FLAG(double, prior_log_ratio_weight, 0.02,
+          "Prior log-ratio weight for override margin adjustment.");
+ABSL_FLAG(double, stage1_high_conf_prior_skip, 0.95,
+          "Skip Stage 2 when raw prior >= threshold and raw leads Stage 1.");
 
 namespace {
 using namespace open_spiel;
@@ -112,12 +116,15 @@ struct Options {
   int leader_rollouts = 32;
   bool sample_opponent_leader_draft = false;
   bool leader_rollouts_explicit = false;
+  double prior_log_ratio_weight = 0.02;
+  double stage1_high_conf_prior_skip = 0.95;
 };
 
 inline std::string CrnModeName(SearchRolloutCrnMode mode) {
   switch (mode) {
     case SearchRolloutCrnMode::kSequential: return "sequential";
     case SearchRolloutCrnMode::kDeckOrderCrn: return "deck_order";
+    case SearchRolloutCrnMode::kEventKeyedCrn: return "event_keyed";
   }
   return "sequential";
 }
@@ -227,13 +234,17 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
     o.crn_mode = SearchRolloutCrnMode::kSequential;
   } else if (crn_mode_str == "deck_order") {
     o.crn_mode = SearchRolloutCrnMode::kDeckOrderCrn;
+  } else if (crn_mode_str == "event_keyed") {
+    o.crn_mode = SearchRolloutCrnMode::kEventKeyedCrn;
   } else {
-    throw std::runtime_error("--crn_mode must be sequential or deck_order");
+    throw std::runtime_error("--crn_mode must be sequential, deck_order, or event_keyed");
   }
   o.unbiased_stage2_gate = absl::GetFlag(FLAGS_unbiased_stage2_gate);
   o.fixed_top5_candidates = absl::GetFlag(FLAGS_fixed_top5_candidates);
   o.leader_rollouts = absl::GetFlag(FLAGS_leader_rollouts);
   o.sample_opponent_leader_draft = absl::GetFlag(FLAGS_sample_opponent_leader_draft);
+  o.prior_log_ratio_weight = absl::GetFlag(FLAGS_prior_log_ratio_weight);
+  o.stage1_high_conf_prior_skip = absl::GetFlag(FLAGS_stage1_high_conf_prior_skip);
   if (o.mode == Mode::kLeader && !o.leader_rollouts_explicit) {
     o.leader_rollouts = o.rollouts;
   }
@@ -357,7 +368,9 @@ CompoundSearchDecisionResult SearchDecision(
     return SuccessiveHalvingRolloutSearchDecision(
         state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
         o.crn_mode, o.unbiased_stage2_gate, /*max_time_ms=*/-1.0,
-        o.fixed_top5_candidates ? 5 : 0);
+        o.fixed_top5_candidates ? 5 : 0, /*max_inflight_worlds=*/96,
+        /*use_bounded_pool_when_unclocked=*/false, /*full_clock_stage2=*/false,
+        o.prior_log_ratio_weight, o.stage1_high_conf_prior_skip);
   }
   if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
     return AdaptiveRolloutSearchDecision(
@@ -584,7 +597,7 @@ json::Object BaseRecord(const Options& o, const std::string& kind) {
           {"margin", kOverrideMargin}, {"rollout_amp", o.rollout_amp},
           {"allow_tf32", o.allow_tf32}, {"device", o.device_name},
           {"threads", o.threads}, {"target_batch_size", o.batch_size},
-          {"crn_mode", o.crn_mode == SearchRolloutCrnMode::kDeckOrderCrn ? "deck_order" : "sequential"},
+          {"crn_mode", CrnModeName(o.crn_mode)},
           {"unbiased_stage2_gate", o.unbiased_stage2_gate},
           {"fixed_top5_candidates", o.fixed_top5_candidates},
           {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},

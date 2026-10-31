@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAGraph.h>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -454,6 +455,43 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 };
 TORCH_MODULE(SharedDunePolicyValueNet);
+
+inline void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> source,
+                             std::shared_ptr<SharedDunePolicyValueNetImpl> target) {
+  torch::NoGradGuard no_grad;
+  target->SetSemanticDescriptorSchema(source->semantic_descriptor_schema_);
+  if (source->enable_zone_encoder_ && !target->enable_zone_encoder_) {
+    target->EnableZoneEncoder();
+  }
+  if (!source->parameters().empty()) {
+    target->to(source->parameters().front().device());
+  }
+  auto source_params = source->named_parameters();
+  auto source_buffers = source->named_buffers();
+  for (auto& item : target->named_parameters()) {
+    auto* src = source_params.find(item.key());
+    if (src == nullptr) {
+      SpielFatalError(
+          "CopyModelWeights: target parameter '" + item.key() +
+          "' has no counterpart in the source model. The inference model may "
+          "be a SUBSET of the training model (PWO-5 auxiliary heads), never a "
+          "superset.");
+    }
+    item.value().copy_(src->to(item.value().device()));
+  }
+  for (auto& item : target->named_buffers()) {
+    auto* src = source_buffers.find(item.key());
+    if (src == nullptr) {
+      SpielFatalError("CopyModelWeights: target buffer '" + item.key() +
+                      "' has no counterpart in the source model.");
+    }
+    item.value().copy_(src->to(item.value().device()));
+  }
+  target->market_appendix_mode_ = source->market_appendix_mode_;
+  target->deck_pool_semantics_ = source->deck_pool_semantics_;
+  target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
+  target->enable_zone_encoder_ = source->enable_zone_encoder_;
+}
 
 inline void CopyInputToOrderedCardSlots(
     torch::Tensor target, const torch::Tensor& source,
@@ -1534,8 +1572,9 @@ struct AutocastGuard {
     c10::DeviceType device_type_;
     bool previous_state_;
     at::ScalarType previous_dtype_;
-    AutocastGuard(c10::DeviceType device_type, bool enabled)
-        : device_type_(device_type) {
+    bool clear_cache_on_exit_;
+    AutocastGuard(c10::DeviceType device_type, bool enabled, bool clear_cache_on_exit = true)
+        : device_type_(device_type), clear_cache_on_exit_(clear_cache_on_exit) {
         if (device_type_ == c10::DeviceType::CUDA) {
             previous_state_ = at::autocast::is_autocast_enabled(at::kCUDA);
             previous_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
@@ -1589,11 +1628,15 @@ struct AutocastGuard {
         if (device_type_ == c10::DeviceType::CUDA) {
             at::autocast::set_autocast_enabled(at::kCUDA, previous_state_);
             at::autocast::set_autocast_dtype(at::kCUDA, previous_dtype_);
-            at::autocast::clear_cache();
+            if (clear_cache_on_exit_) {
+                at::autocast::clear_cache();
+            }
         } else if (device_type_ == c10::DeviceType::CPU) {
             at::autocast::set_autocast_enabled(at::kCPU, previous_state_);
             at::autocast::set_autocast_dtype(at::kCPU, previous_dtype_);
-            at::autocast::clear_cache();
+            if (clear_cache_on_exit_) {
+                at::autocast::clear_cache();
+            }
         }
     }
 };
@@ -2112,13 +2155,15 @@ public:
                      bool emit_batch_membership = false,
                      bool rollout_amp = true,
                      bool allow_tf32 = true,
-                     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr)
+                     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model = nullptr,
+                     bool clear_autocast_cache_per_batch = true)
         : model_(model), critic_model_(critic_model), target_batch_size_(target_batch_size),
           timeout_ms_(timeout_ms), device_(device), sync_mutex_(sync_mutex),
           logit_cap_(logit_cap), device_synchronize_(device_synchronize),
           high_priority_stream_(high_priority_stream),
           emit_batch_membership_(emit_batch_membership),
           rollout_amp_(rollout_amp), allow_tf32_(allow_tf32),
+          clear_autocast_cache_per_batch_(clear_autocast_cache_per_batch),
         stop_(false) {
         if (model_) {
             deck_pool_semantics_ = model_->deck_pool_semantics_;
@@ -2717,6 +2762,7 @@ private:
     bool emit_batch_membership_;
     bool rollout_amp_;
     bool allow_tf32_;
+    bool clear_autocast_cache_per_batch_{true};
     int64_t model_input_dim_;
     int64_t model_action_dim_;
 
@@ -2831,6 +2877,12 @@ private:
         int64_t membership_batch_id = -1;
     };
 
+    struct CapturedForwardGraph {
+        std::unique_ptr<at::cuda::CUDAGraph> graph;
+        SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+        SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+    };
+
     void RunnerAsync() {
         torch::InferenceMode inference_guard;
         const c10::DeviceIndex device_index =
@@ -2858,6 +2910,13 @@ private:
         }
         int pending_slot = -1;
         int next_slot = 0;
+
+        auto device_options = torch::TensorOptions()
+            .dtype(torch::kFloat32).device(device_);
+        torch::Tensor graph_device_obs = torch::empty(
+            {target_batch_size_, model_input_dim_}, device_options);
+        at::cuda::MempoolId_t graph_pool = at::cuda::graph_pool_handle();
+        std::vector<CapturedForwardGraph> captured_graphs(target_batch_size_ + 1);
 
         auto take_batch = [&](bool* timeout_flush) {
             std::vector<Request> batch;
@@ -3101,19 +3160,51 @@ private:
                 slot.host_logits = torch::empty(
                     {target_batch_size_, model_action_dim_}, host_options);
             }
+            if (batch_size >= captured_graphs.size()) {
+                captured_graphs.resize(batch_size + 1);
+            }
+            if (batch_size > static_cast<size_t>(graph_device_obs.size(0))) {
+                graph_device_obs = torch::empty(
+                    {static_cast<int64_t>(batch_size), model_input_dim_}, device_options);
+            }
             {
                 c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
                 auto host_obs = slot.host_obs.narrow(0, 0, batch_size);
-                auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
+                auto device_obs = graph_device_obs.narrow(0, 0, batch_size);
                 device_obs.copy_(host_obs, /*non_blocking=*/true);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
                 {
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
-                    AutocastGuard autocast_guard(c10::DeviceType::CUDA,
-                                                 rollout_amp_);
-                    outputs = model_->forward(device_obs);
-                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
+                    auto& cg = captured_graphs[batch_size];
+                    if (!cg.graph) {
+                        {
+                            AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                         rollout_amp_,
+                                                         /*clear_cache_on_exit=*/true);
+                            outputs = model_->forward(device_obs);
+                            critic_outputs = (critic_model_ != nullptr)
+                                ? critic_model_->forward(device_obs)
+                                : outputs;
+                        }
+                        at::autocast::clear_cache();
+                        {
+                            AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                         rollout_amp_,
+                                                         /*clear_cache_on_exit=*/true);
+                            cg.graph = std::make_unique<at::cuda::CUDAGraph>();
+                            cg.graph->capture_begin(graph_pool, cudaStreamCaptureModeThreadLocal);
+                            cg.outputs = model_->forward(device_obs);
+                            cg.critic_outputs = (critic_model_ != nullptr)
+                                ? critic_model_->forward(device_obs)
+                                : cg.outputs;
+                            cg.graph->capture_end();
+                        }
+                    }
+                    cg.graph->replay();
+                    outputs = cg.outputs;
+                    critic_outputs = cg.critic_outputs;
+
                     if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
                         std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
                         bool has_any_actions = false;
@@ -3124,6 +3215,9 @@ private:
                             }
                         }
                         if (has_any_actions) {
+                            AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                         rollout_amp_,
+                                                         clear_autocast_cache_per_batch_);
                             dune_semantic::ApplySemanticScorerBatch(
                                 model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
                         }
@@ -3316,6 +3410,9 @@ private:
             next_slot = 1 - next_slot;
         }
         if (pending_slot >= 0) finish_slot(slots[pending_slot]);
+        if (!clear_autocast_cache_per_batch_) {
+            at::autocast::clear_cache();
+        }
     }
 
     void Runner() {
@@ -3325,7 +3422,20 @@ private:
         }
         torch::InferenceMode inference_guard;
         torch::Tensor pinned_stacked_obs;
+        torch::Tensor pinned_logits_out;
+        torch::Tensor pinned_values_out;
         bool pinned_allocated = false;
+
+        torch::Tensor graph_device_obs;
+        at::cuda::MempoolId_t graph_pool;
+        std::vector<CapturedForwardGraph> captured_graphs;
+        if (device_.is_cuda()) {
+            graph_device_obs = torch::empty(
+                {target_batch_size_, model_input_dim_},
+                torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+            graph_pool = at::cuda::graph_pool_handle();
+            captured_graphs.resize(target_batch_size_ + 1);
+        }
 
         while (true) {
             std::vector<Request> batch;
@@ -3511,6 +3621,8 @@ private:
                 if (device_.is_cuda()) {
                     auto options = torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
                     pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)model_input_dim_}, options);
+                    pinned_logits_out = torch::empty({(long)target_batch_size_, (long)model_action_dim_}, options);
+                    pinned_values_out = torch::empty({(long)target_batch_size_}, options);
                 } else {
                     pinned_stacked_obs = torch::empty({(long)target_batch_size_, (long)model_input_dim_}, torch::kFloat32);
                 }
@@ -3557,10 +3669,26 @@ private:
                 dev_ev[0].record(dev_impl->getStream(device_));
             }
 
+            if (device_.is_cuda()) {
+                if (batch_size >= captured_graphs.size()) {
+                    captured_graphs.resize(batch_size + 1);
+                }
+                if (batch_size > static_cast<size_t>(graph_device_obs.size(0))) {
+                    graph_device_obs = torch::empty(
+                        {static_cast<int64_t>(batch_size), model_input_dim_},
+                        torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+                }
+            }
+
             // Non-blocking H2D transfer using .slice() for partial batches
-            torch::Tensor device_obs = device_.is_cuda()
-                ? pinned_stacked_obs.slice(0, 0, batch_size).to(device_, /*non_blocking=*/true)
-                : pinned_stacked_obs.slice(0, 0, batch_size);
+            torch::Tensor device_obs;
+            if (device_.is_cuda()) {
+                auto host_slice = pinned_stacked_obs.slice(0, 0, batch_size);
+                device_obs = graph_device_obs.narrow(0, 0, batch_size);
+                device_obs.copy_(host_slice, /*non_blocking=*/true);
+            } else {
+                device_obs = pinned_stacked_obs.slice(0, 0, batch_size);
+            }
 
             if (time_device_) dev_ev[1].record(dev_impl->getStream(device_));
 
@@ -3570,10 +3698,42 @@ private:
                 std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
-                AutocastGuard autocast_guard(c10::DeviceType::CUDA,
-                                             device_.is_cuda() && rollout_amp_);
-                outputs = model_->forward(device_obs);
-                critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
+                if (device_.is_cuda()) {
+                    auto& cg = captured_graphs[batch_size];
+                    if (!cg.graph) {
+                        {
+                            AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                         rollout_amp_,
+                                                         /*clear_cache_on_exit=*/true);
+                            outputs = model_->forward(device_obs);
+                            critic_outputs = (critic_model_ != nullptr)
+                                ? critic_model_->forward(device_obs)
+                                : outputs;
+                        }
+                        at::autocast::clear_cache();
+                        {
+                            AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                         rollout_amp_,
+                                                         /*clear_cache_on_exit=*/true);
+                            cg.graph = std::make_unique<at::cuda::CUDAGraph>();
+                            cg.graph->capture_begin(graph_pool, cudaStreamCaptureModeThreadLocal);
+                            cg.outputs = model_->forward(device_obs);
+                            cg.critic_outputs = (critic_model_ != nullptr)
+                                ? critic_model_->forward(device_obs)
+                                : cg.outputs;
+                            cg.graph->capture_end();
+                        }
+                    }
+                    cg.graph->replay();
+                    outputs = cg.outputs;
+                    critic_outputs = cg.critic_outputs;
+                } else {
+                    AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                 false,
+                                                 clear_autocast_cache_per_batch_);
+                    outputs = model_->forward(device_obs);
+                    critic_outputs = (critic_model_ != nullptr) ? critic_model_->forward(device_obs) : outputs;
+                }
                 if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
                     std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
                     bool has_any_actions = false;
@@ -3584,6 +3744,9 @@ private:
                         }
                     }
                     if (has_any_actions) {
+                        AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                     device_.is_cuda() && rollout_amp_,
+                                                     clear_autocast_cache_per_batch_);
                         dune_semantic::ApplySemanticScorerBatch(
                             model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
                     }
@@ -3599,27 +3762,27 @@ private:
             // C. NON-BLOCKING D2H TRANSFER (cast AMP FP16 outputs back to Float32)
             if (device_.is_cuda()) {
                 pred_logits = pred_logits.to(torch::kFloat32);
-                pred_values = pred_values.to(torch::kFloat32);
+                pred_values = pred_values.to(torch::kFloat32).reshape({static_cast<int64_t>(batch_size)});
                 // Boundary AFTER the cast: without it, "d2h" silently included
                 // the AMP->FP32 conversion, which is device compute, not a
                 // transfer.
                 if (time_device_) dev_ev[3].record(dev_impl->getStream(device_));
                 std::chrono::steady_clock::time_point sync_t0, sync_t1;
+                auto host_logits_slice = pinned_logits_out.slice(0, 0, batch_size);
+                auto host_values_slice = pinned_values_out.slice(0, 0, batch_size);
+                host_logits_slice.copy_(pred_logits, /*non_blocking=*/device_synchronize_);
+                host_values_slice.copy_(pred_values, /*non_blocking=*/device_synchronize_);
+                if (time_device_) dev_ev[4].record(dev_impl->getStream(device_));
                 if (device_synchronize_) {
-                    pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                    pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/true).contiguous();
-                    if (time_device_) dev_ev[4].record(dev_impl->getStream(device_));
-
                     // Wait for asynchronous transfers to complete before reading.
                     sync_t0 = std::chrono::steady_clock::now();
                     torch::cuda::synchronize();
                     sync_t1 = std::chrono::steady_clock::now();
                 } else {
-                    pred_logits = pred_logits.to(torch::kCPU, /*non_blocking=*/false).contiguous();
-                    pred_values = pred_values.to(torch::kCPU, /*non_blocking=*/false).contiguous();
-                    if (time_device_) dev_ev[4].record(dev_impl->getStream(device_));
                     sync_t0 = sync_t1 = std::chrono::steady_clock::now();
                 }
+                pred_logits = host_logits_slice;
+                pred_values = host_values_slice;
                 if (time_device_) {
                     // Every event above is complete by here: either
                     // torch::cuda::synchronize() drained the stream, or the D2H
@@ -3714,6 +3877,9 @@ private:
             // followed by a SINGLE broadcast syscall (instead of 64 individual futex wakes)
             { std::lock_guard<std::mutex> park_lock(park_mutex_); }
             park_cv_.notify_all();
+        }
+        if (device_.is_cuda() && !clear_autocast_cache_per_batch_) {
+            at::autocast::clear_cache();
         }
     }
 };

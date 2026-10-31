@@ -311,8 +311,7 @@ std::unique_ptr<State> DunePUCTISMCTSBot::ResampleFromInfostate(const State& sta
                                      [&resample_rng]() { return absl::Uniform(resample_rng, 0.0, 1.0); });
 }
 
-DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
-  auto key = GetStateKey(state);
+DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNodeWithKey(const std::pair<Player, std::string>& key) {
   node_pool_.push_back(std::make_unique<DuneISMCTSNode>());
   DuneISMCTSNode* node = node_pool_.back().get();
   node->key_hash = DeriveNodeKeyHash(key.first, key.second);
@@ -320,32 +319,32 @@ DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
   return node;
 }
 
-DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
+DuneISMCTSNode* DunePUCTISMCTSBot::CreateNewNode(const State& state) {
+  return CreateNewNodeWithKey(GetStateKey(state));
+}
+
+DuneISMCTSNode* DunePUCTISMCTSBot::LookupNodeByKey(const std::pair<Player, std::string>& key) {
   total_lookups_++;
-  auto key = GetStateKey(state);
   auto iter = nodes_.find(key);
   if (iter == nodes_.end()) {
     return nullptr;
   }
-  DuneISMCTSNode* node = iter->second;
-  if (node->priors_initialized) {
-    std::vector<Action> state_actions = state.LegalActions();
-    for (Action a : state_actions) {
-      SPIEL_CHECK_TRUE(node->child_info.count(a) > 0);
-    }
-    SPIEL_CHECK_EQ(node->child_info.size(), state_actions.size());
-  }
   reused_lookups_++;
-  return node;
+  return iter->second;
+}
+
+DuneISMCTSNode* DunePUCTISMCTSBot::LookupNode(const State& state) {
+  return LookupNodeByKey(GetStateKey(state));
 }
 
 DuneISMCTSNode* DunePUCTISMCTSBot::LookupOrCreateNode(const State& state) {
-  visited_nodes_this_search_.insert(GetStateKey(state));
-  DuneISMCTSNode* node = LookupNode(state);
+  auto key = GetStateKey(state);
+  visited_nodes_this_search_.insert(key);
+  DuneISMCTSNode* node = LookupNodeByKey(key);
   if (node != nullptr) {
     return node;
   }
-  return CreateNewNode(state);
+  return CreateNewNodeWithKey(key);
 }
 
 void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const State& state) {
@@ -372,6 +371,7 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
   }
 
   const ActionsAndProbs& priors = eval_res.first;
+  node->raw_policy = eval_res.first;
   // Root-prior temperature reshapes the prior the TREE searches with. The
   // untransformed network prior is kept alongside it in `raw_prior` for every
   // node, because that — not the reshaped tree prior — is what starvation
@@ -449,9 +449,9 @@ void DunePUCTISMCTSBot::InitializePriorsAndValue(DuneISMCTSNode* node, const Sta
 void DunePUCTISMCTSBot::RecordSampledLeaf(const State& state) {
   current_search_leaf_histories_.push_back(state.History());
   ++diagnostic_leaf_states_seen_;
-  auto leaf_clone = std::shared_ptr<State>(state.Clone().release());
   if (current_search_sampled_leaf_states_.size() < 16) {
-    current_search_sampled_leaf_states_.push_back(std::move(leaf_clone));
+    current_search_sampled_leaf_states_.push_back(
+        std::shared_ptr<State>(state.Clone().release()));
   } else {
     // Deterministic reservoir sampling keeps representative leaves without
     // perturbing the search RNG or retaining up to 100,000 cloned states.
@@ -460,7 +460,8 @@ void DunePUCTISMCTSBot::RecordSampledLeaf(const State& state) {
         diagnostic_leaf_states_seen_ + 0x4c454146ULL);
     size_t slot = sample_seed % diagnostic_leaf_states_seen_;
     if (slot < current_search_sampled_leaf_states_.size()) {
-      current_search_sampled_leaf_states_[slot] = std::move(leaf_clone);
+      current_search_sampled_leaf_states_[slot] =
+          std::shared_ptr<State>(state.Clone().release());
     }
   }
 }
@@ -927,6 +928,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   std::vector<Action> legal_actions = state.LegalActions();
   if (legal_actions.size() == 1) {
     result.policy = {{legal_actions[0], 1.0}};
+    result.raw_policy = result.policy;
     result.simulations_completed = 0;
     result.elapsed_time_ms = 0.0;
     result.inference_count = inference_count_this_search_;
@@ -947,6 +949,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
   if (config_.check_strategic_state && !IsStrategicState(state, state.CurrentPlayer())) {
     auto t_inf_start = std::chrono::steady_clock::now();
     result.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    result.raw_policy = result.policy;
     auto t_inf_end = std::chrono::steady_clock::now();
     accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
     inference_count_this_search_++;
@@ -988,6 +991,7 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
     // fallback) and set used_fallback so callers can see the search never ran.
     auto t_inf_start = std::chrono::steady_clock::now();
     result.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    result.raw_policy = result.policy;
     auto t_inf_end = std::chrono::steady_clock::now();
     accumulated_inference_time_ms_ += std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
     inference_count_this_search_++;
@@ -1246,6 +1250,10 @@ DuneSearchResult DunePUCTISMCTSBot::RunSearch(const State& state, int max_sims, 
         result.fallback_reason = "zero_visits";
       }
     }
+  }
+
+  if (root_node_ != nullptr) {
+    result.raw_policy = root_node_->raw_policy;
   }
 
   Action final_proposed_action = GetRootArgmaxAction(root_node_, legal_actions);

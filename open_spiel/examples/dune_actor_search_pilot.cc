@@ -107,6 +107,9 @@ ABSL_FLAG(std::string, distill_pres_bin, "", "Path to preservation_pool.bin.");
 ABSL_FLAG(int, early_stop_patience, 5, "Epochs without val CE improvement before early stopping.");
 ABSL_FLAG(double, warmup_fraction, 0.10, "Fraction of total training steps for linear LR warmup.");
 ABSL_FLAG(double, lr_scale, 1.0, "Multiplier on base group LRs (5e-6, 5e-6, 5e-5).");
+ABSL_FLAG(bool, distill_head_only, false, "REFIT (arXiv:2609.33127v1): freeze input_layer and all residual blocks during SH distillation, updating only policy_head and semantic_scorer_ to prevent representation churn.");
+ABSL_FLAG(double, distill_kl_coef, 0.1, "Preservation KL regularization weight in SH distillation (default 0.1; set to 1.0 or higher for head-only AOPD).");
+ABSL_FLAG(double, distill_aopd_override_boost, 0.0, "AOPD (arXiv:2610.31563v1): when > 0.0, weight each root's cross-entropy loss in the batch by (dr.overridden ? (1.0 + boost * dr.w) : 1.0) so high-advantage search overrides drive the update.");
 
 
 // Link-only flag definitions required by dune_ppo_training_utils.cc
@@ -1347,20 +1350,21 @@ int RunShDistillLearner() {
     p.set_requires_grad(false);
   }
 
-  // Parameter groups: exclude value_head completely from AdamW param groups!
-  const int cutoff = std::max(0, num_blocks - 4);
-  std::vector<torch::Tensor> grp0_params = student_model->policy_head->parameters();
-  std::vector<torch::Tensor> grp1_params;
-  for (auto& p : student_model->input_layer->parameters()) grp1_params.push_back(p);
-  for (int b = 0; b < cutoff && b < static_cast<int>(student_model->res_blocks.size()); ++b) {
-    for (auto& p : student_model->res_blocks[b]->parameters()) grp1_params.push_back(p);
-  }
-  if (student_model->semantic_scorer_) {
-    for (auto& p : student_model->semantic_scorer_->parameters()) grp1_params.push_back(p);
-  }
-  std::vector<torch::Tensor> grp2_params;
-  for (size_t b = cutoff; b < student_model->res_blocks.size(); ++b) {
-    for (auto& p : student_model->res_blocks[b]->parameters()) grp2_params.push_back(p);
+  const bool distill_head_only = absl::GetFlag(FLAGS_distill_head_only);
+  const double distill_kl_coef = absl::GetFlag(FLAGS_distill_kl_coef);
+  const double distill_aopd_boost = absl::GetFlag(FLAGS_distill_aopd_override_boost);
+
+  if (distill_head_only) {
+    for (auto& p : student_model->input_layer->parameters()) {
+      p.set_requires_grad(false);
+    }
+    for (auto& block : student_model->res_blocks) {
+      for (auto& p : block->parameters()) {
+        p.set_requires_grad(false);
+      }
+    }
+    std::cout << "[DISTILL] distill_head_only=true: frozen input_layer and "
+              << student_model->res_blocks.size() << " residual blocks.\n";
   }
 
   const double lr_scale = absl::GetFlag(FLAGS_lr_scale);
@@ -1368,11 +1372,48 @@ int RunShDistillLearner() {
   const double base_lr1 = 5e-6 * lr_scale;
   const double base_lr2 = 5e-5 * lr_scale;
 
-  std::vector<torch::optim::OptimizerParamGroup> param_groups = {
-      torch::optim::OptimizerParamGroup(grp0_params, std::make_unique<torch::optim::AdamWOptions>(base_lr0)),
-      torch::optim::OptimizerParamGroup(grp1_params, std::make_unique<torch::optim::AdamWOptions>(base_lr1)),
-      torch::optim::OptimizerParamGroup(grp2_params, std::make_unique<torch::optim::AdamWOptions>(base_lr2)),
-  };
+  std::vector<torch::Tensor> grp0_params;
+  std::vector<torch::Tensor> grp1_params;
+  std::vector<torch::Tensor> grp2_params;
+
+  if (distill_head_only) {
+    grp0_params = student_model->policy_head->parameters();
+    if (student_model->semantic_scorer_) {
+      for (auto& p : student_model->semantic_scorer_->parameters()) grp1_params.push_back(p);
+    }
+  } else {
+    // Parameter groups: exclude value_head completely from AdamW param groups!
+    const int cutoff = std::max(0, num_blocks - 4);
+    grp0_params = student_model->policy_head->parameters();
+    for (auto& p : student_model->input_layer->parameters()) grp1_params.push_back(p);
+    for (int b = 0; b < cutoff && b < static_cast<int>(student_model->res_blocks.size()); ++b) {
+      for (auto& p : student_model->res_blocks[b]->parameters()) grp1_params.push_back(p);
+    }
+    if (student_model->semantic_scorer_) {
+      for (auto& p : student_model->semantic_scorer_->parameters()) grp1_params.push_back(p);
+    }
+    for (size_t b = cutoff; b < student_model->res_blocks.size(); ++b) {
+      for (auto& p : student_model->res_blocks[b]->parameters()) grp2_params.push_back(p);
+    }
+  }
+
+  std::vector<torch::optim::OptimizerParamGroup> param_groups;
+  std::vector<double> group_base_lrs;
+  if (!grp0_params.empty()) {
+    param_groups.push_back(
+        torch::optim::OptimizerParamGroup(grp0_params, std::make_unique<torch::optim::AdamWOptions>(base_lr0)));
+    group_base_lrs.push_back(base_lr0);
+  }
+  if (!grp1_params.empty()) {
+    param_groups.push_back(
+        torch::optim::OptimizerParamGroup(grp1_params, std::make_unique<torch::optim::AdamWOptions>(base_lr1)));
+    group_base_lrs.push_back(base_lr1);
+  }
+  if (!grp2_params.empty()) {
+    param_groups.push_back(
+        torch::optim::OptimizerParamGroup(grp2_params, std::make_unique<torch::optim::AdamWOptions>(base_lr2)));
+    group_base_lrs.push_back(base_lr2);
+  }
 
   auto optimizer = std::make_shared<torch::optim::AdamW>(
       param_groups, torch::optim::AdamWOptions(base_lr0).weight_decay(1e-4).eps(1e-8));
@@ -1702,8 +1743,8 @@ int RunShDistillLearner() {
       double mult = (current_step <= warmup_steps)
           ? (static_cast<double>(current_step) / static_cast<double>(warmup_steps))
           : 1.0;
-      for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
-        double base_lr = (g == 2) ? base_lr2 : base_lr0;
+      for (size_t g = 0; g < optimizer->param_groups().size() && g < group_base_lrs.size(); ++g) {
+        double base_lr = group_base_lrs[g];
         static_cast<torch::optim::AdamWOptions&>(optimizer->param_groups()[g].options()).lr(base_lr * mult);
       }
 
@@ -1715,6 +1756,10 @@ int RunShDistillLearner() {
       torch::Tensor s_q = torch::zeros({static_cast<int64_t>(cur_s_bs), 2391},
                                         torch::TensorOptions().dtype(torch::kFloat32).device(device));
       std::vector<const open_spiel::dune_semantic::CandidateActionData*> s_cands(cur_s_bs);
+      std::vector<float> s_weights_vec;
+      if (distill_aopd_boost > 0.0) {
+        s_weights_vec.resize(cur_s_bs, 1.0f);
+      }
 
       for (size_t b = 0; b < cur_s_bs; ++b) {
         const auto& dr = all_roots[train_root_indices[start + b]];
@@ -1725,6 +1770,10 @@ int RunShDistillLearner() {
         }
         s_cands[b] = (dr.obs_row >= 0 && static_cast<size_t>(dr.obs_row) < cand_datas.size())
             ? &cand_datas[dr.obs_row] : &dummy_cand;
+
+        if (distill_aopd_boost > 0.0) {
+          s_weights_vec[b] = dr.overridden ? static_cast<float>(1.0 + distill_aopd_boost * dr.w) : 1.0f;
+        }
 
         double w = dr.w;
         for (size_t i = 0; i < dr.legal_actions.size(); ++i) {
@@ -1747,7 +1796,14 @@ int RunShDistillLearner() {
       torch::Tensor s_capped = open_spiel::CenterAndCapLogitsTensor(s_outputs.logits, s_mask, 10.0f);
       torch::Tensor s_masked = torch::where(s_mask, s_capped, torch::full_like(s_capped, -1e9f));
       torch::Tensor s_log_p = torch::log_softmax(s_masked, -1);
-      torch::Tensor ce_loss = -torch::sum(s_q * s_log_p, -1).mean();
+      torch::Tensor ce_loss;
+      if (distill_aopd_boost > 0.0) {
+        torch::Tensor s_weights = torch::from_blob(
+            s_weights_vec.data(), {static_cast<int64_t>(cur_s_bs)}, torch::kFloat32).clone().to(device);
+        ce_loss = ((-torch::sum(s_q * s_log_p, -1)) * s_weights).sum() / s_weights.sum();
+      } else {
+        ce_loss = -torch::sum(s_q * s_log_p, -1).mean();
+      }
 
       // 2. Materialize Batched Preservation Tensors
       torch::Tensor kl_loss = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
@@ -1804,7 +1860,7 @@ int RunShDistillLearner() {
         kl_loss = torch::sum(torch::where(p_mask, p_ref * (p_log_ref - p_log_p), torch::zeros_like(p_ref)), -1).mean();
       }
 
-      torch::Tensor total_loss = ce_loss + 0.1 * kl_loss;
+      torch::Tensor total_loss = ce_loss + static_cast<float>(distill_kl_coef) * kl_loss;
 
       optimizer->zero_grad();
       total_loss.backward();
@@ -1863,6 +1919,29 @@ int RunShDistillLearner() {
   if (max_diff > 0.0) {
     open_spiel::SpielFatalError(absl::StrFormat(
         "Fatal: student value_head diverged from parent! max_diff = %e", max_diff));
+  }
+
+  if (distill_head_only) {
+    double trunk_max_diff = 0.0;
+    auto s_in_params = student_model->input_layer->parameters();
+    auto p_in_params = parent_model->input_layer->parameters();
+    for (size_t i = 0; i < s_in_params.size(); ++i) {
+      double diff = (s_in_params[i].cpu() - p_in_params[i].cpu()).abs().max().item<double>();
+      if (diff > trunk_max_diff) trunk_max_diff = diff;
+    }
+    for (size_t b = 0; b < student_model->res_blocks.size(); ++b) {
+      auto s_b_params = student_model->res_blocks[b]->parameters();
+      auto p_b_params = parent_model->res_blocks[b]->parameters();
+      for (size_t i = 0; i < s_b_params.size(); ++i) {
+        double diff = (s_b_params[i].cpu() - p_b_params[i].cpu()).abs().max().item<double>();
+        if (diff > trunk_max_diff) trunk_max_diff = diff;
+      }
+    }
+    std::cout << absl::StrFormat("[VERIFY] Head-only trunk parity check vs parent: max_diff = %e\n", trunk_max_diff);
+    if (trunk_max_diff > 0.0) {
+      open_spiel::SpielFatalError(absl::StrFormat(
+          "Fatal: student input_layer or res_blocks diverged from parent in head-only mode! max_diff = %e", trunk_max_diff));
+    }
   }
 
   // -------------------------------------------------------------------------

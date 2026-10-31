@@ -410,6 +410,7 @@ struct SearchDiagnostics {
 
 struct DuneSearchResult {
   ActionsAndProbs policy;
+  ActionsAndProbs raw_policy;
   SearchDiagnostics diagnostics;
   int simulations_completed = 0;
   double elapsed_time_ms = 0.0;
@@ -485,6 +486,7 @@ struct DuneChildInfo {
 
 struct DuneISMCTSNode {
   absl::flat_hash_map<Action, DuneChildInfo> child_info;
+  ActionsAndProbs raw_policy;
   int total_visits = -1;
   bool priors_initialized = false;
   double cached_value = 0.0;  // Neural V(s) for this node's current player
@@ -568,7 +570,9 @@ class DunePUCTISMCTSBot : public Bot {
   std::unique_ptr<State> ResampleFromInfostate(const State& state, int sim_index);
   DuneISMCTSNode* LookupOrCreateNode(const State& state);
   DuneISMCTSNode* CreateNewNode(const State& state);
+  DuneISMCTSNode* CreateNewNodeWithKey(const std::pair<Player, std::string>& key);
   DuneISMCTSNode* LookupNode(const State& state);
+  DuneISMCTSNode* LookupNodeByKey(const std::pair<Player, std::string>& key);
 
   // Core search procedures
   std::vector<double> RunSimulation(State* state, int depth,
