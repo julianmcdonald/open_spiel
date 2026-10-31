@@ -23,6 +23,8 @@ ABSL_DECLARE_FLAG(bool, allow_market_appendix_transition);
 ABSL_DECLARE_FLAG(std::string, market_appendix_transition_source_mode);
 ABSL_DECLARE_FLAG(std::string, market_appendix_transition_source_fingerprint);
 ABSL_DECLARE_FLAG(bool, allow_tf32);
+ABSL_DECLARE_FLAG(bool, allow_tf32_transition);
+ABSL_DECLARE_FLAG(std::string, tf32_transition_source_fingerprint);
 ABSL_DECLARE_FLAG(bool, enable_semantic_scorer);
 ABSL_DECLARE_FLAG(bool, enable_zone_encoder);
 ABSL_DECLARE_FLAG(std::string, semantic_descriptor_schema);

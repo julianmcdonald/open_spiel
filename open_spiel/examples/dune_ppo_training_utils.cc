@@ -51,6 +51,8 @@ std::string g_market_appendix_transition_source_fingerprint = "";
 int64_t g_market_appendix_transition_source_update = -1;
 std::string g_deck_pool_semantics_transition_source_fingerprint = "";
 int64_t g_deck_pool_semantics_transition_source_update = -1;
+std::string g_tf32_transition_source_fingerprint = "";
+int64_t g_tf32_transition_source_update = -1;
 
 ABSL_FLAG(bool, train_value_only, false, "Train only the value head parameters.");
 ABSL_FLAG(bool, rollout_amp, true, "Use CUDA BF16 autocast during rollout generation.");
@@ -560,10 +562,13 @@ bool ValidatePpoPrecisionManifestCompatibility(
           out->rollout_amp ? "true" : "false"));
     }
     if (out->allow_tf32 != current_allow_tf32) {
-      return fail(absl::StrFormat(
-          "allow_tf32 mismatch. Current: %s, Manifest: %s",
-          current_allow_tf32 ? "true" : "false",
-          out->allow_tf32 ? "true" : "false"));
+      if (permitted_transition_source_fingerprint.empty() ||
+          stored_config_fingerprint != permitted_transition_source_fingerprint) {
+        return fail(absl::StrFormat(
+            "allow_tf32 mismatch. Current: %s, Manifest: %s",
+            current_allow_tf32 ? "true" : "false",
+            out->allow_tf32 ? "true" : "false"));
+      }
     }
     if (stored_config_fingerprint != current_config_fingerprint) {
       if (!permitted_transition_source_fingerprint.empty() &&
@@ -1515,6 +1520,12 @@ void SaveDualCheckpoint(
       manifest_obj["deck_pool_semantics_transition_source_fingerprint"] = g_deck_pool_semantics_transition_source_fingerprint;
       if (g_deck_pool_semantics_transition_source_update >= 0) {
         manifest_obj["deck_pool_semantics_transition_source_update"] = g_deck_pool_semantics_transition_source_update;
+      }
+    }
+    if (!g_tf32_transition_source_fingerprint.empty()) {
+      manifest_obj["tf32_transition_source_fingerprint"] = g_tf32_transition_source_fingerprint;
+      if (g_tf32_transition_source_update >= 0) {
+        manifest_obj["tf32_transition_source_update"] = g_tf32_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_ema_magnet_kl_coef) > 0.0) {

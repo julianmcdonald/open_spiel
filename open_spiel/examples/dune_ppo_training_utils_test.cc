@@ -2101,10 +2101,11 @@ void TestPpoPrecisionFingerprintAndManifestMigration() {
                         const std::string& legacy,
                         bool rollout_amp, bool allow_tf32,
                         PpoPrecisionManifestCompatibility* compatibility,
-                        std::string* error) {
+                        std::string* error,
+                        const std::string& permitted_transition = "") {
       return ValidatePpoPrecisionManifestCompatibility(
           manifest, stored, current, pre, legacy, rollout_amp, allow_tf32,
-          compatibility, error);
+          compatibility, error, permitted_transition);
     };
 
     PpoPrecisionManifestCompatibility compatibility;
@@ -2135,6 +2136,19 @@ void TestPpoPrecisionFingerprintAndManifestMigration() {
     UTILS_CHECK(!validate(mismatched, default_fingerprint,
                           default_fingerprint, pre_fingerprint, "", true,
                           true, &compatibility, &error));
+    UTILS_CHECK(error.find("allow_tf32 mismatch") != std::string::npos);
+
+    // Permitted allow_tf32 transition matching stored source fingerprint succeeds.
+    UTILS_CHECK(validate(mismatched, no_tf32_fingerprint,
+                         default_fingerprint, pre_fingerprint, "", true,
+                         true, &compatibility, &error, no_tf32_fingerprint));
+    UTILS_CHECK(compatibility.reward_transition);
+    UTILS_CHECK(compatibility.reward_transition_source_fingerprint == no_tf32_fingerprint);
+
+    // Mismatched permitted transition source fingerprint fails.
+    UTILS_CHECK(!validate(mismatched, no_tf32_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error, "wrong_source_fingerprint"));
     UTILS_CHECK(error.find("allow_tf32 mismatch") != std::string::npos);
     mismatched = fresh;
     mismatched["rollout_amp"] = "true";

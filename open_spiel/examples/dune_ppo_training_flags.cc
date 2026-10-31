@@ -45,6 +45,10 @@ ABSL_FLAG(std::string, market_appendix_transition_source_fingerprint, "",
 ABSL_FLAG(bool, allow_tf32, true,
           "Allow TF32 for CUDA CuBLAS/CuDNN. Default true preserves the "
           "historical runtime policy.");
+ABSL_FLAG(bool, allow_tf32_transition, false,
+          "Allow intentional allow_tf32 transition when resuming from checkpoint.");
+ABSL_FLAG(std::string, tf32_transition_source_fingerprint, "",
+          "Expected source config fingerprint for allow_tf32 transition validation.");
 ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the neural Semantic Action Scorer on legal candidate actions.");
 ABSL_FLAG(bool, enable_zone_encoder, false, "Enable the zone encoder adapter feeding trunk.");
 ABSL_FLAG(std::string, semantic_descriptor_schema, "semantic_action_v3",

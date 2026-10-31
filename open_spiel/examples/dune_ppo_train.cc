@@ -2369,6 +2369,75 @@ std::string ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(
   return computed_source_fp;
 }
 
+std::string ValidateAndComputeTf32TransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_tf32_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  bool source_allow_tf32 = !absl::GetFlag(FLAGS_allow_tf32);
+  auto tf32_it = manifest_obj.find("allow_tf32");
+  if (tf32_it != manifest_obj.end() && tf32_it->second.IsBool()) {
+    source_allow_tf32 = tf32_it->second.GetBool();
+  }
+
+  if (source_allow_tf32 == absl::GetFlag(FLAGS_allow_tf32)) {
+    SpielFatalError(absl::StrFormat(
+        "allow_tf32 transition was requested, but source manifest allow_tf32 (%s) matches current allow_tf32 (%s).",
+        source_allow_tf32 ? "true" : "false",
+        absl::GetFlag(FLAGS_allow_tf32) ? "true" : "false"));
+  }
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          BuildPrePrecisionConfigFingerprintObject(),
+          absl::GetFlag(FLAGS_rollout_amp),
+          source_allow_tf32);
+
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_tf32_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "allow_tf32 transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "allow_tf32 transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_tf32_transition permits ONLY allow_tf32 to differ from the parent manifest. All other settings must match exactly.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+
+  int64_t source_global_update = -1;
+  auto gu_it = manifest_obj.find("global_update");
+  if (gu_it != manifest_obj.end() && gu_it->second.IsInt()) {
+    source_global_update = gu_it->second.GetInt();
+  }
+
+  std::cout << absl::StrFormat(
+      "[allow_tf32-transition] Validated intentional allow_tf32 continuation transition:\n"
+      "  Source update:      %lld\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  allow_tf32:         %s -> %s\n",
+      static_cast<long long>(source_global_update),
+      computed_source_fp, current_config_fingerprint,
+      source_allow_tf32 ? "true" : "false",
+      absl::GetFlag(FLAGS_allow_tf32) ? "true" : "false") << std::endl;
+  return computed_source_fp;
+}
+
 void UpdateEmaWeights(
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& model,
     std::shared_ptr<SharedDunePolicyValueNetImpl>& ema_model,
@@ -2567,6 +2636,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["deck_pool_semantics_transition_source_fingerprint"] = g_deck_pool_semantics_transition_source_fingerprint;
       if (g_deck_pool_semantics_transition_source_update >= 0) {
         manifest_obj["deck_pool_semantics_transition_source_update"] = g_deck_pool_semantics_transition_source_update;
+      }
+    }
+    if (!g_tf32_transition_source_fingerprint.empty()) {
+      manifest_obj["tf32_transition_source_fingerprint"] = g_tf32_transition_source_fingerprint;
+      if (g_tf32_transition_source_update >= 0) {
+        manifest_obj["tf32_transition_source_update"] = g_tf32_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
@@ -10202,6 +10277,12 @@ int main(int argc, char** argv) {
                         ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(manifest_path, config_fingerprint);
                     if (!permitted_transition_source_fingerprint.empty()) {
                       g_deck_pool_semantics_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    } else {
+                      permitted_transition_source_fingerprint =
+                          ValidateAndComputeTf32TransitionFingerprint(manifest_path, config_fingerprint);
+                      if (!permitted_transition_source_fingerprint.empty()) {
+                        g_tf32_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                      }
                     }
                   }
                 }
@@ -10259,6 +10340,9 @@ int main(int argc, char** argv) {
       }
       if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
         g_deck_pool_semantics_transition_source_update = manifest.global_update;
+      }
+      if (!g_tf32_transition_source_fingerprint.empty()) {
+        g_tf32_transition_source_update = manifest.global_update;
       }
     }
 
@@ -11234,6 +11318,12 @@ int main(int argc, char** argv) {
                           ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(manifest_path, config_fingerprint);
                       if (!permitted_transition_source_fingerprint.empty()) {
                         g_deck_pool_semantics_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                      } else {
+                        permitted_transition_source_fingerprint =
+                            ValidateAndComputeTf32TransitionFingerprint(manifest_path, config_fingerprint);
+                        if (!permitted_transition_source_fingerprint.empty()) {
+                          g_tf32_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                        }
                       }
                     }
                   }
@@ -11288,6 +11378,9 @@ int main(int argc, char** argv) {
         }
         if (!g_deck_pool_semantics_transition_source_fingerprint.empty()) {
           g_deck_pool_semantics_transition_source_update = shared_manifest.global_update;
+        }
+        if (!g_tf32_transition_source_fingerprint.empty()) {
+          g_tf32_transition_source_update = shared_manifest.global_update;
         }
       }
 
