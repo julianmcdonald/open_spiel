@@ -3210,11 +3210,11 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       // categorical to measure full legal KL, but retaining 2--50 floats per
       // decision is deliberately opt-in so normal training has no memory or
       // serialization change.
+      const int decision_role_classified = static_cast<int>(ClassifyDuneDecisionRole(
+          *state, current_player, /*has_active_session=*/false));
       std::vector<float> parity_behavior_log_probs;
-      int parity_decision_role = -1;
+      int parity_decision_role = decision_role_classified;
       if (parity_capture) {
-        parity_decision_role = static_cast<int>(ClassifyDuneDecisionRole(
-            *state, current_player, /*has_active_session=*/false));
         float max_logit = -std::numeric_limits<float>::infinity();
         for (Action a : actions) {
           if (a >= 0 && static_cast<size_t>(a) < logits.size()) {

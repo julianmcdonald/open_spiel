@@ -366,10 +366,7 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
               chosen_action = cand_action;
             }
           }
-          if (!(s_id >= 10 && s_id <= 13 && cur_dune != nullptr &&
-                cur_dune->IsPaulPeekChanceNode())) {
-            epoch_card_draws[s_id][chosen_action]++;
-          }
+          epoch_card_draws[s_id][chosen_action]++;
           sim_state->ApplyAction(chosen_action);
         } else {
           // Fall back to kDeckOrderCrn formula for non-deck chance streams (6, 7, 9, 14)

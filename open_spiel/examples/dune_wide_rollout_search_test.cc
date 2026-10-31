@@ -864,6 +864,162 @@ void EventKeyedCrnExtraDrawAndInsertedCardTest(
   SPIEL_CHECK_GT(deck_order_mismatches_part2, 0);
 }
 
+class PaulPeekCrnTestState : public DuneImperiumState {
+ public:
+  PaulPeekCrnTestState(const std::shared_ptr<const Game>& game)
+      : DuneImperiumState(game) {
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+    SetPlayerDiscardForTesting(0, {});
+    SetPlayerDrawDeckForTesting(0, {10, 11});
+    SetPlayerHandForTesting(0, {});
+    SetPhaseForTesting(GamePhase::kAgentTurns);
+    SetPendingPaulPeekPlayerForTesting(0);
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<PaulPeekCrnTestState>(*this);
+  }
+
+  void ApplyAction(Action action) override {
+    DuneImperiumState::ApplyAction(action);
+    if (!peek_processed_) {
+      peek_processed_ = true;
+      // After Paul peeks at the top card, player 0 draws 2 cards:
+      // card 1 is drawn deterministically from player_deck_top_cards_[0] (the peeked card),
+      // card 2 is drawn from player_draw_decks_[0] via chance node on stream 10.
+      DrawPlayerCardsForTesting(0, 2);
+    }
+  }
+
+  bool is_done() const {
+    return static_cast<int>(History().size() - initial_history_size_) >= 2;
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool peek_processed_ = false;
+  size_t initial_history_size_ = 0;
+};
+
+class PaulPeekCrnDuplicateCardTestState : public DuneImperiumState {
+ public:
+  PaulPeekCrnDuplicateCardTestState(const std::shared_ptr<const Game>& game)
+      : DuneImperiumState(game) {
+    SetPendingImperiumSlotForTesting(kInvalidCard);
+    SetPlayerDiscardForTesting(0, {});
+    SetPlayerDrawDeckForTesting(0, {0, 0, 2});
+    SetPlayerHandForTesting(0, {});
+    SetPhaseForTesting(GamePhase::kAgentTurns);
+    SetPendingPaulPeekPlayerForTesting(0);
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<PaulPeekCrnDuplicateCardTestState>(*this);
+  }
+
+  void ApplyAction(Action action) override {
+    DuneImperiumState::ApplyAction(action);
+    if (!peek_processed_) {
+      peek_processed_ = true;
+      DrawPlayerCardsForTesting(0, 2);
+    }
+  }
+
+  bool is_done() const {
+    return static_cast<int>(History().size() - initial_history_size_) >= 2;
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool peek_processed_ = false;
+  size_t initial_history_size_ = 0;
+};
+
+void PaulPeekCrnCardSamplingTest(const std::shared_ptr<const Game>& game) {
+  // Part 1: Distinct cards {10, 11} over 50 seeds
+  const int num_seeds = 50;
+  for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+    PaulPeekCrnTestState state(game);
+    SimulateRolloutWithTurnTrajectory(
+        &state, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+
+    const auto hist = state.history_actions();
+    SPIEL_CHECK_EQ(hist.size(), 2);
+    // Action 0 was Paul peek chance node: chose card 10 or 11
+    SPIEL_CHECK_TRUE(hist[0] == 10 || hist[0] == 11);
+    // Action 1 was the subsequent chance node draw in the same epoch: must be the other card!
+    const Action expected_second = (hist[0] == 10) ? 11 : 10;
+    SPIEL_CHECK_EQ(hist[1], expected_second);
+    // Player hand should have both cards
+    const auto hand = state.GetPlayerHandForTesting(0);
+    SPIEL_CHECK_EQ(hand.size(), 2);
+    SPIEL_CHECK_TRUE(std::find(hand.begin(), hand.end(), 10) != hand.end());
+    SPIEL_CHECK_TRUE(std::find(hand.begin(), hand.end(), 11) != hand.end());
+  }
+
+  // Part 2: Duplicate cards {0, 0, 2} over 2,000 seeds under event-keyed CRN
+  int conditional_first_is_zero = 0;
+  int second_is_zero = 0;
+  int second_is_two = 0;
+  const int num_duplicate_seeds = 2000;
+  for (uint64_t seed = 1; seed <= num_duplicate_seeds; ++seed) {
+    PaulPeekCrnDuplicateCardTestState state(game);
+    SimulateRolloutWithTurnTrajectory(
+        &state, 0, nullptr, seed,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kEventKeyedCrn);
+
+    const auto hist = state.history_actions();
+    SPIEL_CHECK_EQ(hist.size(), 2);
+    if (hist[0] == 0) {
+      conditional_first_is_zero++;
+      if (hist[1] == 0) {
+        second_is_zero++;
+      } else if (hist[1] == 2) {
+        second_is_two++;
+      } else {
+        SPIEL_CHECK_TRUE(false);
+      }
+    }
+  }
+  SPIEL_CHECK_GT(conditional_first_is_zero, 1000);
+  SPIEL_CHECK_EQ(second_is_zero + second_is_two, conditional_first_is_zero);
+  const double frac_zero = static_cast<double>(second_is_zero) / conditional_first_is_zero;
+  std::cout << "[PaulPeekCrnCardSamplingTest] conditional_first_is_zero=" << conditional_first_is_zero
+            << " second_is_zero=" << second_is_zero << " (" << frac_zero * 100.0 << "%)"
+            << " second_is_two=" << second_is_two << " (" << (1.0 - frac_zero) * 100.0 << "%)\n";
+  SPIEL_CHECK_GE(frac_zero, 0.45);
+  SPIEL_CHECK_LE(frac_zero, 0.55);
+}
+
 void CrnDiagnostic30RootsBenchmark(const std::shared_ptr<const Game>& game) {
   std::cout << "\n=== Running 30-Root CRN Diagnostic Benchmark ===" << std::endl;
   const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
@@ -1497,6 +1653,7 @@ int main(int argc, char** argv) {
   DeckOrderCrnAlignmentAndParityTest(game);
   ReshuffleEpochCrnTest(game);
   EventKeyedCrnExtraDrawAndInsertedCardTest(game);
+  PaulPeekCrnCardSamplingTest(game);
   CrnDiagnostic30RootsBenchmark(game);
   Stage1OverAllocationStage2ReservationTest(game);
   ContiguousPrefixOrderingTest(game);

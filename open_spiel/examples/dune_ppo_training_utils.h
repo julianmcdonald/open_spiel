@@ -47,6 +47,8 @@ ABSL_DECLARE_FLAG(double, search_aux_alpha);
 ABSL_DECLARE_FLAG(double, search_aux_rail_kl_target);
 ABSL_DECLARE_FLAG(bool, search_research_diagnostic);
 ABSL_DECLARE_FLAG(bool, use_legacy_unoptimized_reads);
+ABSL_DECLARE_FLAG(bool, use_wave1_ppo_update);
+ABSL_DECLARE_FLAG(bool, use_grad_norm_reuse);
 
 extern std::string g_reward_transition_source_fingerprint;
 extern int64_t g_reward_transition_source_update;

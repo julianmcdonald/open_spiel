@@ -46,6 +46,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <future>
 
 #include "dune_ppo_training_utils.h"
 #include "dune_ppo_numerical_parity.h"
@@ -9708,8 +9709,17 @@ void TestStep1And2ParityAndBenchmark() {
         // Reset flag to false (default)
         absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
 
-        // Assert Model Hash parity
-        CHECK_EQ(HashModelParams(m_leg), HashModelParams(m_opt));
+        // Assert Model Hash and Weight Parity
+        if (dev.is_cpu()) {
+          CHECK_EQ(HashModelParams(m_leg), HashModelParams(m_opt));
+        } else {
+          auto params_leg = m_leg->parameters();
+          auto params_opt = m_opt->parameters();
+          for (size_t p = 0; p < params_leg.size(); ++p) {
+            float p_diff = (params_leg[p] - params_opt[p]).abs().max().item<float>();
+            UTILS_CHECK(p_diff < 1e-5f);
+          }
+        }
 
         // Assert Optimizer State parity
         auto params_leg = m_leg->parameters();
@@ -9724,27 +9734,50 @@ void TestStep1And2ParityAndBenchmark() {
             UTILS_CHECK(st_leg != nullptr);
             UTILS_CHECK(st_opt != nullptr);
             CHECK_EQ(st_leg->step(), st_opt->step());
-            UTILS_CHECK(torch::equal(st_leg->exp_avg(), st_opt->exp_avg()));
-            UTILS_CHECK(torch::equal(st_leg->exp_avg_sq(), st_opt->exp_avg_sq()));
+            if (dev.is_cpu()) {
+              UTILS_CHECK(torch::equal(st_leg->exp_avg(), st_opt->exp_avg()));
+              UTILS_CHECK(torch::equal(st_leg->exp_avg_sq(), st_opt->exp_avg_sq()));
+            } else {
+              float ea_diff = (st_leg->exp_avg() - st_opt->exp_avg()).abs().max().item<float>();
+              float easq_diff = (st_leg->exp_avg_sq() - st_opt->exp_avg_sq()).abs().max().item<float>();
+              UTILS_CHECK(ea_diff < 1e-5f);
+              UTILS_CHECK(easq_diff < 1e-5f);
+            }
           }
         }
 
-        // Assert every single field of PpoUpdateStats
-        CHECK_EQ(stats_leg.policy_loss, stats_opt.policy_loss);
-        CHECK_EQ(stats_leg.value_loss, stats_opt.value_loss);
-        CHECK_EQ(stats_leg.entropy, stats_opt.entropy);
-        CHECK_EQ(stats_leg.approx_kl, stats_opt.approx_kl);
-        CHECK_EQ(stats_leg.clip_fraction, stats_opt.clip_fraction);
-        CHECK_EQ(stats_leg.value_clip_fraction, stats_opt.value_clip_fraction);
-        CHECK_EQ(stats_leg.ema_magnet_kl, stats_opt.ema_magnet_kl);
-        CHECK_EQ(stats_leg.grad_norm_sum, stats_opt.grad_norm_sum);
-        CHECK_EQ(stats_leg.grad_norm_max, stats_opt.grad_norm_max);
+        // Assert PpoUpdateStats
+        if (dev.is_cpu()) {
+          CHECK_EQ(stats_leg.policy_loss, stats_opt.policy_loss);
+          CHECK_EQ(stats_leg.value_loss, stats_opt.value_loss);
+          CHECK_EQ(stats_leg.entropy, stats_opt.entropy);
+          CHECK_EQ(stats_leg.approx_kl, stats_opt.approx_kl);
+          CHECK_EQ(stats_leg.clip_fraction, stats_opt.clip_fraction);
+          CHECK_EQ(stats_leg.value_clip_fraction, stats_opt.value_clip_fraction);
+          CHECK_EQ(stats_leg.ema_magnet_kl, stats_opt.ema_magnet_kl);
+          CHECK_EQ(stats_leg.grad_norm_sum, stats_opt.grad_norm_sum);
+          CHECK_EQ(stats_leg.grad_norm_max, stats_opt.grad_norm_max);
+        } else {
+          CHECK_NEAR(stats_leg.policy_loss, stats_opt.policy_loss, 1e-4);
+          CHECK_NEAR(stats_leg.value_loss, stats_opt.value_loss, 1e-4);
+          CHECK_NEAR(stats_leg.entropy, stats_opt.entropy, 1e-4);
+          CHECK_NEAR(stats_leg.approx_kl, stats_opt.approx_kl, 1e-4);
+          CHECK_NEAR(stats_leg.clip_fraction, stats_opt.clip_fraction, 1e-4);
+          CHECK_NEAR(stats_leg.value_clip_fraction, stats_opt.value_clip_fraction, 1e-4);
+          CHECK_NEAR(stats_leg.ema_magnet_kl, stats_opt.ema_magnet_kl, 1e-4);
+          CHECK_NEAR(stats_leg.grad_norm_sum, stats_opt.grad_norm_sum, 1e-2);
+          CHECK_NEAR(stats_leg.grad_norm_max, stats_opt.grad_norm_max, 1e-2);
+        }
         CHECK_EQ(stats_leg.minibatches, stats_opt.minibatches);
         CHECK_EQ(stats_leg.early_stopped, stats_opt.early_stopped);
         CHECK_EQ(stats_leg.kl_early_stop_epoch, stats_opt.kl_early_stop_epoch);
         CHECK_EQ(stats_leg.epoch_kls.size(), stats_opt.epoch_kls.size());
         for (size_t k = 0; k < stats_leg.epoch_kls.size(); ++k) {
-          CHECK_EQ(stats_leg.epoch_kls[k], stats_opt.epoch_kls[k]);
+          if (dev.is_cpu()) {
+            CHECK_EQ(stats_leg.epoch_kls[k], stats_opt.epoch_kls[k]);
+          } else {
+            CHECK_NEAR(stats_leg.epoch_kls[k], stats_opt.epoch_kls[k], 1e-4);
+          }
         }
       }
       }
@@ -11994,6 +12027,26 @@ int main() {
       absl::SetFlag(&FLAGS_actor_only_advantage_filtering, false);
       absl::SetFlag(&FLAGS_phase_stratified_advantage_norm, false);
       absl::SetFlag(&FLAGS_advantage_filtering_quantile, 0.25);
+
+      // Verify leader selection classification bounds (558..571 vs 572+)
+      {
+        for (Action a = dune_imperium::kActionLeaderPick0;
+             a < dune_imperium::kActionBuyHelenaReserve0; ++a) {
+          PpoTransition t_lead;
+          t_lead.legal_actions = {a, a + 1};
+          CHECK_EQ(static_cast<int>(ClassifyTransitionDecisionRole(t_lead)),
+                   static_cast<int>(DuneDecisionRole::kLeaderSelection));
+        }
+        for (Action a : {dune_imperium::kActionBuyHelenaReserve0,
+                         dune_imperium::kActionLeaderPeekPaul,
+                         dune_imperium::kActionResearchBranchA,
+                         dune_imperium::kActionSpaceDreadnoughtBuild}) {
+          PpoTransition t_non_lead;
+          t_non_lead.legal_actions = {a, a + 1};
+          UTILS_CHECK(static_cast<int>(ClassifyTransitionDecisionRole(t_non_lead)) !=
+                      static_cast<int>(DuneDecisionRole::kLeaderSelection));
+        }
+      }
     }
   } TEST_END();
 
@@ -12004,25 +12057,26 @@ int main() {
       torch::Device cuda_device(torch::kCUDA);
       const int64_t obs_size = 5580;
 
-      // Part 1: Verify parity with and without semantic scorer across multiple batch sizes
-      for (bool with_scorer : {false, true}) {
-        const int hidden_dim = with_scorer ? 2048 : 64;
-        const int num_blocks = 1;
-        auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
-            obs_size, hidden_dim, 2391, num_blocks, /*use_nonlinear=*/false,
-            /*with_aux_heads=*/false, /*head_init_seed=*/0,
-            /*with_semantic_scorer=*/with_scorer, /*enable_zone_encoder=*/false,
-            with_scorer ? dune_semantic::kDescriptorSchemaVersionV3 : "");
-        model->to(cuda_device);
-        model->eval();
+      // Part 1: Verify parity with and without semantic scorer across multiple batch sizes and sync modes
+      for (bool dev_sync : {false, true}) {
+        for (bool with_scorer : {false, true}) {
+          const int hidden_dim = with_scorer ? 2048 : 64;
+          const int num_blocks = 1;
+          auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+              obs_size, hidden_dim, 2391, num_blocks, /*use_nonlinear=*/false,
+              /*with_aux_heads=*/false, /*head_init_seed=*/0,
+              /*with_semantic_scorer=*/with_scorer, /*enable_zone_encoder=*/false,
+              with_scorer ? dune_semantic::kDescriptorSchemaVersionV3 : "");
+          model->to(cuda_device);
+          model->eval();
 
-        std::shared_mutex sync_mutex;
-        const int target_batch = 16;
-        BatchedEvaluator evaluator(
-            model, target_batch, /*timeout_ms=*/1, cuda_device, &sync_mutex,
-            /*logit_cap=*/10.0f, /*device_synchronize=*/false,
-            /*high_priority_stream=*/false, /*emit_batch_membership=*/false,
-            /*rollout_amp=*/false, /*allow_tf32=*/false);
+          std::shared_mutex sync_mutex;
+          const int target_batch = 16;
+          BatchedEvaluator evaluator(
+              model, target_batch, /*timeout_ms=*/50, cuda_device, &sync_mutex,
+              /*logit_cap=*/10.0f, /*device_synchronize=*/dev_sync,
+              /*high_priority_stream=*/false, /*emit_batch_membership=*/true,
+              /*rollout_amp=*/false, /*allow_tf32=*/false);
 
         // Test multiple batch sizes: e.g. 1, 4, target_batch (16)
         for (int batch_size : {1, 4, target_batch}) {
@@ -12048,18 +12102,30 @@ int main() {
             }
           }
 
-          // Evaluate with BatchedEvaluator (which captures and replays CUDA Graph)
-          std::vector<open_spiel::CompactEvalResult> compact_results(batch_size);
+          auto run_eval = [&]() {
+            std::vector<open_spiel::CompactEvalResult> res(batch_size);
+            if (batch_size == 1) {
+              res[0] = evaluator.EvaluateCompact(
+                  obs_batch[0], legal_actions_batch[0], with_scorer ? &cand_batch[0] : nullptr);
+            } else {
+              std::vector<std::future<open_spiel::CompactEvalResult>> futures(batch_size);
+              for (int b = 0; b < batch_size; ++b) {
+                futures[b] = std::async(std::launch::async, [&, b]() {
+                  return evaluator.EvaluateCompact(
+                      obs_batch[b], legal_actions_batch[b], with_scorer ? &cand_batch[b] : nullptr);
+                });
+              }
+              for (int b = 0; b < batch_size; ++b) {
+                res[b] = futures[b].get();
+              }
+            }
+            return res;
+          };
+
           // Evaluate first time (captures graph)
-          for (int b = 0; b < batch_size; ++b) {
-            compact_results[b] = evaluator.EvaluateCompact(
-                obs_batch[b], legal_actions_batch[b], with_scorer ? &cand_batch[b] : nullptr);
-          }
+          auto compact_results = run_eval();
           // Evaluate second time (replays graph)
-          for (int b = 0; b < batch_size; ++b) {
-            compact_results[b] = evaluator.EvaluateCompact(
-                obs_batch[b], legal_actions_batch[b], with_scorer ? &cand_batch[b] : nullptr);
-          }
+          compact_results = run_eval();
 
           // Compute ground truth eager forward pass
           torch::Tensor eager_input = torch::empty({batch_size, obs_size}, torch::TensorOptions().dtype(torch::kFloat32).device(cuda_device));
@@ -12078,6 +12144,9 @@ int main() {
 
           for (int b = 0; b < batch_size; ++b) {
             UTILS_CHECK(compact_results[b].ok);
+            if (batch_size > 1) {
+              UTILS_CHECK(compact_results[b].physical_batch_size > 1);
+            }
             // Check value parity
             float eager_val = eager_values[b].item<float>();
             float graph_val = compact_results[b].value;
@@ -12107,6 +12176,7 @@ int main() {
           }
         }
       }
+    }
 
       // Part 2: Verify live weight mutation via CopyModelWeights
       {
@@ -12164,6 +12234,210 @@ int main() {
         torch::Tensor eager_logits = eager_out.logits.squeeze(0).to(torch::kCPU);
         for (int i = 0; i < eager_logits.size(0); ++i) {
           CHECK_NEAR(res_mut.logits[i], eager_logits[i].item<float>(), 1e-5f);
+        }
+      }
+    }
+  } TEST_END();
+
+  TEST_BEGIN("TrainPpoUpdate: use_grad_norm_reuse numerical parity and step buffer verification") {
+    if (torch::cuda::is_available()) {
+      torch::Device dev(torch::kCUDA, 0);
+      const int64_t obs_size = 64;
+      const int64_t action_dim = 16;
+      const int64_t hidden_dim = 64;
+      const int num_blocks = 1;
+
+      for (int aux_case = 0; aux_case < 3; ++aux_case) {
+        torch::manual_seed(12345 + aux_case);
+        auto model_ref = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, hidden_dim, action_dim, num_blocks,
+            /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+        model_ref->to(dev);
+
+        auto model_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, hidden_dim, action_dim, num_blocks,
+            /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+        model_opt->to(dev);
+        CopyModelWeights(model_ref, model_opt);
+
+        auto ema_ref = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, hidden_dim, action_dim, num_blocks,
+            /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+        ema_ref->to(dev);
+        CopyModelWeights(model_ref, ema_ref);
+
+        auto ema_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
+            obs_size, hidden_dim, action_dim, num_blocks,
+            /*use_nonlinear=*/false, /*with_aux_heads=*/true);
+        ema_opt->to(dev);
+        CopyModelWeights(model_ref, ema_opt);
+
+        torch::optim::AdamW opt_ref(model_ref->parameters(), torch::optim::AdamWOptions(1e-3));
+        torch::optim::AdamW opt_opt(model_opt->parameters(), torch::optim::AdamWOptions(1e-3));
+
+        std::vector<PpoTransition> batch_ref(32);
+        for (size_t i = 0; i < batch_ref.size(); ++i) {
+          auto& t = batch_ref[i];
+          t.state = std::vector<float>(obs_size, static_cast<float>(i + 1) * 0.1f);
+          t.legal_actions = {0, 1, 2, 3};
+          t.action = i % 4;
+          t.old_log_prob = -1.386f;
+          t.advantage = (i % 2 == 0) ? 0.5f : -0.5f;
+          t.return_value = 0.5f;
+          t.value = 0.2f;
+        }
+        std::vector<PpoTransition> batch_opt = batch_ref;
+
+        Pwo5AuxBatch aux_batch_ref;
+        Pwo5AuxConfig aux_cfg;
+        if (aux_case > 0) {
+          int64_t aux_rows = (aux_case == 1) ? 2 : 8;
+          aux_batch_ref.obs = torch::full(
+              {aux_rows, obs_size}, 0.25f,
+              torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+          aux_batch_ref.final_vp = torch::full(
+              {aux_rows}, 0.5f,
+              torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+          aux_batch_ref.terminal_round = torch::zeros(
+              {aux_rows},
+              torch::TensorOptions().dtype(torch::kInt64).device(dev));
+          aux_batch_ref.next_action = torch::ones(
+              {aux_rows},
+              torch::TensorOptions().dtype(torch::kInt64).device(dev));
+          aux_batch_ref.game_id = torch::arange(
+              0, aux_rows,
+              torch::TensorOptions().dtype(torch::kInt64).device(dev));
+          aux_batch_ref.num_games = aux_rows;
+          aux_batch_ref.sampled_games = aux_rows;
+          aux_batch_ref.final_vp_games = aux_rows;
+          aux_batch_ref.terminal_round_games = aux_rows;
+          aux_batch_ref.next_own_action_games = aux_rows;
+          aux_batch_ref.valid = true;
+          aux_cfg.final_vp_coef = 0.1;
+          aux_cfg.terminal_round_coef = 0.1;
+          aux_cfg.next_own_action_coef = 0.1;
+        }
+        Pwo5AuxBatch aux_batch_opt = aux_batch_ref;
+
+        absl::SetFlag(&FLAGS_ppo_minibatch_size, 8);
+        absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+        absl::SetFlag(&FLAGS_target_kl, 0.0);
+        absl::SetFlag(&FLAGS_normalize_advantages, true);
+        absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+        absl::SetFlag(&FLAGS_grad_clip_norm, 0.5);
+        absl::SetFlag(&FLAGS_grad_telemetry_mode, "accumulated");
+
+        // 1. Run reference Wave 2 path (use_grad_norm_reuse = false)
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
+        absl::SetFlag(&FLAGS_use_wave1_ppo_update, false);
+        absl::SetFlag(&FLAGS_use_grad_norm_reuse, false);
+
+        PpoUpdateStats stats_ref = TrainPpoUpdate(
+            model_ref, opt_ref, batch_ref, obs_size, action_dim, dev,
+            /*master=*/12345ULL, /*global_update=*/1,
+            /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+            /*abort_grad_norm_ratio=*/0.0, aux_batch_ref, aux_cfg,
+            /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+            /*compute_diagnostics=*/true, ema_ref, /*ema_magnet_kl_coef=*/0.02);
+
+        // 2. Run optimized Wave 2 path (use_grad_norm_reuse = true)
+        absl::SetFlag(&FLAGS_use_legacy_unoptimized_reads, false);
+        absl::SetFlag(&FLAGS_use_wave1_ppo_update, false);
+        absl::SetFlag(&FLAGS_use_grad_norm_reuse, true);
+
+        PpoUpdateStats stats_opt = TrainPpoUpdate(
+            model_opt, opt_opt, batch_opt, obs_size, action_dim, dev,
+            /*master=*/12345ULL, /*global_update=*/1,
+            /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0,
+            /*abort_grad_norm_ratio=*/0.0, aux_batch_opt, aux_cfg,
+            /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+            /*compute_diagnostics=*/true, ema_opt, /*ema_magnet_kl_coef=*/0.02);
+
+        // Restore default flag
+        absl::SetFlag(&FLAGS_use_grad_norm_reuse, true);
+
+        CHECK_EQ(stats_ref.minibatches, 8);
+        CHECK_EQ(stats_opt.minibatches, 8);
+        UTILS_CHECK(!stats_ref.early_stopped);
+        UTILS_CHECK(!stats_opt.early_stopped);
+
+        // Verify parameters parity and optimizer state parity & persistent step buffer correctness
+        auto named_ref = model_ref->named_parameters();
+        auto named_opt = model_opt->named_parameters();
+        CHECK_EQ(named_ref.size(), named_opt.size());
+        for (size_t p = 0; p < named_ref.size(); ++p) {
+          CHECK_EQ(named_ref[p].key(), named_opt[p].key());
+          const std::string& name = named_ref[p].key();
+          const torch::Tensor& p_ref = named_ref[p].value();
+          const torch::Tensor& p_opt = named_opt[p].value();
+
+          float p_diff = (p_ref - p_opt).abs().max().item<float>();
+          UTILS_CHECK(p_diff < 1e-5f);
+
+          torch::optim::AdamWParamState* st_ref = nullptr;
+          auto it_ref = opt_ref.state().find(p_ref.unsafeGetTensorImpl());
+          if (it_ref != opt_ref.state().end()) {
+            st_ref = dynamic_cast<torch::optim::AdamWParamState*>(it_ref->second.get());
+          }
+
+          torch::optim::AdamWParamState* st_opt = nullptr;
+          auto it_opt = opt_opt.state().find(p_opt.unsafeGetTensorImpl());
+          if (it_opt != opt_opt.state().end()) {
+            st_opt = dynamic_cast<torch::optim::AdamWParamState*>(it_opt->second.get());
+          }
+
+          const bool is_aux = (name.rfind("final_vp_head", 0) == 0 ||
+                               name.rfind("terminal_round_head", 0) == 0 ||
+                               name.rfind("next_own_action_head", 0) == 0);
+
+          if (is_aux && aux_case == 0) {
+            UTILS_CHECK(st_ref == nullptr && st_opt == nullptr);
+          } else {
+            UTILS_CHECK(st_ref != nullptr);
+            UTILS_CHECK(st_opt != nullptr);
+            CHECK_EQ(st_ref->step(), st_opt->step());
+            if (is_aux) {
+              if (aux_case == 1) {
+                CHECK_EQ(st_ref->step(), 4);
+              } else if (aux_case == 2) {
+                CHECK_EQ(st_ref->step(), 8);
+              }
+            } else {
+              CHECK_EQ(st_ref->step(), 8);
+            }
+            float ea_diff = (st_ref->exp_avg() - st_opt->exp_avg()).abs().max().item<float>();
+            float easq_diff = (st_ref->exp_avg_sq() - st_opt->exp_avg_sq()).abs().max().item<float>();
+            UTILS_CHECK(ea_diff < 1e-5f);
+            UTILS_CHECK(easq_diff < 1e-5f);
+          }
+        }
+
+        // Verify stats numerical parity
+        UTILS_CHECK(std::abs(stats_ref.policy_loss - stats_opt.policy_loss) < 1e-5);
+        UTILS_CHECK(std::abs(stats_ref.value_loss - stats_opt.value_loss) < 1e-5);
+        UTILS_CHECK(std::abs(stats_ref.grad_norm_sum - stats_opt.grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.grad_norm_max - stats_opt.grad_norm_max) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.trunk_grad_norm_sum - stats_opt.trunk_grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.policy_head_grad_norm_sum - stats_opt.policy_head_grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.value_head_grad_norm_sum - stats_opt.value_head_grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.final_vp_head_grad_norm_sum - stats_opt.final_vp_head_grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.terminal_round_head_grad_norm_sum - stats_opt.terminal_round_head_grad_norm_sum) < 1e-4);
+        UTILS_CHECK(std::abs(stats_ref.next_own_action_head_grad_norm_sum - stats_opt.next_own_action_head_grad_norm_sum) < 1e-4);
+
+        if (aux_case == 0) {
+          UTILS_CHECK(stats_ref.final_vp_head_grad_norm_sum == 0.0);
+          UTILS_CHECK(stats_ref.terminal_round_head_grad_norm_sum == 0.0);
+          UTILS_CHECK(stats_ref.next_own_action_head_grad_norm_sum == 0.0);
+          UTILS_CHECK(stats_opt.final_vp_head_grad_norm_sum == 0.0);
+          UTILS_CHECK(stats_opt.terminal_round_head_grad_norm_sum == 0.0);
+          UTILS_CHECK(stats_opt.next_own_action_head_grad_norm_sum == 0.0);
+        } else {
+          UTILS_CHECK(stats_ref.final_vp_head_grad_norm_sum > 0.0);
+          UTILS_CHECK(stats_ref.terminal_round_head_grad_norm_sum > 0.0);
+          UTILS_CHECK(stats_ref.next_own_action_head_grad_norm_sum > 0.0);
+          UTILS_CHECK(stats_opt.final_vp_head_grad_norm_sum > 0.0);
+          UTILS_CHECK(stats_opt.terminal_round_head_grad_norm_sum > 0.0);
+          UTILS_CHECK(stats_opt.next_own_action_head_grad_norm_sum > 0.0);
         }
       }
     }

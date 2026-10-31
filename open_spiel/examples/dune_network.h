@@ -2849,6 +2849,12 @@ private:
         AtomicMax(&logit_cap_post_max_, post_max_abs);
     }
 
+    struct CapturedForwardGraph {
+        std::unique_ptr<at::cuda::CUDAGraph> graph;
+        SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+        SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+    };
+
     // Production CUDA path: two reusable slots let the runner assemble the
     // next CPU batch while the previous slot is executing. Completion waits
     // on one CUDA event for this stream, never on the whole device.
@@ -2865,6 +2871,9 @@ private:
         bool wants_logits = false;
         int compact_max_legal = 0;
         std::vector<size_t> compact_request_indices;
+        torch::Tensor compact_host_ids;
+        torch::Tensor compact_host_mask;
+        torch::Tensor compact_host_rows;
         torch::Tensor compact_device_ids;
         torch::Tensor compact_device_mask;
         torch::Tensor compact_device_rows;
@@ -2875,12 +2884,8 @@ private:
         bool has_cap_stats = false;
         bool pending = false;
         int64_t membership_batch_id = -1;
-    };
-
-    struct CapturedForwardGraph {
-        std::unique_ptr<at::cuda::CUDAGraph> graph;
-        SharedDunePolicyValueNetImpl::ModelOutputs outputs;
-        SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+        at::cuda::MempoolId_t graph_pool;
+        std::vector<CapturedForwardGraph> captured_graphs;
     };
 
     void RunnerAsync() {
@@ -2907,16 +2912,11 @@ private:
                 {target_batch_size_}, host_options);
             slot.complete = std::make_unique<c10::Event>(
                 c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+            slot.graph_pool = at::cuda::graph_pool_handle();
+            slot.captured_graphs.resize(target_batch_size_ + 1);
         }
         int pending_slot = -1;
         int next_slot = 0;
-
-        auto device_options = torch::TensorOptions()
-            .dtype(torch::kFloat32).device(device_);
-        torch::Tensor graph_device_obs = torch::empty(
-            {target_batch_size_, model_input_dim_}, device_options);
-        at::cuda::MempoolId_t graph_pool = at::cuda::graph_pool_handle();
-        std::vector<CapturedForwardGraph> captured_graphs(target_batch_size_ + 1);
 
         auto take_batch = [&](bool* timeout_flush) {
             std::vector<Request> batch;
@@ -3062,6 +3062,7 @@ private:
             const size_t action_dim = static_cast<size_t>(model_action_dim_);
             dune_hotspot::ScopedTimer hotspot_timer(
                 dune_hotspot::Kind::kBatcherResultDistribution);
+            size_t compact_cursor = 0;
             for (size_t i = 0; i < slot.batch.size(); ++i) {
                 Request& request = slot.batch[i];
                 if (request.result_dest != nullptr) {
@@ -3074,10 +3075,7 @@ private:
                     }
                 }
                 if (request.compact_dest != nullptr) {
-                    const auto it = std::find(slot.compact_request_indices.begin(),
-                                              slot.compact_request_indices.end(), i);
-                    const size_t compact_index = static_cast<size_t>(
-                        std::distance(slot.compact_request_indices.begin(), it));
+                    const size_t compact_index = compact_cursor++;
                     const float* probs = slot.compact_host_probs.data_ptr<float>();
                     request.compact_dest->actions = request.legal_actions;
                     request.compact_dest->probabilities.assign(
@@ -3160,23 +3158,27 @@ private:
                 slot.host_logits = torch::empty(
                     {target_batch_size_, model_action_dim_}, host_options);
             }
-            if (batch_size >= captured_graphs.size()) {
-                captured_graphs.resize(batch_size + 1);
+            if (batch_size >= slot.captured_graphs.size()) {
+                slot.captured_graphs.resize(batch_size + 1);
             }
-            if (batch_size > static_cast<size_t>(graph_device_obs.size(0))) {
-                graph_device_obs = torch::empty(
+            if (batch_size > static_cast<size_t>(slot.device_obs.size(0))) {
+                auto device_options = torch::TensorOptions()
+                    .dtype(torch::kFloat32).device(device_);
+                slot.device_obs = torch::empty(
                     {static_cast<int64_t>(batch_size), model_input_dim_}, device_options);
+                slot.captured_graphs.clear();
+                slot.captured_graphs.resize(batch_size + 1);
             }
             {
                 c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
                 auto host_obs = slot.host_obs.narrow(0, 0, batch_size);
-                auto device_obs = graph_device_obs.narrow(0, 0, batch_size);
+                auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
                 device_obs.copy_(host_obs, /*non_blocking=*/true);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
                 {
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
-                    auto& cg = captured_graphs[batch_size];
+                    auto& cg = slot.captured_graphs[batch_size];
                     if (!cg.graph) {
                         {
                             AutocastGuard autocast_guard(c10::DeviceType::CUDA,
@@ -3193,7 +3195,7 @@ private:
                                                          rollout_amp_,
                                                          /*clear_cache_on_exit=*/true);
                             cg.graph = std::make_unique<at::cuda::CUDAGraph>();
-                            cg.graph->capture_begin(graph_pool, cudaStreamCaptureModeThreadLocal);
+                            cg.graph->capture_begin(slot.graph_pool, cudaStreamCaptureModeThreadLocal);
                             cg.outputs = model_->forward(device_obs);
                             cg.critic_outputs = (critic_model_ != nullptr)
                                 ? critic_model_->forward(device_obs)
@@ -3215,6 +3217,7 @@ private:
                             }
                         }
                         if (has_any_actions) {
+                            outputs.logits = outputs.logits.clone();
                             AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                          rollout_amp_,
                                                          clear_autocast_cache_per_batch_);
@@ -3239,62 +3242,73 @@ private:
                 if (!slot.compact_request_indices.empty()) {
                     const int compact_count =
                         static_cast<int>(slot.compact_request_indices.size());
-                    // Pinned staging: a pageable host-to-device copy synchronizes
-                    // the stream, so the runner would wait for the forward pass.
-                    torch::Tensor ids_cpu = torch::zeros(
-                        {compact_count, slot.compact_max_legal},
-                        torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
-                    torch::Tensor mask_cpu = torch::zeros(
-                        {compact_count, slot.compact_max_legal},
-                        torch::TensorOptions().dtype(torch::kBool).pinned_memory(true));
+                    const int max_legal = slot.compact_max_legal;
+                    const int64_t total_elems = static_cast<int64_t>(compact_count) * max_legal;
+                    if (!slot.compact_host_ids.defined() ||
+                        slot.compact_host_ids.numel() < total_elems ||
+                        !slot.compact_host_rows.defined() ||
+                        slot.compact_host_rows.numel() < compact_count) {
+                        const int64_t alloc_rows = std::max<int64_t>(target_batch_size_, compact_count);
+                        const int64_t alloc_cols = std::max<int64_t>(max_legal, 128);
+                        const int64_t alloc_total = alloc_rows * alloc_cols;
+                        auto host_i64_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
+                        auto host_bool_opts = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(true);
+                        auto host_f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+                        auto dev_i64_opts = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+                        auto dev_bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device_);
+
+                        slot.compact_host_ids = torch::empty({alloc_total}, host_i64_opts);
+                        slot.compact_host_mask = torch::empty({alloc_total}, host_bool_opts);
+                        slot.compact_host_rows = torch::empty({alloc_rows}, host_i64_opts);
+                        slot.compact_host_probs = torch::empty({alloc_total}, host_f32_opts);
+                        slot.compact_device_ids = torch::empty({alloc_total}, dev_i64_opts);
+                        slot.compact_device_mask = torch::empty({alloc_total}, dev_bool_opts);
+                        slot.compact_device_rows = torch::empty({alloc_rows}, dev_i64_opts);
+                    }
+                    auto ids_cpu = slot.compact_host_ids.narrow(0, 0, total_elems).view({compact_count, max_legal});
+                    auto mask_cpu = slot.compact_host_mask.narrow(0, 0, total_elems).view({compact_count, max_legal});
+                    auto rows_cpu = slot.compact_host_rows.narrow(0, 0, compact_count);
+                    ids_cpu.zero_();
+                    mask_cpu.zero_();
                     int64_t* ids = ids_cpu.data_ptr<int64_t>();
                     bool* mask = mask_cpu.data_ptr<bool>();
-                    for (int k = 0; k < compact_count; ++k) {
-                        const Request& request = slot.batch[
-                            slot.compact_request_indices[k]];
-                        for (size_t j = 0; j < request.legal_actions.size(); ++j) {
-                            ids[k * slot.compact_max_legal + j] =
-                                request.legal_actions[j];
-                            mask[k * slot.compact_max_legal + j] = true;
-                        }
-                    }
-                    slot.compact_device_ids = ids_cpu.to(
-                        device_, /*non_blocking=*/true);
-                    slot.compact_device_mask = mask_cpu.to(
-                        device_, /*non_blocking=*/true);
-                    torch::Tensor rows_cpu = torch::empty(
-                        {compact_count},
-                        torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
                     int64_t* rows = rows_cpu.data_ptr<int64_t>();
                     for (int k = 0; k < compact_count; ++k) {
                         rows[k] = static_cast<int64_t>(slot.compact_request_indices[k]);
+                        const Request& request = slot.batch[slot.compact_request_indices[k]];
+                        for (size_t j = 0; j < request.legal_actions.size(); ++j) {
+                            ids[k * max_legal + j] = request.legal_actions[j];
+                            mask[k * max_legal + j] = true;
+                        }
                     }
-                    slot.compact_device_rows = rows_cpu.to(
-                        device_, /*non_blocking=*/true);
+                    auto dev_ids = slot.compact_device_ids.narrow(0, 0, total_elems).view({compact_count, max_legal});
+                    auto dev_mask = slot.compact_device_mask.narrow(0, 0, total_elems).view({compact_count, max_legal});
+                    auto dev_rows = slot.compact_device_rows.narrow(0, 0, compact_count);
+                    dev_ids.copy_(ids_cpu, /*non_blocking=*/true);
+                    dev_mask.copy_(mask_cpu, /*non_blocking=*/true);
+                    dev_rows.copy_(rows_cpu, /*non_blocking=*/true);
+
                     auto compact_logits = outputs.logits.index_select(
-                        0, slot.compact_device_rows)
-                        .gather(1, slot.compact_device_ids)
+                        0, dev_rows)
+                        .gather(1, dev_ids)
                         .to(torch::kFloat32);
-                    const torch::Tensor legal =
-                        slot.compact_device_mask.to(torch::kFloat32);
+                    const torch::Tensor legal = dev_mask.to(torch::kFloat32);
                     const torch::Tensor legal_count =
                         legal.sum(1, true).clamp_min(1.0);
                     compact_logits = compact_logits -
                         (compact_logits * legal).sum(1, true) / legal_count;
                     const torch::Tensor pre_max = compact_logits.abs().masked_fill(
-                        slot.compact_device_mask.logical_not(), 0.0).amax(1);
+                        dev_mask.logical_not(), 0.0).amax(1);
                     if (logit_cap_ > 0.0f) {
                         compact_logits = logit_cap_ *
                             torch::tanh(compact_logits / logit_cap_);
                     }
                     const torch::Tensor post_max = compact_logits.abs().masked_fill(
-                        slot.compact_device_mask.logical_not(), 0.0).amax(1);
-                    // Same four statistics as before; reading them with item()
-                    // here forced a device sync on every batch.
+                        dev_mask.logical_not(), 0.0).amax(1);
                     const torch::Tensor saturated =
                         ((compact_logits.abs() >=
                           0.99 * static_cast<float>(logit_cap_)) &
-                         slot.compact_device_mask).sum();
+                         dev_mask).sum();
                     const torch::Tensor cap_stats = torch::stack(
                         {pre_max.max().to(torch::kFloat64),
                          post_max.max().to(torch::kFloat64),
@@ -3309,10 +3323,10 @@ private:
                     slot.has_cap_stats = true;
                     auto compact_probs = torch::softmax(
                         compact_logits.masked_fill(
-                            slot.compact_device_mask.logical_not(), -1e9f),
+                            dev_mask.logical_not(), -1e9f),
                         1);
-                    slot.compact_host_probs = compact_probs.to(
-                        torch::kCPU, /*non_blocking=*/true);
+                    auto host_probs_slice = slot.compact_host_probs.narrow(0, 0, total_elems).view({compact_count, max_legal});
+                    host_probs_slice.copy_(compact_probs, /*non_blocking=*/true);
                 }
                 slot.host_values.narrow(0, 0, batch_size).copy_(
                     device_values, /*non_blocking=*/true);
@@ -3429,7 +3443,11 @@ private:
         torch::Tensor graph_device_obs;
         at::cuda::MempoolId_t graph_pool;
         std::vector<CapturedForwardGraph> captured_graphs;
+        std::unique_ptr<c10::cuda::CUDAStream> sync_runner_stream;
         if (device_.is_cuda()) {
+            const c10::DeviceIndex dev_idx = device_.index();
+            sync_runner_stream = std::make_unique<c10::cuda::CUDAStream>(
+                c10::cuda::getStreamFromPool(high_priority_stream_, dev_idx));
             graph_device_obs = torch::empty(
                 {target_batch_size_, model_input_dim_},
                 torch::TensorOptions().dtype(torch::kFloat32).device(device_));
@@ -3663,6 +3681,10 @@ private:
             // VirtualGuardImpl on the default path would touch the CUDA guard
             // registry on every physical batch of every run, including CPU runs
             // and runs with telemetry off.
+            std::optional<c10::cuda::CUDAStreamGuard> stream_guard;
+            if (device_.is_cuda()) {
+                stream_guard.emplace(*sync_runner_stream);
+            }
             std::optional<c10::impl::VirtualGuardImpl> dev_impl;
             if (time_device_) {
                 dev_impl.emplace(c10::DeviceType::CUDA);
@@ -3677,6 +3699,8 @@ private:
                     graph_device_obs = torch::empty(
                         {static_cast<int64_t>(batch_size), model_input_dim_},
                         torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+                    captured_graphs.clear();
+                    captured_graphs.resize(batch_size + 1);
                 }
             }
 
@@ -3744,6 +3768,7 @@ private:
                         }
                     }
                     if (has_any_actions) {
+                        outputs.logits = outputs.logits.clone();
                         AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                      device_.is_cuda() && rollout_amp_,
                                                      clear_autocast_cache_per_batch_);
@@ -3776,7 +3801,7 @@ private:
                 if (device_synchronize_) {
                     // Wait for asynchronous transfers to complete before reading.
                     sync_t0 = std::chrono::steady_clock::now();
-                    torch::cuda::synchronize();
+                    sync_runner_stream->synchronize();
                     sync_t1 = std::chrono::steady_clock::now();
                 } else {
                     sync_t0 = sync_t1 = std::chrono::steady_clock::now();
