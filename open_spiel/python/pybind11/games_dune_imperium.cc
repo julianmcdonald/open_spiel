@@ -725,6 +725,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("prioritize_combat_shipping_for_steam",
            &DuneImperiumState::PrioritizeCombatShippingForSteam,
            py::arg("player"))
+      .def("prioritize_combat_influence_for_steam",
+           &DuneImperiumState::PrioritizeCombatInfluenceForSteam,
+           py::arg("player"))
       .def("get_pending_intrigue_choice_player",
            &DuneImperiumState::GetPendingIntrigueChoicePlayerForTesting)
       .def("get_pending_ceremony_peek_cards",
