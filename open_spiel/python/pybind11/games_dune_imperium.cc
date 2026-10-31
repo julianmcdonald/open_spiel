@@ -496,6 +496,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            &DuneImperiumState::GetPendingArmandRevealTrashActive)
       .def("get_pending_armand_reveal_trash_player",
            &DuneImperiumState::GetPendingArmandRevealTrashPlayer)
+      .def("get_pending_disposal_reveal_trash_player",
+           &DuneImperiumState::GetPendingDisposalRevealTrashPlayer)
       .def("get_played_agent_cards",
            &DuneImperiumState::GetPlayedAgentCardsForTesting, py::arg("player"),
            py::return_value_policy::reference_internal)
