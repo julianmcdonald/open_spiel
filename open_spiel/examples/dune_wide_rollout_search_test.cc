@@ -1,6 +1,7 @@
 #include "open_spiel/examples/dune_wide_rollout_search.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -1397,6 +1398,177 @@ void DepthGuardTest() {
   std::filesystem::remove_all(temp_dir);
 }
 
+class AdaptiveIntrigueKnowledgeProbe : public DuneImperiumState {
+ public:
+  AdaptiveIntrigueKnowledgeProbe(const DuneImperiumState& source,
+                                  std::shared_ptr<std::atomic<int>> checks,
+                                  std::shared_ptr<std::atomic<int>> worker_checks,
+                                  Player observer, std::thread::id owner)
+      : DuneImperiumState(source), checks_(std::move(checks)),
+        worker_checks_(std::move(worker_checks)), observer_(observer),
+        owner_(owner) {}
+  std::unique_ptr<State> Clone() const override {
+    auto clean = DuneImperiumState::Clone();
+    return std::make_unique<AdaptiveIntrigueKnowledgeProbe>(
+        *static_cast<DuneImperiumState*>(clean.get()), checks_, worker_checks_, observer_, owner_);
+  }
+  std::unique_ptr<State> ResampleFromInfostate(
+      Player player, std::function<double()> rng) const override {
+    auto sampled = DuneImperiumState::ResampleFromInfostate(player, rng);
+    auto* world = static_cast<DuneImperiumState*>(sampled.get());
+    SPIEL_CHECK_TRUE(world->SteamIntrigueSimulationForSearch());
+    if (checks_->fetch_add(1) == 0) {
+      auto draw = sampled->Clone();
+      auto* drawn = static_cast<DuneImperiumState*>(draw.get());
+      drawn->DrawIntrigueCardsForTesting(player, 2);
+      drawn->ApplyAction(13);
+      drawn->ApplyAction(13);
+      auto later = drawn->DuneImperiumState::ResampleFromInfostate(player, rng);
+      SPIEL_CHECK_TRUE(static_cast<DuneImperiumState*>(later.get())
+                           ->GetIntrigueHandForTesting(player) == std::vector<int>({13, 13}));
+
+      auto offer = sampled->Clone();
+      auto* ceremony = static_cast<DuneImperiumState*>(offer.get());
+      ceremony->BeginImperiumCeremonyPeekForTesting(player);
+      ceremony->ApplyAction(13);
+      ceremony->ApplyAction(31);
+      const auto legal = ceremony->LegalActions();
+      SPIEL_CHECK_TRUE(std::find(legal.begin(), legal.end(), kActionImperiumCeremonyAccept)
+                       != legal.end());
+      ceremony->ApplyAction(kActionImperiumCeremonyAccept);
+      ceremony->ApplyAction(kActionIntrigueChoiceModeB);
+      auto after_choice = ceremony->DuneImperiumState::ResampleFromInfostate(player, rng);
+      auto* retained = static_cast<DuneImperiumState*>(after_choice.get());
+      SPIEL_CHECK_TRUE(retained->GetIntrigueHandForTesting(player) == std::vector<int>({31}));
+      SPIEL_CHECK_TRUE(retained->GetIntrigueDeckTopCardsForTesting() == std::vector<int>({13}));
+    }
+    return sampled;
+  }
+  void ApplyAction(Action action) override {
+    if (std::this_thread::get_id() != owner_ && worker_checks_->fetch_add(1) == 0) {
+      SPIEL_CHECK_TRUE(SteamIntrigueSimulationForSearch());
+      auto descendant = Clone();
+      auto* probe = static_cast<DuneImperiumState*>(descendant.get());
+      SPIEL_CHECK_TRUE(probe->SteamIntrigueSimulationForSearch());
+      auto drain = [](DuneImperiumState* value) {
+        for (int step = 0; value->IsChanceNode(); ++step) {
+          SPIEL_CHECK_LT(step, 40);
+          const auto outcomes = value->ChanceOutcomes();
+          SPIEL_CHECK_FALSE(outcomes.empty());
+          value->ApplyAction(outcomes.front().first);
+        }
+      };
+      auto draw = [&](DuneImperiumState* value, Player player) {
+        drain(value);
+        value->DrawIntrigueCardsForTesting(player, 1);
+        SPIEL_CHECK_TRUE(value->IsChanceNode());
+        const auto operation = value->GetPendingIntrigueOperationForSteam();
+        SPIEL_CHECK_EQ(std::get<0>(operation), "hand_draw");
+        SPIEL_CHECK_EQ(std::get<3>(operation), player);
+        const auto outcomes = value->ChanceOutcomes();
+        SPIEL_CHECK_TRUE(std::any_of(outcomes.begin(), outcomes.end(), [](const auto& item) {
+          return item.first == 13;
+        }));
+        value->ApplyAction(13);
+      };
+      draw(probe, observer_);
+      const auto own_hand = probe->GetIntrigueHandForTesting(observer_);
+      std::mt19937 rng(9173);
+      auto later = probe->DuneImperiumState::ResampleFromInfostate(observer_, [&]() {
+        return std::generate_canonical<double, 53>(rng);
+      });
+      SPIEL_CHECK_TRUE(static_cast<DuneImperiumState*>(later.get())
+                           ->GetIntrigueHandForTesting(observer_) == own_hand);
+
+      auto opponent_state = Clone();
+      auto* opponent_probe = static_cast<DuneImperiumState*>(opponent_state.get());
+      const Player opponent = (observer_ + 1) % kNumPlayers;
+      drain(opponent_probe);
+      const auto before_facts = opponent_probe->GetSteamIntrigueKnowledgeView(observer_);
+      draw(opponent_probe, opponent);
+      const auto after_facts = opponent_probe->GetSteamIntrigueKnowledgeView(observer_);
+      SPIEL_CHECK_TRUE(before_facts == after_facts);
+    }
+    DuneImperiumState::ApplyAction(action);
+  }
+ private:
+  std::shared_ptr<std::atomic<int>> checks_;
+  std::shared_ptr<std::atomic<int>> worker_checks_;
+  Player observer_;
+  std::thread::id owner_;
+};
+
+void AdaptiveSimulatedIntrigueKnowledgeTest() {
+  auto source = LoadGame("dune_imperium")->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(source.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!source->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    source->ApplyAction(source->IsChanceNode() ? source->ChanceOutcomes().front().first
+                                              : source->LegalActions().front());
+  }
+  const Player player = source->CurrentPlayer();
+  for (int p = 0; p < kNumPlayers; ++p) dune->SetPlayerIntriguesForTesting(p, {});
+  dune->SetIntrigueDrawDeckForTesting({13, 13, 31, 44, 50});
+  dune->SetIntrigueDeckTopCardsForTesting({});
+  dune->SetIntrigueDeckBottomCardsForTesting({});
+  SPIEL_CHECK_TRUE(dune->BeginSteamIntrigueKnowledge(player, {}));
+  SPIEL_CHECK_FALSE(dune->SteamIntrigueSimulationForSearch());
+  const auto before = source->Serialize();
+  const auto facts_before = dune->GetSteamIntrigueKnowledgeView(player);
+  const auto temp_dir = std::filesystem::temp_directory_path() /
+      ("dune_adaptive_intrigue_info_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(temp_dir);
+  const int previous_cpu_threads = at::get_num_threads();
+  at::set_num_threads(1);
+  try {
+    const auto checkpoint = (temp_dir / "tiny.pt").string();
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kLegacyInformationStateSize, 16, kNumDistinctPlayerActions, 1);
+    torch::save(model, checkpoint);
+    const auto schema = GetInformationStateSchema(MarketAppendixMode::kNone);
+    std::ofstream metadata(temp_dir / "tiny.json");
+    metadata << "{\"observation_dim\":" << kLegacyInformationStateSize
+             << ",\"hidden_dim\":16,\"num_blocks\":1,"
+             << "\"market_appendix_mode\":\"none\","
+             << "\"feature_schema_sha256\":\"" << schema.sha256 << "\","
+             << "\"enable_semantic_scorer\":false}";
+    metadata.close();
+    auto checks = std::make_shared<std::atomic<int>>(0);
+    auto worker_checks = std::make_shared<std::atomic<int>>(0);
+    auto clean_source = dune->Clone();
+    AdaptiveIntrigueKnowledgeProbe state(
+        *static_cast<DuneImperiumState*>(clean_source.get()), checks, worker_checks,
+        player, std::this_thread::get_id());
+    DuneAdaptiveRolloutSession session(
+        checkpoint, "cpu", 16, 1, 4, 2, 16, 1138,
+        /*use_successive_halving=*/true, /*fixed_top5_candidates=*/false,
+        /*max_inflight_worlds=*/1, /*num_evaluators=*/1);
+    session.set_reserve_ms(0.0);
+    const auto result = session.Search(state, 5000.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_GT(checks->load(), 0);
+    SPIEL_CHECK_GT(worker_checks->load(), 0);
+    SPIEL_CHECK_GT(result.simulations_completed, 0);
+    SPIEL_CHECK_GT(result.diagnostics.stage1_kept_worlds, 0);
+    SPIEL_CHECK_FALSE(result.policy.empty());
+    SPIEL_CHECK_EQ(state.Serialize(), before);
+    SPIEL_CHECK_FALSE(state.SteamIntrigueSimulationForSearch());
+    SPIEL_CHECK_TRUE(state.GetSteamIntrigueKnowledgeView(player) == facts_before);
+    std::cout << "Adaptive simulated intrigue: " << result.simulations_completed
+              << " completed rollouts, " << result.diagnostics.stage1_kept_worlds
+              << " stage-1 worlds, " << checks->load() << " root samples, "
+              << worker_checks->load() << " worker actions seen\n";
+  } catch (...) {
+    at::set_num_threads(previous_cpu_threads);
+    std::filesystem::remove_all(temp_dir);
+    throw;
+  }
+  at::set_num_threads(previous_cpu_threads);
+  std::filesystem::remove_all(temp_dir);
+}
+
 void AdaptivePublicKnowledgeCorrectionTest() {
   auto state = LoadGame("dune_imperium")->NewInitialState();
   auto* dune = static_cast<DuneImperiumState*>(state.get());
@@ -1638,6 +1810,10 @@ void ClockedExceptionSafetyTest(const std::shared_ptr<const Game>& game) {
 
 int main(int argc, char** argv) {
   using namespace open_spiel::dune_imperium;
+  if (argc > 1 && std::string(argv[1]) == "adaptive-intrigue-info") {
+    AdaptiveSimulatedIntrigueKnowledgeTest();
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "public-card-adaptive") {
     AdaptivePublicKnowledgeCorrectionTest();
     return 0;
@@ -1659,5 +1835,6 @@ int main(int argc, char** argv) {
   ContiguousPrefixOrderingTest(game);
   DepthGuardTest();
   AdaptivePublicKnowledgeCorrectionTest();
+  AdaptiveSimulatedIntrigueKnowledgeTest();
   ClockedExceptionSafetyTest(game);
 }

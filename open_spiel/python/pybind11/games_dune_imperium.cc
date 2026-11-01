@@ -400,10 +400,31 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::return_value_policy::reference_internal)
       .def("set_intrigue_discard",
            &DuneImperiumState::SetIntrigueDiscardForTesting, py::arg("discard"))
+      .def("begin_steam_intrigue_knowledge",
+           &DuneImperiumState::BeginSteamIntrigueKnowledge,
+           py::arg("observer"), py::arg("observations"))
+      .def("has_steam_intrigue_knowledge",
+           &DuneImperiumState::HasSteamIntrigueKnowledge, py::arg("observer"))
+      .def("set_steam_intrigue_simulation_for_search",
+           &DuneImperiumState::SetSteamIntrigueSimulationForSearch, py::arg("observer"))
+      .def("steam_intrigue_simulation_for_search",
+           &DuneImperiumState::SteamIntrigueSimulationForSearch)
+      .def("get_pending_intrigue_operation_for_steam",
+           &DuneImperiumState::GetPendingIntrigueOperationForSteam)
+      .def("get_steam_intrigue_knowledge_view",
+           &DuneImperiumState::GetSteamIntrigueKnowledgeView, py::arg("observer"))
+      .def("set_steam_observed_intrigue_chance",
+           &DuneImperiumState::SetSteamObservedIntrigueChance,
+           py::arg("observer"), py::arg("card"), py::arg("action") = -1)
+      .def("clear_steam_observed_intrigue_chance",
+           &DuneImperiumState::ClearSteamObservedIntrigueChance)
       .def("reconcile_intrigue_assignments_for_steam",
            &DuneImperiumState::ReconcileIntrigueAssignmentsForSteam,
            py::arg("observer"), py::arg("observations"), py::arg("required_action") = -1)
       .def("resync_intrigue_hand_for_steam", &DuneImperiumState::ResyncIntrigueHandForSteam,
+           py::arg("observer"), py::arg("player"), py::arg("count"), py::arg("observations"))
+      .def("replace_steam_intrigue_hand_for_steam",
+           &DuneImperiumState::ReplaceSteamIntrigueHandForSteam,
            py::arg("observer"), py::arg("player"), py::arg("count"), py::arg("observations"))
       .def("get_intrigue_inventory_for_steam", [](const DuneImperiumState& s) {
         py::dict result;
@@ -709,6 +730,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_intrigue_deck_top_cards",
            &DuneImperiumState::SetIntrigueDeckTopCardsForTesting,
            py::arg("cards"))
+      .def("set_intrigue_deck_bottom_cards_for_testing",
+           &DuneImperiumState::SetIntrigueDeckBottomCardsForTesting, py::arg("cards"))
+      .def("set_intrigue_deck_bottom_card_owners_for_testing",
+           &DuneImperiumState::SetIntrigueDeckBottomCardOwnersForTesting, py::arg("owners"))
+      .def("draw_intrigue_cards_for_testing",
+           &DuneImperiumState::DrawIntrigueCardsForTesting, py::arg("player"), py::arg("count"))
       .def("set_hundro_player", &DuneImperiumState::SetHundroPlayerForTesting,
            py::arg("player"))
       .def(
@@ -773,6 +800,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_pending_ceremony_peek_cards",
            &DuneImperiumState::SetPendingCeremonyPeekForTesting,
            py::arg("player"), py::arg("cards"))
+      .def("begin_imperium_ceremony_peek_for_testing",
+           &DuneImperiumState::BeginImperiumCeremonyPeekForTesting, py::arg("player"))
 
       // --- Action helpers ---
       .def("gain_troops", &DuneImperiumState::GainTroopsForTesting,
