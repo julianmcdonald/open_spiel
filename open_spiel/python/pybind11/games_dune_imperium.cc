@@ -400,6 +400,44 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::return_value_policy::reference_internal)
       .def("set_intrigue_discard",
            &DuneImperiumState::SetIntrigueDiscardForTesting, py::arg("discard"))
+      .def("reconcile_intrigue_assignments_for_steam",
+           &DuneImperiumState::ReconcileIntrigueAssignmentsForSteam,
+           py::arg("observer"), py::arg("observations"), py::arg("required_action") = -1)
+      .def("resync_intrigue_hand_for_steam", &DuneImperiumState::ResyncIntrigueHandForSteam,
+           py::arg("observer"), py::arg("player"), py::arg("count"), py::arg("observations"))
+      .def("get_intrigue_inventory_for_steam", [](const DuneImperiumState& s) {
+        py::dict result;
+        std::vector<std::vector<int>> hands;
+        for (int p = 0; p < open_spiel::dune_imperium::kNumPlayers; ++p)
+          hands.push_back(s.GetPlayerIntrigues(p));
+        result["hands"] = py::cast(hands);
+        result["draw_bag"] = py::cast(s.GetIntrigueDrawDeckForTesting());
+        result["topdeck"] = py::cast(s.GetIntrigueDeckTopCardsForTesting());
+        result["bottomdeck"] = py::cast(s.GetIntrigueDeckBottomCardsForTesting());
+        result["bottomdeck_owners"] = py::cast(s.GetIntrigueDeckBottomCardOwnersForTesting());
+        const int ceremony_player = s.GetPendingCeremonyPlayer();
+        result["ceremony"] = ceremony_player >= 0
+            ? py::cast(s.GetPendingCeremonyPeekCards())
+            : py::cast(std::array<int, 2>{-1, -1});
+        result["ceremony_player"] = ceremony_player;
+        result["discard"] = py::cast(s.GetIntrigueDiscardForTesting());
+        const int hundro_player = s.GetPendingHundroSetupPlayer();
+        // This offer aliases the last two hand entries; it is not another zone.
+        result["hundro_offer"] = hundro_player >= 0
+            ? py::make_tuple(s.GetPendingHundroSetupCard(0), s.GetPendingHundroSetupCard(1))
+            : py::make_tuple(-1, -1);
+        result["hundro_player"] = hundro_player;
+        return result;
+      })
+      .def("get_pending_steal_intrigue_for_steam", &DuneImperiumState::GetPendingStealIntrigueForSteam)
+      .def("set_steam_intrigue_search_constraints", &DuneImperiumState::SetSteamIntrigueSearchConstraints,
+           py::arg("observer"), py::arg("observations"))
+      .def("set_steam_endgame_intrigue_evidence", &DuneImperiumState::SetSteamEndgameIntrigueEvidence,
+           py::arg("hands"), py::arg("optional_selections") = std::vector<std::vector<int>>{})
+      .def("get_steam_endgame_intrigue_evidence", &DuneImperiumState::GetSteamEndgameIntrigueEvidence)
+      .def("get_steam_endgame_intrigue_selections", &DuneImperiumState::GetSteamEndgameIntrigueSelections)
+      .def("has_steam_endgame_intrigue_evidence", &DuneImperiumState::HasSteamEndgameIntrigueEvidence)
+      .def("clear_steam_endgame_intrigue_evidence", &DuneImperiumState::ClearSteamEndgameIntrigueEvidence)
       .def("get_intrigue_hand", &DuneImperiumState::GetIntrigueHandForTesting,
            py::arg("player"), py::return_value_policy::reference_internal)
       .def("get_intrigue_draw_deck",
