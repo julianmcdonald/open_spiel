@@ -662,6 +662,14 @@ if (OPEN_SPIEL_BUILD_WITH_LIBTORCH)
   target_link_libraries(dune_f_verification dune_search ${TORCH_LIBRARIES})
   add_test(NAME dune_f_verification COMMAND dune_f_verification)
 
+  add_executable(dune_bf16_cache_verification_test dune_bf16_cache_verification_test.cc
+    $<TARGET_OBJECTS:dune_imperium_test_utils_obj>
+    $<TARGET_OBJECTS:dune_ppo_utils_obj>
+    $<TARGET_OBJECTS:dune_collector_obj>
+    ${OPEN_SPIEL_OBJECTS})
+  target_link_libraries(dune_bf16_cache_verification_test dune_search ${TORCH_LIBRARIES})
+  add_test(NAME dune_bf16_cache_verification_test COMMAND dune_bf16_cache_verification_test)
+
   add_executable(dune_purchase_identity_test
     ../games/dune_imperium/dune_purchase_identity_test.cc
     $<TARGET_OBJECTS:dune_imperium_test_utils_obj> ${OPEN_SPIEL_OBJECTS})

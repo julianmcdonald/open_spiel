@@ -556,10 +556,13 @@ bool ValidatePpoPrecisionManifestCompatibility(
     out->rollout_amp = rollout_it->second.GetBool();
     out->allow_tf32 = tf32_it->second.GetBool();
     if (out->rollout_amp != current_rollout_amp) {
-      return fail(absl::StrFormat(
-          "rollout_amp mismatch. Current: %s, Manifest: %s",
-          current_rollout_amp ? "true" : "false",
-          out->rollout_amp ? "true" : "false"));
+      if (permitted_transition_source_fingerprint.empty() ||
+          stored_config_fingerprint != permitted_transition_source_fingerprint) {
+        return fail(absl::StrFormat(
+            "rollout_amp mismatch. Current: %s, Manifest: %s",
+            current_rollout_amp ? "true" : "false",
+            out->rollout_amp ? "true" : "false"));
+      }
     }
     if (out->allow_tf32 != current_allow_tf32) {
       if (permitted_transition_source_fingerprint.empty() ||

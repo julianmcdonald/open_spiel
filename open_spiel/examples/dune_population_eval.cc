@@ -862,7 +862,8 @@ void WorkerThread(
     auto snapshot_round_ends = [&]() {
       if (!dune_state) return;
       int cur = dune_state->GetCurrentRound();
-      while (last_round >= 0 && last_round < cur) {
+      const int limit = state->IsTerminal() ? (cur + 1) : cur;
+      while (last_round >= 0 && last_round < limit) {
         if (last_round >= 1 && last_round <= kMaxRounds) {
           for (int p = 0; p < kNumPlayers; ++p) {
             vp_at_round_end[last_round][p] = dune_state->GetPlayerVp(p);
@@ -1150,8 +1151,7 @@ void WorkerThread(
     gr.chance_seed = chance_seed;
     gr.game_return = returns[model_player];
     if (dune_state) {
-      gr.ending_round = dune_state->IsTerminal() ? (dune_state->GetCurrentRound() - 1)
-                                                 : dune_state->GetCurrentRound();
+      gr.ending_round = dune_state->GetCurrentRound();
     } else {
       gr.ending_round = -1;
     }
@@ -1268,7 +1268,7 @@ void WorkerThread(
       // appears, the engine's end condition changed under a frozen engine.
       if (!gr.terminal_threshold_set.empty()) {
         gr.terminal_reason = "threshold";
-      } else if (dune_state->GetCurrentRound() > kMaxRounds) {
+      } else if (dune_state->GetCurrentRound() >= kMaxRounds) {
         gr.terminal_reason = "round_limit";
       }
     }

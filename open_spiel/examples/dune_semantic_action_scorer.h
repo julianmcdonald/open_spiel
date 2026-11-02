@@ -17,6 +17,10 @@
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <torch/torch.h>
+#include <torch/nn/functional/linear.h>
+#include <ATen/autocast_mode.h>
+#include <c10/core/Event.h>
+#include <c10/cuda/CUDAStream.h>
 #endif
 
 namespace open_spiel {
@@ -419,6 +423,45 @@ inline void ExtractCandidateDescriptors(
 
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
+// Helper struct for persistent BF16 inference weights.
+// Holds un-registered BF16 weight and bias tensors updated in place.
+struct Bf16LinearCache {
+  torch::Tensor weight;
+  torch::Tensor bias;
+
+  void Refresh(const torch::nn::Linear& fc) {
+    if (!fc || !fc->weight.defined() || !fc->weight.is_cuda()) return;
+    torch::NoGradGuard no_grad;
+    if (!weight.defined() || weight.sizes() != fc->weight.sizes() ||
+        weight.device() != fc->weight.device() ||
+        weight.scalar_type() != torch::kBFloat16) {
+      weight = torch::empty(fc->weight.sizes(),
+                            fc->weight.options().dtype(torch::kBFloat16));
+    }
+    weight.copy_(fc->weight);
+    if (fc->bias.defined()) {
+      if (!bias.defined() || bias.sizes() != fc->bias.sizes() ||
+          bias.device() != fc->bias.device() ||
+          bias.scalar_type() != torch::kBFloat16) {
+        bias = torch::empty(fc->bias.sizes(),
+                            fc->bias.options().dtype(torch::kBFloat16));
+      }
+      bias.copy_(fc->bias);
+    } else {
+      bias = torch::Tensor();
+    }
+  }
+
+  torch::Tensor Forward(const torch::nn::Linear& fc, const torch::Tensor& x,
+                        bool use_bf16_cache) const {
+    if (use_bf16_cache && !torch::GradMode::is_enabled() && weight.defined() &&
+        at::autocast::is_autocast_enabled(at::kCUDA) && x.is_cuda()) {
+      return torch::nn::functional::linear(x, weight, bias);
+    }
+    return const_cast<torch::nn::Linear&>(fc)->forward(x);
+  }
+};
+
 // Neural Semantic Action Scorer Module.
 // Computes a scalar correction from the actor representation and candidate action descriptors.
 struct SemanticActionScorerImpl : torch::nn::Module {
@@ -434,6 +477,14 @@ struct SemanticActionScorerImpl : torch::nn::Module {
   torch::nn::Linear out_layer_ext{nullptr};
   torch::nn::Linear out_layer_f{nullptr};
   bool enable_f_ = false;
+
+  Bf16LinearCache desc_proj_bf16_;
+  Bf16LinearCache trunk_proj_bf16_;
+  Bf16LinearCache mlp1_bf16_;
+  Bf16LinearCache out_layer_bf16_;
+  Bf16LinearCache out_layer_ext_bf16_;
+  Bf16LinearCache out_layer_f_bf16_;
+  bool use_bf16_cache_ = false;
 
   SemanticActionScorerImpl(bool enable_f = false) : enable_f_(enable_f) {
     card_embedding = register_module(
@@ -485,7 +536,32 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       if (out_layer_f->bias.defined()) {
         out_layer_f->bias.zero_();
       }
+      if (use_bf16_cache_) {
+        out_layer_f_bf16_.Refresh(out_layer_f);
+      }
     }
+  }
+
+  void RefreshBf16Cache() {
+    desc_proj_bf16_.Refresh(desc_proj);
+    trunk_proj_bf16_.Refresh(trunk_proj);
+    mlp1_bf16_.Refresh(mlp1);
+    out_layer_bf16_.Refresh(out_layer);
+    if (out_layer_ext) {
+      out_layer_ext_bf16_.Refresh(out_layer_ext);
+    }
+    if (out_layer_f) {
+      out_layer_f_bf16_.Refresh(out_layer_f);
+    }
+    use_bf16_cache_ = true;
+  }
+
+  void DisableBf16Cache() {
+    use_bf16_cache_ = false;
+  }
+
+  bool bf16_cache_ready() const {
+    return use_bf16_cache_;
   }
 
   void Load(torch::serialize::InputArchive& archive,
@@ -564,18 +640,18 @@ struct SemanticActionScorerImpl : torch::nn::Module {
     auto s_emb = space_embedding->forward(space_ids);   // [M, 16]
     auto d_full = torch::cat({feat_tensor, c_emb, s_emb}, -1); // [M, 104]
 
-    auto d_p = torch::relu(desc_ln->forward(desc_proj->forward(d_full)));  // [M, 256]
-    auto h_p = torch::relu(trunk_ln->forward(trunk_proj->forward(trunk))); // [B, 256]
+    auto d_p = torch::relu(desc_ln->forward(desc_proj_bf16_.Forward(desc_proj, d_full, use_bf16_cache_)));  // [M, 256]
+    auto h_p = torch::relu(trunk_ln->forward(trunk_proj_bf16_.Forward(trunk_proj, trunk, use_bf16_cache_))); // [B, 256]
     auto h_gathered = h_p.index_select(0, batch_indices);                  // [M, 256]
 
     auto z = torch::cat({h_gathered, d_p}, -1);                            // [M, 512]
-    auto u = torch::relu(mlp1_ln->forward(mlp1->forward(z)));              // [M, 256]
+    auto u = torch::relu(mlp1_ln->forward(mlp1_bf16_.Forward(mlp1, z, use_bf16_cache_)));              // [M, 256]
     
-    auto legacy_corr = out_layer->forward(u).squeeze(-1);                  // [M]
-    auto ext_corr = out_layer_ext->forward(u).squeeze(-1);                 // [M]
+    auto legacy_corr = out_layer_bf16_.Forward(out_layer, u, use_bf16_cache_).squeeze(-1);                  // [M]
+    auto ext_corr = out_layer_ext_bf16_.Forward(out_layer_ext, u, use_bf16_cache_).squeeze(-1);                 // [M]
     torch::Tensor raw_corr;
     if (enable_f_ && out_layer_f && is_f_mask.defined() && is_f_mask.numel() > 0) {
-      auto f_corr = out_layer_f->forward(u).squeeze(-1);                   // [M]
+      auto f_corr = out_layer_f_bf16_.Forward(out_layer_f, u, use_bf16_cache_).squeeze(-1);                   // [M]
       torch::Tensor base_corr;
       if (is_ext_mask.defined() && is_ext_mask.numel() > 0) {
         base_corr = torch::where(is_ext_mask, ext_corr, legacy_corr);
@@ -613,27 +689,22 @@ inline void ApplySemanticScorerBatch(
 
   const bool on_cuda = device.is_cuda();
   const int64_t m = static_cast<int64_t>(total_cands);
+  auto host_opts = torch::TensorOptions().pinned_memory(on_cuda);
 
-  torch::Tensor ints_host = torch::empty(
-      {4, m},
-      torch::TensorOptions().dtype(torch::kInt64).pinned_memory(on_cuda));
-  torch::Tensor bools_host = torch::empty(
-      {2, m},
-      torch::TensorOptions().dtype(torch::kBool).pinned_memory(on_cuda));
-  torch::Tensor supp_host = torch::empty(
-      {m},
-      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(on_cuda));
+  torch::Tensor ints_host = torch::empty({4, m}, host_opts.dtype(torch::kInt64));
+  torch::Tensor bools_host = torch::empty({2, m}, host_opts.dtype(torch::kBool));
+  torch::Tensor supp_host = torch::empty({m}, host_opts.dtype(torch::kFloat32));
   torch::Tensor feat_host = torch::empty(
       {m, static_cast<int64_t>(kSemanticFeatDim)},
-      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(on_cuda));
+      host_opts.dtype(torch::kFloat32));
 
   int64_t* b_ptr = ints_host.data_ptr<int64_t>();
-  int64_t* a_ptr = b_ptr + total_cands;
-  int64_t* c_ptr = b_ptr + 2 * total_cands;
-  int64_t* s_ptr = b_ptr + 3 * total_cands;
+  int64_t* a_ptr = b_ptr + m;
+  int64_t* c_ptr = b_ptr + 2 * m;
+  int64_t* s_ptr = b_ptr + 3 * m;
 
   bool* is_ext_ptr = bools_host.data_ptr<bool>();
-  bool* is_f_ptr = is_ext_ptr + total_cands;
+  bool* is_f_ptr = is_ext_ptr + m;
 
   float* supp_ptr = supp_host.data_ptr<float>();
   float* feat_ptr = feat_host.data_ptr<float>();

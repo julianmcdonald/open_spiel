@@ -2383,38 +2383,76 @@ std::string ValidateAndComputeTf32TransitionFingerprint(
   }
   const auto& manifest_obj = val_opt->GetObject();
 
+  bool source_rollout_amp = absl::GetFlag(FLAGS_rollout_amp);
+  auto rollout_it = manifest_obj.find("rollout_amp");
+  if (rollout_it != manifest_obj.end() && rollout_it->second.IsBool()) {
+    source_rollout_amp = rollout_it->second.GetBool();
+  }
+
   bool source_allow_tf32 = !absl::GetFlag(FLAGS_allow_tf32);
   auto tf32_it = manifest_obj.find("allow_tf32");
   if (tf32_it != manifest_obj.end() && tf32_it->second.IsBool()) {
     source_allow_tf32 = tf32_it->second.GetBool();
   }
 
-  if (source_allow_tf32 == absl::GetFlag(FLAGS_allow_tf32)) {
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  bool source_train_amp = absl::GetFlag(FLAGS_train_amp);
+  auto train_amp_it = manifest_obj.find("train_amp");
+  if (train_amp_it != manifest_obj.end() && train_amp_it->second.IsBool()) {
+    source_train_amp = train_amp_it->second.GetBool();
+    source_config_obj["train_amp"] = source_train_amp;
+  } else {
+    // If manifest doesn't have "train_amp" explicitly stored as a manifest root field:
+    // Check if manifest_obj["config_fingerprint"] matches fp with current train_amp.
+    std::string stored_fp = "";
+    auto fp_it = manifest_obj.find("config_fingerprint");
+    if (fp_it != manifest_obj.end() && fp_it->second.IsString()) {
+      stored_fp = fp_it->second.GetString();
+    }
+    const std::string fp_same_train_amp = open_spiel::ComputePrecisionConfigFingerprint(
+        source_config_obj, source_rollout_amp, source_allow_tf32);
+    if (!stored_fp.empty() && stored_fp != fp_same_train_amp) {
+      source_config_obj["train_amp"] = !absl::GetFlag(FLAGS_train_amp);
+      const std::string fp_flipped = open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, source_rollout_amp, source_allow_tf32);
+      if (stored_fp == fp_flipped) {
+        source_train_amp = !absl::GetFlag(FLAGS_train_amp);
+      } else {
+        source_config_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
+      }
+    }
+  }
+
+  if (source_allow_tf32 == absl::GetFlag(FLAGS_allow_tf32) &&
+      source_rollout_amp == absl::GetFlag(FLAGS_rollout_amp) &&
+      source_train_amp == absl::GetFlag(FLAGS_train_amp)) {
     SpielFatalError(absl::StrFormat(
-        "allow_tf32 transition was requested, but source manifest allow_tf32 (%s) matches current allow_tf32 (%s).",
+        "allow_tf32/precision transition was requested, but source manifest precision settings "
+        "(rollout_amp=%s, allow_tf32=%s, train_amp=%s) match current settings.",
+        source_rollout_amp ? "true" : "false",
         source_allow_tf32 ? "true" : "false",
-        absl::GetFlag(FLAGS_allow_tf32) ? "true" : "false"));
+        source_train_amp ? "true" : "false"));
   }
 
   const std::string computed_source_fp =
       open_spiel::ComputePrecisionConfigFingerprint(
-          BuildPrePrecisionConfigFingerprintObject(),
-          absl::GetFlag(FLAGS_rollout_amp),
+          source_config_obj,
+          source_rollout_amp,
           source_allow_tf32);
 
   const std::string expected_source_fp =
       absl::GetFlag(FLAGS_tf32_transition_source_fingerprint);
   if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
     SpielFatalError(absl::StrFormat(
-        "allow_tf32 transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        "allow_tf32/precision transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
         expected_source_fp, computed_source_fp));
   }
   auto fp_it = manifest_obj.find("config_fingerprint");
   if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
       fp_it->second.GetString() != computed_source_fp) {
     SpielFatalError(absl::StrFormat(
-        "allow_tf32 transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
-        "  Note: allow_tf32_transition permits ONLY allow_tf32 to differ from the parent manifest. All other settings must match exactly.",
+        "allow_tf32/precision transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_tf32_transition permits ONLY precision settings (allow_tf32, rollout_amp, train_amp) to differ from the parent manifest. All other settings must match exactly.",
         (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
         computed_source_fp));
   }
@@ -2430,11 +2468,17 @@ std::string ValidateAndComputeTf32TransitionFingerprint(
       "  Source update:      %lld\n"
       "  Source fingerprint: %s\n"
       "  Target fingerprint: %s\n"
-      "  allow_tf32:         %s -> %s\n",
+      "  allow_tf32:         %s -> %s\n"
+      "  rollout_amp:        %s -> %s\n"
+      "  train_amp:          %s -> %s\n",
       static_cast<long long>(source_global_update),
       computed_source_fp, current_config_fingerprint,
       source_allow_tf32 ? "true" : "false",
-      absl::GetFlag(FLAGS_allow_tf32) ? "true" : "false") << std::endl;
+      absl::GetFlag(FLAGS_allow_tf32) ? "true" : "false",
+      source_rollout_amp ? "true" : "false",
+      absl::GetFlag(FLAGS_rollout_amp) ? "true" : "false",
+      source_train_amp ? "true" : "false",
+      absl::GetFlag(FLAGS_train_amp) ? "true" : "false") << std::endl;
   return computed_source_fp;
 }
 
@@ -2458,6 +2502,9 @@ void UpdateEmaWeights(
     if (it != nullptr) {
       it->copy_(kv.value().detach());
     }
+  }
+  if (ema_model->bf16_inference_cache_ready()) {
+    ema_model->RefreshBf16InferenceCache();
   }
 }
 
@@ -2549,6 +2596,7 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     WritePpoPrecisionManifestFields(
         manifest_obj, absl::GetFlag(FLAGS_rollout_amp),
         absl::GetFlag(FLAGS_allow_tf32));
+    manifest_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = run_uuid;
     manifest_obj["model_filename"] = std::filesystem::path(model_path).filename().string();
@@ -10832,6 +10880,7 @@ int main(int argc, char** argv) {
     WritePpoPrecisionManifestFields(
         manifest_obj, absl::GetFlag(FLAGS_rollout_amp),
         absl::GetFlag(FLAGS_allow_tf32));
+    manifest_obj["train_amp"] = absl::GetFlag(FLAGS_train_amp);
     manifest_obj["search_label_fingerprint"] = search_label_fingerprint;
     manifest_obj["run_uuid"] = open_spiel::GenerateUUID();
     manifest_obj["checkpoint_uuid"] = open_spiel::GenerateUUID();

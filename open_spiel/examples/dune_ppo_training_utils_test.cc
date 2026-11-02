@@ -2131,6 +2131,19 @@ void TestPpoPrecisionFingerprintAndManifestMigration() {
                           default_fingerprint, pre_fingerprint, "", true,
                           true, &compatibility, &error));
     UTILS_CHECK(error.find("rollout_amp mismatch") != std::string::npos);
+
+    // Permitted rollout_amp transition matching stored source fingerprint succeeds.
+    UTILS_CHECK(validate(mismatched, fp32_fingerprint,
+                         default_fingerprint, pre_fingerprint, "", true,
+                         true, &compatibility, &error, fp32_fingerprint));
+    UTILS_CHECK(compatibility.reward_transition);
+    UTILS_CHECK(compatibility.reward_transition_source_fingerprint == fp32_fingerprint);
+
+    // Mismatched permitted transition source fingerprint for rollout_amp fails.
+    UTILS_CHECK(!validate(mismatched, fp32_fingerprint,
+                         default_fingerprint, pre_fingerprint, "", true,
+                         true, &compatibility, &error, "wrong_source_fingerprint"));
+    UTILS_CHECK(error.find("rollout_amp mismatch") != std::string::npos);
     mismatched = fresh;
     mismatched["allow_tf32"] = false;
     UTILS_CHECK(!validate(mismatched, default_fingerprint,
@@ -2150,6 +2163,23 @@ void TestPpoPrecisionFingerprintAndManifestMigration() {
                           default_fingerprint, pre_fingerprint, "", true,
                           true, &compatibility, &error, "wrong_source_fingerprint"));
     UTILS_CHECK(error.find("allow_tf32 mismatch") != std::string::npos);
+
+    // Permitted combined rollout_amp + allow_tf32 transition matching stored source fingerprint succeeds.
+    auto mismatched_both = fresh;
+    mismatched_both["rollout_amp"] = false;
+    mismatched_both["allow_tf32"] = false;
+    const std::string both_mismatched_fingerprint =
+        ComputePrecisionConfigFingerprint(pre_precision, false, false);
+    UTILS_CHECK(!validate(mismatched_both, both_mismatched_fingerprint,
+                          default_fingerprint, pre_fingerprint, "", true,
+                          true, &compatibility, &error));
+    UTILS_CHECK(error.find("rollout_amp mismatch") != std::string::npos ||
+                error.find("allow_tf32 mismatch") != std::string::npos);
+    UTILS_CHECK(validate(mismatched_both, both_mismatched_fingerprint,
+                         default_fingerprint, pre_fingerprint, "", true,
+                         true, &compatibility, &error, both_mismatched_fingerprint));
+    UTILS_CHECK(compatibility.reward_transition);
+    UTILS_CHECK(compatibility.reward_transition_source_fingerprint == both_mismatched_fingerprint);
     mismatched = fresh;
     mismatched["rollout_amp"] = "true";
     UTILS_CHECK(!validate(mismatched, default_fingerprint,

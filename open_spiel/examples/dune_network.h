@@ -38,12 +38,17 @@
 
 namespace open_spiel {
 
+using dune_semantic::Bf16LinearCache;
+
 // 1. Residual Block Definition
 struct ResBlockImpl : torch::nn::Module {
   torch::nn::Linear fc1{nullptr};
   torch::nn::Linear fc2{nullptr};
   torch::nn::LayerNorm ln1{nullptr};
   torch::nn::LayerNorm ln2{nullptr};
+
+  Bf16LinearCache fc1_bf16_;
+  Bf16LinearCache fc2_bf16_;
 
   ResBlockImpl(int64_t dim) {
     fc1 = register_module("fc1", torch::nn::Linear(dim, dim));
@@ -52,10 +57,15 @@ struct ResBlockImpl : torch::nn::Module {
     ln2 = register_module("ln2", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
   }
 
-  torch::Tensor forward(torch::Tensor x) {
+  void RefreshBf16Cache() {
+    fc1_bf16_.Refresh(fc1);
+    fc2_bf16_.Refresh(fc2);
+  }
+
+  torch::Tensor forward(torch::Tensor x, bool use_bf16_cache = false) {
     torch::Tensor residual = x;
-    x = torch::relu(ln1->forward(fc1->forward(x)));
-    x = ln2->forward(fc2->forward(x));
+    x = torch::relu(ln1->forward(fc1_bf16_.Forward(fc1, x, use_bf16_cache)));
+    x = ln2->forward(fc2_bf16_.Forward(fc2, x, use_bf16_cache));
     return torch::relu(x + residual);
   }
 };
@@ -82,6 +92,10 @@ struct ZoneEncoderImpl : torch::nn::Module {
 
   torch::Tensor tleilaxu_card_map_;
 
+  Bf16LinearCache fc1_bf16_;
+  Bf16LinearCache out_proj_bf16_;
+  torch::Tensor card_embed_bf16_;
+
   ZoneEncoderImpl() {
     fc1 = register_module("fc1", torch::nn::Linear(kZoneInputDim, kZoneHiddenDim));
     ln1 = register_module("ln1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kZoneHiddenDim})));
@@ -104,7 +118,24 @@ struct ZoneEncoderImpl : torch::nn::Module {
     if (archive.try_read("out_proj", out_arch)) out_proj->load(out_arch);
   }
 
-  torch::Tensor forward(const torch::Tensor& obs, const torch::Tensor& card_embed_table) {
+  void RefreshBf16Cache(const torch::Tensor& card_embed) {
+    fc1_bf16_.Refresh(fc1);
+    out_proj_bf16_.Refresh(out_proj);
+    if (card_embed.defined() && card_embed.is_cuda()) {
+      torch::NoGradGuard no_grad;
+      if (!card_embed_bf16_.defined() || card_embed_bf16_.sizes() != card_embed.sizes() ||
+          card_embed_bf16_.device() != card_embed.device() ||
+          card_embed_bf16_.scalar_type() != torch::kBFloat16) {
+        card_embed_bf16_ = torch::empty(card_embed.sizes(),
+                                        card_embed.options().dtype(torch::kBFloat16));
+      }
+      card_embed_bf16_.copy_(card_embed);
+    } else {
+      card_embed_bf16_ = torch::Tensor();
+    }
+  }
+
+  torch::Tensor forward(const torch::Tensor& obs, const torch::Tensor& card_embed_table, bool use_bf16_cache = false) {
     if (obs.size(1) < dune_imperium::kFullPublicInformationStateSize) {
       return torch::zeros({obs.size(0), kTrunkDim}, obs.options());
     }
@@ -126,7 +157,11 @@ struct ZoneEncoderImpl : torch::nn::Module {
 
     const int64_t B = obs.size(0);
     // card_embed_table is [256, 32]; slice to [126, 32]
-    auto card_embed = card_embed_table.slice(0, 0, dune_imperium::kNumImperiumCardIds);
+    auto card_embed = (use_bf16_cache && !torch::GradMode::is_enabled() &&
+                       card_embed_bf16_.defined() &&
+                       at::autocast::is_autocast_enabled(at::kCUDA) && obs.is_cuda())
+                          ? card_embed_bf16_.slice(0, 0, dune_imperium::kNumImperiumCardIds)
+                          : card_embed_table.slice(0, 0, dune_imperium::kNumImperiumCardIds);
     const int64_t C = card_embed.size(1); // 32
 
     // 1. Self piles: 5 piles x 126 dims, starting at 475 (hand, draw, discard, played, revealed)
@@ -186,8 +221,8 @@ struct ZoneEncoderImpl : torch::nn::Module {
         imp_discard_embed   // 32
     }, 1); // Total: 1370 dims
 
-    auto h = torch::relu(ln1->forward(fc1->forward(zone_repr)));
-    return out_proj->forward(h);
+    auto h = torch::relu(ln1->forward(fc1_bf16_.Forward(fc1, zone_repr, use_bf16_cache)));
+    return out_proj_bf16_.Forward(out_proj, h, use_bf16_cache);
   }
 };
 TORCH_MODULE(ZoneEncoder);
@@ -200,6 +235,12 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear value_head{nullptr};
   torch::nn::Linear value_head2{nullptr};
   bool use_nonlinear_value_head_ = false;
+
+  Bf16LinearCache input_layer_bf16_;
+  Bf16LinearCache policy_head_bf16_;
+  Bf16LinearCache value_head_bf16_;
+  Bf16LinearCache value_head2_bf16_;
+  bool use_bf16_inference_cache_ = false;
 
   // --- PWO-5 section 7.2: the three auxiliary heads. -----------------------
   //
@@ -394,6 +435,40 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     }
   }
 
+  void RefreshBf16InferenceCache() {
+    input_layer_bf16_.Refresh(input_layer);
+    for (auto& block : res_blocks) {
+      if (block) {
+        block->RefreshBf16Cache();
+      }
+    }
+    policy_head_bf16_.Refresh(policy_head);
+    if (value_head) {
+      value_head_bf16_.Refresh(value_head);
+    }
+    if (use_nonlinear_value_head_ && value_head2) {
+      value_head2_bf16_.Refresh(value_head2);
+    }
+    if (with_semantic_scorer_ && semantic_scorer_) {
+      semantic_scorer_->RefreshBf16Cache();
+      if (enable_zone_encoder_ && zone_encoder_) {
+        zone_encoder_->RefreshBf16Cache(semantic_scorer_->card_embedding->weight);
+      }
+    }
+    use_bf16_inference_cache_ = true;
+  }
+
+  void DisableBf16InferenceCache() {
+    use_bf16_inference_cache_ = false;
+    if (with_semantic_scorer_ && semantic_scorer_) {
+      semantic_scorer_->DisableBf16Cache();
+    }
+  }
+
+  bool bf16_inference_cache_ready() const {
+    return use_bf16_inference_cache_;
+  }
+
   struct ModelOutputs {
     torch::Tensor logits;
     torch::Tensor values;
@@ -410,13 +485,13 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   // Shared trunk. Split out of forward() so ForwardAux() reuses exactly the
   // same computation rather than a parallel copy of it.
   torch::Tensor Trunk(torch::Tensor x) {
-    torch::Tensor trunk_in = input_layer->forward(x);
+    torch::Tensor trunk_in = input_layer_bf16_.Forward(input_layer, x, use_bf16_inference_cache_);
     if (enable_zone_encoder_ && zone_encoder_ && with_semantic_scorer_ && semantic_scorer_) {
-      trunk_in = trunk_in + zone_encoder_->forward(x, semantic_scorer_->card_embedding->weight);
+      trunk_in = trunk_in + zone_encoder_->forward(x, semantic_scorer_->card_embedding->weight, use_bf16_inference_cache_);
     }
     x = torch::relu(trunk_in);
     for (auto& block : res_blocks) {
-      x = block->forward(x);
+      x = block->forward(x, use_bf16_inference_cache_);
     }
     return x;
   }
@@ -424,13 +499,13 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   ModelOutputs forward(torch::Tensor x) {
     x = Trunk(x);
 
-    torch::Tensor logits = policy_head->forward(x);
+    torch::Tensor logits = policy_head_bf16_.Forward(policy_head, x, use_bf16_inference_cache_);
     torch::Tensor values;
     if (use_nonlinear_value_head_) {
-      auto h = torch::relu(value_head->forward(x));
-      values = torch::tanh(value_head2->forward(h));
+      auto h = torch::relu(value_head_bf16_.Forward(value_head, x, use_bf16_inference_cache_));
+      values = torch::tanh(value_head2_bf16_.Forward(value_head2, h, use_bf16_inference_cache_));
     } else {
-      values = torch::tanh(value_head->forward(x));
+      values = torch::tanh(value_head_bf16_.Forward(value_head, x, use_bf16_inference_cache_));
     }
     return {logits, values, x};
   }
@@ -491,6 +566,12 @@ inline void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> sourc
   target->deck_pool_semantics_ = source->deck_pool_semantics_;
   target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
   target->enable_zone_encoder_ = source->enable_zone_encoder_;
+  if (target->bf16_inference_cache_ready() || source->bf16_inference_cache_ready()) {
+    target->RefreshBf16InferenceCache();
+  }
+  if (!target->parameters().empty() && target->parameters().front().is_cuda()) {
+    c10::cuda::getCurrentCUDAStream().synchronize();
+  }
 }
 
 inline void CopyInputToOrderedCardSlots(
@@ -855,6 +936,13 @@ inline void LoadModelCheckpointRobust(
     if (archive.try_read("zone_encoder", z_arch)) {
       model->zone_encoder_->load(z_arch);
     }
+  }
+
+  if (model->bf16_inference_cache_ready()) {
+    model->RefreshBf16InferenceCache();
+  }
+  if (!model->parameters().empty() && model->parameters().front().is_cuda()) {
+    c10::cuda::getCurrentCUDAStream().synchronize();
   }
 }
 
@@ -2190,6 +2278,17 @@ public:
         if (critic_model_) {
             critic_model_->eval();
         }
+
+        if (rollout_amp_ && device_.is_cuda()) {
+            if (model_) {
+                model_->RefreshBf16InferenceCache();
+            }
+            if (critic_model_) {
+                critic_model_->RefreshBf16InferenceCache();
+            }
+            clear_autocast_cache_per_batch_ = false;
+        }
+
         runner_thread_ = std::thread(&BatchedEvaluator::Runner, this);
     }
 
@@ -3180,6 +3279,14 @@ private:
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                     auto& cg = slot.captured_graphs[batch_size];
                     if (!cg.graph) {
+                        if (rollout_amp_ && device_.is_cuda()) {
+                            if (model_) {
+                                model_->RefreshBf16InferenceCache();
+                            }
+                            if (critic_model_) {
+                                critic_model_->RefreshBf16InferenceCache();
+                            }
+                        }
                         {
                             AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                          rollout_amp_,
@@ -3725,6 +3832,14 @@ private:
                 if (device_.is_cuda()) {
                     auto& cg = captured_graphs[batch_size];
                     if (!cg.graph) {
+                        if (rollout_amp_) {
+                            if (model_) {
+                                model_->RefreshBf16InferenceCache();
+                            }
+                            if (critic_model_) {
+                                critic_model_->RefreshBf16InferenceCache();
+                            }
+                        }
                         {
                             AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                          rollout_amp_,
