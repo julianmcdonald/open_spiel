@@ -323,6 +323,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("player"), py::return_value_policy::reference_internal)
       .def("set_revealed_cards", &DuneImperiumState::SetRevealedCardsForTesting,
            py::arg("player"), py::arg("cards"))
+      .def("set_steam_prefer_played_in_play_trash",
+           &DuneImperiumState::SetSteamPreferPlayedInPlayTrash,
+           py::arg("prefer"))
+      .def("copy_state_from",
+           &DuneImperiumState::CopyStateFrom,
+           py::arg("other"))
 
       // --- Deck Pool (opponent card probability tracking) ---
       .def("set_deck_pool_total_cards",
