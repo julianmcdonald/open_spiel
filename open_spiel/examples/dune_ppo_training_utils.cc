@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -2406,6 +2407,7 @@ PpoUpdateStats TrainPpoUpdate(
     double ema_magnet_kl_coef) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
+  const bool r755_hybrid = ::absl::GetFlag(::FLAGS_r755_hybrid_mode);
 
   // WO-PERF-TIMING. Validated on EVERY path, including the default, so a typo
   // is fatal at the first update rather than silently timing nothing for a
@@ -2837,6 +2839,7 @@ PpoUpdateStats TrainPpoUpdate(
   int64_t aux_slice_uses = 0;                 // (epoch,minibatch) slices actually run
   double aux_norm_sum = 0.0, ppo_only_norm_sum = 0.0;
   int64_t aux_norm_count = 0;
+  std::vector<uint8_t> aux_visited_mask(aux_active ? aux_n : 0, 0);
   if (aux_active) {
     stats.aux_examples_used = static_cast<int>(aux_n);
     auto af = torch::TensorOptions().dtype(torch::kFloat32);
@@ -3272,6 +3275,7 @@ PpoUpdateStats TrainPpoUpdate(
   const bool use_ema_cache =
       (ema_magnet_active && update_epochs > 1 &&
        !::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads));
+  const bool ema_cache_on_cpu = (std::getenv("DUNE_CPU_EMA_CACHE") != nullptr);
   torch::Tensor ema_log_probs_cache;
 
   struct FusedGroupStepCache {
@@ -3294,7 +3298,7 @@ PpoUpdateStats TrainPpoUpdate(
     torch::Tensor permutation_cpu =
         torch::randperm(n_train, gen, torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
     torch::Tensor permutation_device;
-    if (reverse_kl_active || use_ema_cache) {
+    if (reverse_kl_active || (use_ema_cache && !ema_cache_on_cpu)) {
       permutation_device = permutation_cpu.to(device);
     }
     const int64_t* perm_ptr = permutation_cpu.data_ptr<int64_t>();
@@ -3502,15 +3506,22 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor alogp = torch::log_softmax(amasked, -1);
             // Legal-action cross-entropy: targets are 0 at illegal actions, so
             // 0 * (finite masked logprob) = 0 there (no NaN).
-            torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
-            torch::Tensor av = ao.values.squeeze(1);
-            torch::Tensor vmse = (av - a_values).pow(2).mean();
-            ce_val = ce.item<double>();
-            vmse_val = vmse.item<double>();
-            double aux_v_coef = ::absl::GetFlag(::FLAGS_aux_value_coef);
-            if (aux_v_coef < 0.0) aux_v_coef = value_coef;
-            scaled_aux =
-                static_cast<float>(search_loss_coef) * (ce + static_cast<float>(aux_v_coef) * vmse);
+            if (r755_hybrid) {
+              torch::Tensor ce_per_row = -(a_targets * alogp).sum(-1);
+              ce_val = ce_per_row.mean().item<double>();
+              vmse_val = 0.0;
+              scaled_aux = static_cast<float>(search_loss_coef / std::max<double>(1.0, static_cast<double>(mb_len))) * ce_per_row.sum();
+            } else {
+              torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
+              torch::Tensor av = ao.values.squeeze(1);
+              torch::Tensor vmse = (av - a_values).pow(2).mean();
+              ce_val = ce.item<double>();
+              vmse_val = vmse.item<double>();
+              double aux_v_coef = ::absl::GetFlag(::FLAGS_aux_value_coef);
+              if (aux_v_coef < 0.0) aux_v_coef = value_coef;
+              scaled_aux =
+                  static_cast<float>(search_loss_coef) * (ce + static_cast<float>(aux_v_coef) * vmse);
+            }
           };
           if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
             AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
@@ -3520,20 +3531,36 @@ PpoUpdateStats TrainPpoUpdate(
           }
           scaled_aux.backward();
           // Snapshot aux-only grads (clone) and their flattened 2-norm.
-          auto params = model->parameters();
-          aux_grad_snapshot.resize(params.size());
-          double aux_sq = 0.0;
-          for (size_t pi = 0; pi < params.size(); ++pi) {
-            auto g = params[pi].grad();
-            if (g.defined()) {
-              aux_grad_snapshot[pi] = g.detach().clone();
-              aux_sq += aux_grad_snapshot[pi].pow(2).sum().item<double>();
+          if (!r755_hybrid || abort_grad_norm_ratio > 0.0) {
+            auto params = model->parameters();
+            aux_grad_snapshot.resize(params.size());
+            std::vector<torch::Tensor> defined_aux_grads;
+            defined_aux_grads.reserve(params.size());
+            for (size_t pi = 0; pi < params.size(); ++pi) {
+              auto g = params[pi].grad();
+              if (g.defined()) {
+                aux_grad_snapshot[pi] = g.detach().clone();
+                defined_aux_grads.push_back(aux_grad_snapshot[pi]);
+              }
             }
+            double aux_sq = 0.0;
+            if (!defined_aux_grads.empty()) {
+              auto norms = at::_foreach_norm(defined_aux_grads, 2.0);
+              aux_sq = torch::stack(norms).to(torch::kFloat64).pow(2).sum().item<double>();
+            }
+            this_aux_norm = std::sqrt(aux_sq);
           }
-          this_aux_norm = std::sqrt(aux_sq);
           aux_ce_sum += ce_val;
           aux_vmse_sum += vmse_val;
           stats.aux_total_presentations += a_states.size(0);
+          if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
+            std::fill(aux_visited_mask.begin(), aux_visited_mask.end(), static_cast<uint8_t>(1));
+          } else {
+            int64_t mask_sz = static_cast<int64_t>(aux_visited_mask.size());
+            int64_t start_idx = std::max<int64_t>(0, std::min(as, mask_sz));
+            int64_t end_idx = std::max<int64_t>(start_idx, std::min(as + al, mask_sz));
+            std::fill(aux_visited_mask.begin() + start_idx, aux_visited_mask.begin() + end_idx, static_cast<uint8_t>(1));
+          }
           ++aux_slice_uses;
         }
       }
@@ -3686,6 +3713,8 @@ PpoUpdateStats TrainPpoUpdate(
                 mb_nontrivial & (mb_adv.abs() >= static_cast<float>(actor_adv_threshold));
             torch::Tensor active_f = actor_active_mask.to(pg_loss.dtype());
             policy_loss = (pg_loss * active_f).sum() / active_f.sum().clamp_min(1.0f);
+          } else if (r755_hybrid) {
+            policy_loss = pg_loss.masked_select(mb_nontrivial).sum() / static_cast<float>(std::max<int64_t>(1, mb_len));
           } else {
             policy_loss = pg_loss.masked_select(mb_nontrivial).mean();
           }
@@ -3713,8 +3742,13 @@ PpoUpdateStats TrainPpoUpdate(
             if (::absl::GetFlag(::FLAGS_use_wave1_ppo_update)) {
               torch::Tensor ema_logits;
               if (use_ema_cache && epoch > 0) {
-                torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
-                ema_logits = ema_log_probs_cache.index_select(0, mb_idx_dev);
+                if (ema_cache_on_cpu) {
+                  ema_logits = ema_log_probs_cache.index_select(
+                      0, permutation_cpu.narrow(0, start, mb_len)).to(device);
+                } else {
+                  torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+                  ema_logits = ema_log_probs_cache.index_select(0, mb_idx_dev);
+                }
               } else {
                 torch::NoGradGuard no_grad;
                 auto ema_out = ema_model->forward(mb_states);
@@ -3726,11 +3760,22 @@ PpoUpdateStats TrainPpoUpdate(
                 ema_logits = CenterAndCapLogitsTensor(ema_out.logits, mb_masks, logit_cap);
                 if (use_ema_cache && epoch == 0) {
                   if (!ema_log_probs_cache.defined()) {
-                    ema_log_probs_cache =
-                        torch::zeros({n_train, action_dim}, ema_logits.options());
+                    if (ema_cache_on_cpu) {
+                      ema_log_probs_cache = torch::zeros(
+                          {n_train, action_dim},
+                          torch::TensorOptions().dtype(ema_logits.scalar_type()).device(torch::kCPU));
+                    } else {
+                      ema_log_probs_cache =
+                          torch::zeros({n_train, action_dim}, ema_logits.options());
+                    }
                   }
-                  torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
-                  ema_log_probs_cache.index_copy_(0, mb_idx_dev, ema_logits);
+                  if (ema_cache_on_cpu) {
+                    ema_log_probs_cache.index_copy_(
+                        0, permutation_cpu.narrow(0, start, mb_len), ema_logits.to(torch::kCPU));
+                  } else {
+                    torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+                    ema_log_probs_cache.index_copy_(0, mb_idx_dev, ema_logits);
+                  }
                 }
               }
               torch::Tensor masked_ema_logits =
@@ -3739,8 +3784,13 @@ PpoUpdateStats TrainPpoUpdate(
               ema_probs = torch::softmax(masked_ema_logits, -1);
             } else {
               if (use_ema_cache && epoch > 0) {
-                torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
-                ema_log_probs = ema_log_probs_cache.index_select(0, mb_idx_dev);
+                if (ema_cache_on_cpu) {
+                  ema_log_probs = ema_log_probs_cache.index_select(
+                      0, permutation_cpu.narrow(0, start, mb_len)).to(device);
+                } else {
+                  torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+                  ema_log_probs = ema_log_probs_cache.index_select(0, mb_idx_dev);
+                }
               } else {
                 torch::NoGradGuard no_grad;
                 auto ema_out = ema_model->forward(mb_states);
@@ -3755,11 +3805,22 @@ PpoUpdateStats TrainPpoUpdate(
                 ema_log_probs = torch::log_softmax(masked_ema_logits, -1);
                 if (use_ema_cache && epoch == 0) {
                   if (!ema_log_probs_cache.defined()) {
-                    ema_log_probs_cache =
-                        torch::zeros({n_train, action_dim}, ema_log_probs.options());
+                    if (ema_cache_on_cpu) {
+                      ema_log_probs_cache = torch::zeros(
+                          {n_train, action_dim},
+                          torch::TensorOptions().dtype(ema_log_probs.scalar_type()).device(torch::kCPU));
+                    } else {
+                      ema_log_probs_cache =
+                          torch::zeros({n_train, action_dim}, ema_log_probs.options());
+                    }
                   }
-                  torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
-                  ema_log_probs_cache.index_copy_(0, mb_idx_dev, ema_log_probs);
+                  if (ema_cache_on_cpu) {
+                    ema_log_probs_cache.index_copy_(
+                        0, permutation_cpu.narrow(0, start, mb_len), ema_log_probs.to(torch::kCPU));
+                  } else {
+                    torch::Tensor mb_idx_dev = permutation_device.narrow(0, start, mb_len);
+                    ema_log_probs_cache.index_copy_(0, mb_idx_dev, ema_log_probs);
+                  }
                 }
               }
               ema_probs = ema_log_probs.exp();
@@ -3802,9 +3863,10 @@ PpoUpdateStats TrainPpoUpdate(
 
       // Phase 18B unclipped norm accounting (before the shared clip): the
       // accumulated grad now holds aux+ppo; ppo-only = total - aux (snapshot).
-      if (this_mb_has_aux) {
+      if (this_mb_has_aux && (!r755_hybrid || abort_grad_norm_ratio > 0.0)) {
         auto params = model->parameters();
-        double ppo_sq = 0.0;
+        std::vector<torch::Tensor> defined_ppo_grads;
+        defined_ppo_grads.reserve(params.size());
         for (size_t pi = 0; pi < params.size(); ++pi) {
           auto tot = params[pi].grad();
           if (!tot.defined()) continue;
@@ -3812,7 +3874,12 @@ PpoUpdateStats TrainPpoUpdate(
               (pi < aux_grad_snapshot.size() && aux_grad_snapshot[pi].defined())
                   ? (tot - aux_grad_snapshot[pi])
                   : tot;
-          ppo_sq += ppo_g.pow(2).sum().item<double>();
+          defined_ppo_grads.push_back(std::move(ppo_g));
+        }
+        double ppo_sq = 0.0;
+        if (!defined_ppo_grads.empty()) {
+          auto norms = at::_foreach_norm(defined_ppo_grads, 2.0);
+          ppo_sq = torch::stack(norms).to(torch::kFloat64).pow(2).sum().item<double>();
         }
         aux_norm_sum += this_aux_norm;
         ppo_only_norm_sum += std::sqrt(ppo_sq);
@@ -4368,7 +4435,14 @@ PpoUpdateStats TrainPpoUpdate(
   // Phase 18B combined-optimization diagnostics + per-update abort decision.
   if (aux_slice_uses > 0) {
     stats.aux_ce = aux_ce_sum / static_cast<double>(aux_slice_uses);
+    stats.search_aux_loss = stats.aux_ce;
     stats.aux_value_mse = aux_vmse_sum / static_cast<double>(aux_slice_uses);
+  }
+  if (aux_active) {
+    int64_t dv = 0;
+    for (uint8_t b : aux_visited_mask) dv += (b != 0 ? 1 : 0);
+    stats.aux_distinct_visited = dv;
+    stats.aux_visited_mask = std::move(aux_visited_mask);
   }
   if (aux_norm_count > 0) {
     stats.aux_grad_norm_mean =
@@ -4455,7 +4529,7 @@ PpoUpdateStats TrainPpoUpdate(
     }
     if (!nontrivial_indices.empty()) {
       if (nontrivial_indices.size() > 1024) {
-        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, 99993);
+        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, dune_seed::kStreamUnfilteredKlDiag);
         std::mt19937_64 kl_rng(kl_seed);
         std::shuffle(nontrivial_indices.begin(), nontrivial_indices.end(), kl_rng);
         nontrivial_indices.resize(1024);
@@ -4558,7 +4632,7 @@ PpoUpdateStats TrainPpoUpdate(
     }
     if (!nontrivial_indices.empty()) {
       if (nontrivial_indices.size() > 1024) {
-        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, 99993);
+        uint64_t kl_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, 0, dune_seed::kStreamUnfilteredKlDiag);
         std::mt19937_64 kl_rng(kl_seed);
         std::shuffle(nontrivial_indices.begin(), nontrivial_indices.end(), kl_rng);
         nontrivial_indices.resize(1024);
@@ -4659,6 +4733,7 @@ PpoUpdateStats TrainPpoUpdateSeparate(
     double gae_lambda) {
   PpoUpdateStats stats;
   if (batch.empty()) return stats;
+  const bool r755_hybrid = ::absl::GetFlag(::FLAGS_r755_hybrid_mode);
 
   const std::string phase_timing_mode =
       ::absl::GetFlag(::FLAGS_phase_timing_mode);

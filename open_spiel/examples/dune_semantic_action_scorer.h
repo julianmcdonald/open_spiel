@@ -673,13 +673,57 @@ struct SemanticActionScorerImpl : torch::nn::Module {
 };
 TORCH_MODULE(SemanticActionScorer);
 
+struct SemanticScorerBatchWorkspace {
+  int64_t capacity_m = 0;
+  torch::Device dev = torch::kCPU;
+  torch::Tensor ints_host_buf;
+  torch::Tensor bools_host_buf;
+  torch::Tensor supp_host_buf;
+  torch::Tensor feat_host_buf;
+  torch::Tensor ints_dev_buf;
+  torch::Tensor bools_dev_buf;
+  torch::Tensor supp_dev_buf;
+  torch::Tensor feat_dev_buf;
+
+  void EnsureCapacity(int64_t m, torch::Device device) {
+    const bool on_cuda = device.is_cuda();
+    if (m <= capacity_m &&
+        (!on_cuda || (ints_dev_buf.defined() && dev == device)) &&
+        ints_host_buf.defined() && ints_host_buf.is_pinned() == on_cuda) {
+      return;
+    }
+    const int64_t alloc_m =
+        std::max<int64_t>(m, std::max<int64_t>(capacity_m * 2, 4096));
+    auto host_opts =
+        torch::TensorOptions().device(torch::kCPU).pinned_memory(on_cuda);
+    ints_host_buf = torch::empty({4 * alloc_m}, host_opts.dtype(torch::kInt64));
+    bools_host_buf = torch::empty({2 * alloc_m}, host_opts.dtype(torch::kBool));
+    supp_host_buf = torch::empty({alloc_m}, host_opts.dtype(torch::kFloat32));
+    feat_host_buf = torch::empty(
+        {alloc_m, static_cast<int64_t>(kSemanticFeatDim)},
+        host_opts.dtype(torch::kFloat32));
+    if (on_cuda) {
+      auto dev_opts = torch::TensorOptions().device(device);
+      ints_dev_buf = torch::empty({4 * alloc_m}, dev_opts.dtype(torch::kInt64));
+      bools_dev_buf = torch::empty({2 * alloc_m}, dev_opts.dtype(torch::kBool));
+      supp_dev_buf = torch::empty({alloc_m}, dev_opts.dtype(torch::kFloat32));
+      feat_dev_buf = torch::empty(
+          {alloc_m, static_cast<int64_t>(kSemanticFeatDim)},
+          dev_opts.dtype(torch::kFloat32));
+    }
+    capacity_m = alloc_m;
+    dev = device;
+  }
+};
+
 // Helper function to gather candidate descriptors from a batch and apply corrections.
 inline void ApplySemanticScorerBatch(
     const std::shared_ptr<SemanticActionScorerImpl>& scorer,
     const torch::Tensor& trunk,
     const std::vector<const CandidateActionData*>& batch_actions,
     torch::Tensor& inout_logits,
-    torch::Device device) {
+    torch::Device device,
+    SemanticScorerBatchWorkspace* workspace = nullptr) {
   if (!scorer) return;
   size_t total_cands = 0;
   for (const auto* data : batch_actions) {
@@ -689,14 +733,28 @@ inline void ApplySemanticScorerBatch(
 
   const bool on_cuda = device.is_cuda();
   const int64_t m = static_cast<int64_t>(total_cands);
-  auto host_opts = torch::TensorOptions().pinned_memory(on_cuda);
 
-  torch::Tensor ints_host = torch::empty({4, m}, host_opts.dtype(torch::kInt64));
-  torch::Tensor bools_host = torch::empty({2, m}, host_opts.dtype(torch::kBool));
-  torch::Tensor supp_host = torch::empty({m}, host_opts.dtype(torch::kFloat32));
-  torch::Tensor feat_host = torch::empty(
-      {m, static_cast<int64_t>(kSemanticFeatDim)},
-      host_opts.dtype(torch::kFloat32));
+  torch::Tensor ints_host, bools_host, supp_host, feat_host;
+  SemanticScorerBatchWorkspace* active_ws = workspace;
+  if (active_ws == nullptr && !torch::GradMode::is_enabled()) {
+    thread_local SemanticScorerBatchWorkspace tls_ws;
+    active_ws = &tls_ws;
+  }
+  if (active_ws != nullptr) {
+    active_ws->EnsureCapacity(m, device);
+    ints_host = active_ws->ints_host_buf.narrow(0, 0, 4 * m).view({4, m});
+    bools_host = active_ws->bools_host_buf.narrow(0, 0, 2 * m).view({2, m});
+    supp_host = active_ws->supp_host_buf.narrow(0, 0, m);
+    feat_host = active_ws->feat_host_buf.narrow(0, 0, m);
+  } else {
+    auto host_opts = torch::TensorOptions().pinned_memory(on_cuda);
+    ints_host = torch::empty({4, m}, host_opts.dtype(torch::kInt64));
+    bools_host = torch::empty({2, m}, host_opts.dtype(torch::kBool));
+    supp_host = torch::empty({m}, host_opts.dtype(torch::kFloat32));
+    feat_host = torch::empty(
+        {m, static_cast<int64_t>(kSemanticFeatDim)},
+        host_opts.dtype(torch::kFloat32));
+  }
 
   int64_t* b_ptr = ints_host.data_ptr<int64_t>();
   int64_t* a_ptr = b_ptr + m;
@@ -740,10 +798,22 @@ inline void ApplySemanticScorerBatch(
     cursor += sz;
   }
 
-  torch::Tensor ints_dev = on_cuda ? ints_host.to(device, /*non_blocking=*/true) : ints_host;
-  torch::Tensor bools_dev = on_cuda ? bools_host.to(device, /*non_blocking=*/true) : bools_host;
-  torch::Tensor supp_t = on_cuda ? supp_host.to(device, /*non_blocking=*/true) : supp_host;
-  torch::Tensor feat_t = on_cuda ? feat_host.to(device, /*non_blocking=*/true) : feat_host;
+  torch::Tensor ints_dev, bools_dev, supp_t, feat_t;
+  if (on_cuda && active_ws != nullptr) {
+    ints_dev = active_ws->ints_dev_buf.narrow(0, 0, 4 * m).view({4, m});
+    bools_dev = active_ws->bools_dev_buf.narrow(0, 0, 2 * m).view({2, m});
+    supp_t = active_ws->supp_dev_buf.narrow(0, 0, m);
+    feat_t = active_ws->feat_dev_buf.narrow(0, 0, m);
+    ints_dev.copy_(ints_host, /*non_blocking=*/true);
+    bools_dev.copy_(bools_host, /*non_blocking=*/true);
+    supp_t.copy_(supp_host, /*non_blocking=*/true);
+    feat_t.copy_(feat_host, /*non_blocking=*/true);
+  } else {
+    ints_dev = on_cuda ? ints_host.to(device, /*non_blocking=*/true) : ints_host;
+    bools_dev = on_cuda ? bools_host.to(device, /*non_blocking=*/true) : bools_host;
+    supp_t = on_cuda ? supp_host.to(device, /*non_blocking=*/true) : supp_host;
+    feat_t = on_cuda ? feat_host.to(device, /*non_blocking=*/true) : feat_host;
+  }
 
   torch::Tensor b_t = ints_dev[0];
   torch::Tensor a_t = ints_dev[1];

@@ -12487,6 +12487,232 @@ int main() {
     }
   } TEST_END();
 
+  TEST_BEGIN("R7-57 FLAGS_r755_hybrid_mode TrainPpoUpdate and policy loss masking") {
+    const int64_t obs_size = 12;
+    const int64_t action_dim = 5;
+    const auto dev = torch::kCPU;
+
+    // 1. Bitwise identity with FLAGS_r755_hybrid_mode=false and search_examples={}
+    torch::manual_seed(987654);
+    auto model_base = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_base->to(dev);
+    torch::optim::AdamW opt_base(model_base->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    torch::manual_seed(987654);
+    auto model_check = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_check->to(dev);
+    torch::optim::AdamW opt_check(model_check->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    std::vector<PpoTransition> batch1(8);
+    for (int i = 0; i < 8; ++i) {
+      batch1[i].state = std::vector<float>(obs_size, 0.05f * (i + 1));
+      batch1[i].legal_actions = (i % 2 == 0) ? std::vector<Action>{0, 1, 2} : std::vector<Action>{1, 3, 4};
+      batch1[i].action = batch1[i].legal_actions[i % 3];
+      batch1[i].old_log_prob = -1.0f;
+      batch1[i].reward = 0.1f * i;
+      batch1[i].value = 0.05f * i;
+      batch1[i].advantage = (i % 2 == 0) ? 0.4f : -0.3f;
+      batch1[i].return_value = 0.2f * i;
+      batch1[i].player_id = i % 4;
+      batch1[i].episode_id = 200 + i;
+    }
+    auto batch2 = batch1;
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, false);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+    absl::SetFlag(&FLAGS_normalize_advantages, true);
+    absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+    absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+    absl::SetFlag(&FLAGS_value_coef, 0.5);
+    absl::SetFlag(&FLAGS_logit_cap, 10.0);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_amp, false);
+    absl::SetFlag(&FLAGS_grad_clip_norm, 10.0);
+    absl::SetFlag(&FLAGS_diagnostics_only, false);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+
+    torch::manual_seed(1111);
+    PpoUpdateStats stats_base = TrainPpoUpdate(
+        model_base, opt_base, batch1, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0);
+
+    torch::manual_seed(1111);
+    PpoUpdateStats stats_check = TrainPpoUpdate(
+        model_check, opt_check, batch2, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0);
+
+    // Verify bitwise identity of parameters and exact equality of stats
+    UTILS_CHECK(HashModelParams(model_base) == HashModelParams(model_check));
+    UTILS_CHECK(stats_base.policy_loss == stats_check.policy_loss);
+    UTILS_CHECK(stats_base.value_loss == stats_check.value_loss);
+
+    // 2. FLAGS_r755_hybrid_mode=true with search_examples and mask_policy_loss
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+
+    std::vector<SearchTrainingExample> search_examples;
+    for (int i = 0; i < 4; ++i) {
+      SearchTrainingExample ex;
+      ex.observation = std::vector<float>(obs_size, 0.15f * (i + 1));
+      ex.player = 0;
+      ex.legal_actions = {0, 1, 2};
+      ex.normalized_visits = {0.60, 0.30, 0.10};
+      search_examples.push_back(ex);
+    }
+
+    torch::manual_seed(5555);
+    auto model_hybrid = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_hybrid->to(dev);
+    torch::optim::AdamW opt_hybrid(model_hybrid->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    std::vector<PpoTransition> hybrid_batch = batch1;
+    for (size_t i = 0; i < hybrid_batch.size(); ++i) {
+      if (i % 2 == 0) {
+        hybrid_batch[i].mask_policy_loss = true;
+      }
+    }
+
+    torch::manual_seed(2222);
+    PpoUpdateStats stats_hybrid = TrainPpoUpdate(
+        model_hybrid, opt_hybrid, hybrid_batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/2,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10);
+
+    // Verify search_aux_loss is finite and positive
+    UTILS_CHECK(std::isfinite(stats_hybrid.search_aux_loss));
+    UTILS_CHECK(stats_hybrid.search_aux_loss > 0.0);
+    UTILS_CHECK(stats_hybrid.aux_examples_used == 4);
+
+    // 3. Batch where all transitions have mask_policy_loss=true
+    torch::manual_seed(7777);
+    auto model_masked = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_masked->to(dev);
+    torch::optim::AdamW opt_masked(model_masked->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    std::vector<PpoTransition> all_masked_batch = batch1;
+    for (auto& t : all_masked_batch) {
+      t.mask_policy_loss = true;
+    }
+
+    torch::manual_seed(3333);
+    PpoUpdateStats stats_masked = TrainPpoUpdate(
+        model_masked, opt_masked, all_masked_batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/3,
+        /*anchor_model=*/nullptr, /*search_examples=*/{}, /*search_loss_coef=*/0.0);
+
+    // Policy loss is completely masked, but value loss is active and trained
+    UTILS_CHECK(stats_masked.policy_loss == 0.0);
+    UTILS_CHECK(std::isfinite(stats_masked.value_loss));
+    UTILS_CHECK(stats_masked.value_loss > 0.0);
+
+    // Restore default flag
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, false);
+  } TEST_END();
+
+  TEST_BEGIN("R7-58 aux_distinct_visited and aux_visited_mask tracking with KL early-stop") {
+    const int64_t obs_size = 12;
+    const int64_t action_dim = 5;
+    const auto dev = torch::kCPU;
+
+    // Create 16 transitions for batch (4 minibatches of size 4)
+    std::vector<PpoTransition> batch(16);
+    for (int i = 0; i < 16; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.05f * (i + 1));
+      batch[i].legal_actions = (i % 2 == 0) ? std::vector<Action>{0, 1, 2} : std::vector<Action>{1, 3, 4};
+      batch[i].action = batch[i].legal_actions[i % 3];
+      batch[i].old_log_prob = -1.0f;
+      batch[i].reward = 0.1f * i;
+      batch[i].value = 0.05f * i;
+      batch[i].advantage = (i % 2 == 0) ? 0.4f : -0.3f;
+      batch[i].return_value = 0.2f * i;
+      batch[i].player_id = i % 4;
+      batch[i].episode_id = 300 + i;
+    }
+
+    // Create 8 auxiliary search training examples
+    std::vector<SearchTrainingExample> search_examples(8);
+    for (int i = 0; i < 8; ++i) {
+      search_examples[i].observation = std::vector<float>(obs_size, 0.10f * (i + 1));
+      search_examples[i].player = 0;
+      search_examples[i].legal_actions = {0, 1, 2};
+      search_examples[i].normalized_visits = {0.60, 0.30, 0.10};
+    }
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_aux_full_batch_presentation, false);
+    absl::SetFlag(&FLAGS_normalize_advantages, true);
+    absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+    absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+    absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+    absl::SetFlag(&FLAGS_value_coef, 0.5);
+    absl::SetFlag(&FLAGS_logit_cap, 10.0);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+    absl::SetFlag(&FLAGS_train_amp, false);
+    absl::SetFlag(&FLAGS_grad_clip_norm, 10.0);
+    absl::SetFlag(&FLAGS_diagnostics_only, false);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+    absl::SetFlag(&FLAGS_search_aux_decoupled, false);
+
+    // 1. Full run without KL early-stop (target_kl = 0.0)
+    // 16 transitions / 4 mb_size = 4 minibatches.
+    // 8 aux examples sliced across 4 minibatches -> 2 examples per minibatch.
+    // Across 2 epochs, all minibatches run, so all 8 examples visited both epochs.
+    torch::manual_seed(4444);
+    auto model_full = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_full->to(dev);
+    torch::optim::AdamW opt_full(model_full->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    PpoUpdateStats stats_full = TrainPpoUpdate(
+        model_full, opt_full, batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10);
+
+    UTILS_CHECK(!stats_full.early_stopped);
+    UTILS_CHECK(stats_full.aux_distinct_visited == 8);
+    UTILS_CHECK(stats_full.aux_total_presentations == 16); // 8 examples * 2 epochs
+    UTILS_CHECK(stats_full.aux_visited_mask.size() == 8);
+    for (size_t i = 0; i < stats_full.aux_visited_mask.size(); ++i) {
+      UTILS_CHECK(stats_full.aux_visited_mask[i] == 1);
+    }
+
+    // 2. Early-stop run mid-Epoch-0 with target_kl > 0
+    // With target_kl = 1e-5, minibatch 0 triggers early-stop immediately.
+    // Minibatch 0 processes slice [0, 2), so exactly 2 examples are visited.
+    // aux_visited_mask prefix [0, 2) should be 1, suffix [2, 8) should be 0.
+    absl::SetFlag(&FLAGS_target_kl, 1e-5);
+
+    torch::manual_seed(4444);
+    auto model_early = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_early->to(dev);
+    torch::optim::AdamW opt_early(model_early->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    PpoUpdateStats stats_early = TrainPpoUpdate(
+        model_early, opt_early, batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/2,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10);
+
+    UTILS_CHECK(stats_early.early_stopped);
+    UTILS_CHECK(stats_early.kl_early_stop_epoch == 0);
+    UTILS_CHECK(stats_early.aux_distinct_visited < 8);
+    UTILS_CHECK(stats_early.aux_distinct_visited == 2);
+    UTILS_CHECK(stats_early.aux_total_presentations == 2);
+    UTILS_CHECK(stats_early.aux_visited_mask.size() == 8);
+    UTILS_CHECK(stats_early.aux_visited_mask[0] == 1);
+    UTILS_CHECK(stats_early.aux_visited_mask[1] == 1);
+    for (size_t i = 2; i < stats_early.aux_visited_mask.size(); ++i) {
+      UTILS_CHECK(stats_early.aux_visited_mask[i] == 0);
+    }
+
+    // Restore flags
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, false);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

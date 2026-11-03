@@ -176,8 +176,13 @@ int main() {
     seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamModelInit));
     seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamBlueprint));
     seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamSearchGate));
-    // 12 streams → 12 distinct seeds
-    CHECK_EQ(seeds.size(), size_t(12));
+    seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamAuxSampling));
+    seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamPurchaseExploration));
+    seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamUnfilteredKlDiag));
+    seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamGate2NonOverrideDiag));
+    seeds.insert(DeriveSeed(master, kDomainTrain, episode, kStreamR758AuxShuffle));
+    // 17 streams → 17 distinct seeds
+    CHECK_EQ(seeds.size(), size_t(17));
   } TEST_END();
 
   // -----------------------------------------------------------------------

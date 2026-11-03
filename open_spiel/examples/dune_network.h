@@ -1988,6 +1988,7 @@ public:
     virtual dune_imperium::MarketAppendixMode MarketMode() const {
         return dune_imperium::MarketAppendixMode::kNone;
     }
+    virtual void AdjustActiveRollouts(int delta) {}
 };
 
 class DeterministicEvaluator : public IGameEvaluator {
@@ -2232,6 +2233,70 @@ struct BatcherTelemetry {
 
 class BatchedEvaluator : public IGameEvaluator {
 public:
+    enum WaitState : uint32_t {
+        kWaitSpinning = 0,
+        kWaitParked = 1,
+        kWaitNotifying = 2,
+        kWaitReady = 3,
+    };
+
+    template <typename BeforeNotifyHook = void (*)()>
+    static void SignalReadyFlagWithHook(
+        std::atomic<uint32_t>* flag,
+        BeforeNotifyHook before_notify = []() {}) {
+        if (flag == nullptr) return;
+        uint32_t expected = kWaitSpinning;
+        if (flag->compare_exchange_strong(expected, kWaitReady,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            return;
+        }
+        // Caller transitioned to kWaitParked. Transition to kWaitNotifying so
+        // WaitOnReadyFlag cannot return (or exit its thread and destroy *flag)
+        // until notify_one() completes and kWaitReady is published as the
+        // final access to *flag.
+        flag->store(kWaitNotifying, std::memory_order_release);
+        before_notify();
+        flag->notify_one();
+        flag->store(kWaitReady, std::memory_order_release);
+    }
+
+    static void SignalReadyFlag(std::atomic<uint32_t>* flag) {
+        SignalReadyFlagWithHook(flag);
+    }
+
+    template <typename BeforeWaitHook = void (*)()>
+    static void WaitOnReadyFlagWithHook(
+        std::atomic<uint32_t>& flag,
+        BeforeWaitHook before_wait = []() {}) {
+        int spin_count = 0;
+        while (flag.load(std::memory_order_acquire) != kWaitReady) {
+            if (spin_count++ < 4000) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            } else {
+                uint32_t expected = kWaitSpinning;
+                if (flag.compare_exchange_strong(expected, kWaitParked,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+                    before_wait();
+                    flag.wait(kWaitParked, std::memory_order_acquire);
+                } else if (expected == kWaitParked) {
+                    flag.wait(kWaitParked, std::memory_order_acquire);
+                } else if (expected == kWaitNotifying) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+
+    static void WaitOnReadyFlag(std::atomic<uint32_t>& flag) {
+        WaitOnReadyFlagWithHook(flag);
+    }
+
     BatchedEvaluator(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
                      int target_batch_size,
                      int timeout_ms,
@@ -2331,10 +2396,14 @@ public:
         dispatch_rejection_hook_ = std::move(on_rejection_hook);
     }
 
-    void AdjustActiveRollouts(int delta) {
+    void AdjustActiveRollouts(int delta) override {
         int prev = active_rollouts_.fetch_add(delta, std::memory_order_relaxed);
         if (delta < 0 && prev + delta > 0) {
-            cv_.notify_one();
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!requests_.empty() &&
+                requests_.size() >= EffectiveTargetBatchSize()) {
+                cv_.notify_one();
+            }
         }
     }
 
@@ -2342,8 +2411,7 @@ public:
         size_t eff = static_cast<size_t>(target_batch_size_);
         int act = active_rollouts_.load(std::memory_order_relaxed);
         if (act > 0) {
-            size_t cap = std::max<size_t>(
-                1, static_cast<size_t>((act * 3 + 3) / 4));
+            size_t cap = static_cast<size_t>(act);
             eff = std::min(eff, cap);
         }
         return eff;
@@ -2361,7 +2429,8 @@ public:
         // over-reads/truncates and never faults on an unsupported request.
         CheckEvalObsSize(obs.size(), model_input_dim_);
         EvalResult result; // Stack allocated!
-        std::atomic<bool> ready{false};
+        thread_local std::atomic<uint32_t> tls_ready{kWaitSpinning};
+        tls_ready.store(kWaitSpinning, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2376,7 +2445,7 @@ public:
             req.obs = &obs;
             req.action_data = action_data;
             req.result_dest = &result;
-            req.ready_flag = &ready;
+            req.ready_flag = &tls_ready;
             req.wants_logits = true;
             req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             req.group_size = 1;
@@ -2391,25 +2460,7 @@ public:
             }
         }
 
-        // HYBRID WAIT: Spin briefly to catch ultra-fast GPU responses, then park.
-        int spin_count = 0;
-        while (!ready.load(std::memory_order_acquire)) {
-            if (spin_count < 4000) {
-                if (spin_count < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    _mm_pause(); // Emits PAUSE instruction to prevent pipeline flushing
-#else
-                    std::this_thread::yield();
-#endif
-                    spin_count++;
-                }
-            } else {
-                // Park safely (Zero CPU burn)
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, [&] { return ready.load(std::memory_order_acquire); });
-            }
-        }
-
+        WaitOnReadyFlag(tls_ready);
         return result; // Move semantics
     }
 
@@ -2418,7 +2469,8 @@ public:
     EvalResult EvaluateValues(const std::vector<float>& obs) {
         CheckEvalObsSize(obs.size(), model_input_dim_);
         EvalResult result;
-        std::atomic<bool> ready{false};
+        thread_local std::atomic<uint32_t> tls_ready{kWaitSpinning};
+        tls_ready.store(kWaitSpinning, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto now = std::chrono::steady_clock::now();
@@ -2426,7 +2478,7 @@ public:
             Request req;
             req.obs = &obs;
             req.result_dest = &result;
-            req.ready_flag = &ready;
+            req.ready_flag = &tls_ready;
             req.wants_logits = false;
             req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             req.group_size = 1;
@@ -2439,21 +2491,7 @@ public:
                 cv_.notify_one();
             }
         }
-        int spin_count = 0;
-        while (!ready.load(std::memory_order_acquire)) {
-            if (spin_count++ < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
-            } else {
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, [&] {
-                    return ready.load(std::memory_order_acquire);
-                });
-            }
-        }
+        WaitOnReadyFlag(tls_ready);
         return result;
     }
 
@@ -2498,7 +2536,8 @@ public:
         }
         CheckEvalObsSize(obs.size(), model_input_dim_);
         CompactEvalResult result;
-        std::atomic<bool> ready{false};
+        thread_local std::atomic<uint32_t> tls_ready{kWaitSpinning};
+        tls_ready.store(kWaitSpinning, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto now = std::chrono::steady_clock::now();
@@ -2506,7 +2545,7 @@ public:
             Request req;
             req.obs = &obs;
             req.action_data = action_data;
-            req.ready_flag = &ready;
+            req.ready_flag = &tls_ready;
             req.compact_dest = &result;
             req.legal_actions = legal_actions;
             req.wants_logits = false;
@@ -2521,21 +2560,7 @@ public:
                 cv_.notify_one();
             }
         }
-        int spin_count = 0;
-        while (!ready.load(std::memory_order_acquire)) {
-            if (spin_count++ < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
-            } else {
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, [&] {
-                    return ready.load(std::memory_order_acquire);
-                });
-            }
-        }
+        WaitOnReadyFlag(tls_ready);
         return result;
     }
 
@@ -2557,11 +2582,15 @@ public:
             CheckEvalObsSize(obs.size(), model_input_dim_);
         }
 
-        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        thread_local std::vector<std::unique_ptr<std::atomic<uint32_t>>> tls_group_ready;
+        while (tls_group_ready.size() < observations.size()) {
+            tls_group_ready.push_back(std::make_unique<std::atomic<uint32_t>>(kWaitSpinning));
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto now = std::chrono::steady_clock::now();
-            if (requests_.empty()) {
+            const bool was_empty = requests_.empty();
+            if (was_empty) {
                 first_request_ts_ = now;
             }
             // WO-PERF-3: one group id for the whole leaf group so the runner can
@@ -2569,11 +2598,11 @@ public:
             const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             const uint32_t gsize = static_cast<uint32_t>(observations.size());
             for (size_t i = 0; i < observations.size(); ++i) {
-                ready[i].store(false, std::memory_order_relaxed);
+                tls_group_ready[i]->store(kWaitSpinning, std::memory_order_relaxed);
                 Request req;
                 req.obs = &observations[i];
                 req.result_dest = &results[i];
-                req.ready_flag = &ready[i];
+                req.ready_flag = tls_group_ready[i].get();
                 req.group_id = gid;
                 req.group_size = gsize;
                 req.is_group = true;
@@ -2584,28 +2613,13 @@ public:
             group_rows_.fetch_add(gsize, std::memory_order_relaxed);
             // Submit all player observations atomically so the runner can form
             // a useful batch without four serial queue/wait cycles.
-            cv_.notify_one();
+            if (was_empty || requests_.size() >= EffectiveTargetBatchSize()) {
+                cv_.notify_one();
+            }
         }
 
-        auto all_ready = [&]() {
-            for (size_t i = 0; i < observations.size(); ++i) {
-                if (!ready[i].load(std::memory_order_acquire)) return false;
-            }
-            return true;
-        };
-        int spin_count = 0;
-        while (!all_ready()) {
-            if (spin_count < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
-                ++spin_count;
-            } else {
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, all_ready);
-            }
+        for (size_t i = 0; i < observations.size(); ++i) {
+            WaitOnReadyFlag(*tls_group_ready[i]);
         }
         return results;
     }
@@ -2631,19 +2645,23 @@ public:
             SpielFatalError("BatchedEvaluator::EvaluateBatchValues group exceeds target");
         }
         for (const auto& obs : observations) CheckEvalObsSize(obs.size(), model_input_dim_);
-        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        thread_local std::vector<std::unique_ptr<std::atomic<uint32_t>>> tls_group_ready;
+        while (tls_group_ready.size() < observations.size()) {
+            tls_group_ready.push_back(std::make_unique<std::atomic<uint32_t>>(kWaitSpinning));
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto now = std::chrono::steady_clock::now();
-            if (requests_.empty()) first_request_ts_ = now;
+            const bool was_empty = requests_.empty();
+            if (was_empty) first_request_ts_ = now;
             const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             const uint32_t gsize = static_cast<uint32_t>(observations.size());
             for (size_t i = 0; i < observations.size(); ++i) {
-                ready[i].store(false, std::memory_order_relaxed);
+                tls_group_ready[i]->store(kWaitSpinning, std::memory_order_relaxed);
                 Request req;
                 req.obs = &observations[i];
                 req.result_dest = &results[i];
-                req.ready_flag = &ready[i];
+                req.ready_flag = tls_group_ready[i].get();
                 req.wants_logits = false;
                 req.group_id = gid;
                 req.group_size = gsize;
@@ -2653,26 +2671,12 @@ public:
             }
             group_calls_.fetch_add(1, std::memory_order_relaxed);
             group_rows_.fetch_add(gsize, std::memory_order_relaxed);
-            cv_.notify_one();
+            if (was_empty || requests_.size() >= EffectiveTargetBatchSize()) {
+                cv_.notify_one();
+            }
         }
-        auto all_ready = [&]() {
-            for (size_t i = 0; i < observations.size(); ++i) {
-                if (!ready[i].load(std::memory_order_acquire)) return false;
-            }
-            return true;
-        };
-        int spin_count = 0;
-        while (!all_ready()) {
-            if (spin_count++ < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
-            } else {
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, all_ready);
-            }
+        for (size_t i = 0; i < observations.size(); ++i) {
+            WaitOnReadyFlag(*tls_group_ready[i]);
         }
         return results;
     }
@@ -2688,7 +2692,10 @@ public:
             return {std::move(results), std::move(compact)};
         }
         for (const auto& obs : observations) CheckEvalObsSize(obs.size(), model_input_dim_);
-        auto ready = std::make_unique<std::atomic<bool>[]>(observations.size());
+        thread_local std::vector<std::unique_ptr<std::atomic<uint32_t>>> tls_group_ready;
+        while (tls_group_ready.size() < observations.size()) {
+            tls_group_ready.push_back(std::make_unique<std::atomic<uint32_t>>(kWaitSpinning));
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto now = std::chrono::steady_clock::now();
@@ -2696,11 +2703,11 @@ public:
             const uint64_t gid = next_group_id_.fetch_add(1, std::memory_order_relaxed);
             const uint32_t gsize = static_cast<uint32_t>(observations.size());
             for (size_t i = 0; i < observations.size(); ++i) {
-                ready[i].store(false, std::memory_order_relaxed);
+                tls_group_ready[i]->store(kWaitSpinning, std::memory_order_relaxed);
                 Request req;
                 req.obs = &observations[i];
                 req.result_dest = &results[i];
-                req.ready_flag = &ready[i];
+                req.ready_flag = tls_group_ready[i].get();
                 req.wants_logits = false;
                 if (i == prior_index) {
                     req.compact_dest = &compact;
@@ -2717,24 +2724,8 @@ public:
             group_rows_.fetch_add(gsize, std::memory_order_relaxed);
             cv_.notify_one();
         }
-        auto all_ready = [&]() {
-            for (size_t i = 0; i < observations.size(); ++i) {
-                if (!ready[i].load(std::memory_order_acquire)) return false;
-            }
-            return true;
-        };
-        int spin_count = 0;
-        while (!all_ready()) {
-            if (spin_count++ < 4000) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
-            } else {
-                std::unique_lock<std::mutex> park_lock(park_mutex_);
-                park_cv_.wait(park_lock, all_ready);
-            }
+        for (size_t i = 0; i < observations.size(); ++i) {
+            WaitOnReadyFlag(*tls_group_ready[i]);
         }
         return {std::move(results), std::move(compact)};
     }
@@ -2831,7 +2822,7 @@ private:
         const std::vector<float>* obs = nullptr;
         const dune_semantic::CandidateActionData* action_data = nullptr;
         EvalResult* result_dest = nullptr;
-        std::atomic<bool>* ready_flag = nullptr;
+        std::atomic<uint32_t>* ready_flag = nullptr;
         bool wants_logits = true;
         CompactEvalResult* compact_dest = nullptr;
         std::vector<Action> legal_actions;
@@ -2844,9 +2835,6 @@ private:
         bool is_group = false;
         std::chrono::steady_clock::time_point enqueue_ts{};
     };
-
-    std::mutex park_mutex_;
-    std::condition_variable park_cv_;
 
     std::shared_ptr<SharedDunePolicyValueNetImpl> model_;
     std::shared_ptr<SharedDunePolicyValueNetImpl> critic_model_{nullptr};
@@ -2989,6 +2977,7 @@ private:
 
     void RunnerAsync() {
         torch::InferenceMode inference_guard;
+        const bool enable_slot_reorder = (std::getenv("DUNE_DISABLE_SLOT_REORDER") == nullptr);
         const c10::DeviceIndex device_index =
             device_.has_index() ? device_.index() : c10::cuda::current_device();
         std::array<AsyncBatchSlot, 2> slots;
@@ -3017,19 +3006,21 @@ private:
         int pending_slot = -1;
         int next_slot = 0;
 
-        auto take_batch = [&](bool* timeout_flush) {
+        auto take_batch = [&](bool* timeout_flush, bool has_pending_slot) {
             std::vector<Request> batch;
             *timeout_flush = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [this]() { return stop_ || !requests_.empty(); });
                 if (stop_ && requests_.empty()) return batch;
-                const auto deadline =
-                    first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
-                cv_.wait_until(lock, deadline, [this, deadline]() {
-                    return stop_ || requests_.size() >= EffectiveTargetBatchSize() ||
-                           std::chrono::steady_clock::now() >= deadline;
-                });
+                if (!has_pending_slot) {
+                    const auto deadline =
+                        first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
+                    cv_.wait_until(lock, deadline, [this, deadline]() {
+                        return stop_ || requests_.size() >= EffectiveTargetBatchSize() ||
+                               std::chrono::steady_clock::now() >= deadline;
+                    });
+                }
                 if (stop_ && requests_.empty()) return batch;
                 *timeout_flush = !stop_ &&
                                  requests_.size() <
@@ -3148,7 +3139,7 @@ private:
             }
         };
 
-        auto finish_slot = [&](AsyncBatchSlot& slot) {
+        auto wait_slot_gpu = [&](AsyncBatchSlot& slot) {
             if (!slot.pending) return;
             slot.complete->synchronize();
             if (slot.has_cap_stats) {
@@ -3157,6 +3148,10 @@ private:
                                     static_cast<int64_t>(cap[3]));
                 slot.has_cap_stats = false;
             }
+        };
+
+        auto distribute_slot_cpu = [&](AsyncBatchSlot& slot) {
+            if (!slot.pending) return;
             const float* values = slot.host_values.data_ptr<float>();
             const size_t action_dim = static_cast<size_t>(model_action_dim_);
             dune_hotspot::ScopedTimer hotspot_timer(
@@ -3201,16 +3196,17 @@ private:
                             static_cast<int32_t>(i);
                     }
                 }
-                slot.batch[i].ready_flag->store(true,
-                                                std::memory_order_release);
+                SignalReadyFlag(slot.batch[i].ready_flag);
             }
-            {
-                std::lock_guard<std::mutex> park_lock(park_mutex_);
-            }
-            park_cv_.notify_all();
             slot.batch.clear();
             slot.pending = false;
             slot.membership_batch_id = -1;
+        };
+
+        auto finish_slot = [&](AsyncBatchSlot& slot) {
+            if (!slot.pending) return;
+            wait_slot_gpu(slot);
+            distribute_slot_cpu(slot);
         };
 
         auto launch_slot = [&](AsyncBatchSlot& slot) {
@@ -3324,7 +3320,6 @@ private:
                             }
                         }
                         if (has_any_actions) {
-                            outputs.logits = outputs.logits.clone();
                             AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                          rollout_amp_,
                                                          clear_autocast_cache_per_batch_);
@@ -3443,8 +3438,26 @@ private:
         };
 
         for (;;) {
+            if (enable_slot_reorder && pending_slot >= 0) {
+                bool drain_pending_now = false;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    while (!stop_ &&
+                           requests_.size() < EffectiveTargetBatchSize() &&
+                           !slots[pending_slot].complete->query()) {
+                        cv_.wait_for(lock, std::chrono::microseconds(50));
+                    }
+                    drain_pending_now =
+                        !stop_ && requests_.size() < EffectiveTargetBatchSize();
+                }
+                if (drain_pending_now) {
+                    finish_slot(slots[pending_slot]);
+                    pending_slot = -1;
+                }
+            }
             bool timeout_flush = false;
-            std::vector<Request> batch = take_batch(&timeout_flush);
+            std::vector<Request> batch =
+                take_batch(&timeout_flush, /*has_pending_slot=*/(pending_slot >= 0));
             if (batch.empty()) break;
             if (dispatch_budget_hook_) {
                 if (!dispatch_budget_hook_(batch.size())) {
@@ -3463,12 +3476,8 @@ private:
                             req.compact_dest->actions.clear();
                             req.compact_dest->probabilities.clear();
                         }
-                        if (req.ready_flag) req.ready_flag->store(true, std::memory_order_release);
+                        SignalReadyFlag(req.ready_flag);
                     }
-                    {
-                        std::lock_guard<std::mutex> park_lock(park_mutex_);
-                    }
-                    park_cv_.notify_all();
                     continue;
                 }
             }
@@ -3512,21 +3521,50 @@ private:
             // prior GPU batch, while the event wait protects host outputs and
             // avoids whole-device synchronization. Concurrent forwards on the
             // shared LibTorch module are deliberately not enabled.
-            if (pending_slot >= 0) finish_slot(slots[pending_slot]);
-            launch_slot(slot);
-            bool queue_empty = false;
-            {
-                std::lock_guard<std::mutex> queue_lock(mutex_);
-                queue_empty = requests_.empty();
-            }
-            if (queue_empty) {
-                // Every worker may be blocked on this batch. Publish its
-                // event before returning to an empty-queue wait, otherwise
-                // the runner and all actors wait on one another forever.
-                finish_slot(slot);
-                pending_slot = -1;
+            if (enable_slot_reorder) {
+                if (pending_slot >= 0) {
+                    wait_slot_gpu(slots[pending_slot]);
+                }
+                try {
+                    launch_slot(slot);
+                } catch (...) {
+                    if (pending_slot >= 0) {
+                        distribute_slot_cpu(slots[pending_slot]);
+                        pending_slot = -1;
+                    }
+                    throw;
+                }
+                if (pending_slot >= 0) {
+                    distribute_slot_cpu(slots[pending_slot]);
+                    pending_slot = -1;
+                }
             } else {
+                if (pending_slot >= 0) {
+                    finish_slot(slots[pending_slot]);
+                    pending_slot = -1;
+                }
+                launch_slot(slot);
+            }
+            if (enable_slot_reorder) {
                 pending_slot = slot_index;
+            } else {
+                bool has_ready_next_batch = false;
+                {
+                    std::lock_guard<std::mutex> queue_lock(mutex_);
+                    has_ready_next_batch =
+                        !requests_.empty() &&
+                        requests_.size() >= EffectiveTargetBatchSize();
+                }
+                if (!has_ready_next_batch) {
+                    // Unless a full next batch is already queued to overlap CPU
+                    // staging with the GPU forward pass, finish this slot as soon
+                    // as its CUDA event completes so blocked rollout threads wake
+                    // immediately instead of stalling behind take_batch() timeout.
+                    finish_slot(slot);
+                    pending_slot = -1;
+                } else {
+                    pending_slot = slot_index;
+                }
             }
             next_slot = 1 - next_slot;
         }
@@ -3651,12 +3689,8 @@ private:
                             req.compact_dest->actions.clear();
                             req.compact_dest->probabilities.clear();
                         }
-                        if (req.ready_flag) req.ready_flag->store(true, std::memory_order_release);
+                        SignalReadyFlag(req.ready_flag);
                     }
-                    {
-                        std::lock_guard<std::mutex> park_lock(park_mutex_);
-                    }
-                    park_cv_.notify_all();
                     continue;
                 }
             }
@@ -3883,7 +3917,6 @@ private:
                         }
                     }
                     if (has_any_actions) {
-                        outputs.logits = outputs.logits.clone();
                         AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                      device_.is_cuda() && rollout_amp_,
                                                      clear_autocast_cache_per_batch_);
@@ -4009,14 +4042,10 @@ private:
                     }
                 }
 
-                // Set the atomic flag (fast spinning threads will catch this instantly)
-                batch[i].ready_flag->store(true, std::memory_order_release);
+                // Signal the atomic flag (fast spinning threads will catch this instantly,
+                // parked threads will be notified via notify_one)
+                SignalReadyFlag(batch[i].ready_flag);
             }
-
-            // Memory barrier to guarantee parked threads see the ready flag,
-            // followed by a SINGLE broadcast syscall (instead of 64 individual futex wakes)
-            { std::lock_guard<std::mutex> park_lock(park_mutex_); }
-            park_cv_.notify_all();
         }
         if (device_.is_cuda() && !clear_autocast_cache_per_batch_) {
             at::autocast::clear_cache();

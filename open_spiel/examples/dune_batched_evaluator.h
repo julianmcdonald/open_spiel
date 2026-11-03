@@ -27,10 +27,12 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   BatchedNNEvaluator(
       std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval,
       float logit_cap = 10.0f,
-      dune_imperium::MarketAppendixMode market_mode = dune_imperium::MarketAppendixMode::kNone)
+      dune_imperium::MarketAppendixMode market_mode = dune_imperium::MarketAppendixMode::kNone,
+      bool forward_active_rollouts = true)
       : batched_eval_(batched_eval),
         logit_cap_(logit_cap),
-        market_mode_(market_mode) {
+        market_mode_(market_mode),
+        forward_active_rollouts_(forward_active_rollouts) {
     if (batched_eval_) {
       obs_size_ = batched_eval_->ModelInputDim();
       if (dune_imperium::IsFullPublicInformationStateSize(obs_size_)) {
@@ -77,7 +79,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   }
 
   void AdjustActiveRollouts(int delta) {
-    if (batched_eval_) batched_eval_->AdjustActiveRollouts(delta);
+    if (forward_active_rollouts_ && batched_eval_) {
+      batched_eval_->AdjustActiveRollouts(delta);
+    }
   }
 
   std::vector<double> Evaluate(const State& state) override {
@@ -100,9 +104,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
 
   double EvaluatePlayerValue(const State& state, Player player) {
     if (!batched_eval_) return 0.0;
-    std::vector<std::vector<float>> observations = {ModelObservation(state, player)};
+    thread_local std::vector<std::vector<float>> tls_obs(1);
+    FillModelObservation(state, player, &tls_obs[0]);
     g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
-    auto results = batched_eval_->EvaluateBatchValues(observations);
+    auto results = batched_eval_->EvaluateBatchValues(tls_obs);
     double val = results.empty() ? 0.0 : results[0].value;
     DuneNNEvaluator::RecordLeafValue(val);
     return val;
@@ -117,15 +122,54 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     if (current_player < 0 || current_player >= state.NumPlayers()) {
       return {};
     }
-    std::vector<float> obs = ModelObservation(state, current_player);
-    dune_semantic::CandidateActionData cand_data;
+    thread_local std::vector<float> tls_obs;
+    FillModelObservation(state, current_player, &tls_obs);
+    thread_local dune_semantic::CandidateActionData tls_cand_data;
+    tls_cand_data.clear();
     const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
     if (dune != nullptr) {
       const std::string schema = batched_eval_->SemanticDescriptorSchema();
-      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &cand_data, schema);
+      dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &tls_cand_data, schema);
     }
     g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
-    return batched_eval_->EvaluateCompact(obs, legal_actions, &cand_data);
+    return batched_eval_->EvaluateCompact(tls_obs, legal_actions, &tls_cand_data);
+  }
+
+  Action GreedyActionWithLegals(
+      const State& state, const std::vector<Action>& legal_actions) {
+    if (legal_actions.empty()) return kInvalidAction;
+    if (!batched_eval_) {
+      ActionsAndProbs prior = Prior(state);
+      if (prior.empty()) return legal_actions.front();
+      double best_p = -1.0;
+      Action best_a = legal_actions.front();
+      for (Action a : legal_actions) {
+        for (const auto& ap : prior) {
+          if (ap.first == a) {
+            if (ap.second > best_p) {
+              best_p = ap.second;
+              best_a = a;
+            }
+            break;
+          }
+        }
+      }
+      return best_a;
+    }
+    open_spiel::CompactEvalResult result = PriorWithDetails(state, legal_actions);
+    if (!result.ok || result.probabilities.empty()) {
+      return legal_actions.front();
+    }
+    float best_p = -1.0f;
+    Action best_a = legal_actions.front();
+    const size_t n = std::min(result.actions.size(), result.probabilities.size());
+    for (size_t i = 0; i < n; ++i) {
+      if (result.probabilities[i] > best_p) {
+        best_p = result.probabilities[i];
+        best_a = result.actions[i];
+      }
+    }
+    return best_a;
   }
 
   open_spiel::CompactEvalResult PriorWithDetails(const State& state) {
@@ -219,18 +263,34 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   }
 
  private:
-  std::vector<float> ModelObservation(const State& state, Player player) const {
+  void FillModelObservation(const State& state, Player player, std::vector<float>* out) const {
     const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
     if (dune != nullptr) {
-      return dune->InformationStateTensorWithAppendix(player, market_mode_, DeckPoolSemantics());
+      const auto sem = DeckPoolSemantics();
+      const size_t expected_size =
+          (market_mode_ == dune_imperium::MarketAppendixMode::kNone)
+              ? static_cast<size_t>(dune_imperium::kLegacyInformationStateSize)
+              : static_cast<size_t>(
+                    dune_imperium::GetInformationStateSchema(market_mode_, sem).size);
+      out->resize(expected_size);
+      dune->InformationStateTensorWithAppendix(
+          player, market_mode_, absl::MakeSpan(*out), sem);
+      return;
     }
-    return state.InformationStateTensor(player);
+    *out = state.InformationStateTensor(player);
+  }
+
+  std::vector<float> ModelObservation(const State& state, Player player) const {
+    std::vector<float> out;
+    FillModelObservation(state, player, &out);
+    return out;
   }
 
   std::shared_ptr<open_spiel::BatchedEvaluator> batched_eval_;
   float logit_cap_;
   int64_t obs_size_;
   dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
+  bool forward_active_rollouts_{true};
 };
 
 } // namespace open_spiel

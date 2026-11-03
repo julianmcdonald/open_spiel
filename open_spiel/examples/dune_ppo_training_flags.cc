@@ -156,3 +156,36 @@ ABSL_FLAG(bool, allow_pool_transition, false,
 ABSL_FLAG(std::string, pool_transition_source_fingerprint, "",
           "Expected parent config fingerprint for pool transition.");
 
+// R7-55 / R7-57 hybrid search-in-training flags.
+ABSL_FLAG(bool, r755_hybrid_mode, false,
+          "Enable R7-55/R7-57 hybrid 1-round search-in-training mode.");
+ABSL_FLAG(double, r755_search_prob, 0.25,
+          "Per-turn / per-root search probability in R7-55 hybrid mode.");
+ABSL_FLAG(int, r755_category_mask, 31,
+          "Bitmask of enabled R7-55 search categories (bits 0..4 for Categories 1..5).");
+ABSL_FLAG(double, r755_min_t_stat, 1.0,
+          "Minimum paired t-statistic across rollouts to accept an override in R7-55 mode.");
+ABSL_FLAG(bool, r755_execute_overrides, true,
+          "When true, execute accepted overrides a* in the training trajectory.");
+ABSL_FLAG(std::string, r755_gate1_output, "",
+          "If non-empty, run Gate 1 40-game search & Ref512 audit and write JSON to this path.");
+ABSL_FLAG(std::string, r755_gate2_output, "",
+          "If non-empty, emit Gate 2 post-update verification diagnostics JSON to this path.");
+ABSL_FLAG(double, r755_search_loss_coef, -1.0,
+          "If >= 0.0 when r755_hybrid_mode=true, overrides FLAGS_search_loss_coef without changing config_fingerprint.");
+ABSL_FLAG(std::string, r755_crn_mode, "sequential",
+          "CRN mode for r755_hybrid_mode rollouts: 'sequential', 'deck_order', or 'event_keyed'.");
+ABSL_FLAG(bool, r755_reuse_root_prior, false,
+          "If true, pass collector's already-evaluated root legal probabilities into CompoundRolloutSearchDecision to skip duplicate root Prior() GPU call.");
+ABSL_FLAG(bool, r755_dedup_paired_worlds, false,
+          "If true in kPaired mode, determinize each world seed once via ResampleFromInfostate and Clone() across candidates.");
+ABSL_FLAG(double, r755_max_raw_prior, 1.0,
+          "If < 1.0, skip r755 search when the root top-1 legal probability >= r755_max_raw_prior.");
+ABSL_FLAG(int, r755_stage1_rollouts, 0,
+          "If > 0 and < rollouts_per_action in kPaired mode, run 2-stage sequential halving with Stage 1 of this many paired worlds.");
+ABSL_FLAG(double, r755_stage1_min_mean_diff, -1e9,
+          "In 2-stage paired search, stop after Stage 1 (keep raw_action) if the best challenger's Stage-1 mean paired utility diff (u_cand - u_raw) < this threshold.");
+ABSL_FLAG(std::string, r755_root_dump_jsonl, "",
+          "If non-empty, append one JSON line per searched r755 root with category, priors, per-world candidate utilities, nn_evals, and override status.");
+
+

@@ -26,6 +26,7 @@
 #include <future>
 #include <set>
 #include <limits>
+#include <numeric>
 
 #include "open_spiel/examples/dune_batched_evaluator.h"
 #include "open_spiel/examples/dune_online_search_collector.h"
@@ -179,6 +180,145 @@ enum class SearchPairingMode {
   kPaired     // Shared world/rollout seeds across candidates
 };
 
+// R7-55 search categories for hybrid on-policy search-in-training
+enum class R755SearchCategory : int {
+  kIneligible = 0,
+  kAgentCardOrStartPlot = 1,
+  kImmediateSpacePlacement = 2,
+  kRevealPurchase = 3,
+  kStandaloneOrPreRevealPlot = 4,
+  kCombatIntrigue = 5,
+};
+
+inline const char* R755SearchCategoryName(R755SearchCategory cat) {
+  switch (cat) {
+    case R755SearchCategory::kIneligible: return "ineligible";
+    case R755SearchCategory::kAgentCardOrStartPlot: return "agent_card_or_start_plot";
+    case R755SearchCategory::kImmediateSpacePlacement: return "immediate_space_placement";
+    case R755SearchCategory::kRevealPurchase: return "reveal_purchase";
+    case R755SearchCategory::kStandaloneOrPreRevealPlot: return "standalone_or_pre_reveal_plot";
+    case R755SearchCategory::kCombatIntrigue: return "combat_intrigue";
+  }
+  return "unknown";
+}
+
+inline std::ostream& operator<<(std::ostream& os, R755SearchCategory cat) {
+  return os << R755SearchCategoryName(cat);
+}
+
+inline bool IsR755PurchaseAction(Action a) {
+  if (a >= kActionBuyImperiumRow0 && a <= kActionBuyImperiumRow0 + 7) return true;
+  if (a >= kActionBuyHelenaReserve0 && a <= kActionBuyHelenaReserve0 + 7) return true;
+  if (a == kActionBuyReserveArrakisLiaison || a == kActionBuyReserveTheSpiceMustFlow) return true;
+  if (a >= kActionTechAcquire0 && a <= kActionTechAcquireSkip) return true;
+  if (a >= kActionTleilaxuAcquire0 && a <= kActionTleilaxuAcquireSkip) return true;
+  if (a >= kActionTechAcquireWithSolari0 && a <= kActionTechAcquireWithSolariSkip) return true;
+  return false;
+}
+
+inline R755SearchCategory ClassifyR755SearchCategory(
+    const State& state,
+    Player searched_player,
+    bool space_placed_this_turn,
+    int category_mask = 31) {
+  if (state.IsChanceNode() || state.CurrentPlayer() != searched_player) {
+    return R755SearchCategory::kIneligible;
+  }
+  std::vector<Action> legal_actions = state.LegalActions();
+  if (legal_actions.size() <= 1) {
+    return R755SearchCategory::kIneligible;
+  }
+  const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  if (!dune_state) {
+    return R755SearchCategory::kIneligible;
+  }
+  if (dune_state->phase() == GamePhase::kLeaderOfferChance ||
+      dune_state->phase() == GamePhase::kLeaderDraft) {
+    return R755SearchCategory::kIneligible;
+  }
+
+  R755SearchCategory cat = R755SearchCategory::kIneligible;
+
+  // Category 5: Combat intrigue / commit
+  if (dune_state->phase() == GamePhase::kCombat) {
+    bool has_combat_act = false;
+    for (Action a : legal_actions) {
+      if (a == kActionCombatPass || a == kActionFamilyAtomics ||
+          (a >= kActionPlayIntrigueCombatCard0 && a < kActionPlayIntrigueCombatCard0 + kMaxIntrigueCards) ||
+          (a >= kActionCombatCommit0 && a <= kActionCombatCommit0 + 47)) {
+        has_combat_act = true;
+        break;
+      }
+    }
+    if (has_combat_act) {
+      cat = R755SearchCategory::kCombatIntrigue;
+    }
+  }
+
+  // Category 3: Reveal purchase
+  if (cat == R755SearchCategory::kIneligible && dune_state->IsPlayerInRevealTurn(searched_player)) {
+    bool has_purchase = false;
+    for (Action a : legal_actions) {
+      if (IsR755PurchaseAction(a)) {
+        has_purchase = true;
+        break;
+      }
+    }
+    if (has_purchase) {
+      cat = R755SearchCategory::kRevealPurchase;
+    }
+  }
+
+  // Category 1 & Category 2: Agent turns
+  if (cat == R755SearchCategory::kIneligible &&
+      dune_state->phase() == GamePhase::kAgentTurns &&
+      !dune_state->IsPlayerInRevealTurn(searched_player) &&
+      dune_state->GetPlayerAgentsRemainingForTesting(searched_player) > 0) {
+    bool has_agent_card = false;
+    bool has_agent_space = false;
+    for (Action a : legal_actions) {
+      if ((a >= kActionSelectAgentCard0 && a <= kActionSelectAgentCard0 + 255) ||
+          a == kActionPlayKwisatzHaderach) {
+        has_agent_card = true;
+      }
+      if (a >= kActionAgentSpaceConspire && a <= kActionAgentSpaceSietchTabr) {
+        has_agent_space = true;
+      }
+    }
+    if (has_agent_card && !has_agent_space) {
+      cat = R755SearchCategory::kAgentCardOrStartPlot;
+    } else if (has_agent_space && !space_placed_this_turn) {
+      cat = R755SearchCategory::kImmediateSpacePlacement;
+    }
+  }
+
+  // Category 4: Standalone or pre-reveal plot
+  if (cat == R755SearchCategory::kIneligible) {
+    bool has_plot_card = false;
+    bool all_other_allowed = true;
+    for (Action a : legal_actions) {
+      if (a >= kActionPlayIntriguePlotCard0 && a < kActionPlayIntriguePlotCard0 + kMaxIntrigueCards) {
+        has_plot_card = true;
+      } else if (a == kActionReveal || a == kActionEndTurn) {
+        // Allowed
+      } else {
+        all_other_allowed = false;
+      }
+    }
+    if (has_plot_card && all_other_allowed) {
+      cat = R755SearchCategory::kStandaloneOrPreRevealPlot;
+    }
+  }
+
+  if (cat != R755SearchCategory::kIneligible) {
+    int bit = static_cast<int>(cat) - 1;
+    if (((category_mask >> bit) & 1) == 0) {
+      return R755SearchCategory::kIneligible;
+    }
+  }
+  return cat;
+}
+
 // Search rollout truncation mode
 enum class SearchTruncationMode {
   kTerminal,               // Full rollout until game is terminal (default today)
@@ -202,11 +342,153 @@ inline double TruncatedLeafUtility(double value_head_prediction) {
   return value_head_prediction * kValueToLadderScale;
 }
 
+struct ActiveRolloutReleaseGuard {
+  BatchedNNEvaluator* evaluator = nullptr;
+  IGameEvaluator* game_evaluator = nullptr;
+  int count = 1;
+
+  ActiveRolloutReleaseGuard() = default;
+  ActiveRolloutReleaseGuard(BatchedNNEvaluator* ev, int c = 1)
+      : evaluator(ev), game_evaluator(nullptr), count(c) {}
+  ActiveRolloutReleaseGuard(IGameEvaluator* ev, int c = 1)
+      : evaluator(nullptr), game_evaluator(ev), count(c) {}
+
+  ~ActiveRolloutReleaseGuard() {
+    if (evaluator != nullptr) {
+      evaluator->AdjustActiveRollouts(-count);
+    }
+    if (game_evaluator != nullptr) {
+      game_evaluator->AdjustActiveRollouts(-count);
+    }
+  }
+};
+
+class SearchRolloutThreadPool {
+ public:
+  static constexpr size_t kMaxWorkers = 512;
+
+  static SearchRolloutThreadPool& Instance() {
+    static SearchRolloutThreadPool pool;
+    return pool;
+  }
+
+  ~SearchRolloutThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& w : workers_) {
+      if (w.joinable()) w.join();
+    }
+  }
+
+  template <typename Fn>
+  std::future<std::invoke_result_t<Fn>> Submit(Fn&& fn) {
+    using R = std::invoke_result_t<Fn>;
+    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<Fn>(fn));
+    std::future<R> fut = task->get_future();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!stop_) {
+        tasks_.emplace_back([task]() { (*task)(); });
+        if (idle_workers_ < static_cast<int>(tasks_.size()) &&
+            workers_.size() < kMaxWorkers) {
+          SpawnWorkerLocked();
+        }
+        if (idle_workers_ >= static_cast<int>(tasks_.size()) ||
+            !workers_.empty()) {
+          cv_.notify_one();
+          return fut;
+        }
+      }
+    }
+    std::thread([task]() { (*task)(); }).detach();
+    return fut;
+  }
+
+ private:
+  SearchRolloutThreadPool() = default;
+
+  void SpawnWorkerLocked() {
+    ++idle_workers_;
+    workers_.emplace_back([this]() {
+      for (;;) {
+        std::function<void()> job;
+        {
+          std::unique_lock<std::mutex> lock(mu_);
+          cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+          if (stop_ && tasks_.empty()) {
+            --idle_workers_;
+            return;
+          }
+          job = std::move(tasks_.front());
+          tasks_.pop_front();
+          --idle_workers_;
+        }
+        job();
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          ++idle_workers_;
+        }
+      }
+    });
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> tasks_;
+  std::vector<std::thread> workers_;
+  int idle_workers_ = 0;
+  bool stop_ = false;
+};
+
+struct EpochCardDrawCounter {
+  std::array<std::pair<Action, int>, 32> inline_counts{};
+  int inline_size = 0;
+  std::vector<std::pair<Action, int>> overflow;
+
+  void clear() {
+    inline_size = 0;
+    overflow.clear();
+  }
+  int get(Action a) const {
+    for (int i = 0; i < inline_size; ++i) {
+      if (inline_counts[i].first == a) return inline_counts[i].second;
+    }
+    for (const auto& kv : overflow) {
+      if (kv.first == a) return kv.second;
+    }
+    return 0;
+  }
+  void increment(Action a) {
+    for (int i = 0; i < inline_size; ++i) {
+      if (inline_counts[i].first == a) {
+        ++inline_counts[i].second;
+        return;
+      }
+    }
+    if (inline_size < 32) {
+      inline_counts[inline_size++] = {a, 1};
+      return;
+    }
+    for (auto& kv : overflow) {
+      if (kv.first == a) {
+        ++kv.second;
+        return;
+      }
+    }
+    overflow.push_back({a, 1});
+  }
+};
+
 // Result of a rollout tracking both terminal utility and the actions taken within the active turn.
 struct RolloutTrajectory {
   double terminal_utility = 0.0;
   std::vector<Action> intra_turn_actions;
   bool aborted_by_deadline = false;
+  int steps = 0;
+  int nn_evals = 0;
 };
 
 inline Action PickGreedyAction(const ActionsAndProbs& prior, const std::vector<Action>& legal_actions);
@@ -221,12 +503,26 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
     bool sample_opponent_leader_draft = false,
-    const std::chrono::steady_clock::time_point* deadline = nullptr) {
+    const std::chrono::steady_clock::time_point* deadline = nullptr,
+    int* out_steps = nullptr,
+    int* out_nn_evals = nullptr) {
   std::mt19937 rng(rollout_seed);
   int steps = 0;
   const int max_steps = 2500;
   std::vector<Action> intra_turn_actions;
   bool active_turn = true;
+  int loc_steps = 0;
+  int loc_nn_evals = 0;
+
+  auto apply_action = [&](Action act) {
+    sim_state->ApplyAction(act);
+    ++loc_steps;
+    if (out_steps) ++(*out_steps);
+  };
+  auto count_nn_eval = [&]() {
+    ++loc_nn_evals;
+    if (out_nn_evals) ++(*out_nn_evals);
+  };
 
   const auto* cur_dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
   int start_round = cur_dune ? cur_dune->GetCurrentRound() : 1;
@@ -238,11 +534,11 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
   std::array<bool, 15> just_reshuffled{};
   std::array<int, 15> last_effective_epoch;
   last_effective_epoch.fill(-1);
-  std::array<std::unordered_map<Action, int>, 15> epoch_card_draws{};
+  std::array<EpochCardDrawCounter, 15> epoch_card_draws{};
 
   while (!sim_state->IsTerminal() && steps < max_steps) {
     if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) {
-      return {0.0, std::move(intra_turn_actions), /*aborted_by_deadline=*/true};
+      return {0.0, std::move(intra_turn_actions), /*aborted_by_deadline=*/true, loc_steps, loc_nn_evals};
     }
     steps++;
     if (sim_state->IsChanceNode()) {
@@ -344,7 +640,7 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
                     ? std::max(1, static_cast<int>(std::llround(
                                       prob * static_cast<double>(pool_size))))
                     : 1;
-            const int d = epoch_card_draws[s_id][cand_action];
+            const int d = epoch_card_draws[s_id].get(cand_action);
             const int total_copies = d + m;
             const uint64_t StreamEpochTag =
                 0x4F534343ULL + (static_cast<uint64_t>(s_id) << 16) +
@@ -366,8 +662,8 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
               chosen_action = cand_action;
             }
           }
-          epoch_card_draws[s_id][chosen_action]++;
-          sim_state->ApplyAction(chosen_action);
+          epoch_card_draws[s_id].increment(chosen_action);
+          apply_action(chosen_action);
         } else {
           // Fall back to kDeckOrderCrn formula for non-deck chance streams (6, 7, 9, 14)
           const uint64_t k = (static_cast<uint64_t>(reshuffle_epoch[s_id]) << 32) |
@@ -377,7 +673,7 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
           const double u =
               static_cast<double>(draw_seed >> 11) * (1.0 / 9007199254740992.0);
           Action ca = open_spiel::SampleAction(chance_outcomes, u).first;
-          sim_state->ApplyAction(ca);
+          apply_action(ca);
         }
       }
       continue;
@@ -389,8 +685,9 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     // Truncation check: search player's first decision in the subsequent round
     if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer &&
         cur == search_player && cur_round > start_round) {
+      if (evaluator) count_nn_eval();
       double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
-      return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions)};
+      return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
     }
 
     std::vector<Action> legals = sim_state->LegalActions();
@@ -402,6 +699,7 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     } else if (sample_opponent_leader_draft && cur_dune != nullptr &&
                cur_dune->phase() == dune_imperium::GamePhase::kLeaderDraft &&
                cur != search_player) {
+      if (evaluator) count_nn_eval();
       ActionsAndProbs prior = evaluator ? evaluator->PriorWithLegals(*sim_state, legals) : ActionsAndProbs{};
       std::vector<double> prior_probs(legals.size(), 0.0);
       double prior_sum = 0.0;
@@ -451,8 +749,8 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
       double u_lead = static_cast<double>(lead_seed >> 11) * (1.0 / 9007199254740992.0);
       a = open_spiel::SampleAction(mixture_outcomes, u_lead).first;
     } else {
-      ActionsAndProbs prior = evaluator ? evaluator->PriorWithLegals(*sim_state, legals) : ActionsAndProbs{};
-      a = PickGreedyAction(prior, legals);
+      if (evaluator) count_nn_eval();
+      a = evaluator ? evaluator->GreedyActionWithLegals(*sim_state, legals) : legals.front();
     }
 
     if (active_turn) {
@@ -467,19 +765,36 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
       }
     }
 
-    sim_state->ApplyAction(a);
+    apply_action(a);
   }
 
   // In kNextRoundSearchPlayer mode, if loop exits without terminal, evaluate value head
   if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer && !sim_state->IsTerminal()) {
+    if (evaluator) count_nn_eval();
     double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
-    return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions)};
+    return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
   }
 
   // Original fallback: exactly as before for kTerminal mode (and terminal rollouts)
   std::vector<double> ret = sim_state->Returns();
   double u = (static_cast<size_t>(search_player) < ret.size()) ? ret[search_player] : 0.0;
-  return {u, std::move(intra_turn_actions)};
+  return {u, std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
+}
+
+inline RolloutTrajectory SimulateRemainingTurn(
+    State* sim_state,
+    Player search_player,
+    BatchedNNEvaluator* evaluator,
+    uint64_t rollout_seed,
+    SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
+    bool sample_opponent_leader_draft = false,
+    const std::chrono::steady_clock::time_point* deadline = nullptr,
+    int* out_steps = nullptr,
+    int* out_nn_evals = nullptr) {
+  return SimulateRolloutWithTurnTrajectory(
+      sim_state, search_player, evaluator, rollout_seed, truncation_mode,
+      crn_mode, sample_opponent_leader_draft, deadline, out_steps, out_nn_evals);
 }
 
 // Pick greedy action from prior over legal actions
@@ -553,6 +868,14 @@ enum class TreeReuseMode {
   kAdditive     // Always run target rollouts and add to existing tree visits (deepens search)
 };
 
+// Optional search configuration options for CompoundRolloutSearchDecision
+struct CompoundSearchOptions {
+  const ActionsAndProbs* precomputed_raw_prior = nullptr;
+  bool dedup_paired_worlds = false;
+  int stage1_rollouts = 0;
+  double stage1_min_mean_diff = -1e9;
+};
+
 // Decision result from CompoundRolloutSearch
 struct CompoundSearchDecisionResult {
   Action action = kInvalidAction;
@@ -572,7 +895,21 @@ struct CompoundSearchDecisionResult {
   std::string termination_reason = "none";
   double mean_d_stage2 = 0.0;
   double se_d_stage2 = 0.0;
+  // R7-55 hybrid search diagnostics
+  Action raw_action = kInvalidAction;
+  Action best_action = kInvalidAction;
+  Action chosen_action = kInvalidAction;
+  double best_vs_raw_mean_diff = 0.0;
+  double best_vs_raw_t_stat = 0.0;
+  int rollout_steps = 0;
+  int rollout_nn_evals = 0;
+  // R7-58 options and diagnostics
+  std::vector<std::pair<Action, double>> candidate_priors = {};
+  int resample_fallbacks = 0;
+  bool stopped_stage1 = false;
 };
+
+using CompoundRolloutSearchResult = CompoundSearchDecisionResult;
 
 // Optional source of search worlds, keyed by the world seed. Returning nullptr
 // (or leaving it empty) uses ResampleFromInfostate as before. A sampler must be
@@ -593,18 +930,59 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     SearchPairingMode pairing_mode = SearchPairingMode::kUnpaired,
     SearchTruncationMode truncation_mode = SearchTruncationMode::kTerminal,
     SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
-    const SearchWorldSampler& world_sampler = nullptr) {
+    const SearchWorldSampler& world_sampler = nullptr,
+    double min_paired_t_stat = 0.0,
+    const CompoundSearchOptions& opts = {}) {
   if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   std::vector<Action> legal_actions = state.LegalActions();
   if (legal_actions.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
-  if (legal_actions.size() == 1) return {legal_actions.front(), false, 0.0, 0.0, 0, 0, {}, {}};
+  if (legal_actions.size() == 1) {
+    CompoundSearchDecisionResult r;
+    r.action = legal_actions.front();
+    r.chosen_action = r.action;
+    r.raw_action = r.action;
+    r.best_action = r.action;
+    if (opts.precomputed_raw_prior != nullptr) {
+      for (const auto& ap : *opts.precomputed_raw_prior) {
+        if (ap.first == r.action) {
+          r.candidate_priors.push_back(ap);
+          break;
+        }
+      }
+    }
+    if (r.candidate_priors.empty()) {
+      r.candidate_priors.push_back({r.action, 1.0});
+    }
+    return r;
+  }
 
-  ActionsAndProbs raw_prior = evaluators.front()->Prior(state);
+  int total_steps = 0;
+  int total_nn_evals = 0;
+  ActionsAndProbs raw_prior;
+  if (opts.precomputed_raw_prior != nullptr) {
+    raw_prior = *opts.precomputed_raw_prior;
+  } else {
+    if (!evaluators.empty()) ++total_nn_evals;
+    raw_prior = evaluators.front()->Prior(state);
+  }
   Action raw_action = PickGreedyAction(raw_prior, legal_actions);
 
   std::vector<Action> candidates = GetTopKActions(raw_prior, legal_actions, top_k);
   if (candidates.size() <= 1) {
-    return {raw_action, false, 0.0, 0.0, 0, 0, {}, {}};
+    CompoundSearchDecisionResult r;
+    r.action = raw_action;
+    r.chosen_action = raw_action;
+    r.raw_action = raw_action;
+    r.best_action = raw_action;
+    r.rollout_nn_evals = total_nn_evals;
+    for (Action a : candidates) {
+      double p = 0.0;
+      for (const auto& ap : raw_prior) {
+        if (ap.first == a) { p = ap.second; break; }
+      }
+      r.candidate_priors.push_back({a, p});
+    }
+    return r;
   }
 
   // Ensure candidate 0 is always the baseline raw_action
@@ -620,7 +998,44 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     }
   }
 
+  std::vector<std::pair<Action, double>> candidate_priors;
+  candidate_priors.reserve(candidates.size());
+  for (Action cand_a : candidates) {
+    double p = 0.0;
+    for (const auto& ap : raw_prior) {
+      if (ap.first == cand_a) {
+        p = ap.second;
+        break;
+      }
+    }
+    candidate_priors.push_back({cand_a, p});
+  }
+
   const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+
+  int prior_rollouts_reused = 0;
+  for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
+    Action cand_a = candidates[c_idx];
+    int existing_visits = (turn_tree != nullptr) ? turn_tree->GetVisits(cand_a) : 0;
+    if (turn_tree != nullptr && reuse_mode == TreeReuseMode::kTargetFill) {
+      prior_rollouts_reused += std::min(existing_visits, rollouts_per_action);
+    } else if (turn_tree != nullptr) {
+      prior_rollouts_reused += existing_visits;
+    }
+  }
+
+  const bool use_two_stage =
+      (opts.stage1_rollouts > 0 &&
+       opts.stage1_rollouts < rollouts_per_action &&
+       pairing_mode == SearchPairingMode::kPaired &&
+       prior_rollouts_reused == 0);
+
+  const bool can_dedup =
+      (opts.dedup_paired_worlds &&
+       pairing_mode == SearchPairingMode::kPaired &&
+       !world_sampler &&
+       dune != nullptr &&
+       prior_rollouts_reused == 0);
 
   struct RolloutTask {
     size_t c_idx;
@@ -630,124 +1045,324 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     uint64_t wseed;
   };
 
-  std::vector<RolloutTask> tasks;
-  int prior_rollouts_reused = 0;
-
-  std::vector<std::unique_ptr<State>> base_worlds;
-  if (pairing_mode == SearchPairingMode::kPaired && !world_sampler) {
-    base_worlds.resize(rollouts_per_action);
-    for (int r = 0; r < rollouts_per_action; ++r) {
-      uint64_t wseed = dune_seed::DeriveSeed(decision_seed, r);
-      if (dune) {
-        std::mt19937 wrng(wseed);
-        auto rng_func = [&wrng]() {
-          return std::generate_canonical<double, 53>(wrng);
-        };
-        base_worlds[r] = dune->ResampleFromInfostate(search_player, rng_func);
-      }
-      if (!base_worlds[r]) {
-        base_worlds[r] = state.Clone();
-      }
-    }
-  }
-
-  for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
-    Action cand_a = candidates[c_idx];
-    int existing_visits = (turn_tree != nullptr) ? turn_tree->GetVisits(cand_a) : 0;
-    int needed_rollouts = rollouts_per_action;
-
-    if (turn_tree != nullptr && reuse_mode == TreeReuseMode::kTargetFill) {
-      prior_rollouts_reused += std::min(existing_visits, rollouts_per_action);
-      needed_rollouts = std::max(0, rollouts_per_action - existing_visits);
-    } else if (turn_tree != nullptr) {
-      prior_rollouts_reused += existing_visits;
-    }
-
-    for (int r = 0; r < needed_rollouts; ++r) {
-      // In paired mode, all candidates share the exact same world seed for rollout r.
-      // In unpaired mode, world seed depends on candidate index c_idx.
-      uint64_t wseed = (pairing_mode == SearchPairingMode::kPaired)
-          ? dune_seed::DeriveSeed(decision_seed, r)
-          : dune_seed::DeriveSeed(decision_seed, c_idx, r);
-      std::unique_ptr<State> sim_state = nullptr;
-
-      if (world_sampler) {
-        sim_state = world_sampler(wseed);
-        if (sim_state) {
-          const auto sim_legal = sim_state->LegalActions();
-          if (std::find(sim_legal.begin(), sim_legal.end(), cand_a) == sim_legal.end()) {
-            sim_state = nullptr;
-          }
-        }
-      }
-      if (!sim_state && !base_worlds.empty()) {
-        const bool is_last_cand = (c_idx + 1 == candidates.size());
-        sim_state = is_last_cand ? std::move(base_worlds[r]) : base_worlds[r]->Clone();
-      } else if (!sim_state && dune) {
-        std::mt19937 wrng(wseed);
-        auto rng_func = [&wrng]() {
-          return std::generate_canonical<double, 53>(wrng);
-        };
-        sim_state = dune->ResampleFromInfostate(search_player, rng_func);
-      }
-      if (!sim_state) {
-        sim_state = state.Clone();
-      }
-
-      sim_state->ApplyAction(cand_a);
-      tasks.push_back({c_idx, r, cand_a, std::move(sim_state), wseed + 999});
-    }
-  }
-
-  int new_rollouts_executed = static_cast<int>(tasks.size());
+  std::atomic<int> resample_fallbacks{0};
+  int new_rollouts_executed = 0;
 
   TurnSearchTree local_tree;
   TurnSearchTree* active_tree = (turn_tree != nullptr) ? turn_tree : &local_tree;
 
   std::vector<std::vector<double>> per_candidate_rollouts(
       candidates.size(), std::vector<double>(rollouts_per_action, 0.0));
+  std::vector<std::vector<double>> cand_rollout_returns(candidates.size());
 
-  // Concurrently step all rollouts if any are needed
-  if (!tasks.empty()) {
+  const State* root_state_ptr = &state;
+
+  auto build_tasks = [&](const std::vector<size_t>& active_c_indices,
+                         int r_begin, int r_end, bool use_dedup) -> std::vector<RolloutTask> {
+    std::vector<RolloutTask> batch_tasks;
+    if (r_begin >= r_end || active_c_indices.empty()) return batch_tasks;
+    const int num_worlds = r_end - r_begin;
+
+    std::vector<std::unique_ptr<State>> base_worlds;
+    if (use_dedup) {
+      base_worlds.resize(num_worlds);
+      for (int w = 0; w < num_worlds; ++w) {
+        uint64_t wseed = dune_seed::DeriveSeed(decision_seed, r_begin + w);
+        std::mt19937 wrng(wseed);
+        auto rng_func = [&wrng]() {
+          return std::generate_canonical<double, 53>(wrng);
+        };
+        std::unique_ptr<State> base_state = dune->ResampleFromInfostate(search_player, rng_func);
+        if (!base_state) {
+          ++resample_fallbacks;
+          base_state = root_state_ptr->Clone();
+        }
+        base_worlds[w] = std::move(base_state);
+      }
+    }
+
+    batch_tasks.reserve(active_c_indices.size() * num_worlds);
+    for (size_t c_idx : active_c_indices) {
+      Action cand_a = candidates[c_idx];
+      for (int r = r_begin; r < r_end; ++r) {
+        uint64_t wseed = (pairing_mode == SearchPairingMode::kPaired)
+            ? dune_seed::DeriveSeed(decision_seed, r)
+            : dune_seed::DeriveSeed(decision_seed, c_idx, r);
+        std::unique_ptr<State> sim_state = nullptr;
+        if (use_dedup) {
+          sim_state = base_worlds[r - r_begin]->Clone();
+          sim_state->ApplyAction(cand_a);
+        } else if (world_sampler || dune == nullptr) {
+          if (world_sampler) {
+            sim_state = world_sampler(wseed);
+            if (sim_state) {
+              const auto sim_legal = sim_state->LegalActions();
+              if (std::find(sim_legal.begin(), sim_legal.end(), cand_a) == sim_legal.end()) {
+                sim_state = nullptr;
+              }
+            }
+          }
+          if (!sim_state && dune) {
+            std::mt19937 wrng(wseed);
+            auto rng_func = [&wrng]() {
+              return std::generate_canonical<double, 53>(wrng);
+            };
+            sim_state = dune->ResampleFromInfostate(search_player, rng_func);
+            if (!sim_state) {
+              ++resample_fallbacks;
+            }
+          }
+          if (!sim_state) {
+            sim_state = root_state_ptr->Clone();
+          }
+          sim_state->ApplyAction(cand_a);
+        }
+        batch_tasks.push_back({c_idx, r, cand_a, std::move(sim_state), wseed});
+      }
+    }
+    return batch_tasks;
+  };
+
+  auto execute_tasks = [&](std::vector<RolloutTask>& batch_tasks) {
+    if (batch_tasks.empty()) return;
+    new_rollouts_executed += static_cast<int>(batch_tasks.size());
+
     std::vector<std::future<RolloutTrajectory>> futures;
-    futures.reserve(tasks.size());
+    futures.reserve(batch_tasks.size());
 
-    for (size_t i = 0; i < tasks.size(); ++i) {
-      auto* s_ptr = tasks[i].sim_state.get();
-      uint64_t s_seed = tasks[i].wseed;
+    for (size_t i = 0; i < batch_tasks.size(); ++i) {
       auto* active_evaluator = evaluators[i % evaluators.size()].get();
-      futures.push_back(std::async(
-          std::launch::async,
-          [s_ptr, search_player, active_evaluator, s_seed, truncation_mode, crn_mode]() {
+      if (active_evaluator != nullptr) {
+        active_evaluator->AdjustActiveRollouts(1);
+      }
+    }
+
+    for (size_t i = 0; i < batch_tasks.size(); ++i) {
+      auto* prebuilt_ptr = batch_tasks[i].sim_state.get();
+      uint64_t wseed = batch_tasks[i].wseed;
+      Action cand_a = batch_tasks[i].action;
+      auto* active_evaluator = evaluators[i % evaluators.size()].get();
+      futures.push_back(SearchRolloutThreadPool::Instance().Submit(
+          [prebuilt_ptr, root_state_ptr, dune, cand_a, wseed, search_player,
+           active_evaluator, truncation_mode, crn_mode, &resample_fallbacks]() {
+            ActiveRolloutReleaseGuard guard{active_evaluator};
+            std::unique_ptr<State> local_state;
+            State* s_ptr = prebuilt_ptr;
+            if (s_ptr == nullptr) {
+              if (dune != nullptr) {
+                std::mt19937 wrng(wseed);
+                auto rng_func = [&wrng]() {
+                  return std::generate_canonical<double, 53>(wrng);
+                };
+                local_state = dune->ResampleFromInfostate(search_player, rng_func);
+              }
+              if (!local_state) {
+                ++resample_fallbacks;
+                local_state = root_state_ptr->Clone();
+              }
+              local_state->ApplyAction(cand_a);
+              s_ptr = local_state.get();
+            }
             return SimulateRolloutWithTurnTrajectory(
-                s_ptr, search_player, active_evaluator, s_seed, truncation_mode, crn_mode);
+                s_ptr, search_player, active_evaluator, wseed + 999, truncation_mode, crn_mode);
           }));
     }
 
     for (size_t i = 0; i < futures.size(); ++i) {
       RolloutTrajectory traj = futures[i].get();
-      active_tree->RecordRollout(tasks[i].action, traj.intra_turn_actions, traj.terminal_utility);
-      if (tasks[i].c_idx < per_candidate_rollouts.size() &&
-          tasks[i].rollout_idx >= 0 &&
-          static_cast<size_t>(tasks[i].rollout_idx) < per_candidate_rollouts[tasks[i].c_idx].size()) {
-        per_candidate_rollouts[tasks[i].c_idx][tasks[i].rollout_idx] = traj.terminal_utility;
+      total_steps += (traj.steps + 1);
+      total_nn_evals += traj.nn_evals;
+      active_tree->RecordRollout(batch_tasks[i].action, traj.intra_turn_actions, traj.terminal_utility);
+      if (batch_tasks[i].c_idx < per_candidate_rollouts.size() &&
+          batch_tasks[i].rollout_idx >= 0 &&
+          static_cast<size_t>(batch_tasks[i].rollout_idx) < per_candidate_rollouts[batch_tasks[i].c_idx].size()) {
+        per_candidate_rollouts[batch_tasks[i].c_idx][batch_tasks[i].rollout_idx] = traj.terminal_utility;
+      }
+      if (batch_tasks[i].c_idx < cand_rollout_returns.size()) {
+        cand_rollout_returns[batch_tasks[i].c_idx].push_back(traj.terminal_utility);
       }
     }
+  };
+
+  bool stopped_stage1 = false;
+  size_t best_s1_c = 0;
+  if (use_two_stage) {
+    const int R1 = opts.stage1_rollouts;
+    std::vector<size_t> all_c_indices(candidates.size());
+    std::iota(all_c_indices.begin(), all_c_indices.end(), 0);
+    auto s1_tasks = build_tasks(all_c_indices, 0, R1, can_dedup);
+    execute_tasks(s1_tasks);
+
+    best_s1_c = 1;
+    double best_s1_mean_d = -1e9;
+    for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+      double sum_d = 0.0;
+      for (int r = 0; r < R1; ++r) {
+        sum_d += (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]);
+      }
+      double mean_d = sum_d / static_cast<double>(R1);
+      if (c_idx == 1 || mean_d > best_s1_mean_d) {
+        best_s1_mean_d = mean_d;
+        best_s1_c = c_idx;
+      }
+    }
+
+    if (best_s1_c == 0 || best_s1_mean_d < opts.stage1_min_mean_diff) {
+      stopped_stage1 = true;
+    } else {
+      std::vector<size_t> stage2_c_indices = {0, best_s1_c};
+      auto s2_tasks = build_tasks(stage2_c_indices, R1, rollouts_per_action, can_dedup);
+      execute_tasks(s2_tasks);
+    }
+
+    for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
+      per_candidate_rollouts[c_idx].resize(cand_rollout_returns[c_idx].size());
+    }
+  } else if (prior_rollouts_reused == 0) {
+    std::vector<size_t> all_c_indices(candidates.size());
+    std::iota(all_c_indices.begin(), all_c_indices.end(), 0);
+    auto tasks = build_tasks(all_c_indices, 0, rollouts_per_action, can_dedup);
+    execute_tasks(tasks);
+  } else {
+    std::vector<RolloutTask> tasks;
+    for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
+      Action cand_a = candidates[c_idx];
+      int existing_visits = (turn_tree != nullptr) ? turn_tree->GetVisits(cand_a) : 0;
+      int needed_rollouts = rollouts_per_action;
+      if (turn_tree != nullptr && reuse_mode == TreeReuseMode::kTargetFill) {
+        needed_rollouts = std::max(0, rollouts_per_action - existing_visits);
+      }
+      auto c_tasks = build_tasks({c_idx}, 0, needed_rollouts, /*use_dedup=*/false);
+      tasks.insert(tasks.end(), std::make_move_iterator(c_tasks.begin()),
+                   std::make_move_iterator(c_tasks.end()));
+    }
+    execute_tasks(tasks);
   }
 
-  // Calculate candidate statistics
   double raw_mean_u = active_tree->GetMeanUtility(raw_action);
-
   Action best_action = raw_action;
   double best_mean_u = raw_mean_u;
+  size_t best_c_idx = 0;
+  double best_vs_raw_mean_diff = 0.0;
+  double best_vs_raw_t_stat = 0.0;
   bool overridden = false;
 
-  for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
-    Action cand_a = candidates[c_idx];
-    double mean_u = active_tree->GetMeanUtility(cand_a);
-    if (mean_u > raw_mean_u + min_override_margin && mean_u > best_mean_u) {
-      best_mean_u = mean_u;
-      best_action = cand_a;
+  if (use_two_stage) {
+    if (!stopped_stage1) {
+      double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
+      if (cand_mean_u > raw_mean_u) {
+        best_action = candidates[best_s1_c];
+        best_mean_u = cand_mean_u;
+        best_c_idx = best_s1_c;
+        best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
+
+        const auto& raw_returns = cand_rollout_returns[0];
+        const auto& best_returns = cand_rollout_returns[best_c_idx];
+        const size_t R = std::min(raw_returns.size(), best_returns.size());
+        if (R >= 2) {
+          double sum_d = 0.0;
+          for (size_t r = 0; r < R; ++r) {
+            sum_d += (best_returns[r] - raw_returns[r]);
+          }
+          double mean_d = sum_d / static_cast<double>(R);
+          double sum_sq_d = 0.0;
+          for (size_t r = 0; r < R; ++r) {
+            double diff = (best_returns[r] - raw_returns[r]) - mean_d;
+            sum_sq_d += diff * diff;
+          }
+          double var_d = sum_sq_d / static_cast<double>(R - 1);
+          double se_d = std::sqrt(var_d / static_cast<double>(R));
+          best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+        } else {
+          best_vs_raw_t_stat = (min_paired_t_stat <= 0.0) ? 1e9 : 0.0;
+        }
+
+        if (best_mean_u > raw_mean_u + min_override_margin &&
+            best_vs_raw_t_stat >= min_paired_t_stat) {
+          overridden = true;
+        }
+      }
+    } else {
+      double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
+      if (cand_mean_u > raw_mean_u) {
+        best_action = candidates[best_s1_c];
+        best_mean_u = cand_mean_u;
+        best_c_idx = best_s1_c;
+        best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
+
+        const auto& raw_returns = cand_rollout_returns[0];
+        const auto& best_returns = cand_rollout_returns[best_c_idx];
+        const size_t R = std::min(raw_returns.size(), best_returns.size());
+        if (R >= 2) {
+          double sum_d = 0.0;
+          for (size_t r = 0; r < R; ++r) {
+            sum_d += (best_returns[r] - raw_returns[r]);
+          }
+          double mean_d = sum_d / static_cast<double>(R);
+          double sum_sq_d = 0.0;
+          for (size_t r = 0; r < R; ++r) {
+            double diff = (best_returns[r] - raw_returns[r]) - mean_d;
+            sum_sq_d += diff * diff;
+          }
+          double var_d = sum_sq_d / static_cast<double>(R - 1);
+          double se_d = std::sqrt(var_d / static_cast<double>(R));
+          best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+        }
+      }
+      overridden = false;
+    }
+  } else {
+    for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+      Action cand_a = candidates[c_idx];
+      double mean_u = active_tree->GetMeanUtility(cand_a);
+      if (mean_u > best_mean_u) {
+        best_mean_u = mean_u;
+        best_action = cand_a;
+        best_c_idx = c_idx;
+      }
+    }
+
+    if (best_action != raw_action) {
+      best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
+      const auto& raw_returns = cand_rollout_returns[0];
+      const auto& best_returns = cand_rollout_returns[best_c_idx];
+      const size_t R = std::min(raw_returns.size(), best_returns.size());
+
+      if (pairing_mode == SearchPairingMode::kPaired && R >= 2) {
+        double sum_d = 0.0;
+        for (size_t r = 0; r < R; ++r) {
+          sum_d += (best_returns[r] - raw_returns[r]);
+        }
+        double mean_d = sum_d / static_cast<double>(R);
+        double sum_sq_d = 0.0;
+        for (size_t r = 0; r < R; ++r) {
+          double diff = (best_returns[r] - raw_returns[r]) - mean_d;
+          sum_sq_d += diff * diff;
+        }
+        double var_d = sum_sq_d / static_cast<double>(R - 1);
+        double se_d = std::sqrt(var_d / static_cast<double>(R));
+        best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+      } else if (raw_returns.size() >= 2 && best_returns.size() >= 2) {
+        double m0 = 0.0, m1 = 0.0;
+        for (double v : raw_returns) m0 += v;
+        m0 /= raw_returns.size();
+        for (double v : best_returns) m1 += v;
+        m1 /= best_returns.size();
+        double v0 = 0.0, v1 = 0.0;
+        for (double v : raw_returns) v0 += (v - m0) * (v - m0);
+        v0 /= (raw_returns.size() - 1);
+        for (double v : best_returns) v1 += (v - m1) * (v - m1);
+        v1 /= (best_returns.size() - 1);
+        double se = std::sqrt(v0 / raw_returns.size() + v1 / best_returns.size());
+        best_vs_raw_t_stat = (se > 1e-12) ? ((m1 - m0) / se) : ((m1 - m0) > 0.0 ? 1e9 : -1e9);
+      } else {
+        best_vs_raw_t_stat = (min_paired_t_stat <= 0.0) ? 1e9 : 0.0;
+      }
+    }
+
+    if (best_action != raw_action &&
+        best_mean_u > raw_mean_u + min_override_margin &&
+        best_vs_raw_t_stat >= min_paired_t_stat) {
       overridden = true;
     }
   }
@@ -765,7 +1380,47 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     candidate_rollout_utilities.push_back({candidates[c_idx], per_candidate_rollouts[c_idx]});
   }
 
-  return {best_action, overridden, raw_mean_u, best_mean_u, prior_rollouts_reused, new_rollouts_executed, candidate_utilities, candidate_rollout_utilities};
+  CompoundSearchDecisionResult result;
+  result.action = overridden ? best_action : raw_action;
+  result.chosen_action = result.action;
+  result.best_action = best_action;
+  result.raw_action = raw_action;
+  result.overridden = overridden;
+  result.stopped_stage1 = stopped_stage1;
+  result.resample_fallbacks = resample_fallbacks.load();
+  result.raw_mean_utility = raw_mean_u;
+  result.chosen_mean_utility = overridden ? best_mean_u : raw_mean_u;
+  result.prior_rollouts_reused = prior_rollouts_reused;
+  result.new_rollouts_executed = new_rollouts_executed;
+  result.candidate_priors = std::move(candidate_priors);
+  result.candidate_utilities = std::move(candidate_utilities);
+  result.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+  result.best_vs_raw_mean_diff = best_vs_raw_mean_diff;
+  result.best_vs_raw_t_stat = best_vs_raw_t_stat;
+  result.rollout_steps = total_steps;
+  result.rollout_nn_evals = total_nn_evals;
+
+  return result;
+}
+
+inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
+    const State& state,
+    Player search_player,
+    TurnSearchTree* turn_tree,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    int top_k,
+    int rollouts_per_action,
+    double min_override_margin,
+    TreeReuseMode reuse_mode,
+    uint64_t decision_seed,
+    SearchPairingMode pairing_mode,
+    SearchTruncationMode truncation_mode,
+    bool /*full_turn_supervision*/,
+    double min_paired_t_stat = 0.0) {
+  return CompoundRolloutSearchDecision(
+      state, search_player, turn_tree, evaluators, top_k, rollouts_per_action,
+      min_override_margin, reuse_mode, decision_seed, pairing_mode,
+      truncation_mode, SearchRolloutCrnMode::kSequential, nullptr, min_paired_t_stat);
 }
 
 // Compute softmax target distribution over evaluated actions at temperature T
@@ -1094,6 +1749,22 @@ inline std::vector<double> ComputeMpoRelativeTarget(
   }
 
   return target_distribution;
+}
+
+inline std::vector<double> ComputePairwiseMpoTarget(
+    const std::vector<std::pair<Action, double>>& raw_policy,
+    const std::vector<Action>& legal_actions,
+    Action raw_action, double raw_q,
+    Action best_action, double best_q,
+    double base_temperature = 0.15,
+    double max_target_kl = 0.05) {
+  std::vector<std::pair<Action, double>> pair_utilities = {
+      {raw_action, raw_q},
+      {best_action, best_q},
+  };
+  return ComputeMpoRelativeTarget(
+      raw_policy, legal_actions, pair_utilities,
+      base_temperature, max_target_kl);
 }
 
 inline std::vector<float> ExtractObservationTensor(

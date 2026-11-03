@@ -502,6 +502,9 @@ struct PpoUpdateStats {
   double aux_ppo_norm_ratio = 0.0;    // aux_grad_norm_mean / ppo_grad_norm_mean
   bool aux_ratio_abort = false;       // ratio exceeded abort_grad_norm_ratio (caller aborts)
   int64_t aux_total_presentations = 0; // realized auxiliary presentations across minibatches
+  int64_t aux_distinct_visited = 0;    // distinct search_examples rows presented >= 1 time
+  std::vector<uint8_t> aux_visited_mask; // size == aux_examples_used when aux_active; 1 if visited
+  double search_aux_loss = 0.0;       // mean auxiliary search loss (aux_ce)
 
   // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
   double reverse_kl = 0.0;

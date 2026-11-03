@@ -77,5 +77,22 @@ ABSL_DECLARE_FLAG(int, pool_opponents_per_game);
 ABSL_DECLARE_FLAG(bool, allow_pool_transition);
 ABSL_DECLARE_FLAG(std::string, pool_transition_source_fingerprint);
 
+// R7-55 / R7-57 hybrid search-in-training flags.
+ABSL_DECLARE_FLAG(bool, r755_hybrid_mode);
+ABSL_DECLARE_FLAG(double, r755_search_prob);
+ABSL_DECLARE_FLAG(int, r755_category_mask);
+ABSL_DECLARE_FLAG(double, r755_min_t_stat);
+ABSL_DECLARE_FLAG(bool, r755_execute_overrides);
+ABSL_DECLARE_FLAG(std::string, r755_gate1_output);
+ABSL_DECLARE_FLAG(std::string, r755_gate2_output);
+ABSL_DECLARE_FLAG(double, r755_search_loss_coef);
+ABSL_DECLARE_FLAG(std::string, r755_crn_mode);
+ABSL_DECLARE_FLAG(bool, r755_reuse_root_prior);
+ABSL_DECLARE_FLAG(bool, r755_dedup_paired_worlds);
+ABSL_DECLARE_FLAG(double, r755_max_raw_prior);
+ABSL_DECLARE_FLAG(int, r755_stage1_rollouts);
+ABSL_DECLARE_FLAG(double, r755_stage1_min_mean_diff);
+ABSL_DECLARE_FLAG(std::string, r755_root_dump_jsonl);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

@@ -916,6 +916,340 @@ int main(int argc, char** argv) {
     std::cout << "  Override-gated target: verified formula, sum=1.0, non-override dropping verified.\n";
   }
 
+  // Test 10: R7-57 hybrid search-in-training: category classification, t-stat override gating, and pairwise MPO target
+  {
+    std::cout << "Running Test 10: R7-57 category classification, t-stat gating, and pairwise MPO target...\n";
+
+    // 1. ClassifyR755SearchCategory verification
+    std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+    std::unique_ptr<State> state = game->NewInitialState();
+
+    // Chance node is ineligible
+    SPIEL_CHECK_EQ(ClassifyR755SearchCategory(*state, 0, false), R755SearchCategory::kIneligible);
+
+    auto* dune = static_cast<DuneImperiumState*>(state.get());
+    for (int steps = 0;; ++steps) {
+      SPIEL_CHECK_LT(steps, 1000);
+      if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+      state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                               : state->LegalActions().front());
+    }
+    Player cur_p = state->CurrentPlayer();
+
+    // Agent turn with hand cards and agent spaces -> kAgentCardOrStartPlot (agent placement)
+    R755SearchCategory agent_cat = ClassifyR755SearchCategory(*state, cur_p, false);
+    SPIEL_CHECK_EQ(agent_cat, R755SearchCategory::kAgentCardOrStartPlot);
+
+    // Other players are ineligible
+    SPIEL_CHECK_EQ(ClassifyR755SearchCategory(*state, (cur_p + 1) % 4, false), R755SearchCategory::kIneligible);
+
+    // Zero mask makes it ineligible
+    SPIEL_CHECK_EQ(ClassifyR755SearchCategory(*state, cur_p, false, /*category_mask=*/0), R755SearchCategory::kIneligible);
+
+    // Verify combat category classification (kCombatIntrigue / commit)
+    auto combat_state = state->Clone();
+    auto* dune_combat = static_cast<DuneImperiumState*>(combat_state.get());
+    dune_combat->SetPhaseForTesting(GamePhase::kCombat);
+    dune_combat->SetPlayerTroopsInCombatForTesting(cur_p, 2);
+    // Card ID 0 is Ambush (IntrigueType::kCombat)
+    dune_combat->SetPlayerIntrigueHandForTesting(cur_p, {0});
+    R755SearchCategory combat_cat = ClassifyR755SearchCategory(*combat_state, cur_p, false);
+    SPIEL_CHECK_EQ(combat_cat, R755SearchCategory::kCombatIntrigue);
+
+    // Verify reveal purchase category classification (kRevealPurchase / reveal buy)
+    auto reveal_state = state->Clone();
+    auto* dune_reveal = static_cast<DuneImperiumState*>(reveal_state.get());
+    dune_reveal->SetPlayerPersuasionForTesting(cur_p, 10);
+    reveal_state->ApplyAction(kActionReveal);
+    R755SearchCategory rev_cat = ClassifyR755SearchCategory(*reveal_state, cur_p, false);
+    SPIEL_CHECK_EQ(rev_cat, R755SearchCategory::kRevealPurchase);
+
+    // 2. CompoundRolloutSearchDecision with min_override_t_stat gating
+    auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
+        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+    std::shared_mutex mutex;
+    auto coord = std::make_shared<BatchedEvaluator>(
+        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+    auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
+
+    const uint64_t decision_seed = 42ULL;
+    // High t-stat threshold (100.0) -> override never occurs
+    auto res_high_t = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/16,
+        /*min_override_margin=*/0.0,
+        TreeReuseMode::kTargetFill, decision_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        /*full_turn_supervision=*/false,
+        /*min_paired_t_stat=*/100.0);
+    SPIEL_CHECK_FALSE(res_high_t.overridden);
+
+    // Permissive gating: min_paired_t_stat = 0.0 and min_override_margin = -10.0
+    // If a non-raw candidate has higher utility, override must occur
+    auto res_permissive = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/16,
+        /*min_override_margin=*/-10.0,
+        TreeReuseMode::kTargetFill, decision_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        /*full_turn_supervision=*/false,
+        /*min_paired_t_stat=*/0.0);
+    if (res_permissive.best_action != res_permissive.raw_action) {
+      SPIEL_CHECK_TRUE(res_permissive.overridden);
+      SPIEL_CHECK_EQ(res_permissive.action, res_permissive.best_action);
+    }
+
+    // 3. ComputePairwiseMpoTarget verification
+    std::vector<Action> legal_actions = {10, 20, 30, 40, 50};
+    std::vector<std::pair<Action, double>> raw_policy = {
+        {10, 0.40}, {20, 0.30}, {30, 0.15}, {40, 0.10}, {50, 0.05}};
+    Action raw_act = 10;
+    double raw_q = 0.20;
+    Action best_act = 20;
+    double best_q = 0.80;
+    const double max_target_kl = 0.05;
+
+    std::vector<double> mpo_target = ComputePairwiseMpoTarget(
+        raw_policy, legal_actions, raw_act, raw_q, best_act, best_q,
+        /*base_temperature=*/0.15, max_target_kl);
+
+    SPIEL_CHECK_EQ(mpo_target.size(), legal_actions.size());
+
+    // Probabilities sum to 1.0 within 1e-6
+    double sum_probs = 0.0;
+    for (double p : mpo_target) sum_probs += p;
+    SPIEL_CHECK_FLOAT_EQ(sum_probs, 1.0);
+
+    // Non-evaluated legal actions retain their prior mass
+    SPIEL_CHECK_FLOAT_EQ(mpo_target[2], 0.15);
+    SPIEL_CHECK_FLOAT_EQ(mpo_target[3], 0.10);
+    SPIEL_CHECK_FLOAT_EQ(mpo_target[4], 0.05);
+
+    // KL(pi_target || pi_prior) <= max_kl + 1e-4
+    double kl = 0.0;
+    for (size_t i = 0; i < legal_actions.size(); ++i) {
+      if (mpo_target[i] > 1e-12 && raw_policy[i].second > 1e-12) {
+        kl += mpo_target[i] * std::log(mpo_target[i] / raw_policy[i].second);
+      }
+    }
+    SPIEL_CHECK_TRUE(kl <= max_target_kl + 1e-4);
+
+    std::cout << "  Test 10 PASSED: category classification, t-stat gating, and pairwise MPO target verified.\n";
+  }
+
+  // Test 11: R7-58 optimizations and diagnostics:
+  // 1. Bitwise Parity of dedup_paired_worlds=true vs false
+  // 2. precomputed_raw_prior reuse
+  // 3. Two-Stage Sequential Halving + Futility Stop
+  {
+    std::cout << "Running Test 11: R7-58 dedup parity, root prior reuse, and 2-stage futility stop...\n";
+    auto state = LoadGame("dune_imperium")->NewInitialState();
+    auto* dune = static_cast<DuneImperiumState*>(state.get());
+    for (int steps = 0;; ++steps) {
+      SPIEL_CHECK_LT(steps, 1000);
+      if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+      state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                               : state->LegalActions().front());
+    }
+    const Player cur_p = state->CurrentPlayer();
+
+    auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
+        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+    std::shared_mutex mutex;
+    auto coord = std::make_shared<BatchedEvaluator>(
+        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+    auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
+
+    const uint64_t test_seed = 12345ULL;
+
+    // --- Sub-test A: Bitwise Parity of dedup_paired_worlds=true vs false ---
+    CompoundSearchOptions opts_nodedup;
+    opts_nodedup.dedup_paired_worlds = false;
+    auto res_nodedup = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kSequential,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.0,
+        opts_nodedup);
+
+    CompoundSearchOptions opts_dedup;
+    opts_dedup.dedup_paired_worlds = true;
+    auto res_dedup = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kSequential,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.0,
+        opts_dedup);
+
+    SPIEL_CHECK_EQ(res_nodedup.chosen_action, res_dedup.chosen_action);
+    SPIEL_CHECK_EQ(res_nodedup.best_action, res_dedup.best_action);
+    SPIEL_CHECK_EQ(res_nodedup.raw_action, res_dedup.raw_action);
+    SPIEL_CHECK_EQ(res_nodedup.overridden, res_dedup.overridden);
+    SPIEL_CHECK_FLOAT_EQ(res_nodedup.best_vs_raw_t_stat, res_dedup.best_vs_raw_t_stat);
+    SPIEL_CHECK_EQ(res_nodedup.candidate_rollout_utilities.size(),
+                   res_dedup.candidate_rollout_utilities.size());
+    for (size_t ci = 0; ci < res_nodedup.candidate_rollout_utilities.size(); ++ci) {
+      SPIEL_CHECK_EQ(res_nodedup.candidate_rollout_utilities[ci].first,
+                     res_dedup.candidate_rollout_utilities[ci].first);
+      const auto& u_no = res_nodedup.candidate_rollout_utilities[ci].second;
+      const auto& u_de = res_dedup.candidate_rollout_utilities[ci].second;
+      SPIEL_CHECK_EQ(u_no.size(), u_de.size());
+      for (size_t ri = 0; ri < u_no.size(); ++ri) {
+        SPIEL_CHECK_FLOAT_EQ(u_no[ri], u_de[ri]);
+      }
+    }
+    std::cout << "  Sub-test A (sequential R=8) PASSED: Bitwise parity verified.\n";
+
+    // Production settings parity check: rollouts=16, kDeckOrderCrn, min_paired_t_stat=1.5
+    CompoundSearchOptions opts_prod_nodedup;
+    opts_prod_nodedup.dedup_paired_worlds = false;
+    auto res_prod_nodedup = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kDeckOrderCrn,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.5,
+        opts_prod_nodedup);
+
+    CompoundSearchOptions opts_prod_dedup;
+    opts_prod_dedup.dedup_paired_worlds = true;
+    auto res_prod_dedup = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/16,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kDeckOrderCrn,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.5,
+        opts_prod_dedup);
+
+    SPIEL_CHECK_EQ(res_prod_nodedup.chosen_action, res_prod_dedup.chosen_action);
+    SPIEL_CHECK_EQ(res_prod_nodedup.best_action, res_prod_dedup.best_action);
+    SPIEL_CHECK_EQ(res_prod_nodedup.raw_action, res_prod_dedup.raw_action);
+    SPIEL_CHECK_EQ(res_prod_nodedup.overridden, res_prod_dedup.overridden);
+    SPIEL_CHECK_FLOAT_EQ(res_prod_nodedup.best_vs_raw_t_stat, res_prod_dedup.best_vs_raw_t_stat);
+    SPIEL_CHECK_EQ(res_prod_nodedup.candidate_rollout_utilities.size(),
+                   res_prod_dedup.candidate_rollout_utilities.size());
+    for (size_t ci = 0; ci < res_prod_nodedup.candidate_rollout_utilities.size(); ++ci) {
+      SPIEL_CHECK_EQ(res_prod_nodedup.candidate_rollout_utilities[ci].first,
+                     res_prod_dedup.candidate_rollout_utilities[ci].first);
+      const auto& u_no = res_prod_nodedup.candidate_rollout_utilities[ci].second;
+      const auto& u_de = res_prod_dedup.candidate_rollout_utilities[ci].second;
+      SPIEL_CHECK_EQ(u_no.size(), u_de.size());
+      for (size_t ri = 0; ri < u_no.size(); ++ri) {
+        SPIEL_CHECK_FLOAT_EQ(u_no[ri], u_de[ri]);
+      }
+    }
+    std::cout << "  Sub-test A (production deck_order R=16) PASSED: Bitwise parity verified.\n";
+
+    // --- Sub-test B: precomputed_raw_prior reuse ---
+    ActionsAndProbs computed_prior = nn_eval->Prior(*state);
+    CompoundSearchOptions opts_reuse_prior;
+    opts_reuse_prior.precomputed_raw_prior = &computed_prior;
+    auto res_reuse_prior = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kSequential,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.0,
+        opts_reuse_prior);
+
+    // Prior call skipped: rollout_nn_evals reduced by exactly 1
+    SPIEL_CHECK_EQ(res_reuse_prior.rollout_nn_evals, res_nodedup.rollout_nn_evals - 1);
+    SPIEL_CHECK_EQ(res_reuse_prior.chosen_action, res_nodedup.chosen_action);
+    SPIEL_CHECK_EQ(res_reuse_prior.candidate_priors.size(), res_nodedup.candidate_priors.size());
+    for (size_t ci = 0; ci < res_reuse_prior.candidate_priors.size(); ++ci) {
+      SPIEL_CHECK_EQ(res_reuse_prior.candidate_priors[ci].first, res_nodedup.candidate_priors[ci].first);
+      SPIEL_CHECK_FLOAT_EQ(res_reuse_prior.candidate_priors[ci].second, res_nodedup.candidate_priors[ci].second);
+    }
+    std::cout << "  Sub-test B PASSED: Root prior reuse verified.\n";
+
+    // --- Sub-test C: Two-Stage Sequential Halving + Futility Stop ---
+    // C1: Futility stop triggered: stage1_min_mean_diff = 1000.0 (impossible to meet)
+    CompoundSearchOptions opts_futility;
+    opts_futility.stage1_rollouts = 4;
+    opts_futility.stage1_min_mean_diff = 1000.0;
+    auto res_futility = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kSequential,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.0,
+        opts_futility);
+
+    SPIEL_CHECK_TRUE(res_futility.stopped_stage1);
+    SPIEL_CHECK_FALSE(res_futility.overridden);
+    const size_t K = res_futility.candidate_rollout_utilities.size();
+    SPIEL_CHECK_EQ(K, 3);
+    SPIEL_CHECK_EQ(res_futility.new_rollouts_executed, static_cast<int>(K * 4));
+    for (size_t ci = 0; ci < K; ++ci) {
+      SPIEL_CHECK_EQ(res_futility.candidate_rollout_utilities[ci].second.size(), 4);
+    }
+
+    // C2: Stage 1 passes futility (stage1_min_mean_diff = -1000.0) -> Stage 2 runs on {0, best_s1_c}
+    CompoundSearchOptions opts_stage2;
+    opts_stage2.stage1_rollouts = 4;
+    opts_stage2.stage1_min_mean_diff = -1000.0;
+    auto res_stage2 = CompoundRolloutSearchDecision(
+        *state, cur_p, /*turn_tree=*/nullptr, evaluators,
+        /*top_k=*/3, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15,
+        TreeReuseMode::kTargetFill, test_seed,
+        SearchPairingMode::kPaired,
+        SearchTruncationMode::kNextRoundSearchPlayer,
+        SearchRolloutCrnMode::kSequential,
+        /*world_sampler=*/nullptr,
+        /*min_paired_t_stat=*/1.0,
+        opts_stage2);
+
+    SPIEL_CHECK_FALSE(res_stage2.stopped_stage1);
+    // K * 4 (Stage 1) + 2 * (8 - 4) (Stage 2) = 3*4 + 2*4 = 20 total rollouts (instead of 24)
+    SPIEL_CHECK_EQ(res_stage2.new_rollouts_executed, static_cast<int>(3 * 4 + 2 * 4));
+    SPIEL_CHECK_EQ(res_stage2.candidate_rollout_utilities.size(), 3);
+    // Candidate 0 ran 8 rollouts
+    SPIEL_CHECK_EQ(res_stage2.candidate_rollout_utilities[0].second.size(), 8);
+    // One challenger ran 8 rollouts (best_s1_c), the other ran 4 rollouts
+    size_t c_with_8 = 0;
+    size_t c_with_4 = 0;
+    for (size_t ci = 1; ci < 3; ++ci) {
+      if (res_stage2.candidate_rollout_utilities[ci].second.size() == 8) ++c_with_8;
+      if (res_stage2.candidate_rollout_utilities[ci].second.size() == 4) ++c_with_4;
+    }
+    SPIEL_CHECK_EQ(c_with_8, 1);
+    SPIEL_CHECK_EQ(c_with_4, 1);
+    std::cout << "  Sub-test C PASSED: Two-stage sequential halving + futility stop verified.\n";
+
+    std::cout << "  Test 11 PASSED: all R7-58 optimizations verified.\n";
+  }
+
   std::cout << "All TurnSearchTree and CompoundTurnSearch unit tests PASSED successfully!\n";
   return 0;
 }

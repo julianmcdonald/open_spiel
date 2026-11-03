@@ -73,6 +73,7 @@
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "dune_opponent_pool.h"
 #include "dune_compound_turn_search.h"
+#include "dune_batched_evaluator.h"
 #include "dune_targeted_buy.h"
 #include "open_spiel/utils/json.h"
 #endif
@@ -832,6 +833,16 @@ ABSL_FLAG(double, reverse_kl_coef, 0.0,
           "(0.05 in Arm B, 0.0 in Arm A). Detached, nonforced mean.");
 ABSL_FLAG(std::string, save_initial_model_and_exit, "",
           "If non-empty, saves the newly constructed initial random model to this path and exits 0.");
+ABSL_FLAG(bool, r755_shuffle_aux_examples, false,
+          "If true under --r755_hybrid_mode, deterministically shuffle current_collect.aux_examples "
+          "once per update on a dedicated seed stream before Gate-2 and TrainPpoUpdate.");
+ABSL_FLAG(int, pause_for_gate_at_update, 0,
+          "If > 0, synchronously block after flushing diagnostics and checkpoint at this update "
+          "until --gate_decision_file contains CONTINUE or ABORT.");
+ABSL_FLAG(std::string, gate_decision_file, "",
+          "Path to gate decision file ('CONTINUE' or 'ABORT') read at --pause_for_gate_at_update.");
+ABSL_FLAG(int, gate_timeout_seconds, 1800,
+          "Maximum seconds to wait at --pause_for_gate_at_update before failing closed and exiting.");
 
 namespace open_spiel {
 namespace {
@@ -1003,6 +1014,9 @@ struct WorkerStats {
   int64_t parity_legal_ids_unique_in_range = 0;
   int64_t parity_chosen_once = 0;
   std::vector<std::string> parity_capture_errors;
+
+  int64_t r755_searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
+  int64_t r755_executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
 };
 
 
@@ -2980,7 +2994,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                   const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
                   std::vector<open_spiel::dune_imperium::SearchSnapshot>* local_snapshots = nullptr,
                   uint64_t* decision_count = nullptr,
-                  std::mt19937_64* reservoir_rng = nullptr) {
+                  std::mt19937_64* reservoir_rng = nullptr,
+                  std::vector<open_spiel::SearchTrainingExample>* r755_aux_examples = nullptr) {
 
   if (vrpo_episode != nullptr) {
     *vrpo_episode = VrpoCapturedEpisode{};
@@ -3043,6 +3058,25 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
   bool episode_forced_card13 = false;
 
   while (true) {
+    const bool r755_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+    open_spiel::dune_imperium::TurnSearchTree r755_turn_trees_[4];
+    bool r755_space_placed_this_turn_[4] = {false, false, false, false};
+    bool r755_turn_coin_active_[4] = {false, false, false, false};
+    Player r755_last_turn_player_ = open_spiel::kInvalidPlayer;
+    Action r755_last_action_ = open_spiel::kInvalidAction;
+    int64_t r755_decision_index_ = 0;
+
+    std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> r755_search_evals_;
+    if (r755_hybrid) {
+      auto batched_eval = std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator);
+      if (batched_eval != nullptr) {
+        r755_search_evals_.push_back(std::make_shared<open_spiel::BatchedNNEvaluator>(
+            batched_eval, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+            dune_imperium::MarketAppendixMode::kNone,
+            /*forward_active_rollouts=*/false));
+      }
+    }
+
     std::unique_ptr<State> state = game.NewInitialState();
     bool provides_info_state_tensor =
         game.GetType().provides_information_state_tensor;
@@ -3181,6 +3215,24 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
 
       const bool is_learner = (current_player >= 0 && current_player < 4) &&
                               seat_assignment.is_learner_seat[current_player];
+
+      if (r755_hybrid) {
+        ++r755_decision_index_;
+        if (current_player != r755_last_turn_player_ ||
+            r755_last_action_ == dune_imperium::kActionEndTurn) {
+          if (current_player >= 0 && current_player < 4) {
+            r755_space_placed_this_turn_[current_player] = false;
+            r755_turn_trees_[current_player].Reset();
+            uint64_t coin_seed = dune_seed::DeriveSeed(
+                master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
+                0x52373535ULL);
+            std::mt19937_64 coin_rng(coin_seed);
+            r755_turn_coin_active_[current_player] =
+                (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) <
+                 absl::GetFlag(FLAGS_r755_search_prob));
+          }
+        }
+      }
 
       std::shared_ptr<IGameEvaluator> active_evaluator =
           dune_opponent_pool::ResolveEvaluator(current_player, seat_assignment,
@@ -3524,6 +3576,186 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
               local_stats->targeted_buy_telemetry.unforced_buys[1][r_idx]++;
               if (!is_targeted_forced_buy) {
                 targeted_buy_card_id = open_spiel::dune_targeted_buy::kStitchedHorrorTleilaxuId;
+              }
+            }
+          }
+        }
+      }
+
+      bool r755_override_accepted = false;
+      if (r755_hybrid && is_learner && current_player >= 0 && current_player < 4 &&
+          !r755_search_evals_.empty() && !is_forced_buy) {
+        double max_raw_p = 0.0;
+        double p_2 = 0.0;
+        for (double p : legal_probabilities) {
+          if (p > max_raw_p) {
+            p_2 = max_raw_p;
+            max_raw_p = p;
+          } else if (p > p_2) {
+            p_2 = p;
+          }
+        }
+        auto cat = open_spiel::dune_imperium::ClassifyR755SearchCategory(
+            *state, current_player, r755_space_placed_this_turn_[current_player],
+            absl::GetFlag(FLAGS_r755_category_mask));
+        bool coin_active = false;
+        if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
+            cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) {
+          coin_active = r755_turn_coin_active_[current_player];
+        } else if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
+          uint64_t coin_seed = dune_seed::DeriveSeed(
+              master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
+              0x52373535ULL);
+          std::mt19937_64 coin_rng(coin_seed);
+          coin_active =
+              (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) <
+               absl::GetFlag(FLAGS_r755_search_prob));
+        }
+        const double max_prior_gate = absl::GetFlag(FLAGS_r755_max_raw_prior);
+        const bool prior_gated = (max_prior_gate < 1.0 && max_raw_p >= max_prior_gate);
+        if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible &&
+            coin_active && !prior_gated) {
+          int cat_idx = static_cast<int>(cat);
+          if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
+            local_stats->r755_searched_by_cat[cat_idx]++;
+          }
+          uint64_t search_seed = dune_seed::DeriveSeed(
+              master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
+              0x52373553ULL);
+          open_spiel::dune_imperium::TurnSearchTree local_r755_tree;
+
+          open_spiel::dune_imperium::SearchRolloutCrnMode crn_mode =
+              open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+          const std::string crn_str = absl::GetFlag(FLAGS_r755_crn_mode);
+          if (crn_str == "sequential") {
+            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+          } else if (crn_str == "deck_order") {
+            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+          } else if (crn_str == "event_keyed") {
+            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+          } else {
+            open_spiel::SpielFatalError(absl::StrCat("Unknown r755_crn_mode: ", crn_str));
+          }
+
+          open_spiel::ActionsAndProbs collector_raw_prior;
+          open_spiel::dune_imperium::CompoundSearchOptions opts;
+          if (absl::GetFlag(FLAGS_r755_reuse_root_prior)) {
+            collector_raw_prior.reserve(actions.size());
+            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+              double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+              collector_raw_prior.push_back({actions[a_idx], p});
+            }
+            opts.precomputed_raw_prior = &collector_raw_prior;
+          }
+          opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
+          opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
+          opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+
+          auto search_res =
+              open_spiel::dune_imperium::CompoundRolloutSearchDecision(
+                  *state, current_player, &local_r755_tree,
+                  r755_search_evals_, /*top_k=*/3, /*rollouts_per_action=*/16,
+                  /*min_override_margin=*/0.15,
+                  open_spiel::dune_imperium::TreeReuseMode::kTargetFill,
+                  search_seed,
+                  open_spiel::dune_imperium::SearchPairingMode::kPaired,
+                  open_spiel::dune_imperium::SearchTruncationMode::
+                      kNextRoundSearchPlayer,
+                  crn_mode,
+                  /*world_sampler=*/nullptr,
+                  absl::GetFlag(FLAGS_r755_min_t_stat),
+                  opts);
+
+          const std::string root_dump_path = absl::GetFlag(FLAGS_r755_root_dump_jsonl);
+          if (!root_dump_path.empty()) {
+            static std::mutex dump_mutex;
+            std::lock_guard<std::mutex> lock(dump_mutex);
+            std::ofstream out(root_dump_path, std::ios::app);
+            if (out.is_open()) {
+              out << "{\"episode_id\":" << episode_id
+                  << ",\"decision_id\":" << r755_decision_index_
+                  << ",\"cat\":" << cat_idx
+                  << ",\"raw_action\":" << search_res.raw_action
+                  << ",\"best_action\":" << search_res.best_action
+                  << ",\"chosen_action\":" << search_res.chosen_action
+                  << ",\"overridden\":" << (search_res.overridden ? 1 : 0)
+                  << ",\"stopped_stage1\":" << (search_res.stopped_stage1 ? 1 : 0)
+                  << ",\"resample_fallbacks\":" << search_res.resample_fallbacks
+                  << ",\"nn_evals\":" << search_res.rollout_nn_evals
+                  << ",\"max_raw_p\":" << max_raw_p
+                  << ",\"p_2\":" << p_2
+                  << ",\"cand_actions\":[";
+              for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
+                if (ci > 0) out << ",";
+                out << search_res.candidate_rollout_utilities[ci].first;
+              }
+              out << "],\"cand_priors\":[";
+              for (size_t ci = 0; ci < search_res.candidate_priors.size(); ++ci) {
+                if (ci > 0) out << ",";
+                out << search_res.candidate_priors[ci].second;
+              }
+              out << "],\"cand_utils\":[";
+              for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
+                if (ci > 0) out << ",";
+                out << "[";
+                const auto& utils = search_res.candidate_rollout_utilities[ci].second;
+                for (size_t ui = 0; ui < utils.size(); ++ui) {
+                  if (ui > 0) out << ",";
+                  out << utils[ui];
+                }
+                out << "]";
+              }
+              out << "]}\n";
+            }
+          }
+          if (search_res.overridden &&
+              absl::GetFlag(FLAGS_r755_execute_overrides)) {
+            Action best_action = search_res.chosen_action;
+            int best_idx = -1;
+            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+              if (actions[a_idx] == best_action) {
+                best_idx = static_cast<int>(a_idx);
+                break;
+              }
+            }
+            if (best_idx >= 0) {
+              action = best_action;
+              if (best_idx < static_cast<int>(legal_probabilities.size())) {
+                old_log_prob = static_cast<float>(
+                    std::log(std::max(1e-12, legal_probabilities[best_idx])));
+              }
+              r755_override_accepted = true;
+              if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
+                local_stats->r755_executed_overrides_by_cat[cat_idx]++;
+              }
+              if (r755_aux_examples != nullptr) {
+                std::vector<std::pair<Action, double>> raw_policy_pairs;
+                raw_policy_pairs.reserve(actions.size());
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  double p = (a_idx < legal_probabilities.size())
+                                 ? legal_probabilities[a_idx]
+                                 : 0.0;
+                  raw_policy_pairs.push_back({actions[a_idx], p});
+                }
+                open_spiel::SearchTrainingExample ex;
+                ex.observation = obs;
+                ex.player = current_player;
+                ex.legal_actions = actions;
+                if (p_cand_data != nullptr) {
+                  ex.candidate_data = *p_cand_data;
+                }
+                double raw_q = search_res.raw_mean_utility;
+                double best_q = search_res.chosen_mean_utility;
+                ex.normalized_visits =
+                    open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                        raw_policy_pairs, actions, search_res.raw_action, raw_q,
+                        search_res.best_action, best_q,
+                        /*base_temperature=*/0.15, /*max_target_kl=*/0.05);
+                ex.value_target = 0.0;
+                ex.value_target_attached = false;
+                ex.episode_id = episode_id;
+                ex.decision_id = static_cast<int>(r755_decision_index_);
+                r755_aux_examples->push_back(std::move(ex));
               }
             }
           }
@@ -3948,6 +4180,20 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         pre_action_is_high_stakes = dune_imperium::IsHighStakesStrategicState(*state, current_player);
       }
 
+      if (r755_hybrid && current_player >= 0 && current_player < 4) {
+        if (action == dune_imperium::kActionEndTurn) {
+          r755_turn_trees_[current_player].Reset();
+        } else {
+          r755_turn_trees_[current_player].Advance(action);
+        }
+        if (action >= dune_imperium::kActionAgentSpaceConspire &&
+            action <= dune_imperium::kActionAgentSpaceSietchTabr) {
+          r755_space_placed_this_turn_[current_player] = true;
+        }
+        r755_last_turn_player_ = current_player;
+        r755_last_action_ = action;
+      }
+
       state->ApplyAction(action);
       last_player = current_player;
       last_action = action;
@@ -3998,7 +4244,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.behavior_physical_batch_size = result.physical_batch_size;
         transition.behavior_physical_batch_row = result.physical_batch_row;
         transition.candidate_data = std::move(cand_data);
-        transition.mask_policy_loss = false;
+        transition.mask_policy_loss = r755_override_accepted;
         transition.targeted_buy_card = targeted_buy_card_id;
         transition.targeted_buy_round = (dune_state != nullptr) ? dune_state->GetCurrentRound() : 0;
         transition.targeted_buy_forced = is_targeted_forced_buy;
@@ -4328,7 +4574,8 @@ void RolloutWorker(int thread_id, const Game* game,
                     VrpoCapturedEpisodeBuffer* vrpo_buffer,
                     const std::vector<std::shared_ptr<IGameEvaluator>>& opponent_evaluators,
                     std::vector<open_spiel::dune_imperium::SearchSnapshot>* local_snapshots = nullptr,
-                    int global_update = 0) {
+                    int global_update = 0,
+                    std::vector<open_spiel::SearchTrainingExample>* worker_aux_examples = nullptr) {
   uint64_t master = absl::GetFlag(FLAGS_seed);
   WorkerStats local_stats;
   uint64_t search_decision_count = 0;
@@ -4353,7 +4600,8 @@ void RolloutWorker(int thread_id, const Game* game,
                               opponent_evaluators,
                               local_snapshots,
                               local_snapshots != nullptr ? &search_decision_count : nullptr,
-                              local_snapshots != nullptr ? &search_rng : nullptr);
+                              local_snapshots != nullptr ? &search_rng : nullptr,
+                              worker_aux_examples);
     if (vrpo_buffer != nullptr) {
       std::string publish_error;
       if (!vrpo_buffer->PublishValidated(std::move(vrpo_episode),
@@ -4457,6 +4705,9 @@ struct CollectResult {
   // Search-in-Training: reservoir-sampled decision snapshots visited by the learner
   std::vector<open_spiel::dune_imperium::SearchSnapshot> search_snapshots;
   uint64_t search_eligible_decisions = 0;
+
+  int64_t r755_searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
+  int64_t r755_executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
 };
 
 // Phase A: folds the rollout-side pre-cap |z| canaries into the update's stats
@@ -4576,6 +4827,9 @@ CollectResult CollectRollout(const Game* game,
   const bool search_in_training = absl::GetFlag(FLAGS_search_in_training);
   std::vector<std::vector<open_spiel::dune_imperium::SearchSnapshot>> worker_snapshots(
       search_in_training ? num_threads : 0);
+  const bool r755_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+  std::vector<std::vector<open_spiel::SearchTrainingExample>> worker_aux_examples(
+      r755_hybrid ? num_threads : 0);
 
   uint64_t actual_start_ep = next_episode_id->load();
   std::atomic<uint64_t> local_episode_id{actual_start_ep};
@@ -4588,9 +4842,18 @@ CollectResult CollectRollout(const Game* game,
                          rollout_games, reward_lambda, vrpo_buffer,
                          std::cref(opponent_evaluators),
                          search_in_training ? &worker_snapshots[i] : nullptr,
-                         global_update);
+                         global_update,
+                         r755_hybrid ? &worker_aux_examples[i] : nullptr);
   }
   for (auto& worker : workers) worker.join();
+
+  if (r755_hybrid) {
+    for (int i = 0; i < num_threads; ++i) {
+      for (auto& ex : worker_aux_examples[i]) {
+        result.aux_examples.push_back(std::move(ex));
+      }
+    }
+  }
 
   if (search_in_training) {
     std::vector<open_spiel::dune_imperium::SearchSnapshot> all_candidates;
@@ -4652,6 +4915,11 @@ CollectResult CollectRollout(const Game* game,
     result.raw_conflict_vp += stats.raw_conflict_vp;
     result.raw_noncombat_vp += stats.raw_noncombat_vp;
     result.raw_total_vp += stats.raw_total_vp;
+
+    for (int c = 0; c < 6; ++c) {
+      result.r755_searched_by_cat[c] += stats.r755_searched_by_cat[c];
+      result.r755_executed_overrides_by_cat[c] += stats.r755_executed_overrides_by_cat[c];
+    }
 
     result.parity_decisions += stats.parity_decisions;
     result.parity_full_width_ok += stats.parity_full_width_ok;
@@ -7165,7 +7433,6 @@ bool WriteVrpoCaptureArtifact(
   std::filesystem::rename(tmp, output);
   return valid;
 }
-
 struct VrpoValueStats {
   int64_t count = 0;
   double min = 0.0;
@@ -7777,6 +8044,698 @@ bool WriteVrpoQPreflightArtifact(
   }
   std::filesystem::rename(tmp, output);
   return valid;
+}
+
+struct R755Gate2Diagnostics {
+  int update = 0;
+  int64_t total_transitions = 0;
+  int64_t single_action_transitions = 0;
+  int64_t multi_action_transitions = 0;
+  int64_t override_masked_transitions = 0;
+  int64_t ppo_multi_action_transitions = 0;
+  bool mask_identity_holds = true;
+  int64_t nan_inf_count = 0;
+  double logprob_recompute_max_abs_diff = 0.0;
+  double collector_vs_learner_mean_diff = 0.0;
+  double collector_vs_learner_p99_diff = 0.0;
+  double collector_vs_learner_max_diff = 0.0;
+  double collector_vs_learner_kl = 0.0;
+  double mean_student_kl = 0.0;
+  double mean_target_kl = 0.0;
+  double mean_delta_p_target = 0.0;
+  double mean_delta_p_student = 0.0;
+  double student_to_target_ratio = 0.0;
+  double mean_non_override_kl = 0.0;
+  double pre_step_logprob_mean_abs_diff = 0.0;
+  double pre_step_logprob_p99_abs_diff = 0.0;
+  double pre_step_logprob_max_abs_diff = 0.0;
+  double pre_step_ratio_min = 1.0;
+  double pre_step_ratio_p01 = 1.0;
+  double pre_step_ratio_p05 = 1.0;
+  double pre_step_ratio_p50 = 1.0;
+  double pre_step_ratio_p95 = 1.0;
+  double pre_step_ratio_p99 = 1.0;
+  double pre_step_ratio_max = 1.0;
+  double pre_step_clip_frac = 0.0;
+  int64_t aux_distinct_visited = 0;
+  int64_t aux_total_presentations = 0;
+  int64_t visited_aux_count = 0;
+  int64_t unvisited_aux_count = 0;
+  double sum_delta_p_target = 0.0;
+  double sum_delta_p_student = 0.0;
+  double visited_sum_delta_p_target = 0.0;
+  double visited_sum_delta_p_student = 0.0;
+  double unvisited_sum_delta_p_target = 0.0;
+  double unvisited_sum_delta_p_student = 0.0;
+  double visited_student_to_target_ratio = 0.0;
+  double unvisited_student_to_target_ratio = 0.0;
+  int64_t searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
+  int64_t executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
+};
+
+inline std::vector<R755Gate2Diagnostics> g_gate2_diagnostics;
+
+inline void WriteR755Gate2Json(const std::string& path, const std::vector<R755Gate2Diagnostics>& diag) {
+  if (path.empty()) return;
+  json::Array updates;
+  for (const auto& d : diag) {
+    json::Object u;
+    u["update"] = static_cast<int64_t>(d.update);
+    u["total_transitions"] = d.total_transitions;
+    u["single_action_transitions"] = d.single_action_transitions;
+    u["multi_action_transitions"] = d.multi_action_transitions;
+    u["override_masked_transitions"] = d.override_masked_transitions;
+    u["ppo_multi_action_transitions"] = d.ppo_multi_action_transitions;
+    u["mask_identity_holds"] = d.mask_identity_holds;
+    u["nan_inf_count"] = d.nan_inf_count;
+    u["logprob_recompute_max_abs_diff"] = d.logprob_recompute_max_abs_diff;
+    u["collector_vs_learner_mean_diff"] = d.collector_vs_learner_mean_diff;
+    u["collector_vs_learner_p99_diff"] = d.collector_vs_learner_p99_diff;
+    u["collector_vs_learner_max_diff"] = d.collector_vs_learner_max_diff;
+    u["collector_vs_learner_kl"] = d.collector_vs_learner_kl;
+    u["mean_student_kl"] = d.mean_student_kl;
+    u["mean_target_kl"] = d.mean_target_kl;
+    u["mean_delta_p_target"] = d.mean_delta_p_target;
+    u["mean_delta_p_student"] = d.mean_delta_p_student;
+    u["student_to_target_ratio"] = d.student_to_target_ratio;
+    u["mean_non_override_kl"] = d.mean_non_override_kl;
+    u["pre_step_logprob_mean_abs_diff"] = d.pre_step_logprob_mean_abs_diff;
+    u["pre_step_logprob_p99_abs_diff"] = d.pre_step_logprob_p99_abs_diff;
+    u["pre_step_logprob_max_abs_diff"] = d.pre_step_logprob_max_abs_diff;
+    u["pre_step_ratio_min"] = d.pre_step_ratio_min;
+    u["pre_step_ratio_p01"] = d.pre_step_ratio_p01;
+    u["pre_step_ratio_p05"] = d.pre_step_ratio_p05;
+    u["pre_step_ratio_p50"] = d.pre_step_ratio_p50;
+    u["pre_step_ratio_p95"] = d.pre_step_ratio_p95;
+    u["pre_step_ratio_p99"] = d.pre_step_ratio_p99;
+    u["pre_step_ratio_max"] = d.pre_step_ratio_max;
+    u["pre_step_clip_frac"] = d.pre_step_clip_frac;
+    u["aux_distinct_visited"] = d.aux_distinct_visited;
+    u["aux_total_presentations"] = d.aux_total_presentations;
+    u["visited_aux_count"] = d.visited_aux_count;
+    u["unvisited_aux_count"] = d.unvisited_aux_count;
+    u["sum_delta_p_target"] = d.sum_delta_p_target;
+    u["sum_delta_p_student"] = d.sum_delta_p_student;
+    u["visited_sum_delta_p_target"] = d.visited_sum_delta_p_target;
+    u["visited_sum_delta_p_student"] = d.visited_sum_delta_p_student;
+    u["unvisited_sum_delta_p_target"] = d.unvisited_sum_delta_p_target;
+    u["unvisited_sum_delta_p_student"] = d.unvisited_sum_delta_p_student;
+    u["visited_student_to_target_ratio"] = d.visited_student_to_target_ratio;
+    u["unvisited_student_to_target_ratio"] = d.unvisited_student_to_target_ratio;
+    for (int c = 1; c <= 5; ++c) {
+      u[absl::StrCat("cat", c, "_searched")] = d.searched_by_cat[c];
+      u[absl::StrCat("cat", c, "_executed_overrides")] = d.executed_overrides_by_cat[c];
+    }
+    updates.push_back(std::move(u));
+  }
+  json::Object root;
+  root["gate"] = "Gate 2";
+  root["updates"] = std::move(updates);
+  std::filesystem::path p(path);
+  if (!p.parent_path().empty()) std::filesystem::create_directories(p.parent_path());
+  const std::string tmp_path = path + ".tmp";
+  std::ofstream ofs(tmp_path);
+  if (ofs.is_open()) {
+    ofs << json::ToString(root, true) << "\n";
+    ofs.flush();
+    ofs.close();
+    std::filesystem::rename(tmp_path, path);
+    std::cout << "[R755-GATE2] Wrote diagnostics to " << path << "\n";
+  }
+}
+
+struct Gate1AuditedRoot {
+  int game_id = 0;
+  int category = 0;
+  int round = 0;
+  int round_bucket = 0;
+  std::unique_ptr<State> state_clone;
+  Action raw_action = kInvalidAction;
+  Action best_action = kInvalidAction;
+  double delta_p = 0.0;
+  std::vector<std::pair<Action, double>> raw_policy;
+  int rollout_steps = 0;
+  int rollout_nn_evals = 0;
+  double inclusion_prob = 1.0;
+  double delta_q = 0.0;
+  double delta_v_exec = 0.0;
+};
+
+inline void RunR755Gate1Audit(
+    const Game* game,
+    std::shared_ptr<IGameEvaluator> evaluator,
+    int64_t obs_size,
+    uint64_t master_seed,
+    int rollout_games,
+    const std::string& output_path) {
+  auto batched_eval = std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator);
+  std::shared_ptr<open_spiel::BatchedNNEvaluator> nn_eval = nullptr;
+  if (batched_eval != nullptr) {
+    nn_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
+        batched_eval, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
+        dune_imperium::MarketAppendixMode::kNone,
+        /*forward_active_rollouts=*/false);
+  }
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> search_evals;
+  if (nn_eval) search_evals.push_back(nn_eval);
+
+  int num_games = rollout_games > 0 ? rollout_games : 40;
+  std::cout << "[R755-GATE1] Running " << num_games << "-game audit on CPU/accelerator...\n";
+
+  int64_t N_searched = 0;
+  int64_t N_accepted = 0;
+  std::vector<int64_t> n_searched_by_cat(6, 0);
+  std::vector<int64_t> n_accepted_by_cat(6, 0);
+  std::vector<int64_t> executed_overrides_all_seats(6, 0);
+  std::vector<int64_t> game_N_searched(num_games, 0);
+  std::vector<int64_t> game_N_accepted(num_games, 0);
+  std::vector<int64_t> sum_rollout_steps_by_cat(6, 0);
+  std::vector<int64_t> sum_rollout_evals_by_cat(6, 0);
+  double sum_delta_p_accepted = 0.0;
+  std::vector<Gate1AuditedRoot> audited_roots;
+
+  auto eval_market_mode = evaluator ? evaluator->MarketMode() : dune_imperium::MarketAppendixMode::kNone;
+  auto eval_deck_semantics = evaluator ? evaluator->DeckPoolSemantics() : dune_imperium::DeckPoolSemantics::kLegacy;
+
+  struct PerGameStats {
+    int64_t N_searched = 0;
+    int64_t N_accepted = 0;
+    std::vector<int64_t> n_searched_by_cat = std::vector<int64_t>(6, 0);
+    std::vector<int64_t> n_accepted_by_cat = std::vector<int64_t>(6, 0);
+    std::vector<int64_t> executed_overrides_all_seats = std::vector<int64_t>(6, 0);
+    std::vector<int64_t> sum_rollout_steps_by_cat = std::vector<int64_t>(6, 0);
+    std::vector<int64_t> sum_rollout_evals_by_cat = std::vector<int64_t>(6, 0);
+    double sum_delta_p_accepted = 0.0;
+    std::vector<Gate1AuditedRoot> local_roots;
+  };
+  std::vector<PerGameStats> per_game(num_games);
+
+  std::vector<std::future<void>> game_futures;
+  game_futures.reserve(num_games);
+  for (int episode_id = 0; episode_id < num_games; ++episode_id) {
+    game_futures.push_back(
+        open_spiel::dune_imperium::SearchRolloutThreadPool::Instance().Submit([&, episode_id]() {
+          auto& g = per_game[episode_id];
+          int audited_seat = episode_id % 4;
+          auto state = game->NewInitialState();
+          auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
+          std::mt19937_64 policy_rng[4];
+          for (int p = 0; p < 4; ++p) {
+            policy_rng[p] = dune_seed::MakeRng64(dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamPolicyPlayer0 + p));
+          }
+
+          open_spiel::dune_imperium::TurnSearchTree turn_trees[4];
+          bool space_placed_this_turn[4] = {false, false, false, false};
+          bool turn_coin_active[4] = {false, false, false, false};
+          Player last_turn_player = open_spiel::kInvalidPlayer;
+          Action last_action = open_spiel::kInvalidAction;
+          int64_t decision_index = 0;
+
+          while (!state->IsTerminal()) {
+            if (state->IsChanceNode()) {
+              auto outcomes = state->ChanceOutcomes();
+              if (outcomes.empty()) break;
+              double u = std::generate_canonical<double, 53>(chance_rng);
+              Action choice = open_spiel::SampleAction(outcomes, u).first;
+              state->ApplyAction(choice);
+              continue;
+            }
+
+            ++decision_index;
+            Player current_player = state->CurrentPlayer();
+            auto actions = state->LegalActions();
+            if (actions.empty()) break;
+
+            if (current_player != last_turn_player || last_action == dune_imperium::kActionEndTurn) {
+              if (current_player >= 0 && current_player < 4) {
+                space_placed_this_turn[current_player] = false;
+                turn_trees[current_player].Reset();
+                uint64_t coin_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373535ULL);
+                std::mt19937_64 coin_rng(coin_seed);
+                turn_coin_active[current_player] = (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) < absl::GetFlag(FLAGS_r755_search_prob));
+              }
+            }
+
+            const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+            std::vector<float> obs(obs_size, 0.0f);
+            if (dune_state != nullptr) {
+              dune_state->InformationStateTensorWithAppendix(current_player, eval_market_mode, absl::MakeSpan(obs), eval_deck_semantics);
+            } else if (game->GetType().provides_information_state_tensor) {
+              state->InformationStateTensor(current_player, absl::MakeSpan(obs));
+            } else {
+              state->ObservationTensor(current_player, absl::MakeSpan(obs));
+            }
+
+            dune_semantic::CandidateActionData cand_data;
+            const dune_semantic::CandidateActionData* p_cand_data = nullptr;
+            if (dune_state != nullptr && evaluator != nullptr) {
+              dune_semantic::ExtractCandidateDescriptors(*dune_state, actions, &cand_data, evaluator->SemanticDescriptorSchema());
+              p_cand_data = &cand_data;
+            }
+            EvalResult result = evaluator->EvaluateWithActions(obs, p_cand_data);
+            CenterAndCapLegalLogits(result.logits, actions, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
+            std::vector<double> legal_probs;
+            auto sample = SampleTrainingPolicyDistribution(*state, &policy_rng[current_player], result.logits, actions, &legal_probs);
+            Action action = sample.action;
+
+            std::vector<std::pair<Action, double>> raw_policy_pairs;
+            raw_policy_pairs.reserve(actions.size());
+            for (size_t i = 0; i < actions.size(); ++i) {
+              raw_policy_pairs.push_back({actions[i], i < legal_probs.size() ? legal_probs[i] : 0.0});
+            }
+
+            auto cat = open_spiel::dune_imperium::ClassifyR755SearchCategory(
+                *state, current_player, space_placed_this_turn[current_player],
+                absl::GetFlag(FLAGS_r755_category_mask));
+            int cat_idx = static_cast<int>(cat);
+
+            bool coin_active = false;
+            if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
+                cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) {
+              coin_active = turn_coin_active[current_player];
+            } else if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
+              uint64_t coin_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373535ULL);
+              std::mt19937_64 coin_rng(coin_seed);
+              coin_active = (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) < absl::GetFlag(FLAGS_r755_search_prob));
+            }
+
+            if (current_player == audited_seat && cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
+              ++g.N_searched;
+              ++g.n_searched_by_cat[cat_idx];
+
+              uint64_t search_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373553ULL);
+              open_spiel::dune_imperium::TurnSearchTree temp_tree;
+              open_spiel::dune_imperium::CompoundSearchDecisionResult search_res =
+                  open_spiel::dune_imperium::CompoundRolloutSearchDecision(
+                      *state, current_player, &temp_tree, search_evals,
+                      /*top_k=*/3, /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+                      open_spiel::dune_imperium::TreeReuseMode::kTargetFill, search_seed,
+                      open_spiel::dune_imperium::SearchPairingMode::kPaired,
+                      open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer,
+                      /*full_turn_supervision=*/false, absl::GetFlag(FLAGS_r755_min_t_stat));
+              if (coin_active && search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides)) {
+                action = search_res.chosen_action;
+                ++g.executed_overrides_all_seats[cat_idx];
+              }
+
+              if (search_res.overridden) {
+                ++g.N_accepted;
+                ++g.n_accepted_by_cat[cat_idx];
+                g.sum_rollout_steps_by_cat[cat_idx] += search_res.rollout_steps;
+                g.sum_rollout_evals_by_cat[cat_idx] += search_res.rollout_nn_evals;
+
+                int round_num = dune_state ? dune_state->GetCurrentRound() : 1;
+                int bucket = round_num <= 3 ? 0 : (round_num <= 6 ? 1 : 2);
+                auto mpo_target = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                    raw_policy_pairs, actions, search_res.raw_action, search_res.raw_mean_utility,
+                    search_res.best_action, search_res.chosen_mean_utility, 0.15, 0.05);
+                double delta_p = 0.0;
+                for (size_t a_i = 0; a_i < actions.size(); ++a_i) {
+                  if (actions[a_i] == search_res.best_action) {
+                    delta_p = mpo_target[a_i] - (a_i < legal_probs.size() ? legal_probs[a_i] : 0.0);
+                    break;
+                  }
+                }
+                g.sum_delta_p_accepted += delta_p;
+
+                Gate1AuditedRoot r;
+                r.game_id = episode_id;
+                r.category = cat_idx;
+                r.round = round_num;
+                r.round_bucket = bucket;
+                r.state_clone = state->Clone();
+                r.raw_action = search_res.raw_action;
+                r.best_action = search_res.best_action;
+                r.delta_p = delta_p;
+                r.raw_policy = raw_policy_pairs;
+                r.rollout_steps = search_res.rollout_steps;
+                r.rollout_nn_evals = search_res.rollout_nn_evals;
+                g.local_roots.push_back(std::move(r));
+              }
+            } else if (current_player != audited_seat && cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible && coin_active) {
+              uint64_t search_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373553ULL);
+              open_spiel::dune_imperium::TurnSearchTree temp_tree;
+              auto search_res = open_spiel::dune_imperium::CompoundRolloutSearchDecision(
+                  *state, current_player, &temp_tree, search_evals,
+                  /*top_k=*/3, /*rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+                  open_spiel::dune_imperium::TreeReuseMode::kTargetFill, search_seed,
+                  open_spiel::dune_imperium::SearchPairingMode::kPaired,
+                  open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer,
+                  /*full_turn_supervision=*/false, absl::GetFlag(FLAGS_r755_min_t_stat));
+              if (search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides)) {
+                action = search_res.chosen_action;
+                ++g.executed_overrides_all_seats[cat_idx];
+              }
+            }
+
+            if (current_player >= 0 && current_player < 4) {
+              if (action == dune_imperium::kActionEndTurn) {
+                turn_trees[current_player].Reset();
+              } else {
+                turn_trees[current_player].Advance(action);
+              }
+              if (action >= dune_imperium::kActionAgentSpaceConspire &&
+                  action <= dune_imperium::kActionAgentSpaceSietchTabr) {
+                space_placed_this_turn[current_player] = true;
+              }
+              last_turn_player = current_player;
+              last_action = action;
+            }
+            state->ApplyAction(action);
+          }
+        }));
+  }
+
+  for (auto& fut : game_futures) {
+    fut.get();
+  }
+
+  for (int episode_id = 0; episode_id < num_games; ++episode_id) {
+    auto& g = per_game[episode_id];
+    N_searched += g.N_searched;
+    N_accepted += g.N_accepted;
+    game_N_searched[episode_id] = g.N_searched;
+    game_N_accepted[episode_id] = g.N_accepted;
+    for (int c = 0; c < 6; ++c) {
+      n_searched_by_cat[c] += g.n_searched_by_cat[c];
+      n_accepted_by_cat[c] += g.n_accepted_by_cat[c];
+      executed_overrides_all_seats[c] += g.executed_overrides_all_seats[c];
+      sum_rollout_steps_by_cat[c] += g.sum_rollout_steps_by_cat[c];
+      sum_rollout_evals_by_cat[c] += g.sum_rollout_evals_by_cat[c];
+    }
+    sum_delta_p_accepted += g.sum_delta_p_accepted;
+    for (auto& r : g.local_roots) {
+      audited_roots.push_back(std::move(r));
+    }
+  }
+
+  std::cout << "[R755-GATE1] Collection complete: N_searched=" << N_searched
+            << ", N_accepted=" << N_accepted << "\n";
+
+  // Stratified Ref512 selection (cap 120)
+  std::vector<size_t> sampled_indices;
+  if (audited_roots.size() <= 120) {
+    for (size_t i = 0; i < audited_roots.size(); ++i) {
+      audited_roots[i].inclusion_prob = 1.0;
+      sampled_indices.push_back(i);
+    }
+  } else {
+    std::map<std::pair<int, int>, std::vector<size_t>> strata;
+    for (size_t i = 0; i < audited_roots.size(); ++i) {
+      strata[{audited_roots[i].category, audited_roots[i].round_bucket}].push_back(i);
+    }
+    const int num_strata = static_cast<int>(strata.size());
+    const int per_stratum_reserve = (num_strata > 0) ? std::min(15, 120 / num_strata) : 15;
+    std::map<std::pair<int, int>, int> n_sampled;
+    int reserved_total = 0;
+    int excess_total = 0;
+    for (const auto& [k, v] : strata) {
+      if (static_cast<int>(v.size()) <= per_stratum_reserve) {
+        n_sampled[k] = static_cast<int>(v.size());
+        reserved_total += static_cast<int>(v.size());
+      } else {
+        n_sampled[k] = per_stratum_reserve;
+        reserved_total += per_stratum_reserve;
+        excess_total += (static_cast<int>(v.size()) - per_stratum_reserve);
+      }
+    }
+    int remaining_cap = 120 - reserved_total;
+    if (remaining_cap > 0 && excess_total > 0) {
+      int allocated = 0;
+      std::vector<std::pair<double, std::pair<int, int>>> remainders;
+      for (const auto& [k, v] : strata) {
+        if (static_cast<int>(v.size()) > per_stratum_reserve) {
+          double exact = static_cast<double>(remaining_cap) * (static_cast<int>(v.size()) - per_stratum_reserve) / static_cast<double>(excess_total);
+          int add = static_cast<int>(std::floor(exact));
+          n_sampled[k] += add;
+          allocated += add;
+          remainders.push_back({exact - add, k});
+        }
+      }
+      std::sort(remainders.rbegin(), remainders.rend());
+      for (int r = 0; r < remaining_cap - allocated && r < static_cast<int>(remainders.size()); ++r) {
+        if (n_sampled[remainders[r].second] < static_cast<int>(strata.at(remainders[r].second).size())) {
+          n_sampled[remainders[r].second]++;
+        }
+      }
+    }
+    for (auto& [k, v] : strata) {
+      n_sampled[k] = std::min(n_sampled[k], static_cast<int>(v.size()));
+      int n_h = n_sampled[k];
+      int N_h = static_cast<int>(v.size());
+      std::mt19937_64 stratum_rng(20261102ULL + k.first * 100 + k.second);
+      std::shuffle(v.begin(), v.end(), stratum_rng);
+      double prob = static_cast<double>(n_h) / static_cast<double>(N_h);
+      for (int j = 0; j < n_h; ++j) {
+        audited_roots[v[j]].inclusion_prob = prob;
+        sampled_indices.push_back(v[j]);
+      }
+    }
+  }
+
+  std::cout << "[R755-GATE1] Running Ref512 rollouts on " << sampled_indices.size() << " sampled roots...\n";
+
+  // Ref512 paired terminal rollouts
+  auto batcher = batched_eval;
+  const size_t num_sampled = sampled_indices.size();
+  std::vector<std::vector<double>> ret_best_mat(num_sampled, std::vector<double>(512, 0.0));
+  std::vector<std::vector<double>> ret_greedy_mat(num_sampled, std::vector<double>(512, 0.0));
+  std::vector<std::vector<double>> ret_pi_mat(num_sampled, std::vector<double>(512, 0.0));
+
+  const size_t total_ref_tasks = num_sampled * 512;
+  const int num_ref_workers = static_cast<int>(std::min<size_t>(512, total_ref_tasks));
+  if (batcher != nullptr && num_ref_workers > 0) {
+    batcher->AdjustActiveRollouts(num_ref_workers);
+  }
+  std::atomic<size_t> next_ref_task{0};
+  std::vector<std::future<void>> ref_futures;
+  ref_futures.reserve(num_ref_workers);
+  for (int worker_id = 0; worker_id < num_ref_workers; ++worker_id) {
+    ref_futures.push_back(open_spiel::dune_imperium::SearchRolloutThreadPool::Instance().Submit([&]() {
+      open_spiel::dune_imperium::ActiveRolloutReleaseGuard release_guard(batcher.get(), 1);
+      for (;;) {
+        const size_t task_idx = next_ref_task.fetch_add(1, std::memory_order_relaxed);
+        if (task_idx >= total_ref_tasks) break;
+        const size_t r_k = task_idx / 512;
+        const int w = static_cast<int>(task_idx % 512);
+        const size_t s_idx = sampled_indices[r_k];
+        const auto& root = audited_roots[s_idx];
+        const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(root.state_clone.get());
+        Player p = root.state_clone->CurrentPlayer();
+
+        uint64_t wseed = dune_seed::DeriveSeed(20261102ULL, s_idx, w);
+        std::mt19937_64 rng(wseed);
+        auto rng_func = [&rng]() { return std::generate_canonical<double, 53>(rng); };
+        std::unique_ptr<State> world;
+        if (dune) world = dune->ResampleFromInfostate(p, rng_func);
+        if (!world) world = root.state_clone->Clone();
+
+        // Branch 1: a_greedy
+        auto sim1 = world->Clone();
+        sim1->ApplyAction(root.raw_action);
+        auto traj1 = open_spiel::dune_imperium::SimulateRemainingTurn(
+            sim1.get(), p, nn_eval.get(), wseed + 999, open_spiel::dune_imperium::SearchTruncationMode::kTerminal);
+        double ret_greedy = traj1.terminal_utility;
+
+        // Branch 2: a*
+        auto sim2 = world->Clone();
+        sim2->ApplyAction(root.best_action);
+        auto traj2 = open_spiel::dune_imperium::SimulateRemainingTurn(
+            sim2.get(), p, nn_eval.get(), wseed + 999, open_spiel::dune_imperium::SearchTruncationMode::kTerminal);
+        double ret_best = traj2.terminal_utility;
+
+        // Branch 3: pi_old
+        uint64_t pi_seed = dune_seed::DeriveSeed(20261102ULL, s_idx, w, 0x5049ULL);
+        std::mt19937_64 pi_rng(pi_seed);
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        double u = dist(pi_rng);
+        Action a_w = root.raw_policy.front().first;
+        double cum = 0.0;
+        for (const auto& ap : root.raw_policy) {
+          cum += ap.second;
+          if (u <= cum) {
+            a_w = ap.first;
+            break;
+          }
+        }
+        double ret_pi = 0.0;
+        if (a_w == root.raw_action) {
+          ret_pi = ret_greedy;
+        } else if (a_w == root.best_action) {
+          ret_pi = ret_best;
+        } else {
+          auto sim3 = world->Clone();
+          sim3->ApplyAction(a_w);
+          auto traj3 = open_spiel::dune_imperium::SimulateRemainingTurn(
+              sim3.get(), p, nn_eval.get(), wseed + 999, open_spiel::dune_imperium::SearchTruncationMode::kTerminal);
+          ret_pi = traj3.terminal_utility;
+        }
+
+        ret_best_mat[r_k][w] = ret_best;
+        ret_greedy_mat[r_k][w] = ret_greedy;
+        ret_pi_mat[r_k][w] = ret_pi;
+      }
+    }));
+  }
+  for (auto& f : ref_futures) {
+    f.get();
+  }
+  for (size_t r_k = 0; r_k < num_sampled; ++r_k) {
+    auto& root = audited_roots[sampled_indices[r_k]];
+    double sum_ret_best = 0.0, sum_ret_greedy = 0.0, sum_ret_pi = 0.0;
+    for (int w = 0; w < 512; ++w) {
+      sum_ret_best += ret_best_mat[r_k][w];
+      sum_ret_greedy += ret_greedy_mat[r_k][w];
+      sum_ret_pi += ret_pi_mat[r_k][w];
+    }
+    root.delta_q = (sum_ret_best - sum_ret_greedy) / 512.0;
+    root.delta_v_exec = (sum_ret_best - sum_ret_pi) / 512.0;
+  }
+
+  // Horvitz-Thompson Estimators
+  double sum_ht_action = 0.0, sum_ht_exec = 0.0, sum_ht_target = 0.0, sum_ht_neg = 0.0;
+  for (size_t s_idx : sampled_indices) {
+    const auto& root = audited_roots[s_idx];
+    double r_i = root.inclusion_prob;
+    sum_ht_action += (root.delta_q / r_i);
+    sum_ht_exec += (root.delta_v_exec / r_i);
+    sum_ht_target += ((root.delta_p * root.delta_q) / r_i);
+    if (root.delta_q < 0.0) sum_ht_neg += (1.0 / r_i);
+  }
+  double G_action = N_accepted > 0 ? (sum_ht_action / static_cast<double>(N_accepted)) : 0.0;
+  double G_exec = N_accepted > 0 ? (sum_ht_exec / static_cast<double>(N_accepted)) : 0.0;
+  double G_target = N_searched > 0 ? (sum_ht_target / static_cast<double>(N_searched)) : 0.0;
+  double neg_override_rate = N_accepted > 0 ? (sum_ht_neg / static_cast<double>(N_accepted)) : 0.0;
+  double mean_delta_p = N_accepted > 0 ? (sum_delta_p_accepted / static_cast<double>(N_accepted)) : 0.0;
+
+  // 10,000 Game-Clustered Bootstrap Resamples
+  int B_resamples = 10000;
+  std::vector<double> boot_G_action(B_resamples, 0.0);
+  std::vector<double> boot_G_exec(B_resamples, 0.0);
+  std::vector<double> boot_G_target(B_resamples, 0.0);
+  std::vector<double> boot_neg_rate(B_resamples, 0.0);
+
+  for (int b = 0; b < B_resamples; ++b) {
+    uint64_t bseed = dune_seed::DeriveSeed(20261102ULL, 0x424F4F54ULL, b);
+    std::mt19937_64 brng(bseed);
+    std::uniform_int_distribution<int> gdist(0, num_games - 1);
+    std::vector<int> game_weights(num_games, 0);
+    for (int g = 0; g < num_games; ++g) game_weights[gdist(brng)]++;
+
+    double b_act = 0.0, b_exec = 0.0, b_tgt = 0.0, b_neg = 0.0;
+    double b_N_acc = 0.0, b_N_src = 0.0;
+    for (int g = 0; g < num_games; ++g) {
+      b_N_acc += game_weights[g] * game_N_accepted[g];
+      b_N_src += game_weights[g] * game_N_searched[g];
+    }
+    for (size_t s_idx : sampled_indices) {
+      const auto& root = audited_roots[s_idx];
+      int w = game_weights[root.game_id];
+      if (w == 0) continue;
+      double r_i = root.inclusion_prob;
+      b_act += w * (root.delta_q / r_i);
+      b_exec += w * (root.delta_v_exec / r_i);
+      b_tgt += w * ((root.delta_p * root.delta_q) / r_i);
+      if (root.delta_q < 0.0) b_neg += w * (1.0 / r_i);
+    }
+    boot_G_action[b] = b_N_acc > 0 ? (b_act / b_N_acc) : 0.0;
+    boot_G_exec[b] = b_N_acc > 0 ? (b_exec / b_N_acc) : 0.0;
+    boot_G_target[b] = b_N_src > 0 ? (b_tgt / b_N_src) : 0.0;
+    boot_neg_rate[b] = b_N_acc > 0 ? (b_neg / b_N_acc) : 0.0;
+  }
+  std::sort(boot_G_action.begin(), boot_G_action.end());
+  std::sort(boot_G_exec.begin(), boot_G_exec.end());
+  std::sort(boot_G_target.begin(), boot_G_target.end());
+  std::sort(boot_neg_rate.begin(), boot_neg_rate.end());
+
+  json::Object root_obj;
+  root_obj["gate"] = "Gate 1";
+  root_obj["num_games"] = static_cast<int64_t>(num_games);
+  root_obj["N_searched"] = N_searched;
+  root_obj["N_accepted"] = N_accepted;
+  root_obj["N_sampled"] = static_cast<int64_t>(sampled_indices.size());
+  root_obj["mean_delta_p"] = mean_delta_p;
+  root_obj["G_action"] = G_action;
+  root_obj["G_action_ci95_low"] = boot_G_action[250];
+  root_obj["G_action_ci95_high"] = boot_G_action[9750];
+  root_obj["G_action_lcb95"] = boot_G_action[500];
+  root_obj["G_exec"] = G_exec;
+  root_obj["G_exec_ci95_low"] = boot_G_exec[250];
+  root_obj["G_exec_ci95_high"] = boot_G_exec[9750];
+  root_obj["G_exec_lcb95"] = boot_G_exec[500];
+  root_obj["G_target"] = G_target;
+  root_obj["G_target_ci95_low"] = boot_G_target[250];
+  root_obj["G_target_ci95_high"] = boot_G_target[9750];
+  root_obj["G_target_lcb95"] = boot_G_target[500];
+  root_obj["neg_override_rate"] = neg_override_rate;
+  root_obj["neg_override_rate_ci95_low"] = boot_neg_rate[250];
+  root_obj["neg_override_rate_ci95_high"] = boot_neg_rate[9750];
+
+  json::Array categories_json;
+  for (int cat = 1; cat <= 5; ++cat) {
+    int64_t c_searched = n_searched_by_cat[cat];
+    int64_t c_accepted = n_accepted_by_cat[cat];
+    int64_t c_sampled = 0;
+    int64_t c_executed_all = executed_overrides_all_seats[cat];
+    double c_ht_act = 0.0, c_ht_exec = 0.0, c_ht_tgt = 0.0, c_ht_neg = 0.0;
+    for (size_t s_idx : sampled_indices) {
+      const auto& r = audited_roots[s_idx];
+      if (r.category == cat) {
+        ++c_sampled;
+        double r_i = r.inclusion_prob;
+        c_ht_act += (r.delta_q / r_i);
+        c_ht_exec += (r.delta_v_exec / r_i);
+        c_ht_tgt += ((r.delta_p * r.delta_q) / r_i);
+        if (r.delta_q < 0.0) c_ht_neg += (1.0 / r_i);
+      }
+    }
+    double c_G_act = c_accepted > 0 ? (c_ht_act / static_cast<double>(c_accepted)) : 0.0;
+    double c_G_exec = c_accepted > 0 ? (c_ht_exec / static_cast<double>(c_accepted)) : 0.0;
+    double c_G_tgt = c_searched > 0 ? (c_ht_tgt / static_cast<double>(c_searched)) : 0.0;
+    double c_neg_rate = c_accepted > 0 ? (c_ht_neg / static_cast<double>(c_accepted)) : 0.0;
+    double c_override_rate = c_searched > 0 ? (static_cast<double>(c_accepted) / static_cast<double>(c_searched)) : 0.0;
+    double c_mean_steps = c_accepted > 0 ? (static_cast<double>(sum_rollout_steps_by_cat[cat]) / static_cast<double>(c_accepted)) : 0.0;
+    double c_mean_evals = c_accepted > 0 ? (static_cast<double>(sum_rollout_evals_by_cat[cat]) / static_cast<double>(c_accepted)) : 0.0;
+
+    json::Object c_obj;
+    c_obj["category_id"] = static_cast<int64_t>(cat);
+    c_obj["category_name"] = open_spiel::dune_imperium::R755SearchCategoryName(static_cast<open_spiel::dune_imperium::R755SearchCategory>(cat));
+    c_obj["N_searched"] = c_searched;
+    c_obj["N_accepted"] = c_accepted;
+    c_obj["N_sampled"] = c_sampled;
+    c_obj["executed_overrides_all_seats"] = c_executed_all;
+    c_obj["override_rate"] = c_override_rate;
+    c_obj["G_action"] = c_G_act;
+    c_obj["G_exec"] = c_G_exec;
+    c_obj["G_target"] = c_G_tgt;
+    c_obj["neg_override_rate"] = c_neg_rate;
+    c_obj["mean_rollout_steps"] = c_mean_steps;
+    c_obj["mean_rollout_nn_evals"] = c_mean_evals;
+    categories_json.push_back(std::move(c_obj));
+  }
+  root_obj["categories"] = std::move(categories_json);
+
+  std::filesystem::path op(output_path);
+  if (!op.parent_path().empty()) std::filesystem::create_directories(op.parent_path());
+  std::ofstream ofs(output_path);
+  if (ofs.is_open()) {
+    ofs << json::ToString(root_obj, true) << "\n";
+    ofs.flush();
+    ofs.close();
+    std::cout << "[R755-GATE1] Wrote Gate 1 audit artifact to " << output_path << "\n";
+  } else {
+    std::cerr << "[R755-GATE1] ERROR: Could not open " << output_path << " for writing!\n";
+  }
+  std::cout << "[R755-GATE1] Summary: G_action=" << G_action
+            << " [" << boot_G_action[250] << ", " << boot_G_action[9750] << "]"
+            << " (LCB95=" << boot_G_action[500] << ")"
+            << ", G_exec=" << G_exec
+            << " (LCB95=" << boot_G_exec[500] << ")"
+            << ", G_target=" << G_target
+            << " (LCB95=" << boot_G_target[500] << ")"
+            << ", neg_override_rate=" << neg_override_rate
+            << ", mean_delta_p=" << mean_delta_p << std::endl;
+  std::exit(0);
 }
 
 
@@ -9309,6 +10268,18 @@ int main(int argc, char** argv) {
       open_spiel::ComputeCurrentPrePrecisionConfigFingerprint();
   std::string search_label_fingerprint = open_spiel::GetSearchLabelFingerprint(absl::GetFlag(FLAGS_search_label_dir));
   std::string run_uuid = open_spiel::GenerateUUID();
+  const std::string gate_session_nonce = open_spiel::GenerateUUID();
+  if (absl::GetFlag(FLAGS_pause_for_gate_at_update) > 0) {
+    const std::string gdf = absl::GetFlag(FLAGS_gate_decision_file);
+    if (gdf.empty()) {
+      open_spiel::SpielFatalError(
+          "--pause_for_gate_at_update > 0 requires a non-empty --gate_decision_file.");
+    }
+    if (std::filesystem::exists(gdf)) {
+      open_spiel::SpielFatalError(
+          "--gate_decision_file already exists at launch; refusing stale decision file: " + gdf);
+    }
+  }
 
   // -------------------------------------------------------------------------
   // PWO-5 Appendix A.1 note 3: assemble the manifest block, ONCE, before any
@@ -13296,6 +14267,15 @@ int main(int argc, char** argv) {
       SpielFatalError(deadline_error);
     }
   }
+  if (!absl::GetFlag(FLAGS_r755_gate1_output).empty()) {
+    open_spiel::RunR755Gate1Audit(
+        game.get(), evaluator, obs_size, master, rollout_games,
+        absl::GetFlag(FLAGS_r755_gate1_output));
+    std::exit(0);
+  }
+  if (absl::GetFlag(FLAGS_r755_hybrid_mode)) {
+    absl::SetFlag(&FLAGS_aux_full_batch_presentation, false);
+  }
   open_spiel::CollectResult current_collect = open_spiel::CollectRollout(
       game.get(), evaluator, obs_size, &total_env_steps, num_threads, &next_episode_id,
       rollout_games, reward_lambda,
@@ -14110,6 +15090,7 @@ int main(int argc, char** argv) {
     stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
+
     std::string diagnostics_path = absl::GetFlag(FLAGS_diagnostics_path);
     if (!diagnostics_path.empty()) {
       double val_kl = search_buffer.ComputeValidationKL(training_model, device, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
@@ -14244,13 +15225,19 @@ int main(int argc, char** argv) {
           absl::GetFlag(FLAGS_search_override_eta));
       current_collect.aux_examples = std::move(search_sup_res.examples);
     }
+    const double r755_coef_override = absl::GetFlag(FLAGS_r755_search_loss_coef);
+    const double hybrid_coef = (r755_coef_override >= 0.0)
+        ? r755_coef_override
+        : absl::GetFlag(FLAGS_search_loss_coef);
     const double this_search_coef =
-        absl::GetFlag(FLAGS_search_in_training)
-            ? absl::GetFlag(FLAGS_search_loss_lambda)
-            : (online_search_collection
-                   ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
-                                                         aux_search_loss_warmup)
-                   : 0.0);
+        absl::GetFlag(FLAGS_r755_hybrid_mode)
+            ? hybrid_coef
+            : (absl::GetFlag(FLAGS_search_in_training)
+                   ? absl::GetFlag(FLAGS_search_loss_lambda)
+                   : (online_search_collection
+                          ? open_spiel::SearchLossCoefForUpdate(update, aux_search_loss_coef_target,
+                                                                aux_search_loss_warmup)
+                          : 0.0));
     // --- PWO-5 section 8.6: draw this update's auxiliary batch. ----------
     //
     // ONE draw per update (aux = 0), on its own RNG stream. Reusing
@@ -14343,6 +15330,376 @@ int main(int argc, char** argv) {
 
     const bool compute_diagnostics = !absl::GetFlag(FLAGS_diagnostics_path).empty();
 
+    open_spiel::R755Gate2Diagnostics gate2_diag;
+    const bool do_gate2 = !absl::GetFlag(FLAGS_r755_gate2_output).empty();
+    std::vector<std::vector<double>> gate2_aux_pi_old;
+    std::vector<std::vector<double>> gate2_non_override_pi_old;
+    std::vector<size_t> gate2_non_override_indices;
+    std::vector<const std::vector<float>*> gate2_aux_obs_ptrs;
+    std::vector<const dune_semantic::CandidateActionData*> gate2_aux_cads;
+    std::vector<const std::vector<Action>*> gate2_aux_legals;
+    std::vector<const std::vector<float>*> gate2_non_ov_obs_ptrs;
+    std::vector<const dune_semantic::CandidateActionData*> gate2_non_ov_cads;
+    std::vector<const std::vector<Action>*> gate2_non_ov_legals;
+
+    auto eval_collector_probs = [&](const std::vector<float>& obs,
+                                    const dune_semantic::CandidateActionData* cad,
+                                    const std::vector<Action>& legals) -> std::vector<double> {
+      EvalResult res = evaluator->EvaluateWithActions(obs, cad);
+      CenterAndCapLegalLogits(res.logits, legals, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)));
+      std::vector<double> probs;
+      probs.reserve(legals.size());
+      double max_l = -1e9;
+      for (Action a : legals) {
+        if (a >= 0 && a < action_size) max_l = std::max(max_l, static_cast<double>(res.logits[a]));
+      }
+      double sum_e = 0.0;
+      for (Action a : legals) {
+        double e = (a >= 0 && a < action_size) ? std::exp(res.logits[a] - max_l) : 0.0;
+        probs.push_back(e);
+        sum_e += e;
+      }
+      if (sum_e > 0.0) {
+        for (double& p : probs) p /= sum_e;
+      }
+      return probs;
+    };
+
+    auto eval_collector_batch_probs = [&](const std::vector<const std::vector<float>*>& obs_ptrs,
+                                          const std::vector<const dune_semantic::CandidateActionData*>& cads,
+                                          const std::vector<const std::vector<Action>*>& legals_list)
+        -> std::vector<std::vector<double>> {
+      const size_t M = obs_ptrs.size();
+      std::vector<std::vector<double>> batch_probs(M);
+      if (M == 0) return batch_probs;
+
+      evaluator->AdjustActiveRollouts(static_cast<int>(M));
+
+      std::vector<std::future<void>> futures;
+      futures.reserve(M);
+      for (size_t i = 0; i < M; ++i) {
+        futures.push_back(open_spiel::dune_imperium::SearchRolloutThreadPool::Instance().Submit([&, i]() {
+          open_spiel::dune_imperium::ActiveRolloutReleaseGuard release_guard(evaluator.get(), 1);
+          batch_probs[i] = eval_collector_probs(*obs_ptrs[i], cads[i], *legals_list[i]);
+        }));
+      }
+      for (auto& f : futures) {
+        f.get();
+      }
+      return batch_probs;
+    };
+
+    auto eval_learner_batch_probs = [&](const std::vector<const std::vector<float>*>& obs_ptrs,
+                                        const std::vector<const dune_semantic::CandidateActionData*>& cads,
+                                        const std::vector<const std::vector<Action>*>& legals_list,
+                                        size_t max_chunk_size = 2048)
+        -> std::vector<std::vector<double>> {
+      std::vector<std::vector<double>> batch_probs;
+      const size_t M = obs_ptrs.size();
+      if (M == 0) return batch_probs;
+      batch_probs.reserve(M);
+      if (max_chunk_size == 0) max_chunk_size = 2048;
+
+      for (size_t chunk_start = 0; chunk_start < M; chunk_start += max_chunk_size) {
+        const size_t chunk_end = std::min(M, chunk_start + max_chunk_size);
+        const size_t chunk_size = chunk_end - chunk_start;
+
+        torch::NoGradGuard no_grad;
+        open_spiel::AutocastGuard autocast_guard(
+            c10::DeviceType::CUDA, device.is_cuda() && absl::GetFlag(FLAGS_train_amp));
+        auto obs_cpu = torch::empty({static_cast<int64_t>(chunk_size), static_cast<int64_t>(obs_size)}, torch::kFloat32);
+        float* obs_ptr = obs_cpu.data_ptr<float>();
+        for (size_t b = 0; b < chunk_size; ++b) {
+          const auto& obs = *obs_ptrs[chunk_start + b];
+          const size_t copy_n = std::min(obs.size(), static_cast<size_t>(obs_size));
+          std::memcpy(obs_ptr + b * static_cast<size_t>(obs_size), obs.data(), copy_n * sizeof(float));
+          if (copy_n < static_cast<size_t>(obs_size)) {
+            std::memset(obs_ptr + b * static_cast<size_t>(obs_size) + copy_n, 0,
+                        (static_cast<size_t>(obs_size) - copy_n) * sizeof(float));
+          }
+        }
+        auto obs_t = obs_cpu.to(device);
+        auto out = training_model->forward(obs_t);
+        if (training_model->with_semantic_scorer_ && training_model->semantic_scorer_) {
+          std::vector<const dune_semantic::CandidateActionData*> chunk_cads(
+              cads.begin() + chunk_start, cads.begin() + chunk_end);
+          dune_semantic::ApplySemanticScorerBatch(
+              training_model->semantic_scorer_, out.trunk, chunk_cads, out.logits, device);
+        }
+        auto logits_cpu = out.logits.to(torch::kCPU, torch::kFloat32).contiguous();
+        const float* logits_ptr = logits_cpu.data_ptr<float>();
+        const float logit_cap_f = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+        std::vector<float> row_logits(action_size);
+        for (size_t b = 0; b < chunk_size; ++b) {
+          std::memcpy(row_logits.data(), logits_ptr + b * static_cast<size_t>(action_size),
+                      static_cast<size_t>(action_size) * sizeof(float));
+          const auto& legals = *legals_list[chunk_start + b];
+          CenterAndCapLegalLogits(row_logits, legals, logit_cap_f);
+          std::vector<double> probs;
+          probs.reserve(legals.size());
+          double max_l = -1e9;
+          for (Action a : legals) {
+            if (a >= 0 && a < action_size) max_l = std::max(max_l, static_cast<double>(row_logits[a]));
+          }
+          double sum_e = 0.0;
+          for (Action a : legals) {
+            double e = (a >= 0 && a < action_size) ? std::exp(row_logits[a] - max_l) : 0.0;
+            probs.push_back(e);
+            sum_e += e;
+          }
+          if (sum_e > 0.0) {
+            for (double& p : probs) p /= sum_e;
+          }
+          batch_probs.push_back(std::move(probs));
+        }
+      }
+      return batch_probs;
+    };
+
+    auto kl_div = [](const std::vector<double>& p, const std::vector<double>& q) -> double {
+      double kl = 0.0;
+      for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] > 1e-12) {
+          double denom = (i < q.size() && q[i] > 1e-12) ? q[i] : 1e-12;
+          kl += p[i] * std::log(p[i] / denom);
+        }
+      }
+      return std::max(0.0, kl);
+    };
+
+    if (absl::GetFlag(FLAGS_r755_hybrid_mode) &&
+        absl::GetFlag(FLAGS_r755_shuffle_aux_examples) &&
+        current_collect.aux_examples.size() > 1) {
+      uint64_t aux_shuf_seed = dune_seed::DeriveSeed(
+          master, dune_seed::kDomainTrain, update, 0,
+          dune_seed::kStreamR758AuxShuffle);
+      std::mt19937_64 aux_shuf_rng(aux_shuf_seed);
+      std::shuffle(current_collect.aux_examples.begin(),
+                   current_collect.aux_examples.end(), aux_shuf_rng);
+    }
+
+    if (do_gate2) {
+      gate2_diag.update = update;
+      gate2_diag.total_transitions = static_cast<int64_t>(current_collect.rollout.size());
+      for (const auto& t : current_collect.rollout) {
+        if (std::isnan(t.advantage) || std::isinf(t.advantage) ||
+            std::isnan(t.return_value) || std::isinf(t.return_value)) {
+          gate2_diag.nan_inf_count++;
+        }
+        if (t.legal_actions.size() <= 1) {
+          gate2_diag.single_action_transitions++;
+        } else {
+          gate2_diag.multi_action_transitions++;
+          if (t.mask_policy_loss) {
+            gate2_diag.override_masked_transitions++;
+          } else {
+            gate2_diag.ppo_multi_action_transitions++;
+          }
+        }
+      }
+      gate2_diag.mask_identity_holds =
+          (gate2_diag.ppo_multi_action_transitions + gate2_diag.override_masked_transitions ==
+           gate2_diag.multi_action_transitions);
+
+      gate2_aux_obs_ptrs.reserve(current_collect.aux_examples.size());
+      gate2_aux_cads.reserve(current_collect.aux_examples.size());
+      gate2_aux_legals.reserve(current_collect.aux_examples.size());
+      for (const auto& ex : current_collect.aux_examples) {
+        gate2_aux_obs_ptrs.push_back(&ex.observation);
+        gate2_aux_cads.push_back(ex.candidate_data.empty() ? nullptr : &ex.candidate_data);
+        gate2_aux_legals.push_back(&ex.legal_actions);
+      }
+      const size_t learner_eval_chunk = static_cast<size_t>(std::max(1, absl::GetFlag(FLAGS_eval_batch_size)));
+      gate2_aux_pi_old = eval_learner_batch_probs(
+          gate2_aux_obs_ptrs, gate2_aux_cads, gate2_aux_legals, learner_eval_chunk);
+
+      std::vector<size_t> all_non_ov_eligible;
+      all_non_ov_eligible.reserve(current_collect.rollout.size());
+      for (size_t i = 0; i < current_collect.rollout.size(); ++i) {
+        const auto& t = current_collect.rollout[i];
+        if (t.legal_actions.size() > 1 && !t.mask_policy_loss) {
+          all_non_ov_eligible.push_back(i);
+        }
+      }
+      if (all_non_ov_eligible.size() > 2048) {
+        uint64_t non_ov_seed = dune_seed::DeriveSeed(
+            master, dune_seed::kDomainTrain, update, 0,
+            dune_seed::kStreamGate2NonOverrideDiag);
+        std::mt19937_64 non_ov_rng(non_ov_seed);
+        std::shuffle(all_non_ov_eligible.begin(), all_non_ov_eligible.end(), non_ov_rng);
+        all_non_ov_eligible.resize(2048);
+        std::sort(all_non_ov_eligible.begin(), all_non_ov_eligible.end());
+      }
+      gate2_non_override_indices = std::move(all_non_ov_eligible);
+      gate2_non_ov_obs_ptrs.reserve(gate2_non_override_indices.size());
+      gate2_non_ov_cads.reserve(gate2_non_override_indices.size());
+      gate2_non_ov_legals.reserve(gate2_non_override_indices.size());
+      for (size_t idx : gate2_non_override_indices) {
+        const auto& t = current_collect.rollout[idx];
+        gate2_non_ov_obs_ptrs.push_back(&t.state);
+        gate2_non_ov_cads.push_back(t.candidate_data.empty() ? nullptr : &t.candidate_data);
+        gate2_non_ov_legals.push_back(&t.legal_actions);
+      }
+      gate2_non_override_pi_old =
+          eval_learner_batch_probs(gate2_non_ov_obs_ptrs, gate2_non_ov_cads, gate2_non_ov_legals, learner_eval_chunk);
+
+      double max_abs_diff = 0.0;
+      double sum_coll_vs_learn_kl = 0.0;
+      size_t num_coll_vs_learn_states = 0;
+      std::vector<double> coll_vs_learn_diffs;
+
+      auto accumulate_coll_vs_learn = [&](const std::vector<double>& p_coll,
+                                          const std::vector<double>& p_learn) {
+        if (p_coll.size() != p_learn.size() || p_coll.empty()) return;
+        sum_coll_vs_learn_kl += kl_div(p_coll, p_learn);
+        num_coll_vs_learn_states++;
+        for (size_t a = 0; a < p_coll.size(); ++a) {
+          double logp_coll = std::log(std::max(1e-12, p_coll[a]));
+          double logp_learn = std::log(std::max(1e-12, p_learn[a]));
+          coll_vs_learn_diffs.push_back(std::abs(logp_learn - logp_coll));
+        }
+      };
+
+      const size_t coll_check_n = std::min<size_t>(128, gate2_non_override_indices.size());
+      std::vector<const std::vector<float>*> coll_check_obs(
+          gate2_non_ov_obs_ptrs.begin(), gate2_non_ov_obs_ptrs.begin() + coll_check_n);
+      std::vector<const dune_semantic::CandidateActionData*> coll_check_cads(
+          gate2_non_ov_cads.begin(), gate2_non_ov_cads.begin() + coll_check_n);
+      std::vector<const std::vector<Action>*> coll_check_legals(
+          gate2_non_ov_legals.begin(), gate2_non_ov_legals.begin() + coll_check_n);
+
+      auto gate2_non_ov_coll_probs =
+          eval_collector_batch_probs(coll_check_obs, coll_check_cads, coll_check_legals);
+      for (size_t j = 0; j < coll_check_n; ++j) {
+        size_t idx = gate2_non_override_indices[j];
+        const auto& t = current_collect.rollout[idx];
+        const auto& p_coll = gate2_non_ov_coll_probs[j];
+        accumulate_coll_vs_learn(p_coll, gate2_non_override_pi_old[j]);
+        for (size_t a = 0; a < t.legal_actions.size(); ++a) {
+          if (t.legal_actions[a] == t.action && p_coll[a] > 0.0) {
+            double recomputed_logp = std::log(p_coll[a]);
+            max_abs_diff = std::max(
+                max_abs_diff, std::abs(recomputed_logp - static_cast<double>(t.old_log_prob)));
+            break;
+          }
+        }
+      }
+      auto gate2_aux_coll_probs =
+          eval_collector_batch_probs(gate2_aux_obs_ptrs, gate2_aux_cads, gate2_aux_legals);
+      for (size_t i = 0; i < current_collect.aux_examples.size(); ++i) {
+        accumulate_coll_vs_learn(gate2_aux_coll_probs[i], gate2_aux_pi_old[i]);
+      }
+
+      gate2_diag.logprob_recompute_max_abs_diff = max_abs_diff;
+      gate2_diag.collector_vs_learner_kl =
+          (num_coll_vs_learn_states > 0)
+              ? (sum_coll_vs_learn_kl / static_cast<double>(num_coll_vs_learn_states))
+              : 0.0;
+      if (!coll_vs_learn_diffs.empty()) {
+        std::sort(coll_vs_learn_diffs.begin(), coll_vs_learn_diffs.end());
+        double sum_diff = 0.0;
+        for (double d : coll_vs_learn_diffs) sum_diff += d;
+        gate2_diag.collector_vs_learner_mean_diff =
+            sum_diff / static_cast<double>(coll_vs_learn_diffs.size());
+        size_t p99_idx = std::min(
+            coll_vs_learn_diffs.size() - 1,
+            static_cast<size_t>(std::floor(0.99 * static_cast<double>(coll_vs_learn_diffs.size() - 1))));
+        gate2_diag.collector_vs_learner_p99_diff = coll_vs_learn_diffs[p99_idx];
+        gate2_diag.collector_vs_learner_max_diff = coll_vs_learn_diffs.back();
+      }
+
+      // Production Pre-Step Minibatch Comparison
+      const size_t pre_step_cap = static_cast<size_t>(std::max(1, absl::GetFlag(FLAGS_ppo_minibatch_size)));
+      std::vector<const std::vector<float>*> pre_step_obs_ptrs;
+      std::vector<const dune_semantic::CandidateActionData*> pre_step_cads;
+      std::vector<const std::vector<Action>*> pre_step_legals;
+      std::vector<const PpoTransition*> pre_step_transitions;
+
+      pre_step_obs_ptrs.reserve(pre_step_cap);
+      pre_step_cads.reserve(pre_step_cap);
+      pre_step_legals.reserve(pre_step_cap);
+      pre_step_transitions.reserve(pre_step_cap);
+
+      for (const auto& t : current_collect.rollout) {
+        if (pre_step_transitions.size() >= pre_step_cap) break;
+        if (t.legal_actions.size() > 1 && !t.mask_policy_loss) {
+          pre_step_transitions.push_back(&t);
+          pre_step_obs_ptrs.push_back(&t.state);
+          pre_step_cads.push_back(t.candidate_data.empty() ? nullptr : &t.candidate_data);
+          pre_step_legals.push_back(&t.legal_actions);
+        }
+      }
+
+      if (!pre_step_transitions.empty()) {
+        auto pre_step_probs = eval_learner_batch_probs(
+            pre_step_obs_ptrs, pre_step_cads, pre_step_legals, pre_step_cap);
+
+        std::vector<double> abs_diffs;
+        std::vector<double> ratios;
+        abs_diffs.reserve(pre_step_transitions.size());
+        ratios.reserve(pre_step_transitions.size());
+
+        const double clip_eps = absl::GetFlag(FLAGS_ppo_clip_epsilon);
+        int64_t clipped_count = 0;
+        double sum_abs_diff = 0.0;
+
+        for (size_t i = 0; i < pre_step_transitions.size(); ++i) {
+          const auto& t = *pre_step_transitions[i];
+          const auto& p_learn = pre_step_probs[i];
+          size_t a_idx = p_learn.size();
+          for (size_t a = 0; a < t.legal_actions.size(); ++a) {
+            if (t.legal_actions[a] == t.action) {
+              a_idx = a;
+              break;
+            }
+          }
+          if (a_idx < p_learn.size()) {
+            double learner_logp = std::log(std::max(1e-12, p_learn[a_idx]));
+            double diff = learner_logp - static_cast<double>(t.old_log_prob);
+            double abs_diff = std::abs(diff);
+            double ratio = std::exp(diff);
+
+            abs_diffs.push_back(abs_diff);
+            ratios.push_back(ratio);
+            sum_abs_diff += abs_diff;
+
+            if (ratio < 1.0 - clip_eps || ratio > 1.0 + clip_eps) {
+              clipped_count++;
+            }
+          }
+        }
+
+        const size_t N_eval = abs_diffs.size();
+        if (N_eval > 0) {
+          std::sort(abs_diffs.begin(), abs_diffs.end());
+          std::sort(ratios.begin(), ratios.end());
+
+          auto percentile = [](const std::vector<double>& sorted_v, double p) -> double {
+            if (sorted_v.empty()) return 0.0;
+            double idx_f = p * static_cast<double>(sorted_v.size() - 1);
+            size_t idx = static_cast<size_t>(std::clamp<double>(std::round(idx_f), 0.0, static_cast<double>(sorted_v.size() - 1)));
+            return sorted_v[idx];
+          };
+
+          gate2_diag.pre_step_logprob_mean_abs_diff = sum_abs_diff / static_cast<double>(N_eval);
+          gate2_diag.pre_step_logprob_p99_abs_diff = percentile(abs_diffs, 0.99);
+          gate2_diag.pre_step_logprob_max_abs_diff = abs_diffs.back();
+
+          gate2_diag.pre_step_ratio_min = ratios.front();
+          gate2_diag.pre_step_ratio_p01 = percentile(ratios, 0.01);
+          gate2_diag.pre_step_ratio_p05 = percentile(ratios, 0.05);
+          gate2_diag.pre_step_ratio_p50 = percentile(ratios, 0.50);
+          gate2_diag.pre_step_ratio_p95 = percentile(ratios, 0.95);
+          gate2_diag.pre_step_ratio_p99 = percentile(ratios, 0.99);
+          gate2_diag.pre_step_ratio_max = ratios.back();
+
+          gate2_diag.pre_step_clip_frac = static_cast<double>(clipped_count) / static_cast<double>(N_eval);
+
+          gate2_diag.logprob_recompute_max_abs_diff = gate2_diag.pre_step_logprob_max_abs_diff;
+        }
+      }
+    }
+
     open_spiel::PpoUpdateStats stats =
         (absl::GetFlag(FLAGS_separate_actor_critic) && training_critic != nullptr)
             ? open_spiel::TrainPpoUpdateSeparate(
@@ -14355,7 +15712,7 @@ int main(int argc, char** argv) {
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, update, anchor_model,
                   current_collect.aux_examples, this_search_coef,
-                  online_search_collection ? aux_abort_ratio : 0.0,
+                  (online_search_collection || absl::GetFlag(FLAGS_r755_hybrid_mode)) ? aux_abort_ratio : 0.0,
                   pwo5_batch, pwo5_cfg,
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
                   compute_diagnostics,
@@ -14364,6 +15721,111 @@ int main(int argc, char** argv) {
     stats.forced_buys = current_collect.forced_buys;
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
+
+    if (do_gate2) {
+      const size_t learner_eval_chunk = static_cast<size_t>(std::max(1, absl::GetFlag(FLAGS_eval_batch_size)));
+      auto gate2_aux_pi_new =
+          eval_learner_batch_probs(gate2_aux_obs_ptrs, gate2_aux_cads, gate2_aux_legals, learner_eval_chunk);
+      auto gate2_non_override_pi_new =
+          eval_learner_batch_probs(gate2_non_ov_obs_ptrs, gate2_non_ov_cads, gate2_non_ov_legals, learner_eval_chunk);
+
+      double sum_student_kl = 0.0, sum_target_kl = 0.0;
+      double sum_dp_target = 0.0, sum_dp_student = 0.0;
+      double vis_dp_target = 0.0, vis_dp_student = 0.0;
+      double unvis_dp_target = 0.0, unvis_dp_student = 0.0;
+      int64_t visited_aux_count = 0, unvisited_aux_count = 0;
+      for (size_t i = 0; i < current_collect.aux_examples.size(); ++i) {
+        const auto& ex = current_collect.aux_examples[i];
+        const auto& p_old = gate2_aux_pi_old[i];
+        const auto& p_new = gate2_aux_pi_new[i];
+        sum_student_kl += kl_div(p_old, p_new);
+        sum_target_kl += kl_div(ex.normalized_visits, p_old);
+        const bool is_vis = (i < stats.aux_visited_mask.size() && stats.aux_visited_mask[i] != 0);
+        if (is_vis) {
+          ++visited_aux_count;
+        } else {
+          ++unvisited_aux_count;
+        }
+        int best_idx = -1;
+        double max_diff = -1e9;
+        for (size_t a = 0; a < ex.normalized_visits.size(); ++a) {
+          double diff = ex.normalized_visits[a] - p_old[a];
+          if (diff > max_diff) { max_diff = diff; best_idx = static_cast<int>(a); }
+        }
+        if (best_idx >= 0) {
+          double dp_t = ex.normalized_visits[best_idx] - p_old[best_idx];
+          double dp_s = p_new[best_idx] - p_old[best_idx];
+          sum_dp_target += dp_t;
+          sum_dp_student += dp_s;
+          if (is_vis) {
+            vis_dp_target += dp_t;
+            vis_dp_student += dp_s;
+          } else {
+            unvis_dp_target += dp_t;
+            unvis_dp_student += dp_s;
+          }
+        }
+      }
+      size_t n_aux = current_collect.aux_examples.size();
+      if (n_aux > 0) {
+        gate2_diag.mean_student_kl = sum_student_kl / n_aux;
+        gate2_diag.mean_target_kl = sum_target_kl / n_aux;
+        gate2_diag.mean_delta_p_target = sum_dp_target / n_aux;
+        gate2_diag.mean_delta_p_student = sum_dp_student / n_aux;
+        gate2_diag.student_to_target_ratio = (gate2_diag.mean_delta_p_target > 1e-8)
+            ? (gate2_diag.mean_delta_p_student / gate2_diag.mean_delta_p_target) : 0.0;
+      }
+      gate2_diag.aux_distinct_visited = stats.aux_distinct_visited;
+      gate2_diag.aux_total_presentations = stats.aux_total_presentations;
+      gate2_diag.visited_aux_count = visited_aux_count;
+      gate2_diag.unvisited_aux_count = unvisited_aux_count;
+      gate2_diag.sum_delta_p_target = sum_dp_target;
+      gate2_diag.sum_delta_p_student = sum_dp_student;
+      gate2_diag.visited_sum_delta_p_target = vis_dp_target;
+      gate2_diag.visited_sum_delta_p_student = vis_dp_student;
+      gate2_diag.unvisited_sum_delta_p_target = unvis_dp_target;
+      gate2_diag.unvisited_sum_delta_p_student = unvis_dp_student;
+      gate2_diag.visited_student_to_target_ratio =
+          (vis_dp_target > 1e-8) ? (vis_dp_student / vis_dp_target) : 0.0;
+      gate2_diag.unvisited_student_to_target_ratio =
+          (unvis_dp_target > 1e-8) ? (unvis_dp_student / unvis_dp_target) : 0.0;
+
+      double sum_non_override_kl = 0.0;
+      for (size_t j = 0; j < gate2_non_override_indices.size(); ++j) {
+        const auto& p_old = gate2_non_override_pi_old[j];
+        const auto& p_new = gate2_non_override_pi_new[j];
+        sum_non_override_kl += kl_div(p_old, p_new);
+      }
+      if (!gate2_non_override_indices.empty()) {
+        gate2_diag.mean_non_override_kl = sum_non_override_kl / gate2_non_override_indices.size();
+      }
+      for (int c = 0; c < 6; ++c) {
+        gate2_diag.searched_by_cat[c] = current_collect.r755_searched_by_cat[c];
+        gate2_diag.executed_overrides_by_cat[c] = current_collect.r755_executed_overrides_by_cat[c];
+      }
+      open_spiel::g_gate2_diagnostics.push_back(gate2_diag);
+      open_spiel::WriteR755Gate2Json(absl::GetFlag(FLAGS_r755_gate2_output),
+                                     open_spiel::g_gate2_diagnostics);
+      std::cout << absl::StrFormat(
+          "[R755-LIVE-CHECK] update=%d nan_inf_count=%lld mask_identity_holds=%d "
+          "override_masked=%lld cat1_exec=%lld cat2_exec=%lld cat3_exec=%lld "
+          "cat4_exec=%lld cat5_exec=%lld student_to_target_ratio=%.6f "
+          "visited_ratio=%.6f unvisited_ratio=%.6f aux_vis=%lld/%zu aux_pres=%lld\n",
+          update, static_cast<long long>(gate2_diag.nan_inf_count),
+          gate2_diag.mask_identity_holds ? 1 : 0,
+          static_cast<long long>(gate2_diag.override_masked_transitions),
+          static_cast<long long>(gate2_diag.executed_overrides_by_cat[1]),
+          static_cast<long long>(gate2_diag.executed_overrides_by_cat[2]),
+          static_cast<long long>(gate2_diag.executed_overrides_by_cat[3]),
+          static_cast<long long>(gate2_diag.executed_overrides_by_cat[4]),
+          static_cast<long long>(gate2_diag.executed_overrides_by_cat[5]),
+          gate2_diag.student_to_target_ratio,
+          gate2_diag.visited_student_to_target_ratio,
+          gate2_diag.unvisited_student_to_target_ratio,
+          static_cast<long long>(gate2_diag.aux_distinct_visited),
+          current_collect.aux_examples.size(),
+          static_cast<long long>(gate2_diag.aux_total_presentations)) << std::flush;
+    }
 
     // Phase 18B clean abort at the latest valid checkpoint (plan §18C): a
     // per-update aux/PPO grad-norm ratio over threshold stops the run; this
@@ -14635,6 +16097,7 @@ int main(int argc, char** argv) {
       stats.aux_examples_used = static_cast<int>(search_sup_res.examples.size());
       stats.aux_search_loss_coef = this_search_coef;
       stats.aux_ce = aux_res.final_aux_ce;
+      stats.search_aux_loss = stats.aux_ce;
       stats.aux_grad_norm_mean = aux_res.mean_aux_grad_norm;
 
       double this_aux_gain = aux_res.initial_aux_ce - aux_res.final_aux_ce;
@@ -15128,6 +16591,48 @@ int main(int argc, char** argv) {
 
     last_completed_update = update;
 
+    const int gate_pause_upd = absl::GetFlag(FLAGS_pause_for_gate_at_update);
+    const std::string gate_dec_path = absl::GetFlag(FLAGS_gate_decision_file);
+    if (gate_pause_upd > 0 && update == gate_pause_upd && !gate_dec_path.empty()) {
+      if (have_bg && bg_collect_thread.joinable()) {
+        bg_collect_thread.join();
+        have_bg = false;
+      }
+      const double max_wait_s = static_cast<double>(std::max(1, absl::GetFlag(FLAGS_gate_timeout_seconds)));
+      std::cout << absl::StrFormat(
+          "[GATE-BARRIER] Paused after completing and checkpointing update %d (nonce=%s). Waiting up to %ds for decision in %s ...\n",
+          update, gate_session_nonce, std::max(1, absl::GetFlag(FLAGS_gate_timeout_seconds)), gate_dec_path) << std::flush;
+      const auto barrier_start = std::chrono::steady_clock::now();
+      while (!open_spiel::g_stop_requested.load(std::memory_order_relaxed)) {
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - barrier_start).count() >= max_wait_s) {
+          std::cout << absl::StrFormat(
+              "[GATE-BARRIER] Timeout waiting for gate decision (%ds elapsed); failing closed and releasing GPU.\n",
+              static_cast<int>(max_wait_s)) << std::flush;
+          open_spiel::g_stop_requested.store(true, std::memory_order_relaxed);
+          break;
+        }
+        std::ifstream dfs(gate_dec_path);
+        if (dfs.is_open()) {
+          std::string tok, file_nonce;
+          int file_upd = -1;
+          dfs >> tok >> file_nonce >> file_upd;
+          if (tok == "CONTINUE" && file_nonce == gate_session_nonce && file_upd == update) {
+            std::cout << absl::StrFormat(
+                "[GATE-BARRIER] Received valid CONTINUE at update %d (nonce=%s). Proceeding to update %d.\n",
+                update, file_nonce, update + 1) << std::flush;
+            break;
+          } else if (!tok.empty()) {
+            std::cout << absl::StrFormat(
+                "[GATE-BARRIER] Received ABORT or invalid gate token (tok='%s' nonce='%s' upd=%d; expected 'CONTINUE %s %d') at update %d. Stopping cleanly.\n",
+                tok, file_nonce, file_upd, gate_session_nonce, update, update) << std::flush;
+            open_spiel::g_stop_requested.store(true, std::memory_order_relaxed);
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+    }
+
     int interval = absl::GetFlag(FLAGS_checkpoint_interval);
     bool cutoff_reached = false;
     if (cutoff_epoch > 0.0) {
@@ -15151,8 +16656,7 @@ int main(int argc, char** argv) {
         have_bg = false;
       }
 
-      int interval = absl::GetFlag(FLAGS_checkpoint_interval);
-      if (interval <= 0 || update % interval != 0) {
+      if (!is_checkpoint) {
         std::string prefix = absl::GetFlag(FLAGS_run_prefix);
         if (absl::GetFlag(FLAGS_separate_actor_critic) && critic_optimizer != nullptr) {
           std::string actor_model_path = absl::StrCat(prefix, "_model_update_", update, ".pt");
@@ -15298,6 +16802,9 @@ int main(int argc, char** argv) {
   }
   if (!card_telemetry_path.empty() && last_completed_update >= start_update) {
     open_spiel::SaveCardTelemetry(card_telemetry_path, last_completed_update, cum_card11, cum_card13, /*is_checkpoint=*/true);
+  }
+  if (!absl::GetFlag(FLAGS_r755_gate2_output).empty()) {
+    open_spiel::WriteR755Gate2Json(absl::GetFlag(FLAGS_r755_gate2_output), open_spiel::g_gate2_diagnostics);
   }
   return 0;
 #endif

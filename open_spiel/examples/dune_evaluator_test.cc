@@ -726,6 +726,196 @@ int main(int argc, char* argv[]) {
     std::cout << "Test 12 Passed!\n\n";
   }
 
+  // Test 13: CUDA BatchedEvaluator RunnerAsync mixed-request & slot-reorder stress
+  {
+    std::cout << "=== Test 13: CUDA BatchedEvaluator RunnerAsync mixed-request & slot-reorder stress ===\n";
+    if (!torch::cuda::is_available()) {
+      std::cout << "  CUDA unavailable: skipping Test 13\n";
+    } else {
+      torch::Device device(torch::kCUDA, 0);
+      const int64_t kObs = 4096;
+      const int64_t kHidden = 128;
+      const int64_t kAction = 32;
+      const int64_t kBlocks = 1;
+      torch::manual_seed(20261102);
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kObs, kHidden, kAction, kBlocks);
+      model->eval();
+      model->to(device);
+
+      std::shared_mutex sync_mutex;
+      BatchedEvaluator be(model,
+                          /*target_batch_size=*/8,
+                          /*timeout_ms=*/50,
+                          device,
+                          &sync_mutex,
+                          /*logit_cap=*/0.0f,
+                          /*device_synchronize=*/false);
+
+      const int num_threads = 32;
+      const int iters = 40;
+      std::vector<Action> legals = {0, 3, 7, 12, 19, 25, 31};
+
+      std::vector<std::vector<float>> obs(num_threads, std::vector<float>(kObs));
+      for (int t = 0; t < num_threads; ++t) {
+        for (int64_t i = 0; i < kObs; ++i) {
+          obs[t][i] = std::sin(static_cast<float>(t * 100 + i + 1));
+        }
+      }
+
+      std::vector<EvalResult> ref_full(num_threads);
+      std::vector<CompactEvalResult> ref_compact(num_threads);
+      std::vector<EvalResult> ref_val(num_threads);
+      for (int t = 0; t < num_threads; ++t) {
+        ref_full[t] = be.Evaluate(obs[t]);
+        ref_compact[t] = be.EvaluateCompact(obs[t], legals);
+        ref_val[t] = be.EvaluateValues(obs[t]);
+      }
+
+      std::atomic<int> mismatches{0};
+      std::vector<std::thread> threads;
+      threads.reserve(num_threads);
+      for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+          for (int it = 0; it < iters; ++it) {
+            const int mode = (t + it) % 4;
+            if (mode == 0) {
+              EvalResult r = be.Evaluate(obs[t]);
+              bool ok = r.ok && (std::abs(r.value - ref_full[t].value) <= 1e-2);
+              if (ok && r.logits.size() == ref_full[t].logits.size()) {
+                for (size_t k = 0; k < r.logits.size(); ++k) {
+                  if (std::abs(r.logits[k] - ref_full[t].logits[k]) > 1e-2) {
+                    ok = false;
+                    break;
+                  }
+                }
+              } else {
+                ok = false;
+              }
+              if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+            } else if (mode == 1) {
+              CompactEvalResult r = be.EvaluateCompact(obs[t], legals);
+              bool ok = r.ok && (std::abs(r.value - ref_compact[t].value) <= 1e-2);
+              if (ok && r.probabilities.size() == ref_compact[t].probabilities.size()) {
+                for (size_t k = 0; k < r.probabilities.size(); ++k) {
+                  if (std::abs(r.probabilities[k] - ref_compact[t].probabilities[k]) > 1e-2) {
+                    ok = false;
+                    break;
+                  }
+                }
+              } else {
+                ok = false;
+              }
+              if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+            } else if (mode == 2) {
+              EvalResult r = be.EvaluateValues(obs[t]);
+              bool ok = r.ok && (std::abs(r.value - ref_val[t].value) <= 1e-2);
+              if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              std::vector<EvalResult> r_vec = be.EvaluateBatchValues({obs[t]});
+              bool ok = (r_vec.size() == 1) && r_vec[0].ok &&
+                        (std::abs(r_vec[0].value - ref_val[t].value) <= 1e-2);
+              if (!ok) mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        });
+      }
+      for (auto& th : threads) th.join();
+
+      assert(mismatches.load() == 0);
+
+      // Sub-batch tail of 5 requests (< target_batch_size = 8) across
+      // Evaluate, EvaluateCompact, and EvaluateValues
+      std::atomic<int> tail_mismatches{0};
+      std::vector<std::thread> tail_threads;
+      tail_threads.reserve(5);
+      tail_threads.emplace_back([&]() {
+        EvalResult r = be.Evaluate(obs[0]);
+        if (!r.ok || std::abs(r.value - ref_full[0].value) > 1e-2) tail_mismatches.fetch_add(1);
+      });
+      tail_threads.emplace_back([&]() {
+        CompactEvalResult r = be.EvaluateCompact(obs[1], legals);
+        if (!r.ok || std::abs(r.value - ref_compact[1].value) > 1e-2) tail_mismatches.fetch_add(1);
+      });
+      tail_threads.emplace_back([&]() {
+        EvalResult r = be.EvaluateValues(obs[2]);
+        if (!r.ok || std::abs(r.value - ref_val[2].value) > 1e-2) tail_mismatches.fetch_add(1);
+      });
+      tail_threads.emplace_back([&]() {
+        EvalResult r = be.Evaluate(obs[3]);
+        if (!r.ok || std::abs(r.value - ref_full[3].value) > 1e-2) tail_mismatches.fetch_add(1);
+      });
+      tail_threads.emplace_back([&]() {
+        CompactEvalResult r = be.EvaluateCompact(obs[4], legals);
+        if (!r.ok || std::abs(r.value - ref_compact[4].value) > 1e-2) tail_mismatches.fetch_add(1);
+      });
+      for (auto& th : tail_threads) th.join();
+      assert(tail_mismatches.load() == 0);
+
+      std::cout << "Test 13 Passed!\n\n";
+    }
+  }
+
+  // Test 14: Forced-interleaving notification lifetime handshake
+  {
+    std::cout << "=== Test 14: Forced-interleaving notification lifetime handshake ===\n";
+
+    std::atomic<bool> destroyed{false};
+    auto custom_deleter = [&](std::atomic<uint32_t>* ptr) {
+      destroyed.store(true, std::memory_order_release);
+      delete ptr;
+    };
+    using FlagPtr = std::unique_ptr<std::atomic<uint32_t>, decltype(custom_deleter)>;
+
+    std::mutex mtx;
+    std::condition_variable cv_parked;
+    bool waiter_parked = false;
+
+    std::condition_variable cv_resume;
+    bool allow_waiter_resume = false;
+
+    std::atomic<uint32_t>* raw_flag_ptr = nullptr;
+
+    std::thread waiter([&]() {
+      FlagPtr flag(new std::atomic<uint32_t>(BatchedEvaluator::kWaitSpinning), custom_deleter);
+      raw_flag_ptr = flag.get();
+
+      BatchedEvaluator::WaitOnReadyFlagWithHook(*flag, [&]() {
+        {
+          std::lock_guard<std::mutex> lk(mtx);
+          waiter_parked = true;
+        }
+        cv_parked.notify_one();
+
+        {
+          std::unique_lock<std::mutex> lk(mtx);
+          cv_resume.wait(lk, [&]() { return allow_waiter_resume; });
+        }
+      });
+    });
+
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      cv_parked.wait(lk, [&]() { return waiter_parked; });
+    }
+
+    BatchedEvaluator::SignalReadyFlagWithHook(raw_flag_ptr, [&]() {
+      {
+        std::lock_guard<std::mutex> lk(mtx);
+        allow_waiter_resume = true;
+      }
+      cv_resume.notify_one();
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      assert(!destroyed.load(std::memory_order_acquire));
+    });
+
+    waiter.join();
+    assert(destroyed.load(std::memory_order_acquire));
+
+    std::cout << "Test 14 Passed!\n\n";
+  }
+
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";
   return 0;
 }

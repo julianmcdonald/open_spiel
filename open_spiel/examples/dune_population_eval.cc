@@ -44,11 +44,34 @@
 #include "dune_eval_action_selection.h"
 #include "dune_specimen_conversion.h"
 #include "dune_market_diagnostics.h"
+#include "dune_batched_evaluator.h"
+#include "dune_compound_turn_search.h"
 #include "open_spiel/utils/json.h"
 
 // ---------------------------------------------------------------------------
 // Flags
 // ---------------------------------------------------------------------------
+ABSL_FLAG(bool, candidate_r758_teacher, false,
+          "If true, candidate seat runs 1-round CompoundRolloutSearchDecision teacher at play time.");
+ABSL_FLAG(int, candidate_eval_batch_size, -1,
+          "Optional explicit target batch size for candidate BatchedEvaluator (-1 = auto).");
+ABSL_FLAG(int, teacher_category_mask, 27,
+          "R755 category bitmask for candidate_r758_teacher.");
+ABSL_FLAG(int, teacher_top_k, 3,
+          "Top-K candidates for candidate_r758_teacher.");
+ABSL_FLAG(int, teacher_rollouts, 16,
+          "Rollouts per action for candidate_r758_teacher.");
+ABSL_FLAG(int, teacher_stage1_rollouts, 8,
+          "Stage-1 rollouts for candidate_r758_teacher (0 = 1-stage).");
+ABSL_FLAG(double, teacher_stage1_min_mean_diff, 0.03,
+          "Stage-1 min mean diff vs raw for candidate_r758_teacher.");
+ABSL_FLAG(double, teacher_min_t_stat, 1.50,
+          "Min paired t-stat for candidate_r758_teacher.");
+ABSL_FLAG(double, teacher_override_margin, 0.15,
+          "Min override utility margin for candidate_r758_teacher.");
+ABSL_FLAG(std::string, teacher_crn_mode, "deck_order",
+          "CRN mode for candidate_r758_teacher: sequential, deck_order, event_keyed.");
+
 ABSL_FLAG(std::string, model_checkpoint, "",
           "Path to the model checkpoint to evaluate.");
 ABSL_FLAG(bool, enable_semantic_scorer, false,
@@ -140,6 +163,9 @@ using dune_imperium::DuneImperiumState;
 using dune_imperium::kNumPlayers;
 using dune_imperium::kMaxRounds;
 using dune_imperium::kTargetVp;
+
+std::atomic<int64_t> g_teacher_searched_roots{0};
+std::atomic<int64_t> g_teacher_overrides{0};
 
 // ---------------------------------------------------------------------------
 // Domain resolution
@@ -762,6 +788,29 @@ void WorkerThread(
     opp_obs.emplace_back(dim, 0.0f);
   }
 
+  std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> teacher_evals;
+  open_spiel::dune_imperium::SearchRolloutCrnMode teacher_crn_mode =
+      open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+  if (absl::GetFlag(FLAGS_candidate_r758_teacher)) {
+    auto batched_cand = std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(model_evaluator);
+    if (!batched_cand) {
+      SpielFatalError("Candidate teacher search requires BatchedEvaluator (--deterministic_eval=false)");
+    }
+    teacher_evals.push_back(std::make_shared<open_spiel::BatchedNNEvaluator>(
+        batched_cand, candidate_logit_cap, dune_imperium::MarketAppendixMode::kNone,
+        /*forward_active_rollouts=*/false));
+    const std::string mode_str = absl::GetFlag(FLAGS_teacher_crn_mode);
+    if (mode_str == "sequential") {
+      teacher_crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+    } else if (mode_str == "deck_order") {
+      teacher_crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+    } else if (mode_str == "event_keyed") {
+      teacher_crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+    } else {
+      SpielFatalError(absl::StrCat("Unknown teacher_crn_mode: ", mode_str));
+    }
+  }
+
   while (true) {
     const int result_index = next_game_id++;
     if (result_index >= total_games) break;
@@ -816,6 +865,10 @@ void WorkerThread(
 
     std::unique_ptr<State> state = game->NewInitialState();
     int game_length = 0;
+    bool cand_space_placed_this_turn = false;
+    Player last_turn_player = kInvalidPlayer;
+    Action last_action = kInvalidAction;
+    int64_t decision_index = 0;
 
     dune_market_diag::GameMarketTracker market_tracker;
     if (record_market_diagnostics) {
@@ -931,6 +984,12 @@ void WorkerThread(
         break;
       }
 
+      ++decision_index;
+      if ((current_player != last_turn_player || last_action == dune_imperium::kActionEndTurn) &&
+          current_player == model_player) {
+        cand_space_placed_this_turn = false;
+      }
+
       if (record_market_diagnostics && dune_state != nullptr && current_player == model_player) {
         market_tracker.OnCandidateDecision(*dune_state, model_player, legal_actions);
       }
@@ -1002,6 +1061,67 @@ void WorkerThread(
         chosen_action = dune_eval::SelectActionFromLogits(
             result.logits, legal_actions, policy,
             policy_rngs[current_player]);
+
+        if (use_model && absl::GetFlag(FLAGS_candidate_r758_teacher)) {
+          auto cat = dune_imperium::ClassifyR755SearchCategory(
+              *state, current_player, cand_space_placed_this_turn,
+              absl::GetFlag(FLAGS_teacher_category_mask));
+          if (cat != dune_imperium::R755SearchCategory::kIneligible) {
+            double max_logit = -std::numeric_limits<double>::infinity();
+            for (Action a : legal_actions) {
+              if (static_cast<size_t>(a) < result.logits.size()) {
+                max_logit = std::max(max_logit, static_cast<double>(result.logits[a]));
+              }
+            }
+            double sum_exp = 0.0;
+            std::vector<double> exps(legal_actions.size(), 0.0);
+            for (size_t i = 0; i < legal_actions.size(); ++i) {
+              Action a = legal_actions[i];
+              if (static_cast<size_t>(a) < result.logits.size()) {
+                double e = std::exp(static_cast<double>(result.logits[a]) - max_logit);
+                exps[i] = e;
+                sum_exp += e;
+              }
+            }
+            open_spiel::ActionsAndProbs precomputed_prior;
+            precomputed_prior.reserve(legal_actions.size());
+            for (size_t i = 0; i < legal_actions.size(); ++i) {
+              double p = (sum_exp > 0.0) ? (exps[i] / sum_exp) : (1.0 / legal_actions.size());
+              precomputed_prior.push_back({legal_actions[i], p});
+            }
+
+            dune_imperium::CompoundSearchOptions opts;
+            opts.precomputed_raw_prior = &precomputed_prior;
+            opts.dedup_paired_worlds = true;
+            opts.stage1_rollouts = absl::GetFlag(FLAGS_teacher_stage1_rollouts);
+            opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_teacher_stage1_min_mean_diff);
+
+            uint64_t search_seed = dune_seed::DeriveSeed(
+                base_seed, domain, static_cast<uint64_t>(episode_id),
+                static_cast<uint64_t>(decision_index), 0x52373553ULL);
+
+            dune_imperium::TurnSearchTree local_tree;
+            auto sres = dune_imperium::CompoundRolloutSearchDecision(
+                *state, current_player, &local_tree, teacher_evals,
+                absl::GetFlag(FLAGS_teacher_top_k),
+                absl::GetFlag(FLAGS_teacher_rollouts),
+                absl::GetFlag(FLAGS_teacher_override_margin),
+                dune_imperium::TreeReuseMode::kTargetFill,
+                search_seed,
+                dune_imperium::SearchPairingMode::kPaired,
+                dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer,
+                teacher_crn_mode,
+                /*world_sampler=*/nullptr,
+                absl::GetFlag(FLAGS_teacher_min_t_stat),
+                opts);
+
+            ++g_teacher_searched_roots;
+            if (sres.overridden) {
+              ++g_teacher_overrides;
+              chosen_action = sres.chosen_action;
+            }
+          }
+        }
       } else {
         // Random opponent (no model loaded)
         std::uniform_int_distribution<size_t> dist(
@@ -1048,6 +1168,13 @@ void WorkerThread(
       for (int p = 0; p < kNumPlayers; ++p) {
         prev_vp[p] = dune_state ? dune_state->GetPlayerVp(p) : 0;
       }
+      if (current_player == model_player &&
+          chosen_action >= dune_imperium::kActionAgentSpaceConspire &&
+          chosen_action <= dune_imperium::kActionAgentSpaceSietchTabr) {
+        cand_space_placed_this_turn = true;
+      }
+      last_turn_player = current_player;
+      last_action = chosen_action;
       state->ApplyAction(chosen_action);
       if (trace_this) {
         std::cout << "[R" << (dune_state ? dune_state->GetCurrentRound() : -1)
@@ -1411,6 +1538,16 @@ void RunEvaluation() {
     eval_timeout_ms = 2;
   }
 
+  if (absl::GetFlag(FLAGS_candidate_eval_batch_size) > 0) {
+    eval_batch_size = absl::GetFlag(FLAGS_candidate_eval_batch_size);
+  } else if (absl::GetFlag(FLAGS_candidate_r758_teacher) && device.is_cuda()) {
+    eval_batch_size = 256;
+  }
+
+  if (absl::GetFlag(FLAGS_candidate_r758_teacher) && deterministic) {
+    SpielFatalError("--candidate_r758_teacher=true requires batched evaluation (--deterministic_eval=false)");
+  }
+
   std::string device_name = device.is_cuda() ? "CUDA (GPU)" : "CPU";
 
   // Synchronization primitives (only used for the active evaluator mode)
@@ -1480,9 +1617,12 @@ void RunEvaluation() {
     model_evaluator = std::make_shared<DeterministicEvaluator>(
         model, device, &eval_mutex, nullptr, nullptr, rollout_amp);
   } else {
+    const float cand_logit_cap_val = absl::GetFlag(FLAGS_candidate_r758_teacher)
+                                         ? static_cast<float>(candidate_logit_cap)
+                                         : 0.0f;
     model_evaluator = std::make_shared<BatchedEvaluator>(
         model, eval_batch_size, eval_timeout_ms, device,
-        &sync_mutex, 0.0f, /*device_synchronize=*/false, false, false,
+        &sync_mutex, cand_logit_cap_val, /*device_synchronize=*/false, false, false,
         rollout_amp, allow_tf32, /*critic_model=*/nullptr,
         /*clear_autocast_cache_per_batch=*/false);
   }
@@ -1874,6 +2014,17 @@ void RunEvaluation() {
     }
   }
 
+  if (absl::GetFlag(FLAGS_candidate_r758_teacher)) {
+    int64_t searched = g_teacher_searched_roots.load();
+    int64_t overrides = g_teacher_overrides.load();
+    double roots_per_game = total_games > 0 ? static_cast<double>(searched) / total_games : 0.0;
+    double overrides_per_game = total_games > 0 ? static_cast<double>(overrides) / total_games : 0.0;
+    double yield_pct = searched > 0 ? (100.0 * overrides / searched) : 0.0;
+    std::cout << absl::StrFormat(
+        "\nTeacher Search: %d roots (%.2f/game), %d overrides (%.2f/game, %.2f%% yield)\n",
+        searched, roots_per_game, overrides, overrides_per_game, yield_pct);
+  }
+
   // --- Write aggregate JSON with seat-wise and placement counts ---
   if (!output_dir.empty()) {
     std::string agg_path =
@@ -1967,9 +2118,27 @@ void RunEvaluation() {
               << "  \"seat_2_wins\": " << wins_by_seat[2] << ",\n"
               << "  \"seat_2_games\": " << games_by_seat[2] << ",\n"
               << "  \"seat_3_wins\": " << wins_by_seat[3] << ",\n"
-              << "  \"seat_3_games\": " << games_by_seat[3] << "\n"
-              << "}\n";
+              << "  \"seat_3_games\": " << games_by_seat[3];
+      if (absl::GetFlag(FLAGS_candidate_r758_teacher)) {
+        int64_t searched = g_teacher_searched_roots.load();
+        int64_t overrides = g_teacher_overrides.load();
+        double roots_per_game = total_games > 0 ? static_cast<double>(searched) / total_games : 0.0;
+        double overrides_per_game = total_games > 0 ? static_cast<double>(overrides) / total_games : 0.0;
+        double yield_pct = searched > 0 ? (100.0 * overrides / searched) : 0.0;
+        agg_out << ",\n"
+                << "  \"teacher_searched_roots\": " << searched << ",\n"
+                << "  \"teacher_overrides\": " << overrides << ",\n"
+                << "  \"teacher_roots_per_game\": " << absl::StrFormat("%.4f", roots_per_game) << ",\n"
+                << "  \"teacher_overrides_per_game\": " << absl::StrFormat("%.4f", overrides_per_game) << ",\n"
+                << "  \"teacher_override_yield_pct\": " << absl::StrFormat("%.2f", yield_pct);
+      }
+      agg_out << "\n}\n";
       agg_out.close();
+      if (absl::GetFlag(FLAGS_candidate_r758_teacher)) {
+        std::string sum_path = (std::filesystem::path(output_dir) / "summary.json").string();
+        std::error_code ec;
+        std::filesystem::copy_file(agg_path, sum_path, std::filesystem::copy_options::overwrite_existing, ec);
+      }
       std::cout << "\nAggregate results written to " << agg_path << "\n";
     }
   }

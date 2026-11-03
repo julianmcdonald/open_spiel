@@ -1188,6 +1188,10 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
     parameter.set_requires_grad(false);
   }
 
+  const bool use_cuda_amp = impl_->device.is_cuda();
+  if (use_cuda_amp) {
+    impl_->model->RefreshBf16InferenceCache();
+  }
   impl_->mutex = std::make_unique<std::shared_mutex>();
   impl_->coordinators.resize(num_evaluators_);
   impl_->evaluators.resize(num_evaluators_);
@@ -1195,7 +1199,7 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
     impl_->coordinators[e] = std::make_shared<BatchedEvaluator>(
         impl_->model, target_batch_size_, 1, impl_->device,
         impl_->mutex.get(), 10.0f, false, true, false,
-        /*rollout_amp=*/false, /*allow_tf32=*/false);
+        /*rollout_amp=*/use_cuda_amp, /*allow_tf32=*/use_cuda_amp);
     impl_->evaluators[e] = std::make_shared<BatchedNNEvaluator>(
         impl_->coordinators[e], 10.0f, detected_mode);
   }

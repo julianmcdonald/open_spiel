@@ -110,6 +110,11 @@ constexpr uint64_t kStreamFidelityLeafRollout      = 0x00A2;
 // rows), so a shared stream would couple head and distillation row choice.
 inline constexpr uint64_t kStreamAuxSampling = 0x00A3;
 inline constexpr uint64_t kStreamPurchaseExploration = 0x00B0;
+inline constexpr uint64_t kStreamUnfilteredKlDiag     = 0x00C0;
+inline constexpr uint64_t kStreamGate2NonOverrideDiag = 0x00C1;
+// Preserves the calibrated R7-58 auxiliary-example shuffle order (99993) while
+// preventing any future diagnostic sampler from colliding with it.
+inline constexpr uint64_t kStreamR758AuxShuffle       = 99993;
 
 // ===========================================================================
 // The reserved final-gate base-seed range

@@ -254,7 +254,19 @@ inline int RunClockedPairedRolloutStage(
 
   std::exception_ptr first_exception = nullptr;
   int launched_worlds = 0;
+  const int initial_burst_worlds = std::min(planned_worlds, W);
+  for (int w = 0; w < initial_burst_worlds; ++w) {
+    for (size_t slot = 0; slot < num_cands; ++slot) {
+      size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
+      auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+      if (active_evaluator) {
+        active_evaluator->AdjustActiveRollouts(1);
+      }
+    }
+  }
+
   for (int w = 0; w < planned_worlds; ++w) {
+    const bool in_initial_burst = (w < initial_burst_worlds);
     {
       std::unique_lock<std::mutex> lock(shared->cv_m);
       shared->cv.wait(lock, [&]() {
@@ -262,6 +274,17 @@ inline int RunClockedPairedRolloutStage(
       });
       if (shared->any_aborted.load(std::memory_order_relaxed) ||
           std::chrono::steady_clock::now() >= stage_deadline_tp) {
+        if (in_initial_burst) {
+          for (int rem_w = w; rem_w < initial_burst_worlds; ++rem_w) {
+            for (size_t slot = 0; slot < num_cands; ++slot) {
+              size_t eval_idx = (rem_w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
+              auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+              if (active_evaluator) {
+                active_evaluator->AdjustActiveRollouts(-1);
+              }
+            }
+          }
+        }
         break;
       }
       ++shared->active_worlds;
@@ -286,6 +309,12 @@ inline int RunClockedPairedRolloutStage(
 
     bool slot_launch_failed = false;
     for (size_t slot = 0; slot < num_cands; ++slot) {
+      BatchedNNEvaluator* adjusted_evaluator = nullptr;
+      size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
+      auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+      if (in_initial_burst) {
+        adjusted_evaluator = active_evaluator;
+      }
       try {
         const size_t c_idx = candidate_indices[slot];
         const Action cand_a = ordered_candidates[c_idx];
@@ -293,17 +322,15 @@ inline int RunClockedPairedRolloutStage(
             (slot + 1 == num_cands) ? std::move(base_world_state) : base_world_state->Clone();
         sim_state->ApplyAction(cand_a);
         auto* s_ptr = sim_state.get();
-        size_t eval_idx = (w * num_cands + slot) % (evaluators.empty() ? 1 : evaluators.size());
-        auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[eval_idx].get();
+        if (!in_initial_burst && active_evaluator) {
+          active_evaluator->AdjustActiveRollouts(1);
+          adjusted_evaluator = active_evaluator;
+        }
 
-        futures.push_back(std::async(
-            std::launch::async,
+        futures.push_back(SearchRolloutThreadPool::Instance().Submit(
             [shared, s_ptr, sim_state = std::move(sim_state), search_player, active_evaluator,
              s_seed, crn_mode, sample_opponent_leader_draft, stage_deadline_tp,
              w, slot]() mutable {
-              if (active_evaluator) {
-                active_evaluator->AdjustActiveRollouts(1);
-              }
               SlotReleaseGuard guard{shared, w, active_evaluator, false};
               shared->trajs[w][slot] = SimulateRolloutWithTurnTrajectory(
                   s_ptr, search_player, active_evaluator, s_seed,
@@ -315,6 +342,23 @@ inline int RunClockedPairedRolloutStage(
               guard.normal_finish = true;
             }));
       } catch (...) {
+        if (adjusted_evaluator) {
+          adjusted_evaluator->AdjustActiveRollouts(-1);
+        }
+        if (in_initial_burst) {
+          for (size_t rem_slot = slot + 1; rem_slot < num_cands; ++rem_slot) {
+            size_t r_idx = (w * num_cands + rem_slot) % (evaluators.empty() ? 1 : evaluators.size());
+            auto* r_eval = evaluators.empty() ? nullptr : evaluators[r_idx].get();
+            if (r_eval) r_eval->AdjustActiveRollouts(-1);
+          }
+          for (int rem_w = w + 1; rem_w < initial_burst_worlds; ++rem_w) {
+            for (size_t rem_slot = 0; rem_slot < num_cands; ++rem_slot) {
+              size_t r_idx = (rem_w * num_cands + rem_slot) % (evaluators.empty() ? 1 : evaluators.size());
+              auto* r_eval = evaluators.empty() ? nullptr : evaluators[r_idx].get();
+              if (r_eval) r_eval->AdjustActiveRollouts(-1);
+            }
+          }
+        }
         if (!first_exception) {
           first_exception = std::current_exception();
         }
@@ -462,12 +506,19 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
       futures.reserve(tasks.size());
 
       for (size_t i = 0; i < tasks.size(); ++i) {
+        auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
+        if (active_evaluator != nullptr) {
+          active_evaluator->AdjustActiveRollouts(1);
+        }
+      }
+
+      for (size_t i = 0; i < tasks.size(); ++i) {
         auto* s_ptr = tasks[i].sim_state.get();
         uint64_t s_seed = tasks[i].wseed;
         auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
-        futures.push_back(std::async(
-            std::launch::async,
+        futures.push_back(SearchRolloutThreadPool::Instance().Submit(
             [s_ptr, search_player, active_evaluator, s_seed, crn_mode, sample_opponent_leader_draft]() {
+              ActiveRolloutReleaseGuard guard{active_evaluator};
               return SimulateRolloutWithTurnTrajectory(
                   s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
                   crn_mode, sample_opponent_leader_draft);
@@ -841,30 +892,16 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     std::vector<RolloutTask> tasks_stage1;
     tasks_stage1.reserve(K * r_stage1);
 
-    std::vector<std::unique_ptr<State>> base_worlds(r_stage1);
-    for (int r = 0; r < r_stage1; ++r) {
-      uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r));
-      if (dune) {
-        std::mt19937 wrng(wseed);
-        auto rng_func = [&wrng]() {
-          return std::generate_canonical<double, 53>(wrng);
-        };
-        base_worlds[r] = dune->ResampleFromInfostate(search_player, rng_func);
-      }
-      if (!base_worlds[r]) {
-        base_worlds[r] = state.Clone();
-      }
-    }
-
     for (size_t c_idx = 0; c_idx < K; ++c_idx) {
       const Action cand_a = ordered_candidates[c_idx];
-      const bool is_last_cand = (c_idx + 1 == K);
       for (int r = 0; r < r_stage1; ++r) {
         uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r));
-        std::unique_ptr<State> sim_state =
-            is_last_cand ? std::move(base_worlds[r]) : base_worlds[r]->Clone();
-        sim_state->ApplyAction(cand_a);
-        tasks_stage1.push_back({c_idx, r, cand_a, std::move(sim_state), wseed + 999});
+        std::unique_ptr<State> prebuilt;
+        if (dune == nullptr) {
+          prebuilt = state.Clone();
+          prebuilt->ApplyAction(cand_a);
+        }
+        tasks_stage1.push_back({c_idx, r, cand_a, std::move(prebuilt), wseed});
       }
     }
 
@@ -875,15 +912,40 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       futures.reserve(tasks_stage1.size());
 
       for (size_t i = 0; i < tasks_stage1.size(); ++i) {
-        auto* s_ptr = tasks_stage1[i].sim_state.get();
-        uint64_t s_seed = tasks_stage1[i].wseed;
         auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
-        futures.push_back(std::async(
-            std::launch::async,
-            [s_ptr, search_player, active_evaluator, s_seed, crn_mode]() {
+        if (active_evaluator != nullptr) {
+          active_evaluator->AdjustActiveRollouts(1);
+        }
+      }
+
+      const State* root_state_ptr = &state;
+      for (size_t i = 0; i < tasks_stage1.size(); ++i) {
+        auto* prebuilt_ptr = tasks_stage1[i].sim_state.get();
+        uint64_t wseed = tasks_stage1[i].wseed;
+        Action cand_a = tasks_stage1[i].action;
+        auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
+        futures.push_back(SearchRolloutThreadPool::Instance().Submit(
+            [prebuilt_ptr, root_state_ptr, dune, cand_a, wseed, search_player, active_evaluator, crn_mode]() {
+              ActiveRolloutReleaseGuard guard{active_evaluator};
+              std::unique_ptr<State> sim_state;
+              State* s_ptr = prebuilt_ptr;
+              if (s_ptr == nullptr) {
+                if (dune != nullptr) {
+                  std::mt19937 wrng(wseed);
+                  auto rng_func = [&wrng]() {
+                    return std::generate_canonical<double, 53>(wrng);
+                  };
+                  sim_state = dune->ResampleFromInfostate(search_player, rng_func);
+                }
+                if (!sim_state) {
+                  sim_state = root_state_ptr->Clone();
+                }
+                sim_state->ApplyAction(cand_a);
+                s_ptr = sim_state.get();
+              }
               return SimulateRolloutWithTurnTrajectory(
-                  s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
-                  crn_mode);
+                  s_ptr, search_player, active_evaluator, wseed + 999,
+                  SearchTruncationMode::kTerminal, crn_mode);
             }));
       }
 
@@ -1041,31 +1103,17 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     std::vector<RolloutTask> tasks_stage2;
     tasks_stage2.reserve(2 * r_stage2);
 
-    std::vector<std::unique_ptr<State>> base_worlds(r_stage2);
-    for (int r = 0; r < r_stage2; ++r) {
-      uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r_stage1 + r));
-      if (dune) {
-        std::mt19937 wrng(wseed);
-        auto rng_func = [&wrng]() {
-          return std::generate_canonical<double, 53>(wrng);
-        };
-        base_worlds[r] = dune->ResampleFromInfostate(search_player, rng_func);
-      }
-      if (!base_worlds[r]) {
-        base_worlds[r] = state.Clone();
-      }
-    }
-
     for (size_t f_i = 0; f_i < finalists.size(); ++f_i) {
       size_t f_idx = finalists[f_i];
       const Action cand_a = ordered_candidates[f_idx];
-      const bool is_last_cand = (f_i + 1 == finalists.size());
       for (int r = 0; r < r_stage2; ++r) {
         uint64_t wseed = dune_seed::DeriveSeed(decision_seed, static_cast<uint64_t>(r_stage1 + r));
-        std::unique_ptr<State> sim_state =
-            is_last_cand ? std::move(base_worlds[r]) : base_worlds[r]->Clone();
-        sim_state->ApplyAction(cand_a);
-        tasks_stage2.push_back({f_idx, r_stage1 + r, cand_a, std::move(sim_state), wseed + 999});
+        std::unique_ptr<State> prebuilt;
+        if (dune == nullptr) {
+          prebuilt = state.Clone();
+          prebuilt->ApplyAction(cand_a);
+        }
+        tasks_stage2.push_back({f_idx, r_stage1 + r, cand_a, std::move(prebuilt), wseed});
       }
     }
 
@@ -1080,15 +1128,40 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
       futures.reserve(tasks_stage2.size());
 
       for (size_t i = 0; i < tasks_stage2.size(); ++i) {
-        auto* s_ptr = tasks_stage2[i].sim_state.get();
-        uint64_t s_seed = tasks_stage2[i].wseed;
         auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
-        futures.push_back(std::async(
-            std::launch::async,
-            [s_ptr, search_player, active_evaluator, s_seed, crn_mode]() {
+        if (active_evaluator != nullptr) {
+          active_evaluator->AdjustActiveRollouts(1);
+        }
+      }
+
+      const State* root_state_ptr = &state;
+      for (size_t i = 0; i < tasks_stage2.size(); ++i) {
+        auto* prebuilt_ptr = tasks_stage2[i].sim_state.get();
+        uint64_t wseed = tasks_stage2[i].wseed;
+        Action cand_a = tasks_stage2[i].action;
+        auto* active_evaluator = evaluators.empty() ? nullptr : evaluators[i % evaluators.size()].get();
+        futures.push_back(SearchRolloutThreadPool::Instance().Submit(
+            [prebuilt_ptr, root_state_ptr, dune, cand_a, wseed, search_player, active_evaluator, crn_mode]() {
+              ActiveRolloutReleaseGuard guard{active_evaluator};
+              std::unique_ptr<State> sim_state;
+              State* s_ptr = prebuilt_ptr;
+              if (s_ptr == nullptr) {
+                if (dune != nullptr) {
+                  std::mt19937 wrng(wseed);
+                  auto rng_func = [&wrng]() {
+                    return std::generate_canonical<double, 53>(wrng);
+                  };
+                  sim_state = dune->ResampleFromInfostate(search_player, rng_func);
+                }
+                if (!sim_state) {
+                  sim_state = root_state_ptr->Clone();
+                }
+                sim_state->ApplyAction(cand_a);
+                s_ptr = sim_state.get();
+              }
               return SimulateRolloutWithTurnTrajectory(
-                  s_ptr, search_player, active_evaluator, s_seed, SearchTruncationMode::kTerminal,
-                  crn_mode);
+                  s_ptr, search_player, active_evaluator, wseed + 999,
+                  SearchTruncationMode::kTerminal, crn_mode);
             }));
       }
 
@@ -1100,7 +1173,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     }
   } else {
     std::vector<size_t> stage2_cands = {0, best_c_idx};
-    const int s2_inflight = full_clock_stage2 ? std::max(max_inflight_worlds, 192) : max_inflight_worlds;
+    const int s2_inflight = full_clock_stage2 ? std::max(max_inflight_worlds, 256) : std::max(max_inflight_worlds, 194);
     if (!full_clock_stage2 || !has_deadline) {
       RunClockedPairedRolloutStage(
           state, dune, search_player, evaluators, ordered_candidates,
