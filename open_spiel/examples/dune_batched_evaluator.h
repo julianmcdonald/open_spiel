@@ -38,8 +38,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       if (dune_imperium::IsFullPublicInformationStateSize(obs_size_)) {
         if (!batched_eval_->HasSemanticScorer() ||
             (batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV3 &&
-             batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV4)) {
-          SpielFatalError("BatchedNNEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
+             batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV4 &&
+             batched_eval_->SemanticDescriptorSchema() != dune_semantic::kDescriptorSchemaVersionV5)) {
+          SpielFatalError("BatchedNNEvaluator: Full public information actor requires an active semantic scorer with schema v3, v4, or v5");
         }
       }
       if (market_mode_ == dune_imperium::MarketAppendixMode::kNone &&
@@ -47,7 +48,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
         market_mode_ = batched_eval_->MarketMode();
       }
       if (market_mode_ == dune_imperium::MarketAppendixMode::kNone) {
-        if (obs_size_ == dune_imperium::kFullPublicInformationV4StateSize) {
+        if (obs_size_ == dune_imperium::kFullPublicInformationV5StateSize) {
+          market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV5;
+        } else if (obs_size_ == dune_imperium::kFullPublicInformationV4StateSize) {
           market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV4;
         } else if (obs_size_ == dune_imperium::kFullPublicInformationStateSize) {
           market_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV3;
@@ -83,6 +86,9 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
       batched_eval_->AdjustActiveRollouts(delta);
     }
   }
+
+  void SetFastGreedyEnabled(bool enabled) { enable_fast_greedy_ = enabled; }
+  bool FastGreedyEnabled() const { return enable_fast_greedy_; }
 
   std::vector<double> Evaluate(const State& state) override {
     int num_players = state.NumPlayers();
@@ -138,6 +144,23 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   Action GreedyActionWithLegals(
       const State& state, const std::vector<Action>& legal_actions) {
     if (legal_actions.empty()) return kInvalidAction;
+    if (batched_eval_ != nullptr && enable_fast_greedy_) {
+      if (state.IsTerminal()) return legal_actions.front();
+      Player current_player = state.CurrentPlayer();
+      if (current_player < 0 || current_player >= state.NumPlayers()) return legal_actions.front();
+      thread_local std::vector<float> tls_obs;
+      FillModelObservation(state, current_player, &tls_obs);
+      thread_local dune_semantic::CandidateActionData tls_cand_data;
+      tls_cand_data.clear();
+      const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+      if (dune != nullptr) {
+        const std::string schema = batched_eval_->SemanticDescriptorSchema();
+        dune_semantic::ExtractCandidateDescriptors(*dune, legal_actions, &tls_cand_data, schema);
+      }
+      g_total_network_evaluations.fetch_add(1, std::memory_order_relaxed);
+      open_spiel::GreedyEvalResult res = batched_eval_->EvaluateGreedyAction(tls_obs, legal_actions, &tls_cand_data);
+      return (!res.ok || res.action == kInvalidAction) ? legal_actions.front() : res.action;
+    }
     if (!batched_eval_) {
       ActionsAndProbs prior = Prior(state);
       if (prior.empty()) return legal_actions.front();
@@ -291,6 +314,8 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
   int64_t obs_size_;
   dune_imperium::MarketAppendixMode market_mode_{dune_imperium::MarketAppendixMode::kNone};
   bool forward_active_rollouts_{true};
+  bool enable_fast_greedy_{std::getenv("DUNE_ENABLE_FAST_GREEDY") != nullptr &&
+                           std::getenv("DUNE_DISABLE_FAST_GREEDY") == nullptr};
 };
 
 } // namespace open_spiel

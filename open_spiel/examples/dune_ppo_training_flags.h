@@ -28,6 +28,10 @@ ABSL_DECLARE_FLAG(std::string, tf32_transition_source_fingerprint);
 ABSL_DECLARE_FLAG(bool, enable_semantic_scorer);
 ABSL_DECLARE_FLAG(bool, enable_zone_encoder);
 ABSL_DECLARE_FLAG(std::string, semantic_descriptor_schema);
+ABSL_DECLARE_FLAG(bool, allow_semantic_schema_transition);
+ABSL_DECLARE_FLAG(std::string, semantic_schema_transition_source_fingerprint);
+ABSL_DECLARE_FLAG(bool, allow_legacy_v3_on_v4_obs);
+ABSL_DECLARE_FLAG(bool, slot_indexed_out_layer_f);
 ABSL_DECLARE_FLAG(double, specimen_exchange_penalty);
 ABSL_DECLARE_FLAG(double, family_atomics_penalty);
 ABSL_DECLARE_FLAG(double, plot_intrigue_penalty);
@@ -59,6 +63,7 @@ ABSL_DECLARE_FLAG(bool, advantage_filtering);
 ABSL_DECLARE_FLAG(double, advantage_filtering_quantile);
 ABSL_DECLARE_FLAG(bool, enable_study_readouts);
 ABSL_DECLARE_FLAG(double, v4_appendix_lr_mult);
+ABSL_DECLARE_FLAG(int, v5_anneal_legacy_slot_residual_updates);
 ABSL_DECLARE_FLAG(bool, actor_only_advantage_filtering);
 ABSL_DECLARE_FLAG(double, acpo_surrogate_clip);
 ABSL_DECLARE_FLAG(double, acpo_surrogate_clip_neg);
@@ -93,6 +98,23 @@ ABSL_DECLARE_FLAG(double, r755_max_raw_prior);
 ABSL_DECLARE_FLAG(int, r755_stage1_rollouts);
 ABSL_DECLARE_FLAG(double, r755_stage1_min_mean_diff);
 ABSL_DECLARE_FLAG(std::string, r755_root_dump_jsonl);
+
+// R7-55 Phase 3 / Cat 3 & Stage 1 rollout flags.
+ABSL_DECLARE_FLAG(bool, r755_cat3_strict_card_tech_only);
+ABSL_DECLARE_FLAG(double, r755_cat3_search_prob);
+ABSL_DECLARE_FLAG(double, r755_cat3_low_prior_boost_prob);
+ABSL_DECLARE_FLAG(double, r755_cat3_low_prior_threshold);
+ABSL_DECLARE_FLAG(std::string, r755_cat3_truncation_mode);
+ABSL_DECLARE_FLAG(int, r755_cat3_stage1_rollouts);
+ABSL_DECLARE_FLAG(int, r755_cat3_stage2_indep_rollouts);
+ABSL_DECLARE_FLAG(double, r755_cat3_mpo_temperature);
+ABSL_DECLARE_FLAG(double, r755_cat3_mpo_max_kl);
+ABSL_DECLARE_FLAG(std::string, r755_cat3_crn_mode);
+ABSL_DECLARE_FLAG(bool, r755_cat3_symmetric_confirmation);
+ABSL_DECLARE_FLAG(int, r755_stage1_subwave_rollouts);
+ABSL_DECLARE_FLAG(double, r755_stage1_subwave_min_diff);
+ABSL_DECLARE_FLAG(bool, r755_leaf_value_centering);
+ABSL_DECLARE_FLAG(bool, r755_finish_unvisited_aux_on_kl_stop);
 
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

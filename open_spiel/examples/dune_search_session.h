@@ -212,6 +212,21 @@ std::shared_ptr<algorithms::Evaluator> MakeDuneNNEvaluator(
 
 void LoadCalibratedParameters(DuneSearchConfig& config);
 
+struct PolicyPriorDetails {
+  bool ok = false;
+  std::vector<Action> actions;
+  std::vector<float> probabilities;
+  float value = 0.0f;
+};
+
+struct PairedActionEvaluationResult {
+  double u_first = 0.0;
+  double u_second = 0.0;
+  double diff_mean = 0.0;
+  double diff_se = 0.0;
+  int num_worlds = 0;
+};
+
 class DuneAdaptiveRolloutSession {
  public:
   DuneAdaptiveRolloutSession(
@@ -228,10 +243,16 @@ class DuneAdaptiveRolloutSession {
       int max_inflight_worlds = 96,
       int num_evaluators = 1,
       int top5_min_budget = 576,
-      bool all_buy_candidates = true);
+      bool all_buy_candidates = true,
+      bool enable_fp8_trunk = false,
+      bool search_v2 = false);
   ~DuneAdaptiveRolloutSession();
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
+  PairedActionEvaluationResult EvaluateActionPairTerminal(
+      const State& state, Action a_first, Action a_second,
+      int num_worlds = 64, uint64_t seed = 20261104ULL);
+  PolicyPriorDetails PriorWithDetails(const State& state) const;
   void DiscardPendingAction();
   void ResetSession(const std::string& reason);
   bool HasActiveSession() const { return has_active_session_; }
@@ -259,6 +280,10 @@ class DuneAdaptiveRolloutSession {
   void set_stage1_high_conf_prior_skip(double val) { stage1_high_conf_prior_skip_ = std::max(0.0, val); }
   bool use_event_keyed_crn() const { return use_event_keyed_crn_; }
   void set_use_event_keyed_crn(bool val) { use_event_keyed_crn_ = val; }
+  bool enable_fp8_trunk() const { return enable_fp8_trunk_; }
+  void set_enable_fp8_trunk(bool val);
+  bool search_v2() const { return search_v2_; }
+  void set_search_v2(bool val) { search_v2_ = val; }
 
  private:
   std::string checkpoint_path_;
@@ -280,7 +305,19 @@ class DuneAdaptiveRolloutSession {
   double prior_log_ratio_weight_ = 0.02;
   double stage1_high_conf_prior_skip_ = 0.95;
   bool use_event_keyed_crn_ = true;
+  bool enable_fp8_trunk_ = false;
+  bool search_v2_ = false;
   uint64_t search_seed_counter_ = 0;
+
+  struct CachedJointFollowupStep {
+    std::vector<Action> expected_history;
+    Action action = kInvalidAction;
+    double q = 0.0;
+    int visits = 0;
+  };
+  int cached_joint_followup_round_ = -1;
+  Player cached_joint_followup_player_ = kInvalidPlayer;
+  std::vector<CachedJointFollowupStep> cached_joint_followups_;
 
   bool has_active_session_ = false;
   bool has_pending_commit_ = false;

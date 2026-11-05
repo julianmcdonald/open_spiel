@@ -24,7 +24,7 @@ ABSL_FLAG(bool, nonlinear_value_head, false, "Use a nonlinear value head.");
 ABSL_FLAG(std::string, market_appendix_mode, "none",
           "Card-slot input mode: 'none' (5580), 'zeros' or 'ordered_market' (6215), "
           "'ordered_card_slots_v2' (6255), 'full_public_information_v3' (9182), "
-          "or 'full_public_information_v4' (9941).");
+          "'full_public_information_v4' (9941), or 'full_public_information_v5' (10445).");
 ABSL_FLAG(std::string, deck_pool_semantics, "fixed",
           "Observation semantics for deck pool features: 'fixed' (default) or 'legacy'.");
 ABSL_FLAG(bool, allow_deck_pool_semantics_transition, false,
@@ -51,8 +51,16 @@ ABSL_FLAG(std::string, tf32_transition_source_fingerprint, "",
           "Expected source config fingerprint for allow_tf32 transition validation.");
 ABSL_FLAG(bool, enable_semantic_scorer, false, "Enable the neural Semantic Action Scorer on legal candidate actions.");
 ABSL_FLAG(bool, enable_zone_encoder, false, "Enable the zone encoder adapter feeding trunk.");
-ABSL_FLAG(std::string, semantic_descriptor_schema, "semantic_action_v3",
+ABSL_FLAG(std::string, semantic_descriptor_schema, "semantic_action_v4",
           "Semantic descriptor schema version (e.g. semantic_action_v3, semantic_action_v4).");
+ABSL_FLAG(bool, allow_semantic_schema_transition, false,
+          "Allow intentional transition of semantic_descriptor_schema on resume.");
+ABSL_FLAG(std::string, semantic_schema_transition_source_fingerprint, "",
+          "Expected source config fingerprint for semantic schema transition validation.");
+ABSL_FLAG(bool, allow_legacy_v3_on_v4_obs, false,
+          "Allow legacy semantic_action_v3 schema on full_public_information_v4 observation.");
+ABSL_FLAG(bool, slot_indexed_out_layer_f, false,
+          "Enable slot-indexed out_layer_f (2 output units for Tleilaxu slots 0/1) for semantic action scorer.");
 
 // Training-only reward shaping.
 // Sign convention: the value is SUBTRACTED from reward — pass a POSITIVE value to penalize. (The phase-18 pilots passed -0.02, which was a +0.02 bonus.)
@@ -123,7 +131,9 @@ ABSL_FLAG(double, ema_decay, 0.0,
 ABSL_FLAG(std::string, ema_model_checkpoint, "",
           "Optional path to existing EMA model checkpoint to resume.");
 ABSL_FLAG(double, v4_appendix_lr_mult, 1.0,
-          "Multiplier applied to the Adam parameter update on the 759 full_public_information_v4 input columns (9182..9940). Set to 10.0 to match new_block_lr=5e-5 when base_lr=5e-6.");
+          "Multiplier applied to the Adam parameter update on the appendix input columns (>= 9182). Set to 10.0 to match new_block_lr=5e-5 when base_lr=5e-6.");
+ABSL_FLAG(int, v5_anneal_legacy_slot_residual_updates, 0,
+          "When > 0 on semantic_action_v5, linearly anneals within-family asymmetric residuals (w_s - bar_w_F, b_s - bar_b_F) on dynamic purchase/choice slot families in policy_head to zero over the first N updates of the run (preserving Step-0 parity at start and exact zero slot bias after N updates).");
 ABSL_FLAG(bool, actor_only_advantage_filtering, false,
           "EasyPPO (arXiv:2609.36802v1): when true with --advantage_filtering, keep 100% of transitions for critic value_loss regression and apply the top-quantile |A| filter strictly to the actor policy loss.");
 ABSL_FLAG(double, acpo_surrogate_clip, 0.0,
@@ -187,5 +197,39 @@ ABSL_FLAG(double, r755_stage1_min_mean_diff, -1e9,
           "In 2-stage paired search, stop after Stage 1 (keep raw_action) if the best challenger's Stage-1 mean paired utility diff (u_cand - u_raw) < this threshold.");
 ABSL_FLAG(std::string, r755_root_dump_jsonl, "",
           "If non-empty, append one JSON line per searched r755 root with category, priors, per-world candidate utilities, nn_evals, and override status.");
+
+// R7-55 Phase 3 / Cat 3 & Stage 1 rollout flags.
+ABSL_FLAG(bool, r755_cat3_strict_card_tech_only, true,
+          "Strictly restrict Cat 3 (kRevealPurchase) candidate enumeration to card and tech acquisition actions.");
+ABSL_FLAG(double, r755_cat3_search_prob, -1.0,
+          "Per-turn search probability for Cat 3 (if < 0, falls back to r755_search_prob).");
+ABSL_FLAG(double, r755_cat3_low_prior_boost_prob, -1.0,
+          "If >= 0, boost Cat 3 search probability when any legal purchase has prior < r755_cat3_low_prior_threshold.");
+ABSL_FLAG(double, r755_cat3_low_prior_threshold, 0.02,
+          "Prior threshold below which Cat 3 search probability is boosted.");
+ABSL_FLAG(std::string, r755_cat3_truncation_mode, "next_round",
+          "Truncation mode for Cat 3 rollouts (e.g. 'next_round', 'none').");
+ABSL_FLAG(int, r755_cat3_stage1_rollouts, 8,
+          "Stage 1 rollout count for Cat 3 2-stage search.");
+ABSL_FLAG(int, r755_cat3_stage2_indep_rollouts, 24,
+          "Stage 2 independent rollout count for Cat 3 confirmed candidates.");
+ABSL_FLAG(double, r755_cat3_mpo_temperature, 0.02,
+          "Base temperature tau for Cat 3 MPO relative target computation.");
+ABSL_FLAG(double, r755_cat3_mpo_max_kl, 0.05,
+          "Max KL epsilon for Cat 3 MPO relative target computation.");
+ABSL_FLAG(std::string, r755_cat3_crn_mode, "",
+          "CRN mode override for Cat 3 rollouts (if non-empty, overrides r755_crn_mode).");
+ABSL_FLAG(bool, r755_cat3_symmetric_confirmation, false,
+          "Require symmetric confirmation across candidates in Cat 3 Stage 2.");
+ABSL_FLAG(int, r755_stage1_subwave_rollouts, 0,
+          "Number of rollouts in Stage 1 subwave before early exit check.");
+ABSL_FLAG(double, r755_stage1_subwave_min_diff, -0.05,
+          "Minimum difference for Stage 1 subwave early exit.");
+ABSL_FLAG(bool, r755_leaf_value_centering, false,
+          "Center 4-seat leaf values across players in rollout search.");
+ABSL_FLAG(bool, r755_finish_unvisited_aux_on_kl_stop, false,
+          "When true, if PPO KL early stop triggers before all auxiliary search "
+          "examples are visited, run a finish pass over unvisited auxiliary "
+          "examples paired with EMA magnet anchor transitions.");
 
 

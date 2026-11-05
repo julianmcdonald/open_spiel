@@ -39,6 +39,7 @@
 namespace open_spiel {
 
 using dune_semantic::Bf16LinearCache;
+using dune_semantic::Fp8LinearCache;
 
 // 1. Residual Block Definition
 struct ResBlockImpl : torch::nn::Module {
@@ -49,6 +50,9 @@ struct ResBlockImpl : torch::nn::Module {
 
   Bf16LinearCache fc1_bf16_;
   Bf16LinearCache fc2_bf16_;
+  Fp8LinearCache fc1_fp8_;
+  Fp8LinearCache fc2_fp8_;
+  bool use_fp8_ = false;
 
   ResBlockImpl(int64_t dim) {
     fc1 = register_module("fc1", torch::nn::Linear(dim, dim));
@@ -60,16 +64,39 @@ struct ResBlockImpl : torch::nn::Module {
   void RefreshBf16Cache() {
     fc1_bf16_.Refresh(fc1);
     fc2_bf16_.Refresh(fc2);
+    if (use_fp8_) {
+      fc1_fp8_.Refresh(fc1);
+      fc2_fp8_.Refresh(fc2);
+    }
   }
 
-  torch::Tensor forward(torch::Tensor x, bool use_bf16_cache = false) {
+  void PrepareFp8Cache() {
+    fc1_bf16_.Refresh(fc1);
+    fc2_bf16_.Refresh(fc2);
+    fc1_fp8_.Refresh(fc1);
+    fc2_fp8_.Refresh(fc2);
+    use_fp8_ = true;
+  }
+
+  void DisableFp8Cache() {
+    use_fp8_ = false;
+  }
+
+  torch::Tensor forward(torch::Tensor x, bool use_bf16_cache = false, bool use_fp8 = false, bool input_non_negative = false) {
     torch::Tensor residual = x;
-    x = torch::relu(ln1->forward(fc1_bf16_.Forward(fc1, x, use_bf16_cache)));
-    x = ln2->forward(fc2_bf16_.Forward(fc2, x, use_bf16_cache));
+    const bool opt_fp8 = use_fp8 || use_fp8_;
+    if (opt_fp8) {
+      x = torch::relu(ln1->forward(fc1_fp8_.Forward(fc1, x, use_bf16_cache, /*use_fp8=*/true, input_non_negative)));
+      x = ln2->forward(fc2_fp8_.Forward(fc2, x, use_bf16_cache, /*use_fp8=*/true, /*known_non_negative=*/true));
+    } else {
+      x = torch::relu(ln1->forward(fc1_bf16_.Forward(fc1, x, use_bf16_cache)));
+      x = ln2->forward(fc2_bf16_.Forward(fc2, x, use_bf16_cache));
+    }
     return torch::relu(x + residual);
   }
 };
 TORCH_MODULE(ResBlock);
+using ResidualBlockImpl = ResBlockImpl;
 
 // Multiplier applied to the value head's scalar output layer at construction.
 // See the rationale block in the constructor below.
@@ -227,6 +254,14 @@ struct ZoneEncoderImpl : torch::nn::Module {
 };
 TORCH_MODULE(ZoneEncoder);
 
+inline int SemanticSchemaRank(const std::string& schema) {
+  if (schema == dune_semantic::kDescriptorSchemaVersionV5) return 5;
+  if (schema == dune_semantic::kDescriptorSchemaVersionV4) return 4;
+  if (schema == dune_semantic::kDescriptorSchemaVersionV3) return 3;
+  if (schema == dune_semantic::kDescriptorSchemaVersionV2) return 2;
+  return 0;
+}
+
 // 2. Main Dual-Headed Policy-Value Network Definition
 struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   torch::nn::Linear input_layer{nullptr};
@@ -241,6 +276,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   Bf16LinearCache value_head_bf16_;
   Bf16LinearCache value_head2_bf16_;
   bool use_bf16_inference_cache_ = false;
+  bool use_fp8_trunk_ = false;
 
   // --- PWO-5 section 7.2: the three auxiliary heads. -----------------------
   //
@@ -274,6 +310,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   dune_imperium::MarketAppendixMode market_appendix_mode_ = dune_imperium::MarketAppendixMode::kNone;
   dune_imperium::DeckPoolSemantics deck_pool_semantics_ = dune_imperium::DeckPoolSemantics::kLegacy;
   std::string semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
+  torch::Tensor v5_dynamic_slot_mask_;
 
   SharedDunePolicyValueNetImpl(int64_t input_dim, int64_t hidden_dim = 2048, int64_t action_dim = 2391, int num_blocks = 8, bool use_nonlinear = false, bool with_aux_heads = false, uint64_t head_init_seed = 0, bool with_semantic_scorer = false, bool enable_zone_encoder = false, std::string semantic_descriptor_schema = "") {
     use_nonlinear_value_head_ = use_nonlinear;
@@ -281,7 +318,12 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     if (!semantic_descriptor_schema.empty()) {
       semantic_descriptor_schema_ = semantic_descriptor_schema;
     }
-    if (input_dim == dune_imperium::kFullPublicInformationV4StateSize) {
+    if (input_dim == dune_imperium::kFullPublicInformationV5StateSize) {
+      market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV5;
+      if (with_semantic_scorer_ && semantic_descriptor_schema.empty()) {
+        semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV5;
+      }
+    } else if (input_dim == dune_imperium::kFullPublicInformationV4StateSize) {
       market_appendix_mode_ = dune_imperium::MarketAppendixMode::kFullPublicInformationV4;
       if (with_semantic_scorer_ && semantic_descriptor_schema.empty()) {
         semantic_descriptor_schema_ = dune_semantic::kDescriptorSchemaVersionV3;
@@ -402,7 +444,8 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
 
     if (with_semantic_scorer_) {
       bool enable_f = (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4);
-      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f);
+      bool enable_v5 = (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5);
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f, false, enable_v5);
       register_module("semantic_scorer", semantic_scorer_);
     }
     if (enable_zone_encoder) {
@@ -412,17 +455,21 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
 
   void SetSemanticDescriptorSchema(const std::string& schema) {
     semantic_descriptor_schema_ = schema;
-    if (with_semantic_scorer_ && semantic_scorer_ &&
-        schema == dune_semantic::kDescriptorSchemaVersionV4) {
-      semantic_scorer_->EnableF();
+    if (with_semantic_scorer_ && semantic_scorer_) {
+      if (schema == dune_semantic::kDescriptorSchemaVersionV4) {
+        semantic_scorer_->EnableF();
+      } else if (schema == dune_semantic::kDescriptorSchemaVersionV5) {
+        semantic_scorer_->EnableV5();
+      }
     }
   }
 
-  void EnableSemanticScorer(bool enable_f = false) {
+  void EnableSemanticScorer(bool enable_f = false, bool enable_v5 = false) {
     if (!with_semantic_scorer_) {
       with_semantic_scorer_ = true;
       enable_f = enable_f || (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4);
-      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f);
+      enable_v5 = enable_v5 || (semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5);
+      semantic_scorer_ = std::make_shared<dune_semantic::SemanticActionScorerImpl>(enable_f, false, enable_v5);
       register_module("semantic_scorer", semantic_scorer_);
     }
   }
@@ -459,6 +506,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
   }
 
   void DisableBf16InferenceCache() {
+    DisableFp8Cache();
     use_bf16_inference_cache_ = false;
     if (with_semantic_scorer_ && semantic_scorer_) {
       semantic_scorer_->DisableBf16Cache();
@@ -467,6 +515,41 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
 
   bool bf16_inference_cache_ready() const {
     return use_bf16_inference_cache_;
+  }
+
+  void PrepareFp8Cache() {
+    RefreshBf16InferenceCache();
+    for (auto& block : res_blocks) {
+      if (block) {
+        block->PrepareFp8Cache();
+      }
+    }
+    use_fp8_trunk_ = true;
+  }
+
+  void DisableFp8Cache() {
+    use_fp8_trunk_ = false;
+    for (auto& block : res_blocks) {
+      if (block) {
+        block->DisableFp8Cache();
+      }
+    }
+  }
+
+  bool fp8_cache_ready() const {
+    return use_fp8_trunk_;
+  }
+
+  void set_use_fp8_trunk(bool val) {
+    if (val) {
+      PrepareFp8Cache();
+    } else {
+      DisableFp8Cache();
+    }
+  }
+
+  bool use_fp8_trunk() const {
+    return use_fp8_trunk_;
   }
 
   struct ModelOutputs {
@@ -491,7 +574,7 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     }
     x = torch::relu(trunk_in);
     for (auto& block : res_blocks) {
-      x = block->forward(x, use_bf16_inference_cache_);
+      x = block->forward(x, use_bf16_inference_cache_, use_fp8_trunk_, /*input_non_negative=*/true);
     }
     return x;
   }
@@ -500,6 +583,21 @@ struct SharedDunePolicyValueNetImpl : torch::nn::Module {
     x = Trunk(x);
 
     torch::Tensor logits = policy_head_bf16_.Forward(policy_head, x, use_bf16_inference_cache_);
+    if (torch::GradMode::is_enabled() &&
+        semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5 &&
+        logits.size(-1) == 2391) {
+      if (!v5_dynamic_slot_mask_.defined() || v5_dynamic_slot_mask_.device() != logits.device()) {
+        static const std::vector<int64_t> kDynamicSlots = {
+            10, 11, 12, 13, 14, 70, 71, 72, 91, 92, 538, 539, 540, 541, 542,
+            546, 547, 548, 549, 550, 554, 555, 556, 572, 770, 771, 772};
+        auto mask = torch::zeros({1, 2391}, torch::TensorOptions().dtype(torch::kBool).device(logits.device()));
+        for (int64_t a : kDynamicSlots) {
+          mask[0][a] = true;
+        }
+        v5_dynamic_slot_mask_ = mask;
+      }
+      logits = torch::where(v5_dynamic_slot_mask_, logits.detach(), logits);
+    }
     torch::Tensor values;
     if (use_nonlinear_value_head_) {
       auto h = torch::relu(value_head_bf16_.Forward(value_head, x, use_bf16_inference_cache_));
@@ -566,7 +664,9 @@ inline void CopyModelWeights(std::shared_ptr<SharedDunePolicyValueNetImpl> sourc
   target->deck_pool_semantics_ = source->deck_pool_semantics_;
   target->semantic_descriptor_schema_ = source->semantic_descriptor_schema_;
   target->enable_zone_encoder_ = source->enable_zone_encoder_;
-  if (target->bf16_inference_cache_ready() || source->bf16_inference_cache_ready()) {
+  if (target->use_fp8_trunk() || source->use_fp8_trunk()) {
+    target->PrepareFp8Cache();
+  } else if (target->bf16_inference_cache_ready() || source->bf16_inference_cache_ready()) {
     target->RefreshBf16InferenceCache();
   }
   if (!target->parameters().empty() && target->parameters().front().is_cuda()) {
@@ -619,6 +719,26 @@ inline void CopyInputToFullPublicInformationV4(
   SPIEL_CHECK_EQ(target.size(0), source.size(0));
   SPIEL_CHECK_EQ(target.size(1),
                  dune_imperium::kFullPublicInformationV4StateSize);
+  SPIEL_CHECK_EQ(source.size(1), schema.size);
+  const int64_t copied_columns =
+      source_mode == dune_imperium::MarketAppendixMode::kZeros
+          ? dune_imperium::kLegacyInformationStateSize
+          : schema.size;
+  torch::NoGradGuard no_grad;
+  target.zero_();
+  target.slice(1, 0, copied_columns)
+      .copy_(source.slice(1, 0, copied_columns));
+}
+
+inline void CopyInputToFullPublicInformationV5(
+    torch::Tensor target, const torch::Tensor& source,
+    dune_imperium::MarketAppendixMode source_mode) {
+  const auto schema = dune_imperium::GetInformationStateSchema(source_mode);
+  SPIEL_CHECK_EQ(target.dim(), 2);
+  SPIEL_CHECK_EQ(source.dim(), 2);
+  SPIEL_CHECK_EQ(target.size(0), source.size(0));
+  SPIEL_CHECK_EQ(target.size(1),
+                 dune_imperium::kFullPublicInformationV5StateSize);
   SPIEL_CHECK_EQ(source.size(1), schema.size);
   const int64_t copied_columns =
       source_mode == dune_imperium::MarketAppendixMode::kZeros
@@ -774,13 +894,15 @@ inline void LoadModelCheckpointRobust(
     sds_found = it_sds->second.GetString();
     if (sds_found != dune_semantic::kDescriptorSchemaVersionV2 &&
         sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
-        sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
+        sds_found != dune_semantic::kDescriptorSchemaVersionV4 &&
+        sds_found != dune_semantic::kDescriptorSchemaVersionV5) {
       SpielFatalError("LoadModelCheckpointRobust: Checkpoint " + path +
                       " has invalid semantic_descriptor_schema ('" + sds_found + "')");
     }
-    if (sds_found == dune_semantic::kDescriptorSchemaVersionV4 ||
-        model->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4) {
+    if (SemanticSchemaRank(sds_found) >= SemanticSchemaRank(model->semantic_descriptor_schema_)) {
       model->SetSemanticDescriptorSchema(sds_found);
+    } else {
+      model->SetSemanticDescriptorSchema(model->semantic_descriptor_schema_);
     }
   }
 
@@ -907,13 +1029,18 @@ inline void LoadModelCheckpointRobust(
       if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV4) {
         SpielFatalError("LoadModelCheckpointRobust: 9941 checkpoint requires market_appendix_mode='full_public_information_v4': " + path);
       }
+    } else if (expected_input_dim == dune_imperium::kFullPublicInformationV5StateSize) {
+      if (mode_found != dune_imperium::MarketAppendixMode::kFullPublicInformationV5) {
+        SpielFatalError("LoadModelCheckpointRobust: 10445 checkpoint requires market_appendix_mode='full_public_information_v5': " + path);
+      }
     }
     if (!checkpoint_has_scorer) {
       SpielFatalError("LoadModelCheckpointRobust: Full public information checkpoint requires trained semantic scorer: " + path);
     }
     if (sds_found != dune_semantic::kDescriptorSchemaVersionV3 &&
-        sds_found != dune_semantic::kDescriptorSchemaVersionV4) {
-      SpielFatalError("LoadModelCheckpointRobust: Full public information checkpoint requires semantic_descriptor_schema='semantic_action_v3' or 'semantic_action_v4': " + path);
+        sds_found != dune_semantic::kDescriptorSchemaVersionV4 &&
+        sds_found != dune_semantic::kDescriptorSchemaVersionV5) {
+      SpielFatalError("LoadModelCheckpointRobust: Full public information checkpoint requires semantic_descriptor_schema='semantic_action_v3', 'semantic_action_v4', or 'semantic_action_v5': " + path);
     }
     if (!model->with_semantic_scorer_ || !model->semantic_scorer_) {
       SpielFatalError("LoadModelCheckpointRobust: Full public information model requires with_semantic_scorer=true: " + path);
@@ -922,6 +1049,8 @@ inline void LoadModelCheckpointRobust(
 
   if (model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV4) {
     model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV4);
+  } else if (model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5) {
+    model->SetSemanticDescriptorSchema(dune_semantic::kDescriptorSchemaVersionV5);
   }
 
   if (model->with_semantic_scorer_ && model->semantic_scorer_) {
@@ -1009,6 +1138,28 @@ inline std::unique_ptr<torch::optim::AdamW> MakeDuneOptimizer(
   if (model->semantic_scorer_ && model->semantic_scorer_->out_layer_f) {
     for (auto& p : model->semantic_scorer_->out_layer_f->parameters()) {
       f_params_set.push_back(p);
+    }
+  }
+  if (model->semantic_scorer_ && model->semantic_scorer_->enable_v5_) {
+    if (model->semantic_scorer_->v5_item_emb) {
+      for (auto& p : model->semantic_scorer_->v5_item_emb->parameters()) {
+        f_params_set.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_card_adapter) {
+      for (auto& p : model->semantic_scorer_->v5_card_adapter->parameters()) {
+        f_params_set.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_ctx_proj) {
+      for (auto& p : model->semantic_scorer_->v5_ctx_proj->parameters()) {
+        f_params_set.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_query_proj) {
+      for (auto& p : model->semantic_scorer_->v5_query_proj->parameters()) {
+        f_params_set.push_back(p);
+      }
     }
   }
   if (model->enable_zone_encoder_ && model->zone_encoder_) {
@@ -1161,7 +1312,8 @@ inline bool LoadOptimizerCheckpointMigrating(
           int64_t cols = exp_avg.size(1);
           if ((cols == 5580 || cols == 6215 || cols == 6255 ||
                cols == dune_imperium::kFullPublicInformationStateSize ||
-               cols == dune_imperium::kFullPublicInformationV4StateSize) &&
+               cols == dune_imperium::kFullPublicInformationV4StateSize ||
+               cols == dune_imperium::kFullPublicInformationV5StateSize) &&
               exp_avg.size(0) == hidden_dim) {
             ckpt_input_dim = cols;
             break;
@@ -1297,15 +1449,19 @@ inline bool LoadOptimizerCheckpointMigrating(
   const bool use_nonlinear = model->use_nonlinear_value_head_;
   int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
 
-  // Explicit U31400 3-group layout migration:
-  // Source layout has 3 groups: Group 0 = policy (2), Group 1 = torso (86), Group 2 = res9..res12 (32).
-  // Target model is 12 blocks with F parameters appended to Group 2.
+  // Explicit 3-group layout migration for v3 -> v4 (or U31400 style):
+  // Source layout has 3 groups: Group 0 = policy (2), Group 1 = torso (86), Group 2 = res9..res<N> (8 * (dst_num_blocks - 8)).
+  // Target model has F parameters appended to Group 2 (e.g. 12-block: 32 -> 34, moved = 120; 16-block: 64 -> 66, moved = 152).
+  const size_t expected_g2_src = (dst_num_blocks > 8) ? static_cast<size_t>(8 * (dst_num_blocks - 8)) : 0;
   const bool is_u31400_layout = (ckpt_num_groups == 3 && group_param_counts.size() == 3 &&
                                  group_param_counts[0] == 2 && group_param_counts[1] == 86 &&
-                                 group_param_counts[2] == 32 && dst_num_blocks == 12 &&
-                                 model->semantic_scorer_ && model->semantic_scorer_->out_layer_f);
+                                 dst_num_blocks > 8 && group_param_counts[2] == expected_g2_src &&
+                                 model->semantic_scorer_ &&
+                                 (model->semantic_scorer_->out_layer_f || model->semantic_scorer_->enable_v5_));
   if (is_u31400_layout) {
-    std::cout << "[MIGRATION] Detected 12-block 3-group source layout (U31400 style: 2, 86, 32 params). Building matching 3-group source optimizer.\n";
+    const int expected_moved = 2 + 86 + 8 * (dst_num_blocks - 8);
+    std::cout << "[MIGRATION] Detected " << dst_num_blocks << "-block 3-group source layout (2, 86, "
+              << expected_g2_src << " params). Building matching 3-group source optimizer.\n";
     std::vector<torch::Tensor> src_g0;
     src_g0.push_back(torch::zeros_like(model->policy_head->weight, device));
     if (model->policy_head->bias.defined()) {
@@ -1348,8 +1504,8 @@ inline bool LoadOptimizerCheckpointMigrating(
     }
 
     std::vector<torch::Tensor> src_g2;
-    // res9..res12 (32)
-    for (int b = 8; b < 12; ++b) {
+    // res9..res<dst_num_blocks> (8 * (dst_num_blocks - 8))
+    for (int b = 8; b < dst_num_blocks; ++b) {
       for (auto& p : model->res_blocks[b]->parameters()) {
         src_g2.push_back(torch::zeros_like(p, device));
       }
@@ -1364,9 +1520,9 @@ inline bool LoadOptimizerCheckpointMigrating(
     try {
       torch::load(src_optimizer, path, device);
     } catch (const c10::Error& e) {
-      std::cerr << "[MIGRATION ERROR] U31400 source optimizer torch::load failed: " << e.msg() << std::endl;
+      std::cerr << "[MIGRATION ERROR] Source optimizer torch::load failed: " << e.msg() << std::endl;
       if (requires_width_or_block_migration) {
-        SpielFatalError(absl::StrCat("LoadOptimizerCheckpointMigrating: U31400 source optimizer torch::load failed: ", e.msg()));
+        SpielFatalError(absl::StrCat("LoadOptimizerCheckpointMigrating: source optimizer torch::load failed: ", e.msg()));
       }
       return false;
     }
@@ -1390,7 +1546,49 @@ inline bool LoadOptimizerCheckpointMigrating(
     }
 
     // Group 1: torso
-    move_state(src_g1[0], model->input_layer->weight);
+    auto move_input_layer_state = [&](const torch::Tensor& src_t, const torch::Tensor& dst_t) {
+      auto src_key = src_t.unsafeGetTensorImpl();
+      auto it = src_optimizer.state().find(src_key);
+      if (it != src_optimizer.state().end()) {
+        if (ckpt_input_dim != target_input_dim) {
+          auto* src_adam = dynamic_cast<torch::optim::AdamWParamState*>(it->second.get());
+          if (src_adam) {
+            auto new_state = std::make_unique<torch::optim::AdamWParamState>();
+            new_state->step(src_adam->step());
+            const int64_t target_hidden = model->input_layer->weight.size(0);
+            if (src_adam->exp_avg().defined()) {
+              torch::Tensor new_exp_avg = torch::zeros(
+                  {target_hidden, target_input_dim}, src_adam->exp_avg().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_exp_avg.slice(1, 0, copy_cols).copy_(src_adam->exp_avg().slice(1, 0, copy_cols));
+              new_state->exp_avg(new_exp_avg);
+            }
+            if (src_adam->exp_avg_sq().defined()) {
+              torch::Tensor new_exp_avg_sq = torch::zeros(
+                  {target_hidden, target_input_dim}, src_adam->exp_avg_sq().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_exp_avg_sq.slice(1, 0, copy_cols).copy_(src_adam->exp_avg_sq().slice(1, 0, copy_cols));
+              new_state->exp_avg_sq(new_exp_avg_sq);
+            }
+            if (src_adam->max_exp_avg_sq().defined()) {
+              torch::Tensor new_max = torch::zeros(
+                  {target_hidden, target_input_dim}, src_adam->max_exp_avg_sq().options());
+              const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+              new_max.slice(1, 0, copy_cols).copy_(src_adam->max_exp_avg_sq().slice(1, 0, copy_cols));
+              new_state->max_exp_avg_sq(new_max);
+            }
+            optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(new_state);
+            ++moved;
+            return true;
+          }
+        }
+        optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(it->second);
+        ++moved;
+        return true;
+      }
+      return false;
+    };
+    move_input_layer_state(src_g1[0], model->input_layer->weight);
     if (model->input_layer->bias.defined() && src_g1.size() > 1) {
       move_state(src_g1[1], model->input_layer->bias);
     }
@@ -1421,17 +1619,53 @@ inline bool LoadOptimizerCheckpointMigrating(
       move_scorer_mod(model->semantic_scorer_->out_layer_ext);
     }
 
-    // Group 2: res9..res12
+    // Group 2: res9..res<dst_num_blocks>
     size_t g2_idx = 0;
-    for (int b = 8; b < 12; ++b) {
+    for (int b = 8; b < dst_num_blocks; ++b) {
       for (auto& p : model->res_blocks[b]->parameters()) {
         move_state(src_g2[g2_idx++], p);
       }
     }
 
-    // New parameters in Prototype F start with empty optimizer state as specified.
-    std::cout << "[MIGRATION] U31400 optimizer successfully migrated from " << path << ": moved "
-              << moved << " parameter states (expected 120), leaving new parameters with empty optimizer state." << std::endl;
+    if (moved != expected_moved) {
+      SpielFatalError(absl::StrCat(
+          "LoadOptimizerCheckpointMigrating: expected ", expected_moved,
+          " moved parameter states, but moved ", moved));
+    }
+
+    if (model->semantic_scorer_ && model->semantic_scorer_->enable_v5_) {
+      static const std::vector<int64_t> kDynamicSlots = {
+          10, 11, 12, 13, 14, 70, 71, 72, 91, 92, 538, 539, 540, 541, 542,
+          546, 547, 548, 549, 550, 554, 555, 556, 572, 770, 771, 772};
+      auto zero_dynamic_exp_avg = [&](const torch::Tensor& param) {
+        auto it = optimizer.state().find(param.unsafeGetTensorImpl());
+        if (it != optimizer.state().end()) {
+          auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(it->second.get());
+          if (adam_state != nullptr) {
+            for (int64_t row : kDynamicSlots) {
+              if (adam_state->exp_avg().defined() && row < adam_state->exp_avg().size(0)) {
+                adam_state->exp_avg()[row].zero_();
+              }
+              if (adam_state->exp_avg_sq().defined() && row < adam_state->exp_avg_sq().size(0)) {
+                adam_state->exp_avg_sq()[row].zero_();
+              }
+              if (adam_state->max_exp_avg_sq().defined() && row < adam_state->max_exp_avg_sq().size(0)) {
+                adam_state->max_exp_avg_sq()[row].zero_();
+              }
+            }
+          }
+        }
+      };
+      zero_dynamic_exp_avg(model->policy_head->weight);
+      if (model->policy_head->bias.defined()) {
+        zero_dynamic_exp_avg(model->policy_head->bias);
+      }
+    }
+
+    // New parameters in Prototype F / v4 start with empty optimizer state as specified.
+    std::cout << "[MIGRATION] Optimizer successfully migrated from " << path << ": moved "
+              << moved << " parameter states (expected " << expected_moved
+              << "), leaving new parameters with empty optimizer state." << std::endl;
     return true;
   }
 
@@ -1753,6 +1987,12 @@ struct CompactEvalResult {
     int32_t physical_batch_row = -1;
 };
 
+struct GreedyEvalResult {
+    Action action = kInvalidAction;
+    bool ok = true;
+    bool budget_exhausted = false;
+};
+
 struct LogitCapApplicationStats {
   double pre_max_abs = 0.0;
   double post_max_abs = 0.0;
@@ -2009,8 +2249,9 @@ public:
         if (dune_imperium::IsFullPublicInformationStateSize(model_input_dim_)) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
                 (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
-                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
-                SpielFatalError("DeterministicEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4 &&
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV5)) {
+                SpielFatalError("DeterministicEvaluator: Full public information actor requires an active semantic scorer with schema v3, v4, or v5");
             }
         }
     }
@@ -2229,6 +2470,24 @@ struct BatcherTelemetry {
     double d2h_ms = 0.0;          // the device->host transfer ALONE
     double sync_ms = 0.0;         // HOST wall time blocked; overlaps the above
     uint64_t device_timed_batches = 0;   // batches contributing to the above
+    // Step 1: Stage-1 Telemetry, Inter-Slot GPU Idle Gap & CPU stage timings
+    double trunk_ms = 0.0;
+    double scorer_ms = 0.0;
+    double post_cap_softmax_ms = 0.0;
+    double inter_slot_idle_gap_ms = 0.0;
+    uint64_t inter_slot_gap_count = 0;
+    double cpu_wait_ms = 0.0;
+    double cpu_pack_ms = 0.0;
+    double cpu_distribute_ms = 0.0;
+    uint64_t wants_logits_batches = 0;
+    uint64_t wants_logits_rows = 0;
+    uint64_t d2h_bytes = 0;
+    uint64_t greedy_action_calls = 0;
+    uint64_t greedy_action_ties = 0;
+    uint64_t full_batches = 0;
+    uint64_t ge128_batches = 0;
+    uint64_t ge64_batches = 0;
+    uint64_t under64_batches = 0;
 };
 
 class BatchedEvaluator : public IGameEvaluator {
@@ -2317,6 +2576,7 @@ public:
           emit_batch_membership_(emit_batch_membership),
           rollout_amp_(rollout_amp), allow_tf32_(allow_tf32),
           clear_autocast_cache_per_batch_(clear_autocast_cache_per_batch),
+          async_stage_timers_enabled_((std::getenv("DUNE_ENABLE_ASYNC_STAGE_TIMERS") != nullptr)),
         stop_(false) {
         if (model_) {
             deck_pool_semantics_ = model_->deck_pool_semantics_;
@@ -2328,8 +2588,9 @@ public:
         if (dune_imperium::IsFullPublicInformationStateSize(model_input_dim_)) {
             if (!model_->with_semantic_scorer_ || !model_->semantic_scorer_ ||
                 (model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV3 &&
-                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4)) {
-                SpielFatalError("BatchedEvaluator: Full public information actor requires an active semantic scorer with schema v3 or v4");
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV4 &&
+                 model_->semantic_descriptor_schema_ != dune_semantic::kDescriptorSchemaVersionV5)) {
+                SpielFatalError("BatchedEvaluator: Full public information actor requires an active semantic scorer with schema v3, v4, or v5");
             }
         }
 
@@ -2346,10 +2607,18 @@ public:
 
         if (rollout_amp_ && device_.is_cuda()) {
             if (model_) {
-                model_->RefreshBf16InferenceCache();
+                if (model_->use_fp8_trunk()) {
+                    model_->PrepareFp8Cache();
+                } else {
+                    model_->RefreshBf16InferenceCache();
+                }
             }
             if (critic_model_) {
-                critic_model_->RefreshBf16InferenceCache();
+                if (critic_model_->use_fp8_trunk()) {
+                    critic_model_->PrepareFp8Cache();
+                } else {
+                    critic_model_->RefreshBf16InferenceCache();
+                }
             }
             clear_autocast_cache_per_batch_ = false;
         }
@@ -2363,6 +2632,7 @@ public:
             stop_ = true;
         }
         cv_.notify_all();
+        warmup_cv_.notify_all();
         if (runner_thread_.joinable()) runner_thread_.join();
     }
 
@@ -2564,6 +2834,46 @@ public:
         return result;
     }
 
+    GreedyEvalResult EvaluateGreedyAction(
+        const std::vector<float>& obs,
+        const std::vector<Action>& legal_actions,
+        const dune_semantic::CandidateActionData* action_data = nullptr) {
+        if (legal_actions.empty()) {
+            return {kInvalidAction, true, false};
+        }
+        CheckEvalObsSize(obs.size(), model_input_dim_);
+        GreedyEvalResult result;
+        thread_local std::atomic<uint32_t> tls_ready{kWaitSpinning};
+        tls_ready.store(kWaitSpinning, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (requests_.empty()) first_request_ts_ = now;
+            Request req;
+            req.obs = &obs;
+            req.action_data = action_data;
+            req.ready_flag = &tls_ready;
+            req.result_dest = nullptr;
+            req.compact_dest = nullptr;
+            req.greedy_action_dest = &result.action;
+            req.greedy_result_dest = &result;
+            req.legal_actions = legal_actions;
+            req.wants_logits = false;
+            req.group_id = next_group_id_.fetch_add(1, std::memory_order_relaxed);
+            req.group_size = 1;
+            req.is_group = false;
+            req.enqueue_ts = now;
+            requests_.push_back(std::move(req));
+            single_row_calls_.fetch_add(1, std::memory_order_relaxed);
+            if (requests_.size() == 1 ||
+                requests_.size() >= EffectiveTargetBatchSize()) {
+                cv_.notify_one();
+            }
+        }
+        WaitOnReadyFlag(tls_ready);
+        return result;
+    }
+
     std::vector<EvalResult> EvaluateBatch(
         const std::vector<std::vector<float>>& observations) override {
         std::vector<EvalResult> results(observations.size());
@@ -2688,7 +2998,16 @@ public:
         const dune_semantic::CandidateActionData* action_data = nullptr) {
         std::vector<EvalResult> results(observations.size());
         CompactEvalResult compact;
-        if (observations.empty() || prior_index >= observations.size()) {
+        if (observations.empty()) {
+            return {std::move(results), std::move(compact)};
+        }
+        if (observations.size() > static_cast<size_t>(target_batch_size_)) {
+            SpielFatalError("BatchedEvaluator::EvaluateBatchValuesWithCompactPrior group size " +
+                            std::to_string(observations.size()) +
+                            " exceeds configured target " +
+                            std::to_string(target_batch_size_));
+        }
+        if (prior_index >= observations.size()) {
             return {std::move(results), std::move(compact)};
         }
         for (const auto& obs : observations) CheckEvalObsSize(obs.size(), model_input_dim_);
@@ -2730,6 +3049,74 @@ public:
         return {std::move(results), std::move(compact)};
     }
 
+    void EnableAsyncStageTimers(bool enable = true) {
+        async_stage_timers_enabled_.store(enable, std::memory_order_relaxed);
+    }
+
+    void ResetBatcherStageTelemetry() {
+        wants_logits_batches_.store(0, std::memory_order_relaxed);
+        wants_logits_rows_.store(0, std::memory_order_relaxed);
+        d2h_bytes_.store(0, std::memory_order_relaxed);
+        greedy_action_calls_.store(0, std::memory_order_relaxed);
+        greedy_action_ties_.store(0, std::memory_order_relaxed);
+        full_batches_.store(0, std::memory_order_relaxed);
+        ge128_batches_.store(0, std::memory_order_relaxed);
+        ge64_batches_.store(0, std::memory_order_relaxed);
+        under64_batches_.store(0, std::memory_order_relaxed);
+        h2d_us_.store(0, std::memory_order_relaxed);
+        forward_us_.store(0, std::memory_order_relaxed);
+        output_cast_us_.store(0, std::memory_order_relaxed);
+        d2h_us_.store(0, std::memory_order_relaxed);
+        sync_us_.store(0, std::memory_order_relaxed);
+        device_timed_batches_.store(0, std::memory_order_relaxed);
+        trunk_us_.store(0, std::memory_order_relaxed);
+        scorer_us_.store(0, std::memory_order_relaxed);
+        post_cap_softmax_us_.store(0, std::memory_order_relaxed);
+        inter_slot_idle_gap_us_.store(0, std::memory_order_relaxed);
+        inter_slot_gap_count_.store(0, std::memory_order_relaxed);
+        cpu_wait_us_.store(0, std::memory_order_relaxed);
+        cpu_pack_us_.store(0, std::memory_order_relaxed);
+        cpu_distribute_us_.store(0, std::memory_order_relaxed);
+    }
+
+    void WarmupCudaGraphs(const std::vector<int>& batch_sizes) {
+        if (!device_.is_cuda() || device_synchronize_ || batch_sizes.empty()) {
+            return;
+        }
+        std::vector<int> valid_sizes;
+        valid_sizes.reserve(batch_sizes.size());
+        for (int b : batch_sizes) {
+            if (b >= 1 && b <= target_batch_size_) {
+                valid_sizes.push_back(b);
+            }
+        }
+        if (valid_sizes.empty()) return;
+        std::sort(valid_sizes.begin(), valid_sizes.end());
+        valid_sizes.erase(std::unique(valid_sizes.begin(), valid_sizes.end()), valid_sizes.end());
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        warmup_requested_sizes_ = std::move(valid_sizes);
+        warmup_pending_ = true;
+        cv_.notify_one();
+        warmup_cv_.wait(lock, [this]() { return !warmup_pending_ || stop_; });
+    }
+
+    void InvalidateCudaGraphs() {
+        graph_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void SetEnableFp8Trunk(bool enable) {
+        if (sync_mutex_ != nullptr) {
+            std::unique_lock<std::shared_mutex> sync_lock(*sync_mutex_);
+            if (model_) model_->set_use_fp8_trunk(enable);
+            if (critic_model_) critic_model_->set_use_fp8_trunk(enable);
+        } else {
+            if (model_) model_->set_use_fp8_trunk(enable);
+            if (critic_model_) critic_model_->set_use_fp8_trunk(enable);
+        }
+        InvalidateCudaGraphs();
+    }
+
     // R2 (WO-3 review F1): arms the per-batch bookkeeping below (batch-size
     // record, per-row queue-wait accounting, split-leaf-group maps). Call it
     // BEFORE the workload starts; without it those sections are skipped and
@@ -2765,6 +3152,23 @@ public:
         t.sync_ms = sync_us_.load(std::memory_order_relaxed) / 1000.0;
         t.device_timed_batches =
             device_timed_batches_.load(std::memory_order_relaxed);
+        t.trunk_ms = trunk_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.scorer_ms = scorer_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.post_cap_softmax_ms = post_cap_softmax_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.inter_slot_idle_gap_ms = inter_slot_idle_gap_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.inter_slot_gap_count = inter_slot_gap_count_.load(std::memory_order_relaxed);
+        t.cpu_wait_ms = cpu_wait_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.cpu_pack_ms = cpu_pack_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.cpu_distribute_ms = cpu_distribute_us_.load(std::memory_order_relaxed) / 1000.0;
+        t.wants_logits_batches = wants_logits_batches_.load(std::memory_order_relaxed);
+        t.wants_logits_rows = wants_logits_rows_.load(std::memory_order_relaxed);
+        t.d2h_bytes = d2h_bytes_.load(std::memory_order_relaxed);
+        t.greedy_action_calls = greedy_action_calls_.load(std::memory_order_relaxed);
+        t.greedy_action_ties = greedy_action_ties_.load(std::memory_order_relaxed);
+        t.full_batches = full_batches_.load(std::memory_order_relaxed);
+        t.ge128_batches = ge128_batches_.load(std::memory_order_relaxed);
+        t.ge64_batches = ge64_batches_.load(std::memory_order_relaxed);
+        t.under64_batches = under64_batches_.load(std::memory_order_relaxed);
         // Lightweight production telemetry: these counters are always live,
         // so mean batch size remains available even when detailed per-batch
         // telemetry and CUDA event timing are disabled.
@@ -2825,6 +3229,8 @@ private:
         std::atomic<uint32_t>* ready_flag = nullptr;
         bool wants_logits = true;
         CompactEvalResult* compact_dest = nullptr;
+        Action* greedy_action_dest = nullptr;
+        GreedyEvalResult* greedy_result_dest = nullptr;
         std::vector<Action> legal_actions;
         // WO-PERF-3 telemetry tags (no effect on dispatch). group_id is unique
         // per logical call; a one-row Evaluate() is its own group. is_group is
@@ -2898,6 +3304,30 @@ private:
     std::atomic<uint64_t> d2h_us_{0};
     std::atomic<uint64_t> sync_us_{0};
     std::atomic<uint64_t> device_timed_batches_{0};
+    std::atomic<bool> async_stage_timers_enabled_{false};
+    std::condition_variable warmup_cv_;
+    bool warmup_pending_{false};
+    std::vector<int> warmup_requested_sizes_;
+    std::atomic<uint64_t> graph_generation_{0};
+
+    std::atomic<uint64_t> wants_logits_batches_{0};
+    std::atomic<uint64_t> wants_logits_rows_{0};
+    std::atomic<uint64_t> d2h_bytes_{0};
+    std::atomic<uint64_t> greedy_action_calls_{0};
+    std::atomic<uint64_t> greedy_action_ties_{0};
+    std::atomic<uint64_t> full_batches_{0};
+    std::atomic<uint64_t> ge128_batches_{0};
+    std::atomic<uint64_t> ge64_batches_{0};
+    std::atomic<uint64_t> under64_batches_{0};
+
+    std::atomic<uint64_t> trunk_us_{0};
+    std::atomic<uint64_t> scorer_us_{0};
+    std::atomic<uint64_t> post_cap_softmax_us_{0};
+    std::atomic<uint64_t> inter_slot_idle_gap_us_{0};
+    std::atomic<uint64_t> inter_slot_gap_count_{0};
+    std::atomic<uint64_t> cpu_wait_us_{0};
+    std::atomic<uint64_t> cpu_pack_us_{0};
+    std::atomic<uint64_t> cpu_distribute_us_{0};
     std::atomic<uint64_t> logit_cap_decisions_{0};
     std::atomic<uint64_t> logit_cap_legal_logits_{0};
     std::atomic<uint64_t> logit_cap_saturated_{0};
@@ -2940,6 +3370,8 @@ private:
         std::unique_ptr<at::cuda::CUDAGraph> graph;
         SharedDunePolicyValueNetImpl::ModelOutputs outputs;
         SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+        torch::Tensor projected_trunk;
+        torch::Tensor values_f32;
     };
 
     // Production CUDA path: two reusable slots let the runner assemble the
@@ -2973,11 +3405,46 @@ private:
         int64_t membership_batch_id = -1;
         at::cuda::MempoolId_t graph_pool;
         std::vector<CapturedForwardGraph> captured_graphs;
+
+        uint64_t seq = 0;
+        bool has_stage_timing = false;
+        bool h2d_launched = false;
+        bool selective_logits_active = false;
+        std::vector<size_t> logits_request_indices;
+        torch::Tensor logits_host_rows;
+        torch::Tensor logits_device_rows;
+        std::vector<size_t> greedy_request_indices;
+        int greedy_max_legal = 0;
+        int greedy_k_top = 0;
+        torch::Tensor greedy_host_ids;
+        torch::Tensor greedy_host_mask;
+        torch::Tensor greedy_host_rows;
+        torch::Tensor greedy_device_ids;
+        torch::Tensor greedy_device_mask;
+        torch::Tensor greedy_device_rows;
+        torch::Tensor greedy_host_top_vals;
+        torch::Tensor greedy_host_top_idx;
+        torch::Tensor greedy_host_tie_probs;
+        torch::Tensor greedy_last_logits;
+        torch::Tensor greedy_last_mask;
+
+        std::unique_ptr<c10::Event> ev_h2d_start;
+        std::unique_ptr<c10::Event> ev_h2d_end;
+        std::unique_ptr<c10::Event> ev_fwd_start;
+        std::unique_ptr<c10::Event> ev_trunk_end;
+        std::unique_ptr<c10::Event> ev_scorer_end;
+        std::unique_ptr<c10::Event> ev_post_cap_end;
+        std::unique_ptr<c10::Event> ev_d2h_end;
     };
 
     void RunnerAsync() {
         torch::InferenceMode inference_guard;
         const bool enable_slot_reorder = (std::getenv("DUNE_DISABLE_SLOT_REORDER") == nullptr);
+        const bool enable_prewait_h2d = (std::getenv("DUNE_DISABLE_PREWAIT_H2D") == nullptr);
+        const uint64_t cap_stats_stride = (std::getenv("DUNE_DISABLE_CAP_SUBSAMPLE") != nullptr) ? 1ULL : 64ULL;
+        const bool enable_selective_logits_d2h = (std::getenv("DUNE_DISABLE_SELECTIVE_LOGITS_D2H") == nullptr);
+        const bool enable_scorer_inplace = (std::getenv("DUNE_DISABLE_SCORER_INPLACE") == nullptr);
+        const bool enable_tail_graph = (std::getenv("DUNE_DISABLE_TAIL_GRAPH") == nullptr);
         const c10::DeviceIndex device_index =
             device_.has_index() ? device_.index() : c10::cuda::current_device();
         std::array<AsyncBatchSlot, 2> slots;
@@ -3005,22 +3472,31 @@ private:
         }
         int pending_slot = -1;
         int next_slot = 0;
+        std::vector<std::unique_ptr<c10::Event>> batch_end_events;
+        uint64_t next_batch_seq = 0;
+        uint64_t compact_stats_counter = 0;
+        uint64_t local_graph_gen = graph_generation_.load(std::memory_order_acquire);
 
         auto take_batch = [&](bool* timeout_flush, bool has_pending_slot) {
             std::vector<Request> batch;
             *timeout_flush = false;
+            const bool stage_timers_enabled = async_stage_timers_enabled_.load(std::memory_order_relaxed);
+            auto t_wait_start = stage_timers_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this]() { return stop_ || !requests_.empty(); });
+                cv_.wait(lock, [this]() { return stop_ || !requests_.empty() || warmup_pending_; });
+                if (warmup_pending_) return batch;
                 if (stop_ && requests_.empty()) return batch;
                 if (!has_pending_slot) {
                     const auto deadline =
                         first_request_ts_ + std::chrono::milliseconds(timeout_ms_);
                     cv_.wait_until(lock, deadline, [this, deadline]() {
                         return stop_ || requests_.size() >= EffectiveTargetBatchSize() ||
+                               warmup_pending_ ||
                                std::chrono::steady_clock::now() >= deadline;
                     });
                 }
+                if (warmup_pending_) return batch;
                 if (stop_ && requests_.empty()) return batch;
                 *timeout_flush = !stop_ &&
                                  requests_.size() <
@@ -3059,6 +3535,13 @@ private:
                     first_request_ts_ = std::chrono::steady_clock::now();
                 }
             }
+            if (stage_timers_enabled) {
+                auto t_wait_end = std::chrono::steady_clock::now();
+                cpu_wait_us_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_wait_end - t_wait_start).count()),
+                    std::memory_order_relaxed);
+            }
             return batch;
         };
 
@@ -3068,6 +3551,15 @@ private:
             total_batches_.fetch_add(1, std::memory_order_relaxed);
             total_requests_.fetch_add(static_cast<uint64_t>(batch_size),
                                        std::memory_order_relaxed);
+            if (batch_size >= static_cast<size_t>(target_batch_size_)) {
+                full_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else if (batch_size >= 128) {
+                ge128_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else if (batch_size >= 64) {
+                ge64_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                under64_batches_.fetch_add(1, std::memory_order_relaxed);
+            }
             uint64_t observed_max =
                 max_batch_size_seen_.load(std::memory_order_relaxed);
             while (batch_size > observed_max &&
@@ -3141,31 +3633,92 @@ private:
 
         auto wait_slot_gpu = [&](AsyncBatchSlot& slot) {
             if (!slot.pending) return;
+            const bool stage_timers_enabled = async_stage_timers_enabled_.load(std::memory_order_relaxed);
+            auto t_sync_start = stage_timers_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             slot.complete->synchronize();
+            if (stage_timers_enabled) {
+                auto t_sync_end = std::chrono::steady_clock::now();
+                sync_us_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_sync_end - t_sync_start).count()),
+                    std::memory_order_relaxed);
+            }
             if (slot.has_cap_stats) {
                 const double* cap = slot.host_cap_stats.data_ptr<double>();
                 RecordLogitCapStats(cap[0], cap[1], static_cast<int64_t>(cap[2]),
                                     static_cast<int64_t>(cap[3]));
                 slot.has_cap_stats = false;
             }
+            if (slot.has_stage_timing) {
+                slot.has_stage_timing = false;
+                if (slot.seq > 0 && batch_end_events.size() == 4) {
+                    const size_t prev_idx = (slot.seq - 1) % 4;
+                    if (batch_end_events[prev_idx] && slot.ev_fwd_start &&
+                        batch_end_events[prev_idx]->was_marked_for_recording() &&
+                        slot.ev_fwd_start->was_marked_for_recording()) {
+                        batch_end_events[prev_idx]->synchronize();
+                        double gap_ms = std::max(0.0, static_cast<double>(
+                            batch_end_events[prev_idx]->elapsedTime(*slot.ev_fwd_start)));
+                        inter_slot_idle_gap_us_.fetch_add(
+                            static_cast<uint64_t>(gap_ms * 1000.0 + 0.5), std::memory_order_relaxed);
+                        inter_slot_gap_count_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (slot.ev_h2d_start && slot.ev_h2d_end &&
+                    slot.ev_fwd_start && slot.ev_trunk_end &&
+                    slot.ev_scorer_end && slot.ev_post_cap_end && slot.ev_d2h_end &&
+                    slot.ev_h2d_start->was_marked_for_recording() &&
+                    slot.ev_h2d_end->was_marked_for_recording() &&
+                    slot.ev_fwd_start->was_marked_for_recording() &&
+                    slot.ev_trunk_end->was_marked_for_recording() &&
+                    slot.ev_scorer_end->was_marked_for_recording() &&
+                    slot.ev_post_cap_end->was_marked_for_recording() &&
+                    slot.ev_d2h_end->was_marked_for_recording()) {
+                    slot.ev_d2h_end->synchronize();
+                    double h2d_ms = std::max(0.0, static_cast<double>(slot.ev_h2d_start->elapsedTime(*slot.ev_h2d_end)));
+                    double trunk_ms = std::max(0.0, static_cast<double>(slot.ev_fwd_start->elapsedTime(*slot.ev_trunk_end)));
+                    double scorer_ms = std::max(0.0, static_cast<double>(slot.ev_trunk_end->elapsedTime(*slot.ev_scorer_end)));
+                    double fwd_ms = std::max(0.0, static_cast<double>(slot.ev_fwd_start->elapsedTime(*slot.ev_scorer_end)));
+                    double post_cap_ms = std::max(0.0, static_cast<double>(slot.ev_scorer_end->elapsedTime(*slot.ev_post_cap_end)));
+                    double d2h_ms = std::max(0.0, static_cast<double>(slot.ev_post_cap_end->elapsedTime(*slot.ev_d2h_end)));
+
+                    auto us = [](double ms) {
+                        return static_cast<uint64_t>(ms * 1000.0 + 0.5);
+                    };
+                    h2d_us_.fetch_add(us(h2d_ms), std::memory_order_relaxed);
+                    trunk_us_.fetch_add(us(trunk_ms), std::memory_order_relaxed);
+                    scorer_us_.fetch_add(us(scorer_ms), std::memory_order_relaxed);
+                    forward_us_.fetch_add(us(fwd_ms), std::memory_order_relaxed);
+                    post_cap_softmax_us_.fetch_add(us(post_cap_ms), std::memory_order_relaxed);
+                    d2h_us_.fetch_add(us(d2h_ms), std::memory_order_relaxed);
+                    device_timed_batches_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         };
 
         auto distribute_slot_cpu = [&](AsyncBatchSlot& slot) {
             if (!slot.pending) return;
+            const bool stage_timers_enabled = async_stage_timers_enabled_.load(std::memory_order_relaxed);
+            auto t_dist_start = stage_timers_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const float* values = slot.host_values.data_ptr<float>();
             const size_t action_dim = static_cast<size_t>(model_action_dim_);
             dune_hotspot::ScopedTimer hotspot_timer(
                 dune_hotspot::Kind::kBatcherResultDistribution);
             size_t compact_cursor = 0;
+            size_t logits_cursor = 0;
+            const float* logits = slot.host_logits.defined() ? slot.host_logits.data_ptr<float>() : nullptr;
+
             for (size_t i = 0; i < slot.batch.size(); ++i) {
                 Request& request = slot.batch[i];
                 if (request.result_dest != nullptr) {
                     request.result_dest->value = values[i];
-                    if (request.wants_logits) {
-                        const float* logits = slot.host_logits.data_ptr<float>();
+                    if (request.wants_logits && logits != nullptr) {
+                        const size_t offset = slot.selective_logits_active
+                            ? (logits_cursor++ * action_dim)
+                            : (i * action_dim);
                         request.result_dest->logits.assign(
-                            logits + i * action_dim,
-                            logits + (i + 1) * action_dim);
+                            logits + offset,
+                            logits + offset + action_dim);
                     }
                 }
                 if (request.compact_dest != nullptr) {
@@ -3196,11 +3749,101 @@ private:
                             static_cast<int32_t>(i);
                     }
                 }
+            }
+
+            const int G = static_cast<int>(slot.greedy_request_indices.size());
+            if (G > 0) {
+                greedy_action_calls_.fetch_add(G, std::memory_order_relaxed);
+                const int k_top = slot.greedy_k_top;
+                const float* vals = slot.greedy_host_top_vals.data_ptr<float>();
+                const int64_t* idxs = slot.greedy_host_top_idx.data_ptr<int64_t>();
+                std::vector<int> tied_g_indices;
+                for (int g = 0; g < G; ++g) {
+                    Request& req = slot.batch[slot.greedy_request_indices[g]];
+                    if (req.legal_actions.size() <= 1) {
+                        Action act = req.legal_actions.empty() ? kInvalidAction : req.legal_actions.front();
+                        if (req.greedy_action_dest != nullptr) *req.greedy_action_dest = act;
+                        if (req.greedy_result_dest != nullptr) {
+                            req.greedy_result_dest->action = act;
+                            req.greedy_result_dest->ok = true;
+                        }
+                    } else {
+                        const float z1 = vals[g * k_top + 0];
+                        const float z2 = vals[g * k_top + 1];
+                        const int64_t idx1 = idxs[g * k_top + 0];
+                        const float gap = z1 - z2;
+                        if (gap > 1e-5f && std::isfinite(z1) && idx1 >= 0 &&
+                            static_cast<size_t>(idx1) < req.legal_actions.size()) {
+                            Action act = req.legal_actions[static_cast<size_t>(idx1)];
+                            if (req.greedy_action_dest != nullptr) *req.greedy_action_dest = act;
+                            if (req.greedy_result_dest != nullptr) {
+                                req.greedy_result_dest->action = act;
+                                req.greedy_result_dest->ok = true;
+                            }
+                        } else {
+                            tied_g_indices.push_back(g);
+                        }
+                    }
+                }
+                if (!tied_g_indices.empty()) {
+                    const size_t T = tied_g_indices.size();
+                    greedy_action_ties_.fetch_add(T, std::memory_order_relaxed);
+                    c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
+                    torch::InferenceMode inf_guard;
+                    std::vector<int64_t> tied_rows_vec(T);
+                    for (size_t t = 0; t < T; ++t) {
+                        tied_rows_vec[t] = tied_g_indices[t];
+                    }
+                    auto tied_rows_dev = torch::tensor(tied_rows_vec, torch::TensorOptions().dtype(torch::kInt64).device(device_));
+                    auto tied_logits = slot.greedy_last_logits.index_select(0, tied_rows_dev);
+                    auto tied_mask = slot.greedy_last_mask.index_select(0, tied_rows_dev);
+                    auto tied_probs = torch::softmax(tied_logits.masked_fill(tied_mask.logical_not(), -1e9f), 1);
+                    const int64_t tie_total = static_cast<int64_t>(T) * slot.greedy_max_legal;
+                    if (!slot.greedy_host_tie_probs.defined() || slot.greedy_host_tie_probs.numel() < tie_total) {
+                        auto host_f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+                        slot.greedy_host_tie_probs = torch::empty({tie_total}, host_f32_opts);
+                    }
+                    auto host_tie_slice = slot.greedy_host_tie_probs.narrow(0, 0, tie_total).view({static_cast<int64_t>(T), slot.greedy_max_legal});
+                    host_tie_slice.copy_(tied_probs, /*non_blocking=*/true);
+                    slot.stream->synchronize();
+                    d2h_bytes_.fetch_add(T * slot.greedy_max_legal * sizeof(float), std::memory_order_relaxed);
+                    const float* tie_probs_ptr = host_tie_slice.data_ptr<float>();
+                    for (size_t t = 0; t < T; ++t) {
+                        int g = tied_g_indices[t];
+                        Request& req = slot.batch[slot.greedy_request_indices[g]];
+                        const float* row_probs = tie_probs_ptr + t * slot.greedy_max_legal;
+                        float best_p = -1.0f;
+                        Action best_a = req.legal_actions.front();
+                        for (size_t j = 0; j < req.legal_actions.size(); ++j) {
+                            if (row_probs[j] > best_p) {
+                                best_p = row_probs[j];
+                                best_a = req.legal_actions[j];
+                            }
+                        }
+                        if (req.greedy_action_dest != nullptr) *req.greedy_action_dest = best_a;
+                        if (req.greedy_result_dest != nullptr) {
+                            req.greedy_result_dest->action = best_a;
+                            req.greedy_result_dest->ok = true;
+                        }
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < slot.batch.size(); ++i) {
                 SignalReadyFlag(slot.batch[i].ready_flag);
             }
             slot.batch.clear();
             slot.pending = false;
             slot.membership_batch_id = -1;
+            slot.greedy_last_logits = torch::Tensor();
+            slot.greedy_last_mask = torch::Tensor();
+            if (stage_timers_enabled) {
+                auto t_dist_end = std::chrono::steady_clock::now();
+                cpu_distribute_us_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_dist_end - t_dist_start).count()),
+                    std::memory_order_relaxed);
+            }
         };
 
         auto finish_slot = [&](AsyncBatchSlot& slot) {
@@ -3209,20 +3852,67 @@ private:
             distribute_slot_cpu(slot);
         };
 
-        auto launch_slot = [&](AsyncBatchSlot& slot) {
+        auto ensure_stage_events = [&](AsyncBatchSlot& s) {
+            if (!s.ev_h2d_start) {
+                s.ev_h2d_start = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_h2d_end = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_fwd_start = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_trunk_end = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_scorer_end = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_post_cap_end = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+                s.ev_d2h_end = std::make_unique<c10::Event>(c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
+            }
+            if (batch_end_events.empty()) {
+                for (int e = 0; e < 4; ++e) {
+                    batch_end_events.push_back(std::make_unique<c10::Event>(
+                        c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT));
+                }
+            }
+        };
+
+        auto launch_slot = [&](AsyncBatchSlot& slot, bool stage_timers_enabled) {
             const size_t batch_size = slot.batch.size();
+            if (stage_timers_enabled) {
+                ensure_stage_events(slot);
+                slot.seq = next_batch_seq++;
+                slot.has_stage_timing = true;
+            } else {
+                slot.has_stage_timing = false;
+            }
+
             slot.wants_logits = false;
             slot.compact_request_indices.clear();
             slot.compact_max_legal = 0;
+            slot.greedy_request_indices.clear();
+            slot.greedy_max_legal = 0;
+            slot.logits_request_indices.clear();
+
             for (size_t i = 0; i < batch_size; ++i) {
-                if (slot.batch[i].wants_logits) slot.wants_logits = true;
+                if (slot.batch[i].wants_logits) {
+                    slot.wants_logits = true;
+                    if (slot.batch[i].result_dest != nullptr) {
+                        slot.logits_request_indices.push_back(i);
+                    }
+                }
                 if (slot.batch[i].compact_dest != nullptr) {
                     slot.compact_request_indices.push_back(i);
                     slot.compact_max_legal = std::max(
                         slot.compact_max_legal,
                         static_cast<int>(slot.batch[i].legal_actions.size()));
                 }
+                if (slot.batch[i].greedy_action_dest != nullptr) {
+                    slot.greedy_request_indices.push_back(i);
+                    slot.greedy_max_legal = std::max(
+                        slot.greedy_max_legal,
+                        static_cast<int>(slot.batch[i].legal_actions.size()));
+                }
             }
+            const size_t k_logits = slot.logits_request_indices.size();
+            if (k_logits > 0) {
+                wants_logits_batches_.fetch_add(1, std::memory_order_relaxed);
+                wants_logits_rows_.fetch_add(k_logits, std::memory_order_relaxed);
+            }
+
             if (!slot.device_obs.defined()) {
                 auto host_options = torch::TensorOptions()
                     .dtype(torch::kFloat32).device(torch::kCPU)
@@ -3242,17 +3932,6 @@ private:
                 slot.complete = std::make_unique<c10::Event>(
                     c10::DeviceType::CUDA, c10::EventFlag::BACKEND_DEFAULT);
             }
-            if (slot.wants_logits && !slot.device_logits.defined()) {
-                auto host_options = torch::TensorOptions()
-                    .dtype(torch::kFloat32).device(torch::kCPU)
-                    .pinned_memory(true);
-                auto device_options = torch::TensorOptions()
-                    .dtype(torch::kFloat32).device(device_);
-                slot.device_logits = torch::empty(
-                    {target_batch_size_, model_action_dim_}, device_options);
-                slot.host_logits = torch::empty(
-                    {target_batch_size_, model_action_dim_}, host_options);
-            }
             if (batch_size >= slot.captured_graphs.size()) {
                 slot.captured_graphs.resize(batch_size + 1);
             }
@@ -3262,25 +3941,50 @@ private:
                 slot.device_obs = torch::empty(
                     {static_cast<int64_t>(batch_size), model_input_dim_}, device_options);
                 slot.captured_graphs.clear();
+                slot.graph_pool = at::cuda::graph_pool_handle();
                 slot.captured_graphs.resize(batch_size + 1);
             }
             {
                 c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
-                auto host_obs = slot.host_obs.narrow(0, 0, batch_size);
+                if (!slot.h2d_launched) {
+                    if (stage_timers_enabled && slot.ev_h2d_start) {
+                        slot.ev_h2d_start->record(*slot.stream);
+                    }
+                    auto host_obs = slot.host_obs.narrow(0, 0, batch_size);
+                    auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
+                    device_obs.copy_(host_obs, /*non_blocking=*/true);
+                    if (stage_timers_enabled && slot.ev_h2d_end) {
+                        slot.ev_h2d_end->record(*slot.stream);
+                    }
+                }
+                slot.h2d_launched = false;
+
+                if (stage_timers_enabled && slot.ev_fwd_start) {
+                    slot.ev_fwd_start->record(*slot.stream);
+                }
+
                 auto device_obs = slot.device_obs.narrow(0, 0, batch_size);
-                device_obs.copy_(host_obs, /*non_blocking=*/true);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+                torch::Tensor values_f32_out;
                 {
                     std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                     auto& cg = slot.captured_graphs[batch_size];
                     if (!cg.graph) {
                         if (rollout_amp_ && device_.is_cuda()) {
                             if (model_) {
-                                model_->RefreshBf16InferenceCache();
+                                if (model_->use_fp8_trunk()) {
+                                    model_->PrepareFp8Cache();
+                                } else {
+                                    model_->RefreshBf16InferenceCache();
+                                }
                             }
                             if (critic_model_) {
-                                critic_model_->RefreshBf16InferenceCache();
+                                if (critic_model_->use_fp8_trunk()) {
+                                    critic_model_->PrepareFp8Cache();
+                                } else {
+                                    critic_model_->RefreshBf16InferenceCache();
+                                }
                             }
                         }
                         {
@@ -3291,6 +3995,9 @@ private:
                             critic_outputs = (critic_model_ != nullptr)
                                 ? critic_model_->forward(device_obs)
                                 : outputs;
+                            if (enable_tail_graph && model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                (void)model_->semantic_scorer_->ProjectTrunk(outputs.trunk);
+                            }
                         }
                         at::autocast::clear_cache();
                         {
@@ -3303,12 +4010,23 @@ private:
                             cg.critic_outputs = (critic_model_ != nullptr)
                                 ? critic_model_->forward(device_obs)
                                 : cg.outputs;
+                            if (enable_tail_graph) {
+                                if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                    cg.projected_trunk = model_->semantic_scorer_->ProjectTrunk(cg.outputs.trunk);
+                                }
+                                cg.values_f32 = cg.critic_outputs.values.reshape({static_cast<int64_t>(batch_size)}).to(torch::kFloat32);
+                            }
                             cg.graph->capture_end();
                         }
                     }
                     cg.graph->replay();
                     outputs = cg.outputs;
                     critic_outputs = cg.critic_outputs;
+                    values_f32_out = cg.values_f32;
+
+                    if (stage_timers_enabled && slot.ev_trunk_end) {
+                        slot.ev_trunk_end->record(*slot.stream);
+                    }
 
                     if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
                         std::vector<const dune_semantic::CandidateActionData*> batch_actions(batch_size);
@@ -3324,23 +4042,74 @@ private:
                                                          rollout_amp_,
                                                          clear_autocast_cache_per_batch_);
                             dune_semantic::ApplySemanticScorerBatch(
-                                model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                                model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_,
+                                /*workspace=*/nullptr,
+                                /*allow_inplace=*/enable_scorer_inplace,
+                                /*precomputed_trunk_proj=*/(enable_tail_graph ? cg.projected_trunk : torch::Tensor()));
                         }
                     }
+                    if (stage_timers_enabled && slot.ev_scorer_end) {
+                        slot.ev_scorer_end->record(*slot.stream);
+                    }
                 }
-                auto device_values = slot.device_values.narrow(
-                    0, 0, batch_size);
-                device_values.copy_(critic_outputs.values.reshape(
-                                        {static_cast<int64_t>(batch_size)}),
-                                    /*non_blocking=*/true);
-                if (slot.wants_logits) {
-                    auto device_logits = slot.device_logits.narrow(
+
+                if (enable_tail_graph && values_f32_out.defined()) {
+                    slot.host_values.narrow(0, 0, batch_size).copy_(
+                        values_f32_out, /*non_blocking=*/true);
+                } else {
+                    auto device_values = slot.device_values.narrow(
                         0, 0, batch_size);
-                    device_logits.copy_(outputs.logits,
+                    device_values.copy_(critic_outputs.values.reshape(
+                                            {static_cast<int64_t>(batch_size)}),
                                         /*non_blocking=*/true);
-                    slot.host_logits.narrow(0, 0, batch_size).copy_(
-                        device_logits, /*non_blocking=*/true);
+                    slot.host_values.narrow(0, 0, batch_size).copy_(
+                        device_values, /*non_blocking=*/true);
                 }
+
+                if (k_logits > 0) {
+                    if (enable_selective_logits_d2h && k_logits < batch_size) {
+                        if (!slot.logits_host_rows.defined() ||
+                            slot.logits_host_rows.numel() < static_cast<int64_t>(k_logits)) {
+                            const int64_t alloc_k = std::max<int64_t>(target_batch_size_, k_logits);
+                            auto host_i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
+                            auto dev_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+                            slot.logits_host_rows = torch::empty({alloc_k}, host_i64);
+                            slot.logits_device_rows = torch::empty({alloc_k}, dev_i64);
+                        }
+                        int64_t* row_ptrs = slot.logits_host_rows.data_ptr<int64_t>();
+                        for (size_t k = 0; k < k_logits; ++k) {
+                            row_ptrs[k] = static_cast<int64_t>(slot.logits_request_indices[k]);
+                        }
+                        auto dev_rows = slot.logits_device_rows.narrow(0, 0, k_logits);
+                        dev_rows.copy_(slot.logits_host_rows.narrow(0, 0, k_logits), /*non_blocking=*/true);
+
+                        auto selected_logits = outputs.logits.index_select(0, dev_rows);
+                        if (!slot.device_logits.defined() || slot.device_logits.size(0) < static_cast<int64_t>(k_logits)) {
+                            const int64_t alloc_rows = std::max<int64_t>(target_batch_size_, k_logits);
+                            auto dev_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+                            auto host_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+                            slot.device_logits = torch::empty({alloc_rows, model_action_dim_}, dev_f32);
+                            slot.host_logits = torch::empty({alloc_rows, model_action_dim_}, host_f32);
+                        }
+                        auto dev_log_slice = slot.device_logits.narrow(0, 0, k_logits);
+                        dev_log_slice.copy_(selected_logits, /*non_blocking=*/true);
+                        slot.host_logits.narrow(0, 0, k_logits).copy_(dev_log_slice, /*non_blocking=*/true);
+                        slot.selective_logits_active = true;
+                    } else {
+                        if (!slot.device_logits.defined() || slot.device_logits.size(0) < static_cast<int64_t>(batch_size)) {
+                            const int64_t alloc_rows = std::max<int64_t>(target_batch_size_, batch_size);
+                            auto dev_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+                            auto host_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+                            slot.device_logits = torch::empty({alloc_rows, model_action_dim_}, dev_f32);
+                            slot.host_logits = torch::empty({alloc_rows, model_action_dim_}, host_f32);
+                        }
+                        auto dev_log_slice = slot.device_logits.narrow(0, 0, batch_size);
+                        dev_log_slice.copy_(outputs.logits, /*non_blocking=*/true);
+                        slot.host_logits.narrow(0, 0, batch_size).copy_(dev_log_slice, /*non_blocking=*/true);
+                        slot.selective_logits_active = false;
+                    }
+                }
+
                 if (!slot.compact_request_indices.empty()) {
                     const int compact_count =
                         static_cast<int>(slot.compact_request_indices.size());
@@ -3399,30 +4168,41 @@ private:
                         legal.sum(1, true).clamp_min(1.0);
                     compact_logits = compact_logits -
                         (compact_logits * legal).sum(1, true) / legal_count;
-                    const torch::Tensor pre_max = compact_logits.abs().masked_fill(
-                        dev_mask.logical_not(), 0.0).amax(1);
-                    if (logit_cap_ > 0.0f) {
-                        compact_logits = logit_cap_ *
-                            torch::tanh(compact_logits / logit_cap_);
+
+                    const bool sample_cap = ((compact_stats_counter++ % cap_stats_stride) == 0);
+                    if (sample_cap) {
+                        const torch::Tensor pre_max = compact_logits.abs().masked_fill(
+                            dev_mask.logical_not(), 0.0).amax(1);
+                        torch::Tensor post_capped = compact_logits;
+                        if (logit_cap_ > 0.0f) {
+                            post_capped = logit_cap_ * torch::tanh(compact_logits / logit_cap_);
+                        }
+                        const torch::Tensor post_max = post_capped.abs().masked_fill(
+                            dev_mask.logical_not(), 0.0).amax(1);
+                        const torch::Tensor saturated =
+                            ((post_capped.abs() >=
+                              0.99 * static_cast<float>(logit_cap_)) &
+                             dev_mask).sum();
+                        const torch::Tensor cap_stats = torch::stack(
+                            {pre_max.max().to(torch::kFloat64),
+                             post_max.max().to(torch::kFloat64),
+                             legal.sum().to(torch::kFloat64),
+                             saturated.to(torch::kFloat64)});
+                        if (!slot.host_cap_stats.defined()) {
+                            slot.host_cap_stats = torch::empty(
+                                {4}, torch::TensorOptions().dtype(torch::kFloat64)
+                                         .pinned_memory(true));
+                        }
+                        slot.host_cap_stats.copy_(cap_stats, /*non_blocking=*/true);
+                        slot.has_cap_stats = true;
+                        if (logit_cap_ > 0.0f) {
+                            compact_logits = post_capped;
+                        }
+                    } else {
+                        if (logit_cap_ > 0.0f) {
+                            compact_logits = logit_cap_ * torch::tanh(compact_logits / logit_cap_);
+                        }
                     }
-                    const torch::Tensor post_max = compact_logits.abs().masked_fill(
-                        dev_mask.logical_not(), 0.0).amax(1);
-                    const torch::Tensor saturated =
-                        ((compact_logits.abs() >=
-                          0.99 * static_cast<float>(logit_cap_)) &
-                         dev_mask).sum();
-                    const torch::Tensor cap_stats = torch::stack(
-                        {pre_max.max().to(torch::kFloat64),
-                         post_max.max().to(torch::kFloat64),
-                         legal.sum().to(torch::kFloat64),
-                         saturated.to(torch::kFloat64)});
-                    if (!slot.host_cap_stats.defined()) {
-                        slot.host_cap_stats = torch::empty(
-                            {4}, torch::TensorOptions().dtype(torch::kFloat64)
-                                     .pinned_memory(true));
-                    }
-                    slot.host_cap_stats.copy_(cap_stats, /*non_blocking=*/true);
-                    slot.has_cap_stats = true;
                     auto compact_probs = torch::softmax(
                         compact_logits.masked_fill(
                             dev_mask.logical_not(), -1e9f),
@@ -3430,25 +4210,231 @@ private:
                     auto host_probs_slice = slot.compact_host_probs.narrow(0, 0, total_elems).view({compact_count, max_legal});
                     host_probs_slice.copy_(compact_probs, /*non_blocking=*/true);
                 }
-                slot.host_values.narrow(0, 0, batch_size).copy_(
-                    device_values, /*non_blocking=*/true);
+
+                if (!slot.greedy_request_indices.empty()) {
+                    const int greedy_count = static_cast<int>(slot.greedy_request_indices.size());
+                    const int g_max_legal = std::max(1, slot.greedy_max_legal);
+                    slot.greedy_max_legal = g_max_legal;
+                    const int64_t g_total_elems = static_cast<int64_t>(greedy_count) * g_max_legal;
+                    if (!slot.greedy_host_ids.defined() ||
+                        slot.greedy_host_ids.numel() < g_total_elems ||
+                        !slot.greedy_host_rows.defined() ||
+                        slot.greedy_host_rows.numel() < greedy_count) {
+                        const int64_t alloc_rows = std::max<int64_t>(target_batch_size_, greedy_count);
+                        const int64_t alloc_cols = std::max<int64_t>(g_max_legal, 128);
+                        const int64_t alloc_total = alloc_rows * alloc_cols;
+                        auto host_i64_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
+                        auto host_bool_opts = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(true);
+                        auto host_f32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+                        auto dev_i64_opts = torch::TensorOptions().dtype(torch::kInt64).device(device_);
+                        auto dev_bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device_);
+
+                        slot.greedy_host_ids = torch::empty({alloc_total}, host_i64_opts);
+                        slot.greedy_host_mask = torch::empty({alloc_total}, host_bool_opts);
+                        slot.greedy_host_rows = torch::empty({alloc_rows}, host_i64_opts);
+                        slot.greedy_device_ids = torch::empty({alloc_total}, dev_i64_opts);
+                        slot.greedy_device_mask = torch::empty({alloc_total}, dev_bool_opts);
+                        slot.greedy_device_rows = torch::empty({alloc_rows}, dev_i64_opts);
+                        slot.greedy_host_top_vals = torch::empty({alloc_rows * 2}, host_f32_opts);
+                        slot.greedy_host_top_idx = torch::empty({alloc_rows * 2}, host_i64_opts);
+                        slot.greedy_host_tie_probs = torch::empty({alloc_total}, host_f32_opts);
+                    }
+                    auto g_ids_cpu = slot.greedy_host_ids.narrow(0, 0, g_total_elems).view({greedy_count, g_max_legal});
+                    auto g_mask_cpu = slot.greedy_host_mask.narrow(0, 0, g_total_elems).view({greedy_count, g_max_legal});
+                    auto g_rows_cpu = slot.greedy_host_rows.narrow(0, 0, greedy_count);
+                    g_ids_cpu.zero_();
+                    g_mask_cpu.zero_();
+                    int64_t* g_ids = g_ids_cpu.data_ptr<int64_t>();
+                    bool* g_mask = g_mask_cpu.data_ptr<bool>();
+                    int64_t* g_rows = g_rows_cpu.data_ptr<int64_t>();
+                    for (int k = 0; k < greedy_count; ++k) {
+                        g_rows[k] = static_cast<int64_t>(slot.greedy_request_indices[k]);
+                        const Request& req = slot.batch[slot.greedy_request_indices[k]];
+                        for (size_t j = 0; j < req.legal_actions.size(); ++j) {
+                            g_ids[k * g_max_legal + j] = req.legal_actions[j];
+                            g_mask[k * g_max_legal + j] = true;
+                        }
+                    }
+                    auto g_dev_ids = slot.greedy_device_ids.narrow(0, 0, g_total_elems).view({greedy_count, g_max_legal});
+                    auto g_dev_mask = slot.greedy_device_mask.narrow(0, 0, g_total_elems).view({greedy_count, g_max_legal});
+                    auto g_dev_rows = slot.greedy_device_rows.narrow(0, 0, greedy_count);
+                    g_dev_ids.copy_(g_ids_cpu, /*non_blocking=*/true);
+                    g_dev_mask.copy_(g_mask_cpu, /*non_blocking=*/true);
+                    g_dev_rows.copy_(g_rows_cpu, /*non_blocking=*/true);
+
+                    auto greedy_logits = outputs.logits.index_select(0, g_dev_rows)
+                        .gather(1, g_dev_ids)
+                        .to(torch::kFloat32);
+                    const torch::Tensor g_legal = g_dev_mask.to(torch::kFloat32);
+                    const torch::Tensor g_legal_count = g_legal.sum(1, true).clamp_min(1.0);
+                    greedy_logits = greedy_logits - (greedy_logits * g_legal).sum(1, true) / g_legal_count;
+                    if (logit_cap_ > 0.0f) {
+                        greedy_logits = logit_cap_ * torch::tanh(greedy_logits / logit_cap_);
+                    }
+                    slot.greedy_last_logits = greedy_logits;
+                    slot.greedy_last_mask = g_dev_mask;
+
+                    auto masked_top = greedy_logits.masked_fill(g_dev_mask.logical_not(), -std::numeric_limits<float>::infinity());
+                    const int k_top = std::min<int>(2, g_max_legal);
+                    slot.greedy_k_top = k_top;
+                    auto top_res = torch::topk(masked_top, k_top, /*dim=*/1, /*largest=*/true, /*sorted=*/true);
+                    auto top_vals = std::get<0>(top_res);
+                    auto top_idx = std::get<1>(top_res);
+
+                    auto host_top_vals_slice = slot.greedy_host_top_vals.narrow(0, 0, greedy_count * k_top).view({greedy_count, k_top});
+                    auto host_top_idx_slice = slot.greedy_host_top_idx.narrow(0, 0, greedy_count * k_top).view({greedy_count, k_top});
+                    host_top_vals_slice.copy_(top_vals, /*non_blocking=*/true);
+                    host_top_idx_slice.copy_(top_idx, /*non_blocking=*/true);
+                }
+
+                if (stage_timers_enabled && slot.ev_post_cap_end) {
+                    slot.ev_post_cap_end->record(*slot.stream);
+                }
+
+                uint64_t cur_d2h_bytes = batch_size * sizeof(float);
+                if (k_logits > 0) {
+                    const size_t rows_copied = slot.selective_logits_active ? k_logits : batch_size;
+                    cur_d2h_bytes += rows_copied * model_action_dim_ * sizeof(float);
+                }
+                if (!slot.compact_request_indices.empty()) {
+                    cur_d2h_bytes += static_cast<uint64_t>(slot.compact_request_indices.size()) * slot.compact_max_legal * sizeof(float);
+                }
+                if (!slot.greedy_request_indices.empty()) {
+                    cur_d2h_bytes += static_cast<uint64_t>(slot.greedy_request_indices.size()) * slot.greedy_k_top * (sizeof(float) + sizeof(int64_t));
+                }
+                if (slot.has_cap_stats) {
+                    cur_d2h_bytes += 4 * sizeof(double);
+                }
+                d2h_bytes_.fetch_add(cur_d2h_bytes, std::memory_order_relaxed);
+
+                if (stage_timers_enabled && slot.ev_d2h_end) {
+                    slot.ev_d2h_end->record(*slot.stream);
+                    if (batch_end_events.size() == 4) {
+                        batch_end_events[slot.seq % 4]->record(*slot.stream);
+                    }
+                }
                 slot.complete->record(*slot.stream);
             }
             slot.pending = true;
         };
 
         for (;;) {
+            const uint64_t target_graph_gen = graph_generation_.load(std::memory_order_acquire);
+            if (local_graph_gen != target_graph_gen) {
+                if (pending_slot >= 0) {
+                    finish_slot(slots[pending_slot]);
+                    pending_slot = -1;
+                }
+                for (AsyncBatchSlot& s : slots) {
+                    if (s.stream) s.stream->synchronize();
+                    s.captured_graphs.clear();
+                    s.graph_pool = at::cuda::graph_pool_handle();
+                    s.captured_graphs.resize(target_batch_size_ + 1);
+                }
+                local_graph_gen = target_graph_gen;
+            }
+
+            if (warmup_pending_) {
+                if (pending_slot >= 0) {
+                    finish_slot(slots[pending_slot]);
+                    pending_slot = -1;
+                }
+                std::vector<int> sizes_to_warmup;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    sizes_to_warmup = warmup_requested_sizes_;
+                    warmup_requested_sizes_.clear();
+                }
+                for (AsyncBatchSlot& s : slots) {
+                    c10::cuda::CUDAStreamGuard stream_guard(*s.stream);
+                    for (int b : sizes_to_warmup) {
+                        if (b >= static_cast<int>(s.captured_graphs.size())) {
+                            s.captured_graphs.resize(b + 1);
+                        }
+                        if (b > s.device_obs.size(0)) {
+                            auto dev_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+                            s.device_obs = torch::empty({static_cast<int64_t>(b), model_input_dim_}, dev_opts);
+                            s.captured_graphs.clear();
+                            s.graph_pool = at::cuda::graph_pool_handle();
+                            s.captured_graphs.resize(b + 1);
+                        }
+                        auto& cg = s.captured_graphs[b];
+                        if (!cg.graph) {
+                            auto device_obs = s.device_obs.narrow(0, 0, b);
+                            device_obs.zero_();
+                            std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
+                            if (rollout_amp_ && device_.is_cuda()) {
+                                if (model_) {
+                                    if (model_->use_fp8_trunk()) {
+                                        model_->PrepareFp8Cache();
+                                    } else {
+                                        model_->RefreshBf16InferenceCache();
+                                    }
+                                }
+                                if (critic_model_) {
+                                    if (critic_model_->use_fp8_trunk()) {
+                                        critic_model_->PrepareFp8Cache();
+                                    } else {
+                                        critic_model_->RefreshBf16InferenceCache();
+                                    }
+                                }
+                            }
+                            SharedDunePolicyValueNetImpl::ModelOutputs outputs;
+                            SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+                            {
+                                AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                             rollout_amp_,
+                                                             /*clear_cache_on_exit=*/true);
+                                outputs = model_->forward(device_obs);
+                                critic_outputs = (critic_model_ != nullptr)
+                                    ? critic_model_->forward(device_obs)
+                                    : outputs;
+                                if (enable_tail_graph && model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                    (void)model_->semantic_scorer_->ProjectTrunk(outputs.trunk);
+                                }
+                            }
+                            at::autocast::clear_cache();
+                            {
+                                AutocastGuard autocast_guard(c10::DeviceType::CUDA,
+                                                             rollout_amp_,
+                                                             /*clear_cache_on_exit=*/true);
+                                cg.graph = std::make_unique<at::cuda::CUDAGraph>();
+                                cg.graph->capture_begin(s.graph_pool, cudaStreamCaptureModeThreadLocal);
+                                cg.outputs = model_->forward(device_obs);
+                                cg.critic_outputs = (critic_model_ != nullptr)
+                                    ? critic_model_->forward(device_obs)
+                                    : cg.outputs;
+                                if (enable_tail_graph) {
+                                    if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                        cg.projected_trunk = model_->semantic_scorer_->ProjectTrunk(cg.outputs.trunk);
+                                    }
+                                    cg.values_f32 = cg.critic_outputs.values.reshape({static_cast<int64_t>(b)}).to(torch::kFloat32);
+                                }
+                                cg.graph->capture_end();
+                            }
+                        }
+                    }
+                    s.stream->synchronize();
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    warmup_pending_ = false;
+                }
+                warmup_cv_.notify_all();
+                continue;
+            }
+
             if (enable_slot_reorder && pending_slot >= 0) {
                 bool drain_pending_now = false;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
-                    while (!stop_ &&
+                    while (!stop_ && !warmup_pending_ &&
                            requests_.size() < EffectiveTargetBatchSize() &&
                            !slots[pending_slot].complete->query()) {
                         cv_.wait_for(lock, std::chrono::microseconds(50));
                     }
                     drain_pending_now =
-                        !stop_ && requests_.size() < EffectiveTargetBatchSize();
+                        !stop_ && !warmup_pending_ && requests_.size() < EffectiveTargetBatchSize();
                 }
                 if (drain_pending_now) {
                     finish_slot(slots[pending_slot]);
@@ -3458,7 +4444,10 @@ private:
             bool timeout_flush = false;
             std::vector<Request> batch =
                 take_batch(&timeout_flush, /*has_pending_slot=*/(pending_slot >= 0));
-            if (batch.empty()) break;
+            if (batch.empty()) {
+                if (warmup_pending_) continue;
+                break;
+            }
             if (dispatch_budget_hook_) {
                 if (!dispatch_budget_hook_(batch.size())) {
                     if (dispatch_rejection_hook_) {
@@ -3476,6 +4465,13 @@ private:
                             req.compact_dest->actions.clear();
                             req.compact_dest->probabilities.clear();
                         }
+                        if (req.greedy_result_dest) {
+                            req.greedy_result_dest->ok = false;
+                            req.greedy_result_dest->budget_exhausted = true;
+                        }
+                        if (req.greedy_action_dest) {
+                            *req.greedy_action_dest = kInvalidAction;
+                        }
                         SignalReadyFlag(req.ready_flag);
                     }
                     continue;
@@ -3485,6 +4481,12 @@ private:
             AsyncBatchSlot& slot = slots[slot_index];
             if (slot.pending) finish_slot(slot);
             slot.batch = std::move(batch);
+            if (slot.batch.size() > static_cast<size_t>(target_batch_size_)) {
+                SpielFatalError("BatchedEvaluator::RunnerAsync physical batch size " +
+                                std::to_string(slot.batch.size()) +
+                                " exceeds configured target " +
+                                std::to_string(target_batch_size_));
+            }
             if (emit_batch_membership_) {
                 slot.membership_batch_id =
                     next_membership_batch_id_.fetch_add(
@@ -3502,6 +4504,8 @@ private:
                     {target_batch_size_, model_input_dim_}, host_options);
                 destination = slot.host_obs.data_ptr<float>();
             }
+            const bool stage_timers_enabled = async_stage_timers_enabled_.load(std::memory_order_relaxed);
+            auto t_pack_start = stage_timers_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             for (size_t i = 0; i < slot.batch.size(); ++i) {
                 const int64_t input_size =
                     static_cast<int64_t>(slot.batch[i].obs->size());
@@ -3516,18 +4520,51 @@ private:
                                 (model_input_dim_ - copy_size) * sizeof(float));
                 }
             }
+            if (stage_timers_enabled) {
+                auto t_pack_end = std::chrono::steady_clock::now();
+                cpu_pack_us_.fetch_add(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_pack_end - t_pack_start).count()),
+                    std::memory_order_relaxed);
+            }
             // Complete the prior stream before launching the next shared-model
             // forward. The two slots still overlap CPU batch assembly with the
             // prior GPU batch, while the event wait protects host outputs and
             // avoids whole-device synchronization. Concurrent forwards on the
             // shared LibTorch module are deliberately not enabled.
             if (enable_slot_reorder) {
+                if (enable_prewait_h2d) {
+                    const size_t batch_size = slot.batch.size();
+                    if (!slot.device_obs.defined() || batch_size > static_cast<size_t>(slot.device_obs.size(0))) {
+                        auto dev_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+                        const int64_t alloc_rows = std::max<int64_t>(target_batch_size_, batch_size);
+                        slot.device_obs = torch::empty({alloc_rows, model_input_dim_}, dev_opts);
+                        slot.captured_graphs.clear();
+                        slot.captured_graphs.resize(batch_size + 1);
+                    }
+                    if (stage_timers_enabled) {
+                        ensure_stage_events(slot);
+                    }
+                    {
+                        c10::cuda::CUDAStreamGuard stream_guard(*slot.stream);
+                        if (stage_timers_enabled && slot.ev_h2d_start) {
+                            slot.ev_h2d_start->record(*slot.stream);
+                        }
+                        slot.device_obs.narrow(0, 0, batch_size).copy_(
+                            slot.host_obs.narrow(0, 0, batch_size), /*non_blocking=*/true);
+                        if (stage_timers_enabled && slot.ev_h2d_end) {
+                            slot.ev_h2d_end->record(*slot.stream);
+                        }
+                    }
+                    slot.h2d_launched = true;
+                }
                 if (pending_slot >= 0) {
                     wait_slot_gpu(slots[pending_slot]);
                 }
                 try {
-                    launch_slot(slot);
+                    launch_slot(slot, stage_timers_enabled);
                 } catch (...) {
+                    slot.h2d_launched = false;
                     if (pending_slot >= 0) {
                         distribute_slot_cpu(slots[pending_slot]);
                         pending_slot = -1;
@@ -3543,7 +4580,7 @@ private:
                     finish_slot(slots[pending_slot]);
                     pending_slot = -1;
                 }
-                launch_slot(slot);
+                launch_slot(slot, async_stage_timers_enabled_.load(std::memory_order_relaxed));
             }
             if (enable_slot_reorder) {
                 pending_slot = slot_index;
@@ -3579,6 +4616,8 @@ private:
             RunnerAsync();
             return;
         }
+        const bool enable_scorer_inplace = (std::getenv("DUNE_DISABLE_SCORER_INPLACE") == nullptr);
+        const bool enable_tail_graph = (std::getenv("DUNE_DISABLE_TAIL_GRAPH") == nullptr);
         torch::InferenceMode inference_guard;
         torch::Tensor pinned_stacked_obs;
         torch::Tensor pinned_logits_out;
@@ -3588,6 +4627,7 @@ private:
         torch::Tensor graph_device_obs;
         at::cuda::MempoolId_t graph_pool;
         std::vector<CapturedForwardGraph> captured_graphs;
+        uint64_t local_graph_gen = graph_generation_.load(std::memory_order_acquire);
         std::unique_ptr<c10::cuda::CUDAStream> sync_runner_stream;
         if (device_.is_cuda()) {
             const c10::DeviceIndex dev_idx = device_.index();
@@ -3689,6 +4729,13 @@ private:
                             req.compact_dest->actions.clear();
                             req.compact_dest->probabilities.clear();
                         }
+                        if (req.greedy_result_dest) {
+                            req.greedy_result_dest->ok = false;
+                            req.greedy_result_dest->budget_exhausted = true;
+                        }
+                        if (req.greedy_action_dest) {
+                            *req.greedy_action_dest = kInvalidAction;
+                        }
                         SignalReadyFlag(req.ready_flag);
                     }
                     continue;
@@ -3702,6 +4749,15 @@ private:
                 : -1;
             total_batches_.fetch_add(1, std::memory_order_relaxed);
             total_requests_.fetch_add(static_cast<uint64_t>(batch_size), std::memory_order_relaxed);
+            if (batch_size >= static_cast<size_t>(target_batch_size_)) {
+                full_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else if (batch_size >= 128) {
+                ge128_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else if (batch_size >= 64) {
+                ge64_batches_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                under64_batches_.fetch_add(1, std::memory_order_relaxed);
+            }
             uint64_t observed_max = max_batch_size_seen_.load(std::memory_order_relaxed);
             while (batch_size > observed_max &&
                    !max_batch_size_seen_.compare_exchange_weak(
@@ -3788,6 +4844,13 @@ private:
                 pinned_allocated = true;
             }
 
+            if (batch.size() > static_cast<size_t>(target_batch_size_)) {
+                SpielFatalError("BatchedEvaluator::Runner physical batch size " +
+                                std::to_string(batch.size()) +
+                                " exceeds target " +
+                                std::to_string(target_batch_size_));
+            }
+
             float* dest_ptr = pinned_stacked_obs.data_ptr<float>();
             for (size_t i = 0; i < batch_size; ++i) {
                 // Per-request copy length (finding 6): sizing from batch[0] would
@@ -3833,6 +4896,14 @@ private:
             }
 
             if (device_.is_cuda()) {
+                const uint64_t target_graph_gen = graph_generation_.load(std::memory_order_acquire);
+                if (local_graph_gen != target_graph_gen) {
+                    if (sync_runner_stream) sync_runner_stream->synchronize();
+                    captured_graphs.clear();
+                    graph_pool = at::cuda::graph_pool_handle();
+                    local_graph_gen = target_graph_gen;
+                }
+
                 if (batch_size >= captured_graphs.size()) {
                     captured_graphs.resize(batch_size + 1);
                 }
@@ -3841,6 +4912,7 @@ private:
                         {static_cast<int64_t>(batch_size), model_input_dim_},
                         torch::TensorOptions().dtype(torch::kFloat32).device(device_));
                     captured_graphs.clear();
+                    graph_pool = at::cuda::graph_pool_handle();
                     captured_graphs.resize(batch_size + 1);
                 }
             }
@@ -3863,15 +4935,24 @@ private:
                 std::shared_lock<std::shared_mutex> lock(*sync_mutex_);
                 SharedDunePolicyValueNetImpl::ModelOutputs outputs;
                 SharedDunePolicyValueNetImpl::ModelOutputs critic_outputs;
+                torch::Tensor values_f32_out;
                 if (device_.is_cuda()) {
                     auto& cg = captured_graphs[batch_size];
                     if (!cg.graph) {
                         if (rollout_amp_) {
                             if (model_) {
-                                model_->RefreshBf16InferenceCache();
+                                if (model_->use_fp8_trunk()) {
+                                    model_->PrepareFp8Cache();
+                                } else {
+                                    model_->RefreshBf16InferenceCache();
+                                }
                             }
                             if (critic_model_) {
-                                critic_model_->RefreshBf16InferenceCache();
+                                if (critic_model_->use_fp8_trunk()) {
+                                    critic_model_->PrepareFp8Cache();
+                                } else {
+                                    critic_model_->RefreshBf16InferenceCache();
+                                }
                             }
                         }
                         {
@@ -3882,6 +4963,9 @@ private:
                             critic_outputs = (critic_model_ != nullptr)
                                 ? critic_model_->forward(device_obs)
                                 : outputs;
+                            if (enable_tail_graph && model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                (void)model_->semantic_scorer_->ProjectTrunk(outputs.trunk);
+                            }
                         }
                         at::autocast::clear_cache();
                         {
@@ -3894,12 +4978,19 @@ private:
                             cg.critic_outputs = (critic_model_ != nullptr)
                                 ? critic_model_->forward(device_obs)
                                 : cg.outputs;
+                            if (enable_tail_graph) {
+                                if (model_->with_semantic_scorer_ && model_->semantic_scorer_) {
+                                    cg.projected_trunk = model_->semantic_scorer_->ProjectTrunk(cg.outputs.trunk);
+                                }
+                                cg.values_f32 = cg.critic_outputs.values.reshape({static_cast<int64_t>(batch_size)}).to(torch::kFloat32);
+                            }
                             cg.graph->capture_end();
                         }
                     }
                     cg.graph->replay();
                     outputs = cg.outputs;
                     critic_outputs = cg.critic_outputs;
+                    values_f32_out = cg.values_f32;
                 } else {
                     AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                  false,
@@ -3920,8 +5011,14 @@ private:
                         AutocastGuard autocast_guard(c10::DeviceType::CUDA,
                                                      device_.is_cuda() && rollout_amp_,
                                                      clear_autocast_cache_per_batch_);
+                        torch::Tensor precomputed_trunk = (device_.is_cuda() && enable_tail_graph)
+                            ? captured_graphs[batch_size].projected_trunk
+                            : torch::Tensor();
                         dune_semantic::ApplySemanticScorerBatch(
-                            model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_);
+                            model_->semantic_scorer_, outputs.trunk, batch_actions, outputs.logits, device_,
+                            /*workspace=*/nullptr,
+                            /*allow_inplace=*/enable_scorer_inplace,
+                            /*precomputed_trunk_proj=*/precomputed_trunk);
                     }
                 }
                 pred_logits = outputs.logits;
@@ -4039,6 +5136,70 @@ private:
                             static_cast<int32_t>(batch_size);
                         batch[i].compact_dest->physical_batch_row =
                             static_cast<int32_t>(i);
+                    }
+                }
+
+                if (batch[i].greedy_action_dest != nullptr || batch[i].greedy_result_dest != nullptr) {
+                    greedy_action_calls_.fetch_add(1, std::memory_order_relaxed);
+                    Action best_a = kInvalidAction;
+                    if (!batch[i].legal_actions.empty()) {
+                        best_a = batch[i].legal_actions.front();
+                        if (batch[i].legal_actions.size() > 1) {
+                            std::vector<float> row_logits(
+                                logits_ptr + i * action_dim,
+                                logits_ptr + (i + 1) * action_dim);
+                            CenterAndCapLegalLogits(row_logits, batch[i].legal_actions, logit_cap_);
+                            float z_max1 = -std::numeric_limits<float>::infinity();
+                            float z_max2 = -std::numeric_limits<float>::infinity();
+                            Action act1 = batch[i].legal_actions.front();
+                            for (Action a : batch[i].legal_actions) {
+                                if (a >= 0 && static_cast<size_t>(a) < row_logits.size()) {
+                                    float val = row_logits[a];
+                                    if (val > z_max1) {
+                                        z_max2 = z_max1;
+                                        z_max1 = val;
+                                        act1 = a;
+                                    } else if (val > z_max2) {
+                                        z_max2 = val;
+                                    }
+                                }
+                            }
+                            if (z_max1 - z_max2 > 1e-5f) {
+                                best_a = act1;
+                            } else {
+                                greedy_action_ties_.fetch_add(1, std::memory_order_relaxed);
+                                double max_logit = -std::numeric_limits<double>::infinity();
+                                for (Action a : batch[i].legal_actions) {
+                                    if (a >= 0 && static_cast<size_t>(a) < row_logits.size()) {
+                                        max_logit = std::max(max_logit, static_cast<double>(row_logits[a]));
+                                    }
+                                }
+                                double sum_exp = 0.0;
+                                for (Action a : batch[i].legal_actions) {
+                                    if (a >= 0 && static_cast<size_t>(a) < row_logits.size()) {
+                                        sum_exp += std::exp(static_cast<double>(row_logits[a]) - max_logit);
+                                    }
+                                }
+                                float best_p = -1.0f;
+                                for (Action a : batch[i].legal_actions) {
+                                    double prob = (sum_exp > 0.0 && !std::isnan(sum_exp))
+                                                      ? (std::exp(static_cast<double>(row_logits[a]) - max_logit) / sum_exp)
+                                                      : (1.0 / batch[i].legal_actions.size());
+                                    float fprob = static_cast<float>(prob);
+                                    if (fprob > best_p) {
+                                        best_p = fprob;
+                                        best_a = a;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (batch[i].greedy_action_dest != nullptr) {
+                        *batch[i].greedy_action_dest = best_a;
+                    }
+                    if (batch[i].greedy_result_dest != nullptr) {
+                        batch[i].greedy_result_dest->action = best_a;
+                        batch[i].greedy_result_dest->ok = true;
                     }
                 }
 

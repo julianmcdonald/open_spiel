@@ -14,9 +14,11 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 #include <torch/torch.h>
+#include <cstdlib>
 
 #include "dune_network.h"
 #include "dune_evaluator.h"
+#include "dune_batched_evaluator.h"
 
 using namespace open_spiel;
 
@@ -914,6 +916,258 @@ int main(int argc, char* argv[]) {
     assert(destroyed.load(std::memory_order_acquire));
 
     std::cout << "Test 14 Passed!\n\n";
+  }
+
+  // Test 15: Bug 7 group-size guard on EvaluateBatchValuesWithCompactPrior
+  {
+    std::cout << "=== Test 15: Bug 7 group-size guard on EvaluateBatchValuesWithCompactPrior ===\n";
+    std::shared_mutex sync_mutex;
+    open_spiel::BatchedEvaluator be_small(model, /*target_batch_size=*/2, /*timeout_ms=*/5, device, &sync_mutex);
+    std::vector<std::vector<float>> obs_4(4, std::vector<float>(static_cast<size_t>(obs_size), 0.5f));
+    std::vector<Action> legal_actions = {0, 1, 2};
+
+    bool threw = false;
+    open_spiel::SetErrorHandler([](const std::string& msg) { throw std::runtime_error(msg); });
+    try {
+      (void)be_small.EvaluateBatchValuesWithCompactPrior(obs_4, /*prior_index=*/0, legal_actions);
+    } catch (const std::exception& e) {
+      threw = std::string(e.what()).find("exceeds configured target") != std::string::npos;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    assert(threw);
+
+    // Verify target_batch_size = 4 succeeds with 4 observations
+    open_spiel::BatchedEvaluator be_ok(model, /*target_batch_size=*/4, /*timeout_ms=*/5, device, &sync_mutex);
+    auto res_ok = be_ok.EvaluateBatchValuesWithCompactPrior(obs_4, /*prior_index=*/0, legal_actions);
+    assert(res_ok.first.size() == 4);
+    assert(res_ok.second.actions.size() == legal_actions.size());
+
+    std::cout << "Test 15 Passed!\n\n";
+  }
+
+  // Test 16: Bitwise parity max |diff| == 0.0 across Steps 3, 5, 7 + fail-closed v3 kTleilaxuPurchase
+  {
+    std::cout << "=== Test 16: Bitwise parity max |diff| == 0.0 across Steps 3, 5, 7 + fail-closed v3 kTleilaxuPurchase ===\n";
+    const int64_t v4_input_dim = dune_imperium::kFullPublicInformationV4StateSize;
+    auto model_v3 = std::make_shared<SharedDunePolicyValueNetImpl>(
+        v4_input_dim, /*hidden_dim=*/2048, /*action_dim=*/2391, /*num_blocks=*/2,
+        /*use_nonlinear=*/false, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+        /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+        /*semantic_descriptor_schema=*/dune_semantic::kDescriptorSchemaVersionV3);
+    model_v3->eval();
+    {
+      torch::NoGradGuard no_grad;
+      model_v3->semantic_scorer_->out_layer->weight.normal_(0.0, 0.2);
+      model_v3->semantic_scorer_->out_layer_ext->weight.normal_(0.0, 0.2);
+    }
+    model_v3->to(device);
+
+    std::shared_mutex sync_mutex;
+    setenv("DUNE_DISABLE_PREWAIT_H2D", "1", 1);
+    setenv("DUNE_DISABLE_CAP_SUBSAMPLE", "1", 1);
+    setenv("DUNE_DISABLE_SELECTIVE_LOGITS_D2H", "1", 1);
+    setenv("DUNE_DISABLE_SCORER_INPLACE", "1", 1);
+    setenv("DUNE_DISABLE_TAIL_GRAPH", "1", 1);
+    open_spiel::BatchedEvaluator be_legacy(
+        model_v3, /*target_batch_size=*/8, /*timeout_ms=*/500, device, &sync_mutex,
+        /*logit_cap=*/10.0f, /*device_synchronize=*/false, /*high_priority_stream=*/false,
+        /*emit_batch_membership=*/false, /*rollout_amp=*/device.is_cuda(), /*allow_tf32=*/true);
+
+    unsetenv("DUNE_DISABLE_PREWAIT_H2D");
+    unsetenv("DUNE_DISABLE_CAP_SUBSAMPLE");
+    unsetenv("DUNE_DISABLE_SELECTIVE_LOGITS_D2H");
+    unsetenv("DUNE_DISABLE_SCORER_INPLACE");
+    unsetenv("DUNE_DISABLE_TAIL_GRAPH");
+    open_spiel::BatchedEvaluator be_opt(
+        model_v3, /*target_batch_size=*/8, /*timeout_ms=*/500, device, &sync_mutex,
+        /*logit_cap=*/10.0f, /*device_synchronize=*/false, /*high_priority_stream=*/false,
+        /*emit_batch_membership=*/false, /*rollout_amp=*/device.is_cuda(), /*allow_tf32=*/true);
+
+    auto make_cands = [](int batch_idx, int row) -> dune_semantic::CandidateActionData {
+      dune_semantic::CandidateActionData cd;
+      cd.actions = {10, 20, 30};
+      cd.card_ids = {1, 2, 3};
+      cd.space_ids = {4, 5, 6};
+      cd.supported = {true, true, true};
+      if (batch_idx == 1 && (row == 2 || row == 4)) {
+        cd.roles = {dune_semantic::ActionRole::kPrimaryCard,
+                    dune_semantic::ActionRole::kIndexedIntrigue,
+                    dune_semantic::ActionRole::kBoardSpace};
+      } else {
+        cd.roles = {dune_semantic::ActionRole::kPrimaryCard,
+                    dune_semantic::ActionRole::kMarketPurchase,
+                    dune_semantic::ActionRole::kBoardSpace};
+      }
+      cd.features.assign(3 * dune_semantic::kSemanticFeatDim, 0.1f * (batch_idx + 1) + 0.01f * row);
+      return cd;
+    };
+
+    struct BatchOutput {
+      EvalResult eval_0;
+      EvalResult eval_1;
+      CompactEvalResult compact_2;
+      CompactEvalResult compact_3;
+      GreedyEvalResult greedy_4;
+      GreedyEvalResult greedy_5;
+      EvalResult val_6;
+      EvalResult val_7;
+    };
+
+    auto run_batch = [&](open_spiel::BatchedEvaluator& be, int batch_idx) -> BatchOutput {
+      BatchOutput out;
+      std::vector<std::vector<float>> batch_obs(8, std::vector<float>(v4_input_dim));
+      for (int r = 0; r < 8; ++r) {
+        for (size_t i = 0; i < batch_obs[r].size(); ++i) {
+          batch_obs[r][i] = std::sin(static_cast<float>((batch_idx + 1) * 1000 + r * 100 + i));
+        }
+      }
+      std::vector<Action> legal_actions = {10, 20, 30, 40, 50};
+      dune_semantic::CandidateActionData cd0 = make_cands(batch_idx, 0);
+      dune_semantic::CandidateActionData cd2 = make_cands(batch_idx, 2);
+      dune_semantic::CandidateActionData cd3 = make_cands(batch_idx, 3);
+      dune_semantic::CandidateActionData cd4 = make_cands(batch_idx, 4);
+      dune_semantic::CandidateActionData cd5 = make_cands(batch_idx, 5);
+
+      std::vector<std::thread> ths;
+      ths.reserve(8);
+      ths.emplace_back([&]() { out.eval_0 = be.EvaluateWithActions(batch_obs[0], (batch_idx % 2 == 0) ? &cd0 : nullptr); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.eval_1 = be.Evaluate(batch_obs[1]); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.compact_2 = be.EvaluateCompact(batch_obs[2], legal_actions, &cd2); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.compact_3 = be.EvaluateCompact(batch_obs[3], legal_actions, &cd3); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.greedy_4 = be.EvaluateGreedyAction(batch_obs[4], legal_actions, &cd4); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.greedy_5 = be.EvaluateGreedyAction(batch_obs[5], legal_actions, &cd5); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.val_6 = be.EvaluateValues(batch_obs[6]); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      ths.emplace_back([&]() { out.val_7 = be.EvaluateValues(batch_obs[7]); });
+
+      for (auto& t : ths) t.join();
+      return out;
+    };
+
+    for (int b = 0; b < 4; ++b) {
+      BatchOutput legacy_out = run_batch(be_legacy, b);
+      BatchOutput opt_out = run_batch(be_opt, b);
+
+      assert(legacy_out.eval_0.ok && opt_out.eval_0.ok);
+      AssertAlmostEqual(legacy_out.eval_0.value, opt_out.eval_0.value, 0.0);
+      assert(legacy_out.eval_0.logits.size() == opt_out.eval_0.logits.size());
+      for (size_t k = 0; k < legacy_out.eval_0.logits.size(); ++k) {
+        AssertAlmostEqual(legacy_out.eval_0.logits[k], opt_out.eval_0.logits[k], 0.0);
+      }
+
+      assert(legacy_out.eval_1.ok && opt_out.eval_1.ok);
+      AssertAlmostEqual(legacy_out.eval_1.value, opt_out.eval_1.value, 0.0);
+      assert(legacy_out.eval_1.logits.size() == opt_out.eval_1.logits.size());
+      for (size_t k = 0; k < legacy_out.eval_1.logits.size(); ++k) {
+        AssertAlmostEqual(legacy_out.eval_1.logits[k], opt_out.eval_1.logits[k], 0.0);
+      }
+
+      assert(legacy_out.compact_2.ok && opt_out.compact_2.ok);
+      AssertAlmostEqual(legacy_out.compact_2.value, opt_out.compact_2.value, 0.0);
+      assert(legacy_out.compact_2.probabilities.size() == opt_out.compact_2.probabilities.size());
+      for (size_t k = 0; k < legacy_out.compact_2.probabilities.size(); ++k) {
+        AssertAlmostEqual(legacy_out.compact_2.probabilities[k], opt_out.compact_2.probabilities[k], 0.0);
+      }
+
+      assert(legacy_out.compact_3.ok && opt_out.compact_3.ok);
+      AssertAlmostEqual(legacy_out.compact_3.value, opt_out.compact_3.value, 0.0);
+      assert(legacy_out.compact_3.probabilities.size() == opt_out.compact_3.probabilities.size());
+      for (size_t k = 0; k < legacy_out.compact_3.probabilities.size(); ++k) {
+        AssertAlmostEqual(legacy_out.compact_3.probabilities[k], opt_out.compact_3.probabilities[k], 0.0);
+      }
+
+      assert(legacy_out.greedy_4.ok && opt_out.greedy_4.ok);
+      assert(legacy_out.greedy_4.action == opt_out.greedy_4.action);
+
+      assert(legacy_out.greedy_5.ok && opt_out.greedy_5.ok);
+      assert(legacy_out.greedy_5.action == opt_out.greedy_5.action);
+
+      assert(legacy_out.val_6.ok && opt_out.val_6.ok);
+      AssertAlmostEqual(legacy_out.val_6.value, opt_out.val_6.value, 0.0);
+
+      assert(legacy_out.val_7.ok && opt_out.val_7.ok);
+      AssertAlmostEqual(legacy_out.val_7.value, opt_out.val_7.value, 0.0);
+    }
+
+    // Explicit exact tie test
+    auto tie_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        v4_input_dim, hidden_dim, action_size, /*num_blocks=*/1,
+        /*use_nonlinear=*/false, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+        /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+        /*semantic_descriptor_schema=*/dune_semantic::kDescriptorSchemaVersionV3);
+    tie_model->eval();
+    {
+      torch::NoGradGuard no_grad;
+      tie_model->policy_head->weight.zero_();
+      tie_model->policy_head->bias.fill_(-500.0f);
+      tie_model->policy_head->bias[10] = 500.0f;
+      tie_model->policy_head->bias[20] = 500.0f;
+      tie_model->semantic_scorer_->out_layer->weight.zero_();
+      if (tie_model->semantic_scorer_->out_layer->bias.defined()) {
+        tie_model->semantic_scorer_->out_layer->bias.zero_();
+      }
+      tie_model->semantic_scorer_->out_layer_ext->weight.zero_();
+      if (tie_model->semantic_scorer_->out_layer_ext->bias.defined()) {
+        tie_model->semantic_scorer_->out_layer_ext->bias.zero_();
+      }
+    }
+    tie_model->to(device);
+    const char* prev_fast_greedy = std::getenv("DUNE_ENABLE_FAST_GREEDY");
+    setenv("DUNE_ENABLE_FAST_GREEDY", "1", 1);
+    auto tie_be = std::make_shared<open_spiel::BatchedEvaluator>(
+        tie_model, /*target_batch_size=*/1, /*timeout_ms=*/5, device, &sync_mutex, /*logit_cap=*/10.0f);
+    open_spiel::BatchedNNEvaluator tie_nn_eval(tie_be, 10.0f);
+    assert(tie_nn_eval.FastGreedyEnabled());
+
+    std::vector<Action> tie_legals = {10, 20};
+    tie_nn_eval.SetFastGreedyEnabled(false);
+    Action act_legacy = tie_nn_eval.GreedyActionWithLegals(*state, tie_legals);
+
+    tie_nn_eval.SetFastGreedyEnabled(true);
+    Action act_fast = tie_nn_eval.GreedyActionWithLegals(*state, tie_legals);
+
+    assert(act_legacy == act_fast);
+    assert(act_fast == 10 || act_fast == 20);
+    if (device.is_cuda()) {
+      assert(tie_be->GetBatcherTelemetry().greedy_action_ties >= 1);
+    }
+    if (prev_fast_greedy != nullptr) {
+      setenv("DUNE_ENABLE_FAST_GREEDY", prev_fast_greedy, 1);
+    } else {
+      unsetenv("DUNE_ENABLE_FAST_GREEDY");
+    }
+
+    // Fail-closed H2 guard verification on v3 scorer with ActionRole::kTleilaxuPurchase
+    dune_semantic::CandidateActionData h2_data;
+    h2_data.actions = {91};
+    h2_data.card_ids = {118};
+    h2_data.space_ids = {0};
+    h2_data.supported = {true};
+    h2_data.roles = {dune_semantic::ActionRole::kTleilaxuPurchase};
+    h2_data.features.assign(dune_semantic::kSemanticFeatDim, 0.5f);
+
+    std::vector<const dune_semantic::CandidateActionData*> h2_batch = {&h2_data};
+    torch::Tensor dummy_trunk = torch::zeros({1, 2048}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+    torch::Tensor dummy_logits = torch::zeros({1, 2391}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+
+    bool h2_threw = false;
+    open_spiel::SetErrorHandler([](const std::string& msg) { throw std::runtime_error(msg); });
+    try {
+      dune_semantic::ApplySemanticScorerBatch(
+          model_v3->semantic_scorer_, dummy_trunk, h2_batch, dummy_logits, device);
+    } catch (const std::exception& e) {
+      h2_threw = std::string(e.what()).find("enable_f_ is false") != std::string::npos;
+    }
+    open_spiel::SetErrorHandler(ExitingErrorHandler);
+    assert(h2_threw);
+
+    std::cout << "Test 16 Passed!\n\n";
   }
 
   std::cout << "All DuneNNEvaluator tests completed successfully!\n";

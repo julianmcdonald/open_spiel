@@ -1804,6 +1804,228 @@ void ClockedExceptionSafetyTest(const std::shared_ptr<const Game>& game) {
   }
 }
 
+class NormalizedJointPriorEvaluator : public BatchedNNEvaluator {
+ public:
+  NormalizedJointPriorEvaluator() : BatchedNNEvaluator(nullptr, 10.0f) {}
+  ActionsAndProbs Prior(const State& state) override {
+    ActionsAndProbs prior;
+    const auto legal = state.LegalActions();
+    if (legal.empty()) return prior;
+    double s = 0.0;
+    for (size_t i = 0; i < legal.size(); ++i) {
+      const Action a = legal[i];
+      const double w = (a >= kActionSelectAgentCard0) ? (1.0 / (1.0 + 0.1 * i)) : 0.1;
+      prior.emplace_back(a, w);
+      s += w;
+    }
+    for (auto& ap : prior) ap.second /= s;
+    return prior;
+  }
+};
+
+void SearchV2JointCandidateEnumerationAndRolloutTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<NormalizedJointPriorEvaluator>()};
+  const ActionsAndProbs root_prior = evaluators.front()->Prior(*state);
+
+  auto candidates = EnumerateJointAgentCandidates(
+      *state, state->CurrentPlayer(), evaluators, root_prior, /*max_candidates=*/8);
+
+  SPIEL_CHECK_FALSE(candidates.empty());
+  SPIEL_CHECK_LE(candidates.size(), 8);
+
+  Action greedy_root = PickGreedyAction(root_prior, state->LegalActions());
+  SPIEL_CHECK_EQ(candidates[0].first_action, greedy_root);
+
+  bool found_joint_pair = false;
+  for (const auto& cand : candidates) {
+    SPIEL_CHECK_NE(cand.first_action, kInvalidAction);
+    SPIEL_CHECK_GE(cand.joint_prior, 0.0);
+    if (cand.second_action != kInvalidAction) {
+      SPIEL_CHECK_TRUE(IsBoardSpaceAction(cand.second_action));
+      found_joint_pair = true;
+    }
+  }
+  SPIEL_CHECK_TRUE(found_joint_pair);
+
+  TurnSearchTree tree;
+  auto joint_res = SearchV2JointPlacementDecision(
+      *state, state->CurrentPlayer(), &tree, evaluators,
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*max_time_ms=*/-1.0, /*max_inflight_worlds=*/16,
+      /*prior_log_ratio_weight=*/0.02, /*stage1_high_conf_prior_skip=*/0.0,
+      /*precomputed_raw_prior=*/&root_prior);
+
+  SPIEL_CHECK_NE(joint_res.chosen_first_action, kInvalidAction);
+  SPIEL_CHECK_GT(joint_res.base.new_rollouts_executed, 0);
+  SPIEL_CHECK_FALSE(joint_res.joint_candidates.empty());
+}
+
+void SearchV2JointFollowupCacheTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+
+  const auto temp_dir = std::filesystem::temp_directory_path() /
+      ("dune_search_v2_cache_test_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(temp_dir);
+  const int previous_cpu_threads = at::get_num_threads();
+  at::set_num_threads(1);
+  try {
+    const auto checkpoint = (temp_dir / "tiny.pt").string();
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kLegacyInformationStateSize, /*hidden_dim=*/16,
+        kNumDistinctPlayerActions, /*num_blocks=*/1);
+    {
+      torch::NoGradGuard no_grad;
+      for (auto& parameter : model->parameters()) parameter.zero_();
+    }
+    torch::save(model, checkpoint);
+    {
+      const auto schema = GetInformationStateSchema(MarketAppendixMode::kNone);
+      std::ofstream metadata(temp_dir / "tiny.json");
+      metadata << "{\"observation_dim\":" << kLegacyInformationStateSize
+               << ",\"hidden_dim\":16,\"num_blocks\":1,"
+               << "\"market_appendix_mode\":\"none\","
+               << "\"feature_schema_sha256\":\"" << schema.sha256 << "\","
+               << "\"enable_semantic_scorer\":false}\n";
+    }
+
+    DuneAdaptiveRolloutSession session(
+        checkpoint, "cpu", /*hidden_dim=*/16, /*num_blocks=*/1,
+        /*reference_rollouts_per_action=*/8, /*leader_rollouts=*/4,
+        /*target_batch_size=*/16, /*seed=*/1138,
+        /*use_successive_halving=*/true, /*fixed_top5_candidates=*/false,
+        /*max_inflight_worlds=*/4, /*num_evaluators=*/1,
+        /*top5_min_budget=*/576, /*all_buy_candidates=*/true,
+        /*enable_fp8_trunk=*/false, /*search_v2=*/true);
+
+    SPIEL_CHECK_TRUE(session.search_v2());
+
+    const auto res0 = session.Search(*state, 2000.0);
+    session.DiscardPendingAction();
+    SPIEL_CHECK_NE(res0.diagnostics.selected_action, kInvalidAction);
+
+    if (res0.diagnostics.selected_action >= kActionSelectAgentCard0 &&
+        res0.diagnostics.selected_action < kActionSelectAgentCard0 + kNumImperiumCardIds) {
+      state->ApplyAction(res0.diagnostics.selected_action);
+
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto res1 = session.Search(*state, 2000.0);
+      const double elapsed_cache_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+
+      SPIEL_CHECK_EQ(res1.diagnostics.termination_reason, "joint_followup_cache");
+      SPIEL_CHECK_EQ(res1.simulations_completed, 0);
+      SPIEL_CHECK_LT(elapsed_cache_ms, 50.0);
+      SPIEL_CHECK_FALSE(res1.policy.empty());
+      session.DiscardPendingAction();
+
+      session.ResetSession("test_invalidation");
+      const auto res_after_reset = session.Search(*state, 2000.0);
+      session.DiscardPendingAction();
+      SPIEL_CHECK_NE(res_after_reset.diagnostics.termination_reason, "joint_followup_cache");
+    }
+  } catch (...) {
+    at::set_num_threads(previous_cpu_threads);
+    std::filesystem::remove_all(temp_dir);
+    throw;
+  }
+  at::set_num_threads(previous_cpu_threads);
+  std::filesystem::remove_all(temp_dir);
+}
+
+void SearchV2TightClockAntiStarvationTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0;; ++steps) {
+    SPIEL_CHECK_LT(steps, 1000);
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+
+  const auto temp_dir = std::filesystem::temp_directory_path() /
+      ("dune_search_v2_clock_test_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(temp_dir);
+  const int previous_cpu_threads = at::get_num_threads();
+  at::set_num_threads(1);
+  try {
+    const auto checkpoint = (temp_dir / "tiny.pt").string();
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kLegacyInformationStateSize, /*hidden_dim=*/16,
+        kNumDistinctPlayerActions, /*num_blocks=*/1);
+    {
+      torch::NoGradGuard no_grad;
+      for (auto& parameter : model->parameters()) parameter.zero_();
+    }
+    torch::save(model, checkpoint);
+    {
+      const auto schema = GetInformationStateSchema(MarketAppendixMode::kNone);
+      std::ofstream metadata(temp_dir / "tiny.json");
+      metadata << "{\"observation_dim\":" << kLegacyInformationStateSize
+               << ",\"hidden_dim\":16,\"num_blocks\":1,"
+               << "\"market_appendix_mode\":\"none\","
+               << "\"feature_schema_sha256\":\"" << schema.sha256 << "\","
+               << "\"enable_semantic_scorer\":false}\n";
+    }
+
+    DuneAdaptiveRolloutSession session(
+        checkpoint, "cpu", /*hidden_dim=*/16, /*num_blocks=*/1,
+        /*reference_rollouts_per_action=*/16, /*leader_rollouts=*/8,
+        /*target_batch_size=*/16, /*seed=*/20261105,
+        /*use_successive_halving=*/true, /*fixed_top5_candidates=*/false,
+        /*max_inflight_worlds=*/16, /*num_evaluators=*/1,
+        /*top5_min_budget=*/576, /*all_buy_candidates=*/true,
+        /*enable_fp8_trunk=*/false, /*search_v2=*/true);
+
+    {
+      auto s_clone = state->Clone();
+      session.ResetSession("tight_clock_2000ms");
+      const auto res_2000 = session.Search(*s_clone, 2000.0);
+      session.DiscardPendingAction();
+      SPIEL_CHECK_NE(res_2000.fallback_reason, "live_deadline_reached");
+      if (res_2000.simulations_completed > 0) {
+        SPIEL_CHECK_GE(res_2000.diagnostics.stage1_kept_worlds, 2);
+      }
+    }
+
+    {
+      auto s_clone = state->Clone();
+      session.ResetSession("tight_clock_800ms");
+      const auto res_800 = session.Search(*s_clone, 800.0);
+      session.DiscardPendingAction();
+      SPIEL_CHECK_NE(res_800.fallback_reason, "live_deadline_reached");
+      if (res_800.simulations_completed > 0) {
+        SPIEL_CHECK_GE(res_800.diagnostics.stage1_kept_worlds, 2);
+      }
+    }
+  } catch (...) {
+    at::set_num_threads(previous_cpu_threads);
+    std::filesystem::remove_all(temp_dir);
+    throw;
+  }
+  at::set_num_threads(previous_cpu_threads);
+  std::filesystem::remove_all(temp_dir);
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -1837,4 +2059,7 @@ int main(int argc, char** argv) {
   AdaptivePublicKnowledgeCorrectionTest();
   AdaptiveSimulatedIntrigueKnowledgeTest();
   ClockedExceptionSafetyTest(game);
+  SearchV2JointCandidateEnumerationAndRolloutTest(game);
+  SearchV2JointFollowupCacheTest(game);
+  SearchV2TightClockAntiStarvationTest(game);
 }

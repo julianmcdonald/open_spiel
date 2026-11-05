@@ -5,6 +5,7 @@
 #include "open_spiel/spiel_bots.h"
 #include "open_spiel/utils/json.h"
 #include <fstream>
+#include <cstdlib>
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
 #include <algorithm>
 #include <cmath>
@@ -1088,7 +1089,9 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
     int max_inflight_worlds,
     int num_evaluators,
     int top5_min_budget,
-    bool all_buy_candidates)
+    bool all_buy_candidates,
+    bool enable_fp8_trunk,
+    bool search_v2)
     : checkpoint_path_(checkpoint_path),
       device_str_(device_str),
       hidden_dim_(hidden_dim),
@@ -1102,7 +1105,13 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
       max_inflight_worlds_(std::max(1, max_inflight_worlds)),
       num_evaluators_(std::max(1, num_evaluators)),
       top5_min_budget_(top5_min_budget),
-      all_buy_candidates_(all_buy_candidates) {
+      all_buy_candidates_(all_buy_candidates),
+      enable_fp8_trunk_(enable_fp8_trunk),
+      search_v2_(search_v2) {
+  const char* env_fp8 = std::getenv("DUNE_ENABLE_FP8_TRUNK");
+  if (env_fp8 != nullptr && (std::string(env_fp8) == "1" || std::string(env_fp8) == "true")) {
+    enable_fp8_trunk_ = true;
+  }
   torch::Device device(torch::kCPU);
   if (device_str == "cuda" && torch::cuda::is_available()) {
     device = torch::Device(torch::kCUDA);
@@ -1190,7 +1199,11 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
 
   const bool use_cuda_amp = impl_->device.is_cuda();
   if (use_cuda_amp) {
-    impl_->model->RefreshBf16InferenceCache();
+    if (enable_fp8_trunk_) {
+      impl_->model->PrepareFp8Cache();
+    } else {
+      impl_->model->RefreshBf16InferenceCache();
+    }
   }
   impl_->mutex = std::make_unique<std::shared_mutex>();
   impl_->coordinators.resize(num_evaluators_);
@@ -1202,12 +1215,111 @@ DuneAdaptiveRolloutSession::DuneAdaptiveRolloutSession(
         /*rollout_amp=*/use_cuda_amp, /*allow_tf32=*/use_cuda_amp);
     impl_->evaluators[e] = std::make_shared<BatchedNNEvaluator>(
         impl_->coordinators[e], 10.0f, detected_mode);
+    if (use_cuda_amp && std::getenv("DUNE_DISABLE_SESSION_GRAPH_WARMUP") == nullptr) {
+      impl_->coordinators[e]->WarmupCudaGraphs(
+          {1, 4, std::min(target_batch_size_, max_inflight_worlds_), target_batch_size_});
+    }
   }
 
   ResetSession("initialization");
 }
 
 DuneAdaptiveRolloutSession::~DuneAdaptiveRolloutSession() = default;
+
+void DuneAdaptiveRolloutSession::set_enable_fp8_trunk(bool val) {
+  if (enable_fp8_trunk_ == val) return;
+  enable_fp8_trunk_ = val;
+  if (!impl_ || !impl_->device.is_cuda()) return;
+  for (auto& coord : impl_->coordinators) {
+    if (coord) {
+      coord->SetEnableFp8Trunk(val);
+      if (std::getenv("DUNE_DISABLE_SESSION_GRAPH_WARMUP") == nullptr) {
+        coord->WarmupCudaGraphs(
+            {1, 4, std::min(target_batch_size_, max_inflight_worlds_), target_batch_size_});
+      }
+    }
+  }
+}
+
+PolicyPriorDetails DuneAdaptiveRolloutSession::PriorWithDetails(const State& state) const {
+  if (!impl_ || impl_->evaluators.empty() || !impl_->evaluators.front() || state.IsTerminal()) {
+    return {false, {}, {}, 0.0f};
+  }
+  if (state.IsChanceNode()) {
+    PolicyPriorDetails details;
+    auto outcomes = state.ChanceOutcomes();
+    details.actions.reserve(outcomes.size());
+    details.probabilities.reserve(outcomes.size());
+    for (const auto& [action, prob] : outcomes) {
+      details.actions.push_back(action);
+      details.probabilities.push_back(static_cast<float>(prob));
+    }
+    details.ok = !details.actions.empty();
+    details.value = 0.0f;
+    return details;
+  }
+  open_spiel::CompactEvalResult res = impl_->evaluators.front()->PriorWithDetails(state);
+  return {res.ok, std::move(res.actions), std::move(res.probabilities), res.value};
+}
+
+PairedActionEvaluationResult DuneAdaptiveRolloutSession::EvaluateActionPairTerminal(
+    const State& state, Action a_first, Action a_second,
+    int num_worlds, uint64_t seed) {
+  PairedActionEvaluationResult result;
+  if (num_worlds <= 0 || !impl_ || impl_->evaluators.empty()) return result;
+
+  const auto* dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(&state);
+  const Player search_player = state.CurrentPlayer();
+  const std::vector<Action> ordered_candidates = {a_first, a_second};
+  const std::vector<size_t> candidate_indices = {0, 1};
+
+  std::vector<std::vector<double>> per_candidate_rollouts(2);
+  int new_rollouts_executed = 0;
+  auto deadline_tp = std::chrono::steady_clock::now() + std::chrono::hours(24);
+
+  int kept_worlds = dune_imperium::RunClockedPairedRolloutStage(
+      state,
+      dune,
+      search_player,
+      impl_->evaluators,
+      ordered_candidates,
+      candidate_indices,
+      num_worlds,
+      /*world_seed_offset=*/0,
+      seed,
+      use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn
+                           : dune_imperium::SearchRolloutCrnMode::kSequential,
+      /*sample_opponent_leader_draft=*/false,
+      deadline_tp,
+      /*active_tree=*/nullptr,
+      per_candidate_rollouts,
+      new_rollouts_executed,
+      max_inflight_worlds_,
+      /*resample_from_infostate=*/true);
+
+  result.num_worlds = kept_worlds;
+  if (kept_worlds > 0) {
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int r = 0; r < kept_worlds; ++r) {
+      sum0 += per_candidate_rollouts[0][r];
+      sum1 += per_candidate_rollouts[1][r];
+    }
+    result.u_first = sum0 / kept_worlds;
+    result.u_second = sum1 / kept_worlds;
+    result.diff_mean = result.u_first - result.u_second;
+
+    double sum_sq_diff = 0.0;
+    for (int r = 0; r < kept_worlds; ++r) {
+      double d_r = per_candidate_rollouts[0][r] - per_candidate_rollouts[1][r];
+      double diff = d_r - result.diff_mean;
+      sum_sq_diff += diff * diff;
+    }
+    double var_d = (kept_worlds > 1) ? (sum_sq_diff / (kept_worlds - 1)) : 0.0;
+    result.diff_se = (kept_worlds > 1) ? std::sqrt(var_d / kept_worlds) : 0.0;
+  }
+  return result;
+}
 
 void DuneAdaptiveRolloutSession::DiscardPendingAction() {
   last_search_state_.reset();
@@ -1229,7 +1341,12 @@ void DuneAdaptiveRolloutSession::ResetSession(const std::string& reason) {
   session_new_simulations_completed_ = 0;
   session_elapsed_time_ms_ = 0.0;
   turn_elapsed_search_time_ms_ = 0.0;
-  ms_per_rollout_by_round_ = {20.2, 18.5, 17.3, 15.2, 13.4, 10.6, 8.5, 6.1, 4.3, 3.2, 2.5, 2.0};
+  if (!search_v2_) {
+    ms_per_rollout_by_round_ = {20.2, 18.5, 17.3, 15.2, 13.4, 10.6, 8.5, 6.1, 4.3, 3.2, 2.5, 2.0};
+  }
+  cached_joint_followups_.clear();
+  cached_joint_followup_round_ = -1;
+  cached_joint_followup_player_ = kInvalidPlayer;
 }
 
 DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double remaining_time_ms) {
@@ -1298,6 +1415,69 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
   result.diagnostics.visit_counts.assign(legal.size(), 0);
   result.diagnostics.q_values.assign(legal.size(), result.diagnostics.root_value);
 
+  if (!cached_joint_followups_.empty()) {
+    if (p != cached_joint_followup_player_ ||
+        dune_state.GetCurrentRound() != cached_joint_followup_round_) {
+      cached_joint_followups_.clear();
+    } else {
+      const auto& cur_hist = state.History();
+      cached_joint_followups_.erase(
+          std::remove_if(cached_joint_followups_.begin(), cached_joint_followups_.end(),
+                         [&](const CachedJointFollowupStep& step) {
+                           if (step.expected_history.size() < cur_hist.size()) return true;
+                           for (size_t i = 0; i < cur_hist.size(); ++i) {
+                             if (step.expected_history[i] != cur_hist[i]) return true;
+                           }
+                           return false;
+                         }),
+          cached_joint_followups_.end());
+    }
+  }
+
+  if (search_v2_ && !cached_joint_followups_.empty()) {
+    const auto& cur_hist = state.History();
+    for (auto it = cached_joint_followups_.begin(); it != cached_joint_followups_.end(); ++it) {
+      if (it->expected_history == cur_hist) {
+        auto leg_it = std::find(legal.begin(), legal.end(), it->action);
+        if (leg_it != legal.end()) {
+          Action hit_action = it->action;
+          double hit_q = it->q;
+          int hit_visits = it->visits;
+          cached_joint_followups_.erase(it);
+
+          result.diagnostics.selected_action = hit_action;
+          result.diagnostics.mcts_proposed_action = hit_action;
+          result.diagnostics.mcts_overrode_raw = (hit_action != raw_action);
+          result.simulations_completed = 0;
+          result.used_fallback = false;
+          result.fallback_reason = "none";
+          result.diagnostics.fallback_reason = "none";
+          result.diagnostics.termination_reason = "joint_followup_cache";
+          result.policy = raw_prior;
+
+          size_t chosen_idx = std::distance(legal.begin(), leg_it);
+          result.diagnostics.q_values[chosen_idx] = hit_q;
+          result.diagnostics.visit_counts[chosen_idx] = hit_visits;
+
+          result.diagnostics.total_root_visits = hit_visits;
+          result.diagnostics.num_covered_actions = 1;
+
+          const auto t_end = std::chrono::steady_clock::now();
+          double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+          result.elapsed_time_ms = elapsed_ms;
+          result.diagnostics.elapsed_search_time_ms = elapsed_ms;
+          session_elapsed_time_ms_ += elapsed_ms;
+          turn_elapsed_search_time_ms_ += elapsed_ms;
+
+          last_search_state_ = state.Clone();
+          last_search_result_ = result;
+          has_pending_commit_ = true;
+          return result;
+        }
+      }
+    }
+  }
+
   bool is_leader = (dune_state.phase() == dune_imperium::GamePhase::kLeaderDraft ||
                     dune_state.phase() == dune_imperium::GamePhase::kLeaderOfferChance);
 
@@ -1310,8 +1490,11 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     result.diagnostics.termination_reason = result.diagnostics.fallback_reason;
     result.policy = raw_prior;
   } else if (is_leader) {
+    const double eff_reserve_ms = (search_v2_ && remaining_time_ms >= 0.0)
+        ? std::min(reserve_ms_, 0.15 * remaining_time_ms)
+        : (remaining_time_ms >= 0.0 ? reserve_ms_ : 0.0);
     const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
-        ? (remaining_time_ms - reserve_ms_)
+        ? (remaining_time_ms - eff_reserve_ms)
         : -1.0;
 
     int effective_leader_rollouts = leader_rollouts_;
@@ -1319,24 +1502,32 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
     bool deadline_reached = false;
 
     if (remaining_time_ms >= 0.0) {
-      if (available_after_reserve_ms <= 0.0) {
+      if (search_v2_ ? (remaining_time_ms <= 50.0 || available_after_reserve_ms <= 0.0)
+                     : (available_after_reserve_ms <= 0.0)) {
         deadline_reached = true;
       } else {
-        double usable_leader_ms = full_search_
+        double usable_leader_ms = (search_v2_ || full_search_)
             ? (0.965 * available_after_reserve_ms)
             : available_after_reserve_ms;
         target_ms = std::min(25000.0, usable_leader_ms);
         int num_cands = std::max(1, static_cast<int>(legal.size()));
-        double leader_ms_est = full_search_
+        double leader_ms_est = (search_v2_ || full_search_)
             ? std::max(2.0, ms_per_rollout_by_round_[0])
             : std::max(2.0, ms_per_rollout_ema_);
-        double plan_ms = full_search_ ? (0.975 * target_ms) : target_ms;
+        double plan_ms = (search_v2_ || full_search_) ? (0.975 * target_ms) : target_ms;
         int total_leader_rollout_budget = static_cast<int>(plan_ms / leader_ms_est);
-        effective_leader_rollouts = full_search_
+        effective_leader_rollouts = (search_v2_ || full_search_)
             ? (total_leader_rollout_budget / num_cands)
             : std::min(2 * leader_rollouts_, total_leader_rollout_budget / num_cands);
+        if (search_v2_ && target_ms < 4000.0) {
+          effective_leader_rollouts = std::clamp(effective_leader_rollouts, 2, 8);
+        }
         if (effective_leader_rollouts < 2) {
-          deadline_reached = true;
+          if (!search_v2_ || remaining_time_ms <= 50.0) {
+            deadline_reached = true;
+          } else {
+            effective_leader_rollouts = 2;
+          }
         }
       }
     }
@@ -1353,10 +1544,10 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       result.policy = raw_prior;
     } else {
       int num_cands = std::max(1, static_cast<int>(legal.size()));
-      int leader_inflight = full_search_
-          ? std::max(max_inflight_worlds_, 384 / num_cands)
-          : max_inflight_worlds_;
-      double leader_deadline_ms = (full_search_ && target_ms > 0.0) ? (1.008 * target_ms) : target_ms;
+      int leader_inflight = search_v2_
+          ? std::clamp(effective_leader_rollouts, 2, std::max(2, 192 / num_cands))
+          : (full_search_ ? std::max(max_inflight_worlds_, 384 / num_cands) : max_inflight_worlds_);
+      double leader_deadline_ms = ((search_v2_ || full_search_) && target_ms > 0.0) ? (1.008 * target_ms) : target_ms;
       const auto c_res = dune_imperium::LeaderPickRolloutSearchDecision(
           state, p, impl_->evaluators, effective_leader_rollouts, 0.10,
           dune_seed::DeriveSeed(seed_, 0x4C454144ULL, static_cast<uint64_t>(p), search_seed_counter_++),
@@ -1399,53 +1590,133 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       const int retained_pairs = c_res.candidate_rollout_utilities.empty()
           ? 0
           : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
-      if (remaining_time_ms >= 0.0 && (retained_pairs < 2 || c_res.new_rollouts_executed < 2 * num_cands)) {
+      if (remaining_time_ms >= 0.0 &&
+          (search_v2_
+               ? (remaining_time_ms <= 50.0 && retained_pairs < 2)
+               : (retained_pairs < 2 || c_res.new_rollouts_executed < 2 * num_cands))) {
         result.used_fallback = true;
         result.fallback_reason = "live_deadline_reached";
         result.diagnostics.fallback_reason = "live_deadline_reached";
       }
     }
   } else {
+    const double eff_reserve_ms = (search_v2_ && remaining_time_ms >= 0.0)
+        ? std::min(reserve_ms_, 0.15 * remaining_time_ms)
+        : (remaining_time_ms >= 0.0 ? reserve_ms_ : 0.0);
     const double available_after_reserve_ms = (remaining_time_ms >= 0.0)
-        ? (remaining_time_ms - reserve_ms_)
+        ? (remaining_time_ms - eff_reserve_ms)
         : -1.0;
 
     bool ran_high_stakes = false;
     bool live_deadline_starved = false;
 
-    bool should_search = dune_imperium::IsHighStakesStrategicState(state, p);
-    if (full_search_ && !should_search && state.CurrentPlayer() == p && legal.size() >= 2) {
-      if (dune_imperium::IsPurchaseDecisionState(state) ||
-          dune_state.phase() == dune_imperium::GamePhase::kCombat) {
-        should_search = true;
-      } else {
-        bool has_end_or_reveal = false;
-        for (Action a : legal) {
-          if (a == dune_imperium::kActionEndTurn || a == dune_imperium::kActionReveal) {
-            has_end_or_reveal = true;
+    bool is_agent_primary_joint = false;
+    if (search_v2_ &&
+        dune_state.phase() == dune_imperium::GamePhase::kAgentTurns &&
+        !dune_state.IsPlayerInRevealTurn(p)) {
+      for (Action a1 : legal) {
+        if (dune_imperium::IsConvertSpecimenAction(a1)) continue;
+        auto s1 = state.Clone();
+        s1->ApplyAction(a1);
+        if (!s1->IsTerminal() && !s1->IsChanceNode() && s1->CurrentPlayer() == p) {
+          const auto l2 = s1->LegalActions();
+          if (!l2.empty() && (std::all_of(l2.begin(), l2.end(), [](Action a) {
+                return dune_imperium::IsBoardSpaceAction(a);
+              }) || std::all_of(l2.begin(), l2.end(), [](Action a) {
+                return dune_imperium::IsGraftSelectionAction(a);
+              }))) {
+            is_agent_primary_joint = true;
             break;
           }
         }
-        bool has_tree_reuse = false;
-        if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
-          for (Action a : legal) {
-            if (impl_->tree.HasPriorData(a)) {
-              has_tree_reuse = true;
-              break;
+      }
+    }
+
+    bool should_search = false;
+    if (search_v2_) {
+      if (is_agent_primary_joint) {
+        should_search = true;
+      } else if (dune_imperium::IsPurchaseDecisionState(state)) {
+        bool has_buy = false;
+        for (Action a : legal) {
+          if (dune_imperium::IsCardOrTechAcquisitionAction(a) ||
+              a == dune_imperium::kActionTleilaxuAcquire0) {
+            has_buy = true;
+            break;
+          }
+        }
+        if (has_buy || dune_imperium::IsHighStakesStrategicState(state, p)) {
+          should_search = true;
+        }
+      } else if (dune_imperium::IsHighStakesStrategicState(state, p)) {
+        should_search = true;
+      } else if (state.CurrentPlayer() == p && legal.size() >= 2) {
+        if (remaining_time_ms < 0.0 || available_after_reserve_ms >= 900.0) {
+          if (dune_state.phase() == dune_imperium::GamePhase::kCombat) {
+            should_search = true;
+          } else if (dune_imperium::IsFullStrategicState(state, p, raw_prior, 0.025)) {
+            should_search = true;
+          } else if (dune_state.phase() == dune_imperium::GamePhase::kAgentTurns &&
+                     !dune_state.IsPlayerInRevealTurn(p)) {
+            bool has_tree_reuse = false;
+            if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
+              for (Action a : legal) {
+                if (impl_->tree.HasPriorData(a)) {
+                  has_tree_reuse = true;
+                  break;
+                }
+              }
+            }
+            int non_spec = 0;
+            for (Action a : legal) {
+              if (!dune_imperium::IsConvertSpecimenAction(a)) ++non_spec;
+            }
+            if (!has_tree_reuse && non_spec >= 2) {
+              should_search = true;
             }
           }
         }
-        if (!has_end_or_reveal && !has_tree_reuse) {
+      }
+      if (!is_agent_primary_joint && remaining_time_ms >= 0.0 && available_after_reserve_ms < 320.0) {
+        should_search = false;
+      }
+    } else {
+      should_search = dune_imperium::IsHighStakesStrategicState(state, p);
+      if (full_search_ && !should_search && state.CurrentPlayer() == p && legal.size() >= 2) {
+        if (dune_imperium::IsPurchaseDecisionState(state) ||
+            dune_state.phase() == dune_imperium::GamePhase::kCombat) {
           should_search = true;
-        } else if (has_end_or_reveal &&
-                   dune_imperium::IsFullStrategicState(state, p, raw_prior, 0.020)) {
-          should_search = true;
+        } else {
+          bool has_end_or_reveal = false;
+          for (Action a : legal) {
+            if (a == dune_imperium::kActionEndTurn || a == dune_imperium::kActionReveal) {
+              has_end_or_reveal = true;
+              break;
+            }
+          }
+          bool has_tree_reuse = false;
+          if (impl_->tree.current_node() && !impl_->tree.current_node()->children.empty()) {
+            for (Action a : legal) {
+              if (impl_->tree.HasPriorData(a)) {
+                has_tree_reuse = true;
+                break;
+              }
+            }
+          }
+          if (!has_end_or_reveal && !has_tree_reuse) {
+            should_search = true;
+          } else if (has_end_or_reveal &&
+                     dune_imperium::IsFullStrategicState(state, p, raw_prior, 0.020)) {
+            should_search = true;
+          }
         }
       }
     }
 
     if (should_search) {
-      if (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0) {
+      if (remaining_time_ms >= 0.0 &&
+          (search_v2_ ? (remaining_time_ms <= 50.0 || available_after_reserve_ms <= 0.0)
+                      : (available_after_reserve_ms <= 0.0))) {
         live_deadline_starved = true;
       } else {
         int ref_rollouts = reference_rollouts_per_action_;
@@ -1461,11 +1732,210 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           eff_r += 1;
         }
         const int r_bucket = std::clamp(eff_r, 1, 11);
-        const double round_ms_est = full_search_
+        const double round_ms_est = (search_v2_ || full_search_)
             ? std::max(0.4, ms_per_rollout_by_round_[r_bucket])
             : std::max(2.0, ms_per_rollout_ema_);
 
-        if (remaining_time_ms >= 0.0) {
+        std::vector<dune_imperium::JointAgentCandidate> joint_cands;
+
+        if (search_v2_ && remaining_time_ms >= 0.0) {
+          if (is_agent_primary_joint) {
+            const size_t max_cands = (available_after_reserve_ms < 2500.0) ? 5 : 8;
+            joint_cands = dune_imperium::EnumerateJointAgentCandidates(
+                state, p, impl_->evaluators, raw_prior, max_cands);
+
+            const int hand0 = dune_state.GetPlayerCardsInHand(p);
+            const int int0 = static_cast<int>(dune_state.GetPlayerIntrigues(p).size());
+            auto count_branch_searched = [&](Action first_action, Action graft_action, Action second_action, int max_count) -> int {
+              auto sim = state.Clone();
+              sim->ApplyAction(first_action);
+              if (graft_action != kInvalidAction) {
+                if (!sim->IsTerminal() && !sim->IsChanceNode() && sim->CurrentPlayer() == p) {
+                  const auto leg = sim->LegalActions();
+                  if (std::find(leg.begin(), leg.end(), graft_action) != leg.end()) {
+                    sim->ApplyAction(graft_action);
+                  }
+                }
+              }
+              if (second_action != kInvalidAction) {
+                if (!sim->IsTerminal() && !sim->IsChanceNode() && sim->CurrentPlayer() == p) {
+                  const auto leg = sim->LegalActions();
+                  if (std::find(leg.begin(), leg.end(), second_action) != leg.end()) {
+                    sim->ApplyAction(second_action);
+                  }
+                }
+              }
+              bool tree_broken = false;
+              int rem_searched = 0;
+              for (int step = 0; step < 16 && !sim->IsTerminal(); ++step) {
+                if (sim->IsChanceNode()) {
+                  tree_broken = true;
+                  auto outs = sim->ChanceOutcomes();
+                  if (outs.empty()) break;
+                  sim->ApplyAction(outs[0].first);
+                  continue;
+                }
+                if (sim->CurrentPlayer() != p) break;
+                const auto& sim_d = static_cast<const dune_imperium::DuneImperiumState&>(*sim);
+                if (sim_d.phase() != dune_imperium::GamePhase::kAgentTurns ||
+                    sim_d.IsPlayerInRevealTurn(p)) {
+                  break;
+                }
+                if (sim_d.GetPlayerCardsInHand(p) > hand0 ||
+                    static_cast<int>(sim_d.GetPlayerIntrigues(p).size()) > int0) {
+                  tree_broken = true;
+                }
+                std::vector<Action> nl = sim->LegalActions();
+                if (nl.empty()) break;
+                if (nl.size() == 1) {
+                  if (nl[0] == dune_imperium::kActionEndTurn ||
+                      nl[0] == dune_imperium::kActionReveal) {
+                    break;
+                  }
+                  sim->ApplyAction(nl[0]);
+                  continue;
+                }
+                bool has_end_or_reveal = false;
+                int non_spec = 0;
+                for (Action na : nl) {
+                  if (na == dune_imperium::kActionEndTurn ||
+                      na == dune_imperium::kActionReveal) {
+                    has_end_or_reveal = true;
+                  }
+                  if (!dune_imperium::IsConvertSpecimenAction(na)) {
+                    non_spec++;
+                  }
+                }
+                if (has_end_or_reveal && non_spec < 2) {
+                  break;
+                }
+                bool hs_or_buy = dune_imperium::IsHighStakesStrategicState(*sim, p) ||
+                                 dune_imperium::IsPurchaseDecisionState(*sim);
+                ActionsAndProbs sub_prior = impl_->evaluators.front()->Prior(*sim);
+                bool sub_search = hs_or_buy;
+                if (!sub_search) {
+                  if (!has_end_or_reveal && tree_broken) {
+                    sub_search = true;
+                  } else if (has_end_or_reveal &&
+                             dune_imperium::IsFullStrategicState(*sim, p, sub_prior, 0.020)) {
+                    sub_search = true;
+                  }
+                }
+                if (sub_search) {
+                  rem_searched++;
+                  if (rem_searched >= max_count) break;
+                }
+                Action next_a = dune_imperium::PickGreedyAction(sub_prior, nl);
+                if (next_a == dune_imperium::kActionEndTurn ||
+                    next_a == dune_imperium::kActionReveal) {
+                  break;
+                }
+                sim->ApplyAction(next_a);
+              }
+              return rem_searched;
+            };
+
+            const size_t num_check = std::min<size_t>(4, joint_cands.size());
+            int max_rem_sub = 0;
+            for (size_t i = 0; i < num_check; ++i) {
+              int rem = count_branch_searched(joint_cands[i].first_action, joint_cands[i].graft_action, joint_cands[i].second_action, 3);
+              max_rem_sub = std::max(max_rem_sub, rem);
+            }
+            double frac = 0.85;
+            if (max_rem_sub == 1) {
+              frac = 0.62;
+            } else if (max_rem_sub >= 2) {
+              frac = 0.48;
+            }
+            target_ms = std::min(46000.0, frac * available_after_reserve_ms);
+          } else if (is_agent_turn_phase) {
+            const int hand0 = dune_state.GetPlayerCardsInHand(p);
+            const int int0 = static_cast<int>(dune_state.GetPlayerIntrigues(p).size());
+            auto count_branch_searched = [&](Action first_action, int max_count) -> int {
+              auto sim = state.Clone();
+              sim->ApplyAction(first_action);
+              bool tree_broken = false;
+              int rem_searched = 0;
+              for (int step = 0; step < 16 && !sim->IsTerminal(); ++step) {
+                if (sim->IsChanceNode()) {
+                  tree_broken = true;
+                  auto outs = sim->ChanceOutcomes();
+                  if (outs.empty()) break;
+                  sim->ApplyAction(outs[0].first);
+                  continue;
+                }
+                if (sim->CurrentPlayer() != p) break;
+                const auto& sim_d = static_cast<const dune_imperium::DuneImperiumState&>(*sim);
+                if (sim_d.phase() != dune_imperium::GamePhase::kAgentTurns ||
+                    sim_d.IsPlayerInRevealTurn(p)) {
+                  break;
+                }
+                if (sim_d.GetPlayerCardsInHand(p) > hand0 ||
+                    static_cast<int>(sim_d.GetPlayerIntrigues(p).size()) > int0) {
+                  tree_broken = true;
+                }
+                std::vector<Action> nl = sim->LegalActions();
+                if (nl.empty()) break;
+                if (nl.size() == 1) {
+                  if (nl[0] == dune_imperium::kActionEndTurn ||
+                      nl[0] == dune_imperium::kActionReveal) {
+                    break;
+                  }
+                  sim->ApplyAction(nl[0]);
+                  continue;
+                }
+                bool has_end_or_reveal = false;
+                int non_spec = 0;
+                for (Action na : nl) {
+                  if (na == dune_imperium::kActionEndTurn ||
+                      na == dune_imperium::kActionReveal) {
+                    has_end_or_reveal = true;
+                  }
+                  if (!dune_imperium::IsConvertSpecimenAction(na)) {
+                    non_spec++;
+                  }
+                }
+                if (has_end_or_reveal && non_spec < 2) {
+                  break;
+                }
+                bool hs_or_buy = dune_imperium::IsHighStakesStrategicState(*sim, p) ||
+                                 dune_imperium::IsPurchaseDecisionState(*sim);
+                ActionsAndProbs sub_prior = impl_->evaluators.front()->Prior(*sim);
+                bool sub_search = hs_or_buy;
+                if (!sub_search) {
+                  if (!has_end_or_reveal && tree_broken) {
+                    sub_search = true;
+                  } else if (has_end_or_reveal &&
+                             dune_imperium::IsFullStrategicState(*sim, p, sub_prior, 0.020)) {
+                    sub_search = true;
+                  }
+                }
+                if (sub_search) {
+                  rem_searched++;
+                  if (rem_searched >= max_count) break;
+                }
+                Action next_a = dune_imperium::PickGreedyAction(sub_prior, nl);
+                if (next_a == dune_imperium::kActionEndTurn ||
+                    next_a == dune_imperium::kActionReveal) {
+                  break;
+                }
+                sim->ApplyAction(next_a);
+              }
+              return rem_searched;
+            };
+            int rem_sub = count_branch_searched(raw_action, 2);
+            double frac = (rem_sub >= 1) ? 0.58 : 0.88;
+            target_ms = std::min(28000.0, frac * available_after_reserve_ms);
+          } else {
+            double frac = 0.90;
+            target_ms = std::min(30000.0, frac * available_after_reserve_ms);
+          }
+          result.diagnostics.hard_time_limit_ms = target_ms;
+          result.diagnostics.soft_time_limit_ms = remaining_time_ms;
+          double plan_ms = 0.82 * target_ms;
+          int total_rollout_budget = static_cast<int>(plan_ms / round_ms_est);
+          ref_rollouts = std::max(4, total_rollout_budget / 3);
+        } else if (!search_v2_ && remaining_time_ms >= 0.0) {
           double usable_ms = full_search_
               ? ((is_agent_turn_phase ? 0.980 : 0.980) * available_after_reserve_ms)
               : available_after_reserve_ms;
@@ -1589,71 +2059,240 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
           }
         }
 
-        if (remaining_time_ms >= 0.0 && ref_rollouts < 4) {
+        if (!search_v2_ && remaining_time_ms >= 0.0 && ref_rollouts < 4) {
           live_deadline_starved = true;
         } else {
           ran_high_stakes = true;
           const uint64_t decision_seed =
               dune_seed::DeriveSeed(seed_, static_cast<uint64_t>(p), search_seed_counter_++);
-          const int min_top5_budget = full_search_ ? std::min(top5_min_budget_, 96) : top5_min_budget_;
-          const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= min_top5_budget;
-          int effective_top_k = use_top5 ? 5 : 0;
-          if (all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state) &&
-              (use_top5 || (full_search_ && 3 * ref_rollouts >= 48))) {
-            effective_top_k = static_cast<int>(legal.size());
-          }
-          const auto c_res = use_successive_halving_
-              ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
-                    state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
-                    (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), /*unbiased_stage2_gate=*/false,
-                    target_ms, effective_top_k, max_inflight_worlds_,
-                    /*use_bounded_pool_when_unclocked=*/false,
-                    /*full_clock_stage2=*/full_search_,
-                    prior_log_ratio_weight_,
-                    stage1_high_conf_prior_skip_,
-                    /*precomputed_raw_prior=*/&raw_prior)
-              : dune_imperium::AdaptiveRolloutSearchDecision(
-                    state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
-                    (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), target_ms, max_inflight_worlds_,
-                    /*precomputed_raw_prior=*/&raw_prior);
-          result.diagnostics.selected_action = c_res.action;
-          result.diagnostics.mcts_proposed_action = c_res.action;
-          result.diagnostics.mcts_overrode_raw = c_res.overridden;
-          result.simulations_completed = c_res.new_rollouts_executed;
-          result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
-          result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
-          result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
-          result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
-          result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
-          result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
-          result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
-          result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
-          result.diagnostics.termination_reason = c_res.termination_reason;
-          result.policy = raw_prior;
 
-          for (const auto& cu : c_res.candidate_utilities) {
-            for (size_t i = 0; i < legal.size(); ++i) {
-              if (legal[i] == cu.first) {
-                result.diagnostics.q_values[i] = cu.second;
-                break;
+          if (search_v2_) {
+            if (is_agent_primary_joint) {
+              if (joint_cands.empty()) {
+                const size_t max_cands = (remaining_time_ms >= 0.0 && available_after_reserve_ms < 2500.0) ? 5 : 8;
+                joint_cands = dune_imperium::EnumerateJointAgentCandidates(
+                    state, p, impl_->evaluators, raw_prior, max_cands);
+              }
+              std::vector<Action> ordered_cands;
+              std::vector<Action> graft_actions;
+              std::vector<Action> second_actions;
+              std::vector<double> cand_priors;
+              ordered_cands.reserve(joint_cands.size());
+              graft_actions.reserve(joint_cands.size());
+              second_actions.reserve(joint_cands.size());
+              cand_priors.reserve(joint_cands.size());
+              for (const auto& jc : joint_cands) {
+                ordered_cands.push_back(jc.first_action);
+                graft_actions.push_back(jc.graft_action);
+                second_actions.push_back(jc.second_action);
+                cand_priors.push_back(jc.joint_prior);
+              }
+              int chosen_c_idx = 0;
+              const auto c_res = dune_imperium::SearchV2SuccessiveHalvingDecision(
+                  state, p, &(impl_->tree), impl_->evaluators, ordered_cands, cand_priors,
+                  ref_rollouts, 0.15, decision_seed,
+                  (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn
+                                        : dune_imperium::SearchRolloutCrnMode::kSequential),
+                  target_ms, max_inflight_worlds_, prior_log_ratio_weight_,
+                  stage1_high_conf_prior_skip_, &second_actions, &graft_actions, round_ms_est,
+                  &chosen_c_idx);
+
+              Action chosen_first = ordered_cands[chosen_c_idx];
+              Action chosen_graft = graft_actions[chosen_c_idx];
+              Action chosen_second = second_actions[chosen_c_idx];
+
+              result.diagnostics.selected_action = chosen_first;
+              result.diagnostics.mcts_proposed_action = chosen_first;
+              result.diagnostics.mcts_overrode_raw = (chosen_first != raw_action) || c_res.overridden;
+              result.simulations_completed = c_res.new_rollouts_executed;
+              result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+              result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+              result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
+              result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
+              result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
+              result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
+              result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
+              result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
+              result.diagnostics.termination_reason = c_res.termination_reason;
+              result.policy = raw_prior;
+
+              for (size_t i = 0; i < legal.size(); ++i) {
+                Action a = legal[i];
+                double max_q = -1e9;
+                int max_v = 0;
+                bool found = false;
+                for (size_t j = 0; j < joint_cands.size(); ++j) {
+                  if (joint_cands[j].first_action == a) {
+                    found = true;
+                    if (j < c_res.candidate_utilities.size()) {
+                      max_q = std::max(max_q, c_res.candidate_utilities[j].second);
+                    }
+                    if (j < c_res.candidate_rollout_utilities.size()) {
+                      max_v = std::max(max_v, static_cast<int>(c_res.candidate_rollout_utilities[j].second.size()));
+                    }
+                  }
+                }
+                if (found) {
+                  result.diagnostics.q_values[i] = max_q;
+                  result.diagnostics.visit_counts[i] = max_v;
+                }
+              }
+
+              const int retained_pairs = c_res.candidate_rollout_utilities.empty()
+                  ? 0
+                  : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
+              if (remaining_time_ms >= 0.0 && retained_pairs < 2) {
+                result.used_fallback = true;
+                result.fallback_reason = "live_deadline_reached";
+                result.diagnostics.fallback_reason = "live_deadline_reached";
+              } else {
+                cached_joint_followup_round_ = dune_state.GetCurrentRound();
+                cached_joint_followup_player_ = p;
+                cached_joint_followups_.clear();
+                const auto base_hist = state.History();
+                const double chosen_q = c_res.chosen_mean_utility;
+                const int chosen_visits =
+                    (chosen_c_idx < static_cast<int>(c_res.candidate_rollout_utilities.size()))
+                        ? static_cast<int>(c_res.candidate_rollout_utilities[chosen_c_idx].second.size())
+                        : 0;
+
+                if (chosen_graft != kInvalidAction) {
+                  auto hist_step1 = base_hist;
+                  hist_step1.push_back(chosen_first);
+                  cached_joint_followups_.push_back({hist_step1, chosen_graft, chosen_q, chosen_visits});
+                  if (chosen_second != kInvalidAction) {
+                    auto hist_step2 = hist_step1;
+                    hist_step2.push_back(chosen_graft);
+                    cached_joint_followups_.push_back({hist_step2, chosen_second, chosen_q, chosen_visits});
+                  }
+                } else if (chosen_second != kInvalidAction) {
+                  auto hist_step1 = base_hist;
+                  hist_step1.push_back(chosen_first);
+                  cached_joint_followups_.push_back({hist_step1, chosen_second, chosen_q, chosen_visits});
+                }
+              }
+            } else {
+              const int min_top5_budget = std::min(top5_min_budget_, 96);
+              const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= min_top5_budget;
+              int effective_top_k = use_top5 ? 5 : 0;
+              if (all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state) &&
+                  (target_ms < 0.0 || target_ms >= 1500.0) &&
+                  (use_top5 || 3 * ref_rollouts >= 48)) {
+                effective_top_k = static_cast<int>(legal.size());
+              }
+              auto [ordered_cands, cand_priors] =
+                  dune_imperium::SelectOrderedCandidatesAndPriors(raw_prior, legal, effective_top_k);
+
+              const auto c_res = dune_imperium::SearchV2SuccessiveHalvingDecision(
+                  state, p, &(impl_->tree), impl_->evaluators, ordered_cands, cand_priors,
+                  ref_rollouts, 0.15, decision_seed,
+                  (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn
+                                        : dune_imperium::SearchRolloutCrnMode::kSequential),
+                  target_ms, max_inflight_worlds_, prior_log_ratio_weight_,
+                  stage1_high_conf_prior_skip_, /*second_actions=*/nullptr, /*graft_actions=*/nullptr, round_ms_est);
+
+              result.diagnostics.selected_action = c_res.action;
+              result.diagnostics.mcts_proposed_action = c_res.action;
+              result.diagnostics.mcts_overrode_raw = c_res.overridden;
+              result.simulations_completed = c_res.new_rollouts_executed;
+              result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+              result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+              result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
+              result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
+              result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
+              result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
+              result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
+              result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
+              result.diagnostics.termination_reason = c_res.termination_reason;
+              result.policy = raw_prior;
+
+              for (const auto& cu : c_res.candidate_utilities) {
+                for (size_t i = 0; i < legal.size(); ++i) {
+                  if (legal[i] == cu.first) {
+                    result.diagnostics.q_values[i] = cu.second;
+                    break;
+                  }
+                }
+              }
+              for (const auto& cru : c_res.candidate_rollout_utilities) {
+                for (size_t i = 0; i < legal.size(); ++i) {
+                  if (legal[i] == cru.first) {
+                    result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+                    break;
+                  }
+                }
+              }
+
+              const int retained_pairs = c_res.candidate_rollout_utilities.empty()
+                  ? 0
+                  : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
+              if (remaining_time_ms >= 0.0 && retained_pairs < 2) {
+                result.used_fallback = true;
+                result.fallback_reason = "live_deadline_reached";
+                result.diagnostics.fallback_reason = "live_deadline_reached";
               }
             }
-          }
-          for (const auto& cru : c_res.candidate_rollout_utilities) {
-            for (size_t i = 0; i < legal.size(); ++i) {
-              if (legal[i] == cru.first) {
-                result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
-                break;
+          } else {
+            const int min_top5_budget = full_search_ ? std::min(top5_min_budget_, 96) : top5_min_budget_;
+            const bool use_top5 = fixed_top5_candidates_ && 3 * ref_rollouts >= min_top5_budget;
+            int effective_top_k = use_top5 ? 5 : 0;
+            if (all_buy_candidates_ && dune_imperium::IsPurchaseDecisionState(state) &&
+                (use_top5 || (full_search_ && 3 * ref_rollouts >= 48))) {
+              effective_top_k = static_cast<int>(legal.size());
+            }
+            const auto c_res = use_successive_halving_
+                ? dune_imperium::SuccessiveHalvingRolloutSearchDecision(
+                      state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
+                      (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), /*unbiased_stage2_gate=*/false,
+                      target_ms, effective_top_k, max_inflight_worlds_,
+                      /*use_bounded_pool_when_unclocked=*/false,
+                      /*full_clock_stage2=*/full_search_,
+                      prior_log_ratio_weight_,
+                      stage1_high_conf_prior_skip_,
+                      /*precomputed_raw_prior=*/&raw_prior)
+                : dune_imperium::AdaptiveRolloutSearchDecision(
+                      state, p, &(impl_->tree), impl_->evaluators, ref_rollouts, 0.15, decision_seed,
+                      (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn : dune_imperium::SearchRolloutCrnMode::kSequential), target_ms, max_inflight_worlds_,
+                      /*precomputed_raw_prior=*/&raw_prior);
+            result.diagnostics.selected_action = c_res.action;
+            result.diagnostics.mcts_proposed_action = c_res.action;
+            result.diagnostics.mcts_overrode_raw = c_res.overridden;
+            result.simulations_completed = c_res.new_rollouts_executed;
+            result.diagnostics.newly_completed_simulations = c_res.new_rollouts_executed;
+            result.diagnostics.inherited_root_visits = c_res.prior_rollouts_reused;
+            result.diagnostics.stage1_planned_worlds = c_res.stage1_planned_worlds;
+            result.diagnostics.stage1_kept_worlds = c_res.stage1_kept_worlds;
+            result.diagnostics.stage2_planned_worlds = c_res.stage2_planned_worlds;
+            result.diagnostics.stage2_kept_worlds = c_res.stage2_kept_worlds;
+            result.diagnostics.stage1_elapsed_ms = c_res.stage1_elapsed_ms;
+            result.diagnostics.stage2_elapsed_ms = c_res.stage2_elapsed_ms;
+            result.diagnostics.termination_reason = c_res.termination_reason;
+            result.policy = raw_prior;
+
+            for (const auto& cu : c_res.candidate_utilities) {
+              for (size_t i = 0; i < legal.size(); ++i) {
+                if (legal[i] == cu.first) {
+                  result.diagnostics.q_values[i] = cu.second;
+                  break;
+                }
               }
             }
-          }
-          const int retained_pairs = c_res.candidate_rollout_utilities.empty()
-              ? 0
-              : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
-          if (remaining_time_ms >= 0.0 && retained_pairs < 2) {
-            result.used_fallback = true;
-            result.fallback_reason = "live_deadline_reached";
-            result.diagnostics.fallback_reason = "live_deadline_reached";
+            for (const auto& cru : c_res.candidate_rollout_utilities) {
+              for (size_t i = 0; i < legal.size(); ++i) {
+                if (legal[i] == cru.first) {
+                  result.diagnostics.visit_counts[i] = static_cast<int>(cru.second.size());
+                  break;
+                }
+              }
+            }
+            const int retained_pairs = c_res.candidate_rollout_utilities.empty()
+                ? 0
+                : static_cast<int>(c_res.candidate_rollout_utilities[0].second.size());
+            if (remaining_time_ms >= 0.0 && retained_pairs < 2) {
+              result.used_fallback = true;
+              result.fallback_reason = "live_deadline_reached";
+              result.diagnostics.fallback_reason = "live_deadline_reached";
+            }
           }
         }
       }
@@ -1696,9 +2335,16 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
         result.diagnostics.selected_action = raw_action;
         result.diagnostics.mcts_proposed_action = raw_action;
         result.used_fallback = true;
-        std::string reason = (live_deadline_starved || (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0))
-            ? "live_deadline_reached"
-            : "policy_only";
+        std::string reason;
+        if (search_v2_) {
+          reason = (remaining_time_ms >= 0.0 && remaining_time_ms <= 50.0)
+              ? "live_deadline_reached"
+              : "policy_only";
+        } else {
+          reason = (live_deadline_starved || (remaining_time_ms >= 0.0 && available_after_reserve_ms <= 0.0))
+              ? "live_deadline_reached"
+              : "policy_only";
+        }
         result.fallback_reason = reason;
         result.diagnostics.fallback_reason = reason;
         result.diagnostics.termination_reason = reason;
@@ -1727,7 +2373,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state, double r
       !result.used_fallback && elapsed_ms > 0.0) {
     double current_rate = elapsed_ms / result.simulations_completed;
     ms_per_rollout_ema_ = 0.8 * ms_per_rollout_ema_ + 0.2 * current_rate;
-    if (result.simulations_completed >= 160) {
+    if (result.simulations_completed >= (search_v2_ ? 24 : 160)) {
       int r_bucket = 0;
       if (!is_leader) {
         int eff_r = dune_state.GetCurrentRound();

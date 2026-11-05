@@ -9697,27 +9697,31 @@ void TestStep1And2ParityAndBenchmark() {
         auto m_leg = std::make_shared<SharedDunePolicyValueNetImpl>(
             obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
             /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
-            /*with_semantic_scorer=*/true);
+            /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+            dune_semantic::kDescriptorSchemaVersionV4);
         m_leg->to(dev);
 
         auto m_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
             obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
             /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
-            /*with_semantic_scorer=*/true);
+            /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+            dune_semantic::kDescriptorSchemaVersionV4);
         m_opt->to(dev);
         copy_weights(m_leg, m_opt);
 
         auto ema_leg = std::make_shared<SharedDunePolicyValueNetImpl>(
             obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
             /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
-            /*with_semantic_scorer=*/true);
+            /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+            dune_semantic::kDescriptorSchemaVersionV4);
         ema_leg->to(dev);
         copy_weights(m_leg, ema_leg);
 
         auto ema_opt = std::make_shared<SharedDunePolicyValueNetImpl>(
             obs_size, /*hidden_dim=*/2048, action_dim, /*num_blocks=*/2,
             /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
-            /*with_semantic_scorer=*/true);
+            /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+            dune_semantic::kDescriptorSchemaVersionV4);
         ema_opt->to(dev);
         copy_weights(m_leg, ema_opt);
 
@@ -9843,7 +9847,8 @@ void TestStep1And2ParityAndBenchmark() {
         auto m = std::make_shared<SharedDunePolicyValueNetImpl>(
             b_obs, b_hidden, b_act, b_blocks,
             /*nonlinear_value_head=*/false, /*v4_appendix=*/false, /*extra_actions=*/0,
-            /*with_semantic_scorer=*/true);
+            /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+            dune_semantic::kDescriptorSchemaVersionV4);
         m->to(dev);
         return m;
       };
@@ -12711,6 +12716,235 @@ int main() {
     // Restore flags
     absl::SetFlag(&FLAGS_r755_hybrid_mode, false);
     absl::SetFlag(&FLAGS_target_kl, 0.0);
+  } TEST_END();
+
+  TEST_BEGIN("R7-55 opt-in finish unvisited aux on KL stop (--r755_finish_unvisited_aux_on_kl_stop)") {
+    const int64_t obs_size = 12;
+    const int64_t action_dim = 5;
+    const auto dev = torch::kCPU;
+
+    // Create 16 transitions for batch (4 minibatches of size 4)
+    std::vector<PpoTransition> batch(16);
+    for (int i = 0; i < 16; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.05f * (i + 1));
+      batch[i].legal_actions = (i % 2 == 0) ? std::vector<Action>{0, 1, 2} : std::vector<Action>{1, 3, 4};
+      batch[i].action = batch[i].legal_actions[i % 3];
+      batch[i].old_log_prob = -1.0f;
+      batch[i].reward = 0.1f * i;
+      batch[i].value = 0.05f * i;
+      batch[i].advantage = (i % 2 == 0) ? 0.4f : -0.3f;
+      batch[i].return_value = 0.2f * i;
+      batch[i].player_id = i % 4;
+      batch[i].episode_id = 400 + i;
+    }
+
+    // Create 8 auxiliary search training examples
+    std::vector<SearchTrainingExample> search_examples(8);
+    for (int i = 0; i < 8; ++i) {
+      search_examples[i].observation = std::vector<float>(obs_size, 0.10f * (i + 1));
+      search_examples[i].player = 0;
+      search_examples[i].legal_actions = {0, 1, 2};
+      search_examples[i].normalized_visits = {0.60, 0.30, 0.10};
+    }
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 4);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 2);
+    absl::SetFlag(&FLAGS_aux_full_batch_presentation, false);
+    absl::SetFlag(&FLAGS_normalize_advantages, true);
+    absl::SetFlag(&FLAGS_ppo_clip_epsilon, 0.2);
+    absl::SetFlag(&FLAGS_ppo_clip_value_loss, true);
+    absl::SetFlag(&FLAGS_entropy_coef, 0.01);
+    absl::SetFlag(&FLAGS_value_coef, 0.5);
+    absl::SetFlag(&FLAGS_logit_cap, 10.0);
+    absl::SetFlag(&FLAGS_target_kl, 1e-5);
+    absl::SetFlag(&FLAGS_train_amp, false);
+    absl::SetFlag(&FLAGS_grad_clip_norm, 10.0);
+    absl::SetFlag(&FLAGS_diagnostics_only, false);
+    absl::SetFlag(&FLAGS_train_value_only, false);
+    absl::SetFlag(&FLAGS_search_aux_decoupled, false);
+
+    // 1. With r755_finish_unvisited_aux_on_kl_stop = false (default)
+    absl::SetFlag(&FLAGS_r755_finish_unvisited_aux_on_kl_stop, false);
+    torch::manual_seed(4444);
+    auto model_disabled = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_disabled->to(dev);
+    torch::optim::AdamW opt_disabled(model_disabled->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    PpoUpdateStats stats_disabled = TrainPpoUpdate(
+        model_disabled, opt_disabled, batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10);
+
+    UTILS_CHECK(stats_disabled.early_stopped);
+    UTILS_CHECK(stats_disabled.kl_early_stop_epoch == 0);
+    UTILS_CHECK(stats_disabled.aux_distinct_visited < 8);
+    UTILS_CHECK(stats_disabled.aux_distinct_visited == 2);
+    UTILS_CHECK(stats_disabled.aux_finish_pass_steps == 0);
+    UTILS_CHECK(stats_disabled.aux_finish_pass_rows == 0);
+    UTILS_CHECK(stats_disabled.aux_visited_mask.size() == 8);
+    UTILS_CHECK(stats_disabled.aux_visited_mask[0] == 1);
+    UTILS_CHECK(stats_disabled.aux_visited_mask[1] == 1);
+    for (size_t i = 2; i < stats_disabled.aux_visited_mask.size(); ++i) {
+      UTILS_CHECK(stats_disabled.aux_visited_mask[i] == 0);
+    }
+
+    // 2. With r755_finish_unvisited_aux_on_kl_stop = true (opt-in finish pass enabled)
+    absl::SetFlag(&FLAGS_r755_finish_unvisited_aux_on_kl_stop, true);
+    torch::manual_seed(4444);
+    auto model_enabled = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    model_enabled->to(dev);
+    torch::optim::AdamW opt_enabled(model_enabled->parameters(), torch::optim::AdamWOptions(1e-3));
+
+    auto ema_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, 32, action_dim, 2);
+    ema_model->to(dev);
+
+    PpoUpdateStats stats_enabled = TrainPpoUpdate(
+        model_enabled, opt_enabled, batch, obs_size, action_dim, dev,
+        /*master=*/42ULL, /*global_update=*/2,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10,
+        /*abort_grad_norm_ratio=*/0.0, /*pwo5_aux=*/{}, /*pwo5_cfg=*/{},
+        /*collection_model=*/nullptr, /*reverse_kl_coef=*/0.0,
+        /*compute_diagnostics=*/false,
+        /*ema_model=*/ema_model, /*ema_magnet_kl_coef=*/0.05);
+
+    UTILS_CHECK(stats_enabled.early_stopped);
+    UTILS_CHECK(stats_enabled.kl_early_stop_epoch == 0);
+    // Verifying aux_visited_mask reaches 100% (8 / 8) when enabled
+    UTILS_CHECK(stats_enabled.aux_distinct_visited == 8);
+    UTILS_CHECK(stats_enabled.aux_finish_pass_steps > 0);
+    UTILS_CHECK(stats_enabled.aux_finish_pass_rows == 6);  // 8 - 2 = 6 unvisited examples stepped
+    UTILS_CHECK(stats_enabled.aux_visited_mask.size() == 8);
+    for (size_t i = 0; i < stats_enabled.aux_visited_mask.size(); ++i) {
+      UTILS_CHECK(stats_enabled.aux_visited_mask[i] == 1);
+    }
+
+    // Restore flags
+    absl::SetFlag(&FLAGS_r755_finish_unvisited_aux_on_kl_stop, false);
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, false);
+    absl::SetFlag(&FLAGS_target_kl, 0.0);
+  } TEST_END();
+
+  TEST_BEGIN("V5LegacySlotResidualStateAnnealingAndLockContracts") {
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        kFullPublicInformationV5StateSize, 64, 2391, /*num_blocks=*/2, /*use_nonlinear=*/false,
+        /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+
+    // Give distinct random weights to dynamic slots to create initial residuals
+    {
+      torch::NoGradGuard no_grad;
+      for (int64_t s : {10, 11, 12, 13, 14, 70, 71, 72, 91, 92, 538, 539, 540, 541, 542,
+                        546, 547, 548, 549, 550, 554, 555, 556, 770, 771, 772}) {
+        model->policy_head->weight[s].normal_(0.0, 1.0);
+        if (model->policy_head->bias.defined()) {
+          model->policy_head->bias[s].normal_(0.0, 1.0);
+        }
+      }
+    }
+
+    // (i) Initialize with N = 100
+    V5LegacySlotResidualState v5_res;
+    v5_res.Initialize(model, /*anneal_updates=*/100);
+    UTILS_CHECK(v5_res.active);
+    UTILS_CHECK(v5_res.N == 100);
+
+    // Apply at k = 0 (exact step 0 parity)
+    auto w_before = model->policy_head->weight.clone();
+    v5_res.Apply(model, 0);
+    float diff_step0 = (model->policy_head->weight - w_before).abs().max().item<float>();
+    UTILS_CHECK(diff_step0 < 1e-6f);
+
+    // Apply symmetric shift of +0.5 to family 0 slots
+    {
+      torch::NoGradGuard no_grad;
+      for (int64_t s : {10, 11, 12, 13, 14}) {
+        model->policy_head->weight[s].add_(0.5f);
+      }
+    }
+    // Apply at k = 25 (alpha = 0.75)
+    v5_res.Apply(model, 25);
+    // Verify symmetric family mean shift is preserved
+    std::vector<torch::Tensor> w_fam0;
+    for (int64_t s : {10, 11, 12, 13, 14}) {
+      w_fam0.push_back(model->policy_head->weight[s]);
+    }
+    torch::Tensor cur_bar_w0 = torch::stack(w_fam0).mean(0);
+    for (size_t i = 0; i < 5; ++i) {
+      int64_t s = v5_res.families[0][i];
+      torch::Tensor expected_w = cur_bar_w0 + 0.75f * v5_res.init_w_residuals[0][i];
+      float diff = (model->policy_head->weight[s] - expected_w).abs().max().item<float>();
+      UTILS_CHECK(diff < 1e-6f);
+    }
+
+    // (ii) Split 50 + 50 annealing across segments
+    // Progress to update 50 of segment 0
+    v5_res.Apply(model, 50);
+
+    // Segment 1 starts with remaining N = 50
+    V5LegacySlotResidualState v5_seg1;
+    v5_seg1.Initialize(model, /*anneal_updates=*/50);
+    UTILS_CHECK(v5_seg1.active);
+    UTILS_CHECK(v5_seg1.N == 50);
+
+    // At update 25 of segment 1 (global 75):
+    v5_seg1.Apply(model, 25);
+    for (size_t f = 0; f < v5_seg1.families.size(); ++f) {
+      const auto& fam = v5_seg1.families[f];
+      std::vector<torch::Tensor> f_rows;
+      for (int64_t s : fam) f_rows.push_back(model->policy_head->weight[s]);
+      torch::Tensor bar_f = torch::stack(f_rows).mean(0);
+      for (size_t i = 0; i < fam.size(); ++i) {
+        int64_t s = fam[i];
+        torch::Tensor expected_w = bar_f + 0.25f * v5_res.init_w_residuals[f][i];
+        float diff = (model->policy_head->weight[s] - expected_w).abs().max().item<float>();
+        UTILS_CHECK(diff < 1e-5f);
+      }
+    }
+
+    // At update 50 of segment 1 (global 100): alpha reaches 0.0
+    v5_seg1.Apply(model, 50);
+    for (const auto& fam : v5_seg1.families) {
+      for (size_t i = 1; i < fam.size(); ++i) {
+        float max_w_diff = (model->policy_head->weight[fam[i]] - model->policy_head->weight[fam[0]])
+                               .abs().max().item<float>();
+        UTILS_CHECK(max_w_diff == 0.0f);
+        if (model->policy_head->bias.defined()) {
+          float max_b_diff = (model->policy_head->bias[fam[i]] - model->policy_head->bias[fam[0]])
+                                 .abs().max().item<float>();
+          UTILS_CHECK(max_b_diff == 0.0f);
+        }
+      }
+    }
+
+    // (iii) An already-zeroed v5 model with anneal_updates = 0 stays active and locks residuals to 0
+    V5LegacySlotResidualState v5_locked;
+    v5_locked.Initialize(model, /*anneal_updates=*/0);
+    UTILS_CHECK(v5_locked.active);
+    UTILS_CHECK(v5_locked.N == 0);
+
+    // Perturb slot 10 asymmetrically
+    {
+      torch::NoGradGuard no_grad;
+      model->policy_head->weight[10].add_(1.5f);
+    }
+    v5_locked.Apply(model, 1);
+    // Verify slot 10 asymmetry was immediately eliminated and restored to family mean
+    for (const auto& fam : v5_locked.families) {
+      for (size_t i = 1; i < fam.size(); ++i) {
+        float max_w_diff = (model->policy_head->weight[fam[i]] - model->policy_head->weight[fam[0]])
+                               .abs().max().item<float>();
+        UTILS_CHECK(max_w_diff == 0.0f);
+      }
+    }
+
+    // And verify un-annealed model with anneal_updates = 0 is NOT active
+    {
+      torch::NoGradGuard no_grad;
+      model->policy_head->weight[10].add_(2.0f);
+    }
+    V5LegacySlotResidualState v5_unannealed;
+    v5_unannealed.Initialize(model, /*anneal_updates=*/0);
+    UTILS_CHECK(!v5_unannealed.active);
   } TEST_END();
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

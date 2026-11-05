@@ -1,10 +1,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <ATen/cuda/CUDAContext.h>
 
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
@@ -248,9 +251,12 @@ int main(int argc, char** argv) {
   candidates.card_ids = {1, 2, 3};
   candidates.space_ids = {0, 1, 2};
   candidates.supported = {1, 1, 1};
-  candidates.roles = {dune_semantic::ActionRole::kPrimaryCard,
-                      dune_semantic::ActionRole::kTleilaxuPurchase,
-                      dune_semantic::ActionRole::kBoardSpace};
+  candidates.roles = {
+      dune_semantic::ActionRole::kPrimaryCard,
+      model->semantic_scorer_->is_f_enabled()
+          ? dune_semantic::ActionRole::kTleilaxuPurchase
+          : dune_semantic::ActionRole::kIndexedIntrigue,
+      dune_semantic::ActionRole::kBoardSpace};
   std::vector<const dune_semantic::CandidateActionData*> actions(B, &candidates);
   auto scorer_result = [&]() {
     torch::InferenceMode guard;
@@ -323,6 +329,221 @@ int main(int argc, char** argv) {
       }
     }
     std::cout << "  Evaluator refresh synchronize=" << synchronize << ": PASS\n";
+  }
+
+  // =========================================================================
+  // Part 5: FP8 (E4M3) Trunk Cache Verification Test
+  // =========================================================================
+  std::cout << "\n=== Part 5: FP8 (E4M3) Trunk Cache Verification Test ===\n";
+
+  const auto* dev_props = at::cuda::getCurrentDeviceProperties();
+  const bool skip_fp8 = (dev_props->major < 8 || (dev_props->major == 8 && dev_props->minor < 9));
+  if (skip_fp8) {
+    std::cout << "  GPU compute capability " << dev_props->major << "." << dev_props->minor
+              << " < 8.9: skipping FP8 E4M3 verification on this GPU.\n";
+  } else {
+    std::cout << "  GPU compute capability " << dev_props->major << "." << dev_props->minor
+              << " >= 8.9: running FP8 E4M3 verification.\n";
+
+    torch::manual_seed(1337);
+    auto fp8_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        obs_size, hidden_dim, action_dim, num_blocks, use_nonlinear,
+        with_aux_heads, /*head_init_seed=*/0, with_semantic_scorer,
+        enable_zone_encoder, semantic_schema);
+    fp8_model->to(device);
+    if (argc > 1 && std::string(argv[1]).size() > 0) {
+      LoadModelCheckpointRobust(fp8_model, argv[1], device);
+    }
+    fp8_model->eval();
+
+    // Collect 80 in-distribution dune_imperium observations so Part 5 validates
+    // FP8 numerical agreement on both seeded weights and trained checkpoints (argv[1]).
+    auto dune_game = LoadGame("dune_imperium");
+    const int64_t fp8_b = 80;
+    torch::Tensor fp8_obs_cpu = torch::zeros(
+        {fp8_b, obs_size}, torch::TensorOptions().dtype(torch::kFloat32));
+    float* fp8_obs_ptr = fp8_obs_cpu.data_ptr<float>();
+    int64_t collected = 0;
+    for (int g_idx = 0; collected < fp8_b && g_idx < 32; ++g_idx) {
+      auto st = dune_game->NewInitialState();
+      int step = 0;
+      while (!st->IsTerminal() && collected < fp8_b) {
+        if (st->IsChanceNode()) {
+          auto outcomes = st->ChanceOutcomes();
+          st->ApplyAction(outcomes[(g_idx * 131 + step * 17) % outcomes.size()].first);
+        } else {
+          Player p = st->CurrentPlayer();
+          std::vector<float> raw_obs(dune_game->ObservationTensorSize(), 0.0f);
+          st->ObservationTensor(p, absl::MakeSpan(raw_obs));
+          const int64_t copy_n = std::min<int64_t>(obs_size, static_cast<int64_t>(raw_obs.size()));
+          std::memcpy(fp8_obs_ptr + collected * obs_size, raw_obs.data(), copy_n * sizeof(float));
+          ++collected;
+          auto legals = st->LegalActions();
+          st->ApplyAction(legals[(g_idx * 37 + step * 31) % legals.size()]);
+        }
+        ++step;
+      }
+    }
+    CHECK_TRUE(collected == fp8_b, "Collected 80 real dune_imperium observations");
+    torch::Tensor fp8_obs = fp8_obs_cpu.to(device);
+
+    // 1. M = 1 and M = 16 (< 32 threshold): PrepareFp8Cache() produces bitwise
+    // identical logits and values (torch::equal) to RefreshBf16InferenceCache()
+    // under AutocastGuard(c10::DeviceType::CUDA, true), confirming root priors
+    // (M = 1) remain in exact BF16.
+    for (int64_t small_m : {1, 16}) {
+      auto small_obs = fp8_obs.narrow(0, 0, small_m);
+
+      fp8_model->DisableFp8Cache();
+      CHECK_TRUE(!fp8_model->fp8_cache_ready(), "FP8 cache must be disabled before BF16 baseline");
+      fp8_model->RefreshBf16InferenceCache();
+      SharedDunePolicyValueNetImpl::ModelOutputs bf16_out;
+      {
+        torch::InferenceMode guard;
+        AutocastGuard amp(c10::DeviceType::CUDA, true);
+        bf16_out = fp8_model->forward(small_obs);
+      }
+
+      fp8_model->PrepareFp8Cache();
+      CHECK_TRUE(fp8_model->fp8_cache_ready(), "FP8 cache must be ready after PrepareFp8Cache()");
+      SharedDunePolicyValueNetImpl::ModelOutputs fp8_out;
+      {
+        torch::InferenceMode guard;
+        AutocastGuard amp(c10::DeviceType::CUDA, true);
+        fp8_out = fp8_model->forward(small_obs);
+      }
+
+      CHECK_TRUE(torch::equal(bf16_out.logits, fp8_out.logits),
+                 "M < 32 logits must match BF16 exactly (bitwise identical)");
+      CHECK_TRUE(torch::equal(bf16_out.values, fp8_out.values),
+                 "M < 32 values must match BF16 exactly (bitwise identical)");
+      std::cout << "  M = " << small_m << " (< 32 fallback to exact BF16): PASS (bitwise identical)\n";
+    }
+
+    // 2. M = 64 (16-aligned) and M = 70 (unaligned M % 16 != 0 zero-padding path):
+    // PrepareFp8Cache() executes cleanly with finite outputs (torch::isfinite(...).all()),
+    // close agreement with BF16 (cosine_similarity > 0.98f on logits and max abs value diff < 0.08f),
+    // and DisableFp8Cache() restores exact torch::equal bitwise parity with BF16.
+    for (int64_t batch_m : {64, 70}) {
+      auto batch_obs = fp8_obs.narrow(0, 0, batch_m);
+
+      fp8_model->DisableFp8Cache();
+      CHECK_TRUE(!fp8_model->fp8_cache_ready(), "FP8 cache must be disabled before BF16 baseline");
+      fp8_model->RefreshBf16InferenceCache();
+      SharedDunePolicyValueNetImpl::ModelOutputs bf16_out;
+      {
+        torch::InferenceMode guard;
+        AutocastGuard amp(c10::DeviceType::CUDA, true);
+        bf16_out = fp8_model->forward(batch_obs);
+      }
+
+      fp8_model->PrepareFp8Cache();
+      SharedDunePolicyValueNetImpl::ModelOutputs fp8_out;
+      {
+        torch::InferenceMode guard;
+        AutocastGuard amp(c10::DeviceType::CUDA, true);
+        fp8_out = fp8_model->forward(batch_obs);
+      }
+
+      CHECK_TRUE(torch::isfinite(fp8_out.logits).all().item<bool>(), "FP8 logits must be finite");
+      CHECK_TRUE(torch::isfinite(fp8_out.values).all().item<bool>(), "FP8 values must be finite");
+
+      float cos_sim = torch::cosine_similarity(
+          bf16_out.logits.to(torch::kFloat32).flatten(),
+          fp8_out.logits.to(torch::kFloat32).flatten(),
+          /*dim=*/0).item<float>();
+      auto abs_val_diffs = (bf16_out.values.to(torch::kFloat32) -
+                            fp8_out.values.to(torch::kFloat32)).abs();
+      float mean_val_diff = abs_val_diffs.mean().item<float>();
+      float max_val_diff = abs_val_diffs.max().item<float>();
+
+      std::cout << "  M = " << batch_m << " FP8 agreement: cosine_sim=" << cos_sim
+                << ", mean_val_diff=" << mean_val_diff
+                << ", max_val_diff=" << max_val_diff << std::endl;
+      CHECK_TRUE(cos_sim > 0.98f, "FP8 logits cosine similarity with BF16 must be > 0.98");
+      CHECK_TRUE(mean_val_diff < 0.03f, "FP8 values mean abs diff with BF16 must be < 0.03");
+      CHECK_TRUE(max_val_diff < 0.08f, "FP8 values max abs diff with BF16 must be < 0.08");
+
+      fp8_model->DisableFp8Cache();
+      CHECK_TRUE(!fp8_model->fp8_cache_ready(), "FP8 cache must be disabled after DisableFp8Cache()");
+      SharedDunePolicyValueNetImpl::ModelOutputs restored_out;
+      {
+        torch::InferenceMode guard;
+        AutocastGuard amp(c10::DeviceType::CUDA, true);
+        restored_out = fp8_model->forward(batch_obs);
+      }
+      CHECK_TRUE(torch::equal(bf16_out.logits, restored_out.logits),
+                 "DisableFp8Cache must restore exact bitwise parity with BF16 logits");
+      CHECK_TRUE(torch::equal(bf16_out.values, restored_out.values),
+                 "DisableFp8Cache must restore exact bitwise parity with BF16 values");
+      std::cout << "  M = " << batch_m << " DisableFp8Cache bitwise BF16 restoration: PASS\n";
+    }
+
+    // 3. BatchedEvaluator SetEnableFp8Trunk(true) -> WarmupCudaGraphs({1, 64})
+    // -> batch evaluation -> SetEnableFp8Trunk(false) -> WarmupCudaGraphs({1, 64})
+    // executes cleanly with finite outputs and restores exact BF16 output after disabling FP8.
+    {
+      std::shared_mutex eval_mutex;
+      BatchedEvaluator evaluator(fp8_model, /*target_batch_size=*/64, /*timeout_ms=*/1, device, &eval_mutex,
+                                 /*logit_cap=*/10.0f, /*device_synchronize=*/false, /*high_priority_stream=*/true,
+                                 /*emit_batch_membership=*/false, /*rollout_amp=*/true, /*allow_tf32=*/true);
+
+      evaluator.SetEnableFp8Trunk(false);
+      evaluator.WarmupCudaGraphs({1, 64});
+
+      auto base_single = evaluator.EvaluateWithActions(observation, &candidates);
+      CHECK_TRUE(base_single.ok, "Base single eval ok");
+      CHECK_TRUE(base_single.logits.size() == action_dim, "Base single logits size");
+
+      std::vector<std::vector<float>> batch_obs_64(64, observation);
+      auto base_batch = evaluator.EvaluateBatch(batch_obs_64);
+      CHECK_TRUE(base_batch.size() == 64, "Base batch size 64");
+      for (const auto& r : base_batch) {
+        CHECK_TRUE(r.ok, "Base batch item ok");
+      }
+
+      evaluator.SetEnableFp8Trunk(true);
+      CHECK_TRUE(fp8_model->use_fp8_trunk(), "Model use_fp8_trunk must be true");
+      evaluator.WarmupCudaGraphs({1, 64});
+
+      auto fp8_single = evaluator.EvaluateWithActions(observation, &candidates);
+      CHECK_TRUE(fp8_single.ok, "FP8 single eval ok");
+      CHECK_TRUE(std::isfinite(fp8_single.value), "FP8 single value finite");
+      for (float l : fp8_single.logits) {
+        CHECK_TRUE(std::isfinite(l), "FP8 single logit finite");
+      }
+
+      auto fp8_batch = evaluator.EvaluateBatch(batch_obs_64);
+      CHECK_TRUE(fp8_batch.size() == 64, "FP8 batch size 64");
+      for (const auto& r : fp8_batch) {
+        CHECK_TRUE(r.ok, "FP8 batch item ok");
+        CHECK_TRUE(std::isfinite(r.value), "FP8 batch value finite");
+      }
+
+      evaluator.SetEnableFp8Trunk(false);
+      CHECK_TRUE(!fp8_model->use_fp8_trunk(), "Model use_fp8_trunk must be false");
+      evaluator.WarmupCudaGraphs({1, 64});
+
+      auto restored_single = evaluator.EvaluateWithActions(observation, &candidates);
+      CHECK_TRUE(restored_single.ok, "Restored single eval ok");
+      CHECK_TRUE(restored_single.value == base_single.value,
+                 "Restored single value bitwise matches base BF16");
+      CHECK_TRUE(restored_single.logits.size() == base_single.logits.size(),
+                 "Restored single logits size matches base BF16");
+      for (size_t j = 0; j < base_single.logits.size(); ++j) {
+        CHECK_TRUE(restored_single.logits[j] == base_single.logits[j],
+                   "Restored single logit bitwise matches base BF16");
+      }
+
+      auto restored_batch = evaluator.EvaluateBatch(batch_obs_64);
+      CHECK_TRUE(restored_batch.size() == 64, "Restored batch size 64");
+      for (size_t i = 0; i < 64; ++i) {
+        CHECK_TRUE(restored_batch[i].ok, "Restored batch item ok");
+        CHECK_TRUE(restored_batch[i].value == base_batch[i].value,
+                   "Restored batch value bitwise matches base BF16");
+      }
+      std::cout << "  BatchedEvaluator FP8 toggle and CudaGraph invalidation: PASS\n";
+    }
   }
 
   std::cout << "\nALL BF16 LINEAR CACHE VERIFICATION TESTS PASSED!\n";

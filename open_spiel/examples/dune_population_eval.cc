@@ -564,7 +564,9 @@ std::string MarketModeToString(dune_imperium::MarketAppendixMode mode) {
 // ---------------------------------------------------------------------------
 bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* num_blocks,
                            int* input_dim = nullptr, std::string* market_mode = nullptr,
-                           dune_imperium::DeckPoolSemantics* deck_pool_semantics = nullptr) {
+                           dune_imperium::DeckPoolSemantics* deck_pool_semantics = nullptr,
+                           std::string* semantic_descriptor_schema = nullptr,
+                           bool* slot_indexed_out_layer_f = nullptr) {
   // 1. Try to find a JSON file
   std::string json_path = "";
   std::filesystem::path p(model_path);
@@ -632,10 +634,23 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
             std::string schema = it_sds->second.GetString();
             if (schema != dune_semantic::kDescriptorSchemaVersionV2 &&
                 schema != dune_semantic::kDescriptorSchemaVersionV3 &&
-                schema != dune_semantic::kDescriptorSchemaVersionV4) {
+                schema != dune_semantic::kDescriptorSchemaVersionV4 &&
+                schema != dune_semantic::kDescriptorSchemaVersionV5) {
               SpielFatalError(absl::StrFormat(
                   "Model checkpoint %s has invalid semantic_descriptor_schema ('%s')",
                   model_path, schema));
+            }
+            if (semantic_descriptor_schema != nullptr) {
+              *semantic_descriptor_schema = schema;
+            }
+          }
+          if (slot_indexed_out_layer_f != nullptr) {
+            auto it_sif = obj.find("slot_indexed_out_layer_f");
+            if (it_sif != obj.end()) {
+              *slot_indexed_out_layer_f = (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
+                                          (it_sif->second.IsString() && it_sif->second.GetString() == "true");
+            } else {
+              *slot_indexed_out_layer_f = false;
             }
           }
           auto it_ess = obj.find("enable_semantic_scorer");
@@ -662,11 +677,13 @@ bool DetectModelDimensions(const std::string& model_path, int* hidden_dim, int* 
             }
             if (it_sds == obj.end() || !it_sds->second.IsString() ||
                 (it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV3 &&
-                 it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV4)) {
+                 it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV4 &&
+                 it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV5)) {
               SpielFatalError(absl::StrFormat(
-                  "Model checkpoint %s with 9182 input dim requires semantic_descriptor_schema='%s' or '%s'",
+                  "Model checkpoint %s with 9182 input dim requires semantic_descriptor_schema='%s', '%s', or '%s'",
                   model_path, dune_semantic::kDescriptorSchemaVersionV3,
-                  dune_semantic::kDescriptorSchemaVersionV4));
+                  dune_semantic::kDescriptorSchemaVersionV4,
+                  dune_semantic::kDescriptorSchemaVersionV5));
             }
           }
           auto it_hd = obj.find("hidden_dim");
@@ -1560,7 +1577,9 @@ void RunEvaluation() {
   int main_input_dim = static_cast<int>(obs_size);
   std::string main_detected_market_mode = "none";
   dune_imperium::DeckPoolSemantics main_detected_semantics = dune_imperium::DeckPoolSemantics::kLegacy;
-  if (!DetectModelDimensions(model_checkpoint, &main_hidden_dim, &main_num_blocks, &main_input_dim, &main_detected_market_mode, &main_detected_semantics)) {
+  std::string main_detected_schema = "semantic_action_v3";
+  bool main_slot_indexed_f = false;
+  if (!DetectModelDimensions(model_checkpoint, &main_hidden_dim, &main_num_blocks, &main_input_dim, &main_detected_market_mode, &main_detected_semantics, &main_detected_schema, &main_slot_indexed_f)) {
     SpielFatalError("Failed to detect model dimensions for main checkpoint: " + model_checkpoint);
   }
 
@@ -1598,7 +1617,11 @@ void RunEvaluation() {
   }
   auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
       main_input_dim, main_hidden_dim, action_size, main_num_blocks,
-      absl::GetFlag(FLAGS_nonlinear_value_head), false, 0, cand_has_scorer);
+      absl::GetFlag(FLAGS_nonlinear_value_head), false, 0, cand_has_scorer, false, main_detected_schema);
+  model->SetSemanticDescriptorSchema(main_detected_schema);
+  if (main_slot_indexed_f && model->semantic_scorer_ != nullptr) {
+    model->semantic_scorer_->EnableF(true);
+  }
   model->eval();
   LoadModelCheckpointRobust(model, model_checkpoint, device);
   model->to(device);
@@ -1644,7 +1667,9 @@ void RunEvaluation() {
     int opp_detected_input_dim = static_cast<int>(obs_size);
     std::string opp_detected_market_mode_str = "none";
     dune_imperium::DeckPoolSemantics opp_detected_semantics = dune_imperium::DeckPoolSemantics::kLegacy;
-    if (!DetectModelDimensions(opp_path, &opp_detected_hidden, &opp_detected_blocks, &opp_detected_input_dim, &opp_detected_market_mode_str, &opp_detected_semantics)) {
+    std::string opp_detected_schema = "semantic_action_v3";
+    bool opp_slot_indexed_f = false;
+    if (!DetectModelDimensions(opp_path, &opp_detected_hidden, &opp_detected_blocks, &opp_detected_input_dim, &opp_detected_market_mode_str, &opp_detected_semantics, &opp_detected_schema, &opp_slot_indexed_f)) {
       SpielFatalError("Failed to detect model dimensions for opponent checkpoint: " + opp_path);
     }
     auto opp_market_mode = ParseMarketMode(opp_detected_market_mode_str);
@@ -1666,7 +1691,11 @@ void RunEvaluation() {
     }
     auto opp_model = std::make_shared<SharedDunePolicyValueNetImpl>(
         opp_detected_input_dim, opp_detected_hidden, action_size, opp_detected_blocks,
-        absl::GetFlag(FLAGS_opponent_nonlinear_value_head), false, 0, opp_has_scorer);
+        absl::GetFlag(FLAGS_opponent_nonlinear_value_head), false, 0, opp_has_scorer, false, opp_detected_schema);
+    opp_model->SetSemanticDescriptorSchema(opp_detected_schema);
+    if (opp_slot_indexed_f && opp_model->semantic_scorer_ != nullptr) {
+      opp_model->semantic_scorer_->EnableF(true);
+    }
     opp_model->eval();
     LoadModelCheckpointRobust(opp_model, opp_path, device);
     opp_model->to(device);

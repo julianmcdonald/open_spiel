@@ -1017,6 +1017,20 @@ struct WorkerStats {
 
   int64_t r755_searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
   int64_t r755_executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
+
+  // R755 Cat 3 Gate 2 Critic / GAE diagnostics: 9 buckets (3 rounds x 3 priors)
+  // for (i) 4*(G_buy - V_buy), (ii) 4*(G_after - V_after), (iii) 4*(G_buy - (V_buy + A_buy))
+  double r755_cat3_i_sum[9] = {0.0};
+  double r755_cat3_ii_sum[9] = {0.0};
+  double r755_cat3_iii_sum[9] = {0.0};
+  int64_t r755_cat3_bucket_count[9] = {0};
+
+  // Buy tracking: Imperium, Tleilaxu, Tech buys, unspent persuasion
+  int64_t r755_imperium_buys = 0;
+  int64_t r755_tleilaxu_buys = 0;
+  int64_t r755_tech_buys = 0;
+  int64_t r755_reveal_turns = 0;
+  double r755_unspent_persuasion_sum = 0.0;
 };
 
 
@@ -1642,7 +1656,14 @@ json::Object BuildPrePrecisionConfigFingerprintObject() {
 
   const auto resolved_deck_pool_semantics =
       dune_imperium::ParseDeckPoolSemanticsOrDie(absl::GetFlag(FLAGS_deck_pool_semantics));
-  if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v4") {
+  if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v5") {
+    const auto schema = dune_imperium::GetInformationStateSchema(
+        dune_imperium::MarketAppendixMode::kFullPublicInformationV5,
+        resolved_deck_pool_semantics);
+    config_obj["market_appendix_mode"] = std::string("full_public_information_v5");
+    config_obj["observation_dim"] = schema.size;
+    config_obj["feature_schema_sha256"] = std::string(schema.sha256);
+  } else if (absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v4") {
     const auto schema = dune_imperium::GetInformationStateSchema(
         dune_imperium::MarketAppendixMode::kFullPublicInformationV4,
         resolved_deck_pool_semantics);
@@ -2257,6 +2278,23 @@ std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
     source_config_obj.erase("deck_pool_semantics");
   }
 
+  std::string source_semantic_schema;
+  const bool also_semantic_transition =
+      absl::GetFlag(FLAGS_allow_semantic_schema_transition) &&
+      absl::GetFlag(FLAGS_enable_semantic_scorer);
+  if (also_semantic_transition) {
+    source_semantic_schema = "semantic_action_v3";
+    auto schema_it = manifest_obj.find("semantic_descriptor_schema");
+    if (schema_it != manifest_obj.end() && schema_it->second.IsString()) {
+      source_semantic_schema = schema_it->second.GetString();
+    }
+    if (source_semantic_schema.empty() || source_semantic_schema == "none") {
+      source_config_obj.erase("semantic_descriptor_schema");
+    } else {
+      source_config_obj["semantic_descriptor_schema"] = source_semantic_schema;
+    }
+  }
+
   const std::string computed_source_fp =
       open_spiel::ComputePrecisionConfigFingerprint(
           source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
@@ -2267,6 +2305,15 @@ std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
     SpielFatalError(absl::StrFormat(
         "Market appendix transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
         expected_source_fp, computed_source_fp));
+  }
+  if (also_semantic_transition) {
+    const std::string expected_sem_fp =
+        absl::GetFlag(FLAGS_semantic_schema_transition_source_fingerprint);
+    if (!expected_sem_fp.empty() && computed_source_fp != expected_sem_fp) {
+      SpielFatalError(absl::StrFormat(
+          "Semantic schema transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+          expected_sem_fp, computed_source_fp));
+    }
   }
   auto fp_it = manifest_obj.find("config_fingerprint");
   if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
@@ -2284,6 +2331,72 @@ std::string ValidateAndComputeMarketAppendixTransitionFingerprint(
       "  Market appendix mode: '%s' -> '%s'\n",
       computed_source_fp, current_config_fingerprint,
       source_mode, absl::GetFlag(FLAGS_market_appendix_mode)) << std::endl;
+  if (also_semantic_transition) {
+    std::cout << absl::StrFormat(
+        "[semantic_schema-transition] Validated simultaneous semantic schema transition:\n"
+        "  Source fingerprint: %s\n"
+        "  Target fingerprint: %s\n"
+        "  Semantic schema:    '%s' -> '%s'\n",
+        computed_source_fp, current_config_fingerprint,
+        source_semantic_schema, absl::GetFlag(FLAGS_semantic_descriptor_schema)) << std::endl;
+  }
+  return computed_source_fp;
+}
+
+std::string ValidateAndComputeSemanticSchemaTransitionFingerprint(
+    const std::string& manifest_path,
+    const std::string& current_config_fingerprint) {
+  if (!absl::GetFlag(FLAGS_allow_semantic_schema_transition)) return "";
+  std::ifstream mfs(manifest_path);
+  if (!mfs) SpielFatalError("Could not open manifest file at: " + manifest_path);
+  std::string mcontent((std::istreambuf_iterator<char>(mfs)),
+                      std::istreambuf_iterator<char>());
+  auto val_opt = open_spiel::json::FromString(mcontent);
+  if (!val_opt.has_value() || !val_opt->IsObject()) {
+    SpielFatalError("Malformed manifest JSON at: " + manifest_path);
+  }
+  const auto& manifest_obj = val_opt->GetObject();
+
+  std::string source_schema = "semantic_action_v3";
+  auto it = manifest_obj.find("semantic_descriptor_schema");
+  if (it != manifest_obj.end() && it->second.IsString()) {
+    source_schema = it->second.GetString();
+  }
+
+  auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
+  if (source_schema.empty() || source_schema == "none") {
+    source_config_obj.erase("semantic_descriptor_schema");
+  } else {
+    source_config_obj["semantic_descriptor_schema"] = source_schema;
+  }
+
+  const std::string computed_source_fp =
+      open_spiel::ComputePrecisionConfigFingerprint(
+          source_config_obj, absl::GetFlag(FLAGS_rollout_amp),
+          absl::GetFlag(FLAGS_allow_tf32));
+  const std::string expected_source_fp =
+      absl::GetFlag(FLAGS_semantic_schema_transition_source_fingerprint);
+  if (!expected_source_fp.empty() && computed_source_fp != expected_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Semantic schema transition source fingerprint mismatch.\n  Expected by flag: %s\n  Computed from source settings: %s",
+        expected_source_fp, computed_source_fp));
+  }
+  auto fp_it = manifest_obj.find("config_fingerprint");
+  if (fp_it == manifest_obj.end() || !fp_it->second.IsString() ||
+      fp_it->second.GetString() != computed_source_fp) {
+    SpielFatalError(absl::StrFormat(
+        "Semantic schema transition source manifest fingerprint mismatch.\n  Manifest stored: %s\n  Computed from source settings: %s\n"
+        "  Note: allow_semantic_schema_transition permits semantic_descriptor_schema to differ from parent manifest.",
+        (fp_it != manifest_obj.end() && fp_it->second.IsString()) ? fp_it->second.GetString() : "<missing>",
+        computed_source_fp));
+  }
+  std::cout << absl::StrFormat(
+      "[semantic_schema-transition] Validated intentional semantic schema transition:\n"
+      "  Source fingerprint: %s\n"
+      "  Target fingerprint: %s\n"
+      "  Semantic schema:    '%s' -> '%s'\n",
+      computed_source_fp, current_config_fingerprint,
+      source_schema, absl::GetFlag(FLAGS_semantic_descriptor_schema)) << std::endl;
   return computed_source_fp;
 }
 
@@ -2323,7 +2436,8 @@ std::string ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(
 
   auto source_config_obj = BuildPrePrecisionConfigFingerprintObject();
 
-  if (source_mode == "full_public_information_v4" ||
+  if (source_mode == "full_public_information_v5" ||
+      source_mode == "full_public_information_v4" ||
       source_mode == "full_public_information_v3" ||
       source_mode == "ordered_card_slots_v2") {
     const auto schema = dune_imperium::GetInformationStateSchema(
@@ -2635,6 +2749,9 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
       manifest_obj["semantic_descriptor_schema"] = model->semantic_descriptor_schema_;
+      if (model->semantic_scorer_ != nullptr && model->semantic_scorer_->slot_indexed_f_) {
+        manifest_obj["slot_indexed_out_layer_f"] = true;
+      }
     }
     manifest_obj["enable_zone_encoder"] = model->enable_zone_encoder_;
     manifest_obj["specimen_exchange_penalty"] = absl::GetFlag(FLAGS_specimen_exchange_penalty);
@@ -2704,6 +2821,12 @@ void SaveCheckpoint(std::shared_ptr<SharedDunePolicyValueNetImpl> model,
       manifest_obj["tf32_transition_source_fingerprint"] = g_tf32_transition_source_fingerprint;
       if (g_tf32_transition_source_update >= 0) {
         manifest_obj["tf32_transition_source_update"] = g_tf32_transition_source_update;
+      }
+    }
+    if (!g_semantic_schema_transition_source_fingerprint.empty()) {
+      manifest_obj["semantic_schema_transition_source_fingerprint"] = g_semantic_schema_transition_source_fingerprint;
+      if (g_semantic_schema_transition_source_update >= 0) {
+        manifest_obj["semantic_schema_transition_source_update"] = g_semantic_schema_transition_source_update;
       }
     }
     if (absl::GetFlag(FLAGS_pool_game_fraction) > 0.0 &&
@@ -3597,19 +3720,43 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         }
         auto cat = open_spiel::dune_imperium::ClassifyR755SearchCategory(
             *state, current_player, r755_space_placed_this_turn_[current_player],
-            absl::GetFlag(FLAGS_r755_category_mask));
+            absl::GetFlag(FLAGS_r755_category_mask),
+            absl::GetFlag(FLAGS_r755_cat3_strict_card_tech_only));
         bool coin_active = false;
         if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
             cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) {
           coin_active = r755_turn_coin_active_[current_player];
         } else if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
+          double search_prob = absl::GetFlag(FLAGS_r755_search_prob);
+          if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
+            double cat3_prob = absl::GetFlag(FLAGS_r755_cat3_search_prob);
+            if (cat3_prob >= 0.0) {
+              search_prob = cat3_prob;
+            }
+            double boost_prob = absl::GetFlag(FLAGS_r755_cat3_low_prior_boost_prob);
+            if (boost_prob >= 0.0) {
+              const double boost_thresh = absl::GetFlag(FLAGS_r755_cat3_low_prior_threshold);
+              bool has_low_prior_buy = false;
+              for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                if (open_spiel::dune_imperium::IsCardOrTechAcquisitionAction(actions[a_idx])) {
+                  double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+                  if (p < boost_thresh) {
+                    has_low_prior_buy = true;
+                    break;
+                  }
+                }
+              }
+              if (has_low_prior_buy) {
+                search_prob = std::max(search_prob, boost_prob);
+              }
+            }
+          }
           uint64_t coin_seed = dune_seed::DeriveSeed(
               master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
               0x52373535ULL);
           std::mt19937_64 coin_rng(coin_seed);
           coin_active =
-              (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) <
-               absl::GetFlag(FLAGS_r755_search_prob));
+              (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) < search_prob);
         }
         const double max_prior_gate = absl::GetFlag(FLAGS_r755_max_raw_prior);
         const bool prior_gated = (max_prior_gate < 1.0 && max_raw_p >= max_prior_gate);
@@ -3648,19 +3795,61 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
             opts.precomputed_raw_prior = &collector_raw_prior;
           }
           opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
-          opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
-          opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+
+          int top_k = 3;
+          int rollouts_per_action = 16;
+          open_spiel::dune_imperium::SearchTruncationMode truncation_mode =
+              open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
+
+          if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
+            opts.all_buy_candidates = true;
+            opts.symmetric_stage2_confirmation = absl::GetFlag(FLAGS_r755_cat3_symmetric_confirmation);
+            opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage1_rollouts);
+            opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+            opts.stage2_independent_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage2_indep_rollouts);
+            rollouts_per_action = opts.stage1_rollouts + opts.stage2_independent_rollouts;
+            top_k = 12;
+
+            const std::string cat3_trunc_str = absl::GetFlag(FLAGS_r755_cat3_truncation_mode);
+            if (cat3_trunc_str == "next_round" || cat3_trunc_str == "next_round_search_player") {
+              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
+            } else if (cat3_trunc_str == "plus2_rounds" || cat3_trunc_str == "plus_2_rounds") {
+              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kPlus2Rounds;
+            } else if (cat3_trunc_str == "terminal" || cat3_trunc_str == "none") {
+              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kTerminal;
+            } else {
+              open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_truncation_mode: ", cat3_trunc_str));
+            }
+
+            const std::string cat3_crn_override = absl::GetFlag(FLAGS_r755_cat3_crn_mode);
+            if (!cat3_crn_override.empty()) {
+              if (cat3_crn_override == "sequential") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+              } else if (cat3_crn_override == "deck_order") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+              } else if (cat3_crn_override == "event_keyed") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+              } else {
+                open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_crn_mode: ", cat3_crn_override));
+              }
+            }
+          } else {
+            opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
+            opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+            opts.stage1_subwave_rollouts = absl::GetFlag(FLAGS_r755_stage1_subwave_rollouts);
+            opts.stage1_subwave_min_diff = absl::GetFlag(FLAGS_r755_stage1_subwave_min_diff);
+            opts.center_4seat_leaf_values = absl::GetFlag(FLAGS_r755_leaf_value_centering);
+          }
 
           auto search_res =
               open_spiel::dune_imperium::CompoundRolloutSearchDecision(
                   *state, current_player, &local_r755_tree,
-                  r755_search_evals_, /*top_k=*/3, /*rollouts_per_action=*/16,
+                  r755_search_evals_, top_k, rollouts_per_action,
                   /*min_override_margin=*/0.15,
                   open_spiel::dune_imperium::TreeReuseMode::kTargetFill,
                   search_seed,
                   open_spiel::dune_imperium::SearchPairingMode::kPaired,
-                  open_spiel::dune_imperium::SearchTruncationMode::
-                      kNextRoundSearchPlayer,
+                  truncation_mode,
                   crn_mode,
                   /*world_sampler=*/nullptr,
                   absl::GetFlag(FLAGS_r755_min_t_stat),
@@ -3708,9 +3897,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
               out << "]}\n";
             }
           }
-          if (search_res.overridden &&
-              absl::GetFlag(FLAGS_r755_execute_overrides)) {
-            Action best_action = search_res.chosen_action;
+          const bool execute_decision = search_res.teacher_accepted
+              ? absl::GetFlag(FLAGS_r755_execute_overrides)
+              : (search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides));
+          const Action target_action = search_res.teacher_accepted ? search_res.teacher_action : search_res.chosen_action;
+
+          if (execute_decision) {
+            Action best_action = target_action;
             int best_idx = -1;
             for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
               if (actions[a_idx] == best_action) {
@@ -3744,13 +3937,23 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                 if (p_cand_data != nullptr) {
                   ex.candidate_data = *p_cand_data;
                 }
-                double raw_q = search_res.raw_mean_utility;
-                double best_q = search_res.chosen_mean_utility;
-                ex.normalized_visits =
-                    open_spiel::dune_imperium::ComputePairwiseMpoTarget(
-                        raw_policy_pairs, actions, search_res.raw_action, raw_q,
-                        search_res.best_action, best_q,
-                        /*base_temperature=*/0.15, /*max_target_kl=*/0.05);
+                if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase &&
+                    !search_res.stage2_candidate_utilities.empty()) {
+                  ex.normalized_visits =
+                      open_spiel::dune_imperium::ComputeMpoRelativeTarget(
+                          raw_policy_pairs, actions,
+                          search_res.stage2_candidate_utilities,
+                          absl::GetFlag(FLAGS_r755_cat3_mpo_temperature),
+                          absl::GetFlag(FLAGS_r755_cat3_mpo_max_kl));
+                } else {
+                  double raw_q = search_res.raw_mean_utility;
+                  double best_q = search_res.chosen_mean_utility;
+                  ex.normalized_visits =
+                      open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                          raw_policy_pairs, actions, search_res.raw_action, raw_q,
+                          search_res.best_action, best_q,
+                          /*base_temperature=*/0.15, /*max_target_kl=*/0.05);
+                }
                 ex.value_target = 0.0;
                 ex.value_target_attached = false;
                 ex.episode_id = episode_id;
@@ -4247,6 +4450,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
         transition.mask_policy_loss = r755_override_accepted;
         transition.targeted_buy_card = targeted_buy_card_id;
         transition.targeted_buy_round = (dune_state != nullptr) ? dune_state->GetCurrentRound() : 0;
+        transition.round = (dune_state != nullptr) ? dune_state->GetCurrentRound() : 0;
         transition.targeted_buy_forced = is_targeted_forced_buy;
         transition.privileged_appendix = std::move(pre_action_privileged_appendix);
         transition.is_high_stakes = pre_action_is_high_stakes;
@@ -4271,6 +4475,24 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
             int strength_delta = post_strength - pre_combat_strength[current_player];
             if (strength_delta > 0) {
               combat_accumulator.RecordDeployment(current_player, trajectory->size() - 1, strength_delta);
+            }
+          }
+
+          if (dune_state->IsPlayerInRevealTurn(current_player) && local_stats != nullptr) {
+            if (action == dune_imperium::kActionEndTurn) {
+              local_stats->r755_reveal_turns++;
+              local_stats->r755_unspent_persuasion_sum += dune_state->PlayerPersuasion(current_player);
+            } else {
+              if ((action >= dune_imperium::kActionBuyImperiumRow0 && action <= dune_imperium::kActionBuyImperiumRow0 + 7) ||
+                  (action >= dune_imperium::kActionBuyHelenaReserve0 && action <= dune_imperium::kActionBuyHelenaReserve0 + 7) ||
+                  (action == dune_imperium::kActionBuyReserveArrakisLiaison || action == dune_imperium::kActionBuyReserveTheSpiceMustFlow)) {
+                local_stats->r755_imperium_buys++;
+              } else if (action >= dune_imperium::kActionTleilaxuAcquire0 && action < dune_imperium::kActionTleilaxuAcquireSkip) {
+                local_stats->r755_tleilaxu_buys++;
+              } else if ((action >= dune_imperium::kActionTechAcquire0 && action < dune_imperium::kActionTechAcquireSkip) ||
+                         (action >= dune_imperium::kActionTechAcquireWithSolari0 && action < dune_imperium::kActionTechAcquireWithSolariSkip)) {
+                local_stats->r755_tech_buys++;
+              }
             }
           }
 
@@ -4547,6 +4769,34 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
     }
 
+    if (local_stats != nullptr) {
+      for (int p = 0; p < game.NumPlayers(); ++p) {
+        const size_t n_p = player_trans_indices[p].size();
+        if (n_p < 2) continue;
+        for (size_t i = 0; i + 1 < n_p; ++i) {
+          const auto& t_buy = (*trajectory)[player_trans_indices[p][i]];
+          if (t_buy.round >= 1 && t_buy.round <= 6 &&
+              !t_buy.mask_policy_loss &&
+              open_spiel::dune_imperium::IsCardOrTechAcquisitionAction(t_buy.action)) {
+            const auto& t_after = (*trajectory)[player_trans_indices[p][i + 1]];
+            double i_val = 4.0 * (t_buy.mc_return - t_buy.value);
+            double ii_val = 4.0 * (t_after.mc_return - t_after.value);
+            double iii_val = 4.0 * (t_buy.mc_return - (t_buy.value + t_buy.gae_advantage));
+
+            int r_bucket = (t_buy.round <= 2) ? 0 : ((t_buy.round <= 4) ? 1 : 2);
+            double prior = std::exp(static_cast<double>(t_buy.old_log_prob));
+            int p_bucket = (prior < 0.01) ? 0 : ((prior < 0.05) ? 1 : 2);
+            int b_idx = r_bucket * 3 + p_bucket;
+
+            local_stats->r755_cat3_i_sum[b_idx] += i_val;
+            local_stats->r755_cat3_ii_sum[b_idx] += ii_val;
+            local_stats->r755_cat3_iii_sum[b_idx] += iii_val;
+            local_stats->r755_cat3_bucket_count[b_idx]++;
+          }
+        }
+      }
+    }
+
     for (auto& cf : pending_cf) {
       for (int repeat = 0; repeat < cf.replay_weight; ++repeat) {
         if (repeat + 1 == cf.replay_weight) {
@@ -4708,6 +4958,20 @@ struct CollectResult {
 
   int64_t r755_searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
   int64_t r755_executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
+
+  // R755 Cat 3 Gate 2 Critic / GAE diagnostics: 9 buckets (3 rounds x 3 priors)
+  // for (i) 4*(G_buy - V_buy), (ii) 4*(G_after - V_after), (iii) 4*(G_buy - (V_buy + A_buy))
+  double r755_cat3_i_sum[9] = {0.0};
+  double r755_cat3_ii_sum[9] = {0.0};
+  double r755_cat3_iii_sum[9] = {0.0};
+  int64_t r755_cat3_bucket_count[9] = {0};
+
+  // Buy tracking: Imperium, Tleilaxu, Tech buys, unspent persuasion
+  int64_t r755_imperium_buys = 0;
+  int64_t r755_tleilaxu_buys = 0;
+  int64_t r755_tech_buys = 0;
+  int64_t r755_reveal_turns = 0;
+  double r755_unspent_persuasion_sum = 0.0;
 };
 
 // Phase A: folds the rollout-side pre-cap |z| canaries into the update's stats
@@ -4834,16 +5098,36 @@ CollectResult CollectRollout(const Game* game,
   uint64_t actual_start_ep = next_episode_id->load();
   std::atomic<uint64_t> local_episode_id{actual_start_ep};
 
+  auto batched_eval = std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator);
+  if (batched_eval && std::getenv("DUNE_ENABLE_ASYNC_STAGE_TIMERS") != nullptr) {
+    batched_eval->EnableAsyncStageTimers(true);
+  }
+  open_spiel::BatcherTelemetry telem_before;
+  if (batched_eval) {
+    telem_before = batched_eval->GetBatcherTelemetry();
+  }
+
+  std::atomic<int> completed_workers{0};
+  std::atomic<int64_t> first_worker_finish_ns{0};
+
   auto start = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < num_threads; ++i) {
-    workers.emplace_back(RolloutWorker, i, game, evaluator, obs_size,
-                         &rollout_buffer, &stop_collection, total_env_steps,
-                         &worker_stats, &local_episode_id, actual_start_ep,
-                         rollout_games, reward_lambda, vrpo_buffer,
-                         std::cref(opponent_evaluators),
-                         search_in_training ? &worker_snapshots[i] : nullptr,
-                         global_update,
-                         r755_hybrid ? &worker_aux_examples[i] : nullptr);
+    workers.emplace_back([&, i]() {
+      RolloutWorker(i, game, evaluator, obs_size,
+                    &rollout_buffer, &stop_collection, total_env_steps,
+                    &worker_stats, &local_episode_id, actual_start_ep,
+                    rollout_games, reward_lambda, vrpo_buffer,
+                    std::cref(opponent_evaluators),
+                    search_in_training ? &worker_snapshots[i] : nullptr,
+                    global_update,
+                    r755_hybrid ? &worker_aux_examples[i] : nullptr);
+      if (completed_workers.fetch_add(1, std::memory_order_relaxed) == 0) {
+        first_worker_finish_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+      }
+    });
   }
   for (auto& worker : workers) worker.join();
 
@@ -4920,6 +5204,17 @@ CollectResult CollectRollout(const Game* game,
       result.r755_searched_by_cat[c] += stats.r755_searched_by_cat[c];
       result.r755_executed_overrides_by_cat[c] += stats.r755_executed_overrides_by_cat[c];
     }
+    result.r755_imperium_buys += stats.r755_imperium_buys;
+    result.r755_tleilaxu_buys += stats.r755_tleilaxu_buys;
+    result.r755_tech_buys += stats.r755_tech_buys;
+    result.r755_reveal_turns += stats.r755_reveal_turns;
+    result.r755_unspent_persuasion_sum += stats.r755_unspent_persuasion_sum;
+    for (int b = 0; b < 9; ++b) {
+      result.r755_cat3_i_sum[b] += stats.r755_cat3_i_sum[b];
+      result.r755_cat3_ii_sum[b] += stats.r755_cat3_ii_sum[b];
+      result.r755_cat3_iii_sum[b] += stats.r755_cat3_iii_sum[b];
+      result.r755_cat3_bucket_count[b] += stats.r755_cat3_bucket_count[b];
+    }
 
     result.parity_decisions += stats.parity_decisions;
     result.parity_full_width_ok += stats.parity_full_width_ok;
@@ -4983,6 +5278,77 @@ CollectResult CollectRollout(const Game* game,
   }
   result.elapsed_seconds =
       std::chrono::duration<double>(end - start).count();
+
+  double tail_drain_s = 0.0;
+  int64_t f_ns = first_worker_finish_ns.load(std::memory_order_relaxed);
+  if (f_ns > 0) {
+    auto f_time = std::chrono::high_resolution_clock::time_point(
+        std::chrono::nanoseconds(f_ns));
+    tail_drain_s = std::max(0.0, std::chrono::duration<double>(end - f_time).count());
+  }
+
+  if (batched_eval && std::getenv("DUNE_LOG_BATCHER_TELEM") != nullptr) {
+    open_spiel::BatcherTelemetry telem_after = batched_eval->GetBatcherTelemetry();
+    uint64_t d_batches = telem_after.physical_batches - telem_before.physical_batches;
+    uint64_t d_requests = telem_after.submitted_rows - telem_before.submitted_rows;
+    uint64_t d_dev_timed = telem_after.device_timed_batches - telem_before.device_timed_batches;
+    double d_h2d_ms = telem_after.h2d_ms - telem_before.h2d_ms;
+    double d_trunk_ms = telem_after.trunk_ms - telem_before.trunk_ms;
+    double d_scorer_ms = telem_after.scorer_ms - telem_before.scorer_ms;
+    double d_post_cap_ms = telem_after.post_cap_softmax_ms - telem_before.post_cap_softmax_ms;
+    double d_d2h_ms = telem_after.d2h_ms - telem_before.d2h_ms;
+    double d_gap_ms = telem_after.inter_slot_idle_gap_ms - telem_before.inter_slot_idle_gap_ms;
+    uint64_t d_gaps = telem_after.inter_slot_gap_count - telem_before.inter_slot_gap_count;
+    double d_cpu_wait_ms = telem_after.cpu_wait_ms - telem_before.cpu_wait_ms;
+    double d_cpu_pack_ms = telem_after.cpu_pack_ms - telem_before.cpu_pack_ms;
+    double d_cpu_dist_ms = telem_after.cpu_distribute_ms - telem_before.cpu_distribute_ms;
+    uint64_t d_wants_batches = telem_after.wants_logits_batches - telem_before.wants_logits_batches;
+    uint64_t d_wants_rows = telem_after.wants_logits_rows - telem_before.wants_logits_rows;
+    uint64_t d_d2h_bytes = telem_after.d2h_bytes - telem_before.d2h_bytes;
+    uint64_t d_greedy_calls = telem_after.greedy_action_calls - telem_before.greedy_action_calls;
+    uint64_t d_greedy_ties = telem_after.greedy_action_ties - telem_before.greedy_action_ties;
+    uint64_t d_full = telem_after.full_batches - telem_before.full_batches;
+    uint64_t d_ge128 = telem_after.ge128_batches - telem_before.ge128_batches;
+    uint64_t d_ge64 = telem_after.ge64_batches - telem_before.ge64_batches;
+    uint64_t d_under64 = telem_after.under64_batches - telem_before.under64_batches;
+
+    double h2d_ms_batch = d_dev_timed > 0 ? (d_h2d_ms / d_dev_timed) : 0.0;
+    double trunk_ms_batch = d_dev_timed > 0 ? (d_trunk_ms / d_dev_timed) : 0.0;
+    double scorer_ms_batch = d_dev_timed > 0 ? (d_scorer_ms / d_dev_timed) : 0.0;
+    double post_cap_ms_batch = d_dev_timed > 0 ? (d_post_cap_ms / d_dev_timed) : 0.0;
+    double d2h_ms_batch = d_dev_timed > 0 ? (d_d2h_ms / d_dev_timed) : 0.0;
+    double gap_ms_batch = d_gaps > 0 ? (d_gap_ms / d_gaps) : 0.0;
+    double cpu_wait_ms_batch = d_batches > 0 ? (d_cpu_wait_ms / d_batches) : 0.0;
+    double cpu_pack_ms_batch = d_batches > 0 ? (d_cpu_pack_ms / d_batches) : 0.0;
+    double cpu_dist_ms_batch = d_batches > 0 ? (d_cpu_dist_ms / d_batches) : 0.0;
+    double mean_batch_size = d_batches > 0 ? (static_cast<double>(d_requests) / d_batches) : 0.0;
+    double d2h_mb = static_cast<double>(d_d2h_bytes) / (1024.0 * 1024.0);
+
+    std::cout << absl::StrFormat(
+        "[BATCHER-TELEM] u=%d collect_s=%.2f tail_drain_s=%.2f batches=%llu (full=%llu ge128=%llu ge64=%llu u64=%llu) "
+        "rows=%llu mean_b=%.1f | GPU ms/b: h2d=%.3f trunk=%.3f scorer=%.3f post_cap=%.3f d2h=%.3f gap=%.3f | "
+        "CPU ms/b: wait=%.3f pack=%.3f dist=%.3f | D2H: %.1f MB (wants_logits: %llu b, %llu rows) | "
+        "greedy: %llu calls, %llu ties (%.2f%%)",
+        global_update,
+        result.elapsed_seconds,
+        tail_drain_s,
+        static_cast<unsigned long long>(d_batches),
+        static_cast<unsigned long long>(d_full),
+        static_cast<unsigned long long>(d_ge128),
+        static_cast<unsigned long long>(d_ge64),
+        static_cast<unsigned long long>(d_under64),
+        static_cast<unsigned long long>(d_requests),
+        mean_batch_size,
+        h2d_ms_batch, trunk_ms_batch, scorer_ms_batch, post_cap_ms_batch, d2h_ms_batch, gap_ms_batch,
+        cpu_wait_ms_batch, cpu_pack_ms_batch, cpu_dist_ms_batch,
+        d2h_mb,
+        static_cast<unsigned long long>(d_wants_batches),
+        static_cast<unsigned long long>(d_wants_rows),
+        static_cast<unsigned long long>(d_greedy_calls),
+        static_cast<unsigned long long>(d_greedy_ties),
+        d_greedy_calls > 0 ? (100.0 * d_greedy_ties / d_greedy_calls) : 0.0)
+        << std::endl;
+  }
   return result;
 }
 
@@ -8091,6 +8457,16 @@ struct R755Gate2Diagnostics {
   double unvisited_student_to_target_ratio = 0.0;
   int64_t searched_by_cat[6] = {0, 0, 0, 0, 0, 0};
   int64_t executed_overrides_by_cat[6] = {0, 0, 0, 0, 0, 0};
+  double cat3_aux_distinct_visited_fraction = 0.0;
+  double imperium_buy_rate = 0.0;
+  double tleilaxu_buy_rate = 0.0;
+  double tech_buy_rate = 0.0;
+  double mean_unspent_persuasion = 0.0;
+  double purchase_grad_cosine = 0.0;
+  std::vector<double> cat3_i_avg;
+  std::vector<double> cat3_ii_avg;
+  std::vector<double> cat3_iii_avg;
+  std::vector<int64_t> cat3_bucket_counts;
 };
 
 inline std::vector<R755Gate2Diagnostics> g_gate2_diagnostics;
@@ -8146,6 +8522,24 @@ inline void WriteR755Gate2Json(const std::string& path, const std::vector<R755Ga
       u[absl::StrCat("cat", c, "_searched")] = d.searched_by_cat[c];
       u[absl::StrCat("cat", c, "_executed_overrides")] = d.executed_overrides_by_cat[c];
     }
+    u["cat3_aux_distinct_visited_fraction"] = d.cat3_aux_distinct_visited_fraction;
+    u["imperium_buy_rate"] = d.imperium_buy_rate;
+    u["tleilaxu_buy_rate"] = d.tleilaxu_buy_rate;
+    u["tech_buy_rate"] = d.tech_buy_rate;
+    u["mean_unspent_persuasion"] = d.mean_unspent_persuasion;
+    u["purchase_grad_cosine"] = d.purchase_grad_cosine;
+    json::Array arr_i;
+    for (double val : d.cat3_i_avg) arr_i.emplace_back(val);
+    u["cat3_i_avg"] = std::move(arr_i);
+    json::Array arr_ii;
+    for (double val : d.cat3_ii_avg) arr_ii.emplace_back(val);
+    u["cat3_ii_avg"] = std::move(arr_ii);
+    json::Array arr_iii;
+    for (double val : d.cat3_iii_avg) arr_iii.emplace_back(val);
+    u["cat3_iii_avg"] = std::move(arr_iii);
+    json::Array arr_counts;
+    for (int64_t val : d.cat3_bucket_counts) arr_counts.emplace_back(val);
+    u["cat3_bucket_counts"] = std::move(arr_counts);
     updates.push_back(std::move(u));
   }
   json::Object root;
@@ -8193,7 +8587,7 @@ inline void RunR755Gate1Audit(
   if (batched_eval != nullptr) {
     nn_eval = std::make_shared<open_spiel::BatchedNNEvaluator>(
         batched_eval, static_cast<float>(absl::GetFlag(FLAGS_logit_cap)),
-        dune_imperium::MarketAppendixMode::kNone,
+        batched_eval->MarketMode(),
         /*forward_active_rollouts=*/false);
   }
   std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> search_evals;
@@ -8323,6 +8717,28 @@ inline void RunR755Gate1Audit(
               ++g.N_searched;
               ++g.n_searched_by_cat[cat_idx];
 
+              open_spiel::dune_imperium::SearchRolloutCrnMode crn_mode =
+                  open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+              const std::string crn_str = absl::GetFlag(FLAGS_r755_crn_mode);
+              if (crn_str == "sequential") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+              } else if (crn_str == "deck_order") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+              } else if (crn_str == "event_keyed") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+              } else {
+                open_spiel::SpielFatalError(absl::StrCat("Unknown r755_crn_mode: ", crn_str));
+              }
+
+              open_spiel::dune_imperium::CompoundSearchOptions opts;
+              opts.precomputed_raw_prior = absl::GetFlag(FLAGS_r755_reuse_root_prior) ? &raw_policy_pairs : nullptr;
+              opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
+              opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
+              opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+              opts.stage1_subwave_rollouts = absl::GetFlag(FLAGS_r755_stage1_subwave_rollouts);
+              opts.stage1_subwave_min_diff = absl::GetFlag(FLAGS_r755_stage1_subwave_min_diff);
+              opts.center_4seat_leaf_values = absl::GetFlag(FLAGS_r755_leaf_value_centering);
+
               uint64_t search_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373553ULL);
               open_spiel::dune_imperium::TurnSearchTree temp_tree;
               open_spiel::dune_imperium::CompoundSearchDecisionResult search_res =
@@ -8332,7 +8748,8 @@ inline void RunR755Gate1Audit(
                       open_spiel::dune_imperium::TreeReuseMode::kTargetFill, search_seed,
                       open_spiel::dune_imperium::SearchPairingMode::kPaired,
                       open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer,
-                      /*full_turn_supervision=*/false, absl::GetFlag(FLAGS_r755_min_t_stat));
+                      crn_mode, /*world_sampler=*/nullptr,
+                      absl::GetFlag(FLAGS_r755_min_t_stat), opts);
               if (coin_active && search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides)) {
                 action = search_res.chosen_action;
                 ++g.executed_overrides_all_seats[cat_idx];
@@ -8373,6 +8790,28 @@ inline void RunR755Gate1Audit(
                 g.local_roots.push_back(std::move(r));
               }
             } else if (current_player != audited_seat && cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible && coin_active) {
+              open_spiel::dune_imperium::SearchRolloutCrnMode crn_mode =
+                  open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+              const std::string crn_str = absl::GetFlag(FLAGS_r755_crn_mode);
+              if (crn_str == "sequential") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+              } else if (crn_str == "deck_order") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+              } else if (crn_str == "event_keyed") {
+                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+              } else {
+                open_spiel::SpielFatalError(absl::StrCat("Unknown r755_crn_mode: ", crn_str));
+              }
+
+              open_spiel::dune_imperium::CompoundSearchOptions opts;
+              opts.precomputed_raw_prior = absl::GetFlag(FLAGS_r755_reuse_root_prior) ? &raw_policy_pairs : nullptr;
+              opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
+              opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
+              opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+              opts.stage1_subwave_rollouts = absl::GetFlag(FLAGS_r755_stage1_subwave_rollouts);
+              opts.stage1_subwave_min_diff = absl::GetFlag(FLAGS_r755_stage1_subwave_min_diff);
+              opts.center_4seat_leaf_values = absl::GetFlag(FLAGS_r755_leaf_value_centering);
+
               uint64_t search_seed = dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, decision_index, 0x52373553ULL);
               open_spiel::dune_imperium::TurnSearchTree temp_tree;
               auto search_res = open_spiel::dune_imperium::CompoundRolloutSearchDecision(
@@ -8381,7 +8820,8 @@ inline void RunR755Gate1Audit(
                   open_spiel::dune_imperium::TreeReuseMode::kTargetFill, search_seed,
                   open_spiel::dune_imperium::SearchPairingMode::kPaired,
                   open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer,
-                  /*full_turn_supervision=*/false, absl::GetFlag(FLAGS_r755_min_t_stat));
+                  crn_mode, /*world_sampler=*/nullptr,
+                  absl::GetFlag(FLAGS_r755_min_t_stat), opts);
               if (search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides)) {
                 action = search_res.chosen_action;
                 ++g.executed_overrides_all_seats[cat_idx];
@@ -9784,6 +10224,17 @@ int main(int argc, char** argv) {
   if (dune_imperium::IsFullPublicInformationStateSize(obs_size) && !enable_scorer) {
     SpielFatalError("Full public information actor requires --enable_semantic_scorer=true");
   }
+  if ((absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v4" ||
+       absl::GetFlag(FLAGS_market_appendix_mode) == "full_public_information_v5") &&
+      sem_schema != "semantic_action_v4" &&
+      sem_schema != "semantic_action_v5" &&
+      !absl::GetFlag(FLAGS_allow_legacy_v3_on_v4_obs)) {
+    SpielFatalError(absl::StrFormat(
+        "market_appendix_mode=%s requires semantic_descriptor_schema=semantic_action_v4 or semantic_action_v5, "
+        "but found '%s'. Pass --allow_legacy_v3_on_v4_obs=true to override.",
+        absl::GetFlag(FLAGS_market_appendix_mode),
+        sem_schema));
+  }
   std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> training_model =
       std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
           obs_size, absl::GetFlag(FLAGS_hidden_dim), action_size,
@@ -9801,6 +10252,14 @@ int main(int argc, char** argv) {
   if (!sem_schema.empty()) {
     training_model->SetSemanticDescriptorSchema(sem_schema);
     inference_model->SetSemanticDescriptorSchema(sem_schema);
+    if (absl::GetFlag(FLAGS_slot_indexed_out_layer_f)) {
+      if (training_model->semantic_scorer_) {
+        training_model->semantic_scorer_->EnableF(true);
+      }
+      if (inference_model->semantic_scorer_) {
+        inference_model->semantic_scorer_->EnableF(true);
+      }
+    }
   }
   training_model->to(device);
   inference_model->to(device);
@@ -9831,6 +10290,9 @@ int main(int argc, char** argv) {
         pwo5_aux_layout, pwo5_head_init_seed, enable_scorer, enable_zone_enc, sem_schema);
     if (!sem_schema.empty()) {
       ema_model->SetSemanticDescriptorSchema(sem_schema);
+      if (absl::GetFlag(FLAGS_slot_indexed_out_layer_f) && ema_model->semantic_scorer_) {
+        ema_model->semantic_scorer_->EnableF(true);
+      }
     }
     ema_model->to(device);
     if (m_mode_str != "none") {
@@ -10197,6 +10659,9 @@ int main(int argc, char** argv) {
         /*with_aux_heads=*/false, /*head_init_seed=*/0, enable_scorer, enable_zone_enc, sem_schema);
     if (!sem_schema.empty()) {
       anchor_model->SetSemanticDescriptorSchema(sem_schema);
+      if (absl::GetFlag(FLAGS_slot_indexed_out_layer_f) && anchor_model->semantic_scorer_) {
+        anchor_model->semantic_scorer_->EnableF(true);
+      }
     }
     anchor_model->to(device);
     anchor_model->deck_pool_semantics_ = resolved_target_deck_pool_semantics;
@@ -11291,6 +11756,9 @@ int main(int argc, char** argv) {
                       ValidateAndComputeMarketAppendixTransitionFingerprint(manifest_path, config_fingerprint);
                   if (!permitted_transition_source_fingerprint.empty()) {
                     g_market_appendix_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    if (absl::GetFlag(FLAGS_allow_semantic_schema_transition)) {
+                      g_semantic_schema_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                    }
                   } else {
                     permitted_transition_source_fingerprint =
                         ValidateAndComputeDeckPoolSemanticsTransitionFingerprint(manifest_path, config_fingerprint);
@@ -11301,6 +11769,12 @@ int main(int argc, char** argv) {
                           ValidateAndComputeTf32TransitionFingerprint(manifest_path, config_fingerprint);
                       if (!permitted_transition_source_fingerprint.empty()) {
                         g_tf32_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                      } else {
+                        permitted_transition_source_fingerprint =
+                            ValidateAndComputeSemanticSchemaTransitionFingerprint(manifest_path, config_fingerprint);
+                        if (!permitted_transition_source_fingerprint.empty()) {
+                          g_semantic_schema_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                        }
                       }
                     }
                   }
@@ -11363,6 +11837,9 @@ int main(int argc, char** argv) {
       if (!g_tf32_transition_source_fingerprint.empty()) {
         g_tf32_transition_source_update = manifest.global_update;
       }
+      if (!g_semantic_schema_transition_source_fingerprint.empty()) {
+        g_semantic_schema_transition_source_update = manifest.global_update;
+      }
     }
 
     // Verify market_appendix_mode matches the current run's flag
@@ -11388,6 +11865,19 @@ int main(int argc, char** argv) {
         }
         open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
             obj, absl::GetFlag(FLAGS_deck_pool_semantics), "resume");
+        auto sem_it = obj.find("semantic_descriptor_schema");
+        std::string manifest_schema = "semantic_action_v3";
+        if (sem_it != obj.end() && sem_it->second.IsString()) {
+          manifest_schema = sem_it->second.GetString();
+        }
+        std::string current_schema = absl::GetFlag(FLAGS_semantic_descriptor_schema);
+        if (manifest_schema != current_schema) {
+          if (!absl::GetFlag(FLAGS_allow_semantic_schema_transition)) {
+            SpielFatalError(absl::StrFormat(
+                "semantic_descriptor_schema mismatch on resume. Manifest: '%s', Flag: '%s'",
+                manifest_schema, current_schema));
+          }
+        }
       }
     }
 
@@ -11877,6 +12367,9 @@ int main(int argc, char** argv) {
     manifest_obj["enable_semantic_scorer"] = absl::GetFlag(FLAGS_enable_semantic_scorer);
     if (absl::GetFlag(FLAGS_enable_semantic_scorer)) {
       manifest_obj["semantic_descriptor_schema"] = training_model->semantic_descriptor_schema_;
+      if (training_model->semantic_scorer_ != nullptr && training_model->semantic_scorer_->slot_indexed_f_) {
+        manifest_obj["slot_indexed_out_layer_f"] = true;
+      }
     }
     manifest_obj["enable_zone_encoder"] = training_model->enable_zone_encoder_;
     manifest_obj["legacy_migration_provenance"] = "Synthesized via init_mode=bootstrap";
@@ -12343,6 +12836,12 @@ int main(int argc, char** argv) {
                             ValidateAndComputeTf32TransitionFingerprint(manifest_path, config_fingerprint);
                         if (!permitted_transition_source_fingerprint.empty()) {
                           g_tf32_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                        } else {
+                          permitted_transition_source_fingerprint =
+                              ValidateAndComputeSemanticSchemaTransitionFingerprint(manifest_path, config_fingerprint);
+                          if (!permitted_transition_source_fingerprint.empty()) {
+                            g_semantic_schema_transition_source_fingerprint = permitted_transition_source_fingerprint;
+                          }
                         }
                       }
                     }
@@ -12402,6 +12901,9 @@ int main(int argc, char** argv) {
         if (!g_tf32_transition_source_fingerprint.empty()) {
           g_tf32_transition_source_update = shared_manifest.global_update;
         }
+        if (!g_semantic_schema_transition_source_fingerprint.empty()) {
+          g_semantic_schema_transition_source_update = shared_manifest.global_update;
+        }
       }
 
       // Verify market_appendix_mode and feature_schema match the current run's flags
@@ -12427,6 +12929,19 @@ int main(int argc, char** argv) {
           }
           std::string manifest_sem = open_spiel::ValidateResumeDeckPoolSemanticsOrDie(
               obj, absl::GetFlag(FLAGS_deck_pool_semantics), "study_resume");
+          auto sem_it = obj.find("semantic_descriptor_schema");
+          std::string manifest_schema = "semantic_action_v3";
+          if (sem_it != obj.end() && sem_it->second.IsString()) {
+            manifest_schema = sem_it->second.GetString();
+          }
+          std::string current_schema = absl::GetFlag(FLAGS_semantic_descriptor_schema);
+          if (manifest_schema != current_schema) {
+            if (!absl::GetFlag(FLAGS_allow_semantic_schema_transition)) {
+              SpielFatalError(absl::StrFormat(
+                  "semantic_descriptor_schema mismatch on study_resume. Manifest: '%s', Flag: '%s'",
+                  manifest_schema, current_schema));
+            }
+          }
           if (current_mode != "none" && !absl::GetFlag(FLAGS_allow_market_appendix_transition)) {
             auto it_schema = obj.find("feature_schema_sha256");
             std::string manifest_schema = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
@@ -12520,6 +13035,11 @@ int main(int argc, char** argv) {
         /*emit_batch_membership=*/numerical_parity,
         absl::GetFlag(FLAGS_rollout_amp),
         absl::GetFlag(FLAGS_allow_tf32));
+    if (std::getenv("DUNE_ENABLE_ASYNC_STAGE_TIMERS") != nullptr) {
+      if (auto be = std::dynamic_pointer_cast<open_spiel::BatchedEvaluator>(evaluator)) {
+        be->EnableAsyncStageTimers(true);
+      }
+    }
   }
 
   std::vector<std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl>> opponent_models;
@@ -15158,6 +15678,16 @@ int main(int argc, char** argv) {
   };
   std::deque<KeptLabelsRecord> kept_labels_history_25u;
 
+  open_spiel::V5LegacySlotResidualState v5_slot_residual_state;
+  if (training_model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5) {
+    v5_slot_residual_state.Initialize(
+        training_model, absl::GetFlag(FLAGS_v5_anneal_legacy_slot_residual_updates));
+    if (v5_slot_residual_state.active) {
+      std::cout << "[INFO] Initialized V5 legacy slot residual handler (N="
+                << v5_slot_residual_state.N << ", active=true).\n";
+    }
+  }
+
   for (int update = start_update; update <= target_end_update; ++update) {
     if (absl::GetFlag(FLAGS_anneal_lr)) {
       double frac = 1.0 - static_cast<double>(update - 1) /
@@ -15722,6 +16252,11 @@ int main(int argc, char** argv) {
     AttachPrecapAbszStats(&stats, current_collect);
     AttachCanaryStats(&stats, current_collect);
 
+    if (v5_slot_residual_state.active) {
+      int completed_updates_in_run = update - start_update + 1;
+      v5_slot_residual_state.Apply(training_model, completed_updates_in_run);
+    }
+
     if (do_gate2) {
       const size_t learner_eval_chunk = static_cast<size_t>(std::max(1, absl::GetFlag(FLAGS_eval_batch_size)));
       auto gate2_aux_pi_new =
@@ -15803,6 +16338,46 @@ int main(int argc, char** argv) {
         gate2_diag.searched_by_cat[c] = current_collect.r755_searched_by_cat[c];
         gate2_diag.executed_overrides_by_cat[c] = current_collect.r755_executed_overrides_by_cat[c];
       }
+      gate2_diag.cat3_aux_distinct_visited_fraction =
+          current_collect.aux_examples.empty()
+              ? 0.0
+              : static_cast<double>(stats.aux_distinct_visited) /
+                    static_cast<double>(current_collect.aux_examples.size());
+      gate2_diag.imperium_buy_rate =
+          current_collect.r755_reveal_turns > 0
+              ? static_cast<double>(current_collect.r755_imperium_buys) /
+                    static_cast<double>(current_collect.r755_reveal_turns)
+              : 0.0;
+      gate2_diag.tleilaxu_buy_rate =
+          current_collect.r755_reveal_turns > 0
+              ? static_cast<double>(current_collect.r755_tleilaxu_buys) /
+                    static_cast<double>(current_collect.r755_reveal_turns)
+              : 0.0;
+      gate2_diag.tech_buy_rate =
+          current_collect.r755_reveal_turns > 0
+              ? static_cast<double>(current_collect.r755_tech_buys) /
+                    static_cast<double>(current_collect.r755_reveal_turns)
+              : 0.0;
+      gate2_diag.mean_unspent_persuasion =
+          current_collect.r755_reveal_turns > 0
+              ? current_collect.r755_unspent_persuasion_sum /
+                    static_cast<double>(current_collect.r755_reveal_turns)
+              : 0.0;
+      gate2_diag.purchase_grad_cosine = stats.purchase_grad_cosine;
+
+      gate2_diag.cat3_i_avg.assign(9, 0.0);
+      gate2_diag.cat3_ii_avg.assign(9, 0.0);
+      gate2_diag.cat3_iii_avg.assign(9, 0.0);
+      gate2_diag.cat3_bucket_counts.assign(9, 0);
+      for (int b = 0; b < 9; ++b) {
+        int64_t count = current_collect.r755_cat3_bucket_count[b];
+        gate2_diag.cat3_bucket_counts[b] = count;
+        if (count > 0) {
+          gate2_diag.cat3_i_avg[b] = current_collect.r755_cat3_i_sum[b] / static_cast<double>(count);
+          gate2_diag.cat3_ii_avg[b] = current_collect.r755_cat3_ii_sum[b] / static_cast<double>(count);
+          gate2_diag.cat3_iii_avg[b] = current_collect.r755_cat3_iii_sum[b] / static_cast<double>(count);
+        }
+      }
       open_spiel::g_gate2_diagnostics.push_back(gate2_diag);
       open_spiel::WriteR755Gate2Json(absl::GetFlag(FLAGS_r755_gate2_output),
                                      open_spiel::g_gate2_diagnostics);
@@ -15825,6 +16400,20 @@ int main(int argc, char** argv) {
           static_cast<long long>(gate2_diag.aux_distinct_visited),
           current_collect.aux_examples.size(),
           static_cast<long long>(gate2_diag.aux_total_presentations)) << std::flush;
+      std::cout << absl::StrFormat(
+          "[R755-CAT3-DIAG] update=%d buy_rates=[imp=%.4f tle=%.4f tch=%.4f] "
+          "unspent_persuasion=%.4f grad_cos=%.4f aux_vis_frac=%.4f\n",
+          update, gate2_diag.imperium_buy_rate, gate2_diag.tleilaxu_buy_rate,
+          gate2_diag.tech_buy_rate, gate2_diag.mean_unspent_persuasion,
+          gate2_diag.purchase_grad_cosine,
+          gate2_diag.cat3_aux_distinct_visited_fraction);
+      std::cout << "[R755-CAT3-DIAG] (iii) G-(V+A) by bucket: ";
+      for (int b = 0; b < 9; ++b) {
+        std::cout << absl::StrFormat("B%d[n=%lld]=%.4f ", b,
+            static_cast<long long>(gate2_diag.cat3_bucket_counts[b]),
+            gate2_diag.cat3_iii_avg[b]);
+      }
+      std::cout << "\n" << std::flush;
     }
 
     // Phase 18B clean abort at the latest valid checkpoint (plan §18C): a
@@ -15865,6 +16454,12 @@ int main(int argc, char** argv) {
     if (ema_model != nullptr) {
       UpdateEmaWeights(training_model, ema_model, ema_decay);
       ema_updates_absorbed++;
+      if (v5_slot_residual_state.active) {
+        int completed_updates_in_run = update - start_update + 1;
+        if (v5_slot_residual_state.N <= 0 || completed_updates_in_run >= v5_slot_residual_state.N) {
+          v5_slot_residual_state.Apply(ema_model, completed_updates_in_run);
+        }
+      }
     }
 
     double hs_pre_share = (current_collect.nontrivial_transitions > 0)

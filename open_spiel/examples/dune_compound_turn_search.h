@@ -216,11 +216,26 @@ inline bool IsR755PurchaseAction(Action a) {
   return false;
 }
 
+inline bool IsCardOrTechAcquisitionAction(Action a) {
+  // 10..14: Imperium row slots 0..4
+  if (a >= kActionBuyImperiumRow0 && a <= kActionBuyImperiumRow0 + 4) return true;
+  // 91, 92: Tleilaxu row slot 0 and slot 1 (strictly excluding 90 Reclaimed Forces, 96 Skip)
+  if (a == kActionTleilaxuAcquire0 + 1 || a == kActionTleilaxuAcquire0 + 2) return true;
+  // 598, 599: Reserve cards (Arrakis Liaison, The Spice Must Flow)
+  if (a == kActionBuyReserveArrakisLiaison || a == kActionBuyReserveTheSpiceMustFlow) return true;
+  // 70..75: Tech acquisition (spice), excluding 76 (Skip)
+  if (a >= kActionTechAcquire0 && a < kActionTechAcquireSkip) return true;
+  // 770..775: Tech acquisition (solari), excluding 776 (Skip)
+  if (a >= kActionTechAcquireWithSolari0 && a < kActionTechAcquireWithSolariSkip) return true;
+  return false;
+}
+
 inline R755SearchCategory ClassifyR755SearchCategory(
     const State& state,
     Player searched_player,
     bool space_placed_this_turn,
-    int category_mask = 31) {
+    int category_mask = 31,
+    bool strict_cat3_card_tech_only = false) {
   if (state.IsChanceNode() || state.CurrentPlayer() != searched_player) {
     return R755SearchCategory::kIneligible;
   }
@@ -257,15 +272,30 @@ inline R755SearchCategory ClassifyR755SearchCategory(
 
   // Category 3: Reveal purchase
   if (cat == R755SearchCategory::kIneligible && dune_state->IsPlayerInRevealTurn(searched_player)) {
-    bool has_purchase = false;
-    for (Action a : legal_actions) {
-      if (IsR755PurchaseAction(a)) {
-        has_purchase = true;
-        break;
+    if (strict_cat3_card_tech_only) {
+      if (dune_state->GetCurrentRound() <= 6) {
+        bool has_card_or_tech = false;
+        for (Action a : legal_actions) {
+          if (IsCardOrTechAcquisitionAction(a)) {
+            has_card_or_tech = true;
+            break;
+          }
+        }
+        if (has_card_or_tech) {
+          cat = R755SearchCategory::kRevealPurchase;
+        }
       }
-    }
-    if (has_purchase) {
-      cat = R755SearchCategory::kRevealPurchase;
+    } else {
+      bool has_purchase = false;
+      for (Action a : legal_actions) {
+        if (IsR755PurchaseAction(a)) {
+          has_purchase = true;
+          break;
+        }
+      }
+      if (has_purchase) {
+        cat = R755SearchCategory::kRevealPurchase;
+      }
     }
   }
 
@@ -322,7 +352,8 @@ inline R755SearchCategory ClassifyR755SearchCategory(
 // Search rollout truncation mode
 enum class SearchTruncationMode {
   kTerminal,               // Full rollout until game is terminal (default today)
-  kNextRoundSearchPlayer   // Cut off at search player's first decision in subsequent round
+  kNextRoundSearchPlayer,  // Cut off at search player's first decision in subsequent round
+  kPlus2Rounds             // Cut off at search player's first decision in start_round + 2
 };
 
 // Search rollout CRN mode:
@@ -505,7 +536,8 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     bool sample_opponent_leader_draft = false,
     const std::chrono::steady_clock::time_point* deadline = nullptr,
     int* out_steps = nullptr,
-    int* out_nn_evals = nullptr) {
+    int* out_nn_evals = nullptr,
+    bool center_4seat_leaf_values = false) {
   std::mt19937 rng(rollout_seed);
   int steps = 0;
   const int max_steps = 2500;
@@ -519,9 +551,9 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     ++loc_steps;
     if (out_steps) ++(*out_steps);
   };
-  auto count_nn_eval = [&]() {
-    ++loc_nn_evals;
-    if (out_nn_evals) ++(*out_nn_evals);
+  auto count_nn_eval = [&](int count = 1) {
+    loc_nn_evals += count;
+    if (out_nn_evals) *out_nn_evals += count;
   };
 
   const auto* cur_dune = dynamic_cast<const dune_imperium::DuneImperiumState*>(sim_state);
@@ -682,12 +714,38 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     Player cur = sim_state->CurrentPlayer();
     int cur_round = cur_dune ? cur_dune->GetCurrentRound() : 1;
 
-    // Truncation check: search player's first decision in the subsequent round
+    // Truncation check
+    bool should_truncate = false;
     if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer &&
         cur == search_player && cur_round > start_round) {
-      if (evaluator) count_nn_eval();
-      double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
-      return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
+      should_truncate = true;
+    } else if (truncation_mode == SearchTruncationMode::kPlus2Rounds &&
+               cur == search_player && cur_round >= start_round + 2) {
+      should_truncate = true;
+    }
+
+    if (should_truncate) {
+      double leaf_u = 0.0;
+      if (evaluator) {
+        if (center_4seat_leaf_values) {
+          count_nn_eval(4);
+          auto vals = evaluator->Evaluate(*sim_state);
+          double mean_v = 0.0;
+          if (vals.size() >= 4) {
+            mean_v = 0.25 * (vals[0] + vals[1] + vals[2] + vals[3]);
+            leaf_u = TruncatedLeafUtility(vals[search_player] - mean_v);
+          } else if (!vals.empty()) {
+            for (double v : vals) mean_v += v;
+            mean_v /= vals.size();
+            leaf_u = TruncatedLeafUtility(vals[search_player] - mean_v);
+          }
+        } else {
+          count_nn_eval(1);
+          double raw_val = evaluator->EvaluatePlayerValue(*sim_state, search_player);
+          leaf_u = TruncatedLeafUtility(raw_val);
+        }
+      }
+      return {leaf_u, std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
     }
 
     std::vector<Action> legals = sim_state->LegalActions();
@@ -768,11 +826,30 @@ inline RolloutTrajectory SimulateRolloutWithTurnTrajectory(
     apply_action(a);
   }
 
-  // In kNextRoundSearchPlayer mode, if loop exits without terminal, evaluate value head
-  if (truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer && !sim_state->IsTerminal()) {
-    if (evaluator) count_nn_eval();
-    double raw_val = evaluator ? evaluator->EvaluatePlayerValue(*sim_state, search_player) : 0.0;
-    return {TruncatedLeafUtility(raw_val), std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
+  // In kNextRoundSearchPlayer or kPlus2Rounds mode, if loop exits without terminal, evaluate value head
+  if ((truncation_mode == SearchTruncationMode::kNextRoundSearchPlayer ||
+       truncation_mode == SearchTruncationMode::kPlus2Rounds) && !sim_state->IsTerminal()) {
+    double leaf_u = 0.0;
+    if (evaluator) {
+      if (center_4seat_leaf_values) {
+        count_nn_eval(4);
+        auto vals = evaluator->Evaluate(*sim_state);
+        double mean_v = 0.0;
+        if (vals.size() >= 4) {
+          mean_v = 0.25 * (vals[0] + vals[1] + vals[2] + vals[3]);
+          leaf_u = TruncatedLeafUtility(vals[search_player] - mean_v);
+        } else if (!vals.empty()) {
+          for (double v : vals) mean_v += v;
+          mean_v /= vals.size();
+          leaf_u = TruncatedLeafUtility(vals[search_player] - mean_v);
+        }
+      } else {
+        count_nn_eval(1);
+        double raw_val = evaluator->EvaluatePlayerValue(*sim_state, search_player);
+        leaf_u = TruncatedLeafUtility(raw_val);
+      }
+    }
+    return {leaf_u, std::move(intra_turn_actions), /*aborted_by_deadline=*/false, loc_steps, loc_nn_evals};
   }
 
   // Original fallback: exactly as before for kTerminal mode (and terminal rollouts)
@@ -791,10 +868,12 @@ inline RolloutTrajectory SimulateRemainingTurn(
     bool sample_opponent_leader_draft = false,
     const std::chrono::steady_clock::time_point* deadline = nullptr,
     int* out_steps = nullptr,
-    int* out_nn_evals = nullptr) {
+    int* out_nn_evals = nullptr,
+    bool center_4seat_leaf_values = false) {
   return SimulateRolloutWithTurnTrajectory(
       sim_state, search_player, evaluator, rollout_seed, truncation_mode,
-      crn_mode, sample_opponent_leader_draft, deadline, out_steps, out_nn_evals);
+      crn_mode, sample_opponent_leader_draft, deadline, out_steps, out_nn_evals,
+      center_4seat_leaf_values);
 }
 
 // Pick greedy action from prior over legal actions
@@ -874,6 +953,19 @@ struct CompoundSearchOptions {
   bool dedup_paired_worlds = false;
   int stage1_rollouts = 0;
   double stage1_min_mean_diff = -1e9;
+  // Step 8: 4-seat leaf value centering (default OFF)
+  bool center_4seat_leaf_values = false;
+  // Phase 3 Cat 3: all buy candidates (default OFF)
+  bool all_buy_candidates = false;
+  // Step 4: 4+4 stage-1 subwave pruning (default OFF)
+  int stage1_subwave_rollouts = 0;
+  double stage1_subwave_min_diff = -0.05;
+  // Phase 3 Q4a: Symmetric Multi-Candidate Stage-2 Confirmation (default OFF)
+  bool symmetric_stage2_confirmation = false;
+  double confirmation_max_raw_prior = 0.85;
+  double confirmation_rival_cum_mass = 0.90;
+  int confirmation_max_rivals = 3;
+  int stage2_independent_rollouts = 0;
 };
 
 // Decision result from CompoundRolloutSearch
@@ -907,6 +999,11 @@ struct CompoundSearchDecisionResult {
   std::vector<std::pair<Action, double>> candidate_priors = {};
   int resample_fallbacks = 0;
   bool stopped_stage1 = false;
+  // Phase 3 Q4a confirmation and teacher execution
+  bool confirmed = false;
+  bool teacher_accepted = false;
+  Action teacher_action = kInvalidAction;
+  std::vector<std::pair<Action, double>> stage2_candidate_utilities = {};
 };
 
 using CompoundRolloutSearchResult = CompoundSearchDecisionResult;
@@ -967,13 +1064,64 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
   }
   Action raw_action = PickGreedyAction(raw_prior, legal_actions);
 
-  std::vector<Action> candidates = GetTopKActions(raw_prior, legal_actions, top_k);
+  std::vector<Action> candidates;
+  if (opts.all_buy_candidates) {
+    candidates.push_back(raw_action);
+    for (Action a : legal_actions) {
+      if (IsCardOrTechAcquisitionAction(a) && a != raw_action) {
+        candidates.push_back(a);
+      }
+    }
+    std::vector<Action> top_actions = GetTopKActions(raw_prior, legal_actions, top_k);
+    for (Action a : top_actions) {
+      if (std::find(candidates.begin(), candidates.end(), a) == candidates.end()) {
+        candidates.push_back(a);
+      }
+    }
+  } else {
+    candidates = GetTopKActions(raw_prior, legal_actions, top_k);
+  }
+
+  if (opts.symmetric_stage2_confirmation) {
+    std::vector<std::pair<double, Action>> sorted_prior;
+    for (const auto& ap : raw_prior) {
+      if (std::find(legal_actions.begin(), legal_actions.end(), ap.first) != legal_actions.end()) {
+        sorted_prior.push_back({ap.second, ap.first});
+      }
+    }
+    std::sort(sorted_prior.begin(), sorted_prior.end(), [](const auto& a, const auto& b) {
+      return a.first > b.first;
+    });
+    double cum_mass = 0.0;
+    for (const auto& sp : sorted_prior) {
+      if (sp.second == raw_action) {
+        cum_mass += sp.first;
+        break;
+      }
+    }
+    int rival_count = 0;
+    for (const auto& sp : sorted_prior) {
+      if (sp.second == raw_action) continue;
+      if (std::find(candidates.begin(), candidates.end(), sp.second) == candidates.end()) {
+        candidates.push_back(sp.second);
+      }
+      cum_mass += sp.first;
+      ++rival_count;
+      if (cum_mass >= opts.confirmation_rival_cum_mass || rival_count >= opts.confirmation_max_rivals) {
+        break;
+      }
+    }
+  }
+
   if (candidates.size() <= 1) {
     CompoundSearchDecisionResult r;
     r.action = raw_action;
     r.chosen_action = raw_action;
     r.raw_action = raw_action;
     r.best_action = raw_action;
+    r.teacher_action = raw_action;
+    r.teacher_accepted = false;
+    r.confirmed = false;
     r.rollout_nn_evals = total_nn_evals;
     for (Action a : candidates) {
       double p = 0.0;
@@ -992,7 +1140,8 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
       std::swap(candidates.front(), *it);
     } else {
       candidates.insert(candidates.begin(), raw_action);
-      if (candidates.size() > static_cast<size_t>(top_k)) {
+      if (!opts.all_buy_candidates && !opts.symmetric_stage2_confirmation &&
+          candidates.size() > static_cast<size_t>(top_k)) {
         candidates.pop_back();
       }
     }
@@ -1026,7 +1175,7 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
 
   const bool use_two_stage =
       (opts.stage1_rollouts > 0 &&
-       opts.stage1_rollouts < rollouts_per_action &&
+       (opts.stage1_rollouts < rollouts_per_action || opts.stage2_independent_rollouts > 0) &&
        pairing_mode == SearchPairingMode::kPaired &&
        prior_rollouts_reused == 0);
 
@@ -1051,8 +1200,13 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
   TurnSearchTree local_tree;
   TurnSearchTree* active_tree = (turn_tree != nullptr) ? turn_tree : &local_tree;
 
+  const int R1 = opts.stage1_rollouts;
+  const int R2_indep = (opts.stage2_independent_rollouts > 0)
+      ? opts.stage2_independent_rollouts
+      : std::max(0, rollouts_per_action - R1);
+  const int max_rollouts_capacity = std::max(rollouts_per_action, R1 + R2_indep);
   std::vector<std::vector<double>> per_candidate_rollouts(
-      candidates.size(), std::vector<double>(rollouts_per_action, 0.0));
+      candidates.size(), std::vector<double>(max_rollouts_capacity, 0.0));
   std::vector<std::vector<double>> cand_rollout_returns(candidates.size());
 
   const State* root_state_ptr = &state;
@@ -1144,7 +1298,7 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
       auto* active_evaluator = evaluators[i % evaluators.size()].get();
       futures.push_back(SearchRolloutThreadPool::Instance().Submit(
           [prebuilt_ptr, root_state_ptr, dune, cand_a, wseed, search_player,
-           active_evaluator, truncation_mode, crn_mode, &resample_fallbacks]() {
+           active_evaluator, truncation_mode, crn_mode, &resample_fallbacks, &opts]() {
             ActiveRolloutReleaseGuard guard{active_evaluator};
             std::unique_ptr<State> local_state;
             State* s_ptr = prebuilt_ptr;
@@ -1164,7 +1318,9 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
               s_ptr = local_state.get();
             }
             return SimulateRolloutWithTurnTrajectory(
-                s_ptr, search_player, active_evaluator, wseed + 999, truncation_mode, crn_mode);
+                s_ptr, search_player, active_evaluator, wseed + 999, truncation_mode, crn_mode,
+                /*sample_opponent_leader_draft=*/false, /*deadline=*/nullptr,
+                /*out_steps=*/nullptr, /*out_nn_evals=*/nullptr, opts.center_4seat_leaf_values);
           }));
     }
 
@@ -1186,33 +1342,330 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
 
   bool stopped_stage1 = false;
   size_t best_s1_c = 0;
-  if (use_two_stage) {
-    const int R1 = opts.stage1_rollouts;
-    std::vector<size_t> all_c_indices(candidates.size());
-    std::iota(all_c_indices.begin(), all_c_indices.end(), 0);
-    auto s1_tasks = build_tasks(all_c_indices, 0, R1, can_dedup);
-    execute_tasks(s1_tasks);
+  double best_s1_mean_d = -1e9;
+  bool confirmed = false;
+  bool teacher_accepted = false;
+  Action teacher_action = raw_action;
+  std::vector<std::pair<Action, double>> stage2_candidate_utilities;
+  Action chosen_action = raw_action;
+  Action best_action = raw_action;
+  double best_mean_u = 0.0;
+  size_t best_c_idx = 0;
+  double best_vs_raw_mean_diff = 0.0;
+  double best_vs_raw_t_stat = 0.0;
+  bool overridden = false;
+  double raw_mean_u = 0.0;
 
-    best_s1_c = 1;
-    double best_s1_mean_d = -1e9;
-    for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
-      double sum_d = 0.0;
-      for (int r = 0; r < R1; ++r) {
-        sum_d += (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]);
+  if (use_two_stage) {
+    const int W1 = opts.symmetric_stage2_confirmation ? 0 : opts.stage1_subwave_rollouts;
+    if (W1 > 0 && W1 < R1) {
+      std::vector<size_t> all_c_indices(candidates.size());
+      std::iota(all_c_indices.begin(), all_c_indices.end(), 0);
+      auto s1_tasks = build_tasks(all_c_indices, 0, W1, can_dedup);
+      execute_tasks(s1_tasks);
+
+      std::vector<size_t> surviving_challengers;
+      size_t best_w1_c = 1;
+      double best_w1_mean_d = -1e9;
+      for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+        double sum_d = 0.0;
+        for (int r = 0; r < W1; ++r) {
+          sum_d += (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]);
+        }
+        double mean_d = sum_d / static_cast<double>(W1);
+        if (c_idx == 1 || mean_d > best_w1_mean_d) {
+          best_w1_mean_d = mean_d;
+          best_w1_c = c_idx;
+        }
+        if (mean_d >= opts.stage1_subwave_min_diff) {
+          surviving_challengers.push_back(c_idx);
+        }
       }
-      double mean_d = sum_d / static_cast<double>(R1);
-      if (c_idx == 1 || mean_d > best_s1_mean_d) {
-        best_s1_mean_d = mean_d;
-        best_s1_c = c_idx;
+
+      if (surviving_challengers.empty()) {
+        stopped_stage1 = true;
+        best_s1_c = best_w1_c;
+        best_s1_mean_d = best_w1_mean_d;
+      } else {
+        std::vector<size_t> subwave2_indices = {0};
+        subwave2_indices.insert(subwave2_indices.end(),
+                                surviving_challengers.begin(), surviving_challengers.end());
+        auto sw2_tasks = build_tasks(subwave2_indices, W1, R1, can_dedup);
+        execute_tasks(sw2_tasks);
+
+        best_s1_c = surviving_challengers.front();
+        best_s1_mean_d = -1e9;
+        for (size_t c_idx : surviving_challengers) {
+          double sum_d = 0.0;
+          for (int r = 0; r < R1; ++r) {
+            sum_d += (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]);
+          }
+          double mean_d = sum_d / static_cast<double>(R1);
+          if (mean_d > best_s1_mean_d) {
+            best_s1_mean_d = mean_d;
+            best_s1_c = c_idx;
+          }
+        }
+        if (best_s1_mean_d < opts.stage1_min_mean_diff) {
+          stopped_stage1 = true;
+        }
+      }
+    } else {
+      std::vector<size_t> all_c_indices(candidates.size());
+      std::iota(all_c_indices.begin(), all_c_indices.end(), 0);
+      auto s1_tasks = build_tasks(all_c_indices, 0, R1, can_dedup);
+      execute_tasks(s1_tasks);
+
+      best_s1_c = 1;
+      best_s1_mean_d = -1e9;
+      for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+        double sum_d = 0.0;
+        for (int r = 0; r < R1; ++r) {
+          sum_d += (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]);
+        }
+        double mean_d = sum_d / static_cast<double>(R1);
+        if (c_idx == 1 || mean_d > best_s1_mean_d) {
+          best_s1_mean_d = mean_d;
+          best_s1_c = c_idx;
+        }
+      }
+
+      if (best_s1_c == 0 || best_s1_mean_d < opts.stage1_min_mean_diff) {
+        stopped_stage1 = true;
       }
     }
 
-    if (best_s1_c == 0 || best_s1_mean_d < opts.stage1_min_mean_diff) {
-      stopped_stage1 = true;
+    if (opts.symmetric_stage2_confirmation) {
+      double s1_mean_0 = 0.0;
+      for (int r = 0; r < R1; ++r) {
+        s1_mean_0 += per_candidate_rollouts[0][r];
+      }
+      s1_mean_0 /= R1;
+
+      best_s1_c = 0;
+      best_s1_mean_d = -1e9;
+      for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+        if (cand_rollout_returns[c_idx].size() < static_cast<size_t>(R1)) continue;
+        double sum_c = 0.0;
+        for (int r = 0; r < R1; ++r) {
+          sum_c += per_candidate_rollouts[c_idx][r];
+        }
+        double mean_d = (sum_c / R1) - s1_mean_0;
+        if (best_s1_c == 0 || mean_d > best_s1_mean_d) {
+          best_s1_mean_d = mean_d;
+          best_s1_c = c_idx;
+        }
+      }
+
+      stopped_stage1 = false;
+
+      // Case A: best_s1_c != 0 && best_s1_mean_d >= opts.stage1_min_mean_diff
+      if (best_s1_c != 0 && best_s1_mean_d >= opts.stage1_min_mean_diff) {
+        std::vector<size_t> s2_c_indices = {0, best_s1_c};
+        auto s2_tasks = build_tasks(s2_c_indices, R1, R1 + R2_indep, can_dedup);
+        execute_tasks(s2_tasks);
+
+        double sum_d = 0.0;
+        for (int r = R1; r < R1 + R2_indep; ++r) {
+          sum_d += (per_candidate_rollouts[best_s1_c][r] - per_candidate_rollouts[0][r]);
+        }
+        double mean_d = sum_d / static_cast<double>(R2_indep);
+        double sum_sq_d = 0.0;
+        for (int r = R1; r < R1 + R2_indep; ++r) {
+          double diff = (per_candidate_rollouts[best_s1_c][r] - per_candidate_rollouts[0][r]) - mean_d;
+          sum_sq_d += diff * diff;
+        }
+        double var_d = (R2_indep > 1) ? (sum_sq_d / static_cast<double>(R2_indep - 1)) : 0.0;
+        double se_d = std::sqrt(var_d / static_cast<double>(R2_indep));
+        double paired_t_s2 = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+
+        double q_s2_0 = 0.0, q_s2_best = 0.0;
+        for (int r = R1; r < R1 + R2_indep; ++r) {
+          q_s2_0 += per_candidate_rollouts[0][r];
+          q_s2_best += per_candidate_rollouts[best_s1_c][r];
+        }
+        q_s2_0 /= R2_indep;
+        q_s2_best /= R2_indep;
+
+        best_action = candidates[best_s1_c];
+        best_mean_u = q_s2_best;
+        raw_mean_u = q_s2_0;
+        best_c_idx = best_s1_c;
+        best_vs_raw_mean_diff = mean_d;
+        best_vs_raw_t_stat = paired_t_s2;
+
+        if (q_s2_best - q_s2_0 >= min_override_margin && paired_t_s2 >= min_paired_t_stat) {
+          overridden = true;
+          teacher_accepted = true;
+          teacher_action = candidates[best_s1_c];
+          chosen_action = teacher_action;
+          stage2_candidate_utilities.push_back({candidates[0], q_s2_0});
+          stage2_candidate_utilities.push_back({candidates[best_s1_c], q_s2_best});
+        } else {
+          overridden = false;
+          teacher_accepted = false;
+          teacher_action = raw_action;
+          chosen_action = raw_action;
+          stage2_candidate_utilities.clear();
+        }
+      }
+      // Case B: best_s1_mean_d <= 0.0 (candidates[0] won Stage 1)
+      else if (best_s1_mean_d <= 0.0) {
+        double pi_raw_0 = 0.0;
+        for (const auto& ap : raw_prior) {
+          if (ap.first == raw_action) { pi_raw_0 = ap.second; break; }
+        }
+        if (pi_raw_0 < opts.confirmation_max_raw_prior && candidates.size() >= 2) {
+          std::vector<std::pair<double, size_t>> rival_pairs;
+          for (size_t c = 1; c < candidates.size(); ++c) {
+            double p = 0.0;
+            for (const auto& ap : raw_prior) {
+              if (ap.first == candidates[c]) { p = ap.second; break; }
+            }
+            rival_pairs.push_back({p, c});
+          }
+          std::sort(rival_pairs.begin(), rival_pairs.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+          });
+          double cum_p = pi_raw_0;
+          std::vector<size_t> selected_rivals;
+          for (const auto& rp : rival_pairs) {
+            selected_rivals.push_back(rp.second);
+            cum_p += rp.first;
+            if (cum_p >= opts.confirmation_rival_cum_mass ||
+                static_cast<int>(selected_rivals.size()) >= opts.confirmation_max_rivals) {
+              break;
+            }
+          }
+          if (selected_rivals.empty() && candidates.size() >= 2) {
+            selected_rivals.push_back(1);
+          }
+
+          std::vector<size_t> s2_actions = {0};
+          s2_actions.insert(s2_actions.end(), selected_rivals.begin(), selected_rivals.end());
+          auto s2_tasks = build_tasks(s2_actions, R1, R1 + R2_indep, can_dedup);
+          execute_tasks(s2_tasks);
+
+          std::vector<double> q_s2(candidates.size(), 0.0);
+          for (size_t c_idx : s2_actions) {
+            double sum_q = 0.0;
+            for (int r = R1; r < R1 + R2_indep; ++r) {
+              sum_q += per_candidate_rollouts[c_idx][r];
+            }
+            q_s2[c_idx] = sum_q / R2_indep;
+          }
+          raw_mean_u = q_s2[0];
+
+          auto paired_stats = [&](size_t a_idx, size_t b_idx) -> std::pair<double, double> {
+            double sum_d = 0.0;
+            for (int r = R1; r < R1 + R2_indep; ++r) {
+              sum_d += (per_candidate_rollouts[a_idx][r] - per_candidate_rollouts[b_idx][r]);
+            }
+            double mean_d = sum_d / static_cast<double>(R2_indep);
+            double sum_sq = 0.0;
+            for (int r = R1; r < R1 + R2_indep; ++r) {
+              double diff = (per_candidate_rollouts[a_idx][r] - per_candidate_rollouts[b_idx][r]) - mean_d;
+              sum_sq += diff * diff;
+            }
+            double var_d = (R2_indep > 1) ? (sum_sq / static_cast<double>(R2_indep - 1)) : 0.0;
+            double se_d = std::sqrt(var_d / static_cast<double>(R2_indep));
+            double t = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+            return {mean_d, t};
+          };
+
+          size_t rival_1 = selected_rivals[0];
+          auto stats_0_vs_r1 = paired_stats(0, rival_1);
+          if (stats_0_vs_r1.first >= min_override_margin && stats_0_vs_r1.second >= min_paired_t_stat) {
+            confirmed = true;
+            teacher_accepted = true;
+            teacher_action = candidates[0];
+            chosen_action = candidates[0];
+            best_action = candidates[0];
+            best_mean_u = q_s2[0];
+            best_vs_raw_mean_diff = stats_0_vs_r1.first;
+            best_vs_raw_t_stat = stats_0_vs_r1.second;
+            overridden = false;
+            for (size_t c_idx : s2_actions) {
+              stage2_candidate_utilities.push_back({candidates[c_idx], q_s2[c_idx]});
+            }
+          } else {
+            size_t best_r = 0;
+            double best_r_q = -1e9;
+            double best_r_d = -1e9;
+            double best_r_t = -1e9;
+            for (size_t r_c : selected_rivals) {
+              auto stats_r_vs_0 = paired_stats(r_c, 0);
+              if (stats_r_vs_0.first >= min_override_margin && stats_r_vs_0.second >= min_paired_t_stat) {
+                if (q_s2[r_c] > best_r_q) {
+                  best_r_q = q_s2[r_c];
+                  best_r = r_c;
+                  best_r_d = stats_r_vs_0.first;
+                  best_r_t = stats_r_vs_0.second;
+                }
+              }
+            }
+            if (best_r != 0) {
+              overridden = true;
+              teacher_accepted = true;
+              teacher_action = candidates[best_r];
+              chosen_action = candidates[best_r];
+              best_action = candidates[best_r];
+              best_mean_u = best_r_q;
+              best_c_idx = best_r;
+              best_vs_raw_mean_diff = best_r_d;
+              best_vs_raw_t_stat = best_r_t;
+              for (size_t c_idx : s2_actions) {
+                stage2_candidate_utilities.push_back({candidates[c_idx], q_s2[c_idx]});
+              }
+            } else {
+              teacher_accepted = false;
+              teacher_action = raw_action;
+              chosen_action = raw_action;
+              best_action = raw_action;
+              best_mean_u = q_s2[0];
+              best_c_idx = 0;
+              best_vs_raw_mean_diff = 0.0;
+              best_vs_raw_t_stat = 0.0;
+              overridden = false;
+              confirmed = false;
+              stage2_candidate_utilities.clear();
+            }
+          }
+        } else {
+          // pi_raw_0 >= opts.confirmation_max_raw_prior: no Stage 2 runs
+          stopped_stage1 = true;
+          raw_mean_u = s1_mean_0;
+          best_mean_u = s1_mean_0;
+          best_action = raw_action;
+          teacher_accepted = false;
+          teacher_action = raw_action;
+          chosen_action = raw_action;
+          overridden = false;
+          confirmed = false;
+          stage2_candidate_utilities.clear();
+        }
+      }
+      // Case C: 0.0 < best_s1_mean_d < opts.stage1_min_mean_diff (challenger edged 0 by < min diff)
+      else {
+        stopped_stage1 = true;
+        raw_mean_u = s1_mean_0;
+        best_mean_u = s1_mean_0;
+        best_action = raw_action;
+        teacher_accepted = false;
+        teacher_action = raw_action;
+        chosen_action = raw_action;
+        overridden = false;
+        confirmed = false;
+        stage2_candidate_utilities.clear();
+      }
     } else {
-      std::vector<size_t> stage2_c_indices = {0, best_s1_c};
-      auto s2_tasks = build_tasks(stage2_c_indices, R1, rollouts_per_action, can_dedup);
-      execute_tasks(s2_tasks);
+      if (stopped_stage1 || best_s1_c == 0 || best_s1_mean_d < opts.stage1_min_mean_diff) {
+        stopped_stage1 = true;
+      } else {
+        std::vector<size_t> stage2_c_indices = {0, best_s1_c};
+        auto s2_tasks = build_tasks(stage2_c_indices, R1, rollouts_per_action, can_dedup);
+        execute_tasks(s2_tasks);
+      }
     }
 
     for (size_t c_idx = 0; c_idx < candidates.size(); ++c_idx) {
@@ -1239,27 +1692,97 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
     execute_tasks(tasks);
   }
 
-  double raw_mean_u = active_tree->GetMeanUtility(raw_action);
-  Action best_action = raw_action;
-  double best_mean_u = raw_mean_u;
-  size_t best_c_idx = 0;
-  double best_vs_raw_mean_diff = 0.0;
-  double best_vs_raw_t_stat = 0.0;
-  bool overridden = false;
+  if (!(use_two_stage && opts.symmetric_stage2_confirmation)) {
+    raw_mean_u = active_tree->GetMeanUtility(raw_action);
+    best_action = raw_action;
+    best_mean_u = raw_mean_u;
+    best_c_idx = 0;
+    best_vs_raw_mean_diff = 0.0;
+    best_vs_raw_t_stat = 0.0;
+    overridden = false;
 
-  if (use_two_stage) {
-    if (!stopped_stage1) {
-      double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
-      if (cand_mean_u > raw_mean_u) {
-        best_action = candidates[best_s1_c];
-        best_mean_u = cand_mean_u;
-        best_c_idx = best_s1_c;
+    if (use_two_stage) {
+      if (!stopped_stage1) {
+        double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
+        if (cand_mean_u > raw_mean_u) {
+          best_action = candidates[best_s1_c];
+          best_mean_u = cand_mean_u;
+          best_c_idx = best_s1_c;
+          best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
+
+          const auto& raw_returns = cand_rollout_returns[0];
+          const auto& best_returns = cand_rollout_returns[best_c_idx];
+          const size_t R = std::min(raw_returns.size(), best_returns.size());
+          if (R >= 2) {
+            double sum_d = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+              sum_d += (best_returns[r] - raw_returns[r]);
+            }
+            double mean_d = sum_d / static_cast<double>(R);
+            double sum_sq_d = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+              double diff = (best_returns[r] - raw_returns[r]) - mean_d;
+              sum_sq_d += diff * diff;
+            }
+            double var_d = sum_sq_d / static_cast<double>(R - 1);
+            double se_d = std::sqrt(var_d / static_cast<double>(R));
+            best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+          } else {
+            best_vs_raw_t_stat = (min_paired_t_stat <= 0.0) ? 1e9 : 0.0;
+          }
+
+          if (best_mean_u > raw_mean_u + min_override_margin &&
+              best_vs_raw_t_stat >= min_paired_t_stat) {
+            overridden = true;
+          }
+        }
+      } else {
+        double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
+        if (cand_mean_u > raw_mean_u) {
+          best_action = candidates[best_s1_c];
+          best_mean_u = cand_mean_u;
+          best_c_idx = best_s1_c;
+          best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
+
+          const auto& raw_returns = cand_rollout_returns[0];
+          const auto& best_returns = cand_rollout_returns[best_c_idx];
+          const size_t R = std::min(raw_returns.size(), best_returns.size());
+          if (R >= 2) {
+            double sum_d = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+              sum_d += (best_returns[r] - raw_returns[r]);
+            }
+            double mean_d = sum_d / static_cast<double>(R);
+            double sum_sq_d = 0.0;
+            for (size_t r = 0; r < R; ++r) {
+              double diff = (best_returns[r] - raw_returns[r]) - mean_d;
+              sum_sq_d += diff * diff;
+            }
+            double var_d = sum_sq_d / static_cast<double>(R - 1);
+            double se_d = std::sqrt(var_d / static_cast<double>(R));
+            best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+          }
+        }
+        overridden = false;
+      }
+    } else {
+      for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
+        Action cand_a = candidates[c_idx];
+        double mean_u = active_tree->GetMeanUtility(cand_a);
+        if (mean_u > best_mean_u) {
+          best_mean_u = mean_u;
+          best_action = cand_a;
+          best_c_idx = c_idx;
+        }
+      }
+
+      if (best_action != raw_action) {
         best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
-
         const auto& raw_returns = cand_rollout_returns[0];
         const auto& best_returns = cand_rollout_returns[best_c_idx];
         const size_t R = std::min(raw_returns.size(), best_returns.size());
-        if (R >= 2) {
+
+        if (pairing_mode == SearchPairingMode::kPaired && R >= 2) {
           double sum_d = 0.0;
           for (size_t r = 0; r < R; ++r) {
             sum_d += (best_returns[r] - raw_returns[r]);
@@ -1273,97 +1796,29 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
           double var_d = sum_sq_d / static_cast<double>(R - 1);
           double se_d = std::sqrt(var_d / static_cast<double>(R));
           best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
+        } else if (raw_returns.size() >= 2 && best_returns.size() >= 2) {
+          double m0 = 0.0, m1 = 0.0;
+          for (double v : raw_returns) m0 += v;
+          m0 /= raw_returns.size();
+          for (double v : best_returns) m1 += v;
+          m1 /= best_returns.size();
+          double v0 = 0.0, v1 = 0.0;
+          for (double v : raw_returns) v0 += (v - m0) * (v - m0);
+          v0 /= (raw_returns.size() - 1);
+          for (double v : best_returns) v1 += (v - m1) * (v - m1);
+          v1 /= (best_returns.size() - 1);
+          double se = std::sqrt(v0 / raw_returns.size() + v1 / best_returns.size());
+          best_vs_raw_t_stat = (se > 1e-12) ? ((m1 - m0) / se) : ((m1 - m0) > 0.0 ? 1e9 : -1e9);
         } else {
           best_vs_raw_t_stat = (min_paired_t_stat <= 0.0) ? 1e9 : 0.0;
         }
-
-        if (best_mean_u > raw_mean_u + min_override_margin &&
-            best_vs_raw_t_stat >= min_paired_t_stat) {
-          overridden = true;
-        }
       }
-    } else {
-      double cand_mean_u = active_tree->GetMeanUtility(candidates[best_s1_c]);
-      if (cand_mean_u > raw_mean_u) {
-        best_action = candidates[best_s1_c];
-        best_mean_u = cand_mean_u;
-        best_c_idx = best_s1_c;
-        best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
 
-        const auto& raw_returns = cand_rollout_returns[0];
-        const auto& best_returns = cand_rollout_returns[best_c_idx];
-        const size_t R = std::min(raw_returns.size(), best_returns.size());
-        if (R >= 2) {
-          double sum_d = 0.0;
-          for (size_t r = 0; r < R; ++r) {
-            sum_d += (best_returns[r] - raw_returns[r]);
-          }
-          double mean_d = sum_d / static_cast<double>(R);
-          double sum_sq_d = 0.0;
-          for (size_t r = 0; r < R; ++r) {
-            double diff = (best_returns[r] - raw_returns[r]) - mean_d;
-            sum_sq_d += diff * diff;
-          }
-          double var_d = sum_sq_d / static_cast<double>(R - 1);
-          double se_d = std::sqrt(var_d / static_cast<double>(R));
-          best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
-        }
+      if (best_action != raw_action &&
+          best_mean_u > raw_mean_u + min_override_margin &&
+          best_vs_raw_t_stat >= min_paired_t_stat) {
+        overridden = true;
       }
-      overridden = false;
-    }
-  } else {
-    for (size_t c_idx = 1; c_idx < candidates.size(); ++c_idx) {
-      Action cand_a = candidates[c_idx];
-      double mean_u = active_tree->GetMeanUtility(cand_a);
-      if (mean_u > best_mean_u) {
-        best_mean_u = mean_u;
-        best_action = cand_a;
-        best_c_idx = c_idx;
-      }
-    }
-
-    if (best_action != raw_action) {
-      best_vs_raw_mean_diff = best_mean_u - raw_mean_u;
-      const auto& raw_returns = cand_rollout_returns[0];
-      const auto& best_returns = cand_rollout_returns[best_c_idx];
-      const size_t R = std::min(raw_returns.size(), best_returns.size());
-
-      if (pairing_mode == SearchPairingMode::kPaired && R >= 2) {
-        double sum_d = 0.0;
-        for (size_t r = 0; r < R; ++r) {
-          sum_d += (best_returns[r] - raw_returns[r]);
-        }
-        double mean_d = sum_d / static_cast<double>(R);
-        double sum_sq_d = 0.0;
-        for (size_t r = 0; r < R; ++r) {
-          double diff = (best_returns[r] - raw_returns[r]) - mean_d;
-          sum_sq_d += diff * diff;
-        }
-        double var_d = sum_sq_d / static_cast<double>(R - 1);
-        double se_d = std::sqrt(var_d / static_cast<double>(R));
-        best_vs_raw_t_stat = (se_d > 1e-12) ? (mean_d / se_d) : (mean_d > 0.0 ? 1e9 : -1e9);
-      } else if (raw_returns.size() >= 2 && best_returns.size() >= 2) {
-        double m0 = 0.0, m1 = 0.0;
-        for (double v : raw_returns) m0 += v;
-        m0 /= raw_returns.size();
-        for (double v : best_returns) m1 += v;
-        m1 /= best_returns.size();
-        double v0 = 0.0, v1 = 0.0;
-        for (double v : raw_returns) v0 += (v - m0) * (v - m0);
-        v0 /= (raw_returns.size() - 1);
-        for (double v : best_returns) v1 += (v - m1) * (v - m1);
-        v1 /= (best_returns.size() - 1);
-        double se = std::sqrt(v0 / raw_returns.size() + v1 / best_returns.size());
-        best_vs_raw_t_stat = (se > 1e-12) ? ((m1 - m0) / se) : ((m1 - m0) > 0.0 ? 1e9 : -1e9);
-      } else {
-        best_vs_raw_t_stat = (min_paired_t_stat <= 0.0) ? 1e9 : 0.0;
-      }
-    }
-
-    if (best_action != raw_action &&
-        best_mean_u > raw_mean_u + min_override_margin &&
-        best_vs_raw_t_stat >= min_paired_t_stat) {
-      overridden = true;
     }
   }
 
@@ -1381,15 +1836,30 @@ inline CompoundSearchDecisionResult CompoundRolloutSearchDecision(
   }
 
   CompoundSearchDecisionResult result;
-  result.action = overridden ? best_action : raw_action;
-  result.chosen_action = result.action;
-  result.best_action = best_action;
-  result.raw_action = raw_action;
-  result.overridden = overridden;
+  if (opts.symmetric_stage2_confirmation) {
+    result.action = teacher_action;
+    result.chosen_action = teacher_action;
+    result.best_action = best_action;
+    result.raw_action = raw_action;
+    result.overridden = overridden;
+    result.confirmed = confirmed;
+    result.teacher_accepted = teacher_accepted;
+    result.teacher_action = teacher_action;
+    result.stage2_candidate_utilities = std::move(stage2_candidate_utilities);
+  } else {
+    result.action = overridden ? best_action : raw_action;
+    result.chosen_action = result.action;
+    result.best_action = best_action;
+    result.raw_action = raw_action;
+    result.overridden = overridden;
+    result.confirmed = false;
+    result.teacher_accepted = overridden;
+    result.teacher_action = overridden ? best_action : raw_action;
+  }
   result.stopped_stage1 = stopped_stage1;
   result.resample_fallbacks = resample_fallbacks.load();
   result.raw_mean_utility = raw_mean_u;
-  result.chosen_mean_utility = overridden ? best_mean_u : raw_mean_u;
+  result.chosen_mean_utility = (overridden || confirmed) ? best_mean_u : raw_mean_u;
   result.prior_rollouts_reused = prior_rollouts_reused;
   result.new_rollouts_executed = new_rollouts_executed;
   result.candidate_priors = std::move(candidate_priors);

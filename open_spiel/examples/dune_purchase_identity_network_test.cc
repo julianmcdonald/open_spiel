@@ -68,6 +68,23 @@ void TestInputMigration() {
       SPIEL_CHECK_EQ(target_v4.slice(1, prefix).count_nonzero().item<int64_t>(), 0);
     }
   }
+
+  for (auto mode : {MarketAppendixMode::kNone, MarketAppendixMode::kZeros,
+                    MarketAppendixMode::kOrderedMarket,
+                    MarketAppendixMode::kOrderedCardSlotsV2,
+                    MarketAppendixMode::kFullPublicInformationV3,
+                    MarketAppendixMode::kFullPublicInformationV4}) {
+    const auto schema = GetInformationStateSchema(mode);
+    auto source = torch::randn({8, schema.size});
+    auto target_v5 = torch::empty({8, kFullPublicInformationV5StateSize});
+    CopyInputToFullPublicInformationV5(target_v5, source, mode);
+    const int prefix = mode == MarketAppendixMode::kZeros
+                           ? kLegacyInformationStateSize : schema.size;
+    SPIEL_CHECK_TRUE(torch::equal(target_v5.slice(1, 0, prefix), source.slice(1, 0, prefix)));
+    if (prefix < kFullPublicInformationV5StateSize) {
+      SPIEL_CHECK_EQ(target_v5.slice(1, prefix).count_nonzero().item<int64_t>(), 0);
+    }
+  }
 }
 
 void TestIncumbentMigration(const std::filesystem::path& output_dir) {
@@ -1029,6 +1046,147 @@ void TestModelAndOptimizerMigration9182To9941(const std::filesystem::path& temp_
   std::cout << "3-group 9182-to-9941 model and optimizer migration and fatal fail-closed verification passed successfully.\n";
 }
 
+void TestModelAndOptimizerMigration9941To10445(const std::filesystem::path& temp_dir) {
+  std::filesystem::create_directories(temp_dir);
+  torch::Device cpu_device(torch::kCPU);
+
+  // 1. Create a >=9-block v4 model (10 blocks) with semantic scorer
+  auto v4_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationV4StateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+
+  // Build a real 3-group AdamW optimizer
+  auto v4_opt = BuildAdamWOptimizer(
+      *v4_model, /*lr=*/5e-6, /*weight_decay=*/0.0, /*policy_weight_decay=*/0.0,
+      /*new_block_lr=*/5e-5, /*new_block_first_index=*/8);
+  SPIEL_CHECK_EQ(v4_opt->param_groups().size(), 3);
+
+  // Step v4_opt to populate moments
+  torch::Tensor dummy_input = torch::randn({2, kFullPublicInformationV4StateSize});
+  auto out = v4_model->forward(dummy_input);
+  torch::Tensor loss = out.logits.sum() + out.values.sum();
+  for (const auto& group : v4_opt->param_groups()) {
+    for (const auto& p : group.params()) {
+      loss = loss + p.sum();
+    }
+  }
+  loss.backward();
+  v4_opt->step();
+
+  const std::filesystem::path model_path = temp_dir / "ppo_model_update_200.pt";
+  const std::filesystem::path optim_path = temp_dir / "ppo_optimizer_update_200.pt";
+  const std::filesystem::path manifest_path = temp_dir / "ppo_model_update_200.json";
+  torch::save(v4_model, model_path.string());
+  torch::save(*v4_opt, optim_path.string());
+
+  const auto v4_schema = GetInformationStateSchema(MarketAppendixMode::kFullPublicInformationV4);
+  json::Object manifest_obj;
+  manifest_obj["global_update"] = 200;
+  manifest_obj["market_appendix_mode"] = "full_public_information_v4";
+  manifest_obj["observation_dim"] = static_cast<int64_t>(kFullPublicInformationV4StateSize);
+  manifest_obj["feature_schema_sha256"] = std::string(v4_schema.sha256);
+  manifest_obj["enable_semantic_scorer"] = true;
+  manifest_obj["semantic_descriptor_schema"] = "semantic_action_v3";
+  manifest_obj["model_filename"] = model_path.filename().string();
+  manifest_obj["optimizer_filename"] = optim_path.filename().string();
+  manifest_obj["num_blocks"] = 10;
+  manifest_obj["hidden_dim"] = 64;
+  std::ofstream mfs(manifest_path);
+  mfs << json::ToString(json::Value(manifest_obj));
+  mfs.close();
+
+  // 2. Load v5_model (10445 input dim, 10 blocks) via LoadModelCheckpoint
+  auto v5_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      kFullPublicInformationV5StateSize, 64, 2391, /*num_blocks=*/10, /*use_nonlinear=*/false,
+      /*with_aux_heads=*/false, /*head_init_seed=*/0, /*with_semantic_scorer=*/true);
+  LoadModelCheckpoint(v5_model, model_path.string(), cpu_device);
+  SPIEL_CHECK_TRUE(v5_model->market_appendix_mode_ == MarketAppendixMode::kFullPublicInformationV5);
+
+  // Build 3-group target optimizer
+  auto v5_opt = BuildAdamWOptimizer(
+      *v5_model, /*lr=*/5e-6, /*weight_decay=*/0.0, /*policy_weight_decay=*/0.0,
+      /*new_block_lr=*/5e-5, /*new_block_first_index=*/8);
+  SPIEL_CHECK_EQ(v5_opt->param_groups().size(), 3);
+
+  bool migrated = LoadOptimizerCheckpointMigrating(
+      v5_model, *v5_opt, optim_path.string(), cpu_device);
+  SPIEL_CHECK_TRUE(migrated);
+  SPIEL_CHECK_EQ(v5_opt->param_groups().size(), 3);
+
+  // 3. Step 0 forward parity on zero-padded v5 input
+  torch::Tensor test_in_v4 = torch::randn({2, kFullPublicInformationV4StateSize});
+  torch::Tensor test_in_v5 = torch::empty({2, kFullPublicInformationV5StateSize});
+  CopyInputToFullPublicInformationV5(
+      test_in_v5, test_in_v4, MarketAppendixMode::kFullPublicInformationV4);
+  v4_model->eval();
+  v5_model->eval();
+  auto out_v4 = v4_model->forward(test_in_v4);
+  auto out_v5 = v5_model->forward(test_in_v5);
+  double logit_diff = (out_v4.logits - out_v5.logits).abs().max().item<double>();
+  double value_diff = (out_v4.values - out_v5.values).abs().max().item<double>();
+  SPIEL_CHECK_LT(logit_diff, 1e-5);
+  SPIEL_CHECK_LT(value_diff, 1e-5);
+
+  // 4. Assertions on moments
+  auto input_w_key = v5_model->input_layer->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(v5_opt->state().count(input_w_key), 0);
+  auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(
+      v5_opt->state()[input_w_key].get());
+  SPIEL_CHECK_TRUE(adam_state != nullptr);
+  SPIEL_CHECK_TRUE(adam_state->exp_avg().defined());
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(0), 64);
+  SPIEL_CHECK_EQ(adam_state->exp_avg().size(1), kFullPublicInformationV5StateSize);
+  SPIEL_CHECK_EQ(adam_state->exp_avg_sq().size(0), 64);
+  SPIEL_CHECK_EQ(adam_state->exp_avg_sq().size(1), kFullPublicInformationV5StateSize);
+
+  auto* src_input_adam = dynamic_cast<torch::optim::AdamWParamState*>(
+      v4_opt->state()[v4_model->input_layer->weight.unsafeGetTensorImpl()].get());
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg().slice(1, 0, kFullPublicInformationV4StateSize),
+      src_input_adam->exp_avg()));
+  SPIEL_CHECK_TRUE(torch::equal(
+      adam_state->exp_avg_sq().slice(1, 0, kFullPublicInformationV4StateSize),
+      src_input_adam->exp_avg_sq()));
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg().slice(1, kFullPublicInformationV4StateSize, kFullPublicInformationV5StateSize).abs().sum().item<double>(), 0.0);
+  SPIEL_CHECK_EQ(
+      adam_state->exp_avg_sq().slice(1, kFullPublicInformationV4StateSize, kFullPublicInformationV5StateSize).abs().sum().item<double>(), 0.0);
+
+  // Verify dynamic slot AdamW moments in policy_head are zeroed
+  auto policy_w_key = v5_model->policy_head->weight.unsafeGetTensorImpl();
+  SPIEL_CHECK_GT(v5_opt->state().count(policy_w_key), 0);
+  auto* policy_adam = dynamic_cast<torch::optim::AdamWParamState*>(
+      v5_opt->state()[policy_w_key].get());
+  SPIEL_CHECK_TRUE(policy_adam != nullptr);
+  const std::vector<std::vector<int64_t>> families = {
+      {10, 11, 12, 13, 14}, {70, 71, 72}, {91, 92},
+      {538, 539, 540, 541, 542}, {546, 547, 548, 549, 550},
+      {554, 555, 556}, {770, 771, 772}};
+  for (const auto& fam : families) {
+    for (int64_t s : fam) {
+      SPIEL_CHECK_EQ(policy_adam->exp_avg()[s].abs().sum().item<double>(), 0.0);
+      SPIEL_CHECK_EQ(policy_adam->exp_avg_sq()[s].abs().sum().item<double>(), 0.0);
+    }
+  }
+
+  // 5. Verify forward, backward, and v5_opt->step() succeeds
+  v5_model->train();
+  v5_opt->zero_grad();
+  torch::Tensor t_v5 = torch::randn({2, kFullPublicInformationV5StateSize});
+  auto train_out = v5_model->forward(t_v5);
+  torch::Tensor train_loss = train_out.logits.sum() + train_out.values.sum();
+  train_loss.backward();
+
+  auto grad_new_cols = v5_model->input_layer->weight.grad().slice(
+      1, kFullPublicInformationV4StateSize, kFullPublicInformationV5StateSize);
+  SPIEL_CHECK_GT(grad_new_cols.abs().sum().item<double>(), 0.0);
+  v5_opt->step();
+
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir, ec);
+  std::cout << "3-group 9941-to-10445 model and optimizer migration verification passed successfully.\n";
+}
+
 void TestModelMigrationDepthGuards(const std::filesystem::path& temp_dir) {
   std::filesystem::create_directories(temp_dir);
   torch::Device cpu_device(torch::kCPU);
@@ -1985,6 +2143,7 @@ int main(int argc, char** argv) {
   open_spiel::TestPopulatedOptimizerMigration(artifacts_dir / "optim_mig");
   open_spiel::TestOptimizerMigration6255To9182(artifacts_dir / "optim_mig_6255");
   open_spiel::TestModelAndOptimizerMigration9182To9941(artifacts_dir / "optim_mig_9182");
+  open_spiel::TestModelAndOptimizerMigration9941To10445(artifacts_dir / "optim_mig_9941");
   open_spiel::TestModelMigrationDepthGuards(artifacts_dir / "depth_guards");
   open_spiel::TestDeckPoolSemanticsIntegration(artifacts_dir / "deck_pool_sem");
   if (argc > 2) {

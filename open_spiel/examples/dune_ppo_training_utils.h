@@ -70,6 +70,8 @@ extern std::string g_deck_pool_semantics_transition_source_fingerprint;
 extern int64_t g_deck_pool_semantics_transition_source_update;
 extern std::string g_tf32_transition_source_fingerprint;
 extern int64_t g_tf32_transition_source_update;
+extern std::string g_semantic_schema_transition_source_fingerprint;
+extern int64_t g_semantic_schema_transition_source_update;
 
 namespace open_spiel {
 
@@ -124,6 +126,7 @@ struct PpoTransition {
   bool targeted_buy_forced = false;
   float gae_advantage = 0.0f;
   float norm_advantage = 0.0f;
+  int round = 0;
 };
 
 inline bool IsAcquisitionAction(Action a) {
@@ -337,6 +340,9 @@ struct PpoUpdateStats {
   PrecapAbszStats precap_absz_continuation;  // DuneDecisionRole::kAgentContinuation
   PrecapAbszStats precap_absz_purchase;      // DuneDecisionRole::kPurchase
   int64_t forced_buys = 0;                   // Purchase exploration forced buy count (D2)
+  double purchase_grad_cosine = 0.0;         // Cosine similarity between PPO policy loss grads and MPO aux loss grads on scorer output params
+  double purchase_grad_cosine_sum = 0.0;
+  int purchase_grad_cosine_count = 0;
 
   // Mean of the unclipped per-minibatch gradient norms over this update.
   // Distinct from the WO-17 column `ppo_grad_norm_mean`, which is the
@@ -504,6 +510,8 @@ struct PpoUpdateStats {
   int64_t aux_total_presentations = 0; // realized auxiliary presentations across minibatches
   int64_t aux_distinct_visited = 0;    // distinct search_examples rows presented >= 1 time
   std::vector<uint8_t> aux_visited_mask; // size == aux_examples_used when aux_active; 1 if visited
+  int64_t aux_finish_pass_steps = 0;   // steps executed in opt-in unvisited aux finish pass
+  int64_t aux_finish_pass_rows = 0;    // aux rows stepped in opt-in unvisited aux finish pass
   double search_aux_loss = 0.0;       // mean auxiliary search loss (aux_ce)
 
   // --- Reverse KL penalty (Arm B: PPO with reverse-KL to rollout collection policy) ---
@@ -673,6 +681,25 @@ struct Pwo5AuxConfig {
 // the startup/resume condition; this hook exists only so tests can exercise
 // the cadence deterministically.
 void ResetDiagPrepassStateForTesting();
+
+struct V5LegacySlotResidualState {
+  bool active = false;
+  int N = 0;
+  // 7 multi-slot families
+  std::vector<std::vector<int64_t>> families = {
+      {10, 11, 12, 13, 14},
+      {70, 71, 72},
+      {91, 92},
+      {538, 539, 540, 541, 542},
+      {546, 547, 548, 549, 550},
+      {554, 555, 556},
+      {770, 771, 772}};
+  std::vector<torch::Tensor> init_w_residuals;
+  std::vector<torch::Tensor> init_b_residuals;
+
+  void Initialize(const std::shared_ptr<SharedDunePolicyValueNetImpl>& model, int anneal_updates);
+  void Apply(const std::shared_ptr<SharedDunePolicyValueNetImpl>& model, int completed_updates_in_run);
+};
 
 PpoUpdateStats TrainPpoUpdate(
     std::shared_ptr<SharedDunePolicyValueNetImpl> model,

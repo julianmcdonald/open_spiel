@@ -49,6 +49,10 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .value("kNone", open_spiel::dune_imperium::MarketAppendixMode::kNone)
       .value("kZeros", open_spiel::dune_imperium::MarketAppendixMode::kZeros)
       .value("kOrderedMarket", open_spiel::dune_imperium::MarketAppendixMode::kOrderedMarket)
+      .value("kOrderedCardSlotsV2", open_spiel::dune_imperium::MarketAppendixMode::kOrderedCardSlotsV2)
+      .value("kFullPublicInformationV3", open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV3)
+      .value("kFullPublicInformationV4", open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV4)
+      .value("kFullPublicInformationV5", open_spiel::dune_imperium::MarketAppendixMode::kFullPublicInformationV5)
       .export_values();
 
   // --- Structs & Helpers ---
@@ -972,6 +976,19 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_readonly("fallback_reason", &open_spiel::DuneSearchResult::fallback_reason)
       .def_readonly("inference_count", &open_spiel::DuneSearchResult::inference_count);
 
+  py::class_<open_spiel::PolicyPriorDetails>(di, "PolicyPriorDetails")
+      .def_readonly("ok", &open_spiel::PolicyPriorDetails::ok)
+      .def_readonly("actions", &open_spiel::PolicyPriorDetails::actions)
+      .def_readonly("probabilities", &open_spiel::PolicyPriorDetails::probabilities)
+      .def_readonly("value", &open_spiel::PolicyPriorDetails::value);
+
+  py::class_<open_spiel::PairedActionEvaluationResult>(di, "PairedActionEvaluationResult")
+      .def_readonly("u_first", &open_spiel::PairedActionEvaluationResult::u_first)
+      .def_readonly("u_second", &open_spiel::PairedActionEvaluationResult::u_second)
+      .def_readonly("diff_mean", &open_spiel::PairedActionEvaluationResult::diff_mean)
+      .def_readonly("diff_se", &open_spiel::PairedActionEvaluationResult::diff_se)
+      .def_readonly("num_worlds", &open_spiel::PairedActionEvaluationResult::num_worlds);
+
   py::class_<open_spiel::ControllerDecision>(di, "ControllerDecision")
       .def(py::init<>())
       .def_readwrite("selected_action", &open_spiel::ControllerDecision::selected_action)
@@ -1025,7 +1042,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_property_readonly("session_elapsed_time_ms", &open_spiel::DuneSearchSession::session_elapsed_time_ms);
 
   py::class_<open_spiel::DuneAdaptiveRolloutSession>(di, "DuneAdaptiveRolloutSession")
-      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t, bool, bool, int, int, int, bool>(),
+      .def(py::init<const std::string&, const std::string&, int, int, int, int, int, uint64_t, bool, bool, int, int, int, bool, bool, bool>(),
            py::arg("checkpoint_path"),
            py::arg("device_str") = "cuda",
            py::arg("hidden_dim") = 2048,
@@ -1039,9 +1056,17 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("max_inflight_worlds") = 96,
            py::arg("num_evaluators") = 1,
            py::arg("top5_min_budget") = 576,
-           py::arg("all_buy_candidates") = true)
+           py::arg("all_buy_candidates") = true,
+           py::arg("enable_fp8_trunk") = false,
+           py::arg("search_v2") = false)
       .def("search", &open_spiel::DuneAdaptiveRolloutSession::Search,
            py::arg("state"), py::arg("remaining_time_ms") = -1.0)
+      .def("evaluate_action_pair_terminal",
+           &open_spiel::DuneAdaptiveRolloutSession::EvaluateActionPairTerminal,
+           py::arg("state"), py::arg("a_first"), py::arg("a_second"),
+           py::arg("num_worlds") = 64, py::arg("seed") = 20261104ULL)
+      .def("prior_with_details", &open_spiel::DuneAdaptiveRolloutSession::PriorWithDetails,
+           py::arg("state"))
       .def("discard_pending_action", &open_spiel::DuneAdaptiveRolloutSession::DiscardPendingAction)
       .def("reset_session", &open_spiel::DuneAdaptiveRolloutSession::ResetSession, py::arg("reason"))
       .def("set_seed", &open_spiel::DuneAdaptiveRolloutSession::set_seed, py::arg("seed"))
@@ -1088,6 +1113,12 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_full_search",
            &open_spiel::DuneAdaptiveRolloutSession::set_full_search,
            py::arg("val"))
+      .def_property("search_v2",
+                    &open_spiel::DuneAdaptiveRolloutSession::search_v2,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_search_v2)
+      .def("set_search_v2",
+           &open_spiel::DuneAdaptiveRolloutSession::set_search_v2,
+           py::arg("val"))
       .def_property("prior_log_ratio_weight",
                     &open_spiel::DuneAdaptiveRolloutSession::prior_log_ratio_weight,
                     &open_spiel::DuneAdaptiveRolloutSession::set_prior_log_ratio_weight)
@@ -1109,7 +1140,13 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def_property_readonly("ms_per_rollout_ema",
                              &open_spiel::DuneAdaptiveRolloutSession::ms_per_rollout_ema)
       .def_property_readonly("turn_elapsed_search_time_ms",
-                             &open_spiel::DuneAdaptiveRolloutSession::turn_elapsed_search_time_ms);
+                             &open_spiel::DuneAdaptiveRolloutSession::turn_elapsed_search_time_ms)
+      .def_property("enable_fp8_trunk",
+                    &open_spiel::DuneAdaptiveRolloutSession::enable_fp8_trunk,
+                    &open_spiel::DuneAdaptiveRolloutSession::set_enable_fp8_trunk)
+      .def("set_enable_fp8_trunk",
+           &open_spiel::DuneAdaptiveRolloutSession::set_enable_fp8_trunk,
+           py::arg("val"));
 
   di.def("make_dune_nn_evaluator", &open_spiel::MakeDuneNNEvaluator,
          py::arg("checkpoint_path"), py::arg("device_str"),

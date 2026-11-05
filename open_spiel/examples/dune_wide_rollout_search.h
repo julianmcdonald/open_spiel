@@ -243,7 +243,9 @@ inline int RunClockedPairedRolloutStage(
     std::vector<std::vector<double>>& per_candidate_rollouts,
     int& new_rollouts_executed,
     int max_inflight_worlds = 32,
-    bool resample_from_infostate = true) {
+    bool resample_from_infostate = true,
+    const std::vector<Action>* second_actions = nullptr,
+    const std::vector<Action>* graft_actions = nullptr) {
   const size_t num_cands = candidate_indices.size();
   if (planned_worlds <= 0 || num_cands == 0) return 0;
   const int W = std::max(1, max_inflight_worlds);
@@ -321,6 +323,24 @@ inline int RunClockedPairedRolloutStage(
         std::unique_ptr<State> sim_state =
             (slot + 1 == num_cands) ? std::move(base_world_state) : base_world_state->Clone();
         sim_state->ApplyAction(cand_a);
+        if (graft_actions != nullptr && c_idx < graft_actions->size()) {
+          const Action graft_a = (*graft_actions)[c_idx];
+          if (graft_a != kInvalidAction) {
+            const auto leg_g = sim_state->LegalActions();
+            if (std::find(leg_g.begin(), leg_g.end(), graft_a) != leg_g.end()) {
+              sim_state->ApplyAction(graft_a);
+            }
+          }
+        }
+        if (second_actions != nullptr && c_idx < second_actions->size()) {
+          const Action second_a = (*second_actions)[c_idx];
+          if (second_a != kInvalidAction) {
+            const auto leg2 = sim_state->LegalActions();
+            if (std::find(leg2.begin(), leg2.end(), second_a) != leg2.end()) {
+              sim_state->ApplyAction(second_a);
+            }
+          }
+        }
         auto* s_ptr = sim_state.get();
         if (!in_initial_burst && active_evaluator) {
           active_evaluator->AdjustActiveRollouts(1);
@@ -409,8 +429,21 @@ inline int RunClockedPairedRolloutStage(
     for (size_t slot = 0; slot < num_cands; ++slot) {
       const size_t c_idx = candidate_indices[slot];
       if (active_tree) {
+        std::vector<Action> intra = shared->trajs[w][slot].intra_turn_actions;
+        if (second_actions != nullptr && c_idx < second_actions->size()) {
+          const Action second_a = (*second_actions)[c_idx];
+          if (second_a != kInvalidAction) {
+            intra.insert(intra.begin(), second_a);
+          }
+        }
+        if (graft_actions != nullptr && c_idx < graft_actions->size()) {
+          const Action graft_a = (*graft_actions)[c_idx];
+          if (graft_a != kInvalidAction) {
+            intra.insert(intra.begin(), graft_a);
+          }
+        }
         active_tree->RecordRollout(ordered_candidates[c_idx],
-                                   shared->trajs[w][slot].intra_turn_actions,
+                                   intra,
                                    shared->trajs[w][slot].terminal_utility);
       }
       per_candidate_rollouts[c_idx].push_back(shared->trajs[w][slot].terminal_utility);
@@ -1395,6 +1428,941 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   res.termination_reason = overridden ? "override" : "stage2_no_override";
   res.mean_d_stage2 = mean_d_stage2;
   res.se_d_stage2 = se_d_stage2;
+  return res;
+}
+
+inline constexpr int kNumBoardSpaces = 22;
+
+inline bool IsBoardSpaceAction(Action a) {
+  return a >= kActionAgentSpaceConspire && a <= kActionAgentSpaceSietchTabr;
+}
+
+inline bool IsGraftSelectionAction(Action a) {
+  return (a >= kActionSelectGraftPartner0 &&
+          a < kActionSelectGraftPartner0 + kNumImperiumCardIds) ||
+         a == kActionPlayAgentSolo;
+}
+
+struct JointAgentCandidate {
+  Action first_action = kInvalidAction;
+  Action graft_action = kInvalidAction;
+  Action second_action = kInvalidAction;  // kInvalidAction for standalone 1-step root actions (e.g. Reveal, PlotIntrigue)
+  double joint_prior = 0.0;
+};
+
+struct JointSearchV2Result {
+  CompoundSearchDecisionResult base;
+  Action chosen_first_action = kInvalidAction;
+  Action chosen_graft_action = kInvalidAction;
+  Action chosen_second_action = kInvalidAction;
+  Action raw_first_action = kInvalidAction;
+  Action raw_graft_action = kInvalidAction;
+  Action raw_second_action = kInvalidAction;
+  std::vector<JointAgentCandidate> joint_candidates;
+};
+
+inline std::vector<JointAgentCandidate> EnumerateJointAgentCandidates(
+    const State& state,
+    Player search_player,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    const ActionsAndProbs& root_prior,
+    size_t max_candidates = 8) {
+  const std::vector<Action> legal = state.LegalActions();
+  if (legal.empty()) return {};
+
+  auto get_prior_p = [](const ActionsAndProbs& prior, Action a) -> double {
+    for (const auto& ap : prior) {
+      if (ap.first == a) return ap.second;
+    }
+    return 0.0;
+  };
+
+  const Action a1_raw = PickGreedyAction(root_prior, legal);
+
+  int non_spec_count = 0;
+  for (Action a : legal) {
+    if (!IsConvertSpecimenAction(a)) {
+      ++non_spec_count;
+    }
+  }
+  const bool expand_all = (non_spec_count < 4);
+
+  struct CandRecord {
+    Action a1 = kInvalidAction;
+    Action a_graft = kInvalidAction;
+    Action a2 = kInvalidAction;
+    double joint_p = 0.0;
+    double p_s1 = 0.0;
+    bool is_space = false;
+  };
+
+  std::vector<CandRecord> pool;
+  ActionsAndProbs prior_s1_raw;
+  std::vector<Action> l2_raw;
+  bool a1_raw_is_space = false;
+  Action a_graft_raw = kInvalidAction;
+  Action a2_raw = kInvalidAction;
+  double raw_joint_p = get_prior_p(root_prior, a1_raw);
+
+  for (Action a1 : legal) {
+    if (IsConvertSpecimenAction(a1) && a1 != a1_raw) {
+      continue;
+    }
+    const double p_a1 = get_prior_p(root_prior, a1);
+    std::unique_ptr<State> s1 = state.Clone();
+    s1->ApplyAction(a1);
+
+    if (!s1->IsTerminal() && !s1->IsChanceNode() && s1->CurrentPlayer() == search_player) {
+      const auto l2 = s1->LegalActions();
+      if (!l2.empty() && std::all_of(l2.begin(), l2.end(), [](Action a) { return IsBoardSpaceAction(a); })) {
+        if (l2.size() == 1) {
+          pool.push_back({a1, kInvalidAction, l2[0], p_a1, 1.0, true});
+          if (a1 == a1_raw) {
+            a_graft_raw = kInvalidAction;
+            a2_raw = l2[0];
+            raw_joint_p = p_a1;
+            l2_raw = l2;
+            a1_raw_is_space = true;
+          }
+        } else if (l2.size() >= 2) {
+          if (a1 == a1_raw || p_a1 >= 0.005 || expand_all) {
+            ActionsAndProbs prior_s1 = evaluators.empty() ? ActionsAndProbs{} : evaluators.front()->Prior(*s1);
+            if (a1 == a1_raw) {
+              a_graft_raw = kInvalidAction;
+              prior_s1_raw = prior_s1;
+              l2_raw = l2;
+              a1_raw_is_space = true;
+              a2_raw = PickGreedyAction(prior_s1, l2);
+              raw_joint_p = p_a1 * get_prior_p(prior_s1, a2_raw);
+            }
+            for (Action a2 : l2) {
+              const double p_a2 = get_prior_p(prior_s1, a2);
+              pool.push_back({a1, kInvalidAction, a2, p_a1 * p_a2, p_a2, true});
+            }
+          }
+        }
+      } else if (!l2.empty() && std::all_of(l2.begin(), l2.end(), [](Action a) { return IsGraftSelectionAction(a); })) {
+        if (a1 == a1_raw || p_a1 >= 0.005 || expand_all) {
+          ActionsAndProbs prior_graft = evaluators.empty() ? ActionsAndProbs{} : evaluators.front()->Prior(*s1);
+          Action a_graft_0 = PickGreedyAction(prior_graft, l2);
+          std::vector<Action> chosen_grafts = {a_graft_0};
+          Action alt_graft = kInvalidAction;
+          double alt_graft_p = -1.0;
+          for (Action ag : l2) {
+            if (ag == a_graft_0) continue;
+            double pag = get_prior_p(prior_graft, ag);
+            if (pag >= 0.05 && pag > alt_graft_p) {
+              alt_graft_p = pag;
+              alt_graft = ag;
+            }
+          }
+          if (alt_graft != kInvalidAction) {
+            chosen_grafts.push_back(alt_graft);
+          }
+
+          for (Action a_graft : chosen_grafts) {
+            const double p_graft = get_prior_p(prior_graft, a_graft);
+            auto s_g = s1->Clone();
+            s_g->ApplyAction(a_graft);
+            if (!s_g->IsTerminal() && !s_g->IsChanceNode() && s_g->CurrentPlayer() == search_player) {
+              const auto l_space = s_g->LegalActions();
+              if (!l_space.empty() && std::all_of(l_space.begin(), l_space.end(), [](Action a) { return IsBoardSpaceAction(a); })) {
+                if (l_space.size() == 1) {
+                  pool.push_back({a1, a_graft, l_space[0], p_a1 * p_graft, 1.0, true});
+                  if (a1 == a1_raw && a_graft == a_graft_0) {
+                    a_graft_raw = a_graft_0;
+                    a2_raw = l_space[0];
+                    raw_joint_p = p_a1 * p_graft;
+                    l2_raw = l_space;
+                    a1_raw_is_space = true;
+                  }
+                } else {
+                  ActionsAndProbs prior_space = evaluators.empty() ? ActionsAndProbs{} : evaluators.front()->Prior(*s_g);
+                  if (a1 == a1_raw && a_graft == a_graft_0) {
+                    a_graft_raw = a_graft_0;
+                    a2_raw = PickGreedyAction(prior_space, l_space);
+                    raw_joint_p = p_a1 * p_graft * get_prior_p(prior_space, a2_raw);
+                    prior_s1_raw = prior_space;
+                    l2_raw = l_space;
+                    a1_raw_is_space = true;
+                  }
+                  for (Action a2 : l_space) {
+                    const double p_a2 = get_prior_p(prior_space, a2);
+                    pool.push_back({a1, a_graft, a2, p_a1 * p_graft * p_a2, p_a2, true});
+                  }
+                }
+              } else {
+                pool.push_back({a1, a_graft, kInvalidAction, p_a1 * p_graft, 1.0, false});
+                if (a1 == a1_raw && a_graft == a_graft_0) {
+                  a_graft_raw = a_graft_0;
+                  a2_raw = kInvalidAction;
+                  raw_joint_p = p_a1 * p_graft;
+                }
+              }
+            }
+          }
+        } else {
+          pool.push_back({a1, kInvalidAction, kInvalidAction, p_a1, 1.0, false});
+        }
+      } else {
+        pool.push_back({a1, kInvalidAction, kInvalidAction, p_a1, 1.0, false});
+      }
+    } else {
+      pool.push_back({a1, kInvalidAction, kInvalidAction, p_a1, 1.0, false});
+    }
+  }
+
+  std::vector<JointAgentCandidate> result;
+  result.reserve(max_candidates);
+
+  auto already_included = [&](Action a1, Action a_graft, Action a2) {
+    for (const auto& c : result) {
+      if (c.first_action == a1 && c.graft_action == a_graft && c.second_action == a2) return true;
+    }
+    return false;
+  };
+
+  // 1. Index 0 MUST be exact sequential greedy baseline (a1_raw, a_graft_raw, a2_raw)
+  result.push_back({a1_raw, a_graft_raw, a2_raw, raw_joint_p});
+
+  // 2. Guarantee diversity across cards + spaces before filling by joint_prior:
+  // 2a. Second-highest-prior space for a1_raw if p(a2_second | s1_raw) >= 0.025
+  if (a1_raw_is_space && l2_raw.size() >= 2) {
+    std::vector<std::pair<double, Action>> sorted_s1_spaces;
+    sorted_s1_spaces.reserve(l2_raw.size());
+    for (Action a2 : l2_raw) {
+      sorted_s1_spaces.push_back({get_prior_p(prior_s1_raw, a2), a2});
+    }
+    std::stable_sort(sorted_s1_spaces.begin(), sorted_s1_spaces.end(),
+                     [](const auto& lhs, const auto& rhs) {
+                       if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                       return lhs.second < rhs.second;
+                     });
+    if (sorted_s1_spaces.size() >= 2 && sorted_s1_spaces[1].first >= 0.025) {
+      Action a2_second = sorted_s1_spaces[1].second;
+      if (!already_included(a1_raw, a_graft_raw, a2_second) && result.size() < max_candidates) {
+        double p_g = (a_graft_raw != kInvalidAction)
+            ? (raw_joint_p / std::max(1e-12, get_prior_p(root_prior, a1_raw) * get_prior_p(prior_s1_raw, a2_raw)))
+            : 1.0;
+        double j_p = get_prior_p(root_prior, a1_raw) * p_g * sorted_s1_spaces[1].first;
+        result.push_back({a1_raw, a_graft_raw, a2_second, j_p});
+      }
+    }
+  }
+
+  // 2b. Include top-prior follow-up for up to 4 distinct non-specimen root actions a1_alt != a1_raw
+  // (provided p(a1_alt | state) >= 0.015)
+  std::vector<std::pair<double, Action>> sorted_alt_roots;
+  for (Action a1 : legal) {
+    if (a1 == a1_raw || IsConvertSpecimenAction(a1)) continue;
+    const double p_a1 = get_prior_p(root_prior, a1);
+    if (p_a1 >= 0.015) {
+      sorted_alt_roots.push_back({p_a1, a1});
+    }
+  }
+  std::stable_sort(sorted_alt_roots.begin(), sorted_alt_roots.end(),
+                   [](const auto& lhs, const auto& rhs) {
+                     if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                     return lhs.second < rhs.second;
+                   });
+
+  const size_t max_alts = std::min<size_t>(4, sorted_alt_roots.size());
+  for (size_t i = 0; i < max_alts; ++i) {
+    if (result.size() >= max_candidates) break;
+    const Action a1_alt = sorted_alt_roots[i].second;
+    const CandRecord* best_rec = nullptr;
+    for (const auto& rec : pool) {
+      if (rec.a1 == a1_alt) {
+        if (!best_rec || rec.joint_p > best_rec->joint_p) {
+          best_rec = &rec;
+        }
+      }
+    }
+    if (best_rec && !already_included(best_rec->a1, best_rec->a_graft, best_rec->a2)) {
+      result.push_back({best_rec->a1, best_rec->a_graft, best_rec->a2, best_rec->joint_p});
+    }
+  }
+
+  // 2c. Fill remaining slots up to max_candidates in descending order of joint_prior
+  // (filtering joint_prior >= 0.008 unless needed to reach at least 2 candidates)
+  std::vector<CandRecord> rem_pool = pool;
+  std::stable_sort(rem_pool.begin(), rem_pool.end(),
+                   [](const auto& lhs, const auto& rhs) {
+                     if (lhs.joint_p != rhs.joint_p) return lhs.joint_p > rhs.joint_p;
+                     if (lhs.a1 != rhs.a1) return lhs.a1 < rhs.a1;
+                     if (lhs.a_graft != rhs.a_graft) return lhs.a_graft < rhs.a_graft;
+                     return lhs.a2 < rhs.a2;
+                   });
+
+  for (const auto& rec : rem_pool) {
+    if (result.size() >= max_candidates) break;
+    if (rec.joint_p < 0.008 && result.size() >= 2) break;
+    if (!already_included(rec.a1, rec.a_graft, rec.a2)) {
+      result.push_back({rec.a1, rec.a_graft, rec.a2, rec.joint_p});
+    }
+  }
+
+  return result;
+}
+
+inline std::pair<std::vector<Action>, std::vector<double>>
+SelectOrderedCandidatesAndPriors(
+    const ActionsAndProbs& raw_prior,
+    const std::vector<Action>& legal,
+    int fixed_top_k = 0) {
+  const auto sorted_by_prior = GetSortedCandidatesByPrior(raw_prior, legal);
+  std::vector<Action> ordered_candidates;
+  std::vector<double> candidate_priors;
+  if (sorted_by_prior.empty()) return {ordered_candidates, candidate_priors};
+  if (fixed_top_k <= 0) {
+    ordered_candidates.reserve(4);
+    candidate_priors.reserve(4);
+    ordered_candidates.push_back(sorted_by_prior[0].first);
+    candidate_priors.push_back(sorted_by_prior[0].second);
+    if (sorted_by_prior.size() >= 2) {
+      ordered_candidates.push_back(sorted_by_prior[1].first);
+      candidate_priors.push_back(sorted_by_prior[1].second);
+    }
+    if (sorted_by_prior.size() >= 3 && sorted_by_prior[2].second >= 0.025) {
+      ordered_candidates.push_back(sorted_by_prior[2].first);
+      candidate_priors.push_back(sorted_by_prior[2].second);
+      if (sorted_by_prior.size() >= 4 && sorted_by_prior[3].second >= 0.08) {
+        ordered_candidates.push_back(sorted_by_prior[3].first);
+        candidate_priors.push_back(sorted_by_prior[3].second);
+      }
+    }
+  } else {
+    const size_t k_max = std::min<size_t>(static_cast<size_t>(fixed_top_k), sorted_by_prior.size());
+    ordered_candidates.reserve(k_max);
+    candidate_priors.reserve(k_max);
+    for (size_t i = 0; i < k_max; ++i) {
+      ordered_candidates.push_back(sorted_by_prior[i].first);
+      candidate_priors.push_back(sorted_by_prior[i].second);
+    }
+  }
+  return {ordered_candidates, candidate_priors};
+}
+
+inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
+    const State& state,
+    Player search_player,
+    TurnSearchTree* turn_tree,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    const std::vector<Action>& ordered_candidates,
+    const std::vector<double>& candidate_priors,
+    int reference_rollouts_per_action,
+    double min_override_margin,
+    uint64_t decision_seed,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
+    double max_time_ms = -1.0,
+    int max_inflight_worlds = 32,
+    double prior_log_ratio_weight = 0.02,
+    double stage1_high_conf_prior_skip = 0.95,
+    const std::vector<Action>* second_actions = nullptr,
+    const std::vector<Action>* graft_actions = nullptr,
+    double est_ms_per_sim = 20.0,
+    int* chosen_candidate_index = nullptr) {
+  if (chosen_candidate_index != nullptr) {
+    *chosen_candidate_index = 0;
+  }
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
+  if (ordered_candidates.empty()) {
+    return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
+  }
+  if (ordered_candidates.size() == 1 || evaluators.empty()) {
+    return {ordered_candidates.front(), false, 0.0, 0.0, 0, 0, {}, {}};
+  }
+
+  const size_t K = ordered_candidates.size();
+  const Action raw_action = ordered_candidates[0];
+
+  std::vector<double> prior_penalty(K, 0.0);
+  for (size_t c_idx = 1; c_idx < K; ++c_idx) {
+    if (prior_log_ratio_weight > 0.0 && !candidate_priors.empty() && c_idx < candidate_priors.size()) {
+      double log_ratio = std::log((candidate_priors[0] + 1e-6) / (candidate_priors[c_idx] + 1e-6));
+      prior_penalty[c_idx] = prior_log_ratio_weight * std::clamp(log_ratio, 0.0, 4.0);
+    }
+  }
+
+  int prior_rollouts_reused = 0;
+  if (turn_tree != nullptr) {
+    for (Action cand_a : ordered_candidates) {
+      prior_rollouts_reused += turn_tree->GetVisits(cand_a);
+    }
+  }
+
+  const auto* dune = dynamic_cast<const DuneImperiumState*>(&state);
+  TurnSearchTree local_tree;
+  TurnSearchTree* active_tree = (turn_tree != nullptr) ? turn_tree : &local_tree;
+
+  const int total_budget = 3 * reference_rollouts_per_action;
+  const bool has_deadline = (max_time_ms > 0.0);
+  const auto start_time = std::chrono::steady_clock::now();
+
+  // 1. Fast Capped Stage-1 Screen (max_stage1_worlds = 16)
+  int r_stage1 = 2;
+  if (!has_deadline) {
+    r_stage1 = std::clamp(total_budget / (2 * static_cast<int>(K)), 2, 16);
+  } else {
+    r_stage1 = std::clamp(
+        static_cast<int>((0.35 * max_time_ms) / std::max(0.5, static_cast<double>(K) * est_ms_per_sim)),
+        2, 16);
+  }
+
+  const auto stage1_deadline = has_deadline
+      ? (start_time +
+         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+             std::chrono::duration<double, std::milli>(0.58 * max_time_ms)))
+      : std::chrono::steady_clock::time_point::max();
+
+  const auto final_deadline = has_deadline
+      ? (start_time +
+         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+             std::chrono::duration<double, std::milli>(0.985 * max_time_ms)))
+      : std::chrono::steady_clock::time_point::max();
+
+  // CRITICAL ANTI-STARVATION FIX:
+  // Cap Stage-1 s1_inflight worlds by std::clamp(r_stage1, 2, std::max(2, std::min(max_inflight_worlds, 192 / static_cast<int>(K))))
+  const int s1_cap = std::max(2, std::min(max_inflight_worlds, 192 / static_cast<int>(K)));
+  const int s1_inflight = std::clamp(r_stage1, 2, s1_cap);
+
+  std::vector<size_t> candidate_indices(K);
+  std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
+
+  std::vector<std::vector<double>> per_candidate_rollouts(K);
+  for (size_t c = 0; c < K; ++c) {
+    per_candidate_rollouts[c].reserve(r_stage1);
+  }
+  int new_rollouts_executed = 0;
+  const auto s1_t0 = std::chrono::steady_clock::now();
+
+  if (has_deadline) {
+    // Sub-wave 1A (min_worlds = 2): ALWAYS runs first with min_s1_deadline = start_time + 0.92 * max_time_ms and inflight = 2
+    const auto min_s1_deadline = start_time +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double, std::milli>(0.92 * max_time_ms));
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        candidate_indices, 2, /*world_seed_offset=*/0,
+        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+        min_s1_deadline, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, /*max_inflight_worlds=*/2, /*resample_from_infostate=*/true,
+        second_actions, graft_actions);
+
+    const double elapsed_1a = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - s1_t0).count();
+    const int rem_w = r_stage1 - 2;
+
+    // Sub-wave 1B (rem_w = r_stage1 - 2): runs ONLY if rem_w > 0, 2 worlds completed in 1A, and elapsed_1a < 0.40 * max_time_ms
+    if (rem_w > 0 && !per_candidate_rollouts.empty() &&
+        per_candidate_rollouts[0].size() == 2 && elapsed_1a < 0.40 * max_time_ms) {
+      RunClockedPairedRolloutStage(
+          state, dune, search_player, evaluators, ordered_candidates,
+          candidate_indices, rem_w, /*world_seed_offset=*/2,
+          decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+          stage1_deadline, active_tree, per_candidate_rollouts,
+          new_rollouts_executed, s1_inflight, /*resample_from_infostate=*/true,
+          second_actions, graft_actions);
+    }
+  } else {
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        candidate_indices, r_stage1, /*world_seed_offset=*/0,
+        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+        stage1_deadline, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, s1_inflight, /*resample_from_infostate=*/true,
+        second_actions, graft_actions);
+  }
+
+  const auto s1_t1 = std::chrono::steady_clock::now();
+  const double stage1_elapsed_ms =
+      std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
+
+  const int r_stage1_done = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
+
+  if (r_stage1_done < 2) {
+    double raw_mean = 0.0;
+    if (r_stage1_done > 0) {
+      raw_mean = per_candidate_rollouts[0][0];
+    }
+    std::vector<std::pair<Action, double>> candidate_utilities;
+    candidate_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      double u_val = (r_stage1_done > 0) ? per_candidate_rollouts[c_idx][0] : 0.0;
+      candidate_utilities.push_back({ordered_candidates[c_idx], u_val});
+    }
+    std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
+    candidate_rollout_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
+    }
+
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean;
+    res.chosen_mean_utility = raw_mean;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = r_stage1;
+    res.stage1_kept_worlds = r_stage1_done;
+    res.stage2_planned_worlds = 0;
+    res.stage2_kept_worlds = 0;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = 0.0;
+    res.termination_reason = "stage1_starved";
+    return res;
+  }
+
+  double raw_mean_1 = 0.0;
+  for (int r = 0; r < r_stage1_done; ++r) {
+    raw_mean_1 += per_candidate_rollouts[0][r];
+  }
+  raw_mean_1 /= r_stage1_done;
+
+  std::vector<double> mean_1(K, 0.0);
+  std::vector<double> mean_d_1(K, 0.0);
+  mean_1[0] = raw_mean_1;
+  mean_d_1[0] = 0.0;
+
+  size_t best_c_idx = 1;
+  double highest_penalized_adv_1 = -1e9;
+
+  for (size_t c_idx = 1; c_idx < K; ++c_idx) {
+    double sum_u = 0.0;
+    for (int r = 0; r < r_stage1_done; ++r) {
+      sum_u += per_candidate_rollouts[c_idx][r];
+    }
+    mean_1[c_idx] = sum_u / r_stage1_done;
+    mean_d_1[c_idx] = mean_1[c_idx] - raw_mean_1;
+    const double penalized_adv_1 = mean_d_1[c_idx] - prior_penalty[c_idx];
+    if (penalized_adv_1 > highest_penalized_adv_1) {
+      highest_penalized_adv_1 = penalized_adv_1;
+      best_c_idx = c_idx;
+    }
+  }
+
+  // 2. Smart Stage-1 Early-Stop
+  const double best_challenger_adv_1 = mean_d_1[best_c_idx] - prior_penalty[best_c_idx];
+  const bool high_conf_skip =
+      (stage1_high_conf_prior_skip > 0.0 &&
+       !candidate_priors.empty() &&
+       candidate_priors[0] >= stage1_high_conf_prior_skip &&
+       best_challenger_adv_1 <= 0.05);
+  const bool blowout_skip = (r_stage1_done >= 12 && best_challenger_adv_1 < -0.20);
+  const bool tight_clock_skip =
+      (has_deadline && stage1_elapsed_ms >= 0.78 * max_time_ms && best_challenger_adv_1 <= 0.0);
+
+  if (high_conf_skip || blowout_skip || tight_clock_skip) {
+    std::vector<std::pair<Action, double>> candidate_utilities;
+    candidate_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      candidate_utilities.push_back({ordered_candidates[c_idx], mean_1[c_idx]});
+    }
+    std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
+    candidate_rollout_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
+    }
+
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean_1;
+    res.chosen_mean_utility = raw_mean_1;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = r_stage1;
+    res.stage1_kept_worlds = r_stage1_done;
+    res.stage2_planned_worlds = 0;
+    res.stage2_kept_worlds = 0;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = 0.0;
+    res.termination_reason = high_conf_skip ? "stage1_high_conf_skip" : "early_stop";
+    return res;
+  }
+
+  // 3. Adaptive Stage-2 Wave Ramp + High-Confidence Convergence Stop
+  const std::vector<size_t> stage2_cands = {0, best_c_idx};
+  int stage2_planned_worlds = 0;
+  int stage2_kept_worlds = 0;
+  const auto s2_t0 = std::chrono::steady_clock::now();
+
+  const double effective_margin = min_override_margin + prior_penalty[best_c_idx];
+
+  if (!has_deadline) {
+    int r_stage2 = std::max(16, (total_budget - static_cast<int>(K) * r_stage1_done) / 2);
+    stage2_planned_worlds = r_stage2;
+    int s2_inflight = std::min(r_stage2, std::min(max_inflight_worlds, 96));
+    RunClockedPairedRolloutStage(
+        state, dune, search_player, evaluators, ordered_candidates,
+        stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1_done,
+        decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+        final_deadline, active_tree, per_candidate_rollouts,
+        new_rollouts_executed, s2_inflight, /*resample_from_infostate=*/true,
+        second_actions, graft_actions);
+  } else {
+    int seed_offset = r_stage1_done;
+    double cur_ms_per_sim = (r_stage1_done > 0 && stage1_elapsed_ms > 0.0)
+        ? (stage1_elapsed_ms / static_cast<double>(K * r_stage1_done))
+        : est_ms_per_sim;
+    while (true) {
+      const double total_elapsed_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start_time).count();
+      const int s2_done_now = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+      if (s2_done_now >= 2 && total_elapsed_ms >= 0.935 * max_time_ms) {
+        break;
+      }
+      const double rem_ms = std::max(0.0, 0.985 * max_time_ms - total_elapsed_ms);
+      if (rem_ms <= 0.0) break;
+
+      int wave_worlds = 0;
+      if (s2_done_now == 0) {
+        int max_w0 = (rem_ms < 4000.0 ? 12 : 48);
+        wave_worlds = std::clamp(static_cast<int>((0.45 * rem_ms) / std::max(0.1, 2.0 * cur_ms_per_sim)), 2, max_w0);
+      } else {
+        wave_worlds = std::clamp(static_cast<int>(rem_ms / std::max(0.1, 2.0 * cur_ms_per_sim)), 2, 128);
+      }
+      int s2_inflight = std::min(wave_worlds, std::min(max_inflight_worlds, 96));
+
+      stage2_planned_worlds += wave_worlds;
+      const int before_size = static_cast<int>(per_candidate_rollouts[0].size());
+      const auto wt0 = std::chrono::steady_clock::now();
+      RunClockedPairedRolloutStage(
+          state, dune, search_player, evaluators, ordered_candidates,
+          stage2_cands, wave_worlds, /*world_seed_offset=*/seed_offset,
+          decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
+          final_deadline, active_tree, per_candidate_rollouts,
+          new_rollouts_executed, s2_inflight, /*resample_from_infostate=*/true,
+          second_actions, graft_actions);
+      const int wave_kept = static_cast<int>(per_candidate_rollouts[0].size()) - before_size;
+      const double wt_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - wt0).count();
+      seed_offset += wave_worlds;
+      if (wave_kept < wave_worlds || wave_kept <= 0) {
+        break;
+      }
+      if (wt_ms > 0.0) {
+        cur_ms_per_sim = 0.25 * cur_ms_per_sim +
+                         0.75 * (wt_ms / static_cast<double>(2 * wave_kept));
+      }
+
+      const int cur_s2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+      if (cur_s2_done >= 128) {
+        double sum_d_s2 = 0.0;
+        for (int r = 0; r < cur_s2_done; ++r) {
+          sum_d_s2 += (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
+                       per_candidate_rollouts[0][r_stage1_done + r]);
+        }
+        const double mean_d_s2 = sum_d_s2 / cur_s2_done;
+        double sq_diff_s2 = 0.0;
+        for (int r = 0; r < cur_s2_done; ++r) {
+          double diff = (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
+                         per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_s2;
+          sq_diff_s2 += diff * diff;
+        }
+        const double var_d_s2 = sq_diff_s2 / (cur_s2_done - 1);
+        const double se_d_s2 = std::sqrt(var_d_s2 / cur_s2_done);
+        if (se_d_s2 > 1e-9 &&
+            (mean_d_s2 < effective_margin - 3.5 * se_d_s2 ||
+             (mean_d_s2 > effective_margin + 3.5 * se_d_s2 && mean_d_s2 / se_d_s2 >= 2.5))) {
+          break;
+        }
+      }
+    }
+  }
+
+  const auto s2_t1 = std::chrono::steady_clock::now();
+  const double stage2_elapsed_ms =
+      std::chrono::duration<double, std::milli>(s2_t1 - s2_t0).count();
+
+  const int r_stage2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+  stage2_kept_worlds = r_stage2_done;
+
+  if (r_stage2_done < 2) {
+    const int R_tot = static_cast<int>(per_candidate_rollouts[0].size());
+    double raw_sum = 0.0;
+    for (int r = 0; r < R_tot; ++r) {
+      raw_sum += per_candidate_rollouts[0][r];
+    }
+    const double raw_mean_tot = (R_tot > 0) ? (raw_sum / R_tot) : 0.0;
+
+    std::vector<std::pair<Action, double>> candidate_utilities;
+    candidate_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      double u_val = 0.0;
+      if (c_idx == 0) {
+        u_val = raw_mean_tot;
+      } else if (c_idx == best_c_idx && !per_candidate_rollouts[best_c_idx].empty()) {
+        double b_sum = 0.0;
+        for (double v : per_candidate_rollouts[best_c_idx]) b_sum += v;
+        u_val = b_sum / per_candidate_rollouts[best_c_idx].size();
+      } else {
+        u_val = mean_1[c_idx];
+      }
+      candidate_utilities.push_back({ordered_candidates[c_idx], u_val});
+    }
+    std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
+    candidate_rollout_utilities.reserve(K);
+    for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+      candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
+    }
+
+    CompoundSearchDecisionResult res;
+    res.action = raw_action;
+    res.overridden = false;
+    res.raw_mean_utility = raw_mean_tot;
+    res.chosen_mean_utility = raw_mean_tot;
+    res.prior_rollouts_reused = prior_rollouts_reused;
+    res.new_rollouts_executed = new_rollouts_executed;
+    res.candidate_utilities = std::move(candidate_utilities);
+    res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+    res.stage1_planned_worlds = r_stage1;
+    res.stage1_kept_worlds = r_stage1_done;
+    res.stage2_planned_worlds = stage2_planned_worlds;
+    res.stage2_kept_worlds = stage2_kept_worlds;
+    res.stage1_elapsed_ms = stage1_elapsed_ms;
+    res.stage2_elapsed_ms = stage2_elapsed_ms;
+    res.termination_reason = "stage2_starved";
+    return res;
+  }
+
+  const int R_total = r_stage1_done + r_stage2_done;
+
+  // Stage 2 paired difference
+  double sum_d_stage2 = 0.0;
+  for (int r = 0; r < r_stage2_done; ++r) {
+    sum_d_stage2 += (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
+                     per_candidate_rollouts[0][r_stage1_done + r]);
+  }
+  const double mean_d_stage2 = sum_d_stage2 / r_stage2_done;
+
+  double sum_sq_diff_stage2 = 0.0;
+  for (int r = 0; r < r_stage2_done; ++r) {
+    double diff = (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
+                   per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_stage2;
+    sum_sq_diff_stage2 += diff * diff;
+  }
+  const double var_d_stage2 = (r_stage2_done > 1) ? (sum_sq_diff_stage2 / (r_stage2_done - 1)) : 0.0;
+  const double se_d_stage2 = (r_stage2_done > 1) ? std::sqrt(var_d_stage2 / r_stage2_done) : 0.0;
+  const double t_stat_stage2 = (r_stage2_done >= 2)
+      ? ((se_d_stage2 > 1e-9) ? (mean_d_stage2 / se_d_stage2) : (mean_d_stage2 > 0.0 ? 100.0 : 0.0))
+      : 0.0;
+
+  // Total statistics across all R_total rollouts
+  double sum_raw_total = 0.0;
+  double sum_best_total = 0.0;
+  for (int r = 0; r < R_total; ++r) {
+    sum_raw_total += per_candidate_rollouts[0][r];
+    sum_best_total += per_candidate_rollouts[best_c_idx][r];
+  }
+  const double raw_mean_total = sum_raw_total / R_total;
+  const double best_cand_mean_total = sum_best_total / R_total;
+  const double mean_d_total = best_cand_mean_total - raw_mean_total;
+
+  double sum_sq_diff_total = 0.0;
+  for (int r = 0; r < R_total; ++r) {
+    double diff = (per_candidate_rollouts[best_c_idx][r] - per_candidate_rollouts[0][r]) - mean_d_total;
+    sum_sq_diff_total += diff * diff;
+  }
+  const double var_d_total = (R_total > 1) ? (sum_sq_diff_total / (R_total - 1)) : 0.0;
+  const double se_d_total = (R_total > 1) ? std::sqrt(var_d_total / R_total) : 0.0;
+  const double t_stat_total = (R_total >= 2)
+      ? ((se_d_total > 1e-9) ? (mean_d_total / se_d_total) : (mean_d_total > 0.0 ? 100.0 : 0.0))
+      : 0.0;
+
+  // 4. Unbiased Stage-2 Override Gate
+  bool should_override = false;
+  if (r_stage2_done >= 16) {
+    should_override = (mean_d_stage2 >= effective_margin &&
+                       t_stat_stage2 >= 1.50 &&
+                       mean_d_total >= 0.75 * effective_margin);
+  } else {
+    should_override = (mean_d_stage2 > 0.0 &&
+                       mean_d_total >= effective_margin &&
+                       t_stat_total >= 1.50);
+  }
+
+  Action best_action = raw_action;
+  double best_mean_u = raw_mean_total;
+  bool overridden = false;
+  if (should_override) {
+    best_action = ordered_candidates[best_c_idx];
+    best_mean_u = best_cand_mean_total;
+    overridden = true;
+    if (chosen_candidate_index != nullptr) {
+      *chosen_candidate_index = static_cast<int>(best_c_idx);
+    }
+  }
+
+  std::vector<std::pair<Action, double>> candidate_utilities;
+  candidate_utilities.reserve(K);
+  for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+    double u_val = 0.0;
+    if (c_idx == 0) {
+      u_val = raw_mean_total;
+    } else if (c_idx == best_c_idx) {
+      u_val = best_cand_mean_total;
+    } else {
+      u_val = mean_1[c_idx];
+    }
+    candidate_utilities.push_back({ordered_candidates[c_idx], u_val});
+  }
+
+  std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
+  candidate_rollout_utilities.reserve(K);
+  for (size_t c_idx = 0; c_idx < K; ++c_idx) {
+    candidate_rollout_utilities.push_back({ordered_candidates[c_idx], per_candidate_rollouts[c_idx]});
+  }
+
+  CompoundSearchDecisionResult res;
+  res.action = best_action;
+  res.overridden = overridden;
+  res.raw_mean_utility = raw_mean_total;
+  res.chosen_mean_utility = best_mean_u;
+  res.prior_rollouts_reused = prior_rollouts_reused;
+  res.new_rollouts_executed = new_rollouts_executed;
+  res.candidate_utilities = std::move(candidate_utilities);
+  res.candidate_rollout_utilities = std::move(candidate_rollout_utilities);
+  res.stage1_planned_worlds = r_stage1;
+  res.stage1_kept_worlds = r_stage1_done;
+  res.stage2_planned_worlds = stage2_planned_worlds;
+  res.stage2_kept_worlds = stage2_kept_worlds;
+  res.stage1_elapsed_ms = stage1_elapsed_ms;
+  res.stage2_elapsed_ms = stage2_elapsed_ms;
+  res.termination_reason = overridden ? "override" : "stage2_no_override";
+  res.mean_d_stage2 = mean_d_stage2;
+  res.se_d_stage2 = se_d_stage2;
+  return res;
+}
+
+inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
+    const State& state,
+    Player search_player,
+    TurnSearchTree* turn_tree,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    int reference_rollouts_per_action,
+    double min_override_margin,
+    uint64_t decision_seed,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
+    double max_time_ms = -1.0,
+    int fixed_top_k = 0,
+    int max_inflight_worlds = 32,
+    double prior_log_ratio_weight = 0.02,
+    double stage1_high_conf_prior_skip = 0.95,
+    const ActionsAndProbs* precomputed_raw_prior = nullptr,
+    double est_ms_per_sim = 20.0,
+    const std::vector<Action>* second_actions = nullptr,
+    int* chosen_candidate_index = nullptr) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
+  const auto legal = state.LegalActions();
+  if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
+  if (legal.size() == 1) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
+  if (evaluators.empty()) return {legal.front(), false, 0.0, 0.0, 0, 0, {}, {}};
+
+  const ActionsAndProbs raw_prior =
+      (precomputed_raw_prior != nullptr && !precomputed_raw_prior->empty())
+          ? *precomputed_raw_prior
+          : evaluators.front()->Prior(state);
+
+  auto [ordered_candidates, candidate_priors] =
+      SelectOrderedCandidatesAndPriors(raw_prior, legal, fixed_top_k);
+
+  return SearchV2SuccessiveHalvingDecision(
+      state, search_player, turn_tree, evaluators, ordered_candidates,
+      candidate_priors, reference_rollouts_per_action, min_override_margin,
+      decision_seed, crn_mode, max_time_ms, max_inflight_worlds,
+      prior_log_ratio_weight, stage1_high_conf_prior_skip, second_actions,
+      /*graft_actions=*/nullptr, est_ms_per_sim, chosen_candidate_index);
+}
+
+inline JointSearchV2Result SearchV2JointPlacementDecision(
+    const State& state,
+    Player search_player,
+    TurnSearchTree* turn_tree,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
+    int reference_rollouts_per_action,
+    double min_override_margin,
+    uint64_t decision_seed,
+    SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential,
+    double max_time_ms = -1.0,
+    int max_inflight_worlds = 32,
+    double prior_log_ratio_weight = 0.02,
+    double stage1_high_conf_prior_skip = 0.95,
+    const ActionsAndProbs* precomputed_raw_prior = nullptr,
+    double est_ms_per_sim = 20.0,
+    size_t max_candidates = 8) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
+  const auto legal = state.LegalActions();
+  if (legal.empty()) {
+    JointSearchV2Result res;
+    res.base = {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
+    return res;
+  }
+  const ActionsAndProbs raw_prior =
+      (precomputed_raw_prior != nullptr && !precomputed_raw_prior->empty())
+          ? *precomputed_raw_prior
+          : (evaluators.empty() ? ActionsAndProbs{} : evaluators.front()->Prior(state));
+
+  std::vector<JointAgentCandidate> joint_cands = EnumerateJointAgentCandidates(
+      state, search_player, evaluators, raw_prior, max_candidates);
+
+  if (joint_cands.empty()) {
+    Action raw_a = PickGreedyAction(raw_prior, legal);
+    JointSearchV2Result res;
+    res.base = {raw_a, false, 0.0, 0.0, 0, 0, {}, {}};
+    res.chosen_first_action = raw_a;
+    res.chosen_graft_action = kInvalidAction;
+    res.chosen_second_action = kInvalidAction;
+    res.raw_first_action = raw_a;
+    res.raw_graft_action = kInvalidAction;
+    res.raw_second_action = kInvalidAction;
+    return res;
+  }
+
+  std::vector<Action> ordered_cands;
+  std::vector<Action> graft_actions;
+  std::vector<Action> second_actions;
+  std::vector<double> cand_priors;
+  ordered_cands.reserve(joint_cands.size());
+  graft_actions.reserve(joint_cands.size());
+  second_actions.reserve(joint_cands.size());
+  cand_priors.reserve(joint_cands.size());
+
+  for (const auto& jc : joint_cands) {
+    ordered_cands.push_back(jc.first_action);
+    graft_actions.push_back(jc.graft_action);
+    second_actions.push_back(jc.second_action);
+    cand_priors.push_back(jc.joint_prior);
+  }
+
+  int chosen_c_idx = 0;
+  CompoundSearchDecisionResult base_res = SearchV2SuccessiveHalvingDecision(
+      state, search_player, turn_tree, evaluators, ordered_cands, cand_priors,
+      reference_rollouts_per_action, min_override_margin, decision_seed,
+      crn_mode, max_time_ms, max_inflight_worlds, prior_log_ratio_weight,
+      stage1_high_conf_prior_skip, &second_actions, &graft_actions, est_ms_per_sim,
+      &chosen_c_idx);
+
+  JointSearchV2Result res;
+  res.base = base_res;
+  res.raw_first_action = joint_cands[0].first_action;
+  res.raw_graft_action = joint_cands[0].graft_action;
+  res.raw_second_action = joint_cands[0].second_action;
+  if (chosen_c_idx >= 0 && chosen_c_idx < static_cast<int>(joint_cands.size())) {
+    res.chosen_first_action = joint_cands[chosen_c_idx].first_action;
+    res.chosen_graft_action = joint_cands[chosen_c_idx].graft_action;
+    res.chosen_second_action = joint_cands[chosen_c_idx].second_action;
+  } else {
+    res.chosen_first_action = base_res.action;
+    res.chosen_graft_action = kInvalidAction;
+    res.chosen_second_action = kInvalidAction;
+  }
+  res.joint_candidates = std::move(joint_cands);
   return res;
 }
 
