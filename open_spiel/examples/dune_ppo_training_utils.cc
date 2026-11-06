@@ -2937,12 +2937,21 @@ PpoUpdateStats TrainPpoUpdate(
                           !::absl::GetFlag(::FLAGS_search_aux_decoupled);
   stats.aux_search_loss_coef = search_loss_coef;
   std::vector<size_t> purchase_param_indices;
+  std::vector<size_t> action_head_param_indices;
   {
+    const bool is_v5 = model->with_semantic_scorer_ && model->semantic_scorer_ &&
+                       model->semantic_scorer_->enable_v5_;
+    const std::string purchase_target = is_v5 ? "semantic_scorer.v5_" : "out_layer";
     auto named = model->named_parameters();
     for (size_t pi = 0; pi < named.size(); ++pi) {
       const std::string& nm = named[pi].key();
-      if (nm.find("out_layer") != std::string::npos) {
+      if (nm.find(purchase_target) != std::string::npos) {
         purchase_param_indices.push_back(pi);
+      }
+      if (nm.find("semantic_scorer.v5_") != std::string::npos ||
+          nm.find("out_layer") != std::string::npos ||
+          nm.find("policy_head") != std::string::npos) {
+        action_head_param_indices.push_back(pi);
       }
     }
   }
@@ -2950,6 +2959,7 @@ PpoUpdateStats TrainPpoUpdate(
       aux_active ? static_cast<int64_t>(search_examples.size()) : 0;
   torch::Tensor aux_states, aux_masks, aux_targets, aux_values;
   std::vector<const dune_semantic::CandidateActionData*> all_aux_cands;
+  std::vector<std::pair<Action, Action>> all_aux_mpo_pairs;
   std::vector<int64_t> aux_slice_start, aux_slice_len;  // by minibatch index/epoch
   double aux_ce_sum = 0.0, aux_vmse_sum = 0.0;
   int64_t aux_slice_uses = 0;                 // (epoch,minibatch) slices actually run
@@ -2988,6 +2998,10 @@ PpoUpdateStats TrainPpoUpdate(
       vp[i] = static_cast<float>(ex.value_target);
     }
     all_aux_cands.assign(aux_n, nullptr);
+    all_aux_mpo_pairs.resize(aux_n, {kInvalidAction, kInvalidAction});
+    for (int64_t i = 0; i < aux_n; ++i) {
+      all_aux_mpo_pairs[i] = {search_examples[i].best_action, search_examples[i].raw_action};
+    }
     if (model->with_semantic_scorer_) {
       for (int64_t i = 0; i < aux_n; ++i) {
         if (search_examples[i].candidate_data.empty()) {
@@ -3582,6 +3596,119 @@ PpoUpdateStats TrainPpoUpdate(
     phase_timer.End(kPhaseOptimizerStep);
   };
 
+  auto record_t1_slice_delta_log_odds = [&](
+      const torch::Tensor& slice_states,
+      const torch::Tensor& slice_masks,
+      const torch::Tensor& slice_masks_cpu,
+      const torch::Tensor& slice_targets_cpu,
+      const torch::Tensor& slice_logp_before_cpu,
+      const std::vector<const dune_semantic::CandidateActionData*>& slice_cands,
+      const std::vector<std::pair<Action, Action>>& slice_pairs) {
+    if (!slice_states.defined() || !slice_logp_before_cpu.defined() || slice_states.size(0) == 0) {
+      return;
+    }
+    torch::Tensor alogp_after;
+    {
+      torch::NoGradGuard no_grad;
+      auto compute_after = [&]() {
+        auto ao_after = model->forward(slice_states);
+        if (model->with_semantic_scorer_ && model->semantic_scorer_) {
+          dune_semantic::ApplySemanticScorerBatch(
+              model->semantic_scorer_, ao_after.trunk, slice_cands,
+              ao_after.logits, device);
+        }
+        torch::Tensor alogits_after =
+            CenterAndCapLogitsTensor(ao_after.logits, slice_masks, logit_cap);
+        torch::Tensor amasked_after =
+            alogits_after.masked_fill(slice_masks.logical_not(), -1e9f);
+        alogp_after = torch::log_softmax(amasked_after, -1);
+      };
+      if (device.is_cuda() && ::absl::GetFlag(::FLAGS_train_amp)) {
+        AutocastGuard autocast_guard(c10::DeviceType::CUDA, true);
+        compute_after();
+      } else {
+        compute_after();
+      }
+    }
+    torch::Tensor alogp_after_cpu = alogp_after.detach().to(torch::kFloat32).cpu();
+    const int64_t n_rows = slice_states.size(0);
+    const int64_t act_dim = slice_logp_before_cpu.size(1);
+    for (int64_t r = 0; r < n_rows; ++r) {
+      const float* targets_row = slice_targets_cpu[r].data_ptr<float>();
+      const float* logp_before_row = slice_logp_before_cpu[r].data_ptr<float>();
+      const float* logp_after_row = alogp_after_cpu[r].data_ptr<float>();
+      const bool* masks_row = slice_masks_cpu[r].data_ptr<bool>();
+
+      int64_t a_star = -1;
+      int64_t a_ref = -1;
+
+      if (r < static_cast<int64_t>(slice_pairs.size())) {
+        Action p_star = slice_pairs[r].first;
+        Action p_ref = slice_pairs[r].second;
+        if (p_star >= 0 && p_star < act_dim &&
+            p_ref >= 0 && p_ref < act_dim &&
+            p_star != p_ref &&
+            masks_row[p_star] && masks_row[p_ref]) {
+          a_star = p_star;
+          a_ref = p_ref;
+        }
+      }
+
+      if (a_star < 0 || a_ref < 0) {
+        float best_target = -1e9f;
+        int64_t a_second_target = -1;
+        float second_best_target = -1e9f;
+        int64_t a_prev_top = -1;
+        float best_logp_before = -1e9f;
+        int64_t a_second_prev = -1;
+        float second_best_logp_before = -1e9f;
+
+        for (int64_t c = 0; c < act_dim; ++c) {
+          if (!masks_row[c]) continue;
+          float tgt = targets_row[c];
+          if (tgt > best_target) {
+            second_best_target = best_target;
+            a_second_target = a_star;
+            best_target = tgt;
+            a_star = c;
+          } else if (tgt > second_best_target) {
+            second_best_target = tgt;
+            a_second_target = c;
+          }
+          float lp_b = logp_before_row[c];
+          if (lp_b > best_logp_before) {
+            second_best_logp_before = best_logp_before;
+            a_second_prev = a_prev_top;
+            best_logp_before = lp_b;
+            a_prev_top = c;
+          } else if (lp_b > second_best_logp_before) {
+            second_best_logp_before = lp_b;
+            a_second_prev = c;
+          }
+        }
+
+        if (a_star < 0 || best_target <= 0.0f) continue;
+        a_ref = -1;
+        if (a_star != a_prev_top && a_prev_top >= 0) {
+          a_ref = a_prev_top;
+        } else if (a_second_target >= 0 && second_best_target > 0.0f) {
+          a_ref = a_second_target;
+        } else if (a_second_prev >= 0) {
+          a_ref = a_second_prev;
+        }
+      }
+
+      if (a_ref >= 0 && a_star >= 0 && a_ref != a_star) {
+        double delta_after = static_cast<double>(
+            logp_after_row[a_star] - logp_after_row[a_ref]);
+        double delta_before = static_cast<double>(
+            logp_before_row[a_star] - logp_before_row[a_ref]);
+        stats.aux_t1_delta_log_odds_sum += (delta_after - delta_before);
+        stats.aux_t1_measured_rows++;
+      }
+    }
+  };
+
   for (int epoch = 0; epoch < update_epochs; ++epoch) {
     uint64_t perm_seed = dune_seed::DeriveSeed(master, dune_seed::kDomainTrain, global_update, epoch, dune_seed::kStreamPPOPermutation);
     at::Generator gen = dune_seed::MakeTorchCPUGenerator(perm_seed);
@@ -3746,6 +3873,13 @@ PpoUpdateStats TrainPpoUpdate(
 
       std::vector<torch::Tensor> aux_grad_snapshot;
       bool this_mb_has_aux = false;
+      torch::Tensor t1_diag_alogp_before;
+      torch::Tensor t1_diag_a_states;
+      torch::Tensor t1_diag_a_masks;
+      torch::Tensor t1_diag_a_masks_cpu;
+      torch::Tensor t1_diag_a_targets;
+      std::vector<const dune_semantic::CandidateActionData*> t1_diag_a_cands;
+      std::vector<std::pair<Action, Action>> t1_diag_a_pairs;
       double this_aux_norm = 0.0;
       if (aux_active) {
         torch::Tensor a_states, a_masks, a_targets, a_values;
@@ -3794,13 +3928,19 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor amasked =
                 alogits.masked_fill(a_masks.logical_not(), -1e9f);
             torch::Tensor alogp = torch::log_softmax(amasked, -1);
+            if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty()) {
+              t1_diag_alogp_before = alogp.detach().to(torch::kFloat32).cpu();
+            }
             // Legal-action cross-entropy: targets are 0 at illegal actions, so
             // 0 * (finite masked logprob) = 0 there (no NaN).
             if (r755_hybrid) {
               torch::Tensor ce_per_row = -(a_targets * alogp).sum(-1);
               ce_val = ce_per_row.mean().item<double>();
               vmse_val = 0.0;
-              scaled_aux = static_cast<float>(search_loss_coef / std::max<double>(1.0, static_cast<double>(mb_len))) * ce_per_row.sum();
+              scaled_aux = ComputeHybridAuxSumScale(
+                  search_loss_coef, a_states.size(0), mb_len,
+                  ::absl::GetFlag(::FLAGS_r765_aux_norm_mode),
+                  ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef)) * ce_per_row.sum();
             } else {
               torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
               torch::Tensor av = ao.values.squeeze(1);
@@ -3820,6 +3960,22 @@ PpoUpdateStats TrainPpoUpdate(
             compute_aux();
           }
           scaled_aux.backward();
+          if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty()) {
+            t1_diag_a_states = a_states;
+            t1_diag_a_masks = a_masks;
+            t1_diag_a_masks_cpu = a_masks.detach().to(torch::kCPU);
+            t1_diag_a_targets = a_targets.detach().to(torch::kFloat32).cpu();
+            t1_diag_a_cands = a_cands;
+            if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
+              t1_diag_a_pairs = all_aux_mpo_pairs;
+            } else {
+              t1_diag_a_pairs.clear();
+              t1_diag_a_pairs.reserve(al);
+              for (int64_t k = 0; k < al; ++k) {
+                t1_diag_a_pairs.push_back(all_aux_mpo_pairs[as + k]);
+              }
+            }
+          }
           // Snapshot aux-only grads (clone) and their flattened 2-norm.
           if (!r755_hybrid || abort_grad_norm_ratio > 0.0 || !purchase_param_indices.empty()) {
             auto params = model->parameters();
@@ -4169,6 +4325,30 @@ PpoUpdateStats TrainPpoUpdate(
         }
       }
 
+      if (this_mb_has_aux && !action_head_param_indices.empty()) {
+        auto params = model->parameters();
+        double dot_prod = 0.0;
+        double aux_sq = 0.0;
+        double ppo_sq = 0.0;
+        for (size_t pi : action_head_param_indices) {
+          if (pi >= params.size()) continue;
+          auto tot = params[pi].grad();
+          if (!tot.defined()) continue;
+          torch::Tensor g_aux = (pi < aux_grad_snapshot.size() && aux_grad_snapshot[pi].defined())
+              ? aux_grad_snapshot[pi]
+              : torch::zeros_like(tot);
+          torch::Tensor g_ppo = tot - g_aux;
+          dot_prod += (g_aux * g_ppo).sum().to(torch::kFloat64).item<double>();
+          aux_sq += (g_aux * g_aux).sum().to(torch::kFloat64).item<double>();
+          ppo_sq += (g_ppo * g_ppo).sum().to(torch::kFloat64).item<double>();
+        }
+        if (aux_sq > 1e-12 && ppo_sq > 1e-12) {
+          double cosine_sim = dot_prod / (std::sqrt(aux_sq) * std::sqrt(ppo_sq));
+          stats.action_head_grad_cosine_sum += cosine_sim;
+          stats.action_head_grad_cosine_count++;
+        }
+      }
+
       // WO-1 Phase 5: per-module pre-clip gradient norms. MUST be measured here,
       // before clip_grad_norm_ rescales the gradients in place. Grouped by
       // parameter-name prefix; the `value_head` test uses find() rather than a
@@ -4457,6 +4637,15 @@ PpoUpdateStats TrainPpoUpdate(
 
       execute_optimizer_step();
 
+      if (r755_hybrid && this_mb_has_aux &&
+          !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty() &&
+          t1_diag_alogp_before.defined() && t1_diag_a_states.defined()) {
+        record_t1_slice_delta_log_odds(
+            t1_diag_a_states, t1_diag_a_masks, t1_diag_a_masks_cpu,
+            t1_diag_a_targets, t1_diag_alogp_before, t1_diag_a_cands,
+            t1_diag_a_pairs);
+      }
+
       if (::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
         double grad_norm = total_norm_t.item<double>();
         if (std::isnan(grad_norm) || std::isinf(grad_norm)) {
@@ -4593,6 +4782,19 @@ PpoUpdateStats TrainPpoUpdate(
               /*out_old_values=*/nullptr, &mb_num_nontrivial);
         }
 
+        torch::Tensor f_logp_before_cpu;
+        torch::Tensor f_masks_cpu;
+        torch::Tensor f_targets_cpu;
+        std::vector<std::pair<Action, Action>> f_pairs;
+        if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty()) {
+          f_masks_cpu = a_masks.detach().to(torch::kCPU);
+          f_targets_cpu = a_targets.detach().to(torch::kFloat32).cpu();
+          f_pairs.reserve(this_chunk_len);
+          for (int64_t k = 0; k < this_chunk_len; ++k) {
+            f_pairs.push_back(all_aux_mpo_pairs[unvisited_indices[offset + k]]);
+          }
+        }
+
         optimizer.zero_grad();
 
         torch::Tensor scaled_aux;
@@ -4608,14 +4810,18 @@ PpoUpdateStats TrainPpoUpdate(
           torch::Tensor amasked =
               alogits.masked_fill(a_masks.logical_not(), -1e9f);
           torch::Tensor alogp = torch::log_softmax(amasked, -1);
+          if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty()) {
+            f_logp_before_cpu = alogp.detach().to(torch::kFloat32).cpu();
+          }
           if (r755_hybrid) {
             torch::Tensor ce_per_row = -(a_targets * alogp).sum(-1);
             ce_val = ce_per_row.mean().item<double>();
             vmse_val = 0.0;
-            const double denom = std::max<double>(
-                1.0, static_cast<double>(anchor_len > 0 ? anchor_len : minibatch_size));
-            scaled_aux =
-                static_cast<float>(search_loss_coef / denom) * ce_per_row.sum();
+            scaled_aux = ComputeHybridAuxSumScale(
+                search_loss_coef, a_states.size(0),
+                anchor_len > 0 ? anchor_len : minibatch_size,
+                ::absl::GetFlag(::FLAGS_r765_aux_norm_mode),
+                ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef)) * ce_per_row.sum();
           } else {
             torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
             torch::Tensor av = ao.values.squeeze(1);
@@ -4737,6 +4943,13 @@ PpoUpdateStats TrainPpoUpdate(
 
         execute_optimizer_step();
 
+        if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty() &&
+            f_logp_before_cpu.defined()) {
+          record_t1_slice_delta_log_odds(
+              a_states, a_masks, f_masks_cpu, f_targets_cpu,
+              f_logp_before_cpu, a_cands, f_pairs);
+        }
+
         for (int64_t k = 0; k < this_chunk_len; ++k) {
           aux_visited_mask[unvisited_indices[offset + k]] = 1;
         }
@@ -4818,6 +5031,9 @@ PpoUpdateStats TrainPpoUpdate(
     stats.purchase_grad_cosine =
         stats.purchase_grad_cosine_sum / static_cast<double>(stats.purchase_grad_cosine_count);
   }
+  stats.action_head_grad_cosine = stats.action_head_grad_cosine_count > 0
+      ? stats.action_head_grad_cosine_sum / static_cast<double>(stats.action_head_grad_cosine_count)
+      : 0.0;
 
   // --- PWO-5 section 16 gate 3 item 6: per-head loss, per-head denominator,
   // and the REALIZED exposure. Emitted per update so a silent denominator

@@ -232,4 +232,27 @@ ABSL_FLAG(bool, r755_finish_unvisited_aux_on_kl_stop, false,
           "examples are visited, run a finish pass over unvisited auxiliary "
           "examples paired with EMA magnet anchor transitions.");
 
+// R7-65 joint agent search & absorption flags.
+ABSL_FLAG(std::string, r765_aux_norm_mode, "sum_over_mb",
+          "Auxiliary hybrid loss scaling mode: 'sum_over_mb' (default) or 'per_row_capped'.");
+ABSL_FLAG(double, r765_aux_max_slice_coef, 0.24,
+          "Maximum total slice weight cap when r765_aux_norm_mode='per_row_capped'.");
+ABSL_FLAG(bool, r765_joint_agent_search, false,
+          "When true in r755_hybrid_mode, use SearchV2JointPlacementDecision with Stage-2-confirmed follow-up targets on Cat 1 agent root turns.");
+ABSL_FLAG(double, r765_agent_search_prob, -1.0,
+          "Per-turn search probability for Cat 1 agent turns when >= 0.0 (overrides r755_search_prob on Cat 1).");
+ABSL_FLAG(double, r765_agent_max_raw_prior, -1.0,
+          "When >= 0.0, max raw prior gate for Cat 1 and Cat 2 agent-turn search (e.g. 0.95), keeping Cat 3 on r755_max_raw_prior.");
+ABSL_FLAG(bool, r765_seq_v1_agent_search, false,
+          "When true in r755_hybrid_mode, run unclocked Search v1 SuccessiveHalvingRolloutSearchDecision (top_k=5) sequentially on Cat 1 and Cat 2 agent-turn decisions.");
+ABSL_FLAG(int, r765_agent_ref_rollouts, 192,
+          "Unclocked reference_rollouts_per_action (total_budget = 3 * ref_rollouts) for r765 joint agent search.");
+ABSL_FLAG(double, r765_mpo_temperature, 0.15,
+          "Base temperature tau for pairwise MPO targets on tactical overrides.");
+ABSL_FLAG(double, r765_mpo_max_kl, 0.05,
+          "Max KL cap for pairwise MPO targets on tactical overrides.");
+ABSL_FLAG(std::string, r765_absorption_diag_jsonl, "",
+          "If non-empty, write per-update T0/T1/T2/T3 passive preference & MPO constraint diagnostics JSONL.");
+
+
 

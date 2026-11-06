@@ -70,6 +70,7 @@
 #include <torch/torch.h>
 #include "dune_network.h"
 #include "dune_semantic_action_scorer.h"
+#include "dune_compound_turn_search.h"
 #include "open_spiel/abseil-cpp/absl/flags/declare.h"
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "dune_ppo_training_flags.h"
@@ -13045,6 +13046,295 @@ int main() {
     V5LegacySlotResidualState v5_unannealed;
     v5_unannealed.Initialize(model, /*anneal_updates=*/0);
     UTILS_CHECK(!v5_unannealed.active);
+  } TEST_END();
+
+  TEST_BEGIN("MakeOptimizerV5GroupingAndMigrationTest") {
+    const int64_t obs_size = 128;
+    const int64_t hidden_dim = 2048;
+    const int64_t action_dim = open_spiel::dune_imperium::kNumDistinctPlayerActions;
+    const int num_blocks = 16;
+
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        obs_size, hidden_dim, action_dim, num_blocks,
+        /*use_nonlinear_value_head=*/false, /*has_aux_heads=*/false,
+        /*head_init_seed=*/0ULL,
+        /*with_semantic_scorer=*/true, /*enable_zone_encoder=*/false,
+        dune_semantic::kDescriptorSchemaVersionV5);
+
+    auto opt = MakeDuneOptimizer(
+        model, /*lr=*/5e-6, /*weight_decay=*/1e-4, /*policy_weight_decay=*/1e-5,
+        /*new_block_lr=*/5e-5, /*new_block_first_idx=*/8);
+
+    UTILS_CHECK(opt->param_groups().size() == 3);
+    UTILS_CHECK(opt->param_groups()[0].params().size() == 2);
+    UTILS_CHECK(opt->param_groups()[1].params().size() == 86);
+    UTILS_CHECK(opt->param_groups()[2].params().size() == 69);
+
+    const auto& opt0 = static_cast<const torch::optim::AdamWOptions&>(opt->param_groups()[0].options());
+    const auto& opt1 = static_cast<const torch::optim::AdamWOptions&>(opt->param_groups()[1].options());
+    const auto& opt_opts2 = static_cast<const torch::optim::AdamWOptions&>(opt->param_groups()[2].options());
+
+    UTILS_CHECK(opt0.lr() == 5e-6);
+    UTILS_CHECK(opt0.weight_decay() == 1e-5);
+    UTILS_CHECK(opt1.lr() == 5e-6);
+    UTILS_CHECK(opt1.weight_decay() == 1e-4);
+    UTILS_CHECK(opt_opts2.lr() == 5e-5);
+    UTILS_CHECK(opt_opts2.weight_decay() == 0.0);
+
+    // Construct synthetic legacy (2, 91, 64) AdamW
+    std::vector<torch::Tensor> v5_params;
+    if (model->semantic_scorer_->v5_item_emb) {
+      for (auto& p : model->semantic_scorer_->v5_item_emb->parameters()) v5_params.push_back(p);
+    }
+    if (model->semantic_scorer_->v5_card_adapter) {
+      for (auto& p : model->semantic_scorer_->v5_card_adapter->parameters()) v5_params.push_back(p);
+    }
+    if (model->semantic_scorer_->v5_ctx_proj) {
+      for (auto& p : model->semantic_scorer_->v5_ctx_proj->parameters()) v5_params.push_back(p);
+    }
+    if (model->semantic_scorer_->v5_query_proj) {
+      for (auto& p : model->semantic_scorer_->v5_query_proj->parameters()) v5_params.push_back(p);
+    }
+    UTILS_CHECK(v5_params.size() == 5);
+
+    std::vector<torch::Tensor> src_g0 = opt->param_groups()[0].params();
+    std::vector<torch::Tensor> src_g1 = opt->param_groups()[1].params();
+    for (const auto& p : v5_params) src_g1.push_back(p);
+    std::vector<torch::Tensor> src_g2;
+    for (size_t i = 0; i < 64; ++i) {
+      src_g2.push_back(opt->param_groups()[2].params()[i]);
+    }
+    UTILS_CHECK(src_g0.size() == 2);
+    UTILS_CHECK(src_g1.size() == 91);
+    UTILS_CHECK(src_g2.size() == 64);
+
+    std::vector<torch::optim::OptimizerParamGroup> leg_groups;
+    leg_groups.emplace_back(src_g0);
+    leg_groups.emplace_back(src_g1);
+    leg_groups.emplace_back(src_g2);
+    torch::optim::AdamW legacy_opt(leg_groups, torch::optim::AdamWOptions(5e-6));
+
+    for (int step = 0; step < 2; ++step) {
+      legacy_opt.zero_grad();
+      torch::Tensor loss = torch::tensor(0.0f);
+      for (auto& p : model->parameters()) {
+        loss = loss + (p * (0.01f * (step + 1))).sum();
+      }
+      loss.backward();
+      legacy_opt.step();
+    }
+
+    struct SavedAdamState {
+      int64_t step;
+      torch::Tensor exp_avg;
+      torch::Tensor exp_avg_sq;
+    };
+    std::unordered_map<void*, SavedAdamState> orig_states;
+    for (const auto& kv : legacy_opt.state()) {
+      auto* adam_state = dynamic_cast<torch::optim::AdamWParamState*>(kv.second.get());
+      UTILS_CHECK(adam_state != nullptr);
+      orig_states[kv.first] = {adam_state->step(), adam_state->exp_avg().clone(), adam_state->exp_avg_sq().clone()};
+    }
+    UTILS_CHECK(orig_states.size() == 157);
+
+    std::string tmp_opt_path = (std::filesystem::temp_directory_path() / "test_v5_migrating_opt.pt").string();
+    torch::save(legacy_opt, tmp_opt_path);
+
+    auto opt2 = MakeDuneOptimizer(
+        model, /*lr=*/5e-6, /*weight_decay=*/1e-4, /*policy_weight_decay=*/1e-5,
+        /*new_block_lr=*/5e-5, /*new_block_first_idx=*/8);
+
+    UTILS_CHECK(LoadOptimizerCheckpointMigrating(model, *opt2, tmp_opt_path, torch::kCPU));
+    UTILS_CHECK(opt2->state().size() == 157);
+
+    for (const auto& p : model->parameters()) {
+      void* key = p.unsafeGetTensorImpl();
+      UTILS_CHECK(opt2->state().find(key) != opt2->state().end());
+      auto* s2 = dynamic_cast<torch::optim::AdamWParamState*>(opt2->state().at(key).get());
+      UTILS_CHECK(s2 != nullptr);
+      const auto& orig = orig_states.at(key);
+      UTILS_CHECK(s2->step() == 2);
+      const float ea_diff = (s2->exp_avg() - orig.exp_avg).abs().max().item().toFloat();
+      const float easq_diff = (s2->exp_avg_sq() - orig.exp_avg_sq).abs().max().item().toFloat();
+      UTILS_CHECK(ea_diff == 0.0f);
+      UTILS_CHECK(easq_diff == 0.0f);
+    }
+    std::filesystem::remove(tmp_opt_path);
+
+    // Also run a tiny CPU TrainPpoUpdate with scope guard restoring flags
+    bool prev_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+    int prev_mb = absl::GetFlag(FLAGS_ppo_minibatch_size);
+    int prev_epochs = absl::GetFlag(FLAGS_ppo_update_epochs);
+
+    struct FlagsRestorer {
+      bool hybrid;
+      int mb;
+      int epochs;
+      ~FlagsRestorer() {
+        absl::SetFlag(&FLAGS_r755_hybrid_mode, hybrid);
+        absl::SetFlag(&FLAGS_ppo_minibatch_size, mb);
+        absl::SetFlag(&FLAGS_ppo_update_epochs, epochs);
+      }
+    } flags_restorer{prev_hybrid, prev_mb, prev_epochs};
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+
+    const std::vector<Action> test_legals = {
+        dune_imperium::kActionBuyImperiumRow0,
+        dune_imperium::kActionBuyImperiumRow0 + 1};
+    dune_semantic::CandidateActionData test_v5_cand;
+    test_v5_cand.actions = test_legals;
+    test_v5_cand.features.assign(2 * dune_semantic::kSemanticFeatDim, 0.1f);
+    test_v5_cand.card_ids = {5, 6};
+    test_v5_cand.space_ids = {0, 0};
+    test_v5_cand.supported = {1, 1};
+    test_v5_cand.roles = {dune_semantic::ActionRole::kMarketPurchase, dune_semantic::ActionRole::kMarketPurchase};
+    test_v5_cand.v5_families = {0, 0};
+    test_v5_cand.v5_item_ids = {5, 6};
+    test_v5_cand.v5_ctx_features.assign(2 * dune_semantic::kV5CtxDim, 0.1f);
+
+    std::vector<PpoTransition> batch(2);
+    for (int i = 0; i < 2; ++i) {
+      batch[i].state = std::vector<float>(obs_size, 0.1f * (i + 1));
+      batch[i].legal_actions = test_legals;
+      batch[i].action = test_legals[0];
+      batch[i].old_log_prob = -0.693f;
+      batch[i].advantage = 0.5f * (i == 0 ? 1.0f : -0.5f);
+      batch[i].value = 0.0f;
+      batch[i].return_value = 0.5f;
+      batch[i].player_id = 0;
+      batch[i].episode_id = 1;
+      batch[i].candidate_data = test_v5_cand;
+    }
+
+    std::vector<SearchTrainingExample> search_examples(1);
+    search_examples[0].observation = std::vector<float>(obs_size, 0.2f);
+    search_examples[0].player = 0;
+    search_examples[0].legal_actions = test_legals;
+    search_examples[0].normalized_visits = {0.8, 0.2};
+    search_examples[0].candidate_data = test_v5_cand;
+
+    auto update_opt = MakeDuneOptimizer(model, 1e-4);
+    PpoUpdateStats stats = TrainPpoUpdate(
+        model, *update_opt, batch, obs_size, action_dim, torch::kCPU,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.10);
+
+    UTILS_CHECK(stats.purchase_grad_cosine_count > 0);
+    UTILS_CHECK(stats.action_head_grad_cosine_count > 0);
+  } TEST_END();
+
+  TEST_BEGIN("PairwiseMpoDiagnosticsAndAuxScaleParityTest") {
+    // Astra's exact non-binding-KL example
+    const std::vector<std::pair<open_spiel::Action, double>> raw_policy = {
+        {10, 0.85}, {20, 0.01}, {30, 0.14}};
+    const std::vector<open_spiel::Action> legal = {10, 20, 30};
+    double realized_kl = 0.0;
+    double realized_temp = 0.0;
+    auto q = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+        raw_policy, legal, /*raw_action=*/10, /*raw_q=*/0.0,
+        /*best_action=*/20, /*best_q=*/0.15,
+        /*base_temperature=*/0.12, /*max_target_kl=*/0.05,
+        &realized_kl, &realized_temp);
+
+    UTILS_CHECK(std::abs(q[1] - 0.0339) < 5e-4);
+    UTILS_CHECK(std::abs(realized_kl - 0.0179) < 5e-4);
+    UTILS_CHECK(std::abs(realized_temp - 0.12) < 1e-9);
+
+    // Binding-KL example
+    double realized_kl_bind = 0.0;
+    double realized_temp_bind = 0.0;
+    auto q_bind = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+        raw_policy, legal, /*raw_action=*/10, /*raw_q=*/0.0,
+        /*best_action=*/20, /*best_q=*/0.80,
+        /*base_temperature=*/0.05, /*max_target_kl=*/0.05,
+        &realized_kl_bind, &realized_temp_bind);
+
+    UTILS_CHECK(realized_temp_bind > 0.05 + 1e-4);
+    UTILS_CHECK(std::abs(realized_kl_bind - 0.05) < 1e-3);
+
+    // ComputeHybridAuxSumScale tests:
+    // "sum_over_mb": ComputeHybridAuxSumScale(25.0, 1, 2048, "sum_over_mb", 0.24) == float(25.0 / 2048.0)
+    UTILS_CHECK(ComputeHybridAuxSumScale(25.0, 1, 2048, "sum_over_mb", 0.24) == static_cast<float>(25.0 / 2048.0));
+
+    // "per_row_capped":
+    // for slice_rows = 1, search_loss_coef = 0.08, max_slice_coef = 0.24 -> 0.08f
+    UTILS_CHECK(ComputeHybridAuxSumScale(0.08, 1, 2048, "per_row_capped", 0.24) == 0.08f);
+
+    // for slice_rows = 4, search_loss_coef = 0.08, max_slice_coef = 0.24 -> float(0.24 / 4.0) == 0.06f
+    UTILS_CHECK(ComputeHybridAuxSumScale(0.08, 4, 2048, "per_row_capped", 0.24) == 0.06f);
+
+    // for slice_rows = 0 -> 0.0f
+    UTILS_CHECK(ComputeHybridAuxSumScale(0.08, 0, 2048, "per_row_capped", 0.24) == 0.0f);
+
+    // Verify TrainPpoUpdate T1 delta log-odds on a non-flipping soft MPO target
+    const int test_obs_size = 64;
+    const int test_act_dim = 64;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        test_obs_size, 64, test_act_dim, 1, false);
+    {
+      torch::NoGradGuard no_grad;
+      model->policy_head->weight.zero_();
+      model->policy_head->bias.zero_();
+      model->policy_head->bias[10] = 3.0f;
+      model->policy_head->bias[20] = -1.44f;
+      model->policy_head->bias[30] = 1.2f;
+    }
+
+    std::vector<PpoTransition> batch(2);
+    for (int i = 0; i < 2; ++i) {
+      batch[i].state = std::vector<float>(test_obs_size, 0.1f * (i + 1));
+      batch[i].legal_actions = legal;
+      batch[i].action = 10;
+      batch[i].old_log_prob = -0.16f;
+      batch[i].advantage = 0.1f;
+      batch[i].value = 0.0f;
+      batch[i].return_value = 0.1f;
+      batch[i].player_id = 0;
+      batch[i].episode_id = 1;
+    }
+
+    SearchTrainingExample ex;
+    ex.observation = std::vector<float>(test_obs_size, 0.2f);
+    ex.player = 0;
+    ex.legal_actions = legal;
+    ex.normalized_visits = q;
+    ex.best_action = 20;
+    ex.raw_action = 10;
+    std::vector<SearchTrainingExample> search_examples = {ex};
+
+    const bool prev_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+    const std::string prev_diag = absl::GetFlag(FLAGS_r765_absorption_diag_jsonl);
+    const std::string prev_norm = absl::GetFlag(FLAGS_r765_aux_norm_mode);
+    const double prev_max_slice = absl::GetFlag(FLAGS_r765_aux_max_slice_coef);
+    const int prev_mb = absl::GetFlag(FLAGS_ppo_minibatch_size);
+    const int prev_epochs = absl::GetFlag(FLAGS_ppo_update_epochs);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_r765_absorption_diag_jsonl, "/tmp/r765_t1_test_dummy.jsonl");
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, "per_row_capped");
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, 0.24);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+
+    auto update_opt = MakeDuneOptimizer(model, 1e-3);
+    PpoUpdateStats stats = TrainPpoUpdate(
+        model, *update_opt, batch, test_obs_size, test_act_dim, torch::kCPU,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.08);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, prev_hybrid);
+    absl::SetFlag(&FLAGS_r765_absorption_diag_jsonl, prev_diag);
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, prev_norm);
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, prev_max_slice);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, prev_mb);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, prev_epochs);
+    std::filesystem::remove("/tmp/r765_t1_test_dummy.jsonl");
+
+    UTILS_CHECK(stats.aux_t1_measured_rows >= 1);
+    UTILS_CHECK(stats.aux_t1_delta_log_odds_sum > 0.0);
   } TEST_END();
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

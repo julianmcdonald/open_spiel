@@ -2229,14 +2229,17 @@ inline std::vector<double> ComputePairwiseMpoTarget(
     Action raw_action, double raw_q,
     Action best_action, double best_q,
     double base_temperature = 0.15,
-    double max_target_kl = 0.05) {
+    double max_target_kl = 0.05,
+    double* out_realized_kl = nullptr,
+    double* out_realized_temperature = nullptr) {
   std::vector<std::pair<Action, double>> pair_utilities = {
       {raw_action, raw_q},
       {best_action, best_q},
   };
   return ComputeMpoRelativeTarget(
       raw_policy, legal_actions, pair_utilities,
-      base_temperature, max_target_kl);
+      base_temperature, max_target_kl,
+      out_realized_kl, out_realized_temperature);
 }
 
 inline std::vector<float> ExtractObservationTensor(

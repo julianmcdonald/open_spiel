@@ -1454,6 +1454,10 @@ inline bool IsGraftSelectionAction(Action a) {
          a == kActionPlayAgentSolo;
 }
 
+inline bool IsSelectGraftPartnerAction(Action a) {
+  return IsGraftSelectionAction(a);
+}
+
 struct JointAgentCandidate {
   Action first_action = kInvalidAction;
   Action graft_action = kInvalidAction;
@@ -1471,6 +1475,7 @@ struct JointSearchV2Result {
   Action raw_second_action = kInvalidAction;
   std::vector<JointAgentCandidate> joint_candidates;
   int chosen_candidate_index = 0;
+  std::vector<std::vector<double>> per_candidate_rollouts;
 };
 
 inline std::vector<JointAgentCandidate> EnumerateJointAgentCandidates(
@@ -1772,6 +1777,8 @@ struct SearchV2TuningConfig {
   double three_arm_min_rem_ms = 6000.0;
   double three_arm_max_s1_gap = 0.06;
   double three_arm_prune_se = 1.5;
+  bool unclocked_c96_3arm_mode = false;
+  int unclocked_3arm_min_s2_worlds = 24;
 
   // Step 3.2 turn reservation controls
   bool enable_rem0_turn_reservation = false;
@@ -1839,7 +1846,13 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   // 1. Capped Stage-1 Screen
   int r_stage1 = 2;
   if (!has_deadline) {
-    r_stage1 = std::clamp(total_budget / (2 * static_cast<int>(K)), 2, tuning.r_stage1_cap);
+    if (!tuning.unclocked_c96_3arm_mode) {
+      r_stage1 = std::clamp(total_budget / (2 * static_cast<int>(K)), 2, tuning.r_stage1_cap);
+    } else {
+      const int raw_s1 = static_cast<int>(std::llround(
+          (tuning.s1_budget_frac * static_cast<double>(total_budget)) / static_cast<double>(K)));
+      r_stage1 = std::clamp(raw_s1, 2, tuning.r_stage1_cap);
+    }
   } else {
     r_stage1 = std::clamp(
         static_cast<int>((tuning.s1_budget_frac * max_time_ms) / std::max(0.5, static_cast<double>(K) * est_ms_per_sim)),
@@ -2047,13 +2060,21 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
 
   // 3. Adaptive Stage-2 Wave Ramp + High-Confidence Convergence Stop
   std::vector<size_t> active_stage2_cands = {0, best_c_idx};
-  if (tuning.enable_conditional_3arm_stage2 && has_deadline && K >= 3 && second_best_c_idx != 0) {
-    const double entry_elapsed_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start_time).count();
-    const double entry_rem_ms = std::max(0.0, 0.985 * max_time_ms - entry_elapsed_ms);
-    if (entry_rem_ms >= tuning.three_arm_min_rem_ms &&
-        (penalized_adv_1[best_c_idx] - penalized_adv_1[second_best_c_idx]) <= tuning.three_arm_max_s1_gap) {
-      active_stage2_cands = {0, best_c_idx, second_best_c_idx};
+  if (tuning.enable_conditional_3arm_stage2 && K >= 3 && second_best_c_idx != 0) {
+    if (has_deadline) {
+      const double entry_elapsed_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start_time).count();
+      const double entry_rem_ms = std::max(0.0, 0.985 * max_time_ms - entry_elapsed_ms);
+      if (entry_rem_ms >= tuning.three_arm_min_rem_ms &&
+          (penalized_adv_1[best_c_idx] - penalized_adv_1[second_best_c_idx]) <= tuning.three_arm_max_s1_gap) {
+        active_stage2_cands = {0, best_c_idx, second_best_c_idx};
+      }
+    } else if (tuning.unclocked_c96_3arm_mode) {
+      const int rem_budget = std::max(0, total_budget - static_cast<int>(K) * r_stage1_done);
+      if ((rem_budget / 3) >= tuning.unclocked_3arm_min_s2_worlds &&
+          (penalized_adv_1[best_c_idx] - penalized_adv_1[second_best_c_idx]) <= tuning.three_arm_max_s1_gap) {
+        active_stage2_cands = {0, best_c_idx, second_best_c_idx};
+      }
     }
   }
 
@@ -2062,7 +2083,10 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   const auto s2_t0 = std::chrono::steady_clock::now();
 
   if (!has_deadline) {
-    int r_stage2 = std::max(16, (total_budget - static_cast<int>(K) * r_stage1_done) / 2);
+    const int s2_divisor = tuning.unclocked_c96_3arm_mode
+        ? std::max(1, static_cast<int>(active_stage2_cands.size()))
+        : 2;
+    int r_stage2 = std::max(16, (total_budget - static_cast<int>(K) * r_stage1_done) / s2_divisor);
     stage2_planned_worlds = r_stage2;
     const int num_active_s2 = static_cast<int>(active_stage2_cands.size());
     int s2_pool_cap = std::max(2, 512 / num_active_s2);
@@ -2396,7 +2420,7 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   res.action = best_action;
   res.overridden = overridden;
   res.raw_mean_utility = candidate_utilities[0].second;
-  res.chosen_mean_utility = (best_action == raw_action) ? candidate_utilities[0].second : candidate_utilities[best_c_idx].second;
+  res.chosen_mean_utility = overridden ? candidate_utilities[best_c_idx].second : candidate_utilities[0].second;
   res.prior_rollouts_reused = prior_rollouts_reused;
   res.new_rollouts_executed = new_rollouts_executed;
   res.candidate_utilities = std::move(candidate_utilities);
@@ -2540,8 +2564,235 @@ inline JointSearchV2Result SearchV2JointPlacementDecision(
     res.chosen_graft_action = kInvalidAction;
     res.chosen_second_action = kInvalidAction;
   }
+  for (const auto& kv : base_res.candidate_rollout_utilities) {
+    res.per_candidate_rollouts.push_back(kv.second);
+  }
   res.joint_candidates = std::move(joint_cands);
   return res;
+}
+
+inline int ComputeAgentTurnHandPlusPlayed(
+    const DuneImperiumState* dune_state, Player p) {
+  if (dune_state == nullptr || p < 0 || p >= kNumPlayers) return -1;
+  return dune_state->GetPlayerCardsInHand(p) +
+         static_cast<int>(dune_state->GetPlayedAgentCardsForTesting(p).size());
+}
+
+struct PendingJointAgentOverride {
+  bool active = false;
+  uint64_t root_uid = 0;
+  int stage1_kept_worlds = 0;
+  int root_hand_size = -1;
+  int root_intrigue_count = -1;
+  Action chosen_first_action = kInvalidAction;
+  Action executed_graft_action = kInvalidAction;
+  Action expected_graft_action = kInvalidAction;
+  Action expected_second_action = kInvalidAction;
+  int chosen_candidate_index = -1;
+  std::vector<JointAgentCandidate> joint_candidates;
+  std::vector<std::vector<double>> per_candidate_rollouts;
+
+  void Clear() { *this = PendingJointAgentOverride{}; }
+};
+
+struct PendingJointFollowUpDecision {
+  bool execute_override = false;
+  Action forced_action = kInvalidAction;
+  bool emit_aux_target = false;
+  bool is_graft_step = false;
+  uint64_t root_uid = 0;
+  bool same_card_as_raw = false;
+  Action challenger_action = kInvalidAction;
+  double challenger_mean_q = 0.0;
+  double chosen_mean_q = 0.0;
+  int shared_s2_worlds = 0;
+  double mean_s2_diff = 0.0;
+};
+
+inline bool HasStage2ConfirmedJointAdvantage(
+    const std::vector<std::vector<double>>& rollouts,
+    int chosen_c,
+    int alt_idx,
+    int stage1_kept_worlds,
+    double min_s2_margin,
+    double min_total_margin = 0.10,
+    int min_s2_worlds = 24,
+    double* out_alt_mean = nullptr,
+    double* out_chosen_mean = nullptr,
+    int* out_s2_worlds = nullptr,
+    double* out_s2_diff = nullptr) {
+  if (chosen_c < 0 || alt_idx < 0 || chosen_c == alt_idx) return false;
+  if (chosen_c >= static_cast<int>(rollouts.size()) ||
+      alt_idx >= static_cast<int>(rollouts.size())) {
+    return false;
+  }
+  if (stage1_kept_worlds < 0) return false;
+
+  const int n_shared = static_cast<int>(
+      std::min(rollouts[chosen_c].size(), rollouts[alt_idx].size()));
+  const int n_s2 = n_shared - stage1_kept_worlds;
+  if (n_s2 < min_s2_worlds) return false;
+
+  double sum_s2_chosen = 0.0;
+  double sum_s2_alt = 0.0;
+  for (int i = stage1_kept_worlds; i < n_shared; ++i) {
+    sum_s2_chosen += rollouts[chosen_c][i];
+    sum_s2_alt += rollouts[alt_idx][i];
+  }
+  const double mean_s2_chosen = sum_s2_chosen / static_cast<double>(n_s2);
+  const double mean_s2_alt = sum_s2_alt / static_cast<double>(n_s2);
+
+  double sum_all_chosen = 0.0;
+  double sum_all_alt = 0.0;
+  for (int i = 0; i < n_shared; ++i) {
+    sum_all_chosen += rollouts[chosen_c][i];
+    sum_all_alt += rollouts[alt_idx][i];
+  }
+  const double mean_all_chosen = sum_all_chosen / static_cast<double>(n_shared);
+  const double mean_all_alt = sum_all_alt / static_cast<double>(n_shared);
+
+  if (out_alt_mean != nullptr) *out_alt_mean = mean_all_alt;
+  if (out_chosen_mean != nullptr) *out_chosen_mean = mean_all_chosen;
+  if (out_s2_worlds != nullptr) *out_s2_worlds = n_s2;
+  if (out_s2_diff != nullptr) *out_s2_diff = mean_s2_chosen - mean_s2_alt;
+
+  return (mean_s2_chosen - mean_s2_alt) >= min_s2_margin &&
+         (mean_all_chosen - mean_all_alt) >= min_total_margin;
+}
+
+inline PendingJointFollowUpDecision AdvancePendingJointAgentOverride(
+    PendingJointAgentOverride* pending,
+    const std::vector<Action>& legal_actions,
+    Action step_raw_greedy_action,
+    int cur_hand_size,
+    int cur_intrigue_count,
+    bool saw_chance_node,
+    int min_s2_worlds = 24) {
+  if (!pending || !pending->active || legal_actions.empty()) {
+    return {};
+  }
+
+  // Stochastic Tree-Break Guard: if a chance node intervened or private hand/intrigue count changed
+  if (saw_chance_node ||
+      (pending->root_hand_size >= 0 && cur_hand_size >= 0 && cur_hand_size != pending->root_hand_size) ||
+      (pending->root_intrigue_count >= 0 && cur_intrigue_count >= 0 && cur_intrigue_count != pending->root_intrigue_count)) {
+    pending->Clear();
+    return {};
+  }
+
+  const bool all_graft = std::all_of(
+      legal_actions.begin(), legal_actions.end(),
+      [](Action a) { return IsGraftSelectionAction(a); });
+
+  if (all_graft && pending->expected_graft_action != kInvalidAction) {
+    auto it = std::find(legal_actions.begin(), legal_actions.end(), pending->expected_graft_action);
+    if (it == legal_actions.end()) {
+      pending->Clear();
+      return {};
+    }
+    PendingJointFollowUpDecision out;
+    out.execute_override = true;
+    out.forced_action = pending->expected_graft_action;
+    out.is_graft_step = true;
+    out.root_uid = pending->root_uid;
+    out.same_card_as_raw = (!pending->joint_candidates.empty() &&
+        pending->chosen_first_action == pending->joint_candidates[0].first_action);
+    pending->executed_graft_action = pending->expected_graft_action;
+    pending->expected_graft_action = kInvalidAction;
+
+    if (legal_actions.size() >= 2 && step_raw_greedy_action != out.forced_action) {
+      int best_alt_idx = -1;
+      double best_prior = -1.0;
+      for (size_t i = 0; i < pending->joint_candidates.size(); ++i) {
+        const auto& c = pending->joint_candidates[i];
+        if (c.first_action == pending->chosen_first_action &&
+            c.graft_action == step_raw_greedy_action) {
+          if (c.joint_prior > best_prior) {
+            best_prior = c.joint_prior;
+            best_alt_idx = static_cast<int>(i);
+          }
+        }
+      }
+      if (best_alt_idx >= 0) {
+        if (HasStage2ConfirmedJointAdvantage(
+                pending->per_candidate_rollouts,
+                pending->chosen_candidate_index,
+                best_alt_idx,
+                pending->stage1_kept_worlds,
+                /*min_s2_margin=*/0.10,
+                /*min_total_margin=*/0.10,
+                min_s2_worlds,
+                &out.challenger_mean_q,
+                &out.chosen_mean_q,
+                &out.shared_s2_worlds,
+                &out.mean_s2_diff)) {
+          out.emit_aux_target = true;
+          out.challenger_action = step_raw_greedy_action;
+        }
+      }
+    }
+    if (pending->expected_second_action == kInvalidAction) {
+      pending->Clear();
+    }
+    return out;
+  }
+
+  const bool all_space = std::all_of(
+      legal_actions.begin(), legal_actions.end(),
+      [](Action a) { return IsBoardSpaceAction(a); });
+
+  if (all_space && pending->expected_second_action != kInvalidAction) {
+    auto it = std::find(legal_actions.begin(), legal_actions.end(), pending->expected_second_action);
+    if (it == legal_actions.end()) {
+      pending->Clear();
+      return {};
+    }
+    PendingJointFollowUpDecision out;
+    out.execute_override = true;
+    out.forced_action = pending->expected_second_action;
+    out.is_graft_step = false;
+    out.root_uid = pending->root_uid;
+    out.same_card_as_raw = (!pending->joint_candidates.empty() &&
+        pending->chosen_first_action == pending->joint_candidates[0].first_action);
+
+    if (legal_actions.size() >= 2 && step_raw_greedy_action != out.forced_action) {
+      int best_alt_idx = -1;
+      double best_prior = -1.0;
+      for (size_t i = 0; i < pending->joint_candidates.size(); ++i) {
+        const auto& c = pending->joint_candidates[i];
+        if (c.first_action == pending->chosen_first_action &&
+            c.graft_action == pending->executed_graft_action &&
+            c.second_action == step_raw_greedy_action) {
+          if (c.joint_prior > best_prior) {
+            best_prior = c.joint_prior;
+            best_alt_idx = static_cast<int>(i);
+          }
+        }
+      }
+      if (best_alt_idx >= 0) {
+        if (HasStage2ConfirmedJointAdvantage(
+                pending->per_candidate_rollouts,
+                pending->chosen_candidate_index,
+                best_alt_idx,
+                pending->stage1_kept_worlds,
+                /*min_s2_margin=*/0.05,
+                /*min_total_margin=*/0.10,
+                min_s2_worlds,
+                &out.challenger_mean_q,
+                &out.chosen_mean_q,
+                &out.shared_s2_worlds,
+                &out.mean_s2_diff)) {
+          out.emit_aux_target = true;
+          out.challenger_action = step_raw_greedy_action;
+        }
+      }
+    }
+    pending->Clear();
+    return out;
+  }
+
+  pending->Clear();
+  return {};
 }
 
 }  // namespace dune_imperium

@@ -2026,6 +2026,428 @@ void SearchV2TightClockAntiStarvationTest(const std::shared_ptr<const Game>& gam
   std::filesystem::remove_all(temp_dir);
 }
 
+class SyntheticSameCardJointState : public State {
+ public:
+  SyntheticSameCardJointState(std::shared_ptr<const Game> game, Action card_a, Action card_b,
+                              Action space_a, Action space_b)
+      : State(game), card_a_(card_a), card_b_(card_b), space_a_(space_a), space_b_(space_b) {}
+
+  Player CurrentPlayer() const override {
+    return phase_ >= 2 ? kTerminalPlayerId : 0;
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return {card_a_, card_b_};
+    if (phase_ == 1) return {space_a_, space_b_};
+    return {};
+  }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "SyntheticSameCardJointState"; }
+  bool IsTerminal() const override { return phase_ >= 2; }
+  std::vector<double> Returns() const override {
+    if (first_ == card_a_ && second_ == space_b_) {
+      return {1.0, -1.0, 0.0, 0.0};
+    }
+    if (first_ == card_a_ && second_ == space_a_) {
+      return {0.1, -0.1, 0.0, 0.0};
+    }
+    return {-0.5, 0.5, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<SyntheticSameCardJointState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    if (phase_ == 0) {
+      first_ = action;
+      phase_ = 1;
+    } else if (phase_ == 1) {
+      second_ = action;
+      phase_ = 2;
+    }
+  }
+
+ private:
+  Action card_a_;
+  Action card_b_;
+  Action space_a_;
+  Action space_b_;
+  int phase_ = 0;
+  Action first_ = kInvalidAction;
+  Action second_ = kInvalidAction;
+};
+
+class SameCardMockEvaluator : public BatchedNNEvaluator {
+ public:
+  SameCardMockEvaluator(Action card_a, Action card_b, Action space_a, Action space_b)
+      : BatchedNNEvaluator(nullptr, 10.0f),
+        card_a_(card_a), card_b_(card_b), space_a_(space_a), space_b_(space_b) {}
+
+  ActionsAndProbs Prior(const State& state) override {
+    const auto legal = state.LegalActions();
+    ActionsAndProbs prior;
+    if (legal.size() == 2 && legal[0] == card_a_ && legal[1] == card_b_) {
+      prior.emplace_back(card_a_, 0.75);
+      prior.emplace_back(card_b_, 0.25);
+    } else if (legal.size() == 2 && legal[0] == space_a_ && legal[1] == space_b_) {
+      prior.emplace_back(space_a_, 0.70);
+      prior.emplace_back(space_b_, 0.30);
+    } else {
+      for (Action a : legal) prior.emplace_back(a, 1.0 / std::max<size_t>(1, legal.size()));
+    }
+    return prior;
+  }
+
+ private:
+  Action card_a_;
+  Action card_b_;
+  Action space_a_;
+  Action space_b_;
+};
+
+void SearchV2SameCardSpaceOverrideChosenUtilityTest(const std::shared_ptr<const Game>& game) {
+  Action card_0 = kActionSelectAgentCard0 + 0;
+  Action card_1 = kActionSelectAgentCard0 + 1;
+  Action space_a = kInvalidAction;
+  Action space_b = kInvalidAction;
+  for (Action a = 0; a < kNumDistinctPlayerActions; ++a) {
+    if (IsBoardSpaceAction(a)) {
+      if (space_a == kInvalidAction) space_a = a;
+      else if (space_b == kInvalidAction) { space_b = a; break; }
+    }
+  }
+  SPIEL_CHECK_NE(space_a, kInvalidAction);
+  SPIEL_CHECK_NE(space_b, kInvalidAction);
+
+  SyntheticSameCardJointState state(game, card_0, card_1, space_a, space_b);
+  auto eval = std::make_shared<SameCardMockEvaluator>(card_0, card_1, space_a, space_b);
+  TurnSearchTree tree;
+
+  auto joint_res = SearchV2JointPlacementDecision(
+      state, /*search_player=*/0, &tree, {eval},
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*max_time_ms=*/-1.0, /*max_inflight_worlds=*/16,
+      /*prior_log_ratio_weight=*/0.02, /*stage1_high_conf_prior_skip=*/0.0);
+
+  SPIEL_CHECK_TRUE(joint_res.base.overridden);
+  SPIEL_CHECK_EQ(joint_res.chosen_first_action, joint_res.raw_first_action);
+  SPIEL_CHECK_EQ(joint_res.chosen_first_action, card_0);
+  SPIEL_CHECK_EQ(joint_res.chosen_second_action, space_b);
+  SPIEL_CHECK_EQ(joint_res.raw_second_action, space_a);
+  SPIEL_CHECK_LT(std::abs(joint_res.base.raw_mean_utility - 0.1), 1e-6);
+  SPIEL_CHECK_LT(std::abs(joint_res.base.chosen_mean_utility - 1.0), 1e-6);
+}
+
+class SevenActionPayoffState : public State {
+ public:
+  SevenActionPayoffState(std::shared_ptr<const Game> game) : State(game) {}
+
+  Player CurrentPlayer() const override {
+    return phase_ == 1 ? kTerminalPlayerId : 0;
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return {10, 11, 12, 13, 14, 15, 16};
+    return {};
+  }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "SevenActionPayoffState"; }
+  bool IsTerminal() const override { return phase_ == 1; }
+  std::vector<double> Returns() const override {
+    double val = 0.0;
+    if (action_ == 11) val = 0.60;
+    else if (action_ == 12) val = 0.58;
+    else if (action_ == 10) val = 0.0;
+    else val = -0.50;
+    return {val, -val, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<SevenActionPayoffState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    action_ = action;
+    phase_ = 1;
+  }
+
+ private:
+  int phase_ = 0;
+  Action action_ = kInvalidAction;
+};
+
+class SevenActionEvaluator : public BatchedNNEvaluator {
+ public:
+  SevenActionEvaluator() : BatchedNNEvaluator(nullptr, 10.0f) {}
+  ActionsAndProbs Prior(const State& state) override {
+    return {
+      {10, 0.40},
+      {11, 0.10},
+      {12, 0.10},
+      {13, 0.10},
+      {14, 0.10},
+      {15, 0.10},
+      {16, 0.10}
+    };
+  }
+};
+
+void SearchV2UnclockedLegacyParityAndOptIn3ArmTest(const std::shared_ptr<const Game>& game) {
+  SevenActionPayoffState state(game);
+  auto eval = std::make_shared<SevenActionEvaluator>();
+  std::vector<Action> candidates = {10, 11, 12, 13, 14, 15, 16};
+  std::vector<double> cand_priors = {0.40, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10};
+
+  // Case 1: Legacy parity (unclocked_c96_3arm_mode = false)
+  SearchV2TuningConfig legacy_cfg{};
+  legacy_cfg.unclocked_c96_3arm_mode = false;
+  legacy_cfg.enable_conditional_3arm_stage2 = true;
+  TurnSearchTree tree1;
+  int chosen_c_idx1 = -1;
+  auto res_legacy = SearchV2SuccessiveHalvingDecision(
+      state, /*search_player=*/0, &tree1, {eval}, candidates, cand_priors,
+      /*reference_rollouts_per_action=*/64, /*min_override_margin=*/0.10,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*max_time_ms=*/-1.0, /*max_inflight_worlds=*/16,
+      /*prior_log_ratio_weight=*/0.02, /*stage1_high_conf_prior_skip=*/0.0,
+      /*second_actions=*/nullptr, /*graft_actions=*/nullptr,
+      /*est_ms_per_sim=*/20.0, &chosen_c_idx1, legacy_cfg);
+
+  SPIEL_CHECK_EQ(res_legacy.stage1_planned_worlds, 13);
+  SPIEL_CHECK_EQ(res_legacy.stage2_planned_worlds, 50);
+
+  int over_13_count = 0;
+  for (const auto& kv : res_legacy.candidate_rollout_utilities) {
+    if (kv.second.size() > 13) {
+      ++over_13_count;
+      SPIEL_CHECK_TRUE(kv.first == 10 || kv.first == 11);
+    }
+  }
+  SPIEL_CHECK_EQ(over_13_count, 2);
+
+  // Case 2: Opt-in C96 3-arm mode (unclocked_c96_3arm_mode = true)
+  SearchV2TuningConfig optin_cfg{};
+  optin_cfg.unclocked_c96_3arm_mode = true;
+  optin_cfg.s1_budget_frac = 0.28;
+  optin_cfg.enable_conditional_3arm_stage2 = true;
+  optin_cfg.unclocked_3arm_min_s2_worlds = 24;
+  TurnSearchTree tree2;
+  int chosen_c_idx2 = -1;
+  auto res_optin = SearchV2SuccessiveHalvingDecision(
+      state, /*search_player=*/0, &tree2, {eval}, candidates, cand_priors,
+      /*reference_rollouts_per_action=*/96, /*min_override_margin=*/0.10,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*max_time_ms=*/-1.0, /*max_inflight_worlds=*/16,
+      /*prior_log_ratio_weight=*/0.02, /*stage1_high_conf_prior_skip=*/0.0,
+      /*second_actions=*/nullptr, /*graft_actions=*/nullptr,
+      /*est_ms_per_sim=*/20.0, &chosen_c_idx2, optin_cfg);
+
+  SPIEL_CHECK_EQ(res_optin.stage1_planned_worlds, 12);
+  SPIEL_CHECK_EQ(res_optin.stage2_planned_worlds, 68);
+
+  int exactly_80_count = 0;
+  for (const auto& kv : res_optin.candidate_rollout_utilities) {
+    if (kv.second.size() == 80) {
+      ++exactly_80_count;
+      SPIEL_CHECK_TRUE(kv.first == 10 || kv.first == 11 || kv.first == 12);
+    }
+  }
+  SPIEL_CHECK_EQ(exactly_80_count, 3);
+}
+
+void PendingJointOverrideStage2ConfirmedOnlyTest(const std::shared_ptr<const Game>& game) {
+  Action space_a = kInvalidAction;
+  Action space_b = kInvalidAction;
+  for (Action a = 0; a < kNumDistinctPlayerActions; ++a) {
+    if (IsBoardSpaceAction(a)) {
+      if (space_a == kInvalidAction) space_a = a;
+      else if (space_b == kInvalidAction) { space_b = a; break; }
+    }
+  }
+  SPIEL_CHECK_NE(space_a, kInvalidAction);
+  SPIEL_CHECK_NE(space_b, kInvalidAction);
+  Action card_0 = kActionSelectAgentCard0 + 0;
+  Action card_1 = kActionSelectAgentCard0 + 1;
+
+  // Subtest (a) Real DuneImperiumState card-consumption invariant + post-Clear() metadata
+  {
+    auto state = game->NewInitialState();
+    auto* dune = static_cast<DuneImperiumState*>(state.get());
+    for (int steps = 0;; ++steps) {
+      SPIEL_CHECK_LT(steps, 1000);
+      if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+      state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                               : state->LegalActions().front());
+    }
+
+    Player p = state->CurrentPlayer();
+    Action target_card_act = kInvalidAction;
+    for (Action a : state->LegalActions()) {
+      if (a >= kActionSelectAgentCard0 && a < kActionSelectAgentCard0 + kNumImperiumCardIds) {
+        auto clone = state->Clone();
+        clone->ApplyAction(a);
+        if (!clone->IsTerminal() && !clone->IsChanceNode() && clone->CurrentPlayer() == p) {
+          auto l2 = clone->LegalActions();
+          if (l2.size() >= 2 && std::all_of(l2.begin(), l2.end(), [](Action x) { return IsBoardSpaceAction(x); })) {
+            target_card_act = a;
+            break;
+          }
+        }
+      }
+    }
+    SPIEL_CHECK_NE(target_card_act, kInvalidAction);
+    int inv_before = ComputeAgentTurnHandPlusPlayed(dune, p);
+    int hand_before = dune->GetPlayerCardsInHand(p);
+    state->ApplyAction(target_card_act);
+    int inv_after = ComputeAgentTurnHandPlusPlayed(dune, p);
+    int hand_after = dune->GetPlayerCardsInHand(p);
+    SPIEL_CHECK_EQ(inv_after, inv_before);
+    SPIEL_CHECK_LT(hand_after, hand_before);
+  }
+
+  // Subtest (b) Same-card space override
+  {
+    PendingJointAgentOverride pending;
+    pending.active = true;
+    pending.root_uid = 0xABC123ULL;
+    pending.stage1_kept_worlds = 12;
+    pending.root_hand_size = 5;
+    pending.root_intrigue_count = 1;
+    pending.chosen_first_action = card_0;
+    pending.expected_graft_action = kInvalidAction;
+    pending.expected_second_action = space_b;
+    pending.chosen_candidate_index = 1;
+    pending.joint_candidates = {
+        {card_0, kInvalidAction, space_a, 0.5},
+        {card_0, kInvalidAction, space_b, 0.3}
+    };
+    pending.per_candidate_rollouts = {
+        std::vector<double>(48, 0.2),
+        std::vector<double>(48, 0.6)
+    };
+
+    auto follow = AdvancePendingJointAgentOverride(
+        &pending, {space_a, space_b}, space_a, /*cur_hand_size=*/5, /*cur_intrigue_count=*/1, /*saw_chance_node=*/false);
+
+    SPIEL_CHECK_TRUE(follow.execute_override);
+    SPIEL_CHECK_EQ(follow.forced_action, space_b);
+    SPIEL_CHECK_TRUE(follow.emit_aux_target);
+    SPIEL_CHECK_EQ(follow.challenger_action, space_a);
+    SPIEL_CHECK_EQ(follow.shared_s2_worlds, 36);
+    SPIEL_CHECK_EQ(follow.root_uid, 0xABC123ULL);
+    SPIEL_CHECK_TRUE(follow.same_card_as_raw);
+    SPIEL_CHECK_FALSE(pending.active);
+  }
+
+  // Subtest (c) Stage-1-only cross-card space alternative
+  {
+    PendingJointAgentOverride pending;
+    pending.active = true;
+    pending.root_uid = 0xDEF456ULL;
+    pending.stage1_kept_worlds = 12;
+    pending.root_hand_size = 5;
+    pending.root_intrigue_count = 1;
+    pending.chosen_first_action = card_1;
+    pending.expected_graft_action = kInvalidAction;
+    pending.expected_second_action = space_b;
+    pending.chosen_candidate_index = 1;
+    pending.joint_candidates = {
+        {card_0, kInvalidAction, space_a, 0.5},
+        {card_1, kInvalidAction, space_b, 0.3},
+        {card_1, kInvalidAction, space_a, 0.2}
+    };
+    pending.per_candidate_rollouts = {
+        std::vector<double>(48, 0.2),
+        std::vector<double>(48, 0.6),
+        std::vector<double>(12, 0.1)
+    };
+
+    auto follow = AdvancePendingJointAgentOverride(
+        &pending, {space_a, space_b}, space_a, /*cur_hand_size=*/5, /*cur_intrigue_count=*/1, /*saw_chance_node=*/false);
+
+    SPIEL_CHECK_TRUE(follow.execute_override);
+    SPIEL_CHECK_EQ(follow.forced_action, space_b);
+    SPIEL_CHECK_FALSE(follow.emit_aux_target);
+    SPIEL_CHECK_FALSE(follow.same_card_as_raw);
+  }
+
+  // Subtest (d) Graft vs Space 2-step sequence
+  {
+    PendingJointAgentOverride pending;
+    pending.active = true;
+    pending.root_uid = 0x789ULL;
+    pending.stage1_kept_worlds = 12;
+    pending.root_hand_size = 5;
+    pending.root_intrigue_count = 1;
+    pending.chosen_first_action = card_1;
+    pending.expected_graft_action = kActionSelectGraftPartner0 + 1;
+    pending.expected_second_action = space_b;
+    pending.chosen_candidate_index = 1;
+    pending.joint_candidates = {
+        {card_0, kActionPlayAgentSolo, space_a, 0.4},
+        {card_1, kActionSelectGraftPartner0 + 1, space_b, 0.3},
+        {card_1, kActionPlayAgentSolo, space_a, 0.15},
+        {card_1, kActionSelectGraftPartner0 + 1, space_a, 0.15}
+    };
+    pending.per_candidate_rollouts = {
+        std::vector<double>(48, 0.1),
+        std::vector<double>(48, 0.6),
+        std::vector<double>(48, 0.2),
+        std::vector<double>(48, 0.2)
+    };
+
+    auto follow1 = AdvancePendingJointAgentOverride(
+        &pending, {kActionPlayAgentSolo, kActionSelectGraftPartner0 + 1}, kActionPlayAgentSolo,
+        /*cur_hand_size=*/5, /*cur_intrigue_count=*/1, /*saw_chance_node=*/false);
+
+    SPIEL_CHECK_TRUE(follow1.is_graft_step);
+    SPIEL_CHECK_EQ(follow1.forced_action, kActionSelectGraftPartner0 + 1);
+    SPIEL_CHECK_TRUE(follow1.emit_aux_target);
+    SPIEL_CHECK_TRUE(pending.active);
+    SPIEL_CHECK_EQ(pending.executed_graft_action, kActionSelectGraftPartner0 + 1);
+
+    auto follow2 = AdvancePendingJointAgentOverride(
+        &pending, {space_a, space_b}, space_a,
+        /*cur_hand_size=*/5, /*cur_intrigue_count=*/1, /*saw_chance_node=*/false);
+
+    SPIEL_CHECK_FALSE(follow2.is_graft_step);
+    SPIEL_CHECK_EQ(follow2.forced_action, space_b);
+    SPIEL_CHECK_TRUE(follow2.emit_aux_target);
+    SPIEL_CHECK_FALSE(pending.active);
+  }
+
+  // Subtest (e) Stochastic tree-break guard
+  {
+    PendingJointAgentOverride pending1;
+    pending1.active = true;
+    pending1.root_uid = 0x111ULL;
+    pending1.root_hand_size = 5;
+    pending1.root_intrigue_count = 1;
+    pending1.expected_second_action = space_b;
+    auto follow1 = AdvancePendingJointAgentOverride(
+        &pending1, {space_a, space_b}, space_a,
+        /*cur_hand_size=*/5, /*cur_intrigue_count=*/1, /*saw_chance_node=*/true);
+    SPIEL_CHECK_FALSE(follow1.execute_override);
+    SPIEL_CHECK_FALSE(pending1.active);
+
+    PendingJointAgentOverride pending2;
+    pending2.active = true;
+    pending2.root_uid = 0x222ULL;
+    pending2.root_hand_size = 5;
+    pending2.root_intrigue_count = 1;
+    pending2.expected_second_action = space_b;
+    auto follow2 = AdvancePendingJointAgentOverride(
+        &pending2, {space_a, space_b}, space_a,
+        /*cur_hand_size=*/6, /*cur_intrigue_count=*/1, /*saw_chance_node=*/false);
+    SPIEL_CHECK_FALSE(follow2.execute_override);
+    SPIEL_CHECK_FALSE(pending2.active);
+  }
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -2062,4 +2484,7 @@ int main(int argc, char** argv) {
   SearchV2JointCandidateEnumerationAndRolloutTest(game);
   SearchV2JointFollowupCacheTest(game);
   SearchV2TightClockAntiStarvationTest(game);
+  SearchV2SameCardSpaceOverrideChosenUtilityTest(game);
+  SearchV2UnclockedLegacyParityAndOptIn3ArmTest(game);
+  PendingJointOverrideStage2ConfirmedOnlyTest(game);
 }

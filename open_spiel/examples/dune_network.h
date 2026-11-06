@@ -1313,7 +1313,8 @@ inline bool LoadOptimizerCheckpointMigrating(
           if ((cols == 5580 || cols == 6215 || cols == 6255 ||
                cols == dune_imperium::kFullPublicInformationStateSize ||
                cols == dune_imperium::kFullPublicInformationV4StateSize ||
-               cols == dune_imperium::kFullPublicInformationV5StateSize) &&
+               cols == dune_imperium::kFullPublicInformationV5StateSize ||
+               cols == target_input_dim) &&
               exp_avg.size(0) == hidden_dim) {
             ckpt_input_dim = cols;
             break;
@@ -1448,6 +1449,194 @@ inline bool LoadOptimizerCheckpointMigrating(
   const int dst_num_blocks = static_cast<int>(model->res_blocks.size());
   const bool use_nonlinear = model->use_nonlinear_value_head_;
   int64_t ckpt_torso_params = (group_param_counts.size() > 1) ? group_param_counts[1] : 0;
+
+  // Collect v5 parameters if enabled
+  std::vector<torch::Tensor> v5_params;
+  if (model->semantic_scorer_ && model->semantic_scorer_->enable_v5_) {
+    if (model->semantic_scorer_->v5_item_emb) {
+      for (auto& p : model->semantic_scorer_->v5_item_emb->parameters()) {
+        v5_params.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_card_adapter) {
+      for (auto& p : model->semantic_scorer_->v5_card_adapter->parameters()) {
+        v5_params.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_ctx_proj) {
+      for (auto& p : model->semantic_scorer_->v5_ctx_proj->parameters()) {
+        v5_params.push_back(p);
+      }
+    }
+    if (model->semantic_scorer_->v5_query_proj) {
+      for (auto& p : model->semantic_scorer_->v5_query_proj->parameters()) {
+        v5_params.push_back(p);
+      }
+    }
+  }
+
+  // Detect (2, 91, 64) -> (2, 86, 69) migration where v5 parameters were legacy-placed in Group 1
+  bool is_v5_group1_to_group2_migration = false;
+  size_t dst_g0_n = 0;
+  size_t dst_g1_n = 0;
+  size_t dst_g2_n = 0;
+  if (ckpt_num_groups == 3 && group_param_counts.size() == 3 &&
+      optimizer.param_groups().size() == 3 && !v5_params.empty()) {
+    dst_g0_n = optimizer.param_groups()[0].params().size();
+    dst_g1_n = optimizer.param_groups()[1].params().size();
+    dst_g2_n = optimizer.param_groups()[2].params().size();
+    if (dst_g2_n >= v5_params.size() &&
+        group_param_counts[0] == static_cast<int64_t>(dst_g0_n) &&
+        group_param_counts[1] == static_cast<int64_t>(dst_g1_n + v5_params.size()) &&
+        group_param_counts[2] == static_cast<int64_t>(dst_g2_n - v5_params.size())) {
+      is_v5_group1_to_group2_migration = true;
+    }
+  }
+
+  if (is_v5_group1_to_group2_migration) {
+    for (size_t k = 0; k < v5_params.size(); ++k) {
+      const auto& dst_p = optimizer.param_groups()[2].params()[dst_g2_n - v5_params.size() + k];
+      if (!dst_p.is_same(v5_params[k])) {
+        SpielFatalError(absl::StrCat(
+            "LoadOptimizerCheckpointMigrating: destination group 2 param at index ",
+            dst_g2_n - v5_params.size() + k, " does not match v5_params[", k, "]"));
+      }
+    }
+
+    const int64_t target_hidden_dim = model->input_layer->weight.size(0);
+    auto make_src_tensor = [&](const torch::Tensor& p) -> torch::Tensor {
+      if (p.unsafeGetTensorImpl() == model->input_layer->weight.unsafeGetTensorImpl() &&
+          ckpt_input_dim != target_input_dim) {
+        return torch::zeros(
+            {target_hidden_dim, ckpt_input_dim},
+            torch::TensorOptions().dtype(p.dtype()).device(device).requires_grad(true));
+      }
+      return torch::zeros_like(
+          p, torch::TensorOptions().dtype(p.dtype()).device(device).requires_grad(true));
+    };
+
+    std::vector<torch::Tensor> src_g0;
+    src_g0.reserve(dst_g0_n);
+    for (size_t i = 0; i < dst_g0_n; ++i) {
+      src_g0.push_back(make_src_tensor(optimizer.param_groups()[0].params()[i]));
+    }
+
+    std::vector<torch::Tensor> src_g1;
+    src_g1.reserve(dst_g1_n + v5_params.size());
+    for (size_t i = 0; i < dst_g1_n; ++i) {
+      src_g1.push_back(make_src_tensor(optimizer.param_groups()[1].params()[i]));
+    }
+    for (size_t k = 0; k < v5_params.size(); ++k) {
+      src_g1.push_back(make_src_tensor(v5_params[k]));
+    }
+
+    std::vector<torch::Tensor> src_g2;
+    const size_t src_g2_n = dst_g2_n - v5_params.size();
+    src_g2.reserve(src_g2_n);
+    for (size_t i = 0; i < src_g2_n; ++i) {
+      src_g2.push_back(make_src_tensor(optimizer.param_groups()[2].params()[i]));
+    }
+
+    std::vector<torch::optim::OptimizerParamGroup> src_groups;
+    src_groups.emplace_back(src_g0);
+    src_groups.emplace_back(src_g1);
+    src_groups.emplace_back(src_g2);
+
+    torch::optim::AdamW src_optimizer(src_groups, torch::optim::AdamWOptions(lr).eps(1e-5));
+    try {
+      torch::load(src_optimizer, path, device);
+    } catch (const std::exception& e) {
+      if (requires_width_or_block_migration) {
+        SpielFatalError(absl::StrCat(
+            "LoadOptimizerCheckpointMigrating: Failed to load source optimizer for v5 Group 1 -> Group 2 migration: ",
+            e.what()));
+      }
+      return false;
+    }
+
+    int moved = 0;
+    optimizer.state().clear();
+
+    auto move_param_state = [&](const torch::Tensor& src_t, const torch::Tensor& dst_t) {
+      auto src_key = src_t.unsafeGetTensorImpl();
+      auto state_it = src_optimizer.state().find(src_key);
+      if (state_it == src_optimizer.state().end()) {
+        return;
+      }
+      auto* src_adam_state = dynamic_cast<torch::optim::AdamWParamState*>(state_it->second.get());
+      if (!src_adam_state) {
+        optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(state_it->second);
+        ++moved;
+        return;
+      }
+      if (dst_t.unsafeGetTensorImpl() == model->input_layer->weight.unsafeGetTensorImpl() &&
+          ckpt_input_dim != target_input_dim) {
+        auto new_state = std::make_unique<torch::optim::AdamWParamState>();
+        new_state->step(src_adam_state->step());
+        const int64_t copy_cols = std::min(ckpt_input_dim, target_input_dim);
+        if (src_adam_state->exp_avg().defined()) {
+          torch::Tensor new_exp_avg = torch::zeros(
+              {target_hidden_dim, target_input_dim}, src_adam_state->exp_avg().options().device(device));
+          new_exp_avg.slice(1, 0, copy_cols).copy_(src_adam_state->exp_avg().slice(1, 0, copy_cols));
+          new_state->exp_avg(new_exp_avg);
+        }
+        if (src_adam_state->exp_avg_sq().defined()) {
+          torch::Tensor new_exp_avg_sq = torch::zeros(
+              {target_hidden_dim, target_input_dim}, src_adam_state->exp_avg_sq().options().device(device));
+          new_exp_avg_sq.slice(1, 0, copy_cols).copy_(src_adam_state->exp_avg_sq().slice(1, 0, copy_cols));
+          new_state->exp_avg_sq(new_exp_avg_sq);
+        }
+        if (src_adam_state->max_exp_avg_sq().defined()) {
+          torch::Tensor new_max = torch::zeros(
+              {target_hidden_dim, target_input_dim}, src_adam_state->max_exp_avg_sq().options().device(device));
+          new_max.slice(1, 0, copy_cols).copy_(src_adam_state->max_exp_avg_sq().slice(1, 0, copy_cols));
+          new_state->max_exp_avg_sq(new_max);
+        }
+        optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(new_state);
+        ++moved;
+      } else {
+        if (src_adam_state->exp_avg().defined() && src_adam_state->exp_avg().device() != device) {
+          src_adam_state->exp_avg(src_adam_state->exp_avg().to(device));
+        }
+        if (src_adam_state->exp_avg_sq().defined() && src_adam_state->exp_avg_sq().device() != device) {
+          src_adam_state->exp_avg_sq(src_adam_state->exp_avg_sq().to(device));
+        }
+        if (src_adam_state->max_exp_avg_sq().defined() && src_adam_state->max_exp_avg_sq().device() != device) {
+          src_adam_state->max_exp_avg_sq(src_adam_state->max_exp_avg_sq().to(device));
+        }
+        optimizer.state()[dst_t.unsafeGetTensorImpl()] = std::move(state_it->second);
+        ++moved;
+      }
+    };
+
+    // Group 0:
+    for (size_t i = 0; i < dst_g0_n; ++i) {
+      move_param_state(src_g0[i], optimizer.param_groups()[0].params()[i]);
+    }
+    // Group 1:
+    for (size_t i = 0; i < dst_g1_n; ++i) {
+      move_param_state(src_g1[i], optimizer.param_groups()[1].params()[i]);
+    }
+    for (size_t k = 0; k < v5_params.size(); ++k) {
+      move_param_state(src_g1[dst_g1_n + k], v5_params[k]);
+    }
+    // Group 2:
+    for (size_t i = 0; i < src_g2_n; ++i) {
+      move_param_state(src_g2[i], optimizer.param_groups()[2].params()[i]);
+    }
+
+    if (moved != static_cast<int>(total_ckpt_params)) {
+      SpielFatalError(absl::StrCat(
+          "LoadOptimizerCheckpointMigrating: expected to move ", total_ckpt_params,
+          " parameter states in v5 Group 1 -> Group 2 migration, but moved ", moved));
+    }
+
+    std::cout << "[MIGRATION] Migrated v5 scorer parameters from optimizer Group 1 to Group 2 ("
+              << group_param_counts[0] << ", " << group_param_counts[1] << ", " << group_param_counts[2]
+              << ") -> (" << dst_g0_n << ", " << dst_g1_n << ", " << dst_g2_n
+              << ") preserving all " << moved << " AdamW states." << std::endl;
+    return true;
+  }
 
   // Explicit 3-group layout migration for v3 -> v4 (or U31400 style):
   // Source layout has 3 groups: Group 0 = policy (2), Group 1 = torso (86), Group 2 = res9..res<N> (8 * (dst_num_blocks - 8)).

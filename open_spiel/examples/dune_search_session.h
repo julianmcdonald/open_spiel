@@ -241,6 +241,7 @@ struct DirectSearchV2RootResult {
   int stage2_kept_worlds = 0;
   std::string termination_reason = "none";
   bool overridden = false;
+  bool usable_override = false;
   Action chosen_first_action = kInvalidAction;
   Action chosen_graft_action = kInvalidAction;
   Action chosen_second_action = kInvalidAction;
@@ -250,6 +251,19 @@ struct DirectSearchV2RootResult {
   int chosen_candidate_index = 0;
   int num_candidates = 0;
   double est_ms_per_sim_used = 0.0;
+};
+
+struct DirectSearchV1SequentialRootResult {
+  double elapsed_ms = 0.0;
+  int new_rollouts_executed = 0;
+  bool overridden = false;
+  bool usable_override = false;
+  Action chosen_first_action = kInvalidAction;
+  Action chosen_graft_action = kInvalidAction;
+  Action chosen_second_action = kInvalidAction;
+  Action raw_first_action = kInvalidAction;
+  Action raw_graft_action = kInvalidAction;
+  Action raw_second_action = kInvalidAction;
 };
 
 struct EvaluateJointCandidatesResult {
@@ -335,7 +349,10 @@ class DuneAdaptiveRolloutSession {
   }
   DirectSearchV2RootResult RunDirectSearchV2Root(
       const State& state, double target_budget_ms, uint64_t decision_seed,
-      bool is_purchase = false);
+      bool is_purchase = false, int override_ref_rollouts = -1);
+  DirectSearchV1SequentialRootResult RunDirectSearchV1SequentialRoot(
+      const State& state, double target_budget_ms, uint64_t decision_seed,
+      int override_ref_rollouts = -1);
   EvaluateJointCandidatesResult EvaluateJointCandidatesPaired(
       const State& state,
       const std::vector<Action>& first_actions,

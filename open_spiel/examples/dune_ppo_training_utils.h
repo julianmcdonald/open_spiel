@@ -1,6 +1,7 @@
 #ifndef OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_UTILS_H_
 #define OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_UTILS_H_
 
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <memory>
@@ -304,6 +305,20 @@ class PhaseScope {
   int phase_;
 };
 
+inline float ComputeHybridAuxSumScale(
+    double search_loss_coef, int64_t slice_rows, int64_t denom_mb_rows,
+    absl::string_view norm_mode = "sum_over_mb",
+    double max_slice_coef = 0.24) {
+  if (slice_rows <= 0) return 0.0f;
+  if (norm_mode == "per_row_capped") {
+    const double total_w = std::min(
+        max_slice_coef, search_loss_coef * static_cast<double>(slice_rows));
+    return static_cast<float>(total_w / static_cast<double>(slice_rows));
+  }
+  const double denom = std::max<double>(1.0, static_cast<double>(denom_mb_rows));
+  return static_cast<float>(search_loss_coef / denom);
+}
+
 struct PpoUpdateStats {
   double policy_loss = 0.0;
   double value_loss = 0.0;
@@ -343,6 +358,11 @@ struct PpoUpdateStats {
   double purchase_grad_cosine = 0.0;         // Cosine similarity between PPO policy loss grads and MPO aux loss grads on scorer output params
   double purchase_grad_cosine_sum = 0.0;
   int purchase_grad_cosine_count = 0;
+  double action_head_grad_cosine = 0.0;
+  double action_head_grad_cosine_sum = 0.0;
+  int action_head_grad_cosine_count = 0;
+  double aux_t1_delta_log_odds_sum = 0.0;
+  int64_t aux_t1_measured_rows = 0;
 
   // Mean of the unclipped per-minibatch gradient norms over this update.
   // Distinct from the WO-17 column `ppo_grad_norm_mean`, which is the

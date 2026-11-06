@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <deque>
+#include <array>
 #include <numeric>
 #include <sstream>
 #include <iomanip>
@@ -73,6 +74,7 @@
 #include "dune_evaluator.h"  // DuneNNEvaluator for online-collection snapshot inference
 #include "dune_opponent_pool.h"
 #include "dune_compound_turn_search.h"
+#include "dune_wide_rollout_search.h"
 #include "dune_batched_evaluator.h"
 #include "dune_targeted_buy.h"
 #include "open_spiel/utils/json.h"
@@ -923,6 +925,32 @@ inline void SignalHandler(int signum) {
   g_stop_requested.store(true, std::memory_order_relaxed);
 }
 
+struct R765OverrideProbeRecord {
+  uint64_t root_uid = 0;
+  std::string category;  // "card", "same_card_space", "cross_card_space", "graft", "cat3_purchase"
+  std::vector<float> observation;
+  std::vector<Action> legal_actions;
+  dune_semantic::CandidateActionData candidate_data;
+  Action a_star = open_spiel::kInvalidAction;
+  Action a_ref = open_spiel::kInvalidAction;
+  double delta_q = 0.0;
+  double realized_kl = 0.0;
+  double realized_temp = 0.0;
+  bool kl_cap_bound = false;
+  double t0_log_odds = 0.0;
+  double target_log_odds = 0.0;
+  bool target_flips_argmax = false;
+  double t2_live_log_odds = 0.0;
+  double t2_ema_log_odds = 0.0;
+};
+
+struct R765AgreedProbeRecord {
+  std::vector<float> observation;
+  std::vector<Action> legal_actions;
+  dune_semantic::CandidateActionData candidate_data;
+  Action greedy_action = open_spiel::kInvalidAction;
+};
+
 struct WorkerStats {
   uint64_t games = 0;
   uint64_t moves = 0;
@@ -1031,6 +1059,9 @@ struct WorkerStats {
   int64_t r755_tech_buys = 0;
   int64_t r755_reveal_turns = 0;
   double r755_unspent_persuasion_sum = 0.0;
+
+  std::vector<R765OverrideProbeRecord> r765_override_probes;
+  std::vector<R765AgreedProbeRecord> r765_agreed_probes;
 };
 
 
@@ -1260,125 +1291,13 @@ std::unique_ptr<torch::optim::AdamW> MakeOptimizer(
     return optimizer;
   }
 
-  std::vector<torch::Tensor> policy_params;
-  std::vector<torch::Tensor> other_params;
-  // PWO-5 section 7.4: the three auxiliary heads sit in their OWN parameter
-  // group with weight_decay = 0.0, IN ALL SIX ARMS.
-  std::vector<torch::Tensor> aux_head_params;
-  std::vector<torch::Tensor> new_block_params;
-
-  const double new_block_lr = absl::GetFlag(FLAGS_new_block_lr);
-  const int new_block_first_idx = absl::GetFlag(FLAGS_new_block_first_index);
-  std::vector<torch::Tensor> new_block_params_set;
-  if (new_block_lr > 0.0) {
-    for (int b = new_block_first_idx; b < static_cast<int>(model->res_blocks.size()); ++b) {
-      for (auto& p : model->res_blocks[b]->parameters()) {
-        new_block_params_set.push_back(p);
-      }
-    }
-  }
-
-  // F prototype parameters (appended to higher-rate group)
-  std::vector<torch::Tensor> f_params_set;
-  if (model->semantic_scorer_ && model->semantic_scorer_->out_layer_f) {
-    for (auto& p : model->semantic_scorer_->out_layer_f->parameters()) {
-      f_params_set.push_back(p);
-    }
-  }
-  if (model->enable_zone_encoder_ && model->zone_encoder_) {
-    for (auto& p : model->zone_encoder_->parameters()) {
-      f_params_set.push_back(p);
-    }
-  }
-
-  auto policy_params_set = model->policy_head->parameters();
-  std::vector<torch::Tensor> aux_params_set;
-  if (model->has_aux_heads_) {
-    for (auto& p : model->final_vp_head->parameters()) aux_params_set.push_back(p);
-    for (auto& p : model->terminal_round_head->parameters()) aux_params_set.push_back(p);
-    for (auto& p : model->next_own_action_head->parameters()) aux_params_set.push_back(p);
-  }
-  for (auto& param : model->parameters()) {
-    bool is_policy = false;
-    for (auto& policy_param : policy_params_set) {
-      if (param.is_same(policy_param)) {
-        is_policy = true;
-        break;
-      }
-    }
-    bool is_aux = false;
-    for (auto& aux_param : aux_params_set) {
-      if (param.is_same(aux_param)) {
-        is_aux = true;
-        break;
-      }
-    }
-    bool is_new_block = false;
-    for (auto& nb_param : new_block_params_set) {
-      if (param.is_same(nb_param)) {
-        is_new_block = true;
-        break;
-      }
-    }
-    bool is_f = false;
-    for (auto& f_param : f_params_set) {
-      if (param.is_same(f_param)) {
-        is_f = true;
-        break;
-      }
-    }
-    if (is_policy) {
-      policy_params.push_back(param);
-    } else if (is_aux) {
-      aux_head_params.push_back(param);
-    } else if (is_new_block) {
-      new_block_params.push_back(param);
-    } else if (is_f) {
-      // Do not add to other_params; will be appended to new_block_params below.
-    } else {
-      other_params.push_back(param);
-    }
-  }
-
-  // Preserve existing parameter membership/order and map inherited state correctly;
-  // append the new parameters to the existing higher-rate group.
-  for (auto& p : f_params_set) {
-    new_block_params.push_back(p);
-  }
-
-  // Group order: 0 = policy, 1 = other (trunk/value/scorer), 2 = aux heads (if present),
-  // new blocks group APPENDED LAST if new_block_lr > 0.
-  std::vector<torch::optim::OptimizerParamGroup> groups;
-  groups.emplace_back(policy_params);
-  groups.emplace_back(other_params);
-  if (model->has_aux_heads_) {
-    groups.emplace_back(aux_head_params);
-  }
-  if (new_block_lr > 0.0) {
-    groups.emplace_back(new_block_params);
-  }
-  auto optimizer = std::make_unique<torch::optim::AdamW>(
-      groups, torch::optim::AdamWOptions(absl::GetFlag(FLAGS_learning_rate))
-                  .eps(1e-5));
-  static_cast<torch::optim::AdamWOptions&>(
-      optimizer->param_groups()[0].options())
-      .weight_decay(absl::GetFlag(FLAGS_policy_weight_decay));
-  static_cast<torch::optim::AdamWOptions&>(
-      optimizer->param_groups()[1].options())
-      .weight_decay(absl::GetFlag(FLAGS_weight_decay));
-  if (model->has_aux_heads_) {
-    static_cast<torch::optim::AdamWOptions&>(
-        optimizer->param_groups()[2].options())
-        .weight_decay(0.0);  // section 7.4 -- hard zero, never a flag
-  }
-  if (new_block_lr > 0.0) {
-    const size_t nb_idx = optimizer->param_groups().size() - 1;
-    auto& nb_options = static_cast<torch::optim::AdamWOptions&>(
-        optimizer->param_groups()[nb_idx].options());
-    nb_options.lr(new_block_lr);
-    nb_options.weight_decay(0.0);
-  }
-  return optimizer;
+  return open_spiel::MakeDuneOptimizer(
+      model,
+      absl::GetFlag(FLAGS_learning_rate),
+      absl::GetFlag(FLAGS_weight_decay),
+      absl::GetFlag(FLAGS_policy_weight_decay),
+      absl::GetFlag(FLAGS_new_block_lr),
+      absl::GetFlag(FLAGS_new_block_first_index));
 }
 
 // PWO-5 section 7.2 — the OPTIMIZER half of the migration.
@@ -3188,6 +3107,8 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
     Player r755_last_turn_player_ = open_spiel::kInvalidPlayer;
     Action r755_last_action_ = open_spiel::kInvalidAction;
     int64_t r755_decision_index_ = 0;
+    std::array<open_spiel::dune_imperium::PendingJointAgentOverride, 4> r765_pending_joint;
+    std::array<bool, 4> r765_saw_chance_since_root = {false, false, false, false};
 
     std::vector<std::shared_ptr<open_spiel::BatchedNNEvaluator>> r755_search_evals_;
     if (r755_hybrid) {
@@ -3303,6 +3224,10 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                     : SampleAction(outcomes, chance_rng).first;
         state->ApplyAction(action);
         check_hand_draws();
+        r765_saw_chance_since_root.fill(true);
+        if (r755_hybrid) {
+          for (auto& t : r755_turn_trees_) t.Reset();
+        }
         continue;
       }
 
@@ -3339,6 +3264,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       const bool is_learner = (current_player >= 0 && current_player < 4) &&
                               seat_assignment.is_learner_seat[current_player];
 
+      if (last_player >= 0 && last_player < 4 && current_player != last_player) {
+        r765_pending_joint[last_player].Clear();
+      }
+      if (!is_learner && current_player >= 0 && current_player < 4) {
+        r765_pending_joint[current_player].Clear();
+      }
+
       if (r755_hybrid) {
         ++r755_decision_index_;
         if (current_player != r755_last_turn_player_ ||
@@ -3350,9 +3282,13 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                 master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
                 0x52373535ULL);
             std::mt19937_64 coin_rng(coin_seed);
+            const double turn_coin_prob =
+                (absl::GetFlag(FLAGS_r765_agent_search_prob) >= 0.0)
+                    ? absl::GetFlag(FLAGS_r765_agent_search_prob)
+                    : absl::GetFlag(FLAGS_r755_search_prob);
             r755_turn_coin_active_[current_player] =
                 (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) <
-                 absl::GetFlag(FLAGS_r755_search_prob));
+                 turn_coin_prob);
           }
         }
       }
@@ -3708,257 +3644,702 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       bool r755_override_accepted = false;
       if (r755_hybrid && is_learner && current_player >= 0 && current_player < 4 &&
           !r755_search_evals_.empty() && !is_forced_buy) {
-        double max_raw_p = 0.0;
-        double p_2 = 0.0;
-        for (double p : legal_probabilities) {
-          if (p > max_raw_p) {
-            p_2 = max_raw_p;
-            max_raw_p = p;
-          } else if (p > p_2) {
-            p_2 = p;
-          }
-        }
-        auto cat = open_spiel::dune_imperium::ClassifyR755SearchCategory(
-            *state, current_player, r755_space_placed_this_turn_[current_player],
-            absl::GetFlag(FLAGS_r755_category_mask),
-            absl::GetFlag(FLAGS_r755_cat3_strict_card_tech_only));
-        bool coin_active = false;
-        if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
-            cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) {
-          coin_active = r755_turn_coin_active_[current_player];
-        } else if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
-          double search_prob = absl::GetFlag(FLAGS_r755_search_prob);
-          if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
-            double cat3_prob = absl::GetFlag(FLAGS_r755_cat3_search_prob);
-            if (cat3_prob >= 0.0) {
-              search_prob = cat3_prob;
+        if (absl::GetFlag(FLAGS_r765_joint_agent_search) &&
+            r765_pending_joint[current_player].active) {
+          Action step_raw_greedy_action = actions[0];
+          double max_step_p = -1.0;
+          for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+            double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+            if (p > max_step_p) {
+              max_step_p = p;
+              step_raw_greedy_action = actions[a_idx];
             }
-            double boost_prob = absl::GetFlag(FLAGS_r755_cat3_low_prior_boost_prob);
-            if (boost_prob >= 0.0) {
-              const double boost_thresh = absl::GetFlag(FLAGS_r755_cat3_low_prior_threshold);
-              bool has_low_prior_buy = false;
-              for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-                if (open_spiel::dune_imperium::IsCardOrTechAcquisitionAction(actions[a_idx])) {
-                  double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
-                  if (p < boost_thresh) {
-                    has_low_prior_buy = true;
-                    break;
-                  }
+          }
+          int cur_hand = open_spiel::dune_imperium::ComputeAgentTurnHandPlusPlayed(dune_state, current_player);
+          int cur_intr = dune_state ? static_cast<int>(dune_state->GetPlayerIntrigues(current_player).size()) : -1;
+          auto follow = open_spiel::dune_imperium::AdvancePendingJointAgentOverride(
+              &r765_pending_joint[current_player], actions, step_raw_greedy_action,
+              cur_hand, cur_intr, r765_saw_chance_since_root[current_player]);
+
+          if (follow.execute_override) {
+            action = follow.forced_action;
+            for (size_t act_i = 0; act_i < actions.size(); ++act_i) {
+              if (actions[act_i] == action) {
+                if (act_i < legal_probabilities.size()) {
+                  old_log_prob = static_cast<float>(
+                      std::log(std::max(1e-12, legal_probabilities[act_i])));
                 }
-              }
-              if (has_low_prior_buy) {
-                search_prob = std::max(search_prob, boost_prob);
-              }
-            }
-          }
-          uint64_t coin_seed = dune_seed::DeriveSeed(
-              master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
-              0x52373535ULL);
-          std::mt19937_64 coin_rng(coin_seed);
-          coin_active =
-              (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) < search_prob);
-        }
-        const double max_prior_gate = absl::GetFlag(FLAGS_r755_max_raw_prior);
-        const bool prior_gated = (max_prior_gate < 1.0 && max_raw_p >= max_prior_gate);
-        if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible &&
-            coin_active && !prior_gated) {
-          int cat_idx = static_cast<int>(cat);
-          if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
-            local_stats->r755_searched_by_cat[cat_idx]++;
-          }
-          uint64_t search_seed = dune_seed::DeriveSeed(
-              master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
-              0x52373553ULL);
-          open_spiel::dune_imperium::TurnSearchTree local_r755_tree;
-
-          open_spiel::dune_imperium::SearchRolloutCrnMode crn_mode =
-              open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
-          const std::string crn_str = absl::GetFlag(FLAGS_r755_crn_mode);
-          if (crn_str == "sequential") {
-            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
-          } else if (crn_str == "deck_order") {
-            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
-          } else if (crn_str == "event_keyed") {
-            crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
-          } else {
-            open_spiel::SpielFatalError(absl::StrCat("Unknown r755_crn_mode: ", crn_str));
-          }
-
-          open_spiel::ActionsAndProbs collector_raw_prior;
-          open_spiel::dune_imperium::CompoundSearchOptions opts;
-          if (absl::GetFlag(FLAGS_r755_reuse_root_prior)) {
-            collector_raw_prior.reserve(actions.size());
-            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-              double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
-              collector_raw_prior.push_back({actions[a_idx], p});
-            }
-            opts.precomputed_raw_prior = &collector_raw_prior;
-          }
-          opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
-
-          int top_k = 3;
-          int rollouts_per_action = 16;
-          open_spiel::dune_imperium::SearchTruncationMode truncation_mode =
-              open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
-
-          if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
-            opts.all_buy_candidates = true;
-            opts.symmetric_stage2_confirmation = absl::GetFlag(FLAGS_r755_cat3_symmetric_confirmation);
-            opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage1_rollouts);
-            opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
-            opts.stage2_independent_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage2_indep_rollouts);
-            rollouts_per_action = opts.stage1_rollouts + opts.stage2_independent_rollouts;
-            top_k = 12;
-
-            const std::string cat3_trunc_str = absl::GetFlag(FLAGS_r755_cat3_truncation_mode);
-            if (cat3_trunc_str == "next_round" || cat3_trunc_str == "next_round_search_player") {
-              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
-            } else if (cat3_trunc_str == "plus2_rounds" || cat3_trunc_str == "plus_2_rounds") {
-              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kPlus2Rounds;
-            } else if (cat3_trunc_str == "terminal" || cat3_trunc_str == "none") {
-              truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kTerminal;
-            } else {
-              open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_truncation_mode: ", cat3_trunc_str));
-            }
-
-            const std::string cat3_crn_override = absl::GetFlag(FLAGS_r755_cat3_crn_mode);
-            if (!cat3_crn_override.empty()) {
-              if (cat3_crn_override == "sequential") {
-                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
-              } else if (cat3_crn_override == "deck_order") {
-                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
-              } else if (cat3_crn_override == "event_keyed") {
-                crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
-              } else {
-                open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_crn_mode: ", cat3_crn_override));
-              }
-            }
-          } else {
-            opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
-            opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
-            opts.stage1_subwave_rollouts = absl::GetFlag(FLAGS_r755_stage1_subwave_rollouts);
-            opts.stage1_subwave_min_diff = absl::GetFlag(FLAGS_r755_stage1_subwave_min_diff);
-            opts.center_4seat_leaf_values = absl::GetFlag(FLAGS_r755_leaf_value_centering);
-          }
-
-          auto search_res =
-              open_spiel::dune_imperium::CompoundRolloutSearchDecision(
-                  *state, current_player, &local_r755_tree,
-                  r755_search_evals_, top_k, rollouts_per_action,
-                  /*min_override_margin=*/0.15,
-                  open_spiel::dune_imperium::TreeReuseMode::kTargetFill,
-                  search_seed,
-                  open_spiel::dune_imperium::SearchPairingMode::kPaired,
-                  truncation_mode,
-                  crn_mode,
-                  /*world_sampler=*/nullptr,
-                  absl::GetFlag(FLAGS_r755_min_t_stat),
-                  opts);
-
-          const std::string root_dump_path = absl::GetFlag(FLAGS_r755_root_dump_jsonl);
-          if (!root_dump_path.empty()) {
-            static std::mutex dump_mutex;
-            std::lock_guard<std::mutex> lock(dump_mutex);
-            std::ofstream out(root_dump_path, std::ios::app);
-            if (out.is_open()) {
-              out << "{\"episode_id\":" << episode_id
-                  << ",\"decision_id\":" << r755_decision_index_
-                  << ",\"cat\":" << cat_idx
-                  << ",\"raw_action\":" << search_res.raw_action
-                  << ",\"best_action\":" << search_res.best_action
-                  << ",\"chosen_action\":" << search_res.chosen_action
-                  << ",\"overridden\":" << (search_res.overridden ? 1 : 0)
-                  << ",\"stopped_stage1\":" << (search_res.stopped_stage1 ? 1 : 0)
-                  << ",\"resample_fallbacks\":" << search_res.resample_fallbacks
-                  << ",\"nn_evals\":" << search_res.rollout_nn_evals
-                  << ",\"max_raw_p\":" << max_raw_p
-                  << ",\"p_2\":" << p_2
-                  << ",\"cand_actions\":[";
-              for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
-                if (ci > 0) out << ",";
-                out << search_res.candidate_rollout_utilities[ci].first;
-              }
-              out << "],\"cand_priors\":[";
-              for (size_t ci = 0; ci < search_res.candidate_priors.size(); ++ci) {
-                if (ci > 0) out << ",";
-                out << search_res.candidate_priors[ci].second;
-              }
-              out << "],\"cand_utils\":[";
-              for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
-                if (ci > 0) out << ",";
-                out << "[";
-                const auto& utils = search_res.candidate_rollout_utilities[ci].second;
-                for (size_t ui = 0; ui < utils.size(); ++ui) {
-                  if (ui > 0) out << ",";
-                  out << utils[ui];
-                }
-                out << "]";
-              }
-              out << "]}\n";
-            }
-          }
-          const bool execute_decision = search_res.teacher_accepted
-              ? absl::GetFlag(FLAGS_r755_execute_overrides)
-              : (search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides));
-          const Action target_action = search_res.teacher_accepted ? search_res.teacher_action : search_res.chosen_action;
-
-          if (execute_decision) {
-            Action best_action = target_action;
-            int best_idx = -1;
-            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-              if (actions[a_idx] == best_action) {
-                best_idx = static_cast<int>(a_idx);
                 break;
               }
             }
-            if (best_idx >= 0) {
-              action = best_action;
-              if (best_idx < static_cast<int>(legal_probabilities.size())) {
-                old_log_prob = static_cast<float>(
-                    std::log(std::max(1e-12, legal_probabilities[best_idx])));
+            r755_override_accepted = true;
+
+            if (follow.emit_aux_target && r755_aux_examples != nullptr) {
+              std::vector<std::pair<Action, double>> raw_policy_pairs;
+              raw_policy_pairs.reserve(actions.size());
+              for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                double p = (a_idx < legal_probabilities.size())
+                               ? legal_probabilities[a_idx]
+                               : 0.0;
+                raw_policy_pairs.push_back({actions[a_idx], p});
               }
-              r755_override_accepted = true;
-              if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
-                local_stats->r755_executed_overrides_by_cat[cat_idx]++;
+              double realized_kl = 0.0;
+              double realized_temp = 0.0;
+              open_spiel::SearchTrainingExample ex;
+              ex.observation = obs;
+              ex.player = current_player;
+              ex.legal_actions = actions;
+              if (p_cand_data != nullptr) {
+                ex.candidate_data = *p_cand_data;
               }
-              if (r755_aux_examples != nullptr) {
-                std::vector<std::pair<Action, double>> raw_policy_pairs;
-                raw_policy_pairs.reserve(actions.size());
-                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
-                  double p = (a_idx < legal_probabilities.size())
-                                 ? legal_probabilities[a_idx]
-                                 : 0.0;
-                  raw_policy_pairs.push_back({actions[a_idx], p});
-                }
-                open_spiel::SearchTrainingExample ex;
-                ex.observation = obs;
-                ex.player = current_player;
-                ex.legal_actions = actions;
-                if (p_cand_data != nullptr) {
-                  ex.candidate_data = *p_cand_data;
-                }
-                if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase &&
-                    !search_res.stage2_candidate_utilities.empty()) {
-                  ex.normalized_visits =
-                      open_spiel::dune_imperium::ComputeMpoRelativeTarget(
-                          raw_policy_pairs, actions,
-                          search_res.stage2_candidate_utilities,
-                          absl::GetFlag(FLAGS_r755_cat3_mpo_temperature),
-                          absl::GetFlag(FLAGS_r755_cat3_mpo_max_kl));
+              ex.normalized_visits = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                  raw_policy_pairs, actions, follow.challenger_action, follow.challenger_mean_q,
+                  follow.forced_action, follow.chosen_mean_q,
+                  absl::GetFlag(FLAGS_r765_mpo_temperature),
+                  absl::GetFlag(FLAGS_r765_mpo_max_kl),
+                  &realized_kl, &realized_temp);
+              ex.best_action = follow.forced_action;
+              ex.raw_action = follow.challenger_action;
+              ex.value_target = 0.0;
+              ex.value_target_attached = false;
+              ex.episode_id = episode_id;
+              ex.decision_id = static_cast<int>(r755_decision_index_);
+              r755_aux_examples->push_back(std::move(ex));
+
+              if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                R765OverrideProbeRecord probe;
+                probe.root_uid = follow.root_uid;
+                if (follow.is_graft_step) {
+                  probe.category = "graft";
                 } else {
-                  double raw_q = search_res.raw_mean_utility;
-                  double best_q = search_res.chosen_mean_utility;
-                  ex.normalized_visits =
-                      open_spiel::dune_imperium::ComputePairwiseMpoTarget(
-                          raw_policy_pairs, actions, search_res.raw_action, raw_q,
-                          search_res.best_action, best_q,
-                          /*base_temperature=*/0.15, /*max_target_kl=*/0.05);
+                  probe.category = follow.same_card_as_raw ? "same_card_space" : "cross_card_space";
                 }
-                ex.value_target = 0.0;
-                ex.value_target_attached = false;
-                ex.episode_id = episode_id;
-                ex.decision_id = static_cast<int>(r755_decision_index_);
-                r755_aux_examples->push_back(std::move(ex));
+                probe.observation = obs;
+                probe.legal_actions = actions;
+                if (p_cand_data != nullptr) probe.candidate_data = *p_cand_data;
+                probe.a_star = follow.forced_action;
+                probe.a_ref = follow.challenger_action;
+                probe.delta_q = follow.chosen_mean_q - follow.challenger_mean_q;
+                probe.realized_kl = realized_kl;
+                probe.realized_temp = realized_temp;
+                const double base_t = std::max(1e-4, absl::GetFlag(FLAGS_r765_mpo_temperature));
+                probe.kl_cap_bound = (realized_temp > base_t + 1e-9);
+
+                int idx_star = -1, idx_ref = -1;
+                for (size_t a = 0; a < actions.size(); ++a) {
+                  if (actions[a] == probe.a_star) idx_star = static_cast<int>(a);
+                  if (actions[a] == probe.a_ref) idx_ref = static_cast<int>(a);
+                }
+                if (idx_star >= 0 && idx_ref >= 0 &&
+                    idx_star < static_cast<int>(legal_probabilities.size()) &&
+                    idx_ref < static_cast<int>(legal_probabilities.size())) {
+                  double p_star = legal_probabilities[idx_star];
+                  double p_ref = legal_probabilities[idx_ref];
+                  probe.t0_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+                }
+                const auto& norm_v = r755_aux_examples->back().normalized_visits;
+                if (idx_star >= 0 && idx_ref >= 0 &&
+                    idx_star < static_cast<int>(norm_v.size()) &&
+                    idx_ref < static_cast<int>(norm_v.size())) {
+                  double t_star = norm_v[idx_star];
+                  double t_ref = norm_v[idx_ref];
+                  probe.target_log_odds = std::log(std::max(1e-12, t_star)) - std::log(std::max(1e-12, t_ref));
+                  size_t max_t_idx = std::max_element(norm_v.begin(), norm_v.end()) - norm_v.begin();
+                  probe.target_flips_argmax = (max_t_idx == static_cast<size_t>(idx_star));
+                }
+                local_stats->r765_override_probes.push_back(std::move(probe));
+              }
+            }
+          }
+        }
+
+        if (!r755_override_accepted) {
+          double max_raw_p = 0.0;
+          double p_2 = 0.0;
+          for (double p : legal_probabilities) {
+            if (p > max_raw_p) {
+              p_2 = max_raw_p;
+              max_raw_p = p;
+            } else if (p > p_2) {
+              p_2 = p;
+            }
+          }
+          auto cat = open_spiel::dune_imperium::ClassifyR755SearchCategory(
+              *state, current_player, r755_space_placed_this_turn_[current_player],
+              absl::GetFlag(FLAGS_r755_category_mask),
+              absl::GetFlag(FLAGS_r755_cat3_strict_card_tech_only));
+          bool coin_active = false;
+          if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
+              cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) {
+            coin_active = r755_turn_coin_active_[current_player];
+          } else if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible) {
+            double search_prob = absl::GetFlag(FLAGS_r755_search_prob);
+            if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
+              double cat3_prob = absl::GetFlag(FLAGS_r755_cat3_search_prob);
+              if (cat3_prob >= 0.0) {
+                search_prob = cat3_prob;
+              }
+              double boost_prob = absl::GetFlag(FLAGS_r755_cat3_low_prior_boost_prob);
+              if (boost_prob >= 0.0) {
+                const double boost_thresh = absl::GetFlag(FLAGS_r755_cat3_low_prior_threshold);
+                bool has_low_prior_buy = false;
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  if (open_spiel::dune_imperium::IsCardOrTechAcquisitionAction(actions[a_idx])) {
+                    double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+                    if (p < boost_thresh) {
+                      has_low_prior_buy = true;
+                      break;
+                    }
+                  }
+                }
+                if (has_low_prior_buy) {
+                  search_prob = std::max(search_prob, boost_prob);
+                }
+              }
+            }
+            uint64_t coin_seed = dune_seed::DeriveSeed(
+                master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
+                0x52373535ULL);
+            std::mt19937_64 coin_rng(coin_seed);
+            coin_active =
+                (std::uniform_real_distribution<double>(0.0, 1.0)(coin_rng) < search_prob);
+          }
+          double max_prior_gate = absl::GetFlag(FLAGS_r755_max_raw_prior);
+          if ((cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
+               cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) &&
+              absl::GetFlag(FLAGS_r765_agent_max_raw_prior) >= 0.0) {
+            max_prior_gate = absl::GetFlag(FLAGS_r765_agent_max_raw_prior);
+          }
+          const bool prior_gated = (max_prior_gate < 1.0 && max_raw_p >= max_prior_gate);
+          if (cat != open_spiel::dune_imperium::R755SearchCategory::kIneligible &&
+              coin_active && !prior_gated) {
+            int cat_idx = static_cast<int>(cat);
+            if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
+              local_stats->r755_searched_by_cat[cat_idx]++;
+            }
+            uint64_t search_seed = dune_seed::DeriveSeed(
+                master, dune_seed::kDomainTrain, episode_id, r755_decision_index_,
+                0x52373553ULL);
+            open_spiel::dune_imperium::TurnSearchTree local_r755_tree;
+
+            open_spiel::dune_imperium::SearchRolloutCrnMode crn_mode =
+                open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+            const std::string crn_str = absl::GetFlag(FLAGS_r755_crn_mode);
+            if (crn_str == "sequential") {
+              crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+            } else if (crn_str == "deck_order") {
+              crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+            } else if (crn_str == "event_keyed") {
+              crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+            } else {
+              open_spiel::SpielFatalError(absl::StrCat("Unknown r755_crn_mode: ", crn_str));
+            }
+
+            open_spiel::ActionsAndProbs raw_policy_pairs;
+            raw_policy_pairs.reserve(actions.size());
+            for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+              double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+              raw_policy_pairs.push_back({actions[a_idx], p});
+            }
+
+            if (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot &&
+                absl::GetFlag(FLAGS_r765_joint_agent_search)) {
+              open_spiel::dune_imperium::SearchV2TuningConfig tuning{};
+              tuning.unclocked_c96_3arm_mode = true;
+              auto joint_res = open_spiel::dune_imperium::SearchV2JointPlacementDecision(
+                  *state, current_player, &local_r755_tree, r755_search_evals_,
+                  absl::GetFlag(FLAGS_r765_agent_ref_rollouts),
+                  /*min_override_margin=*/0.15,
+                  search_seed,
+                  crn_mode,
+                  /*max_time_ms=*/-1.0,
+                  /*max_inflight_worlds=*/192,
+                  /*prior_log_ratio_weight=*/0.02,
+                  max_prior_gate,
+                  &raw_policy_pairs,
+                  /*est_ms_per_sim=*/3.5,
+                  /*max_candidates=*/8,
+                  tuning);
+
+              const uint64_t root_uid = (episode_id << 16) | static_cast<uint64_t>(r755_decision_index_);
+
+              if (joint_res.base.overridden && absl::GetFlag(FLAGS_r755_execute_overrides)) {
+                if (local_stats != nullptr) {
+                  local_stats->r755_executed_overrides_by_cat[1]++;
+                }
+                Action best_action = joint_res.chosen_first_action;
+                int best_idx = -1;
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  if (actions[a_idx] == best_action) {
+                    best_idx = static_cast<int>(a_idx);
+                    break;
+                  }
+                }
+                if (best_idx >= 0) {
+                  action = best_action;
+                  if (best_idx < static_cast<int>(legal_probabilities.size())) {
+                    old_log_prob = static_cast<float>(
+                        std::log(std::max(1e-12, legal_probabilities[best_idx])));
+                  }
+                  r755_override_accepted = true;
+
+                  if (joint_res.chosen_first_action != joint_res.raw_first_action) {
+                    if (r755_aux_examples != nullptr) {
+                      double realized_kl = 0.0;
+                      double realized_temp = 0.0;
+                      open_spiel::SearchTrainingExample ex;
+                      ex.observation = obs;
+                      ex.player = current_player;
+                      ex.legal_actions = actions;
+                      if (p_cand_data != nullptr) {
+                        ex.candidate_data = *p_cand_data;
+                      }
+                      ex.normalized_visits = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                          raw_policy_pairs, actions, joint_res.raw_first_action,
+                          joint_res.base.raw_mean_utility, joint_res.chosen_first_action,
+                          joint_res.base.chosen_mean_utility,
+                          absl::GetFlag(FLAGS_r765_mpo_temperature),
+                          absl::GetFlag(FLAGS_r765_mpo_max_kl),
+                          &realized_kl, &realized_temp);
+                      ex.best_action = joint_res.chosen_first_action;
+                      ex.raw_action = joint_res.raw_first_action;
+                      ex.value_target = 0.0;
+                      ex.value_target_attached = false;
+                      ex.episode_id = episode_id;
+                      ex.decision_id = static_cast<int>(r755_decision_index_);
+                      r755_aux_examples->push_back(std::move(ex));
+
+                      if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                        R765OverrideProbeRecord probe;
+                        probe.root_uid = root_uid;
+                        probe.category = "card";
+                        probe.observation = obs;
+                        probe.legal_actions = actions;
+                        if (p_cand_data != nullptr) probe.candidate_data = *p_cand_data;
+                        probe.a_star = joint_res.chosen_first_action;
+                        probe.a_ref = joint_res.raw_first_action;
+                        probe.delta_q = joint_res.base.chosen_mean_utility - joint_res.base.raw_mean_utility;
+                        probe.realized_kl = realized_kl;
+                        probe.realized_temp = realized_temp;
+                        const double base_t = std::max(1e-4, absl::GetFlag(FLAGS_r765_mpo_temperature));
+                        probe.kl_cap_bound = (realized_temp > base_t + 1e-9);
+
+                        int s_idx = -1, r_idx = -1;
+                        for (size_t a = 0; a < actions.size(); ++a) {
+                          if (actions[a] == probe.a_star) s_idx = static_cast<int>(a);
+                          if (actions[a] == probe.a_ref) r_idx = static_cast<int>(a);
+                        }
+                        if (s_idx >= 0 && r_idx >= 0 &&
+                            s_idx < static_cast<int>(legal_probabilities.size()) &&
+                            r_idx < static_cast<int>(legal_probabilities.size())) {
+                          double p_star = legal_probabilities[s_idx];
+                          double p_ref = legal_probabilities[r_idx];
+                          probe.t0_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+                        }
+                        const auto& norm_v = r755_aux_examples->back().normalized_visits;
+                        if (s_idx >= 0 && r_idx >= 0 &&
+                            s_idx < static_cast<int>(norm_v.size()) &&
+                            r_idx < static_cast<int>(norm_v.size())) {
+                          double t_star = norm_v[s_idx];
+                          double t_ref = norm_v[r_idx];
+                          probe.target_log_odds = std::log(std::max(1e-12, t_star)) - std::log(std::max(1e-12, t_ref));
+                          size_t max_t_idx = std::max_element(norm_v.begin(), norm_v.end()) - norm_v.begin();
+                          probe.target_flips_argmax = (max_t_idx == static_cast<size_t>(s_idx));
+                        }
+                        local_stats->r765_override_probes.push_back(std::move(probe));
+                      }
+                    }
+                  }
+
+                  if (joint_res.chosen_graft_action != open_spiel::kInvalidAction ||
+                      joint_res.chosen_second_action != open_spiel::kInvalidAction) {
+                    auto& pj = r765_pending_joint[current_player];
+                    pj.active = true;
+                    pj.root_uid = root_uid;
+                    pj.stage1_kept_worlds = joint_res.base.stage1_kept_worlds;
+                    pj.root_hand_size = open_spiel::dune_imperium::ComputeAgentTurnHandPlusPlayed(dune_state, current_player);
+                    pj.root_intrigue_count = dune_state ? static_cast<int>(dune_state->GetPlayerIntrigues(current_player).size()) : -1;
+                    pj.chosen_first_action = joint_res.chosen_first_action;
+                    pj.executed_graft_action = open_spiel::kInvalidAction;
+                    pj.expected_graft_action = joint_res.chosen_graft_action;
+                    pj.expected_second_action = joint_res.chosen_second_action;
+                    pj.chosen_candidate_index = joint_res.chosen_candidate_index;
+                    pj.joint_candidates = std::move(joint_res.joint_candidates);
+                    pj.per_candidate_rollouts = std::move(joint_res.per_candidate_rollouts);
+                    r765_saw_chance_since_root[current_player] = false;
+                  }
+                }
+              } else if (!joint_res.base.overridden) {
+                if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                  if (local_stats->r765_agreed_probes.size() < 16) {
+                    R765AgreedProbeRecord ap;
+                    ap.observation = obs;
+                    ap.legal_actions = actions;
+                    if (p_cand_data != nullptr) ap.candidate_data = *p_cand_data;
+                    Action greedy_a = actions[0];
+                    double max_p = -1.0;
+                    for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                      double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+                      if (p > max_p) {
+                        max_p = p;
+                        greedy_a = actions[a_idx];
+                      }
+                    }
+                    ap.greedy_action = greedy_a;
+                    local_stats->r765_agreed_probes.push_back(std::move(ap));
+                  }
+                }
+              }
+            } else if ((cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot ||
+                        cat == open_spiel::dune_imperium::R755SearchCategory::kImmediateSpacePlacement) &&
+                       absl::GetFlag(FLAGS_r765_seq_v1_agent_search)) {
+              Action raw_a = actions[0];
+              double best_p = -1.0;
+              for (size_t i = 0; i < actions.size(); ++i) {
+                double p = (i < legal_probabilities.size()) ? legal_probabilities[i] : 0.0;
+                if (p > best_p) {
+                  best_p = p;
+                  raw_a = actions[i];
+                }
+              }
+
+              auto v1_res = open_spiel::dune_imperium::SuccessiveHalvingRolloutSearchDecision(
+                  *state, current_player, &r755_turn_trees_[current_player], r755_search_evals_,
+                  absl::GetFlag(FLAGS_r765_agent_ref_rollouts), /*min_override_margin=*/0.15,
+                  search_seed, crn_mode, /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0,
+                  /*fixed_top_k=*/5, /*max_inflight_worlds=*/192,
+                  /*use_bounded_pool_when_unclocked=*/false, /*full_clock_stage2=*/false,
+                  /*prior_log_ratio_weight=*/0.02, max_prior_gate, &raw_policy_pairs);
+
+              if (v1_res.overridden && v1_res.action != raw_a && absl::GetFlag(FLAGS_r755_execute_overrides)) {
+                int best_idx = -1;
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  if (actions[a_idx] == v1_res.action) {
+                    best_idx = static_cast<int>(a_idx);
+                    break;
+                  }
+                }
+                if (best_idx >= 0) {
+                  action = v1_res.action;
+                  if (best_idx < static_cast<int>(legal_probabilities.size())) {
+                    old_log_prob = static_cast<float>(
+                        std::log(std::max(1e-12, legal_probabilities[best_idx])));
+                  }
+                  r755_override_accepted = true;
+                  if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
+                    local_stats->r755_executed_overrides_by_cat[cat_idx]++;
+                  }
+
+                  double raw_q = v1_res.raw_mean_utility;
+                  double chosen_q = v1_res.chosen_mean_utility;
+                  for (const auto& cu : v1_res.candidate_utilities) {
+                    if (cu.first == raw_a) raw_q = cu.second;
+                    if (cu.first == v1_res.action) chosen_q = cu.second;
+                  }
+
+                  if (r755_aux_examples != nullptr) {
+                    double realized_kl = 0.0;
+                    double realized_temp = 0.0;
+                    open_spiel::SearchTrainingExample ex;
+                    ex.observation = obs;
+                    ex.player = current_player;
+                    ex.legal_actions = actions;
+                    if (p_cand_data != nullptr) {
+                      ex.candidate_data = *p_cand_data;
+                    }
+                    ex.normalized_visits = open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                        raw_policy_pairs, actions, raw_a, raw_q, v1_res.action, chosen_q,
+                        absl::GetFlag(FLAGS_r765_mpo_temperature),
+                        absl::GetFlag(FLAGS_r765_mpo_max_kl),
+                        &realized_kl, &realized_temp);
+                    ex.best_action = v1_res.action;
+                    ex.raw_action = raw_a;
+                    ex.value_target = 0.0;
+                    ex.value_target_attached = false;
+                    ex.episode_id = episode_id;
+                    ex.decision_id = static_cast<int>(r755_decision_index_);
+                    r755_aux_examples->push_back(std::move(ex));
+
+                    if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                      R765OverrideProbeRecord probe;
+                      probe.root_uid = (episode_id << 16) | static_cast<uint64_t>(r755_decision_index_);
+                      probe.category = (cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot)
+                          ? "card" : "same_card_space";
+                      probe.observation = obs;
+                      probe.legal_actions = actions;
+                      if (p_cand_data != nullptr) probe.candidate_data = *p_cand_data;
+                      probe.a_star = v1_res.action;
+                      probe.a_ref = raw_a;
+                      probe.delta_q = chosen_q - raw_q;
+                      probe.realized_kl = realized_kl;
+                      probe.realized_temp = realized_temp;
+                      const double base_t = std::max(1e-4, absl::GetFlag(FLAGS_r765_mpo_temperature));
+                      probe.kl_cap_bound = (realized_temp > base_t + 1e-9);
+
+                      int s_idx = -1, r_idx = -1;
+                      for (size_t a = 0; a < actions.size(); ++a) {
+                        if (actions[a] == probe.a_star) s_idx = static_cast<int>(a);
+                        if (actions[a] == probe.a_ref) r_idx = static_cast<int>(a);
+                      }
+                      if (s_idx >= 0 && r_idx >= 0 &&
+                          s_idx < static_cast<int>(legal_probabilities.size()) &&
+                          r_idx < static_cast<int>(legal_probabilities.size())) {
+                        double p_star = legal_probabilities[s_idx];
+                        double p_ref = legal_probabilities[r_idx];
+                        probe.t0_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+                      }
+                      const auto& norm_v = r755_aux_examples->back().normalized_visits;
+                      if (s_idx >= 0 && r_idx >= 0 &&
+                          s_idx < static_cast<int>(norm_v.size()) &&
+                          r_idx < static_cast<int>(norm_v.size())) {
+                        double t_star = norm_v[s_idx];
+                        double t_ref = norm_v[r_idx];
+                        probe.target_log_odds = std::log(std::max(1e-12, t_star)) - std::log(std::max(1e-12, t_ref));
+                        size_t max_t_idx = std::max_element(norm_v.begin(), norm_v.end()) - norm_v.begin();
+                        probe.target_flips_argmax = (max_t_idx == static_cast<size_t>(s_idx));
+                      }
+                      local_stats->r765_override_probes.push_back(std::move(probe));
+                    }
+                  }
+                }
+              } else if (!v1_res.overridden && cat == open_spiel::dune_imperium::R755SearchCategory::kAgentCardOrStartPlot) {
+                if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                  if (local_stats->r765_agreed_probes.size() < 16) {
+                    R765AgreedProbeRecord ap;
+                    ap.observation = obs;
+                    ap.legal_actions = actions;
+                    if (p_cand_data != nullptr) ap.candidate_data = *p_cand_data;
+                    ap.greedy_action = raw_a;
+                    local_stats->r765_agreed_probes.push_back(std::move(ap));
+                  }
+                }
+              }
+            } else {
+              open_spiel::ActionsAndProbs collector_raw_prior;
+              open_spiel::dune_imperium::CompoundSearchOptions opts;
+              if (absl::GetFlag(FLAGS_r755_reuse_root_prior)) {
+                collector_raw_prior.reserve(actions.size());
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  double p = (a_idx < legal_probabilities.size()) ? legal_probabilities[a_idx] : 0.0;
+                  collector_raw_prior.push_back({actions[a_idx], p});
+                }
+                opts.precomputed_raw_prior = &collector_raw_prior;
+              }
+              opts.dedup_paired_worlds = absl::GetFlag(FLAGS_r755_dedup_paired_worlds);
+
+              int top_k = 3;
+              int rollouts_per_action = 16;
+              open_spiel::dune_imperium::SearchTruncationMode truncation_mode =
+                  open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
+
+              if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase) {
+                opts.all_buy_candidates = true;
+                opts.symmetric_stage2_confirmation = absl::GetFlag(FLAGS_r755_cat3_symmetric_confirmation);
+                opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage1_rollouts);
+                opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+                opts.stage2_independent_rollouts = absl::GetFlag(FLAGS_r755_cat3_stage2_indep_rollouts);
+                rollouts_per_action = opts.stage1_rollouts + opts.stage2_independent_rollouts;
+                top_k = 12;
+
+                const std::string cat3_trunc_str = absl::GetFlag(FLAGS_r755_cat3_truncation_mode);
+                if (cat3_trunc_str == "next_round" || cat3_trunc_str == "next_round_search_player") {
+                  truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kNextRoundSearchPlayer;
+                } else if (cat3_trunc_str == "plus2_rounds" || cat3_trunc_str == "plus_2_rounds") {
+                  truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kPlus2Rounds;
+                } else if (cat3_trunc_str == "terminal" || cat3_trunc_str == "none") {
+                  truncation_mode = open_spiel::dune_imperium::SearchTruncationMode::kTerminal;
+                } else {
+                  open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_truncation_mode: ", cat3_trunc_str));
+                }
+
+                const std::string cat3_crn_override = absl::GetFlag(FLAGS_r755_cat3_crn_mode);
+                if (!cat3_crn_override.empty()) {
+                  if (cat3_crn_override == "sequential") {
+                    crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kSequential;
+                  } else if (cat3_crn_override == "deck_order") {
+                    crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kDeckOrderCrn;
+                  } else if (cat3_crn_override == "event_keyed") {
+                    crn_mode = open_spiel::dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn;
+                  } else {
+                    open_spiel::SpielFatalError(absl::StrCat("Unknown r755_cat3_crn_mode: ", cat3_crn_override));
+                  }
+                }
+              } else {
+                opts.stage1_rollouts = absl::GetFlag(FLAGS_r755_stage1_rollouts);
+                opts.stage1_min_mean_diff = absl::GetFlag(FLAGS_r755_stage1_min_mean_diff);
+                opts.stage1_subwave_rollouts = absl::GetFlag(FLAGS_r755_stage1_subwave_rollouts);
+                opts.stage1_subwave_min_diff = absl::GetFlag(FLAGS_r755_stage1_subwave_min_diff);
+                opts.center_4seat_leaf_values = absl::GetFlag(FLAGS_r755_leaf_value_centering);
+              }
+
+              auto search_res =
+                  open_spiel::dune_imperium::CompoundRolloutSearchDecision(
+                      *state, current_player, &local_r755_tree,
+                      r755_search_evals_, top_k, rollouts_per_action,
+                      /*min_override_margin=*/0.15,
+                      open_spiel::dune_imperium::TreeReuseMode::kTargetFill,
+                      search_seed,
+                      open_spiel::dune_imperium::SearchPairingMode::kPaired,
+                      truncation_mode,
+                      crn_mode,
+                      /*world_sampler=*/nullptr,
+                      absl::GetFlag(FLAGS_r755_min_t_stat),
+                      opts);
+
+              const std::string root_dump_path = absl::GetFlag(FLAGS_r755_root_dump_jsonl);
+              if (!root_dump_path.empty()) {
+                static std::mutex dump_mutex;
+                std::lock_guard<std::mutex> lock(dump_mutex);
+                std::ofstream out(root_dump_path, std::ios::app);
+                if (out.is_open()) {
+                  out << "{\"episode_id\":" << episode_id
+                      << ",\"decision_id\":" << r755_decision_index_
+                      << ",\"cat\":" << cat_idx
+                      << ",\"raw_action\":" << search_res.raw_action
+                      << ",\"best_action\":" << search_res.best_action
+                      << ",\"chosen_action\":" << search_res.chosen_action
+                      << ",\"overridden\":" << (search_res.overridden ? 1 : 0)
+                      << ",\"stopped_stage1\":" << (search_res.stopped_stage1 ? 1 : 0)
+                      << ",\"resample_fallbacks\":" << search_res.resample_fallbacks
+                      << ",\"nn_evals\":" << search_res.rollout_nn_evals
+                      << ",\"max_raw_p\":" << max_raw_p
+                      << ",\"p_2\":" << p_2
+                      << ",\"cand_actions\":[";
+                  for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
+                    if (ci > 0) out << ",";
+                    out << search_res.candidate_rollout_utilities[ci].first;
+                  }
+                  out << "],\"cand_priors\":[";
+                  for (size_t ci = 0; ci < search_res.candidate_priors.size(); ++ci) {
+                    if (ci > 0) out << ",";
+                    out << search_res.candidate_priors[ci].second;
+                  }
+                  out << "],\"cand_utils\":[";
+                  for (size_t ci = 0; ci < search_res.candidate_rollout_utilities.size(); ++ci) {
+                    if (ci > 0) out << ",";
+                    out << "[";
+                    const auto& utils = search_res.candidate_rollout_utilities[ci].second;
+                    for (size_t ui = 0; ui < utils.size(); ++ui) {
+                      if (ui > 0) out << ",";
+                      out << utils[ui];
+                    }
+                    out << "]";
+                  }
+                  out << "]}\n";
+                }
+              }
+              const bool execute_decision = search_res.teacher_accepted
+                  ? absl::GetFlag(FLAGS_r755_execute_overrides)
+                  : (search_res.overridden && absl::GetFlag(FLAGS_r755_execute_overrides));
+              const Action target_action = search_res.teacher_accepted ? search_res.teacher_action : search_res.chosen_action;
+
+              if (execute_decision) {
+                Action best_action = target_action;
+                int best_idx = -1;
+                for (size_t a_idx = 0; a_idx < actions.size(); ++a_idx) {
+                  if (actions[a_idx] == best_action) {
+                    best_idx = static_cast<int>(a_idx);
+                    break;
+                  }
+                }
+                if (best_idx >= 0) {
+                  action = best_action;
+                  if (best_idx < static_cast<int>(legal_probabilities.size())) {
+                    old_log_prob = static_cast<float>(
+                        std::log(std::max(1e-12, legal_probabilities[best_idx])));
+                  }
+                  r755_override_accepted = true;
+                  if (local_stats != nullptr && cat_idx >= 1 && cat_idx <= 5) {
+                    local_stats->r755_executed_overrides_by_cat[cat_idx]++;
+                  }
+                  if (r755_aux_examples != nullptr) {
+                    double realized_kl = 0.0;
+                    double realized_temp = 0.0;
+                    open_spiel::SearchTrainingExample ex;
+                    ex.observation = obs;
+                    ex.player = current_player;
+                    ex.legal_actions = actions;
+                    if (p_cand_data != nullptr) {
+                      ex.candidate_data = *p_cand_data;
+                    }
+                    if (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase &&
+                        !search_res.stage2_candidate_utilities.empty()) {
+                      ex.normalized_visits =
+                          open_spiel::dune_imperium::ComputeMpoRelativeTarget(
+                              raw_policy_pairs, actions,
+                              search_res.stage2_candidate_utilities,
+                              absl::GetFlag(FLAGS_r755_cat3_mpo_temperature),
+                              absl::GetFlag(FLAGS_r755_cat3_mpo_max_kl),
+                              &realized_kl, &realized_temp);
+                    } else {
+                      double raw_q = search_res.raw_mean_utility;
+                      double best_q = search_res.chosen_mean_utility;
+                      ex.normalized_visits =
+                          open_spiel::dune_imperium::ComputePairwiseMpoTarget(
+                              raw_policy_pairs, actions, search_res.raw_action, raw_q,
+                              search_res.best_action, best_q,
+                              absl::GetFlag(FLAGS_r765_mpo_temperature),
+                              absl::GetFlag(FLAGS_r765_mpo_max_kl),
+                              &realized_kl, &realized_temp);
+                    }
+                    if (search_res.overridden && search_res.chosen_action != search_res.raw_action) {
+                      ex.best_action = search_res.chosen_action;
+                      ex.raw_action = search_res.raw_action;
+                    }
+                    ex.value_target = 0.0;
+                    ex.value_target_attached = false;
+                    ex.episode_id = episode_id;
+                    ex.decision_id = static_cast<int>(r755_decision_index_);
+                    r755_aux_examples->push_back(std::move(ex));
+
+                    if (search_res.overridden && search_res.chosen_action != search_res.raw_action &&
+                        !absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
+                      R765OverrideProbeRecord probe;
+                      probe.root_uid = (episode_id << 16) | static_cast<uint64_t>(r755_decision_index_);
+                      probe.category = (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase)
+                          ? "cat3_purchase" : "same_card_space";
+                      probe.observation = obs;
+                      probe.legal_actions = actions;
+                      if (p_cand_data != nullptr) probe.candidate_data = *p_cand_data;
+                      probe.a_star = search_res.chosen_action;
+                      probe.a_ref = search_res.raw_action;
+                      probe.delta_q = search_res.chosen_mean_utility - search_res.raw_mean_utility;
+                      probe.realized_kl = realized_kl;
+                      probe.realized_temp = realized_temp;
+                      const double base_t = std::max(
+                          1e-4,
+                          (cat == open_spiel::dune_imperium::R755SearchCategory::kRevealPurchase &&
+                           !search_res.stage2_candidate_utilities.empty())
+                              ? absl::GetFlag(FLAGS_r755_cat3_mpo_temperature)
+                              : absl::GetFlag(FLAGS_r765_mpo_temperature));
+                      probe.kl_cap_bound = (realized_temp > base_t + 1e-9);
+
+                      int s_idx = -1, r_idx = -1;
+                      for (size_t a = 0; a < actions.size(); ++a) {
+                        if (actions[a] == probe.a_star) s_idx = static_cast<int>(a);
+                        if (actions[a] == probe.a_ref) r_idx = static_cast<int>(a);
+                      }
+                      if (s_idx >= 0 && r_idx >= 0 &&
+                          s_idx < static_cast<int>(legal_probabilities.size()) &&
+                          r_idx < static_cast<int>(legal_probabilities.size())) {
+                        double p_star = legal_probabilities[s_idx];
+                        double p_ref = legal_probabilities[r_idx];
+                        probe.t0_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+                      }
+                      const auto& norm_v = r755_aux_examples->back().normalized_visits;
+                      if (s_idx >= 0 && r_idx >= 0 &&
+                          s_idx < static_cast<int>(norm_v.size()) &&
+                          r_idx < static_cast<int>(norm_v.size())) {
+                        double t_star = norm_v[s_idx];
+                        double t_ref = norm_v[r_idx];
+                        probe.target_log_odds = std::log(std::max(1e-12, t_star)) - std::log(std::max(1e-12, t_ref));
+                        size_t max_t_idx = std::max_element(norm_v.begin(), norm_v.end()) - norm_v.begin();
+                        probe.target_flips_argmax = (max_t_idx == static_cast<size_t>(s_idx));
+                      }
+                      local_stats->r765_override_probes.push_back(std::move(probe));
+                    }
+                  }
+                }
               }
             }
           }
@@ -4384,6 +4765,9 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
       }
 
       if (r755_hybrid && current_player >= 0 && current_player < 4) {
+        if (action == dune_imperium::kActionEndTurn || action == dune_imperium::kActionReveal) {
+          r765_pending_joint[current_player].Clear();
+        }
         if (action == dune_imperium::kActionEndTurn) {
           r755_turn_trees_[current_player].Reset();
         } else {
@@ -4972,6 +5356,9 @@ struct CollectResult {
   int64_t r755_tech_buys = 0;
   int64_t r755_reveal_turns = 0;
   double r755_unspent_persuasion_sum = 0.0;
+
+  std::vector<R765OverrideProbeRecord> r765_override_probes;
+  std::vector<R765AgreedProbeRecord> r765_agreed_probes;
 };
 
 // Phase A: folds the rollout-side pre-cap |z| canaries into the update's stats
@@ -5256,6 +5643,15 @@ CollectResult CollectRollout(const Game* game,
     result.card11_metrics += stats.card11_metrics;
     result.card13_metrics += stats.card13_metrics;
     result.targeted_buy_telemetry += stats.targeted_buy_telemetry;
+
+    for (const auto& pr : stats.r765_override_probes) {
+      result.r765_override_probes.push_back(pr);
+    }
+    for (const auto& ap : stats.r765_agreed_probes) {
+      if (result.r765_agreed_probes.size() < 64) {
+        result.r765_agreed_probes.push_back(ap);
+      }
+    }
   }
 
   result.targeted_buy_achieved_card11 = open_spiel::dune_targeted_buy::g_targeted_buy_tracker.achieved_games_card11.load(std::memory_order_relaxed);
@@ -12963,6 +13359,39 @@ int main(int argc, char** argv) {
         torch::load(*optimizer, optim_path, device);
       }
 
+      if (!absl::GetFlag(FLAGS_train_value_only) && optimizer) {
+        open_spiel::SetOptimizerLearningRate(
+            *optimizer, absl::GetFlag(FLAGS_learning_rate), absl::GetFlag(FLAGS_new_block_lr));
+        if (critic_optimizer != nullptr) {
+          open_spiel::SetOptimizerLearningRate(*critic_optimizer, absl::GetFlag(FLAGS_learning_rate));
+        }
+        for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+          auto& options =
+              static_cast<torch::optim::AdamWOptions&>(
+                  optimizer->param_groups()[g].options());
+          options.weight_decay(g == 0 ? absl::GetFlag(FLAGS_policy_weight_decay)
+                              : g == 1 ? absl::GetFlag(FLAGS_weight_decay)
+                                       : 0.0);
+        }
+        for (size_t g = 0; g < optimizer->param_groups().size(); ++g) {
+          const auto& options =
+              static_cast<const torch::optim::AdamWOptions&>(
+                  optimizer->param_groups()[g].options());
+          const double expected_lr = GetExpectedGroupLearningRate(
+              g, optimizer->param_groups().size(),
+              absl::GetFlag(FLAGS_learning_rate),
+              absl::GetFlag(FLAGS_new_block_lr));
+          if (std::abs(options.lr() - expected_lr) > 1e-12) {
+            SpielFatalError(absl::StrFormat(
+                "Optimizer parameter group %zu effective learning rate mismatch: expected %.6e, got %.6e",
+                g, expected_lr, options.lr()));
+          }
+        }
+        std::cout << absl::StrFormat(
+            "[INFO] Verified effective learning rate in all %zu optimizer parameter groups\n",
+            optimizer->param_groups().size());
+      }
+
       auto* te_flag = absl::FindCommandLineFlag("target_end_update");
       if (te_flag && te_flag->CurrentValue() != te_flag->DefaultValue() &&
           absl::GetFlag(FLAGS_target_end_update) != shared_manifest.target_end_update) {
@@ -15678,6 +16107,13 @@ int main(int argc, char** argv) {
   };
   std::deque<KeptLabelsRecord> kept_labels_history_25u;
 
+  struct R765AbsorptionUpdateRecord {
+    int update = 0;
+    std::vector<R765OverrideProbeRecord> probes;
+    double mean_t2_live_delta = 0.0;
+  };
+  std::deque<R765AbsorptionUpdateRecord> r765_absorption_history;
+
   open_spiel::V5LegacySlotResidualState v5_slot_residual_state;
   if (training_model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5) {
     v5_slot_residual_state.Initialize(
@@ -16755,6 +17191,311 @@ int main(int argc, char** argv) {
       if (current_non_value_hash != initial_non_value_hash) {
         SpielFatalError(absl::StrFormat("Policy/trunk parameters changed during value-only training! Expected: %s, Got: %s",
                                         initial_non_value_hash, current_non_value_hash));
+      }
+    }
+
+    if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty()) {
+      auto eval_model_probe_probs = [&](
+          std::shared_ptr<SharedDunePolicyValueNetImpl> eval_m,
+          const std::vector<const std::vector<float>*>& obs_ptrs,
+          const std::vector<const dune_semantic::CandidateActionData*>& cads,
+          const std::vector<const std::vector<Action>*>& legals_list,
+          size_t max_chunk_size = 2048) -> std::vector<std::vector<double>> {
+        std::vector<std::vector<double>> batch_probs;
+        const size_t M = obs_ptrs.size();
+        if (M == 0 || !eval_m) return batch_probs;
+        batch_probs.reserve(M);
+        if (max_chunk_size == 0) max_chunk_size = 2048;
+
+        for (size_t chunk_start = 0; chunk_start < M; chunk_start += max_chunk_size) {
+          const size_t chunk_end = std::min(M, chunk_start + max_chunk_size);
+          const size_t chunk_size = chunk_end - chunk_start;
+
+          torch::NoGradGuard no_grad;
+          open_spiel::AutocastGuard autocast_guard(
+              c10::DeviceType::CUDA, device.is_cuda() && absl::GetFlag(FLAGS_train_amp));
+          auto obs_cpu = torch::empty({static_cast<int64_t>(chunk_size), static_cast<int64_t>(obs_size)}, torch::kFloat32);
+          float* obs_ptr = obs_cpu.data_ptr<float>();
+          for (size_t b = 0; b < chunk_size; ++b) {
+            const auto& obs = *obs_ptrs[chunk_start + b];
+            const size_t copy_n = std::min(obs.size(), static_cast<size_t>(obs_size));
+            std::memcpy(obs_ptr + b * static_cast<size_t>(obs_size), obs.data(), copy_n * sizeof(float));
+            if (copy_n < static_cast<size_t>(obs_size)) {
+              std::memset(obs_ptr + b * static_cast<size_t>(obs_size) + copy_n, 0,
+                          (static_cast<size_t>(obs_size) - copy_n) * sizeof(float));
+            }
+          }
+          auto obs_t = obs_cpu.to(device);
+          auto out = eval_m->forward(obs_t);
+          if (eval_m->with_semantic_scorer_ && eval_m->semantic_scorer_) {
+            std::vector<const dune_semantic::CandidateActionData*> chunk_cads(
+                cads.begin() + chunk_start, cads.begin() + chunk_end);
+            dune_semantic::ApplySemanticScorerBatch(
+                eval_m->semantic_scorer_, out.trunk, chunk_cads, out.logits, device);
+          }
+          auto logits_cpu = out.logits.to(torch::kCPU, torch::kFloat32).contiguous();
+          const float* logits_ptr = logits_cpu.data_ptr<float>();
+          const float logit_cap_f = static_cast<float>(absl::GetFlag(FLAGS_logit_cap));
+          std::vector<float> row_logits(action_size);
+          for (size_t b = 0; b < chunk_size; ++b) {
+            std::memcpy(row_logits.data(), logits_ptr + b * static_cast<size_t>(action_size),
+                        static_cast<size_t>(action_size) * sizeof(float));
+            const auto& legals = *legals_list[chunk_start + b];
+            CenterAndCapLegalLogits(row_logits, legals, logit_cap_f);
+            std::vector<double> probs;
+            probs.reserve(legals.size());
+            double max_l = -1e9;
+            for (Action a : legals) {
+              if (a >= 0 && a < action_size) max_l = std::max(max_l, static_cast<double>(row_logits[a]));
+            }
+            double sum_e = 0.0;
+            for (Action a : legals) {
+              double e = (a >= 0 && a < action_size) ? std::exp(row_logits[a] - max_l) : 0.0;
+              probs.push_back(e);
+              sum_e += e;
+            }
+            if (sum_e > 0.0) {
+              for (double& p : probs) p /= sum_e;
+            }
+            batch_probs.push_back(std::move(probs));
+          }
+        }
+        return batch_probs;
+      };
+
+      const size_t n_ov = current_collect.r765_override_probes.size();
+      std::vector<const std::vector<float>*> cur_obs_ptrs;
+      std::vector<const dune_semantic::CandidateActionData*> cur_cads;
+      std::vector<const std::vector<Action>*> cur_legals;
+      cur_obs_ptrs.reserve(n_ov);
+      cur_cads.reserve(n_ov);
+      cur_legals.reserve(n_ov);
+      for (const auto& probe : current_collect.r765_override_probes) {
+        cur_obs_ptrs.push_back(&probe.observation);
+        cur_cads.push_back(&probe.candidate_data);
+        cur_legals.push_back(&probe.legal_actions);
+      }
+
+      auto pi_t2_live = eval_model_probe_probs(training_model, cur_obs_ptrs, cur_cads, cur_legals);
+      auto pi_t2_ema = (ema_model != nullptr)
+          ? eval_model_probe_probs(ema_model, cur_obs_ptrs, cur_cads, cur_legals)
+          : std::vector<std::vector<double>>{};
+
+      std::unordered_set<uint64_t> distinct_roots;
+      std::map<std::string, int64_t> cat_counts = {
+          {"card", 0}, {"same_card_space", 0}, {"cross_card_space", 0},
+          {"graft", 0}, {"cat3_purchase", 0}};
+      double sum_delta_q = 0.0;
+      double sum_realized_kl = 0.0;
+      double sum_realized_temp = 0.0;
+      int64_t kl_cap_bound_count = 0;
+      int64_t target_flips_argmax_count = 0;
+      double sum_delta_log_odds_target = 0.0;
+      double sum_delta_log_odds_t2_live = 0.0;
+      double sum_delta_log_odds_t2_ema = 0.0;
+
+      for (size_t i = 0; i < n_ov; ++i) {
+        auto& probe = current_collect.r765_override_probes[i];
+        distinct_roots.insert(probe.root_uid);
+        cat_counts[probe.category]++;
+        sum_delta_q += probe.delta_q;
+        sum_realized_kl += probe.realized_kl;
+        sum_realized_temp += probe.realized_temp;
+        if (probe.kl_cap_bound) kl_cap_bound_count++;
+        if (probe.target_flips_argmax) target_flips_argmax_count++;
+        sum_delta_log_odds_target += (probe.target_log_odds - probe.t0_log_odds);
+
+        int s_idx = -1, r_idx = -1;
+        for (size_t a = 0; a < probe.legal_actions.size(); ++a) {
+          if (probe.legal_actions[a] == probe.a_star) s_idx = static_cast<int>(a);
+          if (probe.legal_actions[a] == probe.a_ref) r_idx = static_cast<int>(a);
+        }
+        if (s_idx >= 0 && r_idx >= 0 && i < pi_t2_live.size() &&
+            s_idx < static_cast<int>(pi_t2_live[i].size()) &&
+            r_idx < static_cast<int>(pi_t2_live[i].size())) {
+          double p_star = pi_t2_live[i][s_idx];
+          double p_ref = pi_t2_live[i][r_idx];
+          probe.t2_live_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+          sum_delta_log_odds_t2_live += (probe.t2_live_log_odds - probe.t0_log_odds);
+        }
+        if (s_idx >= 0 && r_idx >= 0 && i < pi_t2_ema.size() &&
+            s_idx < static_cast<int>(pi_t2_ema[i].size()) &&
+            r_idx < static_cast<int>(pi_t2_ema[i].size())) {
+          double p_star = pi_t2_ema[i][s_idx];
+          double p_ref = pi_t2_ema[i][r_idx];
+          probe.t2_ema_log_odds = std::log(std::max(1e-12, p_star)) - std::log(std::max(1e-12, p_ref));
+          sum_delta_log_odds_t2_ema += (probe.t2_ema_log_odds - probe.t0_log_odds);
+        }
+      }
+
+      double mean_delta_q = n_ov > 0 ? (sum_delta_q / n_ov) : 0.0;
+      double mean_realized_kl = n_ov > 0 ? (sum_realized_kl / n_ov) : 0.0;
+      double mean_realized_temp = n_ov > 0 ? (sum_realized_temp / n_ov) : 0.0;
+      double kl_cap_bound_frac = n_ov > 0 ? (static_cast<double>(kl_cap_bound_count) / n_ov) : 0.0;
+      double target_flips_argmax_frac = n_ov > 0 ? (static_cast<double>(target_flips_argmax_count) / n_ov) : 0.0;
+      double mean_delta_log_odds_target = n_ov > 0 ? (sum_delta_log_odds_target / n_ov) : 0.0;
+      double mean_delta_log_odds_t1 = stats.aux_t1_measured_rows > 0
+          ? (stats.aux_t1_delta_log_odds_sum / stats.aux_t1_measured_rows) : 0.0;
+      double mean_delta_log_odds_t2_live = n_ov > 0 ? (sum_delta_log_odds_t2_live / n_ov) : 0.0;
+      double mean_delta_log_odds_t2_ema = n_ov > 0 ? (sum_delta_log_odds_t2_ema / n_ov) : 0.0;
+      double ratio_t1 = (mean_delta_log_odds_target > 1e-8)
+          ? (mean_delta_log_odds_t1 / mean_delta_log_odds_target) : 0.0;
+      double ratio_t2_live = (mean_delta_log_odds_target > 1e-8)
+          ? (mean_delta_log_odds_t2_live / mean_delta_log_odds_target) : 0.0;
+
+      double agreed_greedy_preserve_rate = 1.0;
+      if (!current_collect.r765_agreed_probes.empty()) {
+        std::vector<const std::vector<float>*> ag_obs_ptrs;
+        std::vector<const dune_semantic::CandidateActionData*> ag_cads;
+        std::vector<const std::vector<Action>*> ag_legals;
+        ag_obs_ptrs.reserve(current_collect.r765_agreed_probes.size());
+        ag_cads.reserve(current_collect.r765_agreed_probes.size());
+        ag_legals.reserve(current_collect.r765_agreed_probes.size());
+        for (const auto& ap : current_collect.r765_agreed_probes) {
+          ag_obs_ptrs.push_back(&ap.observation);
+          ag_cads.push_back(&ap.candidate_data);
+          ag_legals.push_back(&ap.legal_actions);
+        }
+        auto ag_probs = eval_model_probe_probs(training_model, ag_obs_ptrs, ag_cads, ag_legals);
+        int64_t preserved_count = 0;
+        for (size_t i = 0; i < current_collect.r765_agreed_probes.size(); ++i) {
+          const auto& ap = current_collect.r765_agreed_probes[i];
+          if (i < ag_probs.size() && !ag_probs[i].empty()) {
+            size_t best_idx = std::max_element(ag_probs[i].begin(), ag_probs[i].end()) - ag_probs[i].begin();
+            if (best_idx < ap.legal_actions.size() && ap.legal_actions[best_idx] == ap.greedy_action) {
+              preserved_count++;
+            }
+          }
+        }
+        agreed_greedy_preserve_rate = static_cast<double>(preserved_count) /
+                                      static_cast<double>(current_collect.r765_agreed_probes.size());
+      }
+
+      int64_t t3_5u_roots = 0;
+      double mean_delta_log_odds_t3_5u = 0.0;
+      int64_t t3_10u_roots = 0;
+      double mean_delta_log_odds_t3_10u = 0.0;
+      double ret_10u = 0.0;
+
+      for (const auto& hist_rec : r765_absorption_history) {
+        if (hist_rec.update == update - 5 && !hist_rec.probes.empty()) {
+          std::unordered_set<uint64_t> roots_5u;
+          std::vector<const std::vector<float>*> h_obs;
+          std::vector<const dune_semantic::CandidateActionData*> h_cads;
+          std::vector<const std::vector<Action>*> h_legals;
+          for (const auto& pr : hist_rec.probes) {
+            roots_5u.insert(pr.root_uid);
+            h_obs.push_back(&pr.observation);
+            h_cads.push_back(&pr.candidate_data);
+            h_legals.push_back(&pr.legal_actions);
+          }
+          t3_5u_roots = static_cast<int64_t>(roots_5u.size());
+          auto h_probs = eval_model_probe_probs(training_model, h_obs, h_cads, h_legals);
+          double sum_dlo = 0.0;
+          size_t valid_n = 0;
+          for (size_t i = 0; i < hist_rec.probes.size(); ++i) {
+            const auto& pr = hist_rec.probes[i];
+            int s_idx = -1, r_idx = -1;
+            for (size_t a = 0; a < pr.legal_actions.size(); ++a) {
+              if (pr.legal_actions[a] == pr.a_star) s_idx = static_cast<int>(a);
+              if (pr.legal_actions[a] == pr.a_ref) r_idx = static_cast<int>(a);
+            }
+            if (s_idx >= 0 && r_idx >= 0 && i < h_probs.size() &&
+                s_idx < static_cast<int>(h_probs[i].size()) &&
+                r_idx < static_cast<int>(h_probs[i].size())) {
+              double cur_lo = std::log(std::max(1e-12, h_probs[i][s_idx])) -
+                              std::log(std::max(1e-12, h_probs[i][r_idx]));
+              sum_dlo += (cur_lo - pr.t0_log_odds);
+              valid_n++;
+            }
+          }
+          if (valid_n > 0) mean_delta_log_odds_t3_5u = sum_dlo / valid_n;
+        }
+        if (hist_rec.update == update - 10 && !hist_rec.probes.empty()) {
+          std::unordered_set<uint64_t> roots_10u;
+          std::vector<const std::vector<float>*> h_obs;
+          std::vector<const dune_semantic::CandidateActionData*> h_cads;
+          std::vector<const std::vector<Action>*> h_legals;
+          for (const auto& pr : hist_rec.probes) {
+            roots_10u.insert(pr.root_uid);
+            h_obs.push_back(&pr.observation);
+            h_cads.push_back(&pr.candidate_data);
+            h_legals.push_back(&pr.legal_actions);
+          }
+          t3_10u_roots = static_cast<int64_t>(roots_10u.size());
+          auto h_probs = eval_model_probe_probs(training_model, h_obs, h_cads, h_legals);
+          double sum_dlo = 0.0;
+          size_t valid_n = 0;
+          for (size_t i = 0; i < hist_rec.probes.size(); ++i) {
+            const auto& pr = hist_rec.probes[i];
+            int s_idx = -1, r_idx = -1;
+            for (size_t a = 0; a < pr.legal_actions.size(); ++a) {
+              if (pr.legal_actions[a] == pr.a_star) s_idx = static_cast<int>(a);
+              if (pr.legal_actions[a] == pr.a_ref) r_idx = static_cast<int>(a);
+            }
+            if (s_idx >= 0 && r_idx >= 0 && i < h_probs.size() &&
+                s_idx < static_cast<int>(h_probs[i].size()) &&
+                r_idx < static_cast<int>(h_probs[i].size())) {
+              double cur_lo = std::log(std::max(1e-12, h_probs[i][s_idx])) -
+                              std::log(std::max(1e-12, h_probs[i][r_idx]));
+              sum_dlo += (cur_lo - pr.t0_log_odds);
+              valid_n++;
+            }
+          }
+          if (valid_n > 0) {
+            mean_delta_log_odds_t3_10u = sum_dlo / valid_n;
+            if (hist_rec.mean_t2_live_delta > 1e-8) {
+              ret_10u = mean_delta_log_odds_t3_10u / hist_rec.mean_t2_live_delta;
+            }
+          }
+        }
+      }
+
+      R765AbsorptionUpdateRecord cur_rec;
+      cur_rec.update = update;
+      cur_rec.probes = current_collect.r765_override_probes;
+      cur_rec.mean_t2_live_delta = mean_delta_log_odds_t2_live;
+      r765_absorption_history.push_back(std::move(cur_rec));
+      while (r765_absorption_history.size() > 10) {
+        r765_absorption_history.pop_front();
+      }
+
+      std::string diag_jsonl_path = absl::GetFlag(FLAGS_r765_absorption_diag_jsonl);
+      if (!diag_jsonl_path.empty()) {
+        std::ofstream out(diag_jsonl_path, std::ios::app);
+        if (out.is_open()) {
+          out << "{"
+              << "\"global_update\":" << update
+              << ",\"distinct_override_roots\":" << distinct_roots.size()
+              << ",\"emitted_aux_examples\":" << current_collect.aux_examples.size()
+              << ",\"category_counts\":{"
+              << "\"card\":" << cat_counts["card"]
+              << ",\"same_card_space\":" << cat_counts["same_card_space"]
+              << ",\"cross_card_space\":" << cat_counts["cross_card_space"]
+              << ",\"graft\":" << cat_counts["graft"]
+              << ",\"cat3_purchase\":" << cat_counts["cat3_purchase"]
+              << "}"
+              << ",\"mean_delta_q\":" << mean_delta_q
+              << ",\"mean_realized_kl\":" << mean_realized_kl
+              << ",\"mean_realized_temp\":" << mean_realized_temp
+              << ",\"kl_cap_bound_frac\":" << kl_cap_bound_frac
+              << ",\"target_flips_argmax_frac\":" << target_flips_argmax_frac
+              << ",\"mean_delta_log_odds_target\":" << mean_delta_log_odds_target
+              << ",\"mean_delta_log_odds_t1\":" << mean_delta_log_odds_t1
+              << ",\"mean_delta_log_odds_t2_live\":" << mean_delta_log_odds_t2_live
+              << ",\"mean_delta_log_odds_t2_ema\":" << mean_delta_log_odds_t2_ema
+              << ",\"ratio_t1\":" << ratio_t1
+              << ",\"ratio_t2_live\":" << ratio_t2_live
+              << ",\"t3_5u_roots\":" << t3_5u_roots
+              << ",\"mean_delta_log_odds_t3_5u\":" << mean_delta_log_odds_t3_5u
+              << ",\"t3_10u_roots\":" << t3_10u_roots
+              << ",\"mean_delta_log_odds_t3_10u\":" << mean_delta_log_odds_t3_10u
+              << ",\"ret_10u\":" << ret_10u
+              << ",\"agreed_greedy_preserve_rate\":" << agreed_greedy_preserve_rate
+              << ",\"v5_dynamic_grad_cosine\":" << stats.purchase_grad_cosine
+              << ",\"action_head_grad_cosine\":" << stats.action_head_grad_cosine
+              << "}\n";
+        }
       }
     }
 

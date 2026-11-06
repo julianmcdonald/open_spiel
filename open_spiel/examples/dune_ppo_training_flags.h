@@ -116,5 +116,17 @@ ABSL_DECLARE_FLAG(double, r755_stage1_subwave_min_diff);
 ABSL_DECLARE_FLAG(bool, r755_leaf_value_centering);
 ABSL_DECLARE_FLAG(bool, r755_finish_unvisited_aux_on_kl_stop);
 
+// R7-65 joint agent search & absorption flags.
+ABSL_DECLARE_FLAG(std::string, r765_aux_norm_mode);
+ABSL_DECLARE_FLAG(double, r765_aux_max_slice_coef);
+ABSL_DECLARE_FLAG(bool, r765_joint_agent_search);
+ABSL_DECLARE_FLAG(double, r765_agent_search_prob);
+ABSL_DECLARE_FLAG(double, r765_agent_max_raw_prior);
+ABSL_DECLARE_FLAG(bool, r765_seq_v1_agent_search);
+ABSL_DECLARE_FLAG(int, r765_agent_ref_rollouts);
+ABSL_DECLARE_FLAG(double, r765_mpo_temperature);
+ABSL_DECLARE_FLAG(double, r765_mpo_max_kl);
+ABSL_DECLARE_FLAG(std::string, r765_absorption_diag_jsonl);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

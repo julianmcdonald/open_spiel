@@ -1172,6 +1172,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
         d["three_arm_min_rem_ms"] = t.three_arm_min_rem_ms;
         d["three_arm_max_s1_gap"] = t.three_arm_max_s1_gap;
         d["three_arm_prune_se"] = t.three_arm_prune_se;
+        d["unclocked_c96_3arm_mode"] = t.unclocked_c96_3arm_mode;
+        d["unclocked_3arm_min_s2_worlds"] = t.unclocked_3arm_min_s2_worlds;
         d["enable_rem0_turn_reservation"] = t.enable_rem0_turn_reservation;
         return d;
       })
@@ -1189,7 +1191,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
                                             py::object three_arm_min_rem_ms,
                                             py::object three_arm_max_s1_gap,
                                             py::object three_arm_prune_se,
-                                            py::object enable_rem0_turn_reservation) {
+                                            py::object enable_rem0_turn_reservation,
+                                            py::object unclocked_c96_3arm_mode,
+                                            py::object unclocked_3arm_min_s2_worlds) {
         auto cfg = self.search_v2_tuning();
         if (!subwave_1a_max_budget_ms.is_none()) cfg.subwave_1a_max_budget_ms = subwave_1a_max_budget_ms.cast<double>();
         if (!legacy_s1_inflight_cap.is_none()) cfg.legacy_s1_inflight_cap = legacy_s1_inflight_cap.cast<bool>();
@@ -1205,6 +1209,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
         if (!three_arm_max_s1_gap.is_none()) cfg.three_arm_max_s1_gap = three_arm_max_s1_gap.cast<double>();
         if (!three_arm_prune_se.is_none()) cfg.three_arm_prune_se = three_arm_prune_se.cast<double>();
         if (!enable_rem0_turn_reservation.is_none()) cfg.enable_rem0_turn_reservation = enable_rem0_turn_reservation.cast<bool>();
+        if (!unclocked_c96_3arm_mode.is_none()) cfg.unclocked_c96_3arm_mode = unclocked_c96_3arm_mode.cast<bool>();
+        if (!unclocked_3arm_min_s2_worlds.is_none()) cfg.unclocked_3arm_min_s2_worlds = unclocked_3arm_min_s2_worlds.cast<int>();
         self.set_search_v2_tuning(cfg);
       },
       py::arg("subwave_1a_max_budget_ms") = py::none(),
@@ -1220,15 +1226,18 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       py::arg("three_arm_min_rem_ms") = py::none(),
       py::arg("three_arm_max_s1_gap") = py::none(),
       py::arg("three_arm_prune_se") = py::none(),
-      py::arg("enable_rem0_turn_reservation") = py::none())
+      py::arg("enable_rem0_turn_reservation") = py::none(),
+      py::arg("unclocked_c96_3arm_mode") = py::none(),
+      py::arg("unclocked_3arm_min_s2_worlds") = py::none())
       .def("get_ms_per_rollout_by_round", &open_spiel::DuneAdaptiveRolloutSession::GetMsPerRolloutByRound)
       .def("set_ms_per_rollout_by_round", &open_spiel::DuneAdaptiveRolloutSession::SetMsPerRolloutByRound, py::arg("vals"))
       .def("run_direct_search_v2_root", [](open_spiel::DuneAdaptiveRolloutSession& self,
                                            const open_spiel::State& state,
                                            double target_budget_ms,
                                            uint64_t decision_seed,
-                                           bool is_purchase) {
-        auto res = self.RunDirectSearchV2Root(state, target_budget_ms, decision_seed, is_purchase);
+                                           bool is_purchase,
+                                           int override_ref_rollouts) {
+        auto res = self.RunDirectSearchV2Root(state, target_budget_ms, decision_seed, is_purchase, override_ref_rollouts);
         py::dict d;
         d["elapsed_ms"] = res.elapsed_ms;
         d["stage1_elapsed_ms"] = res.stage1_elapsed_ms;
@@ -1242,6 +1251,7 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
         d["stage2_kept_worlds"] = res.stage2_kept_worlds;
         d["termination_reason"] = res.termination_reason;
         d["overridden"] = res.overridden;
+        d["usable_override"] = res.usable_override;
         d["chosen_first_action"] = res.chosen_first_action;
         d["chosen_graft_action"] = res.chosen_graft_action;
         d["chosen_second_action"] = res.chosen_second_action;
@@ -1252,7 +1262,26 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
         d["num_candidates"] = res.num_candidates;
         d["est_ms_per_sim_used"] = res.est_ms_per_sim_used;
         return d;
-      }, py::arg("state"), py::arg("target_budget_ms"), py::arg("decision_seed"), py::arg("is_purchase") = false)
+      }, py::arg("state"), py::arg("target_budget_ms"), py::arg("decision_seed"), py::arg("is_purchase") = false, py::arg("override_ref_rollouts") = -1)
+      .def("run_direct_search_v1_sequential_root", [](open_spiel::DuneAdaptiveRolloutSession& self,
+                                                      const open_spiel::State& state,
+                                                      double target_budget_ms,
+                                                      uint64_t decision_seed,
+                                                      int override_ref_rollouts) {
+        auto res = self.RunDirectSearchV1SequentialRoot(state, target_budget_ms, decision_seed, override_ref_rollouts);
+        py::dict d;
+        d["elapsed_ms"] = res.elapsed_ms;
+        d["new_rollouts_executed"] = res.new_rollouts_executed;
+        d["overridden"] = res.overridden;
+        d["usable_override"] = res.usable_override;
+        d["chosen_first_action"] = res.chosen_first_action;
+        d["chosen_graft_action"] = res.chosen_graft_action;
+        d["chosen_second_action"] = res.chosen_second_action;
+        d["raw_first_action"] = res.raw_first_action;
+        d["raw_graft_action"] = res.raw_graft_action;
+        d["raw_second_action"] = res.raw_second_action;
+        return d;
+      }, py::arg("state"), py::arg("target_budget_ms"), py::arg("decision_seed"), py::arg("override_ref_rollouts") = -1)
       .def("evaluate_joint_candidates_paired", [](open_spiel::DuneAdaptiveRolloutSession& self,
                                                  const open_spiel::State& state,
                                                  const std::vector<open_spiel::Action>& first_actions,
