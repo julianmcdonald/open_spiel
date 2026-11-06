@@ -9585,6 +9585,106 @@ void TestStep1And2ParityAndBenchmark() {
                               l_cpu.numel() * sizeof(float)) == 0);
     }
 
+    // 1b. v5 Scorer Parity Sub-check (CPU and CUDA, U in {0, 4, 16}, FP64 and FP32, fwd + bwd)
+    for (const auto& dev : devices) {
+      for (const auto& dtype : {torch::kFloat64, torch::kFloat32}) {
+        const double tol = (dtype == torch::kFloat64) ? 1e-12 : 1e-5;
+        for (int U : {0, 4, 16}) {
+          const int B = 16;
+          std::vector<dune_semantic::CandidateActionData> cad_storage(B);
+          std::vector<const dune_semantic::CandidateActionData*> batch_actions(B);
+          for (int b = 0; b < B; ++b) {
+            const int num_cands = 8;
+            auto& cad = cad_storage[b];
+            cad.actions.resize(num_cands);
+            cad.card_ids.resize(num_cands);
+            cad.space_ids.resize(num_cands);
+            cad.supported.resize(num_cands, 1);
+            cad.roles.resize(num_cands, dune_semantic::ActionRole::kBoardSpace);
+            cad.features.resize(num_cands * dune_semantic::kSemanticFeatDim, 0.01f);
+            cad.v5_families.resize(num_cands, -1);
+            cad.v5_item_ids.resize(num_cands, 279);
+            cad.v5_ctx_features.resize(num_cands * dune_semantic::kV5CtxDim, 0.0f);
+
+            const bool is_v5_state = (b < U);
+            for (int j = 0; j < num_cands; ++j) {
+              cad.actions[j] = static_cast<Action>(100 + j);
+              cad.card_ids[j] = (b * 7 + j) % dune_semantic::kCardVocabSize;
+              cad.space_ids[j] = (b * 13 + j) % dune_semantic::kSpaceVocabSize;
+              if (is_v5_state) {
+                cad.v5_families[j] = j % dune_semantic::kV5NumFamilies;
+                cad.v5_item_ids[j] = (b * 17 + j * 3) % dune_semantic::kV5ItemVocabSize;
+                for (int f = 0; f < dune_semantic::kV5CtxDim; ++f) {
+                  cad.v5_ctx_features[j * dune_semantic::kV5CtxDim + f] = 0.02f * ((f + j) % 10);
+                }
+              }
+            }
+            batch_actions[b] = &cad;
+          }
+
+          torch::manual_seed(1001 + U);
+          auto scorer_leg = std::make_shared<dune_semantic::SemanticActionScorerImpl>(
+              /*enable_f=*/true, /*slot_indexed_f=*/true, /*enable_v5=*/true);
+          scorer_leg->to(dev);
+          scorer_leg->to(dtype);
+          scorer_leg->train();
+
+          auto scorer_fast = std::make_shared<dune_semantic::SemanticActionScorerImpl>(
+              /*enable_f=*/true, /*slot_indexed_f=*/true, /*enable_v5=*/true);
+          scorer_fast->to(dev);
+          scorer_fast->to(dtype);
+          scorer_fast->train();
+
+          {
+            torch::NoGradGuard no_grad;
+            auto leg_params = scorer_leg->named_parameters();
+            auto fast_params = scorer_fast->named_parameters();
+            for (const auto& item : leg_params) {
+              fast_params[item.key()].copy_(item.value());
+            }
+          }
+
+          auto opts = torch::TensorOptions().device(dev).dtype(dtype);
+          torch::Tensor trunk_base = torch::randn({B, 2048}, opts);
+          torch::Tensor logits_base = torch::randn({B, 2391}, opts);
+          torch::Tensor target = torch::randn({B, 2391}, opts);
+
+          // 1) Legacy pass
+          dune_semantic::SetForceLegacyV5Scorer(true);
+          torch::Tensor trunk_leg = trunk_base.clone().detach().requires_grad_(true);
+          torch::Tensor logits_leg = logits_base.clone();
+          dune_semantic::ApplySemanticScorerBatch(scorer_leg, trunk_leg, batch_actions, logits_leg, dev);
+          torch::Tensor loss_leg = (logits_leg * target).sum();
+          loss_leg.backward();
+
+          // 2) Fast pass
+          dune_semantic::SetForceLegacyV5Scorer(false);
+          torch::Tensor trunk_fast = trunk_base.clone().detach().requires_grad_(true);
+          torch::Tensor logits_fast = logits_base.clone();
+          dune_semantic::ApplySemanticScorerBatch(scorer_fast, trunk_fast, batch_actions, logits_fast, dev);
+          torch::Tensor loss_fast = (logits_fast * target).sum();
+          loss_fast.backward();
+
+          double fwd_diff = (logits_leg - logits_fast).abs().max().item<double>();
+          UTILS_CHECK(fwd_diff <= tol);
+
+          double trunk_grad_diff = (trunk_leg.grad() - trunk_fast.grad()).abs().max().item<double>();
+          UTILS_CHECK(trunk_grad_diff <= tol);
+
+          auto leg_params = scorer_leg->named_parameters();
+          auto fast_params = scorer_fast->named_parameters();
+          for (const auto& item : leg_params) {
+            if (item.value().grad().defined()) {
+              UTILS_CHECK(fast_params[item.key()].grad().defined());
+              double p_diff = (item.value().grad() - fast_params[item.key()].grad()).abs().max().item<double>();
+              UTILS_CHECK(p_diff <= tol);
+            }
+          }
+        }
+      }
+    }
+    dune_semantic::SetForceLegacyV5Scorer(false);
+
     // Benchmark Semantic Scorer on CUDA if available
     if (torch::cuda::is_available()) {
       torch::Device dev(torch::kCUDA);

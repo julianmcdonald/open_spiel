@@ -403,9 +403,17 @@ struct SearchDiagnostics {
   int stage1_kept_worlds = 0;
   int stage2_planned_worlds = 0;
   int stage2_kept_worlds = 0;
+  int stage1_rollouts_executed = 0;
+  int stage2_rollouts_executed = 0;
   double stage1_elapsed_ms = 0.0;
   double stage2_elapsed_ms = 0.0;
   std::string termination_reason = "none";
+
+  // Calibrated turn reservation diagnostics
+  double pred_rem_0 = -1.0;
+  double pred_max_rem_sub = -1.0;
+  double pred_eff_rem = -1.0;
+  int pred_max_raw_rem = -1;
 };
 
 struct DuneSearchResult {

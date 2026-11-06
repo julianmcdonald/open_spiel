@@ -568,6 +568,22 @@ inline void ExtractCandidateDescriptors(
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 #include <ATen/ops/_scaled_mm.h>
 
+inline std::atomic<bool>& ForceLegacyV5ScorerFlag() {
+  static std::atomic<bool> flag([]() {
+    const char* env = std::getenv("DUNE_LEGACY_V5_SCORER");
+    return env != nullptr && std::string(env) == "1";
+  }());
+  return flag;
+}
+
+inline void SetForceLegacyV5Scorer(bool v) {
+  ForceLegacyV5ScorerFlag().store(v, std::memory_order_relaxed);
+}
+
+inline bool GetForceLegacyV5Scorer() {
+  return ForceLegacyV5ScorerFlag().load(std::memory_order_relaxed);
+}
+
 // Helper struct for persistent BF16 inference weights.
 // Holds un-registered BF16 weight and bias tensors updated in place.
 struct Bf16LinearCache {
@@ -1038,7 +1054,10 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       const torch::Tensor& v5_item_ids = torch::Tensor(),
       const torch::Tensor& v5_families = torch::Tensor(),
       const torch::Tensor& v5_ctx_feat = torch::Tensor(),
-      std::optional<bool> any_v5_hint = std::nullopt) {
+      std::optional<bool> any_v5_hint = std::nullopt,
+      const torch::Tensor& v5_idx_pre = torch::Tensor(),
+      const torch::Tensor& v5_unique_states_pre = torch::Tensor(),
+      const torch::Tensor& v5_state_slot_pre = torch::Tensor()) {
     if (batch_indices.numel() == 0 || feat_tensor.numel() == 0) {
       return;
     }
@@ -1058,6 +1077,104 @@ struct SemanticActionScorerImpl : torch::nn::Module {
         ? (*any_ext_hint && has_ext_mask)
         : has_ext_mask;
 
+    const bool use_fast_v5 = v5_idx_pre.defined() && !GetForceLegacyV5Scorer();
+
+    if (use_fast_v5) {
+      const bool fast_any_v5 = (v5_idx_pre.numel() > 0);
+      if (fast_any_v5 && (!enable_v5_ || !v5_query_proj)) {
+        SpielFatalError(
+            "SemanticActionScorer::ComputeAndAddCorrections: v5 action encountered "
+            "while enable_v5_ is false; semantic_action_v5 scorer required.");
+      }
+
+      auto c_emb = card_embedding->forward(card_ids);     // [M, 32]
+      auto s_emb = space_embedding->forward(space_ids);   // [M, 16]
+      auto d_full = torch::cat({feat_tensor.to(c_emb.dtype()), c_emb, s_emb}, -1); // [M, 104]
+
+      auto d_p = torch::relu(desc_ln->forward(desc_proj_bf16_.Forward(desc_proj, d_full, use_bf16_cache_)));  // [M, 256]
+      auto h_p = precomputed_trunk_proj.defined() ? precomputed_trunk_proj : ProjectTrunk(trunk); // [B, 256]
+      auto h_gathered = h_p.index_select(0, batch_indices);                  // [M, 256]
+
+      auto z = torch::cat({h_gathered, d_p}, -1);                            // [M, 512]
+      auto u = torch::relu(mlp1_ln->forward(mlp1_bf16_.Forward(mlp1, z, use_bf16_cache_)));              // [M, 256]
+      
+      auto legacy_corr = out_layer_bf16_.Forward(out_layer, u, use_bf16_cache_).squeeze(-1);                  // [M]
+      torch::Tensor raw_corr = legacy_corr;
+      if (any_ext) {
+        auto ext_corr = out_layer_ext_bf16_.Forward(out_layer_ext, u, use_bf16_cache_).squeeze(-1);                 // [M]
+        raw_corr = torch::where(is_ext_mask, ext_corr, raw_corr);
+      }
+      if (any_f) {
+        torch::Tensor f_corr;
+        if (slot_indexed_f_ && out_layer_f->options.out_features() == 2) {
+          auto f_out = out_layer_f_bf16_.Forward(out_layer_f, u, use_bf16_cache_); // [M, 2]
+          auto col_indices = (action_indices == (dune_imperium::kActionTleilaxuAcquire0 + 2)).to(torch::kInt64).unsqueeze(1); // [M, 1]
+          f_corr = f_out.gather(1, col_indices).squeeze(1); // [M]
+        } else {
+          f_corr = out_layer_f_bf16_.Forward(out_layer_f, u, use_bf16_cache_).squeeze(-1); // [M]
+        }
+        raw_corr = torch::where(is_f_mask, f_corr, raw_corr);
+      }
+
+      if (fast_any_v5 && torch::GradMode::is_enabled()) {
+        auto is_v5_mask = (v5_families >= 0);
+        raw_corr = torch::where(is_v5_mask, raw_corr.detach(), raw_corr);
+      }
+
+      auto corr = (raw_corr * supported_mask.to(raw_corr.dtype())).to(inout_logits.dtype());      // [M]
+
+      if (fast_any_v5) {
+        const int64_t m_v5 = v5_idx_pre.numel();
+        auto item_v5 = v5_item_ids.index_select(0, v5_idx_pre);
+        auto fam_v5 = v5_families.index_select(0, v5_idx_pre);
+        auto ctx_v5 = v5_ctx_feat.to(h_p.dtype()).index_select(0, v5_idx_pre);
+        auto h_u = h_p.index_select(0, v5_unique_states_pre);  // [U, 256]
+        auto q_u = v5_query_proj_bf16_.Forward(v5_query_proj, h_u, use_bf16_cache_);  // [U, 1440]
+        auto q_all = q_u.index_select(0, v5_state_slot_pre).view({m_v5, kV5NumFamilies, kV5EmbedDim});
+
+        auto fam_expanded = fam_v5.unsqueeze(1).unsqueeze(2).expand({-1, 1, kV5EmbedDim});
+        auto q_sel = q_all.gather(1, fam_expanded).squeeze(1);
+
+        torch::Tensor e_id;
+        if (use_bf16_cache_ && !torch::GradMode::is_enabled() &&
+            v5_item_emb_bf16_.defined() && item_v5.is_cuda() &&
+            at::autocast::is_autocast_enabled(at::kCUDA)) {
+          e_id = at::embedding(v5_item_emb_bf16_, item_v5);
+        } else {
+          e_id = v5_item_emb->forward(item_v5);
+        }
+
+        auto c_v5 = c_emb.index_select(0, v5_idx_pre);
+        if (torch::GradMode::is_enabled()) {
+          c_v5 = c_v5.detach();
+        }
+        auto c_v5_masked = c_v5 * (item_v5 < 256).unsqueeze(-1).to(c_v5.dtype());
+
+        auto k_item = e_id +
+                      v5_card_adapter_bf16_.Forward(v5_card_adapter, c_v5_masked, use_bf16_cache_) +
+                      v5_ctx_proj_bf16_.Forward(v5_ctx_proj, ctx_v5, use_bf16_cache_);
+
+        auto comp_dtype = (raw_corr.dtype() == torch::kFloat64) ? torch::kFloat64 : torch::kFloat32;
+        auto v5_delta = (q_sel.to(comp_dtype) * k_item.to(comp_dtype)).sum(-1);
+
+        auto base_corr = (raw_corr * supported_mask.to(raw_corr.dtype())).to(comp_dtype);
+        base_corr = base_corr.index_put({v5_idx_pre}, base_corr.index_select(0, v5_idx_pre) + v5_delta);
+        corr = base_corr.to(inout_logits.dtype());
+      }
+
+      if (allow_inplace && !torch::GradMode::is_enabled()) {
+        inout_logits.index_put_(
+            {batch_indices, action_indices},
+            inout_logits.index({batch_indices, action_indices}) + corr,
+            /*accumulate=*/false);
+      } else {
+        inout_logits = inout_logits.index_put(
+            {batch_indices, action_indices},
+            inout_logits.index({batch_indices, action_indices}) + corr);
+      }
+      return;
+    }
+
     const bool has_v5_tensor = v5_families.defined() && v5_families.numel() > 0;
     const bool any_v5 = any_v5_hint.has_value()
         ? (*any_v5_hint && has_v5_tensor)
@@ -1070,7 +1187,7 @@ struct SemanticActionScorerImpl : torch::nn::Module {
 
     auto c_emb = card_embedding->forward(card_ids);     // [M, 32]
     auto s_emb = space_embedding->forward(space_ids);   // [M, 16]
-    auto d_full = torch::cat({feat_tensor, c_emb, s_emb}, -1); // [M, 104]
+    auto d_full = torch::cat({feat_tensor.to(c_emb.dtype()), c_emb, s_emb}, -1); // [M, 104]
 
     auto d_p = torch::relu(desc_ln->forward(desc_proj_bf16_.Forward(desc_proj, d_full, use_bf16_cache_)));  // [M, 256]
     auto h_p = precomputed_trunk_proj.defined() ? precomputed_trunk_proj : ProjectTrunk(trunk); // [B, 256]
@@ -1105,7 +1222,7 @@ struct SemanticActionScorerImpl : torch::nn::Module {
       }
     }
 
-    auto corr = (raw_corr * supported_mask).to(inout_logits.dtype());      // [M]
+    auto corr = (raw_corr * supported_mask.to(raw_corr.dtype())).to(inout_logits.dtype());      // [M]
 
     if (any_v5) {
       auto v5_idx = torch::nonzero(is_v5_mask).squeeze(-1);
@@ -1113,7 +1230,7 @@ struct SemanticActionScorerImpl : torch::nn::Module {
         auto b_v5 = batch_indices.index_select(0, v5_idx);
         auto item_v5 = v5_item_ids.index_select(0, v5_idx);
         auto fam_v5 = v5_families.index_select(0, v5_idx);
-        auto ctx_v5 = v5_ctx_feat.index_select(0, v5_idx);
+        auto ctx_v5 = v5_ctx_feat.to(h_p.dtype()).index_select(0, v5_idx);
         auto h_v5 = h_p.index_select(0, b_v5);
 
         auto q_all = v5_query_proj_bf16_.Forward(v5_query_proj, h_v5, use_bf16_cache_).view({-1, kV5NumFamilies, kV5EmbedDim});
@@ -1139,9 +1256,10 @@ struct SemanticActionScorerImpl : torch::nn::Module {
                       v5_card_adapter_bf16_.Forward(v5_card_adapter, c_v5_masked, use_bf16_cache_) +
                       v5_ctx_proj_bf16_.Forward(v5_ctx_proj, ctx_v5, use_bf16_cache_);
 
-        auto v5_delta = (q_sel.to(torch::kFloat32) * k_item.to(torch::kFloat32)).sum(-1);
+        auto comp_dtype = (raw_corr.dtype() == torch::kFloat64) ? torch::kFloat64 : torch::kFloat32;
+        auto v5_delta = (q_sel.to(comp_dtype) * k_item.to(comp_dtype)).sum(-1);
 
-        auto base_corr = (raw_corr * supported_mask).to(torch::kFloat32);
+        auto base_corr = (raw_corr * supported_mask.to(raw_corr.dtype())).to(comp_dtype);
         base_corr = base_corr.index_put({v5_idx}, base_corr.index_select(0, v5_idx) + v5_delta);
         corr = base_corr.to(inout_logits.dtype());
       }
@@ -1213,6 +1331,14 @@ struct SemanticScorerBatchWorkspace {
   torch::Tensor feat_dev_buf;
   torch::Tensor v5_ctx_dev_buf;
 
+  std::vector<int32_t> v5_state_to_slot;
+  torch::Tensor v5_idx_pinned;
+  torch::Tensor v5_unique_states_pinned;
+  torch::Tensor v5_state_slot_pinned;
+  torch::Tensor v5_idx_dev_buf;
+  torch::Tensor v5_unique_states_dev_buf;
+  torch::Tensor v5_state_slot_dev_buf;
+
   void EnsureCapacity(int64_t m, torch::Device device) {
     const bool on_cuda = device.is_cuda();
     if (m <= capacity_m &&
@@ -1233,6 +1359,11 @@ struct SemanticScorerBatchWorkspace {
     v5_ctx_host_buf = torch::empty(
         {alloc_m, static_cast<int64_t>(kV5CtxDim)},
         host_opts.dtype(torch::kFloat32));
+
+    v5_idx_pinned = torch::empty({alloc_m}, host_opts.dtype(torch::kInt64));
+    v5_unique_states_pinned = torch::empty({alloc_m}, host_opts.dtype(torch::kInt64));
+    v5_state_slot_pinned = torch::empty({alloc_m}, host_opts.dtype(torch::kInt64));
+
     if (on_cuda) {
       auto dev_opts = torch::TensorOptions().device(device);
       ints_dev_buf = torch::empty({6 * alloc_m}, dev_opts.dtype(torch::kInt64));
@@ -1244,6 +1375,10 @@ struct SemanticScorerBatchWorkspace {
       v5_ctx_dev_buf = torch::empty(
           {alloc_m, static_cast<int64_t>(kV5CtxDim)},
           dev_opts.dtype(torch::kFloat32));
+
+      v5_idx_dev_buf = torch::empty({alloc_m}, dev_opts.dtype(torch::kInt64));
+      v5_unique_states_dev_buf = torch::empty({alloc_m}, dev_opts.dtype(torch::kInt64));
+      v5_state_slot_dev_buf = torch::empty({alloc_m}, dev_opts.dtype(torch::kInt64));
     }
     capacity_m = alloc_m;
     dev = device;
@@ -1273,9 +1408,33 @@ inline void ApplySemanticScorerBatch(
   torch::Tensor ints_host, bools_host, supp_host, feat_host, v5_ctx_host;
   SemanticScorerBatchWorkspace* active_ws = workspace;
   if (active_ws == nullptr && !torch::GradMode::is_enabled()) {
-    thread_local SemanticScorerBatchWorkspace tls_ws;
-    active_ws = &tls_ws;
+    if (on_cuda) {
+      struct StreamWsEntry {
+        c10::DeviceIndex dev_idx;
+        c10::StreamId stream_id;
+        std::unique_ptr<SemanticScorerBatchWorkspace> ws;
+      };
+      thread_local std::vector<StreamWsEntry> tls_cuda_workspaces;
+      c10::DeviceIndex dev_index = device.has_index() ? device.index() : c10::cuda::current_device();
+      c10::cuda::CUDAStream cur_stream = c10::cuda::getCurrentCUDAStream(dev_index);
+      c10::DeviceIndex d_idx = cur_stream.device_index();
+      c10::StreamId s_id = cur_stream.id();
+      for (auto& entry : tls_cuda_workspaces) {
+        if (entry.dev_idx == d_idx && entry.stream_id == s_id) {
+          active_ws = entry.ws.get();
+          break;
+        }
+      }
+      if (active_ws == nullptr) {
+        tls_cuda_workspaces.push_back({d_idx, s_id, std::make_unique<SemanticScorerBatchWorkspace>()});
+        active_ws = tls_cuda_workspaces.back().ws.get();
+      }
+    } else {
+      thread_local SemanticScorerBatchWorkspace tls_cpu_ws;
+      active_ws = &tls_cpu_ws;
+    }
   }
+
   if (active_ws != nullptr) {
     active_ws->EnsureCapacity(m, device);
     ints_host = active_ws->ints_host_buf.narrow(0, 0, 6 * m).view({6, m});
@@ -1310,6 +1469,38 @@ inline void ApplySemanticScorerBatch(
   float* feat_ptr = feat_host.data_ptr<float>();
   float* v5_ctx_ptr = v5_ctx_host.data_ptr<float>();
 
+  const bool use_fast_v5 = !GetForceLegacyV5Scorer();
+  torch::Tensor v5_idx_pinned, v5_unique_states_pinned, v5_state_slot_pinned;
+  int64_t* v5_idx_ptr = nullptr;
+  int64_t* v5_unique_ptr = nullptr;
+  int64_t* v5_slot_ptr = nullptr;
+  std::vector<int32_t>* state_to_slot_ptr = nullptr;
+  thread_local std::vector<int32_t> tls_state_to_slot;
+
+  if (use_fast_v5) {
+    if (active_ws != nullptr) {
+      v5_idx_pinned = active_ws->v5_idx_pinned.narrow(0, 0, m);
+      v5_unique_states_pinned = active_ws->v5_unique_states_pinned.narrow(0, 0, m);
+      v5_state_slot_pinned = active_ws->v5_state_slot_pinned.narrow(0, 0, m);
+      state_to_slot_ptr = &active_ws->v5_state_to_slot;
+    } else {
+      auto host_opts = torch::TensorOptions().device(torch::kCPU).pinned_memory(on_cuda);
+      v5_idx_pinned = torch::empty({m}, host_opts.dtype(torch::kInt64));
+      v5_unique_states_pinned = torch::empty({m}, host_opts.dtype(torch::kInt64));
+      v5_state_slot_pinned = torch::empty({m}, host_opts.dtype(torch::kInt64));
+      state_to_slot_ptr = &tls_state_to_slot;
+    }
+    v5_idx_ptr = v5_idx_pinned.data_ptr<int64_t>();
+    v5_unique_ptr = v5_unique_states_pinned.data_ptr<int64_t>();
+    v5_slot_ptr = v5_state_slot_pinned.data_ptr<int64_t>();
+
+    if (state_to_slot_ptr->size() < batch_actions.size()) {
+      state_to_slot_ptr->resize(batch_actions.size(), -1);
+    }
+  }
+
+  int64_t m_v5 = 0;
+  int64_t u_v5 = 0;
   bool any_ext = false;
   bool any_f = false;
   bool any_v5 = false;
@@ -1343,7 +1534,20 @@ inline void ApplySemanticScorerBatch(
       int64_t v5_item = (has_v5 && j < data->v5_item_ids.size()) ? data->v5_item_ids[j] : 279;
       v5_fam_ptr[idx] = v5_fam;
       v5_item_ptr[idx] = v5_item;
-      if (v5_fam >= 0) any_v5 = true;
+      if (v5_fam >= 0) {
+        any_v5 = true;
+        if (use_fast_v5) {
+          int32_t slot_u = (*state_to_slot_ptr)[b];
+          if (slot_u < 0) {
+            slot_u = static_cast<int32_t>(u_v5);
+            (*state_to_slot_ptr)[b] = slot_u;
+            v5_unique_ptr[u_v5++] = static_cast<int64_t>(b);
+          }
+          v5_idx_ptr[m_v5] = static_cast<int64_t>(idx);
+          v5_slot_ptr[m_v5] = static_cast<int64_t>(slot_u);
+          ++m_v5;
+        }
+      }
     }
     if (!data->features.empty()) {
       std::memcpy(feat_ptr + cursor * kSemanticFeatDim,
@@ -1358,6 +1562,12 @@ inline void ApplySemanticScorerBatch(
       std::memset(v5_ctx_ptr + cursor * kV5CtxDim, 0, sz * kV5CtxDim * sizeof(float));
     }
     cursor += sz;
+  }
+
+  if (use_fast_v5) {
+    for (int64_t ui = 0; ui < u_v5; ++ui) {
+      (*state_to_slot_ptr)[static_cast<size_t>(v5_unique_ptr[ui])] = -1;
+    }
   }
 
   if (any_f && (!scorer->enable_f_ || !scorer->out_layer_f)) {
@@ -1407,10 +1617,36 @@ inline void ApplySemanticScorerBatch(
   torch::Tensor v5_item_t = ints_dev[4];
   torch::Tensor v5_fam_t = ints_dev[5];
 
+  torch::Tensor v5_idx_t, v5_unique_t, v5_slot_t;
+  if (use_fast_v5) {
+    if (m_v5 > 0) {
+      auto v5_idx_sub = v5_idx_pinned.narrow(0, 0, m_v5);
+      auto v5_unique_sub = v5_unique_states_pinned.narrow(0, 0, u_v5);
+      auto v5_slot_sub = v5_state_slot_pinned.narrow(0, 0, m_v5);
+      if (on_cuda && active_ws != nullptr) {
+        v5_idx_t = active_ws->v5_idx_dev_buf.narrow(0, 0, m_v5);
+        v5_unique_t = active_ws->v5_unique_states_dev_buf.narrow(0, 0, u_v5);
+        v5_slot_t = active_ws->v5_state_slot_dev_buf.narrow(0, 0, m_v5);
+        v5_idx_t.copy_(v5_idx_sub, /*non_blocking=*/true);
+        v5_unique_t.copy_(v5_unique_sub, /*non_blocking=*/true);
+        v5_slot_t.copy_(v5_slot_sub, /*non_blocking=*/true);
+      } else {
+        v5_idx_t = on_cuda ? v5_idx_sub.to(device, /*non_blocking=*/true) : v5_idx_sub;
+        v5_unique_t = on_cuda ? v5_unique_sub.to(device, /*non_blocking=*/true) : v5_unique_sub;
+        v5_slot_t = on_cuda ? v5_slot_sub.to(device, /*non_blocking=*/true) : v5_slot_sub;
+      }
+    } else {
+      v5_idx_t = b_t.narrow(0, 0, 0);
+      v5_unique_t = b_t.narrow(0, 0, 0);
+      v5_slot_t = b_t.narrow(0, 0, 0);
+    }
+  }
+
   scorer->ComputeAndAddCorrections(
       trunk, b_t, a_t, feat_t, c_t, s_t, supp_t, inout_logits,
       is_ext_t, is_f_t, allow_inplace, any_ext, any_f, precomputed_trunk_proj,
-      v5_item_t, v5_fam_t, v5_ctx_t, any_v5);
+      v5_item_t, v5_fam_t, v5_ctx_t, any_v5,
+      v5_idx_t, v5_unique_t, v5_slot_t);
 }
 
 #endif // OPEN_SPIEL_BUILD_WITH_LIBTORCH

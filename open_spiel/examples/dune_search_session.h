@@ -10,6 +10,7 @@
 #include "open_spiel/spiel.h"
 #include "dune_puct_is_mcts.h"
 #include "dune_search_routing.h"
+#include "dune_wide_rollout_search.h"
 
 namespace open_spiel {
 
@@ -227,6 +228,37 @@ struct PairedActionEvaluationResult {
   int num_worlds = 0;
 };
 
+struct DirectSearchV2RootResult {
+  double elapsed_ms = 0.0;
+  double stage1_elapsed_ms = 0.0;
+  double stage2_elapsed_ms = 0.0;
+  int new_rollouts_executed = 0;
+  int stage1_rollouts_executed = 0;
+  int stage2_rollouts_executed = 0;
+  int stage1_planned_worlds = 0;
+  int stage1_kept_worlds = 0;
+  int stage2_planned_worlds = 0;
+  int stage2_kept_worlds = 0;
+  std::string termination_reason = "none";
+  bool overridden = false;
+  Action chosen_first_action = kInvalidAction;
+  Action chosen_graft_action = kInvalidAction;
+  Action chosen_second_action = kInvalidAction;
+  Action raw_first_action = kInvalidAction;
+  Action raw_graft_action = kInvalidAction;
+  Action raw_second_action = kInvalidAction;
+  int chosen_candidate_index = 0;
+  int num_candidates = 0;
+  double est_ms_per_sim_used = 0.0;
+};
+
+struct EvaluateJointCandidatesResult {
+  std::vector<double> mean_utilities;
+  std::vector<std::vector<double>> per_candidate_rollouts;
+  double elapsed_ms = 0.0;
+  int rollouts_executed = 0;
+};
+
 class DuneAdaptiveRolloutSession {
  public:
   DuneAdaptiveRolloutSession(
@@ -283,7 +315,34 @@ class DuneAdaptiveRolloutSession {
   bool enable_fp8_trunk() const { return enable_fp8_trunk_; }
   void set_enable_fp8_trunk(bool val);
   bool search_v2() const { return search_v2_; }
-  void set_search_v2(bool val) { search_v2_ = val; }
+  void set_search_v2(bool val) {
+    search_v2_ = val;
+    if (val && !search_v2_round_priors_initialized_) {
+      ms_per_rollout_by_round_ = {{15.0, 11.8, 11.1, 8.9, 8.0, 6.5, 5.4, 3.5, 2.5, 2.5, 2.5, 2.5}};
+      ms_per_rollout_ema_ = 11.8;
+      search_v2_round_priors_initialized_ = true;
+    }
+  }
+  const dune_imperium::SearchV2TuningConfig& search_v2_tuning() const { return search_v2_tuning_; }
+  void set_search_v2_tuning(const dune_imperium::SearchV2TuningConfig& cfg) { search_v2_tuning_ = cfg; }
+  std::vector<double> GetMsPerRolloutByRound() const {
+    return std::vector<double>(ms_per_rollout_by_round_.begin(), ms_per_rollout_by_round_.end());
+  }
+  void SetMsPerRolloutByRound(const std::vector<double>& vals) {
+    for (size_t i = 0; i < std::min(vals.size(), ms_per_rollout_by_round_.size()); ++i) {
+      if (vals[i] > 0.0) ms_per_rollout_by_round_[i] = vals[i];
+    }
+  }
+  DirectSearchV2RootResult RunDirectSearchV2Root(
+      const State& state, double target_budget_ms, uint64_t decision_seed,
+      bool is_purchase = false);
+  EvaluateJointCandidatesResult EvaluateJointCandidatesPaired(
+      const State& state,
+      const std::vector<Action>& first_actions,
+      const std::vector<Action>& graft_actions,
+      const std::vector<Action>& second_actions,
+      int num_worlds,
+      uint64_t decision_seed);
 
  private:
   std::string checkpoint_path_;
@@ -307,6 +366,8 @@ class DuneAdaptiveRolloutSession {
   bool use_event_keyed_crn_ = true;
   bool enable_fp8_trunk_ = false;
   bool search_v2_ = false;
+  bool search_v2_round_priors_initialized_ = false;
+  dune_imperium::SearchV2TuningConfig search_v2_tuning_{};
   uint64_t search_seed_counter_ = 0;
 
   struct CachedJointFollowupStep {

@@ -982,6 +982,8 @@ struct CompoundSearchDecisionResult {
   int stage1_kept_worlds = 0;
   int stage2_planned_worlds = 0;
   int stage2_kept_worlds = 0;
+  int stage1_rollouts_executed = 0;
+  int stage2_rollouts_executed = 0;
   double stage1_elapsed_ms = 0.0;
   double stage2_elapsed_ms = 0.0;
   std::string termination_reason = "none";

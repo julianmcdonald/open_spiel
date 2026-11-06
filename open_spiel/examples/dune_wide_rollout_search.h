@@ -632,6 +632,7 @@ inline CompoundSearchDecisionResult PairedPriorSortedRolloutSearchDecision(
   const auto s1_t1 = std::chrono::steady_clock::now();
   const double stage1_elapsed_ms =
       std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
+  const int stage1_rollouts_executed = new_rollouts_executed;
 
   const int r_completed = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
 
@@ -1009,6 +1010,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   const auto s1_t1 = std::chrono::steady_clock::now();
   const double stage1_elapsed_ms =
       std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
+  const int stage1_rollouts_executed = new_rollouts_executed;
 
   const int r_stage1_done = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
   stage1_kept_worlds = r_stage1_done;
@@ -1043,6 +1045,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     res.stage1_kept_worlds = stage1_kept_worlds;
     res.stage2_planned_worlds = 0;
     res.stage2_kept_worlds = 0;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = 0;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = 0.0;
     res.termination_reason = "stage1_starved";
@@ -1110,6 +1114,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     res.stage1_kept_worlds = stage1_kept_worlds;
     res.stage2_planned_worlds = 0;
     res.stage2_kept_worlds = 0;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = 0;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = 0.0;
     res.termination_reason = high_conf_skip ? "stage1_high_conf_skip" : "early_stop";
@@ -1263,6 +1269,7 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   const auto s2_t1 = std::chrono::steady_clock::now();
   const double stage2_elapsed_ms =
       std::chrono::duration<double, std::milli>(s2_t1 - s2_t0).count();
+  const int stage2_rollouts_executed = new_rollouts_executed - stage1_rollouts_executed;
 
   const int r_stage2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
   stage2_kept_worlds = r_stage2_done;
@@ -1309,6 +1316,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
     res.stage1_kept_worlds = stage1_kept_worlds;
     res.stage2_planned_worlds = stage2_planned_worlds;
     res.stage2_kept_worlds = stage2_kept_worlds;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = stage2_rollouts_executed;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = stage2_elapsed_ms;
     res.termination_reason = "stage2_starved";
@@ -1423,6 +1432,8 @@ inline CompoundSearchDecisionResult SuccessiveHalvingRolloutSearchDecision(
   res.stage1_kept_worlds = stage1_kept_worlds;
   res.stage2_planned_worlds = stage2_planned_worlds;
   res.stage2_kept_worlds = stage2_kept_worlds;
+  res.stage1_rollouts_executed = stage1_rollouts_executed;
+  res.stage2_rollouts_executed = stage2_rollouts_executed;
   res.stage1_elapsed_ms = stage1_elapsed_ms;
   res.stage2_elapsed_ms = stage2_elapsed_ms;
   res.termination_reason = overridden ? "override" : "stage2_no_override";
@@ -1459,6 +1470,7 @@ struct JointSearchV2Result {
   Action raw_graft_action = kInvalidAction;
   Action raw_second_action = kInvalidAction;
   std::vector<JointAgentCandidate> joint_candidates;
+  int chosen_candidate_index = 0;
 };
 
 inline std::vector<JointAgentCandidate> EnumerateJointAgentCandidates(
@@ -1743,6 +1755,28 @@ SelectOrderedCandidatesAndPriors(
   return {ordered_candidates, candidate_priors};
 }
 
+struct SearchV2TuningConfig {
+  // Step 2A batching & wave sizing controls
+  double subwave_1a_max_budget_ms = 3000.0;  // Set to 1e9 for legacy always-Subwave-1A; sweep {0.0, 3000.0, 4500.0}
+  bool legacy_s1_inflight_cap = false;       // true => min(max_inflight_worlds, 192 / K); false => 512 / K (respecting small CPU test max_inflight_worlds < 96)
+  bool seed_s2_ms_with_min_prior = true;     // true => min(s1_ms_per_sim, est_ms_per_sim) initially, then direct measured after wave 0
+  int s2_max_w0 = 192;                       // Legacy: 48; Step 2A winner: 192
+  int s2_max_wave_worlds = 1024;             // Legacy: 128; Step 2A winner: 1024
+  int s2_inflight_cap = 256;                 // Legacy: 96; sweep {96, 256}
+  bool legacy_clamp_session_inflight = false;// true => also clamp s2_inflight by max_inflight_worlds (96)
+
+  // Step 2B screening & retention controls (Winner: C96_3arm)
+  int r_stage1_cap = 96;                     // Legacy/Step 2A: 16; Step 2B winner: 96
+  double s1_budget_frac = 0.30;              // Legacy/Step 2A: 0.35; Step 2B winner: 0.30
+  bool enable_conditional_3arm_stage2 = true; // Legacy/Step 2A: false; Step 2B winner: true
+  double three_arm_min_rem_ms = 6000.0;
+  double three_arm_max_s1_gap = 0.06;
+  double three_arm_prune_se = 1.5;
+
+  // Step 3.2 turn reservation controls
+  bool enable_rem0_turn_reservation = false;
+};
+
 inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     const State& state,
     Player search_player,
@@ -1761,7 +1795,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     const std::vector<Action>* second_actions = nullptr,
     const std::vector<Action>* graft_actions = nullptr,
     double est_ms_per_sim = 20.0,
-    int* chosen_candidate_index = nullptr) {
+    int* chosen_candidate_index = nullptr,
+    const SearchV2TuningConfig& tuning = SearchV2TuningConfig{}) {
   if (chosen_candidate_index != nullptr) {
     *chosen_candidate_index = 0;
   }
@@ -1799,14 +1834,16 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   const bool has_deadline = (max_time_ms > 0.0);
   const auto start_time = std::chrono::steady_clock::now();
 
-  // 1. Fast Capped Stage-1 Screen (max_stage1_worlds = 16)
+  const bool caller_small_cap = (max_inflight_worlds > 0 && max_inflight_worlds < 96);
+
+  // 1. Capped Stage-1 Screen
   int r_stage1 = 2;
   if (!has_deadline) {
-    r_stage1 = std::clamp(total_budget / (2 * static_cast<int>(K)), 2, 16);
+    r_stage1 = std::clamp(total_budget / (2 * static_cast<int>(K)), 2, tuning.r_stage1_cap);
   } else {
     r_stage1 = std::clamp(
-        static_cast<int>((0.35 * max_time_ms) / std::max(0.5, static_cast<double>(K) * est_ms_per_sim)),
-        2, 16);
+        static_cast<int>((tuning.s1_budget_frac * max_time_ms) / std::max(0.5, static_cast<double>(K) * est_ms_per_sim)),
+        2, tuning.r_stage1_cap);
   }
 
   const auto stage1_deadline = has_deadline
@@ -1821,10 +1858,13 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
              std::chrono::duration<double, std::milli>(0.985 * max_time_ms)))
       : std::chrono::steady_clock::time_point::max();
 
-  // CRITICAL ANTI-STARVATION FIX:
-  // Cap Stage-1 s1_inflight worlds by std::clamp(r_stage1, 2, std::max(2, std::min(max_inflight_worlds, 192 / static_cast<int>(K))))
-  const int s1_cap = std::max(2, std::min(max_inflight_worlds, 192 / static_cast<int>(K)));
-  const int s1_inflight = std::clamp(r_stage1, 2, s1_cap);
+  int s1_pool_cap = std::max(2, 512 / static_cast<int>(K));
+  if (tuning.legacy_s1_inflight_cap) {
+    s1_pool_cap = std::max(2, std::min(max_inflight_worlds, 192 / static_cast<int>(K)));
+  } else if (caller_small_cap) {
+    s1_pool_cap = std::max(2, std::min(max_inflight_worlds, s1_pool_cap));
+  }
+  const int s1_inflight = std::clamp(r_stage1, 2, s1_pool_cap);
 
   std::vector<size_t> candidate_indices(K);
   std::iota(candidate_indices.begin(), candidate_indices.end(), 0);
@@ -1836,7 +1876,7 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   int new_rollouts_executed = 0;
   const auto s1_t0 = std::chrono::steady_clock::now();
 
-  if (has_deadline) {
+  if (has_deadline && max_time_ms <= tuning.subwave_1a_max_budget_ms) {
     // Sub-wave 1A (min_worlds = 2): ALWAYS runs first with min_s1_deadline = start_time + 0.92 * max_time_ms and inflight = 2
     const auto min_s1_deadline = start_time +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -1877,6 +1917,7 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   const auto s1_t1 = std::chrono::steady_clock::now();
   const double stage1_elapsed_ms =
       std::chrono::duration<double, std::milli>(s1_t1 - s1_t0).count();
+  const int stage1_rollouts_executed = new_rollouts_executed;
 
   const int r_stage1_done = per_candidate_rollouts.empty() ? 0 : static_cast<int>(per_candidate_rollouts[0].size());
 
@@ -1910,6 +1951,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     res.stage1_kept_worlds = r_stage1_done;
     res.stage2_planned_worlds = 0;
     res.stage2_kept_worlds = 0;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = 0;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = 0.0;
     res.termination_reason = "stage1_starved";
@@ -1924,8 +1967,10 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
 
   std::vector<double> mean_1(K, 0.0);
   std::vector<double> mean_d_1(K, 0.0);
+  std::vector<double> penalized_adv_1(K, 0.0);
   mean_1[0] = raw_mean_1;
   mean_d_1[0] = 0.0;
+  penalized_adv_1[0] = 0.0;
 
   size_t best_c_idx = 1;
   double highest_penalized_adv_1 = -1e9;
@@ -1937,15 +1982,27 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     }
     mean_1[c_idx] = sum_u / r_stage1_done;
     mean_d_1[c_idx] = mean_1[c_idx] - raw_mean_1;
-    const double penalized_adv_1 = mean_d_1[c_idx] - prior_penalty[c_idx];
-    if (penalized_adv_1 > highest_penalized_adv_1) {
-      highest_penalized_adv_1 = penalized_adv_1;
+    penalized_adv_1[c_idx] = mean_d_1[c_idx] - prior_penalty[c_idx];
+    if (penalized_adv_1[c_idx] > highest_penalized_adv_1) {
+      highest_penalized_adv_1 = penalized_adv_1[c_idx];
       best_c_idx = c_idx;
     }
   }
 
+  size_t second_best_c_idx = 0;
+  double second_highest_penalized_adv_1 = -1e9;
+  if (K >= 3) {
+    for (size_t c_idx = 1; c_idx < K; ++c_idx) {
+      if (c_idx == best_c_idx) continue;
+      if (penalized_adv_1[c_idx] > second_highest_penalized_adv_1) {
+        second_highest_penalized_adv_1 = penalized_adv_1[c_idx];
+        second_best_c_idx = c_idx;
+      }
+    }
+  }
+
   // 2. Smart Stage-1 Early-Stop
-  const double best_challenger_adv_1 = mean_d_1[best_c_idx] - prior_penalty[best_c_idx];
+  const double best_challenger_adv_1 = penalized_adv_1[best_c_idx];
   const bool high_conf_skip =
       (stage1_high_conf_prior_skip > 0.0 &&
        !candidate_priors.empty() &&
@@ -1980,6 +2037,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     res.stage1_kept_worlds = r_stage1_done;
     res.stage2_planned_worlds = 0;
     res.stage2_kept_worlds = 0;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = 0;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = 0.0;
     res.termination_reason = high_conf_skip ? "stage1_high_conf_skip" : "early_stop";
@@ -1987,29 +2046,46 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   }
 
   // 3. Adaptive Stage-2 Wave Ramp + High-Confidence Convergence Stop
-  const std::vector<size_t> stage2_cands = {0, best_c_idx};
+  std::vector<size_t> active_stage2_cands = {0, best_c_idx};
+  if (tuning.enable_conditional_3arm_stage2 && has_deadline && K >= 3 && second_best_c_idx != 0) {
+    const double entry_elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start_time).count();
+    const double entry_rem_ms = std::max(0.0, 0.985 * max_time_ms - entry_elapsed_ms);
+    if (entry_rem_ms >= tuning.three_arm_min_rem_ms &&
+        (penalized_adv_1[best_c_idx] - penalized_adv_1[second_best_c_idx]) <= tuning.three_arm_max_s1_gap) {
+      active_stage2_cands = {0, best_c_idx, second_best_c_idx};
+    }
+  }
+
   int stage2_planned_worlds = 0;
   int stage2_kept_worlds = 0;
   const auto s2_t0 = std::chrono::steady_clock::now();
 
-  const double effective_margin = min_override_margin + prior_penalty[best_c_idx];
-
   if (!has_deadline) {
     int r_stage2 = std::max(16, (total_budget - static_cast<int>(K) * r_stage1_done) / 2);
     stage2_planned_worlds = r_stage2;
-    int s2_inflight = std::min(r_stage2, std::min(max_inflight_worlds, 96));
+    const int num_active_s2 = static_cast<int>(active_stage2_cands.size());
+    int s2_pool_cap = std::max(2, 512 / num_active_s2);
+    int s2_cap = (tuning.legacy_clamp_session_inflight || caller_small_cap)
+        ? std::min(max_inflight_worlds, tuning.s2_inflight_cap)
+        : std::min(s2_pool_cap, tuning.s2_inflight_cap);
+    int s2_inflight = std::min(r_stage2, std::max(2, s2_cap));
     RunClockedPairedRolloutStage(
         state, dune, search_player, evaluators, ordered_candidates,
-        stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1_done,
+        active_stage2_cands, r_stage2, /*world_seed_offset=*/r_stage1_done,
         decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
         final_deadline, active_tree, per_candidate_rollouts,
         new_rollouts_executed, s2_inflight, /*resample_from_infostate=*/true,
         second_actions, graft_actions);
   } else {
     int seed_offset = r_stage1_done;
-    double cur_ms_per_sim = (r_stage1_done > 0 && stage1_elapsed_ms > 0.0)
+    const double s1_ms_per_sim = (r_stage1_done > 0 && stage1_elapsed_ms > 0.0)
         ? (stage1_elapsed_ms / static_cast<double>(K * r_stage1_done))
         : est_ms_per_sim;
+    double cur_ms_per_sim = (tuning.seed_s2_ms_with_min_prior && est_ms_per_sim > 0.0)
+        ? std::min(s1_ms_per_sim, est_ms_per_sim)
+        : s1_ms_per_sim;
+
     while (true) {
       const double total_elapsed_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - start_time).count();
@@ -2020,21 +2096,32 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
       const double rem_ms = std::max(0.0, 0.985 * max_time_ms - total_elapsed_ms);
       if (rem_ms <= 0.0) break;
 
+      const int num_active_s2 = static_cast<int>(active_stage2_cands.size());
+      const double arms_d = static_cast<double>(num_active_s2);
       int wave_worlds = 0;
       if (s2_done_now == 0) {
-        int max_w0 = (rem_ms < 4000.0 ? 12 : 48);
-        wave_worlds = std::clamp(static_cast<int>((0.45 * rem_ms) / std::max(0.1, 2.0 * cur_ms_per_sim)), 2, max_w0);
+        int max_w0 = (rem_ms < 4000.0 ? 12 : tuning.s2_max_w0);
+        wave_worlds = std::clamp(
+            static_cast<int>((0.45 * rem_ms) / std::max(0.1, arms_d * cur_ms_per_sim)),
+            2, max_w0);
       } else {
-        wave_worlds = std::clamp(static_cast<int>(rem_ms / std::max(0.1, 2.0 * cur_ms_per_sim)), 2, 128);
+        wave_worlds = std::clamp(
+            static_cast<int>(rem_ms / std::max(0.1, arms_d * cur_ms_per_sim)),
+            2, tuning.s2_max_wave_worlds);
       }
-      int s2_inflight = std::min(wave_worlds, std::min(max_inflight_worlds, 96));
+
+      const int s2_pool_cap = std::max(2, 512 / num_active_s2);
+      const int s2_cap = (tuning.legacy_clamp_session_inflight || caller_small_cap)
+          ? std::min(max_inflight_worlds, tuning.s2_inflight_cap)
+          : std::min(s2_pool_cap, tuning.s2_inflight_cap);
+      int s2_inflight = std::min(wave_worlds, std::max(2, s2_cap));
 
       stage2_planned_worlds += wave_worlds;
       const int before_size = static_cast<int>(per_candidate_rollouts[0].size());
       const auto wt0 = std::chrono::steady_clock::now();
       RunClockedPairedRolloutStage(
           state, dune, search_player, evaluators, ordered_candidates,
-          stage2_cands, wave_worlds, /*world_seed_offset=*/seed_offset,
+          active_stage2_cands, wave_worlds, /*world_seed_offset=*/seed_offset,
           decision_seed, crn_mode, /*sample_opponent_leader_draft=*/false,
           final_deadline, active_tree, per_candidate_rollouts,
           new_rollouts_executed, s2_inflight, /*resample_from_infostate=*/true,
@@ -2047,30 +2134,101 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
         break;
       }
       if (wt_ms > 0.0) {
-        cur_ms_per_sim = 0.25 * cur_ms_per_sim +
-                         0.75 * (wt_ms / static_cast<double>(2 * wave_kept));
+        const double measured_ms = wt_ms / static_cast<double>(num_active_s2 * wave_kept);
+        if (tuning.seed_s2_ms_with_min_prior && s2_done_now == 0) {
+          cur_ms_per_sim = measured_ms;
+        } else {
+          cur_ms_per_sim = 0.25 * cur_ms_per_sim + 0.75 * measured_ms;
+        }
       }
 
       const int cur_s2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
+
+      if (active_stage2_cands.size() == 3 && cur_s2_done >= 128) {
+        const size_t c1 = active_stage2_cands[1];
+        const size_t c2 = active_stage2_cands[2];
+        double sum_c1 = 0.0, sum_c2 = 0.0;
+        for (int r = 0; r < cur_s2_done; ++r) {
+          sum_c1 += per_candidate_rollouts[c1][r_stage1_done + r];
+          sum_c2 += per_candidate_rollouts[c2][r_stage1_done + r];
+        }
+        const double mean_s2_c1 = sum_c1 / cur_s2_done;
+        const double mean_s2_c2 = sum_c2 / cur_s2_done;
+        const double mean_diff_pair = mean_s2_c1 - mean_s2_c2;
+        double sq_diff_pair = 0.0;
+        for (int r = 0; r < cur_s2_done; ++r) {
+          double diff = (per_candidate_rollouts[c1][r_stage1_done + r] -
+                         per_candidate_rollouts[c2][r_stage1_done + r]) - mean_diff_pair;
+          sq_diff_pair += diff * diff;
+        }
+        const double var_pair = sq_diff_pair / (cur_s2_done - 1);
+        const double se_pair = std::sqrt(var_pair / cur_s2_done);
+        const double score1 = mean_s2_c1 - prior_penalty[c1];
+        const double score2 = mean_s2_c2 - prior_penalty[c2];
+        const size_t lead_c = (score1 >= score2) ? c1 : c2;
+        const double gap = std::abs(score1 - score2);
+        if ((se_pair > 1e-9 && gap >= tuning.three_arm_prune_se * se_pair) ||
+            (se_pair <= 1e-9 && gap > 0.0)) {
+          active_stage2_cands = {0, lead_c};
+          best_c_idx = lead_c;
+        }
+      }
+
       if (cur_s2_done >= 128) {
-        double sum_d_s2 = 0.0;
-        for (int r = 0; r < cur_s2_done; ++r) {
-          sum_d_s2 += (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
+        if (active_stage2_cands.size() == 2) {
+          const size_t cur_best = active_stage2_cands[1];
+          const double eff_m = min_override_margin + prior_penalty[cur_best];
+          double sum_d_s2 = 0.0;
+          for (int r = 0; r < cur_s2_done; ++r) {
+            sum_d_s2 += (per_candidate_rollouts[cur_best][r_stage1_done + r] -
+                         per_candidate_rollouts[0][r_stage1_done + r]);
+          }
+          const double mean_d_s2 = sum_d_s2 / cur_s2_done;
+          double sq_diff_s2 = 0.0;
+          for (int r = 0; r < cur_s2_done; ++r) {
+            double diff = (per_candidate_rollouts[cur_best][r_stage1_done + r] -
+                           per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_s2;
+            sq_diff_s2 += diff * diff;
+          }
+          const double var_d_s2 = sq_diff_s2 / (cur_s2_done - 1);
+          const double se_d_s2 = std::sqrt(var_d_s2 / cur_s2_done);
+          if (se_d_s2 > 1e-9 &&
+              (mean_d_s2 < eff_m - 3.5 * se_d_s2 ||
+               (mean_d_s2 > eff_m + 3.5 * se_d_s2 && mean_d_s2 / se_d_s2 >= 2.5))) {
+            break;
+          }
+        } else if (active_stage2_cands.size() == 3) {
+          const size_t c1 = active_stage2_cands[1];
+          const size_t c2 = active_stage2_cands[2];
+          const double eff_m1 = min_override_margin + prior_penalty[c1];
+          const double eff_m2 = min_override_margin + prior_penalty[c2];
+
+          double sum_d1 = 0.0, sum_d2 = 0.0;
+          for (int r = 0; r < cur_s2_done; ++r) {
+            sum_d1 += (per_candidate_rollouts[c1][r_stage1_done + r] -
                        per_candidate_rollouts[0][r_stage1_done + r]);
-        }
-        const double mean_d_s2 = sum_d_s2 / cur_s2_done;
-        double sq_diff_s2 = 0.0;
-        for (int r = 0; r < cur_s2_done; ++r) {
-          double diff = (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
-                         per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_s2;
-          sq_diff_s2 += diff * diff;
-        }
-        const double var_d_s2 = sq_diff_s2 / (cur_s2_done - 1);
-        const double se_d_s2 = std::sqrt(var_d_s2 / cur_s2_done);
-        if (se_d_s2 > 1e-9 &&
-            (mean_d_s2 < effective_margin - 3.5 * se_d_s2 ||
-             (mean_d_s2 > effective_margin + 3.5 * se_d_s2 && mean_d_s2 / se_d_s2 >= 2.5))) {
-          break;
+            sum_d2 += (per_candidate_rollouts[c2][r_stage1_done + r] -
+                       per_candidate_rollouts[0][r_stage1_done + r]);
+          }
+          const double mean_d1 = sum_d1 / cur_s2_done;
+          const double mean_d2 = sum_d2 / cur_s2_done;
+          double sq_diff1 = 0.0, sq_diff2 = 0.0;
+          for (int r = 0; r < cur_s2_done; ++r) {
+            double diff1 = (per_candidate_rollouts[c1][r_stage1_done + r] -
+                            per_candidate_rollouts[0][r_stage1_done + r]) - mean_d1;
+            double diff2 = (per_candidate_rollouts[c2][r_stage1_done + r] -
+                            per_candidate_rollouts[0][r_stage1_done + r]) - mean_d2;
+            sq_diff1 += diff1 * diff1;
+            sq_diff2 += diff2 * diff2;
+          }
+          const double se1 = std::sqrt((sq_diff1 / (cur_s2_done - 1)) / cur_s2_done);
+          const double se2 = std::sqrt((sq_diff2 / (cur_s2_done - 1)) / cur_s2_done);
+
+          const bool both_lose = (se1 > 1e-9 && mean_d1 < eff_m1 - 3.5 * se1) &&
+                                 (se2 > 1e-9 && mean_d2 < eff_m2 - 3.5 * se2);
+          if (both_lose) {
+            break;
+          }
         }
       }
     }
@@ -2079,31 +2237,18 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   const auto s2_t1 = std::chrono::steady_clock::now();
   const double stage2_elapsed_ms =
       std::chrono::duration<double, std::milli>(s2_t1 - s2_t0).count();
+  const int stage2_rollouts_executed = new_rollouts_executed - stage1_rollouts_executed;
 
   const int r_stage2_done = static_cast<int>(per_candidate_rollouts[0].size()) - r_stage1_done;
   stage2_kept_worlds = r_stage2_done;
 
   if (r_stage2_done < 2) {
-    const int R_tot = static_cast<int>(per_candidate_rollouts[0].size());
-    double raw_sum = 0.0;
-    for (int r = 0; r < R_tot; ++r) {
-      raw_sum += per_candidate_rollouts[0][r];
-    }
-    const double raw_mean_tot = (R_tot > 0) ? (raw_sum / R_tot) : 0.0;
-
     std::vector<std::pair<Action, double>> candidate_utilities;
     candidate_utilities.reserve(K);
     for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-      double u_val = 0.0;
-      if (c_idx == 0) {
-        u_val = raw_mean_tot;
-      } else if (c_idx == best_c_idx && !per_candidate_rollouts[best_c_idx].empty()) {
-        double b_sum = 0.0;
-        for (double v : per_candidate_rollouts[best_c_idx]) b_sum += v;
-        u_val = b_sum / per_candidate_rollouts[best_c_idx].size();
-      } else {
-        u_val = mean_1[c_idx];
-      }
+      double u_sum = 0.0;
+      for (double val : per_candidate_rollouts[c_idx]) u_sum += val;
+      double u_val = per_candidate_rollouts[c_idx].empty() ? 0.0 : (u_sum / per_candidate_rollouts[c_idx].size());
       candidate_utilities.push_back({ordered_candidates[c_idx], u_val});
     }
     std::vector<std::pair<Action, std::vector<double>>> candidate_rollout_utilities;
@@ -2115,8 +2260,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     CompoundSearchDecisionResult res;
     res.action = raw_action;
     res.overridden = false;
-    res.raw_mean_utility = raw_mean_tot;
-    res.chosen_mean_utility = raw_mean_tot;
+    res.raw_mean_utility = candidate_utilities[0].second;
+    res.chosen_mean_utility = candidate_utilities[0].second;
     res.prior_rollouts_reused = prior_rollouts_reused;
     res.new_rollouts_executed = new_rollouts_executed;
     res.candidate_utilities = std::move(candidate_utilities);
@@ -2125,6 +2270,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     res.stage1_kept_worlds = r_stage1_done;
     res.stage2_planned_worlds = stage2_planned_worlds;
     res.stage2_kept_worlds = stage2_kept_worlds;
+    res.stage1_rollouts_executed = stage1_rollouts_executed;
+    res.stage2_rollouts_executed = stage2_rollouts_executed;
     res.stage1_elapsed_ms = stage1_elapsed_ms;
     res.stage2_elapsed_ms = stage2_elapsed_ms;
     res.termination_reason = "stage2_starved";
@@ -2133,66 +2280,97 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
 
   const int R_total = r_stage1_done + r_stage2_done;
 
-  // Stage 2 paired difference
-  double sum_d_stage2 = 0.0;
-  for (int r = 0; r < r_stage2_done; ++r) {
-    sum_d_stage2 += (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
-                     per_candidate_rollouts[0][r_stage1_done + r]);
-  }
-  const double mean_d_stage2 = sum_d_stage2 / r_stage2_done;
+  auto compute_candidate_stats = [&](size_t c_idx) {
+    double sum_d_s2 = 0.0;
+    for (int r = 0; r < r_stage2_done; ++r) {
+      sum_d_s2 += (per_candidate_rollouts[c_idx][r_stage1_done + r] -
+                   per_candidate_rollouts[0][r_stage1_done + r]);
+    }
+    const double mean_d_s2 = sum_d_s2 / r_stage2_done;
+    double sq_diff_s2 = 0.0;
+    for (int r = 0; r < r_stage2_done; ++r) {
+      double diff = (per_candidate_rollouts[c_idx][r_stage1_done + r] -
+                     per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_s2;
+      sq_diff_s2 += diff * diff;
+    }
+    const double var_d_s2 = (r_stage2_done > 1) ? (sq_diff_s2 / (r_stage2_done - 1)) : 0.0;
+    const double se_d_s2 = (r_stage2_done > 1) ? std::sqrt(var_d_s2 / r_stage2_done) : 0.0;
+    const double t_stat_s2 = (r_stage2_done >= 2)
+        ? ((se_d_s2 > 1e-9) ? (mean_d_s2 / se_d_s2) : (mean_d_s2 > 0.0 ? 100.0 : 0.0))
+        : 0.0;
 
-  double sum_sq_diff_stage2 = 0.0;
-  for (int r = 0; r < r_stage2_done; ++r) {
-    double diff = (per_candidate_rollouts[best_c_idx][r_stage1_done + r] -
-                   per_candidate_rollouts[0][r_stage1_done + r]) - mean_d_stage2;
-    sum_sq_diff_stage2 += diff * diff;
-  }
-  const double var_d_stage2 = (r_stage2_done > 1) ? (sum_sq_diff_stage2 / (r_stage2_done - 1)) : 0.0;
-  const double se_d_stage2 = (r_stage2_done > 1) ? std::sqrt(var_d_stage2 / r_stage2_done) : 0.0;
-  const double t_stat_stage2 = (r_stage2_done >= 2)
-      ? ((se_d_stage2 > 1e-9) ? (mean_d_stage2 / se_d_stage2) : (mean_d_stage2 > 0.0 ? 100.0 : 0.0))
-      : 0.0;
+    double sum_raw = 0.0, sum_c = 0.0;
+    for (int r = 0; r < R_total; ++r) {
+      sum_raw += per_candidate_rollouts[0][r];
+      sum_c += per_candidate_rollouts[c_idx][r];
+    }
+    const double mean_raw = sum_raw / R_total;
+    const double mean_c = sum_c / R_total;
+    const double mean_d_tot = mean_c - mean_raw;
+    double sq_diff_tot = 0.0;
+    for (int r = 0; r < R_total; ++r) {
+      double diff = (per_candidate_rollouts[c_idx][r] - per_candidate_rollouts[0][r]) - mean_d_tot;
+      sq_diff_tot += diff * diff;
+    }
+    const double var_d_tot = (R_total > 1) ? (sq_diff_tot / (R_total - 1)) : 0.0;
+    const double se_d_tot = (R_total > 1) ? std::sqrt(var_d_tot / R_total) : 0.0;
+    const double t_stat_tot = (R_total >= 2)
+        ? ((se_d_tot > 1e-9) ? (mean_d_tot / se_d_tot) : (mean_d_tot > 0.0 ? 100.0 : 0.0))
+        : 0.0;
 
-  // Total statistics across all R_total rollouts
-  double sum_raw_total = 0.0;
-  double sum_best_total = 0.0;
-  for (int r = 0; r < R_total; ++r) {
-    sum_raw_total += per_candidate_rollouts[0][r];
-    sum_best_total += per_candidate_rollouts[best_c_idx][r];
-  }
-  const double raw_mean_total = sum_raw_total / R_total;
-  const double best_cand_mean_total = sum_best_total / R_total;
-  const double mean_d_total = best_cand_mean_total - raw_mean_total;
+    const double eff_m = min_override_margin + prior_penalty[c_idx];
+    bool passes = false;
+    if (r_stage2_done >= 16) {
+      passes = (mean_d_s2 >= eff_m && t_stat_s2 >= 1.50 && mean_d_tot >= 0.75 * eff_m);
+    } else {
+      passes = (mean_d_s2 > 0.0 && mean_d_tot >= eff_m && t_stat_tot >= 1.50);
+    }
+    return std::make_tuple(passes, mean_d_s2, se_d_s2, mean_d_s2 - prior_penalty[c_idx]);
+  };
 
-  double sum_sq_diff_total = 0.0;
-  for (int r = 0; r < R_total; ++r) {
-    double diff = (per_candidate_rollouts[best_c_idx][r] - per_candidate_rollouts[0][r]) - mean_d_total;
-    sum_sq_diff_total += diff * diff;
-  }
-  const double var_d_total = (R_total > 1) ? (sum_sq_diff_total / (R_total - 1)) : 0.0;
-  const double se_d_total = (R_total > 1) ? std::sqrt(var_d_total / R_total) : 0.0;
-  const double t_stat_total = (R_total >= 2)
-      ? ((se_d_total > 1e-9) ? (mean_d_total / se_d_total) : (mean_d_total > 0.0 ? 100.0 : 0.0))
-      : 0.0;
-
-  // 4. Unbiased Stage-2 Override Gate
   bool should_override = false;
-  if (r_stage2_done >= 16) {
-    should_override = (mean_d_stage2 >= effective_margin &&
-                       t_stat_stage2 >= 1.50 &&
-                       mean_d_total >= 0.75 * effective_margin);
-  } else {
-    should_override = (mean_d_stage2 > 0.0 &&
-                       mean_d_total >= effective_margin &&
-                       t_stat_total >= 1.50);
+  double final_mean_d_s2 = 0.0;
+  double final_se_d_s2 = 0.0;
+
+  if (active_stage2_cands.size() == 2) {
+    best_c_idx = active_stage2_cands[1];
+    auto [passes, m_d, se_d, score] = compute_candidate_stats(best_c_idx);
+    should_override = passes;
+    final_mean_d_s2 = m_d;
+    final_se_d_s2 = se_d;
+  } else if (active_stage2_cands.size() == 3) {
+    const size_t c1 = active_stage2_cands[1];
+    const size_t c2 = active_stage2_cands[2];
+    auto [p1, m_d1, se_d1, score1] = compute_candidate_stats(c1);
+    auto [p2, m_d2, se_d2, score2] = compute_candidate_stats(c2);
+
+    if (p1 && !p2) {
+      best_c_idx = c1;
+      should_override = true;
+      final_mean_d_s2 = m_d1;
+      final_se_d_s2 = se_d1;
+    } else if (!p1 && p2) {
+      best_c_idx = c2;
+      should_override = true;
+      final_mean_d_s2 = m_d2;
+      final_se_d_s2 = se_d2;
+    } else if (p1 && p2) {
+      best_c_idx = (score1 >= score2) ? c1 : c2;
+      should_override = true;
+      final_mean_d_s2 = (best_c_idx == c1) ? m_d1 : m_d2;
+      final_se_d_s2 = (best_c_idx == c1) ? se_d1 : se_d2;
+    } else {
+      best_c_idx = (score1 >= score2) ? c1 : c2;
+      should_override = false;
+      final_mean_d_s2 = (best_c_idx == c1) ? m_d1 : m_d2;
+      final_se_d_s2 = (best_c_idx == c1) ? se_d1 : se_d2;
+    }
   }
 
   Action best_action = raw_action;
-  double best_mean_u = raw_mean_total;
   bool overridden = false;
   if (should_override) {
     best_action = ordered_candidates[best_c_idx];
-    best_mean_u = best_cand_mean_total;
     overridden = true;
     if (chosen_candidate_index != nullptr) {
       *chosen_candidate_index = static_cast<int>(best_c_idx);
@@ -2202,14 +2380,9 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   std::vector<std::pair<Action, double>> candidate_utilities;
   candidate_utilities.reserve(K);
   for (size_t c_idx = 0; c_idx < K; ++c_idx) {
-    double u_val = 0.0;
-    if (c_idx == 0) {
-      u_val = raw_mean_total;
-    } else if (c_idx == best_c_idx) {
-      u_val = best_cand_mean_total;
-    } else {
-      u_val = mean_1[c_idx];
-    }
+    double u_sum = 0.0;
+    for (double val : per_candidate_rollouts[c_idx]) u_sum += val;
+    double u_val = per_candidate_rollouts[c_idx].empty() ? 0.0 : (u_sum / per_candidate_rollouts[c_idx].size());
     candidate_utilities.push_back({ordered_candidates[c_idx], u_val});
   }
 
@@ -2222,8 +2395,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   CompoundSearchDecisionResult res;
   res.action = best_action;
   res.overridden = overridden;
-  res.raw_mean_utility = raw_mean_total;
-  res.chosen_mean_utility = best_mean_u;
+  res.raw_mean_utility = candidate_utilities[0].second;
+  res.chosen_mean_utility = (best_action == raw_action) ? candidate_utilities[0].second : candidate_utilities[best_c_idx].second;
   res.prior_rollouts_reused = prior_rollouts_reused;
   res.new_rollouts_executed = new_rollouts_executed;
   res.candidate_utilities = std::move(candidate_utilities);
@@ -2232,11 +2405,13 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
   res.stage1_kept_worlds = r_stage1_done;
   res.stage2_planned_worlds = stage2_planned_worlds;
   res.stage2_kept_worlds = stage2_kept_worlds;
+  res.stage1_rollouts_executed = stage1_rollouts_executed;
+  res.stage2_rollouts_executed = stage2_rollouts_executed;
   res.stage1_elapsed_ms = stage1_elapsed_ms;
   res.stage2_elapsed_ms = stage2_elapsed_ms;
   res.termination_reason = overridden ? "override" : "stage2_no_override";
-  res.mean_d_stage2 = mean_d_stage2;
-  res.se_d_stage2 = se_d_stage2;
+  res.mean_d_stage2 = final_mean_d_s2;
+  res.se_d_stage2 = final_se_d_s2;
   return res;
 }
 
@@ -2257,7 +2432,8 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
     const ActionsAndProbs* precomputed_raw_prior = nullptr,
     double est_ms_per_sim = 20.0,
     const std::vector<Action>* second_actions = nullptr,
-    int* chosen_candidate_index = nullptr) {
+    int* chosen_candidate_index = nullptr,
+    const SearchV2TuningConfig& tuning = SearchV2TuningConfig{}) {
   if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   const auto legal = state.LegalActions();
   if (legal.empty()) return {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
@@ -2277,7 +2453,7 @@ inline CompoundSearchDecisionResult SearchV2SuccessiveHalvingDecision(
       candidate_priors, reference_rollouts_per_action, min_override_margin,
       decision_seed, crn_mode, max_time_ms, max_inflight_worlds,
       prior_log_ratio_weight, stage1_high_conf_prior_skip, second_actions,
-      /*graft_actions=*/nullptr, est_ms_per_sim, chosen_candidate_index);
+      /*graft_actions=*/nullptr, est_ms_per_sim, chosen_candidate_index, tuning);
 }
 
 inline JointSearchV2Result SearchV2JointPlacementDecision(
@@ -2295,7 +2471,8 @@ inline JointSearchV2Result SearchV2JointPlacementDecision(
     double stage1_high_conf_prior_skip = 0.95,
     const ActionsAndProbs* precomputed_raw_prior = nullptr,
     double est_ms_per_sim = 20.0,
-    size_t max_candidates = 8) {
+    size_t max_candidates = 8,
+    const SearchV2TuningConfig& tuning = SearchV2TuningConfig{}) {
   if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
   const auto legal = state.LegalActions();
   if (legal.empty()) {
@@ -2346,13 +2523,14 @@ inline JointSearchV2Result SearchV2JointPlacementDecision(
       reference_rollouts_per_action, min_override_margin, decision_seed,
       crn_mode, max_time_ms, max_inflight_worlds, prior_log_ratio_weight,
       stage1_high_conf_prior_skip, &second_actions, &graft_actions, est_ms_per_sim,
-      &chosen_c_idx);
+      &chosen_c_idx, tuning);
 
   JointSearchV2Result res;
   res.base = base_res;
   res.raw_first_action = joint_cands[0].first_action;
   res.raw_graft_action = joint_cands[0].graft_action;
   res.raw_second_action = joint_cands[0].second_action;
+  res.chosen_candidate_index = chosen_c_idx;
   if (chosen_c_idx >= 0 && chosen_c_idx < static_cast<int>(joint_cands.size())) {
     res.chosen_first_action = joint_cands[chosen_c_idx].first_action;
     res.chosen_graft_action = joint_cands[chosen_c_idx].graft_action;
