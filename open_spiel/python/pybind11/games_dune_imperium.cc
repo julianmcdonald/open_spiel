@@ -471,6 +471,8 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
            py::arg("observer"), py::arg("observations"))
       .def("set_steam_endgame_intrigue_evidence", &DuneImperiumState::SetSteamEndgameIntrigueEvidence,
            py::arg("hands"), py::arg("optional_selections") = std::vector<std::vector<int>>{})
+      .def("observe_steam_endgame_scarab", &DuneImperiumState::ObserveSteamEndgameScarab,
+           py::arg("player"))
       .def("get_steam_endgame_intrigue_evidence", &DuneImperiumState::GetSteamEndgameIntrigueEvidence)
       .def("get_steam_endgame_intrigue_selections", &DuneImperiumState::GetSteamEndgameIntrigueSelections)
       .def("has_steam_endgame_intrigue_evidence", &DuneImperiumState::HasSteamEndgameIntrigueEvidence)
