@@ -333,9 +333,11 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("set_steam_prefer_played_in_play_trash",
            &DuneImperiumState::SetSteamPreferPlayedInPlayTrash,
            py::arg("prefer"))
-      .def("steam_select_queued_selective_breeding_trash",
-           &DuneImperiumState::SteamSelectQueuedSelectiveBreedingTrash,
-           py::arg("player"))
+      .def("get_pending_trash_choice_descriptors",
+           &DuneImperiumState::GetPendingTrashChoiceDescriptors)
+      .def("steam_select_queued_trash_choice",
+           &DuneImperiumState::SteamSelectQueuedTrashChoice,
+           py::arg("player"), py::arg("descriptor"))
       .def("copy_state_from",
            &DuneImperiumState::CopyStateFrom,
            py::arg("other"))
