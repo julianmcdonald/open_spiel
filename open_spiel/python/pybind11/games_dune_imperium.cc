@@ -842,6 +842,9 @@ void open_spiel::init_pyspiel_games_dune_imperium(py::module &m) {
       .def("acquire_imperium_card",
            &DuneImperiumState::AcquireImperiumCardForTesting, py::arg("player"),
            py::arg("card_id"), py::arg("to_topdeck"))
+      .def("resolve_observed_bypass_protocol",
+           &DuneImperiumState::ResolveObservedBypassProtocol, py::arg("player"),
+           py::arg("card_id"), py::arg("to_topdeck"))
       .def("acquire_tleilaxu_imperium_card",
            &DuneImperiumState::AcquireTleilaxuImperiumCardForTesting,
            py::arg("player"), py::arg("card_id"))
