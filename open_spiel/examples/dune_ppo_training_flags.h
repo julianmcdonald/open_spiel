@@ -127,6 +127,13 @@ ABSL_DECLARE_FLAG(int, r765_agent_ref_rollouts);
 ABSL_DECLARE_FLAG(double, r765_mpo_temperature);
 ABSL_DECLARE_FLAG(double, r765_mpo_max_kl);
 ABSL_DECLARE_FLAG(std::string, r765_absorption_diag_jsonl);
+ABSL_DECLARE_FLAG(int, r765_replay_window_updates);
+ABSL_DECLARE_FLAG(double, r765_replay_row_coef);
+ABSL_DECLARE_FLAG(double, r765_preserve_5u_min_rate);
+ABSL_DECLARE_FLAG(std::string, r765_collateral_panel_json);
+ABSL_DECLARE_FLAG(int, r765_collateral_check_interval);
+ABSL_DECLARE_FLAG(double, r765_collateral_min_all_agree);
+ABSL_DECLARE_FLAG(double, r765_collateral_min_hp65_agree);
 
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

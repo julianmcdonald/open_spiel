@@ -253,6 +253,20 @@ ABSL_FLAG(double, r765_mpo_max_kl, 0.05,
           "Max KL cap for pairwise MPO targets on tactical overrides.");
 ABSL_FLAG(std::string, r765_absorption_diag_jsonl, "",
           "If non-empty, write per-update T0/T1/T2/T3 passive preference & MPO constraint diagnostics JSONL.");
+ABSL_FLAG(int, r765_replay_window_updates, 0,
+          "When > 1, bounded ephemeral RAM replay lifetime K (trains ages 0..K-1, evicts before age K; starts empty on launch).");
+ABSL_FLAG(double, r765_replay_row_coef, 0.02,
+          "Per-row auxiliary CE coefficient for replay rows (ages 1..K-1) when r765_replay_window_updates > 1.");
+ABSL_FLAG(double, r765_preserve_5u_min_rate, 0.0,
+          "When > 0.0, hard-abort threshold on rolling 5-update pooled agreed_greedy_preserve_rate (empty 5-update window or nonfinite also aborts).");
+ABSL_FLAG(std::string, r765_collateral_panel_json, "",
+          "When non-empty, path to inference_states_1024.json for in-process periodic collateral agreement checks.");
+ABSL_FLAG(int, r765_collateral_check_interval, 5,
+          "Update cadence for in-process r765_collateral_panel_json agreement checks.");
+ABSL_FLAG(double, r765_collateral_min_all_agree, 0.0,
+          "When > 0.0, hard-abort floor on overall greedy agreement vs baseline_greedy_action on r765_collateral_panel_json.");
+ABSL_FLAG(double, r765_collateral_min_hp65_agree, 0.0,
+          "When > 0.0, hard-abort floor on high-prior (max baseline_probs >= 0.65) greedy agreement on r765_collateral_panel_json.");
 
 
 

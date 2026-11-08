@@ -2960,6 +2960,8 @@ PpoUpdateStats TrainPpoUpdate(
   torch::Tensor aux_states, aux_masks, aux_targets, aux_values;
   std::vector<const dune_semantic::CandidateActionData*> all_aux_cands;
   std::vector<std::pair<Action, Action>> all_aux_mpo_pairs;
+  std::vector<double> all_aux_row_weights(aux_active ? aux_n : 0, search_loss_coef);
+  std::vector<int> all_aux_ages(aux_active ? aux_n : 0, 0);
   std::vector<int64_t> aux_slice_start, aux_slice_len;  // by minibatch index/epoch
   double aux_ce_sum = 0.0, aux_vmse_sum = 0.0;
   int64_t aux_slice_uses = 0;                 // (epoch,minibatch) slices actually run
@@ -2968,6 +2970,11 @@ PpoUpdateStats TrainPpoUpdate(
   std::vector<uint8_t> aux_visited_mask(aux_active ? aux_n : 0, 0);
   if (aux_active) {
     stats.aux_examples_used = static_cast<int>(aux_n);
+    for (int64_t i = 0; i < aux_n; ++i) {
+      const SearchTrainingExample& ex = search_examples[i];
+      all_aux_row_weights[i] = (ex.row_loss_weight >= 0.0) ? ex.row_loss_weight : search_loss_coef;
+      all_aux_ages[i] = std::clamp(ex.replay_age, 0, PpoUpdateStats::kMaxR765ReplayAges - 1);
+    }
     auto af = torch::TensorOptions().dtype(torch::kFloat32);
     auto ab = torch::TensorOptions().dtype(torch::kBool);
     torch::Tensor s = torch::zeros({aux_n, obs_size}, af);
@@ -3603,7 +3610,8 @@ PpoUpdateStats TrainPpoUpdate(
       const torch::Tensor& slice_targets_cpu,
       const torch::Tensor& slice_logp_before_cpu,
       const std::vector<const dune_semantic::CandidateActionData*>& slice_cands,
-      const std::vector<std::pair<Action, Action>>& slice_pairs) {
+      const std::vector<std::pair<Action, Action>>& slice_pairs,
+      const std::vector<int>& slice_ages) {
     if (!slice_states.defined() || !slice_logp_before_cpu.defined() || slice_states.size(0) == 0) {
       return;
     }
@@ -3634,6 +3642,7 @@ PpoUpdateStats TrainPpoUpdate(
     const int64_t n_rows = slice_states.size(0);
     const int64_t act_dim = slice_logp_before_cpu.size(1);
     for (int64_t r = 0; r < n_rows; ++r) {
+      if (r < static_cast<int64_t>(slice_ages.size()) && slice_ages[r] != 0) continue;
       const float* targets_row = slice_targets_cpu[r].data_ptr<float>();
       const float* logp_before_row = slice_logp_before_cpu[r].data_ptr<float>();
       const float* logp_after_row = alogp_after_cpu[r].data_ptr<float>();
@@ -3880,6 +3889,7 @@ PpoUpdateStats TrainPpoUpdate(
       torch::Tensor t1_diag_a_targets;
       std::vector<const dune_semantic::CandidateActionData*> t1_diag_a_cands;
       std::vector<std::pair<Action, Action>> t1_diag_a_pairs;
+      std::vector<int> t1_diag_a_ages;
       double this_aux_norm = 0.0;
       if (aux_active) {
         torch::Tensor a_states, a_masks, a_targets, a_values;
@@ -3915,6 +3925,21 @@ PpoUpdateStats TrainPpoUpdate(
               }
             }
           }
+          std::vector<double> slice_raw_w;
+          std::vector<int> slice_ages;
+          if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
+            slice_raw_w = all_aux_row_weights;
+            slice_ages = all_aux_ages;
+          } else {
+            slice_raw_w.reserve(al);
+            slice_ages.reserve(al);
+            for (int64_t k = 0; k < al; ++k) {
+              slice_raw_w.push_back(all_aux_row_weights[as + k]);
+              slice_ages.push_back(all_aux_ages[as + k]);
+            }
+          }
+          std::vector<float> eff_w;
+          bool slice_cap_active = false;
           torch::Tensor scaled_aux;
           double ce_val = 0.0, vmse_val = 0.0;
           auto compute_aux = [&]() {
@@ -3937,10 +3962,18 @@ PpoUpdateStats TrainPpoUpdate(
               torch::Tensor ce_per_row = -(a_targets * alogp).sum(-1);
               ce_val = ce_per_row.mean().item<double>();
               vmse_val = 0.0;
-              scaled_aux = ComputeHybridAuxSumScale(
-                  search_loss_coef, a_states.size(0), mb_len,
+              bool cap_active = false;
+              eff_w = ComputeWeightedHybridAuxRowWeights(
+                  slice_raw_w, mb_len,
                   ::absl::GetFlag(::FLAGS_r765_aux_norm_mode),
-                  ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef)) * ce_per_row.sum();
+                  ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef),
+                  &cap_active);
+              slice_cap_active = cap_active;
+              torch::Tensor eff_w_t = torch::from_blob(
+                  eff_w.data(), {static_cast<int64_t>(eff_w.size())},
+                  torch::TensorOptions().dtype(torch::kFloat32))
+                  .to(ce_per_row.device(), ce_per_row.dtype());
+              scaled_aux = (ce_per_row * eff_w_t).sum();
             } else {
               torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
               torch::Tensor av = ao.values.squeeze(1);
@@ -3960,12 +3993,26 @@ PpoUpdateStats TrainPpoUpdate(
             compute_aux();
           }
           scaled_aux.backward();
+          if (r755_hybrid) {
+            stats.aux_total_slices++;
+            if (slice_cap_active) stats.aux_cap_active_slices++;
+            for (size_t k = 0; k < slice_ages.size(); ++k) {
+              int age = slice_ages[k];
+              if (age >= 0 && age < PpoUpdateStats::kMaxR765ReplayAges) {
+                stats.aux_presentations_by_age[age]++;
+                if (k < eff_w.size()) {
+                  stats.aux_eff_weight_sum_by_age[age] += eff_w[k];
+                }
+              }
+            }
+          }
           if (r755_hybrid && !::absl::GetFlag(::FLAGS_r765_absorption_diag_jsonl).empty()) {
             t1_diag_a_states = a_states;
             t1_diag_a_masks = a_masks;
             t1_diag_a_masks_cpu = a_masks.detach().to(torch::kCPU);
             t1_diag_a_targets = a_targets.detach().to(torch::kFloat32).cpu();
             t1_diag_a_cands = a_cands;
+            t1_diag_a_ages = slice_ages;
             if (::absl::GetFlag(::FLAGS_aux_full_batch_presentation)) {
               t1_diag_a_pairs = all_aux_mpo_pairs;
             } else {
@@ -4643,7 +4690,7 @@ PpoUpdateStats TrainPpoUpdate(
         record_t1_slice_delta_log_odds(
             t1_diag_a_states, t1_diag_a_masks, t1_diag_a_masks_cpu,
             t1_diag_a_targets, t1_diag_alogp_before, t1_diag_a_cands,
-            t1_diag_a_pairs);
+            t1_diag_a_pairs, t1_diag_a_ages);
       }
 
       if (::absl::GetFlag(::FLAGS_use_legacy_unoptimized_reads)) {
@@ -4797,6 +4844,18 @@ PpoUpdateStats TrainPpoUpdate(
 
         optimizer.zero_grad();
 
+        std::vector<double> f_slice_raw_w;
+        std::vector<int> f_slice_ages;
+        f_slice_raw_w.reserve(this_chunk_len);
+        f_slice_ages.reserve(this_chunk_len);
+        for (int64_t k = 0; k < this_chunk_len; ++k) {
+          int64_t row_idx = unvisited_indices[offset + k];
+          f_slice_raw_w.push_back(all_aux_row_weights[row_idx]);
+          f_slice_ages.push_back(all_aux_ages[row_idx]);
+        }
+        std::vector<float> f_eff_w;
+        bool f_slice_cap_active = false;
+
         torch::Tensor scaled_aux;
         double ce_val = 0.0, vmse_val = 0.0;
         auto compute_aux = [&]() {
@@ -4817,11 +4876,19 @@ PpoUpdateStats TrainPpoUpdate(
             torch::Tensor ce_per_row = -(a_targets * alogp).sum(-1);
             ce_val = ce_per_row.mean().item<double>();
             vmse_val = 0.0;
-            scaled_aux = ComputeHybridAuxSumScale(
-                search_loss_coef, a_states.size(0),
-                anchor_len > 0 ? anchor_len : minibatch_size,
+            const int64_t denom_rows = anchor_len > 0 ? anchor_len : minibatch_size;
+            bool cap_active = false;
+            f_eff_w = ComputeWeightedHybridAuxRowWeights(
+                f_slice_raw_w, denom_rows,
                 ::absl::GetFlag(::FLAGS_r765_aux_norm_mode),
-                ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef)) * ce_per_row.sum();
+                ::absl::GetFlag(::FLAGS_r765_aux_max_slice_coef),
+                &cap_active);
+            f_slice_cap_active = cap_active;
+            torch::Tensor eff_w_t = torch::from_blob(
+                f_eff_w.data(), {static_cast<int64_t>(f_eff_w.size())},
+                torch::TensorOptions().dtype(torch::kFloat32))
+                .to(ce_per_row.device(), ce_per_row.dtype());
+            scaled_aux = (ce_per_row * eff_w_t).sum();
           } else {
             torch::Tensor ce = -(a_targets * alogp).sum(-1).mean();
             torch::Tensor av = ao.values.squeeze(1);
@@ -4841,6 +4908,19 @@ PpoUpdateStats TrainPpoUpdate(
           compute_aux();
         }
         scaled_aux.backward();
+        if (r755_hybrid) {
+          stats.aux_total_slices++;
+          if (f_slice_cap_active) stats.aux_cap_active_slices++;
+          for (size_t k = 0; k < f_slice_ages.size(); ++k) {
+            int age = f_slice_ages[k];
+            if (age >= 0 && age < PpoUpdateStats::kMaxR765ReplayAges) {
+              stats.aux_presentations_by_age[age]++;
+              if (k < f_eff_w.size()) {
+                stats.aux_eff_weight_sum_by_age[age] += f_eff_w[k];
+              }
+            }
+          }
+        }
 
         if (ema_magnet_active && anchor_len > 0) {
           torch::Tensor scaled_ema_loss;
@@ -4947,7 +5027,7 @@ PpoUpdateStats TrainPpoUpdate(
             f_logp_before_cpu.defined()) {
           record_t1_slice_delta_log_odds(
               a_states, a_masks, f_masks_cpu, f_targets_cpu,
-              f_logp_before_cpu, a_cands, f_pairs);
+              f_logp_before_cpu, a_cands, f_pairs, f_slice_ages);
         }
 
         for (int64_t k = 0; k < this_chunk_len; ++k) {
@@ -5019,10 +5099,29 @@ PpoUpdateStats TrainPpoUpdate(
         (stats.ppo_grad_norm_mean > 0.0)
             ? (stats.aux_grad_norm_mean / stats.ppo_grad_norm_mean)
             : 0.0;
+    // Under r765_aux_norm_mode == "per_row_capped", auxiliary examples occupy
+    // only `aux_norm_count` slices while the remaining PPO minibatches in the
+    // epoch/update carry zero auxiliary gradient. Evaluate the per-update abort
+    // guard against the update-wide aux/PPO gradient share while preserving
+    // `stats.aux_ppo_norm_ratio` as the conditional aux-slice diagnostic.
+    double effective_abort_ratio = stats.aux_ppo_norm_ratio;
+    if (r755_hybrid &&
+        ::absl::GetFlag(::FLAGS_r765_aux_norm_mode) == "per_row_capped") {
+      const int64_t num_mb_epoch =
+          std::max<int64_t>(1, (n_train + minibatch_size - 1) / minibatch_size);
+      const int64_t update_mb_denom =
+          std::max<int64_t>({aux_norm_count, stats.minibatches, num_mb_epoch});
+      const double update_wide_aux_mean =
+          aux_norm_sum / static_cast<double>(update_mb_denom);
+      effective_abort_ratio =
+          (stats.ppo_grad_norm_mean > 0.0)
+              ? (update_wide_aux_mean / stats.ppo_grad_norm_mean)
+              : 0.0;
+    }
     // The caller (trainer) performs the clean abort at the latest valid
     // checkpoint; TrainPpoUpdate only flags it (so tests can assert the path).
     if (abort_grad_norm_ratio > 0.0 &&
-        stats.aux_ppo_norm_ratio > abort_grad_norm_ratio) {
+        effective_abort_ratio > abort_grad_norm_ratio) {
       stats.aux_ratio_abort = true;
     }
   }

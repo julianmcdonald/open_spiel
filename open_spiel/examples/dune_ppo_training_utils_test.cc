@@ -13337,6 +13337,429 @@ int main() {
     UTILS_CHECK(stats.aux_t1_delta_log_odds_sum > 0.0);
   } TEST_END();
 
+  TEST_BEGIN("R7-65 per_row_capped evaluates abort_grad_norm_ratio on update-wide minibatch share") {
+    const int test_obs_size = 64;
+    const int test_act_dim = 64;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        test_obs_size, 64, test_act_dim, 1, false);
+    {
+      torch::NoGradGuard no_grad;
+      model->policy_head->weight.zero_();
+      model->policy_head->bias.zero_();
+      model->policy_head->bias[10] = 3.0f;
+      model->policy_head->bias[20] = -1.44f;
+      model->policy_head->bias[30] = 1.2f;
+    }
+
+    const std::vector<open_spiel::Action> legal = {10, 20, 30};
+    std::vector<PpoTransition> batch(20);
+    for (int i = 0; i < 20; ++i) {
+      batch[i].state = std::vector<float>(test_obs_size, 0.1f * (i + 1));
+      batch[i].legal_actions = legal;
+      batch[i].action = 10;
+      batch[i].old_log_prob = -0.16f;
+      batch[i].advantage = 0.1f;
+      batch[i].value = 0.0f;
+      batch[i].return_value = 0.1f;
+      batch[i].player_id = 0;
+      batch[i].episode_id = 1;
+    }
+
+    SearchTrainingExample ex;
+    ex.observation = std::vector<float>(test_obs_size, 0.2f);
+    ex.player = 0;
+    ex.legal_actions = legal;
+    ex.normalized_visits = {0.0, 1.0, 0.0};
+    ex.best_action = 20;
+    ex.raw_action = 10;
+    std::vector<SearchTrainingExample> search_examples = {ex};
+
+    const bool prev_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+    const std::string prev_norm = absl::GetFlag(FLAGS_r765_aux_norm_mode);
+    const double prev_max_slice = absl::GetFlag(FLAGS_r765_aux_max_slice_coef);
+    const int prev_mb = absl::GetFlag(FLAGS_ppo_minibatch_size);
+    const int prev_epochs = absl::GetFlag(FLAGS_ppo_update_epochs);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, "per_row_capped");
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, 2.0);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+
+    auto update_opt1 = MakeDuneOptimizer(model, 1e-3);
+    PpoUpdateStats stats1 = TrainPpoUpdate(
+        model, *update_opt1, batch, test_obs_size, test_act_dim, torch::kCPU,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples,
+        /*search_loss_coef=*/0.20, /*abort_grad_norm_ratio=*/0.50);
+
+    UTILS_CHECK(stats1.aux_ppo_norm_ratio > 0.50);
+    UTILS_CHECK(stats1.aux_ppo_norm_ratio / 10.0 <= 0.50);
+    UTILS_CHECK(stats1.aux_ratio_abort == false);
+
+    // Call TrainPpoUpdate again with a huge search_loss_coef so even update-wide ratio exceeds 0.50
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, 500.0);
+    auto update_opt2 = MakeDuneOptimizer(model, 1e-3);
+    PpoUpdateStats stats2 = TrainPpoUpdate(
+        model, *update_opt2, batch, test_obs_size, test_act_dim, torch::kCPU,
+        /*master=*/42ULL, /*global_update=*/2,
+        /*anchor_model=*/nullptr, search_examples,
+        /*search_loss_coef=*/500.0, /*abort_grad_norm_ratio=*/0.50);
+
+    UTILS_CHECK(stats2.aux_ratio_abort == true);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, prev_hybrid);
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, prev_norm);
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, prev_max_slice);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, prev_mb);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, prev_epochs);
+  } TEST_END();
+
+  TEST_BEGIN("R7-65 heterogeneous 0.08/0.02 age weights, shared 0.30 slice cap, and fresh-only T1 isolation") {
+    // 1. Direct unit test of ComputeWeightedHybridAuxRowWeights
+    {
+      std::vector<double> uncapped_w = {0.08, 0.08};
+      bool cap_active = false;
+      auto eff_uncapped = ComputeWeightedHybridAuxRowWeights(
+          uncapped_w, /*denom_mb_rows=*/10, "per_row_capped", 0.30, &cap_active);
+      UTILS_CHECK(cap_active == false);
+      UTILS_CHECK(eff_uncapped.size() == 2);
+      UTILS_CHECK(std::abs(eff_uncapped[0] - 0.08f) < 1e-6);
+      UTILS_CHECK(std::abs(eff_uncapped[1] - 0.08f) < 1e-6);
+
+      // Capped case: 2 fresh rows at 0.08 and 10 replay rows at 0.02 => sum = 0.36 > 0.30
+      std::vector<double> capped_w = {0.08, 0.08, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02};
+      cap_active = false;
+      auto eff_capped = ComputeWeightedHybridAuxRowWeights(
+          capped_w, /*denom_mb_rows=*/10, "per_row_capped", 0.30, &cap_active);
+      UTILS_CHECK(cap_active == true);
+      UTILS_CHECK(eff_capped.size() == 12);
+      double sum_eff = 0.0;
+      for (float w : eff_capped) sum_eff += w;
+      UTILS_CHECK(std::abs(sum_eff - 0.30) < 1e-5);
+      UTILS_CHECK(std::abs(eff_capped[0] - (0.08f * 0.30f / 0.36f)) < 1e-5);
+      UTILS_CHECK(std::abs(eff_capped[2] - (0.02f * 0.30f / 0.36f)) < 1e-5);
+
+      // sum_over_mb norm mode fallback
+      cap_active = false;
+      auto eff_sum_mb = ComputeWeightedHybridAuxRowWeights(
+          uncapped_w, /*denom_mb_rows=*/4, "sum_over_mb", 0.30, &cap_active);
+      UTILS_CHECK(cap_active == false);
+      UTILS_CHECK(eff_sum_mb.size() == 2);
+      UTILS_CHECK(std::abs(eff_sum_mb[0] - 0.02f) < 1e-6);
+    }
+
+    // 2. TrainPpoUpdate integration test on CPU with heterogeneous row weights and ages
+    const int test_obs_size = 64;
+    const int test_act_dim = 64;
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        test_obs_size, 64, test_act_dim, 1, false);
+    {
+      torch::NoGradGuard no_grad;
+      model->policy_head->weight.zero_();
+      model->policy_head->bias.zero_();
+      model->policy_head->bias[10] = 3.0f;
+      model->policy_head->bias[20] = -1.44f;
+      model->policy_head->bias[30] = 1.2f;
+    }
+
+    const std::vector<open_spiel::Action> legal = {10, 20, 30};
+    std::vector<PpoTransition> batch(20);
+    for (int i = 0; i < 20; ++i) {
+      batch[i].state = std::vector<float>(test_obs_size, 0.1f * (i + 1));
+      batch[i].legal_actions = legal;
+      batch[i].action = 10;
+      batch[i].old_log_prob = -0.16f;
+      batch[i].advantage = 0.1f;
+      batch[i].value = 0.0f;
+      batch[i].return_value = 0.1f;
+      batch[i].player_id = 0;
+      batch[i].episode_id = 1;
+    }
+
+    // ex0 is fresh (age 0), ex1 is replay (age 1)
+    SearchTrainingExample ex0;
+    ex0.observation = std::vector<float>(test_obs_size, 0.2f);
+    ex0.player = 0;
+    ex0.legal_actions = legal;
+    ex0.normalized_visits = {0.0, 1.0, 0.0};
+    ex0.best_action = 20;
+    ex0.raw_action = 10;
+    ex0.replay_age = 0;
+    ex0.row_loss_weight = 0.08;
+
+    SearchTrainingExample ex1;
+    ex1.observation = std::vector<float>(test_obs_size, 0.3f);
+    ex1.player = 0;
+    ex1.legal_actions = legal;
+    ex1.normalized_visits = {0.0, 1.0, 0.0};
+    ex1.best_action = 20;
+    ex1.raw_action = 10;
+    ex1.replay_age = 1;
+    ex1.row_loss_weight = 0.02;
+
+    std::vector<SearchTrainingExample> search_examples = {ex0, ex1};
+
+    const bool prev_hybrid = absl::GetFlag(FLAGS_r755_hybrid_mode);
+    const std::string prev_norm = absl::GetFlag(FLAGS_r765_aux_norm_mode);
+    const double prev_max_slice = absl::GetFlag(FLAGS_r765_aux_max_slice_coef);
+    const std::string prev_diag = absl::GetFlag(FLAGS_r765_absorption_diag_jsonl);
+    const int prev_mb = absl::GetFlag(FLAGS_ppo_minibatch_size);
+    const int prev_epochs = absl::GetFlag(FLAGS_ppo_update_epochs);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, true);
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, "per_row_capped");
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, 0.30);
+    absl::SetFlag(&FLAGS_r765_absorption_diag_jsonl, "/tmp/r765_test121_diag.jsonl");
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, 2);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, 1);
+
+    auto update_opt = MakeDuneOptimizer(model, 1e-3);
+    PpoUpdateStats stats = TrainPpoUpdate(
+        model, *update_opt, batch, test_obs_size, test_act_dim, torch::kCPU,
+        /*master=*/42ULL, /*global_update=*/1,
+        /*anchor_model=*/nullptr, search_examples, /*search_loss_coef=*/0.08);
+
+    absl::SetFlag(&FLAGS_r755_hybrid_mode, prev_hybrid);
+    absl::SetFlag(&FLAGS_r765_aux_norm_mode, prev_norm);
+    absl::SetFlag(&FLAGS_r765_aux_max_slice_coef, prev_max_slice);
+    absl::SetFlag(&FLAGS_r765_absorption_diag_jsonl, prev_diag);
+    absl::SetFlag(&FLAGS_ppo_minibatch_size, prev_mb);
+    absl::SetFlag(&FLAGS_ppo_update_epochs, prev_epochs);
+    std::filesystem::remove("/tmp/r765_test121_diag.jsonl");
+
+    UTILS_CHECK(stats.aux_presentations_by_age[0] > 0);
+    UTILS_CHECK(stats.aux_presentations_by_age[1] > 0);
+    UTILS_CHECK(stats.aux_eff_weight_sum_by_age[0] > 0.0);
+    UTILS_CHECK(stats.aux_eff_weight_sum_by_age[1] > 0.0);
+    UTILS_CHECK(stats.aux_total_slices > 0);
+    UTILS_CHECK(stats.aux_t1_measured_rows >= 1);
+  } TEST_END();
+
+  TEST_BEGIN("R7-65 replay cohort manager K=10 expiry, empty-update aging, frozen targets, distinct roots, and d_final_live denominator") {
+    R765ReplayCohortManager manager;
+    UTILS_CHECK(manager.active_train_cohorts() == 0);
+    UTILS_CHECK(manager.active_diag_cohorts() == 0);
+
+    const int test_obs_size = 64;
+    const std::vector<open_spiel::Action> legal = {10, 20, 30};
+
+    // Cohort at update 1: 2 rows for root 1001, 1 row for root 1002
+    SearchTrainingExample ex1;
+    ex1.observation = std::vector<float>(test_obs_size, 0.1f);
+    ex1.legal_actions = legal;
+    ex1.normalized_visits = {0.1, 0.7, 0.2};
+    ex1.best_action = 20;
+    ex1.raw_action = 10;
+    ex1.r765_root_uid = 1001;
+
+    SearchTrainingExample ex2;
+    ex2.observation = std::vector<float>(test_obs_size, 0.2f);
+    ex2.legal_actions = legal;
+    ex2.normalized_visits = {0.1, 0.2, 0.7};
+    ex2.best_action = 30;
+    ex2.raw_action = 10;
+    ex2.r765_root_uid = 1001;
+
+    SearchTrainingExample ex3;
+    ex3.observation = std::vector<float>(test_obs_size, 0.3f);
+    ex3.legal_actions = legal;
+    ex3.normalized_visits = {0.2, 0.6, 0.2};
+    ex3.best_action = 20;
+    ex3.raw_action = 10;
+    ex3.r765_root_uid = 1002;
+
+    std::vector<SearchTrainingExample> fresh_examples = {ex1, ex2, ex3};
+
+    // Corresponding diagnostic probes
+    R765DiagProbeItem pr1;
+    pr1.root_uid = 1001;
+    pr1.observation = ex1.observation;
+    pr1.legal_actions = legal;
+    pr1.a_star = 20;
+    pr1.a_ref = 10;
+    pr1.t0_log_odds = -1.5;
+
+    R765DiagProbeItem pr2;
+    pr2.root_uid = 1001;
+    pr2.observation = ex2.observation;
+    pr2.legal_actions = legal;
+    pr2.a_star = 30;
+    pr2.a_ref = 10;
+    pr2.t0_log_odds = -1.2;
+
+    R765DiagProbeItem pr3;
+    pr3.root_uid = 1002;
+    pr3.observation = ex3.observation;
+    pr3.legal_actions = legal;
+    pr3.a_star = 20;
+    pr3.a_ref = 10;
+    pr3.t0_log_odds = -1.8;
+
+    std::vector<R765DiagProbeItem> fresh_probes = {pr1, pr2, pr3};
+
+    std::vector<SearchTrainingExample> combined;
+    manager.AdvanceAndBuildUpdateBatch(
+        /*global_update=*/1, fresh_examples, /*fresh_coef=*/0.08, /*replay_coef=*/0.02,
+        /*window_k=*/10, /*shuffle_seed=*/42ULL, /*do_shuffle=*/false, &combined);
+
+    UTILS_CHECK(combined.size() == 3);
+    for (size_t i = 0; i < combined.size(); ++i) {
+      UTILS_CHECK(combined[i].replay_age == 0);
+      UTILS_CHECK(combined[i].row_loss_weight == 0.08);
+      UTILS_CHECK(combined[i].r765_root_uid == fresh_examples[i].r765_root_uid);
+      UTILS_CHECK(combined[i].observation == fresh_examples[i].observation);
+      UTILS_CHECK(combined[i].normalized_visits == fresh_examples[i].normalized_visits);
+    }
+
+    auto mock_eval_fn = [](const std::vector<const std::vector<float>*>& obs_ptrs,
+                           const std::vector<const dune_semantic::CandidateActionData*>& cads,
+                           const std::vector<const std::vector<Action>*>& legals) {
+      std::vector<std::vector<double>> res;
+      for (size_t i = 0; i < obs_ptrs.size(); ++i) {
+        // Return p(10)=0.2, p(20)=0.5, p(30)=0.3
+        res.push_back({0.2, 0.5, 0.3});
+      }
+      return res;
+    };
+
+    std::vector<uint8_t> visited_mask(combined.size(), 1);
+    auto readout1 = manager.FinalizeUpdateAndEvaluateRetention(
+        /*global_update=*/1, /*window_k=*/10, fresh_probes, visited_mask, mock_eval_fn);
+    UTILS_CHECK(readout1.active_train_cohorts == 1);
+    UTILS_CHECK(readout1.active_diag_cohorts == 1);
+    UTILS_CHECK(readout1.has_final_age_cohort_this_update == false);
+
+    // Updates 2..10: empty fresh examples (advancing on empty updates)
+    for (int u = 2; u <= 10; ++u) {
+      manager.AdvanceAndBuildUpdateBatch(
+          u, /*fresh_examples=*/{}, /*fresh_coef=*/0.08, /*replay_coef=*/0.02,
+          /*window_k=*/10, /*shuffle_seed=*/42ULL + u, /*do_shuffle=*/false, &combined);
+      UTILS_CHECK(combined.size() == 3);
+      for (size_t i = 0; i < combined.size(); ++i) {
+        UTILS_CHECK(combined[i].replay_age == u - 1);
+        UTILS_CHECK(combined[i].row_loss_weight == 0.02);
+        // Targets remain frozen and immutable
+        UTILS_CHECK(combined[i].observation == fresh_examples[i].observation);
+        UTILS_CHECK(combined[i].normalized_visits == fresh_examples[i].normalized_visits);
+      }
+      std::vector<uint8_t> vmask(combined.size(), 1);
+      auto r = manager.FinalizeUpdateAndEvaluateRetention(
+          u, /*window_k=*/10, /*fresh_probes=*/{}, vmask, mock_eval_fn);
+      if (u == 10) {
+        // At update 10, age = 9 = expected_final_age for K=10!
+        UTILS_CHECK(r.has_final_age_cohort_this_update == true);
+        UTILS_CHECK(r.final_age_full_coverage == true);
+        UTILS_CHECK(r.final_age_visited_rows == 3);
+        UTILS_CHECK(r.final_age_total_rows == 3);
+      } else {
+        UTILS_CHECK(r.has_final_age_cohort_this_update == false);
+      }
+    }
+
+    // Update 11: age reaches 10 >= K, evicted before adding fresh examples
+    manager.AdvanceAndBuildUpdateBatch(
+        /*global_update=*/11, /*fresh_examples=*/{}, /*fresh_coef=*/0.08, /*replay_coef=*/0.02,
+        /*window_k=*/10, /*shuffle_seed=*/111ULL, /*do_shuffle=*/false, &combined);
+    UTILS_CHECK(combined.empty() == true);
+    UTILS_CHECK(manager.active_train_cohorts() == 0);
+
+    auto readout11 = manager.FinalizeUpdateAndEvaluateRetention(
+        /*global_update=*/11, /*window_k=*/10, /*fresh_probes=*/{}, {}, mock_eval_fn);
+    UTILS_CHECK(readout11.active_train_cohorts == 0);
+    // Diag cohort remains retained post-eviction!
+    UTILS_CHECK(readout11.active_diag_cohorts == 1);
+    UTILS_CHECK(readout11.post_evict_5u_roots == 0);
+
+    // Updates 12..14: still within post-evict window before +5u
+    for (int u = 12; u <= 14; ++u) {
+      auto r = manager.FinalizeUpdateAndEvaluateRetention(
+          u, /*window_k=*/10, /*fresh_probes=*/{}, {}, mock_eval_fn);
+      UTILS_CHECK(r.post_evict_5u_roots == 0);
+    }
+
+    // Update 15: global_update == last_presented_update + 5 (10 + 5)
+    auto readout15 = manager.FinalizeUpdateAndEvaluateRetention(
+        /*global_update=*/15, /*window_k=*/10, /*fresh_probes=*/{}, {}, mock_eval_fn);
+    // 2 distinct roots pooled (root 1001 and root 1002)
+    UTILS_CHECK(readout15.post_evict_5u_roots == 2);
+    UTILS_CHECK(readout15.post_evict_5u_d_final_denom > 0.0);
+    UTILS_CHECK(readout15.post_evict_5u_d_cur > 0.0);
+    // Under constant mock eval, cur == final_denom so retention is exactly 1.0
+    UTILS_CHECK(std::abs(readout15.post_evict_5u_ret - 1.0) < 1e-6);
+
+    // Update 20: global_update == last_presented_update + 10 (10 + 10)
+    auto readout20 = manager.FinalizeUpdateAndEvaluateRetention(
+        /*global_update=*/20, /*window_k=*/10, /*fresh_probes=*/{}, {}, mock_eval_fn);
+    UTILS_CHECK(readout20.post_evict_10u_roots == 2);
+    UTILS_CHECK(std::abs(readout20.post_evict_10u_ret - 1.0) < 1e-6);
+    // Diag cohort expires at update 20
+    UTILS_CHECK(readout20.active_diag_cohorts == 0);
+
+    // Update 21: diag cohort is gone
+    auto readout21 = manager.FinalizeUpdateAndEvaluateRetention(
+        /*global_update=*/21, /*window_k=*/10, /*fresh_probes=*/{}, {}, mock_eval_fn);
+    UTILS_CHECK(readout21.active_diag_cohorts == 0);
+  } TEST_END();
+
+  TEST_BEGIN("R7-65 preserve window guard handles 0-probe updates, empty 5u windows, rate breaches, and nonfinite telemetry") {
+    R765PreserveWindowGuard guard;
+    double pooled_rate = 0.0;
+    int64_t pooled_p = 0;
+    int64_t pooled_e = 0;
+    std::string abort_reason;
+
+    // 1. 4 populated updates + 1 zero-probe update passing
+    // Upd 1: 9/10
+    UTILS_CHECK(guard.PushAndCheck(9, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    // Upd 2: 10/10
+    UTILS_CHECK(guard.PushAndCheck(10, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    // Upd 3: 10/10
+    UTILS_CHECK(guard.PushAndCheck(10, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    // Upd 4: 9/10
+    UTILS_CHECK(guard.PushAndCheck(9, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    // Upd 5: 0/0 (zero-probe update)
+    bool ok5 = guard.PushAndCheck(0, 0, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok5 == true);
+    UTILS_CHECK(pooled_p == 38);
+    UTILS_CHECK(pooled_e == 40);
+    UTILS_CHECK(std::abs(pooled_rate - (38.0 / 40.0)) < 1e-6);
+    UTILS_CHECK(pooled_rate >= 0.90);
+    UTILS_CHECK(abort_reason.empty());
+
+    // 2. 5 consecutive zero-probe updates -> empty_5u_preserve_window abort
+    guard.Reset();
+    for (int i = 0; i < 4; ++i) {
+      UTILS_CHECK(guard.PushAndCheck(0, 0, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    }
+    bool ok_empty = guard.PushAndCheck(0, 0, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok_empty == false);
+    UTILS_CHECK(abort_reason == "empty_5u_preserve_window");
+
+    // 3. Pooled rate breach: 5 updates of 8/10 = 40/50 = 0.80 < 0.90
+    guard.Reset();
+    for (int i = 0; i < 4; ++i) {
+      UTILS_CHECK(guard.PushAndCheck(8, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason));
+    }
+    bool ok_breach = guard.PushAndCheck(8, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok_breach == false);
+    UTILS_CHECK(abort_reason.find("pooled_5u_preserve_rate_breach") != std::string::npos);
+
+    // 4. Nonfinite or invalid telemetry
+    guard.Reset();
+    bool ok_nan = guard.PushAndCheck(10, 10, 0.90, false, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok_nan == false);
+    UTILS_CHECK(abort_reason == "nonfinite_or_invalid_telemetry");
+
+    bool ok_inv1 = guard.PushAndCheck(-1, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok_inv1 == false);
+    UTILS_CHECK(abort_reason == "nonfinite_or_invalid_telemetry");
+
+    bool ok_inv2 = guard.PushAndCheck(11, 10, 0.90, true, &pooled_rate, &pooled_p, &pooled_e, &abort_reason);
+    UTILS_CHECK(ok_inv2 == false);
+    UTILS_CHECK(abort_reason == "nonfinite_or_invalid_telemetry");
+  } TEST_END();
+
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";
   return 0;
 }

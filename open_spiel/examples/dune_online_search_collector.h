@@ -148,6 +148,10 @@ struct SearchTrainingExample {
   std::shared_ptr<State> state_snapshot = nullptr;
   Action raw_action = kInvalidAction;
   Action best_action = kInvalidAction;
+
+  int replay_age = 0;
+  double row_loss_weight = -1.0;
+  uint64_t r765_root_uid = 0;
 };
 
 // Frozen 18B collection configuration. Defaults encode the baseline/uncapped

@@ -3704,6 +3704,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
               ex.value_target_attached = false;
               ex.episode_id = episode_id;
               ex.decision_id = static_cast<int>(r755_decision_index_);
+              ex.r765_root_uid = follow.root_uid;
               r755_aux_examples->push_back(std::move(ex));
 
               if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
@@ -3907,6 +3908,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                       ex.value_target_attached = false;
                       ex.episode_id = episode_id;
                       ex.decision_id = static_cast<int>(r755_decision_index_);
+                      ex.r765_root_uid = root_uid;
                       r755_aux_examples->push_back(std::move(ex));
 
                       if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
@@ -4058,6 +4060,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                     ex.value_target_attached = false;
                     ex.episode_id = episode_id;
                     ex.decision_id = static_cast<int>(r755_decision_index_);
+                    ex.r765_root_uid = (episode_id << 16) | static_cast<uint64_t>(r755_decision_index_);
                     r755_aux_examples->push_back(std::move(ex));
 
                     if (!absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty() && local_stats != nullptr) {
@@ -4290,6 +4293,7 @@ int PpoSimulation(uint64_t master, uint64_t episode_id, const Game& game,
                     ex.value_target_attached = false;
                     ex.episode_id = episode_id;
                     ex.decision_id = static_cast<int>(r755_decision_index_);
+                    ex.r765_root_uid = (episode_id << 16) | static_cast<uint64_t>(r755_decision_index_);
                     r755_aux_examples->push_back(std::move(ex));
 
                     if (search_res.overridden && search_res.chosen_action != search_res.raw_action &&
@@ -16114,6 +16118,89 @@ int main(int argc, char** argv) {
   };
   std::deque<R765AbsorptionUpdateRecord> r765_absorption_history;
 
+  open_spiel::R765ReplayCohortManager r765_replay_mgr;
+  open_spiel::R765PreserveWindowGuard r765_preserve_guard;
+
+  struct R765CollateralPanelItem {
+    std::vector<float> obs;
+    std::vector<Action> legal_actions;
+    dune_semantic::CandidateActionData candidate_data;
+    int baseline_greedy_action = -1;
+    bool is_hp65 = false;
+  };
+  std::vector<R765CollateralPanelItem> r765_collateral_panel;
+  const std::string panel_json_path = absl::GetFlag(FLAGS_r765_collateral_panel_json);
+  if (!panel_json_path.empty()) {
+    std::ifstream f(panel_json_path);
+    if (!f.is_open()) {
+      open_spiel::SpielFatalError("Failed to open --r765_collateral_panel_json: " + panel_json_path);
+    }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto parsed = open_spiel::json::FromString(content);
+    if (!parsed.has_value() || !parsed->IsArray() || parsed->GetArray().empty()) {
+      open_spiel::SpielFatalError("Malformed or empty JSON in --r765_collateral_panel_json: " + panel_json_path);
+    }
+    const auto& arr = parsed->GetArray();
+    const auto eval_market_mode = training_model->market_appendix_mode_;
+    const auto eval_deck_semantics = training_model->deck_pool_semantics_;
+    const int active_obs_size = dune_imperium::GetInformationStateSchema(eval_market_mode, eval_deck_semantics).size;
+    int64_t hp65_count = 0;
+    r765_collateral_panel.reserve(arr.size());
+    for (size_t i = 0; i < arr.size(); ++i) {
+      if (!arr[i].IsObject()) {
+        open_spiel::SpielFatalError("Expected object in --r765_collateral_panel_json array at index " + std::to_string(i));
+      }
+      const auto& obj = arr[i].GetObject();
+      auto it_ser = obj.find("serialized_state");
+      auto it_ga = obj.find("baseline_greedy_action");
+      auto it_probs = obj.find("baseline_probs");
+      if (it_ser == obj.end() || it_ga == obj.end() || it_probs == obj.end()) {
+        open_spiel::SpielFatalError("Missing required keys in --r765_collateral_panel_json at index " + std::to_string(i));
+      }
+      std::string ser_state = it_ser->second.GetString();
+      int base_ga = it_ga->second.IsInt() ? static_cast<int>(it_ga->second.GetInt())
+                                          : static_cast<int>(it_ga->second.GetDouble());
+      double max_p = 0.0;
+      if (it_probs->second.IsArray()) {
+        for (const auto& pv : it_probs->second.GetArray()) {
+          double p = pv.IsDouble() ? pv.GetDouble() : (pv.IsInt() ? static_cast<double>(pv.GetInt()) : 0.0);
+          max_p = std::max(max_p, p);
+        }
+      }
+      bool is_hp65 = (max_p >= 0.65);
+      if (is_hp65) hp65_count++;
+
+      std::unique_ptr<State> st = game->DeserializeState(ser_state);
+      if (!st) {
+        open_spiel::SpielFatalError("Failed to deserialize state in --r765_collateral_panel_json at index " + std::to_string(i));
+      }
+      Player current_player = st->CurrentPlayer();
+      const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(st.get());
+      std::vector<float> obs(active_obs_size, 0.0f);
+      if (dune_state != nullptr && current_player >= 0) {
+        dune_state->InformationStateTensorWithAppendix(
+            current_player, eval_market_mode, absl::MakeSpan(obs), eval_deck_semantics);
+      } else if (current_player >= 0) {
+        st->InformationStateTensor(current_player, absl::MakeSpan(obs));
+      }
+      std::vector<Action> legals = st->LegalActions();
+      dune_semantic::CandidateActionData cand_data;
+      if (dune_state != nullptr && training_model->with_semantic_scorer_) {
+        dune_semantic::ExtractCandidateDescriptors(
+            *dune_state, legals, &cand_data, training_model->semantic_descriptor_schema_);
+      }
+      R765CollateralPanelItem item;
+      item.obs = std::move(obs);
+      item.legal_actions = std::move(legals);
+      item.candidate_data = std::move(cand_data);
+      item.baseline_greedy_action = base_ga;
+      item.is_hp65 = is_hp65;
+      r765_collateral_panel.push_back(std::move(item));
+    }
+    std::cout << "[R765-PANEL] Loaded " << r765_collateral_panel.size()
+              << " states (" << hp65_count << " hp65 states) from " << panel_json_path << "\n";
+  }
+
   open_spiel::V5LegacySlotResidualState v5_slot_residual_state;
   if (training_model->semantic_descriptor_schema_ == dune_semantic::kDescriptorSchemaVersionV5) {
     v5_slot_residual_state.Initialize(
@@ -16433,15 +16520,35 @@ int main(int argc, char** argv) {
       return std::max(0.0, kl);
     };
 
-    if (absl::GetFlag(FLAGS_r755_hybrid_mode) &&
-        absl::GetFlag(FLAGS_r755_shuffle_aux_examples) &&
-        current_collect.aux_examples.size() > 1) {
+    std::vector<open_spiel::SearchTrainingExample> train_aux_examples;
+    const int r765_replay_k = absl::GetFlag(FLAGS_r765_replay_window_updates);
+    if (absl::GetFlag(FLAGS_r755_hybrid_mode) && r765_replay_k > 1) {
       uint64_t aux_shuf_seed = dune_seed::DeriveSeed(
           master, dune_seed::kDomainTrain, update, 0,
           dune_seed::kStreamR758AuxShuffle);
-      std::mt19937_64 aux_shuf_rng(aux_shuf_seed);
-      std::shuffle(current_collect.aux_examples.begin(),
-                   current_collect.aux_examples.end(), aux_shuf_rng);
+      r765_replay_mgr.AdvanceAndBuildUpdateBatch(
+          update, current_collect.aux_examples, this_search_coef,
+          absl::GetFlag(FLAGS_r765_replay_row_coef), r765_replay_k,
+          aux_shuf_seed, absl::GetFlag(FLAGS_r755_shuffle_aux_examples),
+          &train_aux_examples);
+    } else {
+      if (absl::GetFlag(FLAGS_r755_hybrid_mode) &&
+          absl::GetFlag(FLAGS_r755_shuffle_aux_examples) &&
+          current_collect.aux_examples.size() > 1) {
+        uint64_t aux_shuf_seed = dune_seed::DeriveSeed(
+            master, dune_seed::kDomainTrain, update, 0,
+            dune_seed::kStreamR758AuxShuffle);
+        std::mt19937_64 aux_shuf_rng(aux_shuf_seed);
+        std::shuffle(current_collect.aux_examples.begin(),
+                     current_collect.aux_examples.end(), aux_shuf_rng);
+      }
+      train_aux_examples = current_collect.aux_examples;
+      if (absl::GetFlag(FLAGS_r755_hybrid_mode) && !absl::GetFlag(FLAGS_r765_absorption_diag_jsonl).empty()) {
+        std::vector<open_spiel::SearchTrainingExample> dummy_comb;
+        r765_replay_mgr.AdvanceAndBuildUpdateBatch(
+            update, current_collect.aux_examples, this_search_coef,
+            absl::GetFlag(FLAGS_r765_replay_row_coef), 1, 0, false, &dummy_comb);
+      }
     }
 
     if (do_gate2) {
@@ -16467,10 +16574,10 @@ int main(int argc, char** argv) {
           (gate2_diag.ppo_multi_action_transitions + gate2_diag.override_masked_transitions ==
            gate2_diag.multi_action_transitions);
 
-      gate2_aux_obs_ptrs.reserve(current_collect.aux_examples.size());
-      gate2_aux_cads.reserve(current_collect.aux_examples.size());
-      gate2_aux_legals.reserve(current_collect.aux_examples.size());
-      for (const auto& ex : current_collect.aux_examples) {
+      gate2_aux_obs_ptrs.reserve(train_aux_examples.size());
+      gate2_aux_cads.reserve(train_aux_examples.size());
+      gate2_aux_legals.reserve(train_aux_examples.size());
+      for (const auto& ex : train_aux_examples) {
         gate2_aux_obs_ptrs.push_back(&ex.observation);
         gate2_aux_cads.push_back(ex.candidate_data.empty() ? nullptr : &ex.candidate_data);
         gate2_aux_legals.push_back(&ex.legal_actions);
@@ -16677,7 +16784,7 @@ int main(int argc, char** argv) {
             : open_spiel::TrainPpoUpdate(
                   training_model, *optimizer, current_collect.rollout,
                   obs_size, action_size, device, master, update, anchor_model,
-                  current_collect.aux_examples, this_search_coef,
+                  train_aux_examples, this_search_coef,
                   (online_search_collection || absl::GetFlag(FLAGS_r755_hybrid_mode)) ? aux_abort_ratio : 0.0,
                   pwo5_batch, pwo5_cfg,
                   collection_model, absl::GetFlag(FLAGS_reverse_kl_coef),
@@ -17343,8 +17450,30 @@ int main(int argc, char** argv) {
       double ratio_t2_live = (mean_delta_log_odds_target > 1e-8)
           ? (mean_delta_log_odds_t2_live / mean_delta_log_odds_target) : 0.0;
 
-      double agreed_greedy_preserve_rate = 1.0;
-      if (!current_collect.r765_agreed_probes.empty()) {
+      std::vector<open_spiel::R765DiagProbeItem> fresh_diag_items;
+      fresh_diag_items.reserve(current_collect.r765_override_probes.size());
+      for (const auto& pr : current_collect.r765_override_probes) {
+        open_spiel::R765DiagProbeItem item;
+        item.root_uid = pr.root_uid;
+        item.observation = pr.observation;
+        item.legal_actions = pr.legal_actions;
+        item.candidate_data = pr.candidate_data;
+        item.a_star = pr.a_star;
+        item.a_ref = pr.a_ref;
+        item.t0_log_odds = pr.t0_log_odds;
+        fresh_diag_items.push_back(std::move(item));
+      }
+      auto post_evict = r765_replay_mgr.FinalizeUpdateAndEvaluateRetention(
+          update, std::max(1, absl::GetFlag(FLAGS_r765_replay_window_updates)),
+          fresh_diag_items, stats.aux_visited_mask,
+          [&](const auto& o, const auto& c, const auto& l) {
+            return eval_model_probe_probs(training_model, o, c, l);
+          });
+
+      int64_t agreed_preserved_count = 0;
+      int64_t agreed_eligible_count = static_cast<int64_t>(current_collect.r765_agreed_probes.size());
+      double agreed_greedy_preserve_rate = (agreed_eligible_count == 0) ? -1.0 : 1.0;
+      if (agreed_eligible_count > 0) {
         std::vector<const std::vector<float>*> ag_obs_ptrs;
         std::vector<const dune_semantic::CandidateActionData*> ag_cads;
         std::vector<const std::vector<Action>*> ag_legals;
@@ -17357,18 +17486,112 @@ int main(int argc, char** argv) {
           ag_legals.push_back(&ap.legal_actions);
         }
         auto ag_probs = eval_model_probe_probs(training_model, ag_obs_ptrs, ag_cads, ag_legals);
-        int64_t preserved_count = 0;
         for (size_t i = 0; i < current_collect.r765_agreed_probes.size(); ++i) {
           const auto& ap = current_collect.r765_agreed_probes[i];
           if (i < ag_probs.size() && !ag_probs[i].empty()) {
             size_t best_idx = std::max_element(ag_probs[i].begin(), ag_probs[i].end()) - ag_probs[i].begin();
             if (best_idx < ap.legal_actions.size() && ap.legal_actions[best_idx] == ap.greedy_action) {
-              preserved_count++;
+              agreed_preserved_count++;
             }
           }
         }
-        agreed_greedy_preserve_rate = static_cast<double>(preserved_count) /
-                                      static_cast<double>(current_collect.r765_agreed_probes.size());
+        agreed_greedy_preserve_rate = static_cast<double>(agreed_preserved_count) /
+                                      static_cast<double>(agreed_eligible_count);
+      }
+
+      bool panel1024_evaluated = false;
+      double panel1024_agree_all = -1.0;
+      double panel1024_agree_hp65 = -1.0;
+      if (!r765_collateral_panel.empty()) {
+        const int check_interval = std::max(1, absl::GetFlag(FLAGS_r765_collateral_check_interval));
+        if ((update - start_update + 1) % check_interval == 0 || update == target_end_update) {
+          panel1024_evaluated = true;
+          std::vector<const std::vector<float>*> p_obs;
+          std::vector<const dune_semantic::CandidateActionData*> p_cads;
+          std::vector<const std::vector<Action>*> p_legals;
+          p_obs.reserve(r765_collateral_panel.size());
+          p_cads.reserve(r765_collateral_panel.size());
+          p_legals.reserve(r765_collateral_panel.size());
+          for (const auto& item : r765_collateral_panel) {
+            p_obs.push_back(&item.obs);
+            p_cads.push_back(item.candidate_data.empty() ? nullptr : &item.candidate_data);
+            p_legals.push_back(&item.legal_actions);
+          }
+          auto p_probs = eval_model_probe_probs(training_model, p_obs, p_cads, p_legals);
+          int64_t agree_all_cnt = 0;
+          int64_t agree_hp65_cnt = 0;
+          int64_t hp65_tot = 0;
+          for (size_t i = 0; i < r765_collateral_panel.size(); ++i) {
+            const auto& item = r765_collateral_panel[i];
+            if (item.is_hp65) hp65_tot++;
+            if (i < p_probs.size() && !p_probs[i].empty()) {
+              const auto& probs = p_probs[i];
+              double best_p = -1e9;
+              Action best_a = open_spiel::kInvalidAction;
+              for (size_t a_idx = 0; a_idx < item.legal_actions.size(); ++a_idx) {
+                if (a_idx >= probs.size()) continue;
+                double pf = probs[a_idx];
+                Action ai = item.legal_actions[a_idx];
+                if (pf > best_p + 1e-12 || (std::abs(pf - best_p) <= 1e-12 && (best_a < 0 || ai < best_a))) {
+                  best_p = pf;
+                  best_a = ai;
+                }
+              }
+              if (best_a == item.baseline_greedy_action) {
+                agree_all_cnt++;
+                if (item.is_hp65) agree_hp65_cnt++;
+              }
+            }
+          }
+          panel1024_agree_all = r765_collateral_panel.empty() ? 1.0 : (static_cast<double>(agree_all_cnt) / r765_collateral_panel.size());
+          panel1024_agree_hp65 = hp65_tot == 0 ? 1.0 : (static_cast<double>(agree_hp65_cnt) / static_cast<double>(hp65_tot));
+        }
+      }
+
+      bool all_metrics_finite =
+          std::isfinite(stats.policy_loss) &&
+          std::isfinite(stats.value_loss) &&
+          std::isfinite(stats.entropy) &&
+          std::isfinite(stats.approx_kl) &&
+          std::isfinite(mean_delta_q) &&
+          std::isfinite(mean_realized_kl) &&
+          std::isfinite(mean_realized_temp) &&
+          std::isfinite(mean_delta_log_odds_target) &&
+          std::isfinite(mean_delta_log_odds_t1) &&
+          std::isfinite(mean_delta_log_odds_t2_live) &&
+          std::isfinite(mean_delta_log_odds_t2_ema) &&
+          std::isfinite(post_evict.post_evict_5u_ret) &&
+          std::isfinite(post_evict.post_evict_10u_ret);
+      if (panel1024_evaluated) {
+        all_metrics_finite = all_metrics_finite &&
+            std::isfinite(panel1024_agree_all) &&
+            std::isfinite(panel1024_agree_hp65);
+      }
+
+      double pooled_5u_preserve_rate = -1.0;
+      int64_t pooled_5u_preserved = 0;
+      int64_t pooled_5u_eligible = 0;
+      std::string preserve_abort_reason;
+      bool preserve_ok = r765_preserve_guard.PushAndCheck(
+          agreed_preserved_count, agreed_eligible_count,
+          absl::GetFlag(FLAGS_r765_preserve_5u_min_rate),
+          all_metrics_finite, &pooled_5u_preserve_rate,
+          &pooled_5u_preserved, &pooled_5u_eligible, &preserve_abort_reason);
+
+      bool coverage_ok = true;
+      if (absl::GetFlag(FLAGS_r765_replay_window_updates) > 1 &&
+          absl::GetFlag(FLAGS_r755_finish_unvisited_aux_on_kl_stop) &&
+          post_evict.has_final_age_cohort_this_update &&
+          !post_evict.final_age_full_coverage) {
+        coverage_ok = false;
+      }
+
+      bool panel_ok = true;
+      if (panel1024_evaluated) {
+        double min_all = absl::GetFlag(FLAGS_r765_collateral_min_all_agree);
+        double min_hp65 = absl::GetFlag(FLAGS_r765_collateral_min_hp65_agree);
+        if (min_all > 0.0 && panel1024_agree_all < min_all) panel_ok = false;
+        if (min_hp65 > 0.0 && panel1024_agree_hp65 < min_hp65) panel_ok = false;
       }
 
       int64_t t3_5u_roots = 0;
@@ -17461,13 +17684,55 @@ int main(int argc, char** argv) {
       }
 
       std::string diag_jsonl_path = absl::GetFlag(FLAGS_r765_absorption_diag_jsonl);
+      bool jsonl_write_ok = true;
       if (!diag_jsonl_path.empty()) {
         std::ofstream out(diag_jsonl_path, std::ios::app);
         if (out.is_open()) {
+          const int replay_k = absl::GetFlag(FLAGS_r765_replay_window_updates);
+          const int n_ages = std::min(16, std::max(1, replay_k));
+          const double cap_frac = stats.aux_total_slices > 0
+              ? (static_cast<double>(stats.aux_cap_active_slices) / static_cast<double>(stats.aux_total_slices))
+              : 0.0;
           out << "{"
               << "\"global_update\":" << update
               << ",\"distinct_override_roots\":" << distinct_roots.size()
               << ",\"emitted_aux_examples\":" << current_collect.aux_examples.size()
+              << ",\"total_aux_rows_in_update\":" << train_aux_examples.size()
+              << ",\"active_replay_cohorts\":" << post_evict.active_train_cohorts
+              << ",\"aux_cap_active_slices\":" << stats.aux_cap_active_slices
+              << ",\"aux_total_slices\":" << stats.aux_total_slices
+              << ",\"aux_cap_active_frac\":" << cap_frac
+              << ",\"aux_presentations_by_age\":[";
+          for (int a = 0; a < n_ages; ++a) {
+            if (a > 0) out << ",";
+            out << stats.aux_presentations_by_age[a];
+          }
+          out << "],\"aux_mean_eff_weight_by_age\":[";
+          for (int a = 0; a < n_ages; ++a) {
+            if (a > 0) out << ",";
+            double mean_w = stats.aux_presentations_by_age[a] > 0
+                ? (stats.aux_eff_weight_sum_by_age[a] / static_cast<double>(stats.aux_presentations_by_age[a]))
+                : 0.0;
+            out << mean_w;
+          }
+          out << "],\"final_age_cohort_matured\":" << (post_evict.has_final_age_cohort_this_update ? 1 : 0)
+              << ",\"final_age_full_coverage\":" << (post_evict.final_age_full_coverage ? 1 : 0)
+              << ",\"post_evict_5u_roots\":" << post_evict.post_evict_5u_roots
+              << ",\"post_evict_5u_d_final_denom\":" << post_evict.post_evict_5u_d_final_denom
+              << ",\"post_evict_5u_d_cur\":" << post_evict.post_evict_5u_d_cur
+              << ",\"post_evict_5u_ret\":" << post_evict.post_evict_5u_ret
+              << ",\"post_evict_10u_roots\":" << post_evict.post_evict_10u_roots
+              << ",\"post_evict_10u_d_final_denom\":" << post_evict.post_evict_10u_d_final_denom
+              << ",\"post_evict_10u_d_cur\":" << post_evict.post_evict_10u_d_cur
+              << ",\"post_evict_10u_ret\":" << post_evict.post_evict_10u_ret
+              << ",\"agreed_preserved_count\":" << agreed_preserved_count
+              << ",\"agreed_eligible_count\":" << agreed_eligible_count
+              << ",\"pooled_5u_preserved\":" << pooled_5u_preserved
+              << ",\"pooled_5u_eligible\":" << pooled_5u_eligible
+              << ",\"pooled_5u_preserve_rate\":" << pooled_5u_preserve_rate
+              << ",\"panel1024_evaluated\":" << (panel1024_evaluated ? 1 : 0)
+              << ",\"panel1024_agree_all\":" << panel1024_agree_all
+              << ",\"panel1024_agree_hp65\":" << panel1024_agree_hp65
               << ",\"category_counts\":{"
               << "\"card\":" << cat_counts["card"]
               << ",\"same_card_space\":" << cat_counts["same_card_space"]
@@ -17495,7 +17760,28 @@ int main(int argc, char** argv) {
               << ",\"v5_dynamic_grad_cosine\":" << stats.purchase_grad_cosine
               << ",\"action_head_grad_cosine\":" << stats.action_head_grad_cosine
               << "}\n";
+          out.flush();
+          jsonl_write_ok = out.good();
+        } else {
+          jsonl_write_ok = false;
         }
+      }
+
+      if (!preserve_ok || !all_metrics_finite || !jsonl_write_ok || !coverage_ok || !panel_ok) {
+        if (have_bg && bg_collect_thread.joinable()) bg_collect_thread.join();
+        std::string abort_msg = "ABORT[R765-GUARD]:";
+        if (!jsonl_write_ok) abort_msg += " jsonl_write_failed";
+        if (!all_metrics_finite) abort_msg += " nonfinite_telemetry";
+        if (!preserve_ok) abort_msg += " " + preserve_abort_reason;
+        if (!coverage_ok) abort_msg += " final_age_coverage_failed";
+        if (!panel_ok) {
+          abort_msg += absl::StrFormat(" collateral_panel_floor_breached (all=%.4f < %.4f or hp65=%.4f < %.4f)",
+                                      panel1024_agree_all, absl::GetFlag(FLAGS_r765_collateral_min_all_agree),
+                                      panel1024_agree_hp65, absl::GetFlag(FLAGS_r765_collateral_min_hp65_agree));
+        }
+        std::cerr << abort_msg << "\n";
+        std::cout << abort_msg << "\n";
+        std::exit(4);
       }
     }
 
