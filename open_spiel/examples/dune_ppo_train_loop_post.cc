@@ -9,19 +9,22 @@ namespace open_spiel::ppo_train_internal {
 #ifdef OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
 void PpoTrainRunContext::SaveAuxiliarySidecars(int ckpt_update) {
-  std::filesystem::path ckpt_dir =
-      std::filesystem::path(absl::GetFlag(FLAGS_run_prefix)).parent_path();
+  std::filesystem::path run_pfx(absl::GetFlag(FLAGS_run_prefix));
+  std::filesystem::path ckpt_dir = run_pfx.parent_path();
   if (ckpt_dir.empty()) ckpt_dir = ".";
+  std::string run_stem = run_pfx.filename().string();
+  if (run_stem.empty()) run_stem = "ppo";
   if (absl::GetFlag(FLAGS_r765_replay_window_updates) > 1) {
     const std::string replay_out =
-        (ckpt_dir / absl::StrCat("ppo_r765_replay_update_", ckpt_update, ".bin")).string();
+        (ckpt_dir / absl::StrCat(run_stem, "_r765_replay_update_", ckpt_update, ".bin")).string();
     if (!r765_replay_mgr.SaveState(replay_out, &r765_preserve_guard)) {
       SpielFatalError("Failed to save R7-65 replay sidecar at: " + replay_out);
     }
   }
   if (v5_slot_residual_state.N > 0 &&
       !v5_slot_residual_state.init_w_residuals.empty()) {
-    const std::string v5_sidecar_out = (ckpt_dir / "v5_anneal_state.json").string();
+    const std::string v5_sidecar_out =
+        (ckpt_dir / absl::StrCat(run_stem, "_v5_anneal_state.json")).string();
     if (!v5_slot_residual_state.SaveSidecar(v5_sidecar_out)) {
       SpielFatalError("Failed to save V5 anneal sidecar at: " + v5_sidecar_out);
     }

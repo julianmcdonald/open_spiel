@@ -142,12 +142,18 @@ void RunR755Gate1Audit(
   };
   std::vector<PerGameStats> per_game(num_games);
 
-  std::vector<std::future<void>> game_futures;
-  game_futures.reserve(num_games);
-  for (int episode_id = 0; episode_id < num_games; ++episode_id) {
-    game_futures.push_back(
-        open_spiel::dune_imperium::SearchRolloutThreadPool::Instance().Submit([&, episode_id]() {
-          auto& g = per_game[episode_id];
+  const int num_outer_workers = std::min<int>(
+      num_games,
+      std::max<int>(1, static_cast<int>(std::thread::hardware_concurrency()) / 2));
+  std::atomic<int> next_game{0};
+  std::vector<std::thread> outer_workers;
+  outer_workers.reserve(num_outer_workers);
+  for (int w = 0; w < num_outer_workers; ++w) {
+    outer_workers.emplace_back([&]() {
+      for (;;) {
+        const int episode_id = next_game.fetch_add(1, std::memory_order_relaxed);
+        if (episode_id >= num_games) break;
+        auto& g = per_game[episode_id];
           int audited_seat = episode_id % 4;
           auto state = game->NewInitialState();
           auto chance_rng = dune_seed::MakeRng64(dune_seed::DeriveSeed(master_seed, dune_seed::kDomainTrain, episode_id, dune_seed::kStreamChance));
@@ -371,11 +377,12 @@ void RunR755Gate1Audit(
             }
             state->ApplyAction(action);
           }
-        }));
+      }
+    });
   }
 
-  for (auto& fut : game_futures) {
-    fut.get();
+  for (auto& th : outer_workers) {
+    if (th.joinable()) th.join();
   }
 
   for (int episode_id = 0; episode_id < num_games; ++episode_id) {

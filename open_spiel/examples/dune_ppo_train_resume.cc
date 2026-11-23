@@ -120,6 +120,28 @@ void RecordTransitionSourceUpdate(int64_t global_update) {
   }
 }
 
+std::string DeriveSiblingCheckpointPath(
+    const std::string& base_path,
+    const std::string& base_update_token,
+    const std::string& base_final_token,
+    const std::string& target_update_token,
+    const std::string& target_final_token) {
+  if (base_path.empty()) return "";
+  std::filesystem::path p(base_path);
+  std::string filename = p.filename().string();
+  size_t pos = filename.rfind(base_update_token);
+  if (pos != std::string::npos) {
+    filename.replace(pos, base_update_token.size(), target_update_token);
+    return (p.parent_path() / filename).string();
+  }
+  pos = filename.rfind(base_final_token);
+  if (pos != std::string::npos) {
+    filename.replace(pos, base_final_token.size(), target_final_token);
+    return (p.parent_path() / filename).string();
+  }
+  return "";
+}
+
 void ApplyAndVerifyOptimizerConfig(
     torch::optim::AdamW& optimizer,
     const std::shared_ptr<SharedDunePolicyValueNetImpl>& training_model,
@@ -318,7 +340,10 @@ void RunCheckpointResume(PpoTrainRunContext& ctx) {
     RecordTransitionSourceUpdate(manifest.global_update);
   }
 
-  // Verify market_appendix_mode matches the current run's flag
+  // Verify market_appendix_mode matches the current run's flag and capture
+  // optional critic filenames if present in the manifest JSON.
+  std::string manifest_critic_model_filename;
+  std::string manifest_critic_optim_filename;
   {
     std::ifstream mfs(manifest_path);
     std::string content((std::istreambuf_iterator<char>(mfs)),
@@ -326,6 +351,14 @@ void RunCheckpointResume(PpoTrainRunContext& ctx) {
     auto parsed = open_spiel::json::FromString(content);
     if (parsed && parsed->IsObject()) {
       const auto& obj = parsed->GetObject();
+      auto cm_it = obj.find("critic_model_filename");
+      if (cm_it != obj.end() && cm_it->second.IsString()) {
+        manifest_critic_model_filename = cm_it->second.GetString();
+      }
+      auto co_it = obj.find("critic_optimizer_filename");
+      if (co_it != obj.end() && co_it->second.IsString()) {
+        manifest_critic_optim_filename = co_it->second.GetString();
+      }
       auto it = obj.find("market_appendix_mode");
       std::string manifest_mode = "none";
       if (it != obj.end() && it->second.IsString()) {
@@ -401,10 +434,17 @@ void RunCheckpointResume(PpoTrainRunContext& ctx) {
     if (absl::GetFlag(FLAGS_enable_ema_tracking) && ctx.ema_model != nullptr) {
       std::string ema_path = absl::GetFlag(FLAGS_ema_model_checkpoint);
       if (ema_path.empty()) {
-        std::string sibling_ema = (std::filesystem::path(model_path).parent_path() /
-            ("ppo_model_ema_update_" + std::to_string(manifest.global_update) + ".pt")).string();
-        if (std::filesystem::exists(sibling_ema)) {
-          ema_path = sibling_ema;
+        std::string stem_ema = DeriveSiblingCheckpointPath(
+            model_path, "_model_update_", "_model_final",
+            "_model_ema_update_", "_model_ema_final");
+        if (!stem_ema.empty() && std::filesystem::exists(stem_ema)) {
+          ema_path = stem_ema;
+        } else {
+          std::string legacy_ema = (std::filesystem::path(model_path).parent_path() /
+              ("ppo_model_ema_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+          if (std::filesystem::exists(legacy_ema)) {
+            ema_path = legacy_ema;
+          }
         }
       }
       if (!ema_path.empty() && std::filesystem::exists(ema_path)) {
@@ -445,11 +485,31 @@ void RunCheckpointResume(PpoTrainRunContext& ctx) {
     if (absl::GetFlag(FLAGS_separate_actor_critic) && ctx.training_critic != nullptr) {
       std::string critic_path = absl::GetFlag(FLAGS_critic_checkpoint);
       if (critic_path.empty()) {
-        std::string sibling_critic = (std::filesystem::path(model_path).parent_path() /
-            ("ppo_critic_model_update_" + std::to_string(manifest.global_update) + ".pt")).string();
-        if (std::filesystem::exists(sibling_critic)) {
-          critic_path = sibling_critic;
-        } else {
+        const std::filesystem::path model_dir =
+            std::filesystem::path(model_path).parent_path();
+        if (!manifest_critic_model_filename.empty()) {
+          std::string manifest_critic =
+              (model_dir / manifest_critic_model_filename).string();
+          if (std::filesystem::exists(manifest_critic)) {
+            critic_path = manifest_critic;
+          }
+        }
+        if (critic_path.empty()) {
+          std::string stem_critic = DeriveSiblingCheckpointPath(
+              model_path, "_model_update_", "_model_final",
+              "_critic_model_update_", "_critic_model_final");
+          if (!stem_critic.empty() && std::filesystem::exists(stem_critic)) {
+            critic_path = stem_critic;
+          }
+        }
+        if (critic_path.empty()) {
+          std::string legacy_critic = (model_dir /
+              ("ppo_critic_model_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+          if (std::filesystem::exists(legacy_critic)) {
+            critic_path = legacy_critic;
+          }
+        }
+        if (critic_path.empty()) {
           critic_path = model_path;
         }
       }
@@ -484,10 +544,29 @@ void RunCheckpointResume(PpoTrainRunContext& ctx) {
       if (absl::GetFlag(FLAGS_separate_actor_critic) && ctx.critic_optimizer != nullptr) {
         std::string critic_opt_path = absl::GetFlag(FLAGS_critic_optim_checkpoint);
         if (critic_opt_path.empty()) {
-          std::string sibling_opt = (std::filesystem::path(optim_path).parent_path() /
-              ("ppo_critic_optimizer_update_" + std::to_string(manifest.global_update) + ".pt")).string();
-          if (std::filesystem::exists(sibling_opt)) {
-            critic_opt_path = sibling_opt;
+          const std::filesystem::path optim_dir =
+              std::filesystem::path(optim_path).parent_path();
+          if (!manifest_critic_optim_filename.empty()) {
+            std::string manifest_opt =
+                (optim_dir / manifest_critic_optim_filename).string();
+            if (std::filesystem::exists(manifest_opt)) {
+              critic_opt_path = manifest_opt;
+            }
+          }
+          if (critic_opt_path.empty()) {
+            std::string stem_opt = DeriveSiblingCheckpointPath(
+                optim_path, "_optimizer_update_", "_optimizer_final",
+                "_critic_optimizer_update_", "_critic_optimizer_final");
+            if (!stem_opt.empty() && std::filesystem::exists(stem_opt)) {
+              critic_opt_path = stem_opt;
+            }
+          }
+          if (critic_opt_path.empty()) {
+            std::string legacy_opt = (optim_dir /
+                ("ppo_critic_optimizer_update_" + std::to_string(manifest.global_update) + ".pt")).string();
+            if (std::filesystem::exists(legacy_opt)) {
+              critic_opt_path = legacy_opt;
+            }
           }
         }
         if (!critic_opt_path.empty() && std::filesystem::exists(critic_opt_path)) {

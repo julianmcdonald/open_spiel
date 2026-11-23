@@ -713,13 +713,21 @@ void OnlineSearchCollector::CollectUpdate(
             // still samples the raw visit distribution. alpha == 1.0 is inert.
             target = SharpenVisitTarget(target, config_.target_sharpen_exponent);
 
+            bool uses_semantic_scorer = false;
+            std::string semantic_schema = dune_semantic::kDescriptorSchemaVersionV3;
             SearchTrainingExample ex;
             if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(evaluator.get())) {
               ex.observation = nn->GetConsumedObservation(*state, cur);
+              uses_semantic_scorer = nn->HasSemanticScorer();
+              semantic_schema = nn->SemanticDescriptorSchema();
             } else if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(evaluator.get())) {
               ex.observation = batched->GetConsumedObservation(*state, cur);
+              uses_semantic_scorer = batched->HasSemanticScorer();
+              semantic_schema = batched->SemanticDescriptorSchema();
             } else if (const auto* split = dynamic_cast<const SplitPolicyValueEvaluator*>(evaluator.get())) {
               ex.observation = split->GetConsumedObservation(*state, cur);
+              uses_semantic_scorer = split->HasSemanticScorer();
+              semantic_schema = split->SemanticDescriptorSchema();
             } else {
               ex.observation = provides_istate ? state->InformationStateTensor(cur)
                                                : state->ObservationTensor(cur);
@@ -727,6 +735,13 @@ void OnlineSearchCollector::CollectUpdate(
             ex.player = cur;
             ex.legal_actions = diag.actions;      // aligned to normalized_visits
             ex.normalized_visits = target;        // CE target (pruned when noised)
+            if (uses_semantic_scorer && !ex.legal_actions.empty()) {
+              if (const auto* dune_state =
+                      dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get())) {
+                dune_semantic::ExtractCandidateDescriptors(
+                    *dune_state, ex.legal_actions, &ex.candidate_data, semantic_schema);
+              }
+            }
             ex.value_target = 0.0;                // attached at terminal
             ex.value_target_attached = false;
             ex.checkpoint_hash = checkpoint_hash_;

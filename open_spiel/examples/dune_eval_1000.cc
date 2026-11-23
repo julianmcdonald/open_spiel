@@ -17,13 +17,153 @@
 #include "open_spiel/spiel.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/abseil-cpp/absl/strings/str_format.h"
+#include "open_spiel/utils/json.h"
 #include <torch/torch.h>
+
+#include <fstream>
 
 #include "dune_network.h"
 #include "dune_seed_utils.h"
 
 namespace open_spiel {
 namespace {
+
+bool DetectModelDimensions(
+    const std::string& model_path,
+    int* hidden_dim,
+    int* num_blocks,
+    int64_t* input_dim,
+    std::string* semantic_descriptor_schema,
+    bool* slot_indexed_out_layer_f,
+    bool* use_nonlinear_value_head,
+    bool* enable_zone_encoder) {
+  std::string json_path;
+  std::filesystem::path p(model_path);
+  std::filesystem::path p_json = p;
+  p_json.replace_extension(".json");
+  if (std::filesystem::exists(p_json)) {
+    json_path = p_json.string();
+  } else {
+    std::error_code ec;
+    if (std::filesystem::is_symlink(p, ec)) {
+      auto resolved = std::filesystem::canonical(p, ec);
+      if (!ec) {
+        resolved.replace_extension(".json");
+        if (std::filesystem::exists(resolved)) {
+          json_path = resolved.string();
+        }
+      }
+    }
+    if (json_path.empty()) {
+      std::filesystem::path p_manifest = p.parent_path() / "manifest.json";
+      if (std::filesystem::exists(p_manifest)) {
+        json_path = p_manifest.string();
+      }
+    }
+  }
+
+  if (!json_path.empty()) {
+    try {
+      std::ifstream f(json_path);
+      if (f) {
+        std::string content((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        auto val_opt = json::FromString(content);
+        if (val_opt.has_value() && val_opt->IsObject()) {
+          const auto& obj = val_opt->GetObject();
+          if (input_dim != nullptr) {
+            auto it_od = obj.find("observation_dim");
+            if (it_od != obj.end() && it_od->second.IsInt()) {
+              *input_dim = it_od->second.GetInt();
+            }
+          }
+          if (semantic_descriptor_schema != nullptr) {
+            auto it_sds = obj.find("semantic_descriptor_schema");
+            if (it_sds != obj.end() && it_sds->second.IsString()) {
+              *semantic_descriptor_schema = it_sds->second.GetString();
+            }
+          }
+          if (slot_indexed_out_layer_f != nullptr) {
+            auto it_sif = obj.find("slot_indexed_out_layer_f");
+            if (it_sif != obj.end()) {
+              *slot_indexed_out_layer_f =
+                  (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
+                  (it_sif->second.IsString() && it_sif->second.GetString() == "true");
+            }
+          }
+          if (use_nonlinear_value_head != nullptr) {
+            auto it_nl = obj.find("use_nonlinear_value_head");
+            if (it_nl != obj.end()) {
+              *use_nonlinear_value_head =
+                  (it_nl->second.IsBool() && it_nl->second.GetBool()) ||
+                  (it_nl->second.IsString() && it_nl->second.GetString() == "true");
+            }
+          }
+          if (enable_zone_encoder != nullptr) {
+            auto it_ze = obj.find("enable_zone_encoder");
+            if (it_ze != obj.end()) {
+              *enable_zone_encoder =
+                  (it_ze->second.IsBool() && it_ze->second.GetBool()) ||
+                  (it_ze->second.IsString() && it_ze->second.GetString() == "true");
+            }
+          }
+          auto it_hd = obj.find("hidden_dim");
+          auto it_nb = obj.find("num_blocks");
+          if (it_hd != obj.end() && it_hd->second.IsInt() &&
+              it_nb != obj.end() && it_nb->second.IsInt()) {
+            *hidden_dim = static_cast<int>(it_hd->second.GetInt());
+            *num_blocks = static_cast<int>(it_nb->second.GetInt());
+            return true;
+          }
+          auto it_arch = obj.find("architecture");
+          if (it_arch != obj.end() && it_arch->second.IsObject()) {
+            const auto& arch_obj = it_arch->second.GetObject();
+            auto it_arch_hd = arch_obj.find("hidden_dim");
+            auto it_arch_nb = arch_obj.find("num_blocks");
+            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
+                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
+              *hidden_dim = static_cast<int>(it_arch_hd->second.GetInt());
+              *num_blocks = static_cast<int>(it_arch_nb->second.GetInt());
+              return true;
+            }
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "Error parsing sidecar JSON for " << model_path << ": " << e.what() << "\n";
+    }
+  }
+
+  try {
+    torch::serialize::InputArchive archive;
+    archive.load_from(model_path, torch::kCPU);
+    torch::serialize::InputArchive in_arch;
+    archive.read("input_layer", in_arch);
+    torch::Tensor weight;
+    in_arch.read("weight", weight);
+    *hidden_dim = static_cast<int>(weight.size(0));
+    if (input_dim != nullptr) {
+      *input_dim = weight.size(1);
+    }
+    int blocks = 0;
+    while (true) {
+      torch::serialize::InputArchive res_arch;
+      if (!archive.try_read("res" + std::to_string(blocks + 1), res_arch)) {
+        break;
+      }
+      ++blocks;
+    }
+    *num_blocks = blocks;
+    if (use_nonlinear_value_head != nullptr) {
+      torch::serialize::InputArchive vh2_arch;
+      *use_nonlinear_value_head = archive.try_read("value_head2", vh2_arch);
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to detect model dimensions from " << model_path << ": " << e.what() << "\n";
+    return false;
+  }
+}
 
 struct ThreadStats {
   int model_wins = 0;
@@ -140,7 +280,16 @@ void BatchedWorkerThread(
           state->ObservationTensor(current_player, absl::MakeSpan(obs));
         }
 
-        EvalResult result = evaluator->Evaluate(obs);
+        EvalResult result;
+        if (dune_state != nullptr && evaluator != nullptr && evaluator->HasSemanticScorer()) {
+          dune_semantic::CandidateActionData cand_data;
+          dune_semantic::ExtractCandidateDescriptors(
+              *dune_state, legal_actions, &cand_data,
+              evaluator->SemanticDescriptorSchema());
+          result = evaluator->EvaluateWithActions(obs, &cand_data);
+        } else {
+          result = evaluator->Evaluate(obs);
+        }
         CenterAndCapLegalLogits(result.logits, legal_actions, logit_cap);
 
         // Argmax over legal actions
@@ -293,17 +442,44 @@ void RunEvaluation(const std::string& model_checkpoint,
 
   auto sync_mutex = std::make_shared<std::shared_mutex>();
 
-  auto model_a = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
-  model_a->eval();
-  try {
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_checkpoint, device);
-    model_a->load(archive);
-  } catch (const c10::Error& e) {
-    std::cerr << "Failed to load Model A checkpoint: " << model_checkpoint << "\n" << e.msg() << "\n";
-    std::exit(1);
-  }
-  model_a->to(device);
+  auto load_eval_model = [&](const std::string& checkpoint_path,
+                             int default_hidden,
+                             int default_blocks,
+                             const char* label) -> std::shared_ptr<SharedDunePolicyValueNetImpl> {
+    int h_dim = default_hidden;
+    int n_blocks = default_blocks;
+    int64_t in_dim = obs_size;
+    std::string schema = dune_semantic::kDescriptorSchemaVersionV3;
+    bool slot_f = false;
+    bool use_nonlinear = false;
+    bool enable_zone_encoder = false;
+    if (!DetectModelDimensions(
+            checkpoint_path, &h_dim, &n_blocks, &in_dim,
+            &schema, &slot_f, &use_nonlinear, &enable_zone_encoder)) {
+      std::cerr << "Failed to detect dimensions for " << label << ": " << checkpoint_path << "\n";
+      std::exit(1);
+    }
+    const bool has_scorer = CheckpointHasSemanticScorer(checkpoint_path, torch::kCPU);
+    auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+        in_dim, h_dim, action_size, n_blocks,
+        use_nonlinear, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+        has_scorer, enable_zone_encoder, schema);
+    model->SetSemanticDescriptorSchema(schema);
+    if (slot_f && model->semantic_scorer_ != nullptr) {
+      model->semantic_scorer_->EnableF(true);
+    }
+    model->eval();
+    try {
+      LoadModelCheckpointRobust(model, checkpoint_path, device);
+    } catch (const c10::Error& e) {
+      std::cerr << "Failed to load " << label << " checkpoint: " << checkpoint_path << "\n" << e.msg() << "\n";
+      std::exit(1);
+    }
+    model->to(device);
+    return model;
+  };
+
+  auto model_a = load_eval_model(model_checkpoint, hidden_dim, num_blocks, "Model A");
 
   // The evaluator returns raw logits; workers center over legal actions before capping.
   auto model_a_evaluator = std::make_shared<BatchedEvaluator>(
@@ -314,17 +490,7 @@ void RunEvaluation(const std::string& model_checkpoint,
     opponent_evaluators.reserve(opponent_paths.size());
   }
   for (const std::string& opponent_path : opponent_paths) {
-    auto model_b = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, opp_hidden_dim, action_size, opp_num_blocks);
-    model_b->eval();
-    try {
-      torch::serialize::InputArchive archive;
-      archive.load_from(opponent_path, device);
-      model_b->load(archive);
-    } catch (const c10::Error& e) {
-      std::cerr << "Failed to load opponent checkpoint: " << opponent_path << "\n" << e.msg() << "\n";
-      std::exit(1);
-    }
-    model_b->to(device);
+    auto model_b = load_eval_model(opponent_path, opp_hidden_dim, opp_num_blocks, "opponent");
     opponent_evaluators.push_back(std::make_shared<BatchedEvaluator>(
         model_b, eval_batch_size, eval_timeout_ms, device, sync_mutex.get(), 0.0f));
   }

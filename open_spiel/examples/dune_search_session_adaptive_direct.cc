@@ -6,6 +6,98 @@
 #include <numeric>
 
 namespace open_spiel {
+namespace {
+
+dune_imperium::JointSearchV2Result RunJointPlacementWithPrimaryPriors(
+    const State& state,
+    Player search_player,
+    dune_imperium::TurnSearchTree* turn_tree,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& prior_evaluators,
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& rollout_evaluators,
+    int reference_rollouts_per_action,
+    double min_override_margin,
+    uint64_t decision_seed,
+    dune_imperium::SearchRolloutCrnMode crn_mode,
+    double max_time_ms,
+    int max_inflight_worlds,
+    double prior_log_ratio_weight,
+    double stage1_high_conf_prior_skip,
+    double est_ms_per_sim,
+    size_t max_candidates,
+    const dune_imperium::SearchV2TuningConfig& tuning,
+    double win_speed_tiebreak_eps,
+    bool ceiling_aware_margin) {
+  if (turn_tree != nullptr) turn_tree->BindPublicCardKnowledge(state);
+  const auto legal = state.LegalActions();
+  if (legal.empty()) {
+    dune_imperium::JointSearchV2Result res;
+    res.base = {kInvalidAction, false, 0.0, 0.0, 0, 0, {}, {}};
+    return res;
+  }
+  const ActionsAndProbs raw_prior =
+      prior_evaluators.empty() ? ActionsAndProbs{}
+                               : prior_evaluators.front()->Prior(state);
+  std::vector<dune_imperium::JointAgentCandidate> joint_cands =
+      dune_imperium::EnumerateJointAgentCandidates(
+          state, search_player, prior_evaluators, raw_prior, max_candidates);
+  if (joint_cands.empty()) {
+    Action raw_a = dune_imperium::PickGreedyAction(raw_prior, legal);
+    dune_imperium::JointSearchV2Result res;
+    res.base = {raw_a, false, 0.0, 0.0, 0, 0, {}, {}};
+    res.chosen_first_action = raw_a;
+    res.chosen_graft_action = kInvalidAction;
+    res.chosen_second_action = kInvalidAction;
+    res.raw_first_action = raw_a;
+    res.raw_graft_action = kInvalidAction;
+    res.raw_second_action = kInvalidAction;
+    return res;
+  }
+  std::vector<Action> ordered_cands;
+  std::vector<Action> graft_actions;
+  std::vector<Action> second_actions;
+  std::vector<double> cand_priors;
+  ordered_cands.reserve(joint_cands.size());
+  graft_actions.reserve(joint_cands.size());
+  second_actions.reserve(joint_cands.size());
+  cand_priors.reserve(joint_cands.size());
+  for (const auto& jc : joint_cands) {
+    ordered_cands.push_back(jc.first_action);
+    graft_actions.push_back(jc.graft_action);
+    second_actions.push_back(jc.second_action);
+    cand_priors.push_back(jc.joint_prior);
+  }
+  int chosen_c_idx = 0;
+  dune_imperium::CompoundSearchDecisionResult base_res =
+      dune_imperium::SearchV2SuccessiveHalvingDecision(
+          state, search_player, turn_tree, rollout_evaluators, ordered_cands,
+          cand_priors, reference_rollouts_per_action, min_override_margin,
+          decision_seed, crn_mode, max_time_ms, max_inflight_worlds,
+          prior_log_ratio_weight, stage1_high_conf_prior_skip, &second_actions,
+          &graft_actions, est_ms_per_sim, &chosen_c_idx, tuning,
+          win_speed_tiebreak_eps, ceiling_aware_margin);
+  dune_imperium::JointSearchV2Result res;
+  res.base = base_res;
+  res.raw_first_action = joint_cands[0].first_action;
+  res.raw_graft_action = joint_cands[0].graft_action;
+  res.raw_second_action = joint_cands[0].second_action;
+  res.chosen_candidate_index = chosen_c_idx;
+  if (chosen_c_idx >= 0 && chosen_c_idx < static_cast<int>(joint_cands.size())) {
+    res.chosen_first_action = joint_cands[chosen_c_idx].first_action;
+    res.chosen_graft_action = joint_cands[chosen_c_idx].graft_action;
+    res.chosen_second_action = joint_cands[chosen_c_idx].second_action;
+  } else {
+    res.chosen_first_action = base_res.action;
+    res.chosen_graft_action = kInvalidAction;
+    res.chosen_second_action = kInvalidAction;
+  }
+  for (const auto& kv : base_res.candidate_rollout_utilities) {
+    res.per_candidate_rollouts.push_back(kv.second);
+  }
+  res.joint_candidates = std::move(joint_cands);
+  return res;
+}
+
+}  // namespace
 
 PairedActionEvaluationResult DuneAdaptiveRolloutSession::EvaluateActionPairTerminal(
     const State& state, Action a_first, Action a_second,
@@ -85,7 +177,9 @@ DirectSearchV2RootResult DuneAdaptiveRolloutSession::RunDirectSearchV2Root(
   const int ref_rollouts = (override_ref_rollouts > 0)
                                ? override_ref_rollouts
                                : std::max(4, static_cast<int>((0.82 * target_budget_ms) / est_ms_per_sim) / 3);
-  const int worker_s2_cap = 128 * std::max(1, num_evaluators_);
+  const auto& rollout_evals = ActiveRolloutEvaluators();
+  const int worker_s2_cap =
+      128 * std::max(1, static_cast<int>(rollout_evals.size()));
   const int inflight = (target_budget_ms < 0.0)
                            ? std::min(worker_s2_cap, std::max(192, max_inflight_worlds_))
                            : std::min(worker_s2_cap, max_inflight_worlds_);
@@ -98,15 +192,14 @@ DirectSearchV2RootResult DuneAdaptiveRolloutSession::RunDirectSearchV2Root(
 
   if (!is_purchase) {
     const size_t max_cands = (target_budget_ms >= 0.0 && target_budget_ms < 2500.0) ? 5 : 8;
-    auto joint_res = dune_imperium::SearchV2JointPlacementDecision(
-        state, p, &local_tree, impl_->evaluators, ref_rollouts, 0.15,
-        decision_seed,
+    auto joint_res = RunJointPlacementWithPrimaryPriors(
+        state, p, &local_tree, impl_->evaluators, rollout_evals, ref_rollouts,
+        0.15, decision_seed,
         (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn
                               : dune_imperium::SearchRolloutCrnMode::kSequential),
         target_budget_ms, inflight, prior_log_ratio_weight_,
-        stage1_high_conf_prior_skip_, /*precomputed_raw_prior=*/nullptr,
-        est_ms_per_sim, max_cands, eff_v2_tuning, win_speed_tiebreak_eps_,
-        ceiling_aware_margin_);
+        stage1_high_conf_prior_skip_, est_ms_per_sim, max_cands, eff_v2_tuning,
+        win_speed_tiebreak_eps_, ceiling_aware_margin_);
 
     const auto t1 = std::chrono::steady_clock::now();
     res.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -189,7 +282,7 @@ DirectSearchV2RootResult DuneAdaptiveRolloutSession::RunDirectSearchV2Root(
 
     int chosen_c_idx = 0;
     const auto c_res = dune_imperium::SearchV2SuccessiveHalvingDecision(
-        state, p, &local_tree, impl_->evaluators, ordered_cands, cand_priors,
+        state, p, &local_tree, rollout_evals, ordered_cands, cand_priors,
         ref_rollouts, 0.15, decision_seed,
         (use_event_keyed_crn_ ? dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn
                               : dune_imperium::SearchRolloutCrnMode::kSequential),
@@ -279,7 +372,9 @@ DirectSearchV1SequentialRootResult DuneAdaptiveRolloutSession::RunDirectSearchV1
   double root_budget_ms = -1.0;
   int root_ref = 0;
   int inflight = 0;
-  const int worker_s2_cap = 128 * std::max(1, num_evaluators_);
+  const auto& rollout_evals = ActiveRolloutEvaluators();
+  const int worker_s2_cap =
+      128 * std::max(1, static_cast<int>(rollout_evals.size()));
   if (target_budget_ms >= 0.0) {
     root_budget_ms = 0.60 * target_budget_ms;
     root_ref = (override_ref_rollouts > 0)
@@ -296,7 +391,7 @@ DirectSearchV1SequentialRootResult DuneAdaptiveRolloutSession::RunDirectSearchV1
                                               : dune_imperium::SearchRolloutCrnMode::kSequential);
 
   auto s1_res = dune_imperium::SuccessiveHalvingRolloutSearchDecision(
-      state, p, &local_tree, impl_->evaluators, root_ref, /*min_override_margin=*/0.15,
+      state, p, &local_tree, rollout_evals, root_ref, /*min_override_margin=*/0.15,
       decision_seed, crn_mode, unbiased_stage2_gate_, root_budget_ms,
       /*fixed_top_k=*/5, inflight, /*use_bounded_pool_when_unclocked=*/false,
       /*full_clock_stage2=*/false, prior_log_ratio_weight_,
@@ -355,7 +450,7 @@ DirectSearchV1SequentialRootResult DuneAdaptiveRolloutSession::RunDirectSearchV1
       if (target_budget_ms < 0.0 || sub_budget_ms >= 5.0) {
         uint64_t sub_seed = decision_seed ^ (has_graft ? 0x517CC1B727220A95ULL : 0x9E3779B97F4A7C15ULL);
         auto sub_res = dune_imperium::SuccessiveHalvingRolloutSearchDecision(
-            *sim, p, &local_tree, impl_->evaluators, sub_ref, 0.15, sub_seed,
+            *sim, p, &local_tree, rollout_evals, sub_ref, 0.15, sub_seed,
             crn_mode, unbiased_stage2_gate_, sub_budget_ms, 5, inflight, false, false,
             prior_log_ratio_weight_, stage1_high_conf_prior_skip_, &sub_prior,
             /*all_buy_candidates=*/false, win_speed_tiebreak_eps_,
@@ -420,13 +515,15 @@ EvaluateJointCandidatesResult DuneAdaptiveRolloutSession::EvaluateJointCandidate
   int rollouts_executed = 0;
   dune_imperium::TurnSearchTree local_tree;
 
-  const int worker_s2_cap = 128 * std::max(1, num_evaluators_);
+  const auto& rollout_evals = ActiveRolloutEvaluators();
+  const int worker_s2_cap =
+      128 * std::max(1, static_cast<int>(rollout_evals.size()));
   const int inflight = std::clamp(
       num_worlds, 2, std::min(worker_s2_cap, std::max(2, 512 / static_cast<int>(K))));
 
   const auto t0 = std::chrono::steady_clock::now();
   dune_imperium::RunClockedPairedRolloutStage(
-      state, dune, p, impl_->evaluators, first_actions, candidate_indices,
+      state, dune, p, rollout_evals, first_actions, candidate_indices,
       num_worlds, /*world_seed_offset=*/0, decision_seed,
       dune_imperium::SearchRolloutCrnMode::kEventKeyedCrn,
       /*sample_opponent_leader_draft=*/false,

@@ -531,9 +531,11 @@ inline void BatchedEvaluator::LaunchAsyncSlot(
                 const torch::Tensor post_max = post_capped.abs().masked_fill(
                     dev_mask.logical_not(), 0.0).amax(1);
                 const torch::Tensor saturated =
-                    ((post_capped.abs() >=
-                      0.99 * static_cast<float>(logit_cap_)) &
-                     dev_mask).sum();
+                    (logit_cap_ > 0.0f)
+                        ? ((post_capped.abs() >=
+                            0.99 * static_cast<float>(logit_cap_)) &
+                           dev_mask).sum()
+                        : torch::zeros({}, compact_logits.options().dtype(torch::kInt64));
                 const torch::Tensor cap_stats = torch::stack(
                     {pre_max.max().to(torch::kFloat64),
                      post_max.max().to(torch::kFloat64),

@@ -69,6 +69,10 @@ class BatchedNNEvaluator : public algorithms::Evaluator {
     return ModelObservation(state, player);
   }
 
+  bool HasSemanticScorer() const {
+    return batched_eval_ != nullptr && batched_eval_->HasSemanticScorer();
+  }
+
   std::string SemanticDescriptorSchema() const {
     return batched_eval_ ? batched_eval_->SemanticDescriptorSchema() : dune_semantic::kDescriptorSchemaVersionV3;
   }

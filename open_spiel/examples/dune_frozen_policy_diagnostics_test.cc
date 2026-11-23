@@ -20,7 +20,6 @@ namespace open_spiel {
 namespace dune_diagnostics {
 namespace {
 
-using dune_imperium::ActionToString;
 using dune_imperium::ContainsAction;
 using dune_imperium::DuneImperiumState;
 using dune_imperium::kActionAgentSpaceSwordmaster;

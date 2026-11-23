@@ -33,7 +33,6 @@
 namespace open_spiel {
 namespace dune_diagnostics {
 
-using dune_imperium::ActionToString;
 using dune_imperium::AgentSpaceNameForAction;
 using dune_imperium::BuildStateAtFirstAgentTurn;
 using dune_imperium::ContainsAction;
@@ -161,7 +160,7 @@ inline std::string DiagnosticActionToString(Action a) {
   if (a >= 600 && a <= 621) {
     return "PlaceAgent[" + dune_imperium::SpaceToName(static_cast<dune_imperium::BoardSpaceID>(a)) + "]";
   }
-  return ActionToString(a);
+  return "Action[" + std::to_string(a) + "]";
 }
 
 inline constexpr int kIntrigueEconomicPositioning = 23;

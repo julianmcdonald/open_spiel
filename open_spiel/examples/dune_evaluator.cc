@@ -8,6 +8,7 @@
 #include <random>
 
 #include "open_spiel/spiel.h"
+#include "open_spiel/utils/json.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_content.h"
 #include "open_spiel/games/dune_imperium/dune_imperium_cards.h"
@@ -18,6 +19,147 @@
 #include "dune_terminal_vp_report.h" 
 
 using namespace open_spiel;
+
+namespace {
+
+bool DetectModelDimensions(
+    const std::string& model_path,
+    int64_t* hidden_dim,
+    int* num_blocks,
+    int64_t* input_dim,
+    std::string* semantic_descriptor_schema,
+    bool* slot_indexed_out_layer_f,
+    bool* use_nonlinear_value_head,
+    bool* enable_zone_encoder) {
+  std::string json_path;
+  std::filesystem::path p(model_path);
+  std::filesystem::path p_json = p;
+  p_json.replace_extension(".json");
+  if (std::filesystem::exists(p_json)) {
+    json_path = p_json.string();
+  } else {
+    std::error_code ec;
+    if (std::filesystem::is_symlink(p, ec)) {
+      auto resolved = std::filesystem::canonical(p, ec);
+      if (!ec) {
+        resolved.replace_extension(".json");
+        if (std::filesystem::exists(resolved)) {
+          json_path = resolved.string();
+        }
+      }
+    }
+    if (json_path.empty()) {
+      std::filesystem::path p_manifest = p.parent_path() / "manifest.json";
+      if (std::filesystem::exists(p_manifest)) {
+        json_path = p_manifest.string();
+      }
+    }
+  }
+
+  if (!json_path.empty()) {
+    try {
+      std::ifstream f(json_path);
+      if (f) {
+        std::string content((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        auto val_opt = json::FromString(content);
+        if (val_opt.has_value() && val_opt->IsObject()) {
+          const auto& obj = val_opt->GetObject();
+          if (input_dim != nullptr) {
+            auto it_od = obj.find("observation_dim");
+            if (it_od != obj.end() && it_od->second.IsInt()) {
+              *input_dim = it_od->second.GetInt();
+            }
+          }
+          if (semantic_descriptor_schema != nullptr) {
+            auto it_sds = obj.find("semantic_descriptor_schema");
+            if (it_sds != obj.end() && it_sds->second.IsString()) {
+              *semantic_descriptor_schema = it_sds->second.GetString();
+            }
+          }
+          if (slot_indexed_out_layer_f != nullptr) {
+            auto it_sif = obj.find("slot_indexed_out_layer_f");
+            if (it_sif != obj.end()) {
+              *slot_indexed_out_layer_f =
+                  (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
+                  (it_sif->second.IsString() && it_sif->second.GetString() == "true");
+            }
+          }
+          if (use_nonlinear_value_head != nullptr) {
+            auto it_nl = obj.find("use_nonlinear_value_head");
+            if (it_nl != obj.end()) {
+              *use_nonlinear_value_head =
+                  (it_nl->second.IsBool() && it_nl->second.GetBool()) ||
+                  (it_nl->second.IsString() && it_nl->second.GetString() == "true");
+            }
+          }
+          if (enable_zone_encoder != nullptr) {
+            auto it_ze = obj.find("enable_zone_encoder");
+            if (it_ze != obj.end()) {
+              *enable_zone_encoder =
+                  (it_ze->second.IsBool() && it_ze->second.GetBool()) ||
+                  (it_ze->second.IsString() && it_ze->second.GetString() == "true");
+            }
+          }
+          auto it_hd = obj.find("hidden_dim");
+          auto it_nb = obj.find("num_blocks");
+          if (it_hd != obj.end() && it_hd->second.IsInt() &&
+              it_nb != obj.end() && it_nb->second.IsInt()) {
+            *hidden_dim = it_hd->second.GetInt();
+            *num_blocks = static_cast<int>(it_nb->second.GetInt());
+            return true;
+          }
+          auto it_arch = obj.find("architecture");
+          if (it_arch != obj.end() && it_arch->second.IsObject()) {
+            const auto& arch_obj = it_arch->second.GetObject();
+            auto it_arch_hd = arch_obj.find("hidden_dim");
+            auto it_arch_nb = arch_obj.find("num_blocks");
+            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
+                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
+              *hidden_dim = it_arch_hd->second.GetInt();
+              *num_blocks = static_cast<int>(it_arch_nb->second.GetInt());
+              return true;
+            }
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "Error parsing sidecar JSON for " << model_path << ": " << e.what() << "\n";
+    }
+  }
+
+  try {
+    torch::serialize::InputArchive archive;
+    archive.load_from(model_path, torch::kCPU);
+    torch::serialize::InputArchive in_arch;
+    archive.read("input_layer", in_arch);
+    torch::Tensor weight;
+    in_arch.read("weight", weight);
+    *hidden_dim = weight.size(0);
+    if (input_dim != nullptr) {
+      *input_dim = weight.size(1);
+    }
+    int blocks = 0;
+    while (true) {
+      torch::serialize::InputArchive res_arch;
+      if (!archive.try_read("res" + std::to_string(blocks + 1), res_arch)) {
+        break;
+      }
+      ++blocks;
+    }
+    *num_blocks = blocks;
+    if (use_nonlinear_value_head != nullptr) {
+      torch::serialize::InputArchive vh2_arch;
+      *use_nonlinear_value_head = archive.try_read("value_head2", vh2_arch);
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to detect model dimensions from " << model_path << ": " << e.what() << "\n";
+    return false;
+  }
+}
+
+}  // namespace
 
 struct ActionProb {
   Action action;
@@ -398,14 +540,7 @@ int main(int argc, char* argv[]) {
     rng.seed(seed);
   }
 
-  // 2. Initialize the Network
-  int64_t obs_size = game->InformationStateTensorShape()[0];
-  int64_t action_size = 2391;
-  
-  auto inference_model = std::make_shared<SharedDunePolicyValueNetImpl>(obs_size, hidden_dim, action_size, num_blocks);
-  inference_model->eval(); // Disable Dropout/BatchNorm variance
-
-  // 3. Robust Multi-Path Checkpoint Loading
+  // 2. Resolve checkpoint path and device
   if (!std::filesystem::exists(model_checkpoint)) {
     std::vector<std::string> paths = {
       "../../../dune_stage_a_run11_model.pt",
@@ -421,7 +556,6 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Device Management
   torch::Device device(torch::kCPU);
   try {
     if (torch::cuda::is_available()) {
@@ -431,12 +565,37 @@ int main(int argc, char* argv[]) {
     device = torch::Device(torch::kCPU);
   }
 
-  // Load Model weights with explicit device mapping
+  // 3. Auto-detect model dimensions and initialize network
+  int64_t obs_size = game->InformationStateTensorShape()[0];
+  int64_t action_size = game->NumDistinctActions();
+  std::string detected_schema = dune_semantic::kDescriptorSchemaVersionV3;
+  bool slot_indexed_f = false;
+  bool use_nonlinear_value_head = false;
+  bool enable_zone_encoder = false;
+  if (!DetectModelDimensions(
+          model_checkpoint, &hidden_dim, &num_blocks, &obs_size,
+          &detected_schema, &slot_indexed_f, &use_nonlinear_value_head,
+          &enable_zone_encoder)) {
+    std::cerr << "[ERROR] Could not detect model dimensions for " << model_checkpoint << "\n";
+    return 1;
+  }
+  const bool has_semantic_scorer =
+      CheckpointHasSemanticScorer(model_checkpoint, torch::kCPU);
+
+  auto inference_model = std::make_shared<SharedDunePolicyValueNetImpl>(
+      obs_size, hidden_dim, action_size, num_blocks,
+      use_nonlinear_value_head, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+      has_semantic_scorer, enable_zone_encoder, detected_schema);
+  inference_model->SetSemanticDescriptorSchema(detected_schema);
+  if (slot_indexed_f && inference_model->semantic_scorer_ != nullptr) {
+    inference_model->semantic_scorer_->EnableF(true);
+  }
+  inference_model->eval(); // Disable Dropout/BatchNorm variance
+
+  // Load Model weights with explicit device mapping and robust manifest checks
   try {
     std::cout << "Loading model checkpoint onto " << device << "...\n";
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_checkpoint, device);
-    inference_model->load(archive);
+    LoadModelCheckpointRobust(inference_model, model_checkpoint, device);
     std::cout << "Successfully loaded model weights from " << model_checkpoint << "\n";
   } catch (const c10::Error& e) {
     if (device.is_cuda()) {
@@ -444,9 +603,7 @@ int main(int argc, char* argv[]) {
       std::cerr << "Error details: " << e.msg() << "\n";
       device = torch::Device(torch::kCPU);
       try {
-        torch::serialize::InputArchive archive;
-        archive.load_from(model_checkpoint, device);
-        inference_model->load(archive);
+        LoadModelCheckpointRobust(inference_model, model_checkpoint, device);
         std::cout << "Successfully loaded model weights onto CPU as fallback.\n";
       } catch (const c10::Error& fallback_err) {
         std::cerr << "\n[ERROR] Failed to load checkpoint on CPU: " << model_checkpoint << "\n";
@@ -542,8 +699,19 @@ int main(int argc, char* argv[]) {
     }
 
     // --- TENSOR PREPARATION ---
-    // Use InformationStateTensor to match the dynamic tensor shape
-    std::vector<float> obs_tensor = state->InformationStateTensor();
+    const auto* dune_state = dynamic_cast<const dune_imperium::DuneImperiumState*>(state.get());
+    std::vector<float> obs_tensor;
+    if (dune_state != nullptr) {
+      obs_tensor = dune_state->InformationStateTensorWithAppendix(
+          current_player,
+          inference_model->market_appendix_mode_,
+          inference_model->deck_pool_semantics_);
+    } else {
+      obs_tensor = state->InformationStateTensor();
+    }
+    if (static_cast<int64_t>(obs_tensor.size()) != obs_size) {
+      obs_tensor.resize(static_cast<size_t>(obs_size), 0.0f);
+    }
     torch::Tensor input_tensor = torch::from_blob(obs_tensor.data(), {1, obs_size}, torch::kFloat).to(device);
 
     // --- QUERY THE NETWORK ---
@@ -551,6 +719,17 @@ int main(int argc, char* argv[]) {
 
     // Extract Policy (Action Probabilities)
     std::vector<Action> legal_actions = state->LegalActions();
+    if (inference_model->with_semantic_scorer_ && inference_model->semantic_scorer_ &&
+        dune_state != nullptr && !legal_actions.empty()) {
+      dune_semantic::CandidateActionData cand_data;
+      dune_semantic::ExtractCandidateDescriptors(
+          *dune_state, legal_actions, &cand_data,
+          inference_model->semantic_descriptor_schema_);
+      std::vector<const dune_semantic::CandidateActionData*> batch_cands = {&cand_data};
+      dune_semantic::ApplySemanticScorerBatch(
+          inference_model->semantic_scorer_, output.trunk, batch_cands,
+          output.logits, device);
+    }
     torch::Tensor policy_logits = output.logits.squeeze(0); // Remains on the model's device
 
     std::vector<int64_t> legal_indices;

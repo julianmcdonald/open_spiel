@@ -130,6 +130,32 @@ class SplitPolicyValueEvaluator : public open_spiel::algorithms::Evaluator {
     return value_source_;
   }
 
+  bool HasSemanticScorer() const {
+    if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
+      return nn->HasSemanticScorer();
+    }
+    if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(policy_source_.get())) {
+      return batched->HasSemanticScorer();
+    }
+    if (const auto* split = dynamic_cast<const SplitPolicyValueEvaluator*>(policy_source_.get())) {
+      return split->HasSemanticScorer();
+    }
+    return false;
+  }
+
+  std::string SemanticDescriptorSchema() const {
+    if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
+      return nn->SemanticDescriptorSchema();
+    }
+    if (const auto* batched = dynamic_cast<const BatchedNNEvaluator*>(policy_source_.get())) {
+      return batched->SemanticDescriptorSchema();
+    }
+    if (const auto* split = dynamic_cast<const SplitPolicyValueEvaluator*>(policy_source_.get())) {
+      return split->SemanticDescriptorSchema();
+    }
+    return dune_semantic::kDescriptorSchemaVersionV3;
+  }
+
   dune_imperium::DeckPoolSemantics DeckPoolSemantics() const {
     if (const auto* nn = dynamic_cast<const DuneNNEvaluator*>(policy_source_.get())) {
       return nn->DeckPoolSemantics();

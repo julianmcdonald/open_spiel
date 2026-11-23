@@ -19,6 +19,7 @@ namespace dune_semantic {
 struct SemanticScorerBatchWorkspace {
   int64_t capacity_m = 0;
   torch::Device dev = torch::kCPU;
+  bool pinned_host_ = false;
   torch::Tensor ints_host_buf;
   torch::Tensor bools_host_buf;
   torch::Tensor supp_host_buf;
@@ -38,17 +39,19 @@ struct SemanticScorerBatchWorkspace {
   torch::Tensor v5_unique_states_dev_buf;
   torch::Tensor v5_state_slot_dev_buf;
 
-  void EnsureCapacity(int64_t m, torch::Device device) {
+  void EnsureCapacity(int64_t m, torch::Device device, bool use_pinned_host = true) {
     const bool on_cuda = device.is_cuda();
+    const bool want_pinned = on_cuda && use_pinned_host;
     if (m <= capacity_m &&
         (!on_cuda || (ints_dev_buf.defined() && dev == device)) &&
-        ints_host_buf.defined() && ints_host_buf.is_pinned() == on_cuda) {
+        ints_host_buf.defined() && pinned_host_ == want_pinned &&
+        ints_host_buf.is_pinned() == want_pinned) {
       return;
     }
     const int64_t alloc_m =
         std::max<int64_t>(m, std::max<int64_t>(capacity_m * 2, 4096));
     auto host_opts =
-        torch::TensorOptions().device(torch::kCPU).pinned_memory(on_cuda);
+        torch::TensorOptions().device(torch::kCPU).pinned_memory(want_pinned);
     ints_host_buf = torch::empty({6 * alloc_m}, host_opts.dtype(torch::kInt64));
     bools_host_buf = torch::empty({2 * alloc_m}, host_opts.dtype(torch::kBool));
     supp_host_buf = torch::empty({alloc_m}, host_opts.dtype(torch::kFloat32));
@@ -81,6 +84,7 @@ struct SemanticScorerBatchWorkspace {
     }
     capacity_m = alloc_m;
     dev = device;
+    pinned_host_ = want_pinned;
   }
 };
 
@@ -106,7 +110,9 @@ inline void ApplySemanticScorerBatch(
 
   torch::Tensor ints_host, bools_host, supp_host, feat_host, v5_ctx_host;
   SemanticScorerBatchWorkspace* active_ws = workspace;
+  bool use_pinned_host = true;
   if (active_ws == nullptr && !torch::GradMode::is_enabled()) {
+    use_pinned_host = false;
     if (on_cuda) {
       struct StreamWsEntry {
         c10::DeviceIndex dev_idx;
@@ -135,7 +141,7 @@ inline void ApplySemanticScorerBatch(
   }
 
   if (active_ws != nullptr) {
-    active_ws->EnsureCapacity(m, device);
+    active_ws->EnsureCapacity(m, device, use_pinned_host);
     ints_host = active_ws->ints_host_buf.narrow(0, 0, 6 * m).view({6, m});
     bools_host = active_ws->bools_host_buf.narrow(0, 0, 2 * m).view({2, m});
     supp_host = active_ws->supp_host_buf.narrow(0, 0, m);

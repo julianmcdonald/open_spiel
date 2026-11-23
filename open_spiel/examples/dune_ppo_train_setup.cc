@@ -802,11 +802,45 @@ std::optional<int> RunSetupPreloopPhase(PpoTrainRunContext& ctx) {
   // the pre-loop rollout used (sequential, main thread).
   ctx.RunAuxCollection(ctx.start_update, ctx.current_collect);
 
+  auto resolve_input_run_stem = []() -> std::string {
+    const std::string model_ckpt = absl::GetFlag(FLAGS_model_checkpoint);
+    if (!model_ckpt.empty()) {
+      const std::string model_stem =
+          std::filesystem::path(model_ckpt).stem().string();
+      const size_t pos = model_stem.rfind("_model_");
+      if (pos != std::string::npos && pos > 0) {
+        return model_stem.substr(0, pos);
+      }
+    }
+    std::string run_stem =
+        std::filesystem::path(absl::GetFlag(FLAGS_run_prefix)).filename().string();
+    return run_stem.empty() ? std::string("ppo") : run_stem;
+  };
+  const std::string input_stem = resolve_input_run_stem();
+  auto resolve_sidecar_with_legacy =
+      [&ctx](const std::string& primary_name,
+             const std::string& legacy_name) -> std::string {
+    const std::string primary = ctx.ResolveInputSidecarPath(primary_name);
+    if (!primary.empty() && std::filesystem::exists(primary)) {
+      return primary;
+    }
+    if (legacy_name != primary_name) {
+      const std::string legacy = ctx.ResolveInputSidecarPath(legacy_name);
+      if (!legacy.empty() && std::filesystem::exists(legacy)) {
+        return legacy;
+      }
+    }
+    return primary;
+  };
+
   if ((ctx.init_mode == "checkpoint" || ctx.init_mode == "study_resume") &&
       absl::GetFlag(FLAGS_r765_replay_window_updates) > 1 && ctx.start_update > 1) {
-    const std::string replay_filename =
+    const std::string primary_replay_filename =
+        absl::StrCat(input_stem, "_r765_replay_update_", ctx.start_update - 1, ".bin");
+    const std::string legacy_replay_filename =
         absl::StrCat("ppo_r765_replay_update_", ctx.start_update - 1, ".bin");
-    const std::string replay_sidecar = ctx.ResolveInputSidecarPath(replay_filename);
+    const std::string replay_sidecar =
+        resolve_sidecar_with_legacy(primary_replay_filename, legacy_replay_filename);
     if (!replay_sidecar.empty() && std::filesystem::exists(replay_sidecar)) {
       if (!ctx.r765_replay_mgr.LoadState(replay_sidecar, &ctx.r765_preserve_guard)) {
         SpielFatalError("Failed to load R7-65 replay sidecar at: " + replay_sidecar);
@@ -827,7 +861,9 @@ std::optional<int> RunSetupPreloopPhase(PpoTrainRunContext& ctx) {
     const int v5_anneal_n = absl::GetFlag(FLAGS_v5_anneal_legacy_slot_residual_updates);
     bool loaded_v5_sidecar = false;
     if (v5_anneal_n > 0 && (ctx.init_mode == "checkpoint" || ctx.init_mode == "study_resume")) {
-      const std::string v5_sidecar_in = ctx.ResolveInputSidecarPath("v5_anneal_state.json");
+      const std::string v5_sidecar_in = resolve_sidecar_with_legacy(
+          absl::StrCat(input_stem, "_v5_anneal_state.json"),
+          "v5_anneal_state.json");
       if (!v5_sidecar_in.empty() && std::filesystem::exists(v5_sidecar_in)) {
         if (ctx.v5_slot_residual_state.LoadSidecar(v5_sidecar_in, ctx.device) &&
             ctx.v5_slot_residual_state.N == v5_anneal_n) {

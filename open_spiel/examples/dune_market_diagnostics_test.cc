@@ -21,7 +21,6 @@ namespace open_spiel {
 namespace dune_market_diag {
 namespace {
 
-using dune_imperium::ActionToString;
 using dune_imperium::BuildStateAtFirstRevealTurn;
 using dune_imperium::DuneImperiumState;
 using dune_imperium::IntrigueChoiceKind;

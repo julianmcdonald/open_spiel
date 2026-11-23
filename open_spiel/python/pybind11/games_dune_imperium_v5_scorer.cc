@@ -25,6 +25,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,9 @@ void RegisterDuneImperiumV5Scorer(py::module_ &di) {
       open_spiel::SpielFatalError("CUDA is required for run_v5_scorer_zero_sync_probe");
     }
     torch::Device cuda_dev(torch::kCUDA);
+
+    static std::mutex probe_mu;
+    std::lock_guard<std::mutex> lock(probe_mu);
 
     static std::shared_ptr<open_spiel::dune_semantic::SemanticActionScorerImpl> probe_scorer;
     static open_spiel::dune_semantic::SemanticScorerBatchWorkspace probe_ws;
@@ -269,7 +273,9 @@ void RegisterDuneImperiumV5Scorer(py::module_ &di) {
 
       for (size_t i = 0; i < N; ++i) {
         auto state = game->DeserializeState(serialized_states[i]);
+        SPIEL_CHECK_TRUE(state != nullptr);
         const auto* dune = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(state.get());
+        SPIEL_CHECK_TRUE(dune != nullptr);
         all_obs[i] = dune->InformationStateTensorWithAppendix(
             dune->CurrentPlayer(),
             model->market_appendix_mode_,
@@ -394,30 +400,35 @@ void RegisterDuneImperiumV5Scorer(py::module_ &di) {
         std::string path;
         std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model;
       };
+      static std::mutex cached_bench_mu;
       static CachedBench cached_bench;
-      if (cached_bench.path != checkpoint_path || !cached_bench.model) {
-        int64_t input_dim = 10445;
-        std::string json_path = std::filesystem::path(checkpoint_path).replace_extension(".json").string();
-        std::ifstream jf(json_path);
-        if (jf.good()) {
-          std::string content((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
-          auto pos = content.find("\"observation_dim\":");
-          if (pos != std::string::npos) {
-            input_dim = std::stoll(content.substr(pos + 18));
+      std::shared_ptr<open_spiel::SharedDunePolicyValueNetImpl> model;
+      {
+        std::lock_guard<std::mutex> lock(cached_bench_mu);
+        if (cached_bench.path != checkpoint_path || !cached_bench.model) {
+          int64_t input_dim = 10445;
+          std::string json_path = std::filesystem::path(checkpoint_path).replace_extension(".json").string();
+          std::ifstream jf(json_path);
+          if (jf.good()) {
+            std::string content((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+            auto pos = content.find("\"observation_dim\":");
+            if (pos != std::string::npos) {
+              input_dim = std::stoll(content.substr(pos + 18));
+            }
           }
+          auto m = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
+              input_dim, 2048, 2391, 16,
+              /*use_nonlinear=*/false, /*with_aux_heads=*/false, /*head_init_seed=*/0,
+              /*with_semantic_scorer=*/true);
+          open_spiel::LoadModelCheckpointRobust(m, checkpoint_path, cuda_dev);
+          m->to(cuda_dev);
+          m->eval();
+          m->RefreshBf16InferenceCache();
+          cached_bench.path = checkpoint_path;
+          cached_bench.model = m;
         }
-        auto m = std::make_shared<open_spiel::SharedDunePolicyValueNetImpl>(
-            input_dim, 2048, 2391, 16,
-            /*use_nonlinear=*/false, /*with_aux_heads=*/false, /*head_init_seed=*/0,
-            /*with_semantic_scorer=*/true);
-        open_spiel::LoadModelCheckpointRobust(m, checkpoint_path, cuda_dev);
-        m->to(cuda_dev);
-        m->eval();
-        m->RefreshBf16InferenceCache();
-        cached_bench.path = checkpoint_path;
-        cached_bench.model = m;
+        model = cached_bench.model;
       }
-      auto model = cached_bench.model;
       const int64_t input_dim = model->input_layer->options.in_features();
 
       auto game = open_spiel::LoadGame("dune_imperium");
@@ -447,7 +458,9 @@ void RegisterDuneImperiumV5Scorer(py::module_ &di) {
           s_str = non_v5_serialized[non_v5_idx_counter++ % non_v5_serialized.size()];
         }
         auto state = game->DeserializeState(s_str);
+        SPIEL_CHECK_TRUE(state != nullptr);
         const auto* dune = dynamic_cast<const open_spiel::dune_imperium::DuneImperiumState*>(state.get());
+        SPIEL_CHECK_TRUE(dune != nullptr);
         auto obs = dune->InformationStateTensorWithAppendix(
             dune->CurrentPlayer(),
             model->market_appendix_mode_,

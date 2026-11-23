@@ -353,7 +353,7 @@ bool RunTrainPpoUpdatePrepass(TrainPpoUpdateContext& ctx) {
     if (model->with_semantic_scorer_) {
       for (int64_t i = 0; i < aux_n; ++i) {
         if (search_examples[i].candidate_data.empty()) {
-          open_spiel::SpielFatalError("TrainPpoUpdateSeparate: semantic scorer is enabled but candidate descriptors are missing or empty on search examples.");
+          open_spiel::SpielFatalError("TrainPpoUpdate: semantic scorer is enabled but candidate descriptors are missing or empty on search examples.");
         }
         ctx.all_aux_cands[i] = &search_examples[i].candidate_data;
       }

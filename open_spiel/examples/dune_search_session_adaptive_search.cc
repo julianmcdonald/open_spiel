@@ -617,7 +617,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state,
               int chosen_visits = 0;
               dune_search_session_internal::RunAdaptiveV2JointRolloutSearch(
                   state, params, legal, raw_action, raw_prior, &(impl_->tree),
-                  impl_->evaluators, joint_cands, result,
+                  ActiveRolloutEvaluators(), joint_cands, result,
                   cached_followups_valid, chosen_c_idx, chosen_first,
                   chosen_graft, chosen_second, chosen_q, chosen_visits);
               if (cached_followups_valid) {
@@ -646,7 +646,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state,
             } else {
               dune_search_session_internal::RunAdaptiveV2SingleRolloutSearch(
                   state, params, legal, raw_prior, &(impl_->tree),
-                  impl_->evaluators, result);
+                  ActiveRolloutEvaluators(), result);
             }
           } else {
             Action chosen_second_action = kInvalidAction;

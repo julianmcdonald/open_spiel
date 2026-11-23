@@ -142,6 +142,26 @@ inline std::string HashModelParametersAndBuffers(
   return ComputeStringSHA256(ss.str());
 }
 
+// Evaluate state with semantic candidate descriptors when active on the evaluator.
+inline EvalResult EvaluateWithOptionalSemanticScorer(
+    const std::shared_ptr<IGameEvaluator>& active_evaluator,
+    const dune_imperium::DuneImperiumState* dune_state,
+    const std::vector<float>& obs,
+    const std::vector<Action>& actions,
+    dune_semantic::CandidateActionData* out_cand_data) {
+  if (dune_state != nullptr && active_evaluator != nullptr &&
+      active_evaluator->HasSemanticScorer()) {
+    dune_semantic::CandidateActionData local_cand_data;
+    dune_semantic::CandidateActionData* cand_ptr =
+        out_cand_data != nullptr ? out_cand_data : &local_cand_data;
+    dune_semantic::ExtractCandidateDescriptors(
+        *dune_state, actions, cand_ptr,
+        active_evaluator->SemanticDescriptorSchema());
+    return active_evaluator->EvaluateWithActions(obs, cand_ptr);
+  }
+  return active_evaluator->Evaluate(obs);
+}
+
 // Reusable standalone simulation of a single-learner episode with opponent pool routing.
 inline int SimulateSingleLearnerRollout(
     uint64_t master, uint64_t episode_id, const Game& game,
@@ -222,7 +242,10 @@ inline int SimulateSingleLearnerRollout(
       state->ObservationTensor(current_player, absl::MakeSpan(obs));
     }
 
-    EvalResult result = active_evaluator->Evaluate(obs);
+    dune_semantic::CandidateActionData cand_data;
+    EvalResult result = EvaluateWithOptionalSemanticScorer(
+        active_evaluator, dune_state, obs, actions,
+        is_learner ? &cand_data : nullptr);
     std::vector<float> logits = std::move(result.logits);
     CenterAndCapLegalLogits(logits, actions, 10.0f);
 
@@ -246,6 +269,7 @@ inline int SimulateSingleLearnerRollout(
       transition.return_value = 0.0f;
       transition.player_id = current_player;
       transition.episode_id = episode_id;
+      transition.candidate_data = std::move(cand_data);
       trajectory->push_back(std::move(transition));
     }
   }
@@ -263,6 +287,7 @@ inline int SimulateSingleLearnerRollout(
       seen_last = true;
     }
     reward = std::clamp(reward / reward_scale, -1.0f, 1.0f);
+    it->reward = reward;
     float delta = reward + 1.0f * last_value - it->value;
     float advantage = delta + 1.0f * last_gae;
     it->advantage = advantage;
@@ -357,7 +382,10 @@ inline int SimulateMixedPoolRollout(
       state->ObservationTensor(current_player, absl::MakeSpan(obs));
     }
 
-    EvalResult result = active_evaluator->Evaluate(obs);
+    dune_semantic::CandidateActionData cand_data;
+    EvalResult result = EvaluateWithOptionalSemanticScorer(
+        active_evaluator, dune_state, obs, actions,
+        is_learner ? &cand_data : nullptr);
     std::vector<float> logits = std::move(result.logits);
     CenterAndCapLegalLogits(logits, actions, 10.0f);
 
@@ -381,6 +409,7 @@ inline int SimulateMixedPoolRollout(
       transition.return_value = 0.0f;
       transition.player_id = current_player;
       transition.episode_id = episode_id;
+      transition.candidate_data = std::move(cand_data);
       trajectory->push_back(std::move(transition));
     }
   }
