@@ -485,9 +485,7 @@ GameOutcome PlayCompoundTournamentGame(
       outcome.final_vps[p] = dune_state->GetPlayerVp(p);
     }
   }
-  if (dune_state && dune_state->IsTerminal()) {
-    outcome.ending_round = dune_state->GetCurrentRound() - 1;
-  } else if (dune_state) {
+  if (dune_state) {
     outcome.ending_round = dune_state->GetCurrentRound();
   }
 

@@ -268,5 +268,18 @@ ABSL_FLAG(double, r765_collateral_min_all_agree, 0.0,
 ABSL_FLAG(double, r765_collateral_min_hp65_agree, 0.0,
           "When > 0.0, hard-abort floor on high-prior (max baseline_probs >= 0.65) greedy agreement on r765_collateral_panel_json.");
 
+// V5 appendix LR scaling & terminal win-speed flags.
+ABSL_FLAG(double, v5_appendix_lr_mult, 0.0,
+          "Post-step learning rate multiplier applied strictly to V5 appendix input_layer columns [9941, in_cols) when > 0.0 (0 = disabled / legacy v4_appendix_lr_mult behavior).");
+ABSL_FLAG(double, win_speed_bonus_per_round, 0.0,
+          "Extra terminal reward per round saved before Round 9 for sole 1st-place winners (0 = disabled).");
+ABSL_FLAG(double, r765_teacher_win_speed_tiebreak_eps, -1.0,
+          "Solo-1st win-speed tie-break eps per round saved for online search teachers. "
+          "When < 0 (default), resolves to min(0.05, win_speed_bonus_per_round) if win_speed_bonus_per_round > 0 else 0.0.");
+ABSL_FLAG(bool, r765_teacher_unbiased_stage2_gate, true,
+          "Use unbiased Stage-2 override gate on r765_seq_v1_agent_search online teacher calls.");
+ABSL_FLAG(bool, r765_teacher_ceiling_aware_margin, true,
+          "Use ceiling-aware override margin near +2.25 solo-win ceiling on online search teachers.");
+
 
 

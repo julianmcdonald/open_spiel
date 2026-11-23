@@ -132,6 +132,8 @@ class DuneSearchSession {
   std::string last_re_root_status() const { return last_re_root_status_; }
   std::string intermediate_re_root_status() const { return intermediate_re_root_status_; }
   void SetLastRequestedMaxSimsForTesting(int sims) { last_requested_max_sims_ = sims; }
+  double kl_policy_tau() const { return kl_policy_tau_; }
+  void set_kl_policy_tau(double val) { kl_policy_tau_ = std::max(0.0, val); }
 
  private:
   // The CONFIGURED hard limits for a decision, i.e. what this decision's budget
@@ -160,7 +162,7 @@ class DuneSearchSession {
   int update_id_ = 0;
   int decision_id_ = 0;
 
-  std::mt19937 rng_;
+  std::mt19937_64 rng_;
 
   // Cumulative budget tracking
   int session_new_simulations_completed_ = 0;
@@ -202,6 +204,7 @@ class DuneSearchSession {
   std::unique_ptr<State> last_search_state_;
   DuneSearchResult last_search_result_;
   int last_requested_max_sims_ = 0;
+  double kl_policy_tau_ = 0.0;
 };
 
 // Factory helper to construct neural network evaluator from checkpoint
@@ -273,6 +276,50 @@ struct EvaluateJointCandidatesResult {
   int rollouts_executed = 0;
 };
 
+struct DuneSearchSessionConfig {
+  bool superhuman_mode = false;
+  bool full_search = false;
+  bool search_v2 = false;
+  bool unbiased_stage2_gate = false;
+  bool fixed_top5_candidates = true;
+  bool all_buy_candidates = true;
+  bool use_event_keyed_crn = true;
+  bool ceiling_aware_margin = true;
+  double win_speed_tiebreak_eps = 0.0;
+  double kl_policy_tau = 0.0;
+  double reserve_ms = 10000.0;
+  double prior_log_ratio_weight = 0.02;
+  double stage1_high_conf_prior_skip = 0.95;
+
+  bool enable_macro_space_candidates = false;
+  int macro_space_min_round = 1;
+  bool enable_endgame_ply2 = false;
+  bool endgame_ply2_stage2_only = true;
+  int endgame_ply2_worlds = 4;
+  double endgame_ply2_margin = 0.12;
+  bool enable_intrigue_belief = false;
+  double intrigue_belief_age_combat_slope = 0.25;
+  double intrigue_belief_age_endgame_slope = 0.30;
+  double intrigue_belief_close_pass_combat_penalty = -1.20;
+  bool rescue_optional_abilities = false;
+  std::string rollout_checkpoint = "";
+
+  static DuneSearchSessionConfig Superhuman() {
+    DuneSearchSessionConfig cfg;
+    cfg.superhuman_mode = true;
+    cfg.full_search = true;
+    cfg.search_v2 = false;
+    cfg.unbiased_stage2_gate = true;
+    cfg.fixed_top5_candidates = true;
+    cfg.all_buy_candidates = true;
+    cfg.use_event_keyed_crn = true;
+    cfg.ceiling_aware_margin = true;
+    cfg.win_speed_tiebreak_eps = 0.05;
+    cfg.rescue_optional_abilities = false;
+    return cfg;
+  }
+};
+
 class DuneAdaptiveRolloutSession {
  public:
   DuneAdaptiveRolloutSession(
@@ -293,6 +340,9 @@ class DuneAdaptiveRolloutSession {
       bool enable_fp8_trunk = false,
       bool search_v2 = false);
   ~DuneAdaptiveRolloutSession();
+
+  void ApplySessionConfig(const DuneSearchSessionConfig& cfg);
+  DuneSearchSessionConfig GetSessionConfig() const;
 
   DuneSearchResult Search(const State& state, double remaining_time_ms = -1.0);
   PairedActionEvaluationResult EvaluateActionPairTerminal(
@@ -320,6 +370,16 @@ class DuneAdaptiveRolloutSession {
   void set_reserve_ms(double val) { reserve_ms_ = std::max(0.0, val); }
   bool full_search() const { return full_search_; }
   void set_full_search(bool val) { full_search_ = val; }
+  bool superhuman_mode() const { return superhuman_mode_; }
+  void set_superhuman_mode(bool val);
+  double win_speed_tiebreak_eps() const { return win_speed_tiebreak_eps_; }
+  void set_win_speed_tiebreak_eps(double val) { win_speed_tiebreak_eps_ = std::max(0.0, val); }
+  bool ceiling_aware_margin() const { return ceiling_aware_margin_; }
+  void set_ceiling_aware_margin(bool val) { ceiling_aware_margin_ = val; }
+  bool unbiased_stage2_gate() const { return unbiased_stage2_gate_; }
+  void set_unbiased_stage2_gate(bool val) { unbiased_stage2_gate_ = val; }
+  double kl_policy_tau() const { return kl_policy_tau_; }
+  void set_kl_policy_tau(double val) { kl_policy_tau_ = std::max(0.0, val); }
   double prior_log_ratio_weight() const { return prior_log_ratio_weight_; }
   void set_prior_log_ratio_weight(double val) { prior_log_ratio_weight_ = std::max(0.0, val); }
   double stage1_high_conf_prior_skip() const { return stage1_high_conf_prior_skip_; }
@@ -331,6 +391,9 @@ class DuneAdaptiveRolloutSession {
   bool search_v2() const { return search_v2_; }
   void set_search_v2(bool val) {
     search_v2_ = val;
+    if (val) {
+      superhuman_mode_ = false;
+    }
     if (val && !search_v2_round_priors_initialized_) {
       ms_per_rollout_by_round_ = {{15.0, 11.8, 11.1, 8.9, 8.0, 6.5, 5.4, 3.5, 2.5, 2.5, 2.5, 2.5}};
       ms_per_rollout_ema_ = 11.8;
@@ -361,6 +424,36 @@ class DuneAdaptiveRolloutSession {
       int num_worlds,
       uint64_t decision_seed);
 
+  void set_rollout_checkpoint(const std::string& path);
+  std::string rollout_checkpoint() const { return rollout_checkpoint_path_; }
+  int rollout_num_blocks() const { return rollout_num_blocks_; }
+
+  bool enable_macro_space_candidates() const { return enable_macro_space_candidates_; }
+  void set_enable_macro_space_candidates(bool val) { enable_macro_space_candidates_ = val; }
+  int macro_space_min_round() const { return macro_space_min_round_; }
+  void set_macro_space_min_round(int val) { macro_space_min_round_ = val; }
+
+  bool enable_endgame_ply2() const { return enable_endgame_ply2_; }
+  void set_enable_endgame_ply2(bool val) { enable_endgame_ply2_ = val; }
+  bool endgame_ply2_stage2_only() const { return endgame_ply2_stage2_only_; }
+  void set_endgame_ply2_stage2_only(bool val) { endgame_ply2_stage2_only_ = val; }
+  int endgame_ply2_worlds() const { return endgame_ply2_worlds_; }
+  void set_endgame_ply2_worlds(int val) { endgame_ply2_worlds_ = val; }
+  double endgame_ply2_margin() const { return endgame_ply2_margin_; }
+  void set_endgame_ply2_margin(double val) { endgame_ply2_margin_ = val; }
+
+  bool enable_intrigue_belief() const { return enable_intrigue_belief_; }
+  void set_enable_intrigue_belief(bool val) { enable_intrigue_belief_ = val; }
+  void set_intrigue_belief_params(double age_combat_slope, double age_endgame_slope, double close_pass_combat_penalty) {
+    intrigue_belief_age_combat_slope_ = age_combat_slope;
+    intrigue_belief_age_endgame_slope_ = age_endgame_slope;
+    intrigue_belief_close_pass_combat_penalty_ = close_pass_combat_penalty;
+  }
+  bool rescue_optional_abilities() const { return rescue_optional_abilities_; }
+  void set_rescue_optional_abilities(bool val) { rescue_optional_abilities_ = val; }
+
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>>& ActiveRolloutEvaluators() const;
+
  private:
   std::string checkpoint_path_;
   std::string device_str_;
@@ -378,6 +471,11 @@ class DuneAdaptiveRolloutSession {
   bool all_buy_candidates_ = true;
   double reserve_ms_ = 10000.0;
   bool full_search_ = false;
+  bool superhuman_mode_ = false;
+  double win_speed_tiebreak_eps_ = 0.0;
+  bool ceiling_aware_margin_ = true;
+  bool unbiased_stage2_gate_ = false;
+  double kl_policy_tau_ = 0.0;
   double prior_log_ratio_weight_ = 0.02;
   double stage1_high_conf_prior_skip_ = 0.95;
   bool use_event_keyed_crn_ = true;
@@ -386,6 +484,25 @@ class DuneAdaptiveRolloutSession {
   bool search_v2_round_priors_initialized_ = false;
   dune_imperium::SearchV2TuningConfig search_v2_tuning_{};
   uint64_t search_seed_counter_ = 0;
+
+  int rollout_num_blocks_ = 16;
+  std::string rollout_checkpoint_path_ = "";
+  bool cuda_superhuman_priors_initialized_ = false;
+
+  bool enable_macro_space_candidates_ = false;
+  int macro_space_min_round_ = 1;
+  Action pending_macro_space_hint_ = kInvalidAction;
+
+  bool enable_endgame_ply2_ = false;
+  bool endgame_ply2_stage2_only_ = true;
+  int endgame_ply2_worlds_ = 4;
+  double endgame_ply2_margin_ = 0.12;
+
+  bool enable_intrigue_belief_ = false;
+  double intrigue_belief_age_combat_slope_ = 0.25;
+  double intrigue_belief_age_endgame_slope_ = 0.30;
+  double intrigue_belief_close_pass_combat_penalty_ = -1.20;
+  bool rescue_optional_abilities_ = false;
 
   struct CachedJointFollowupStep {
     std::vector<Action> expected_history;

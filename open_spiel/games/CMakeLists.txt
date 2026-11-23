@@ -252,9 +252,6 @@ endif()
 
 list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium.cc
-  dune_imperium/dune_imperium_public_card_knowledge.cc
-  dune_imperium/dune_imperium_public_card_knowledge.h
-  dune_imperium/dune_imperium_public_card_state.cc
   dune_imperium/dune_imperium.h
   dune_imperium/dune_imperium_board.cc
   dune_imperium/dune_imperium_board.h
@@ -262,14 +259,43 @@ list(APPEND GAME_SOURCES
   dune_imperium/dune_imperium_cards.h
   dune_imperium/dune_imperium_common.cc
   dune_imperium/dune_imperium_common.h
+  dune_imperium/dune_imperium_field_manifest.h
+  dune_imperium/dune_imperium_internal.h
+  dune_imperium/dune_imperium_public_card_knowledge.cc
+  dune_imperium/dune_imperium_public_card_knowledge.h
+  dune_imperium/dune_imperium_public_card_state.cc
+  dune_imperium/dune_imperium_state_accessors.cc
   dune_imperium/dune_imperium_state_agent.cc
+  dune_imperium/dune_imperium_state_agent_cards.cc
+  dune_imperium/dune_imperium_state_agent_effects.cc
+  dune_imperium/dune_imperium_state_agent_internal.h
+  dune_imperium/dune_imperium_state_agent_rewards.cc
+  dune_imperium/dune_imperium_state_agent_space.cc
+  dune_imperium/dune_imperium_state_apply.cc
+  dune_imperium/dune_imperium_state_chance.cc
   dune_imperium/dune_imperium_state_combat.cc
+  dune_imperium/dune_imperium_state_init.cc
   dune_imperium/dune_imperium_state_intrigue.cc
+  dune_imperium/dune_imperium_state_intrigue_helpers.cc
+  dune_imperium/dune_imperium_state_intrigue_legal.cc
+  dune_imperium/dune_imperium_state_intrigue_plot.cc
+  dune_imperium/dune_imperium_state_legal.cc
+  dune_imperium/dune_imperium_state_manifest_audit.cc
+  dune_imperium/dune_imperium_state_market.cc
+  dune_imperium/dune_imperium_state_observation.cc
+  dune_imperium/dune_imperium_state_resample.cc
+  dune_imperium/dune_imperium_state_research_trash.cc
   dune_imperium/dune_imperium_state_reveal.cc
   dune_imperium/dune_imperium_state_reveal_cards.cc
+  dune_imperium/dune_imperium_state_round.cc
+  dune_imperium/dune_imperium_state_shipping.cc
+  dune_imperium/dune_imperium_state_steam_intrigue.cc
+  dune_imperium/dune_imperium_state_strings.cc
   dune_imperium/dune_imperium_state_tech.cc
   dune_imperium/dune_imperium_state_tensor.cc
+  dune_imperium/dune_imperium_state_testing.cc
   dune_imperium/dune_imperium_state_util.cc
+  dune_imperium/dune_imperium_types.h
   dune_imperium/dune_imperium_util.cc
   dune_imperium/dune_imperium_util.h
 )

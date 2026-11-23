@@ -1,43 +1,33 @@
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
 #include <memory>
-#include <mutex>
-#include <optional>
-#include <random>
 #include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <vector>
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include <torch/torch.h>
 
-#include "open_spiel/examples/dune_batched_evaluator.h"
-#include "open_spiel/examples/dune_compound_turn_search.h"
-#include "open_spiel/examples/dune_network.h"
-#include "open_spiel/examples/dune_wide_rollout_search.h"
+#include "open_spiel/examples/dune_play_search_tournament_internal.h"
 #include "open_spiel/examples/dune_seed_utils.h"
 #include "open_spiel/examples/dune_sha256.h"
-#include "open_spiel/games/dune_imperium/dune_imperium.h"
-#include "open_spiel/spiel.h"
-#include "open_spiel/utils/json.h"
 
 
 ABSL_FLAG(std::string, mode, "raw",
-          "Controller: raw, legacy, wide, leader, adaptive, or adaptive_leader.");
+          "Controller: raw, legacy, wide, leader, adaptive, adaptive_leader, "
+          "sh_adaptive, sh_adaptive_leader, full_sh_adaptive_leader, or sh_superhuman.");
+ABSL_FLAG(std::string, cand_profile, "",
+          "Optional candidate profile override (e.g. sh_superhuman).");
 ABSL_FLAG(std::string, model_checkpoint, "", "Frozen candidate checkpoint.");
 ABSL_FLAG(std::string, opponent_checkpoint, "", "Different frozen actual-opponent checkpoint.");
 ABSL_FLAG(int, games, 4, "Number of requested games.");
@@ -60,6 +50,8 @@ ABSL_FLAG(bool, unbiased_stage2_gate, false,
           "Use unbiased Stage-2 Successive Halving gate.");
 ABSL_FLAG(bool, fixed_top5_candidates, false,
           "Use fixed top-5 candidates (up to min(5, legal)) in Successive Halving.");
+ABSL_FLAG(bool, all_buy_candidates, false,
+          "Include all legal card and tech acquisitions at buy decisions.");
 ABSL_FLAG(int, leader_rollouts, 32, "Leader pick rollout search rollouts.");
 ABSL_FLAG(bool, sample_opponent_leader_draft, false,
           "Sample opponent leader draft mixture in rollout search.");
@@ -67,106 +59,23 @@ ABSL_FLAG(double, prior_log_ratio_weight, 0.02,
           "Prior log-ratio weight for override margin adjustment.");
 ABSL_FLAG(double, stage1_high_conf_prior_skip, 0.95,
           "Skip Stage 2 when raw prior >= threshold and raw leads Stage 1.");
+ABSL_FLAG(double, win_speed_tiebreak_eps, -1.0,
+          "Terminal win-speed tie-breaker epsilon (-1 uses profile default: "
+          "0.05 for sh_superhuman, 0.0 otherwise).");
+ABSL_FLAG(bool, ceiling_aware_margin, true,
+          "Scale override margin smoothly near +2.25 utility ceiling.");
+ABSL_FLAG(double, kl_policy_tau, 0.0,
+          "Optional KL-regularized search policy temperature (>0 enables smooth distribution).");
+ABSL_FLAG(double, game_clock_ms, -1.0,
+          "Optional per-game candidate search clock budget in ms (-1 disables clock).");
+
+namespace open_spiel::dune_imperium::play_search_tournament {
+
+volatile std::sig_atomic_t interrupted = 0;
 
 namespace {
-using namespace open_spiel;
-using namespace open_spiel::dune_imperium;
-using Clock = std::chrono::steady_clock;
-constexpr double kOverrideMargin = 0.15;
-constexpr int kControllerVersion = 3;
-constexpr const char* kSimulationPolicy = "candidate_model_all_seats";
-volatile std::sig_atomic_t interrupted = 0;
+
 void HandleSignal(int) { interrupted = 1; }
-
-enum class Mode {
-  kRaw,
-  kLegacy,
-  kWide,
-  kLeader,
-  kAdaptive,
-  kAdaptiveLeader,
-  kShAdaptive,
-  kShAdaptiveLeader,
-  kFullShAdaptiveLeader
-};
-
-struct Options {
-  Mode mode;
-  std::string mode_name;
-  std::string model_path;
-  std::string opponent_path;
-  std::string roots_path;
-  std::string output_path;
-  std::string device_name;
-  int games;
-  int start_game_id;
-  int threads;
-  int batch_size;
-  int rollouts;
-  int max_roots;
-  uint64_t master_seed;
-  bool rollout_amp;
-  bool allow_tf32;
-  double max_seconds;
-  std::vector<int> explicit_game_ids;
-  std::string config_key;
-  SearchRolloutCrnMode crn_mode = SearchRolloutCrnMode::kSequential;
-  bool unbiased_stage2_gate = false;
-  bool fixed_top5_candidates = false;
-  int leader_rollouts = 32;
-  bool sample_opponent_leader_draft = false;
-  bool leader_rollouts_explicit = false;
-  double prior_log_ratio_weight = 0.02;
-  double stage1_high_conf_prior_skip = 0.95;
-};
-
-inline std::string CrnModeName(SearchRolloutCrnMode mode) {
-  switch (mode) {
-    case SearchRolloutCrnMode::kSequential: return "sequential";
-    case SearchRolloutCrnMode::kDeckOrderCrn: return "deck_order";
-    case SearchRolloutCrnMode::kEventKeyedCrn: return "event_keyed";
-  }
-  return "sequential";
-}
-
-double SecondsSince(Clock::time_point start) {
-  return std::chrono::duration<double>(Clock::now() - start).count();
-}
-
-json::Value ReadJson(const std::string& path) {
-  std::ifstream input(path);
-  if (!input) throw std::runtime_error("Cannot read " + path);
-  std::string content((std::istreambuf_iterator<char>(input)), {});
-  auto parsed = json::FromString(content);
-  if (!parsed) throw std::runtime_error("Invalid JSON in " + path);
-  return *parsed;
-}
-
-int IntField(const json::Object& object, const std::string& field) {
-  auto it = object.find(field);
-  if (it == object.end() || !it->second.IsInt()) {
-    throw std::runtime_error("Missing integer field: " + field);
-  }
-  return static_cast<int>(it->second.GetInt());
-}
-
-std::string StringField(const json::Object& object, const std::string& field) {
-  auto it = object.find(field);
-  if (it == object.end() || !it->second.IsString()) {
-    throw std::runtime_error("Missing string field: " + field);
-  }
-  return it->second.GetString();
-}
-
-bool BoolField(const json::Object& object, const std::string& field,
-               bool absent_value) {
-  auto it = object.find(field);
-  if (it == object.end()) return absent_value;
-  if (!it->second.IsBool()) {
-    throw std::runtime_error("Invalid boolean field: " + field);
-  }
-  return it->second.GetBool();
-}
 
 Options ReadOptions(int argc = 0, char** argv = nullptr) {
   Options o;
@@ -176,10 +85,37 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
         arg.rfind("-leader_rollouts=", 0) == 0 ||
         arg == "--leader_rollouts" || arg == "-leader_rollouts") {
       o.leader_rollouts_explicit = true;
-      break;
+    } else if (arg.rfind("--crn_mode=", 0) == 0 ||
+               arg.rfind("-crn_mode=", 0) == 0 ||
+               arg == "--crn_mode" || arg == "-crn_mode") {
+      o.crn_mode_explicit = true;
+    } else if (arg.rfind("--unbiased_stage2_gate", 0) == 0 ||
+               arg.rfind("-unbiased_stage2_gate", 0) == 0 ||
+               arg.rfind("--nounbiased_stage2_gate", 0) == 0) {
+      o.unbiased_stage2_gate_explicit = true;
+    } else if (arg.rfind("--fixed_top5_candidates", 0) == 0 ||
+               arg.rfind("-fixed_top5_candidates", 0) == 0 ||
+               arg.rfind("--nofixed_top5_candidates", 0) == 0) {
+      o.fixed_top5_explicit = true;
+    } else if (arg.rfind("--all_buy_candidates", 0) == 0 ||
+               arg.rfind("-all_buy_candidates", 0) == 0 ||
+               arg.rfind("--noall_buy_candidates", 0) == 0) {
+      o.all_buy_explicit = true;
+    } else if (arg.rfind("--rollouts_per_action=", 0) == 0 ||
+               arg.rfind("-rollouts_per_action=", 0) == 0 ||
+               arg == "--rollouts_per_action" || arg == "-rollouts_per_action") {
+      o.rollouts_explicit = true;
     }
   }
+  o.cand_profile = absl::GetFlag(FLAGS_cand_profile);
   o.mode_name = absl::GetFlag(FLAGS_mode);
+  if (!o.cand_profile.empty()) {
+    if (o.cand_profile == "sh_superhuman") {
+      o.mode_name = "sh_superhuman";
+    } else {
+      throw std::runtime_error("--cand_profile must be empty or sh_superhuman");
+    }
+  }
   if (o.mode_name == "raw") o.mode = Mode::kRaw;
   else if (o.mode_name == "legacy") o.mode = Mode::kLegacy;
   else if (o.mode_name == "wide") o.mode = Mode::kWide;
@@ -189,7 +125,8 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
   else if (o.mode_name == "sh_adaptive") o.mode = Mode::kShAdaptive;
   else if (o.mode_name == "sh_adaptive_leader") o.mode = Mode::kShAdaptiveLeader;
   else if (o.mode_name == "full_sh_adaptive_leader") o.mode = Mode::kFullShAdaptiveLeader;
-  else throw std::runtime_error("--mode must be raw, legacy, wide, leader, adaptive, adaptive_leader, sh_adaptive, sh_adaptive_leader, or full_sh_adaptive_leader");
+  else if (o.mode_name == "sh_superhuman") o.mode = Mode::kShSuperhuman;
+  else throw std::runtime_error("--mode must be raw, legacy, wide, leader, adaptive, adaptive_leader, sh_adaptive, sh_adaptive_leader, full_sh_adaptive_leader, or sh_superhuman");
   o.model_path = std::filesystem::canonical(absl::GetFlag(FLAGS_model_checkpoint)).string();
   o.opponent_path = std::filesystem::canonical(absl::GetFlag(FLAGS_opponent_checkpoint)).string();
   if (o.model_path == o.opponent_path) {
@@ -241,10 +178,25 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
   }
   o.unbiased_stage2_gate = absl::GetFlag(FLAGS_unbiased_stage2_gate);
   o.fixed_top5_candidates = absl::GetFlag(FLAGS_fixed_top5_candidates);
+  o.all_buy_candidates = absl::GetFlag(FLAGS_all_buy_candidates);
   o.leader_rollouts = absl::GetFlag(FLAGS_leader_rollouts);
   o.sample_opponent_leader_draft = absl::GetFlag(FLAGS_sample_opponent_leader_draft);
   o.prior_log_ratio_weight = absl::GetFlag(FLAGS_prior_log_ratio_weight);
   o.stage1_high_conf_prior_skip = absl::GetFlag(FLAGS_stage1_high_conf_prior_skip);
+  o.ceiling_aware_margin = absl::GetFlag(FLAGS_ceiling_aware_margin);
+  o.kl_policy_tau = std::max(0.0, absl::GetFlag(FLAGS_kl_policy_tau));
+  o.game_clock_ms = absl::GetFlag(FLAGS_game_clock_ms);
+  const double raw_eps = absl::GetFlag(FLAGS_win_speed_tiebreak_eps);
+  if (o.mode == Mode::kShSuperhuman) {
+    if (!o.crn_mode_explicit) o.crn_mode = SearchRolloutCrnMode::kEventKeyedCrn;
+    if (!o.unbiased_stage2_gate_explicit) o.unbiased_stage2_gate = true;
+    if (!o.fixed_top5_explicit) o.fixed_top5_candidates = true;
+    if (!o.all_buy_explicit) o.all_buy_candidates = true;
+    if (!o.rollouts_explicit) o.rollouts = 192;
+    o.win_speed_tiebreak_eps = (raw_eps >= 0.0) ? raw_eps : 0.05;
+  } else {
+    o.win_speed_tiebreak_eps = (raw_eps >= 0.0) ? raw_eps : 0.0;
+  }
   if (o.mode == Mode::kLeader && !o.leader_rollouts_explicit) {
     o.leader_rollouts = o.rollouts;
   }
@@ -273,376 +225,174 @@ Options ReadOptions(int argc = 0, char** argv = nullptr) {
       {"fixed_top5_candidates", o.fixed_top5_candidates},
       {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
       {"leader_rollouts", o.leader_rollouts}};
+  if (o.win_speed_tiebreak_eps > 0.0) {
+    identity["win_speed_tiebreak_eps"] = o.win_speed_tiebreak_eps;
+  }
+  if (!o.ceiling_aware_margin) {
+    identity["ceiling_aware_margin"] = o.ceiling_aware_margin;
+  }
+  if (o.all_buy_candidates) {
+    identity["all_buy_candidates"] = o.all_buy_candidates;
+  }
+  if (o.kl_policy_tau > 0.0) {
+    identity["kl_policy_tau"] = o.kl_policy_tau;
+  }
+  if (o.game_clock_ms > 0.0) {
+    identity["game_clock_ms"] = o.game_clock_ms;
+  }
   o.config_key = ComputeStringSHA256(json::ToString(identity));
   return o;
 }
 
-struct ModelBundle {
-  std::shared_ptr<SharedDunePolicyValueNetImpl> model;
-  std::unique_ptr<std::shared_mutex> mutex;
-  std::shared_ptr<BatchedEvaluator> coordinator;
-  std::shared_ptr<BatchedNNEvaluator> evaluator;
-  int num_blocks;
-  std::string model_sha256;
-};
-
 ModelBundle LoadFrozenModel(const std::string& path, const Options& o,
                             torch::Device device) {
-  auto sidecar = std::filesystem::path(path).replace_extension(".json");
+  std::filesystem::path p_ckpt(path);
+  std::filesystem::path sidecar = p_ckpt;
+  sidecar.replace_extension(".json");
+  if (!std::filesystem::exists(sidecar)) {
+    std::filesystem::path parent_manifest = p_ckpt.parent_path() / "manifest.json";
+    if (std::filesystem::exists(parent_manifest)) {
+      sidecar = parent_manifest;
+    }
+  }
   const auto value = ReadJson(sidecar.string());
   if (!value.IsObject()) throw std::runtime_error("Manifest must be an object: " + path);
   const auto& meta = value.GetObject();
-  const int observation_dim = IntField(meta, "observation_dim");
-  const int hidden_dim = IntField(meta, "hidden_dim");
-  const int num_blocks = IntField(meta, "num_blocks");
-  if (observation_dim != kFullPublicInformationStateSize || hidden_dim != 2048 ||
-      (num_blocks != 8 && num_blocks != 12 && num_blocks != 16) ||
-      StringField(meta, "market_appendix_mode") != "full_public_information_v3" ||
-      StringField(meta, "semantic_descriptor_schema") != "semantic_action_v3" ||
-      !BoolField(meta, "enable_semantic_scorer", false) ||
-      BoolField(meta, "enable_zone_encoder", false) ||
-      BoolField(meta, "nonlinear_value_head", false) ||
-      BoolField(meta, "with_aux_heads", false)) {
-    throw std::runtime_error("Unsupported checkpoint architecture: " + path);
+
+  int observation_dim = -1;
+  if (auto it = meta.find("observation_dim"); it != meta.end() && it->second.IsInt()) {
+    observation_dim = static_cast<int>(it->second.GetInt());
   }
+  int hidden_dim = -1;
+  int num_blocks = -1;
+  if (auto it = meta.find("hidden_dim"); it != meta.end() && it->second.IsInt()) {
+    hidden_dim = static_cast<int>(it->second.GetInt());
+  }
+  if (auto it = meta.find("num_blocks"); it != meta.end() && it->second.IsInt()) {
+    num_blocks = static_cast<int>(it->second.GetInt());
+  }
+  if ((hidden_dim <= 0 || num_blocks <= 0) && meta.find("architecture") != meta.end() &&
+      meta.at("architecture").IsObject()) {
+    const auto& arch = meta.at("architecture").GetObject();
+    if (hidden_dim <= 0 && arch.find("hidden_dim") != arch.end() && arch.at("hidden_dim").IsInt()) {
+      hidden_dim = static_cast<int>(arch.at("hidden_dim").GetInt());
+    }
+    if (num_blocks <= 0 && arch.find("num_blocks") != arch.end() && arch.at("num_blocks").IsInt()) {
+      num_blocks = static_cast<int>(arch.at("num_blocks").GetInt());
+    }
+  }
+  if (observation_dim <= 0 || hidden_dim <= 0 || num_blocks <= 0) {
+    torch::serialize::InputArchive archive;
+    archive.load_from(path, torch::kCPU);
+    torch::serialize::InputArchive in_archive;
+    if (archive.try_read("input_layer", in_archive)) {
+      torch::Tensor w;
+      if (in_archive.try_read("weight", w) && w.dim() == 2) {
+        if (hidden_dim <= 0) hidden_dim = static_cast<int>(w.size(0));
+        if (observation_dim <= 0) observation_dim = static_cast<int>(w.size(1));
+      }
+    }
+    if (num_blocks <= 0) {
+      int detected_blocks = 0;
+      for (int b = 0; b < 64; ++b) {
+        torch::serialize::InputArchive blk;
+        if (!archive.try_read("block_" + std::to_string(b), blk)) break;
+        ++detected_blocks;
+      }
+      if (detected_blocks > 0) num_blocks = detected_blocks;
+    }
+  }
+  if (observation_dim <= 0 || hidden_dim <= 0 || num_blocks <= 0) {
+    throw std::runtime_error("Cannot resolve checkpoint dimensions: " + path);
+  }
+
+  std::string market_mode_str = "none";
+  if (auto it = meta.find("market_appendix_mode"); it != meta.end() && it->second.IsString()) {
+    market_mode_str = it->second.GetString();
+  }
+  const MarketAppendixMode market_mode = ParseMarketAppendixMode(market_mode_str);
+  DeckPoolSemantics deck_pool_semantics = DeckPoolSemantics::kLegacy;
+  if (auto it = meta.find("deck_pool_semantics"); it != meta.end() && it->second.IsString()) {
+    deck_pool_semantics = ParseDeckPoolSemanticsOrDie(it->second.GetString());
+  }
+  const auto schema = GetInformationStateSchema(market_mode, deck_pool_semantics);
+  if (observation_dim != schema.size) {
+    throw std::runtime_error("Checkpoint observation_dim (" +
+                             std::to_string(observation_dim) +
+                             ") mismatches schema size (" +
+                             std::to_string(schema.size) + ") for " + path);
+  }
+
+  std::string descriptor_schema = "";
+  if (auto it = meta.find("semantic_descriptor_schema"); it != meta.end() && it->second.IsString()) {
+    descriptor_schema = it->second.GetString();
+  }
+  const bool enable_semantic_scorer_meta = BoolField(meta, "enable_semantic_scorer", false);
+  const bool has_scorer = enable_semantic_scorer_meta ||
+                          CheckpointHasSemanticScorer(path, torch::kCPU);
+  const bool enable_zone_encoder = BoolField(meta, "enable_zone_encoder", false);
+  const bool nonlinear_value_head = BoolField(meta, "nonlinear_value_head", false);
+  const bool with_aux_heads = BoolField(meta, "with_aux_heads", false);
+  bool slot_indexed_out_layer_f = false;
+  if (auto it_sif = meta.find("slot_indexed_out_layer_f"); it_sif != meta.end()) {
+    slot_indexed_out_layer_f =
+        (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
+        (it_sif->second.IsString() && it_sif->second.GetString() == "true");
+  }
+  if (IsFullPublicInformationStateSize(observation_dim)) {
+    if (!has_scorer ||
+        (descriptor_schema != dune_semantic::kDescriptorSchemaVersionV3 &&
+         descriptor_schema != dune_semantic::kDescriptorSchemaVersionV4 &&
+         descriptor_schema != dune_semantic::kDescriptorSchemaVersionV5)) {
+      throw std::runtime_error(
+          "Full public information checkpoint requires semantic_action_v3/v4/v5 scorer: " + path);
+    }
+  }
+
   ModelBundle bundle;
   bundle.num_blocks = num_blocks;
-  bundle.model_sha256 = StringField(meta, "model_sha256");
+  if (auto it_sha = meta.find("model_sha256"); it_sha != meta.end() && it_sha->second.IsString() &&
+      !it_sha->second.GetString().empty()) {
+    bundle.model_sha256 = it_sha->second.GetString();
+  } else {
+    bundle.model_sha256 = ComputeFileSHA256(path);
+  }
   bundle.model = std::make_shared<SharedDunePolicyValueNetImpl>(
       observation_dim, hidden_dim, kNumDistinctPlayerActions, num_blocks,
-      false, false, 0, true, false);
+      nonlinear_value_head, with_aux_heads, 0, has_scorer, enable_zone_encoder,
+      descriptor_schema);
+  if (!descriptor_schema.empty()) {
+    bundle.model->SetSemanticDescriptorSchema(descriptor_schema);
+  }
+  if (slot_indexed_out_layer_f && bundle.model->semantic_scorer_ != nullptr) {
+    bundle.model->semantic_scorer_->EnableF(true);
+  }
   LoadModelCheckpointRobust(bundle.model, path, torch::Device(torch::kCPU));
   bundle.model->to(device);
   bundle.model->eval();
   for (auto& parameter : bundle.model->parameters()) parameter.set_requires_grad(false);
+  if (device.is_cuda() && o.rollout_amp) {
+    bundle.model->RefreshBf16InferenceCache();
+  }
   bundle.mutex = std::make_unique<std::shared_mutex>();
   bundle.coordinator = std::make_shared<BatchedEvaluator>(
       bundle.model, o.batch_size, 1, device, bundle.mutex.get(), 10.0f,
       false, true, false, o.rollout_amp, o.allow_tf32);
-  bundle.evaluator = std::make_shared<BatchedNNEvaluator>(bundle.coordinator, 10.0f);
+  bundle.evaluator = std::make_shared<BatchedNNEvaluator>(
+      bundle.coordinator, 10.0f, market_mode);
   std::cout << "[MODEL] " << path << " blocks=" << num_blocks
-            << " obs=" << observation_dim << " precision="
-            << (o.rollout_amp ? "AMP" : "FP32") << " tf32=" << o.allow_tf32
+            << " hidden=" << hidden_dim
+            << " obs=" << observation_dim
+            << " market=" << market_mode_str
+            << " deck_pool=" << DeckPoolSemanticsToString(deck_pool_semantics)
+            << " schema=" << (descriptor_schema.empty() ? "none" : descriptor_schema)
+            << " precision=" << (o.rollout_amp ? "AMP" : "FP32")
+            << " tf32=" << o.allow_tf32
             << " device=" << device << '\n' << std::flush;
   return bundle;
 }
 
-struct RunControl {
-  Clock::time_point start = Clock::now();
-  double max_seconds;
-  std::atomic<bool> failed{false};
-  bool Stop() const {
-    return interrupted || failed.load() ||
-           (max_seconds > 0 && SecondsSince(start) >= max_seconds);
-  }
-};
-
-bool IsLeader(const State& state) {
-  const auto& dune = static_cast<const DuneImperiumState&>(state);
-  return dune.phase() == GamePhase::kLeaderDraft ||
-         dune.phase() == GamePhase::kLeaderOfferChance;
-}
-
-int PriorRank(const ActionsAndProbs& prior, const std::vector<Action>& legal,
-              Action chosen) {
-  const Action raw = PickGreedyAction(prior, legal);
-  if (chosen == raw) return 1;
-  std::vector<std::pair<double, Action>> scored;
-  for (Action a : legal) {
-    if (a == raw) continue;
-    double probability = 0;
-    for (const auto& item : prior) if (item.first == a) probability = item.second;
-    scored.emplace_back(probability, a);
-  }
-  std::sort(scored.rbegin(), scored.rend());
-  for (size_t i = 0; i < scored.size(); ++i) if (scored[i].second == chosen) return i + 2;
-  throw std::runtime_error("Controller selected an illegal action");
-}
-
-CompoundSearchDecisionResult SearchDecision(
-    const State& state, Player seat, TurnSearchTree* tree,
-    const std::vector<std::shared_ptr<BatchedNNEvaluator>>& evaluators,
-    const Options& o, uint64_t seed) {
-  if (o.mode == Mode::kShAdaptive || o.mode == Mode::kShAdaptiveLeader ||
-      o.mode == Mode::kFullShAdaptiveLeader) {
-    return SuccessiveHalvingRolloutSearchDecision(
-        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
-        o.crn_mode, o.unbiased_stage2_gate, /*max_time_ms=*/-1.0,
-        o.fixed_top5_candidates ? 5 : 0, /*max_inflight_worlds=*/96,
-        /*use_bounded_pool_when_unclocked=*/false, /*full_clock_stage2=*/false,
-        o.prior_log_ratio_weight, o.stage1_high_conf_prior_skip);
-  }
-  if (o.mode == Mode::kAdaptive || o.mode == Mode::kAdaptiveLeader) {
-    return AdaptiveRolloutSearchDecision(
-        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
-        o.crn_mode);
-  }
-  if (o.mode == Mode::kWide) {
-    return WideRolloutSearchDecision(
-        state, seat, tree, evaluators, o.rollouts, kOverrideMargin, seed,
-        o.crn_mode);
-  }
-  return CompoundRolloutSearchDecision(
-      state, seat, tree, evaluators, 3, o.rollouts, kOverrideMargin,
-      TreeReuseMode::kAdditive, seed, SearchPairingMode::kUnpaired,
-      SearchTruncationMode::kTerminal, o.crn_mode);
-}
-
-struct GameOutcome {
-  int game_id = 0;
-  uint64_t seed = 0;
-  Player seat = 0;
-  std::vector<double> returns;
-  std::vector<int> vps;
-  int placement = 0;
-  int ending_round = 0;
-  int searches = 0;
-  int overrides = 0;
-  int new_rollouts = 0;
-  int reused_rollouts = 0;
-  int new_info_resets = 0;
-  int decisions = 0;
-  int wide_roots = 0;
-  int prior_rank4plus_selections = 0;
-  double search_seconds = 0;
-  double game_seconds = 0;
-  double sum_paired_corr = 0.0;
-  double sum_paired_diff_var = 0.0;
-  int paired_corr_pairs = 0;
-  int paired_diff_var_pairs = 0;
-};
-using GameResult = GameOutcome;
-
-struct Summary {
-  int completed_games = 0;
-  double sum_paired_corr = 0.0;
-  double sum_paired_diff_var = 0.0;
-  int paired_corr_pairs = 0;
-  int paired_diff_var_pairs = 0;
-  double mean_paired_rollout_corr() const {
-    return paired_corr_pairs > 0 ? (sum_paired_corr / paired_corr_pairs) : 0.0;
-  }
-  double mean_paired_diff_var() const {
-    return paired_diff_var_pairs > 0 ? (sum_paired_diff_var / paired_diff_var_pairs) : 0.0;
-  }
-};
-
-std::optional<GameOutcome> PlayGame(
-    int game_id, const Game& game, const ModelBundle& candidate,
-    const ModelBundle& opponent, const Options& o, const RunControl& control) {
-  GameOutcome out;
-  out.game_id = game_id;
-  out.seat = game_id % 4;
-  out.seed = dune_seed::DeriveSeed(o.master_seed, dune_seed::kStreamSearchSampling, game_id);
-  const auto start = Clock::now();
-  auto state = game.NewInitialState();
-  std::mt19937 chance_rng(out.seed);
-  TurnSearchTree tree;
-  Player last_player = kInvalidPlayer;
-  uint64_t search_seed_counter = 0;
-  const std::vector<std::shared_ptr<BatchedNNEvaluator>> simulations{candidate.evaluator};
-
-  while (!state->IsTerminal()) {
-    if (control.Stop()) return std::nullopt;
-    if (state->IsChanceNode()) {
-      const auto& before = static_cast<const DuneImperiumState&>(*state);
-      const int hand = before.GetPlayerCardsInHand(out.seat);
-      const int intrigues = before.GetPlayerIntrigues(out.seat).size();
-      Action action = SampleAction(state->ChanceOutcomes(),
-          std::generate_canonical<double, 53>(chance_rng)).first;
-      state->ApplyAction(action);
-      const auto& after = static_cast<const DuneImperiumState&>(*state);
-      if (after.GetPlayerCardsInHand(out.seat) > hand ||
-          static_cast<int>(after.GetPlayerIntrigues(out.seat).size()) > intrigues) {
-        tree.Reset();
-        ++out.new_info_resets;
-      }
-      continue;
-    }
-    const Player current = state->CurrentPlayer();
-    if (current != last_player) {
-      tree.Reset();
-      last_player = current;
-    }
-    const auto legal = state->LegalActions();
-    if (legal.empty()) throw std::runtime_error("Nonterminal state has no legal actions");
-    auto& evaluator = current == out.seat ? candidate.evaluator : opponent.evaluator;
-    const auto prior = evaluator->Prior(*state);
-    if (prior.empty()) throw std::runtime_error("Empty neural prior");
-    const Action raw = PickGreedyAction(prior, legal);
-    Action chosen = raw;
-    if (current == out.seat) {
-      ++out.decisions;
-      if ((o.mode == Mode::kLeader || o.mode == Mode::kAdaptiveLeader ||
-           o.mode == Mode::kShAdaptiveLeader ||
-           o.mode == Mode::kFullShAdaptiveLeader) &&
-          IsLeader(*state) && legal.size() > 1) {
-        const auto search_start = Clock::now();
-        const int rollouts = o.leader_rollouts;
-        const uint64_t leader_seed =
-            dune_seed::DeriveSeed(out.seed, 0x4C454144ULL, current);
-        const auto result = LeaderPickRolloutSearchDecision(
-            *state, current, simulations, rollouts, 0.10, leader_seed,
-            o.crn_mode, o.sample_opponent_leader_draft);
-        out.search_seconds += SecondsSince(search_start);
-        if (control.Stop()) return std::nullopt;
-        chosen = result.action;
-        ++out.searches;
-        out.overrides += result.overridden;
-        out.new_rollouts += result.new_rollouts_executed;
-        if (result.candidate_rollout_utilities.size() >= 2) {
-          auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
-          out.sum_paired_corr += corr_stats.sum_corr;
-          out.sum_paired_diff_var += corr_stats.sum_diff_var;
-          out.paired_corr_pairs += corr_stats.corr_pair_count;
-          out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
-        }
-      } else {
-        const bool search_allowed =
-            o.mode != Mode::kRaw && o.mode != Mode::kLeader && !IsLeader(*state);
-        if (o.mode == Mode::kFullShAdaptiveLeader) {
-          const bool should_search =
-              search_allowed && IsFullStrategicState(*state, current, prior, 0.020);
-          if (should_search) {
-            const auto search_start = Clock::now();
-            const uint64_t seed = dune_seed::DeriveSeed(out.seed, current, search_seed_counter++);
-            const auto result = SearchDecision(*state, current, &tree, simulations, o, seed);
-            out.search_seconds += SecondsSince(search_start);
-            if (control.Stop()) return std::nullopt;
-            chosen = result.action;
-            ++out.searches;
-            out.overrides += result.overridden;
-            out.new_rollouts += result.new_rollouts_executed;
-            out.reused_rollouts += result.prior_rollouts_reused;
-            out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
-            if (result.candidate_rollout_utilities.size() >= 2) {
-              auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
-              out.sum_paired_corr += corr_stats.sum_corr;
-              out.sum_paired_diff_var += corr_stats.sum_diff_var;
-              out.paired_corr_pairs += corr_stats.corr_pair_count;
-              out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
-            }
-          }
-        } else if (search_allowed && IsHighStakesStrategicState(*state, current) && legal.size() > 1) {
-          const auto search_start = Clock::now();
-          const uint64_t seed = dune_seed::DeriveSeed(out.seed, current, search_seed_counter++);
-          const auto result = SearchDecision(*state, current, &tree, simulations, o, seed);
-          out.search_seconds += SecondsSince(search_start);
-          if (control.Stop()) return std::nullopt;
-          chosen = result.action;
-          ++out.searches;
-          out.overrides += result.overridden;
-          out.new_rollouts += result.new_rollouts_executed;
-          out.reused_rollouts += result.prior_rollouts_reused;
-          if (o.mode == Mode::kWide && legal.size() > 3) {
-            ++out.wide_roots;
-          }
-          out.prior_rank4plus_selections += result.overridden && PriorRank(prior, legal, chosen) >= 4;
-          if (result.candidate_rollout_utilities.size() >= 2) {
-            auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
-            out.sum_paired_corr += corr_stats.sum_corr;
-            out.sum_paired_diff_var += corr_stats.sum_diff_var;
-            out.paired_corr_pairs += corr_stats.corr_pair_count;
-            out.paired_diff_var_pairs += corr_stats.diff_var_pair_count;
-          }
-        } else if (search_allowed && tree.current_node() && !tree.current_node()->children.empty()) {
-          double best = -1e9;
-          for (Action a : legal) {
-            if (tree.HasPriorData(a) && tree.GetMeanUtility(a) > best) {
-              best = tree.GetMeanUtility(a);
-              chosen = a;
-            }
-          }
-        }
-      }
-      if (o.mode != Mode::kRaw) {
-        tree.Advance(chosen);
-        if (chosen == kActionEndTurn) tree.Reset();
-      }
-    }
-    if (std::find(legal.begin(), legal.end(), chosen) == legal.end()) {
-      throw std::runtime_error("Selected action is not legal");
-    }
-    const auto& before = static_cast<const DuneImperiumState&>(*state);
-    const int hand = current == out.seat ? before.GetPlayerCardsInHand(out.seat) : 0;
-    const int intrigues = current == out.seat ? before.GetPlayerIntrigues(out.seat).size() : 0;
-    state->ApplyAction(chosen);
-    const auto& after = static_cast<const DuneImperiumState&>(*state);
-    if (current == out.seat && chosen != kActionEndTurn &&
-        (after.GetPlayerCardsInHand(out.seat) > hand ||
-         static_cast<int>(after.GetPlayerIntrigues(out.seat).size()) > intrigues)) {
-      tree.Reset();
-      ++out.new_info_resets;
-    }
-  }
-  out.returns = state->Returns();
-  if (out.returns.size() != 4 ||
-      !std::all_of(out.returns.begin(), out.returns.end(), [](double r) { return std::isfinite(r); })) {
-    throw std::runtime_error("Invalid terminal returns");
-  }
-  out.placement = 1;
-  for (double r : out.returns) out.placement += r > out.returns[out.seat];
-  const auto& dune = static_cast<const DuneImperiumState&>(*state);
-  for (int p = 0; p < 4; ++p) out.vps.push_back(dune.GetPlayerVp(p));
-  out.ending_round = dune.GetCurrentRound() - 1;
-  out.game_seconds = SecondsSince(start);
-  return out;
-}
-
-json::Object BaseRecord(const Options& o, const std::string& kind) {
-  return {{"record_type", kind}, {"config_key", o.config_key}, {"mode", o.mode_name},
-          {"controller_version", kControllerVersion}, {"simulation_policy", kSimulationPolicy},
-          {"model_checkpoint", o.model_path}, {"opponent_checkpoint", o.opponent_path},
-          {"master_seed", std::to_string(o.master_seed)}, {"rollouts_per_action", o.rollouts},
-          {"margin", kOverrideMargin}, {"rollout_amp", o.rollout_amp},
-          {"allow_tf32", o.allow_tf32}, {"device", o.device_name},
-          {"threads", o.threads}, {"target_batch_size", o.batch_size},
-          {"crn_mode", CrnModeName(o.crn_mode)},
-          {"unbiased_stage2_gate", o.unbiased_stage2_gate},
-          {"fixed_top5_candidates", o.fixed_top5_candidates},
-          {"sample_opponent_leader_draft", o.sample_opponent_leader_draft},
-          {"leader_rollouts", o.leader_rollouts}};
-}
-
-json::Object GameRecord(const GameOutcome& out, const Options& o) {
-  auto row = BaseRecord(o, "game");
-  row["game_id"] = out.game_id;
-  row["seed"] = std::to_string(out.seed);
-  row["seat"] = out.seat;
-  json::Array returns, vps;
-  for (double r : out.returns) returns.emplace_back(r);
-  for (int vp : out.vps) vps.emplace_back(vp);
-  row["returns"] = returns;
-  row["final_vps"] = vps;
-  row["utility"] = out.returns[out.seat];
-  row["placement"] = out.placement;
-  row["ending_round"] = out.ending_round;
-  row["searches"] = out.searches;
-  row["overrides"] = out.overrides;
-  row["new_rollouts"] = out.new_rollouts;
-  row["reused_rollouts"] = out.reused_rollouts;
-  row["new_info_resets"] = out.new_info_resets;
-  row["decisions"] = out.decisions;
-  row["wide_roots"] = out.wide_roots;
-  row["prior_rank4plus_selections"] = out.prior_rank4plus_selections;
-  row["search_wall_seconds"] = out.search_seconds;
-  row["game_wall_seconds"] = out.game_seconds;
-  const double mean_paired_corr = out.paired_corr_pairs > 0
-                                      ? (out.sum_paired_corr / out.paired_corr_pairs)
-                                      : 0.0;
-  const double mean_paired_diff_var = out.paired_diff_var_pairs > 0
-                                          ? (out.sum_paired_diff_var / out.paired_diff_var_pairs)
-                                          : 0.0;
-  row["sum_paired_corr"] = out.sum_paired_corr;
-  row["sum_paired_diff_var"] = out.sum_paired_diff_var;
-  row["paired_corr_pairs"] = out.paired_corr_pairs;
-  row["paired_diff_var_pairs"] = out.paired_diff_var_pairs;
-  row["mean_paired_rollout_corr"] = mean_paired_corr;
-  row["mean_paired_diff_var"] = mean_paired_diff_var;
-  return row;
-}
-
-std::set<int> ReadCompleted(const Options& o) {
+std::set<int> ReadCompleted(const Options& o, Summary* summary_out = nullptr) {
   std::set<int> completed;
   std::ifstream input(o.output_path);
   if (!input && std::filesystem::exists(o.output_path)) {
@@ -678,146 +428,74 @@ std::set<int> ReadCompleted(const Options& o) {
       if (StringField(row, "seed") != std::to_string(seed)) {
         throw std::runtime_error("Existing game has a mismatched seed");
       }
+      if (summary_out != nullptr) {
+        summary_out->completed_games++;
+        const int placement = IntField(row, "placement");
+        if (placement == 1) summary_out->wins++;
+        summary_out->sum_utility += NumberField(row, "utility", 0.0);
+        const int end_r = static_cast<int>(NumberField(row, "ending_round", 0.0));
+        summary_out->sum_ending_round += end_r;
+        if (end_r > 0 && end_r <= 7) summary_out->rounds_le_7_count++;
+        summary_out->sum_cand_r7_track_vp += NumberField(row, "cand_r7_track_vp", 0.0);
+        summary_out->sum_max4_r7_track_vp += NumberField(row, "max4_r7_track_vp", 0.0);
+      }
     }
   }
   return completed;
 }
 
-struct RootCase {
-  int root_id;
-  int game_id;
-  int seat;
-  int round;
-  std::string decision_type;
-  std::vector<Action> history;
-};
-
-std::vector<RootCase> ReadRoots(const Options& o) {
-  const auto value = ReadJson(o.roots_path);
-  if (!value.IsObject()) throw std::runtime_error("Root corpus must be an object");
-  const auto& object = value.GetObject();
-  auto roots = object.find("roots");
-  if (roots == object.end() || !roots->second.IsArray()) throw std::runtime_error("Missing roots array");
-  std::map<std::pair<int, std::string>, std::vector<RootCase>> strata;
-  std::set<int> ids;
-  for (const auto& item : roots->second.GetArray()) {
-    if (!item.IsObject()) throw std::runtime_error("Root must be an object");
-    const auto& row = item.GetObject();
-    RootCase root{IntField(row, "root_id"), IntField(row, "game_id"),
-                  IntField(row, "search_seat"), IntField(row, "round"),
-                  StringField(row, "decision_type"), {}};
-    if (!ids.insert(root.root_id).second || root.seat < 0 || root.seat >= 4) {
-      throw std::runtime_error("Duplicate root ID or invalid seat");
-    }
-    auto history = row.find("action_history");
-    if (history == row.end() || !history->second.IsArray()) throw std::runtime_error("Missing root history");
-    for (const auto& action : history->second.GetArray()) {
-      if (!action.IsInt()) throw std::runtime_error("Invalid action in root history");
-      root.history.push_back(action.GetInt());
-    }
-    const int band = root.round <= 3 ? 0 : root.round <= 6 ? 1 : 2;
-    strata[{band, root.decision_type}].push_back(std::move(root));
-  }
-  for (auto& [key, bucket] : strata) {
-    std::sort(bucket.begin(), bucket.end(), [](const auto& a, const auto& b) { return a.root_id < b.root_id; });
-  }
-  std::vector<RootCase> result;
-  for (size_t offset = 0;; ++offset) {
-    bool added = false;
-    for (const auto& [key, bucket] : strata) {
-      if (offset < bucket.size()) {
-        result.push_back(bucket[offset]);
-        added = true;
-        if (o.max_roots > 0 && result.size() == static_cast<size_t>(o.max_roots)) return result;
-      }
-    }
-    if (!added) return result;
-  }
-}
-
-int RunRoots(const Options& o, const Game& game, const ModelBundle& candidate,
-             const RunControl& control, const std::set<int>& completed,
-             std::ofstream& output) {
-  const auto roots = ReadRoots(o);
-  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators{candidate.evaluator};
-  int done = 0;
-  for (const auto& root : roots) {
-    if (completed.count(root.root_id)) { ++done; continue; }
-    if (control.Stop()) break;
-    auto state = game.NewInitialState();
-    for (size_t index = 0; index < root.history.size(); ++index) {
-      const Action action = root.history[index];
-      const auto legal = state->LegalActions();
-      if (std::find(legal.begin(), legal.end(), action) == legal.end()) {
-        throw std::runtime_error("Illegal root history: root_id=" + std::to_string(root.root_id) +
-            " index=" + std::to_string(index) + " action=" + std::to_string(action) +
-            " current_player=" + std::to_string(state->CurrentPlayer()));
-      }
-      state->ApplyAction(action);
-    }
-    if (state->IsTerminal() || state->IsChanceNode() || state->CurrentPlayer() != root.seat) {
-      throw std::runtime_error("Replayed root has the wrong actor or is not a player decision");
-    }
-    const auto start = Clock::now();
-    const auto nn_start = g_total_network_evaluations.load();
-    const auto legal = state->LegalActions();
-    const auto prior = candidate.evaluator->Prior(*state);
-    const Action raw = PickGreedyAction(prior, legal);
-    const uint64_t seed = dune_seed::DeriveSeed(o.master_seed, dune_seed::kStreamSearchSampling, root.root_id);
-    CompoundSearchDecisionResult result;
-    result.action = raw;
-    TurnSearchTree tree;
-    const bool should_search =
-        o.mode != Mode::kRaw && o.mode != Mode::kLeader && !IsLeader(*state) &&
-        (o.mode == Mode::kFullShAdaptiveLeader
-             ? IsFullStrategicState(*state, root.seat, prior, 0.020)
-             : (IsHighStakesStrategicState(*state, root.seat) && legal.size() > 1));
-    if (should_search) {
-      result = SearchDecision(*state, root.seat, &tree, evaluators, o, seed);
-    }
-    if (control.Stop()) break;
-    auto row = BaseRecord(o, "root");
-    row["roots_json"] = o.roots_path;
-    row["root_id"] = root.root_id;
-    row["game_id"] = root.game_id;
-    row["seed"] = std::to_string(seed);
-    row["seat"] = root.seat;
-    row["round"] = root.round;
-    row["decision_type"] = root.decision_type;
-    row["chosen_action"] = result.action;
-    row["raw_action"] = raw;
-    row["selected_prior_rank"] = PriorRank(prior, legal, result.action);
-    const bool wide_applicable = should_search && o.mode == Mode::kWide && legal.size() > 3;
-    row["wide_applicable"] = wide_applicable;
-    row["overridden"] = result.overridden;
-    row["new_rollouts"] = result.new_rollouts_executed;
-    row["reused_rollouts"] = result.prior_rollouts_reused;
-    row["search_wall_seconds"] = SecondsSince(start);
-    row["network_evaluations"] = static_cast<int64_t>(g_total_network_evaluations.load() - nn_start);
-    json::Array utilities;
-    for (const auto& [action, utility] : result.candidate_utilities) {
-      utilities.emplace_back(json::Array{action, utility});
-    }
-    row["candidate_utilities"] = utilities;
-    double root_mean_paired_corr = 0.0;
-    double root_mean_paired_diff_var = 0.0;
-    if (result.candidate_rollout_utilities.size() >= 2) {
-      auto corr_stats = ComputeMeanPairedCorrelation(result.candidate_rollout_utilities);
-      root_mean_paired_corr = corr_stats.mean_paired_corr;
-      root_mean_paired_diff_var = corr_stats.mean_paired_diff_var;
-    }
-    row["mean_paired_rollout_corr"] = root_mean_paired_corr;
-    row["mean_paired_diff_var"] = root_mean_paired_diff_var;
-    output << json::ToString(row) << '\n' << std::flush;
-    if (!output) throw std::runtime_error("Failed to append root output");
-    std::cout << "[ROOT] " << ++done << '/' << roots.size() << " id=" << root.root_id
-              << " elapsed=" << SecondsSince(control.start) << "s\n" << std::flush;
-  }
-  return done == static_cast<int>(roots.size()) ? 0 : 2;
-}
 }  // namespace
 
+json::Value ReadJson(const std::string& path) {
+  std::ifstream input(path);
+  if (!input) throw std::runtime_error("Cannot read " + path);
+  std::string content((std::istreambuf_iterator<char>(input)), {});
+  auto parsed = json::FromString(content);
+  if (!parsed) throw std::runtime_error("Invalid JSON in " + path);
+  return *parsed;
+}
+
+int IntField(const json::Object& object, const std::string& field) {
+  auto it = object.find(field);
+  if (it == object.end() || !it->second.IsInt()) {
+    throw std::runtime_error("Missing integer field: " + field);
+  }
+  return static_cast<int>(it->second.GetInt());
+}
+
+std::string StringField(const json::Object& object, const std::string& field) {
+  auto it = object.find(field);
+  if (it == object.end() || !it->second.IsString()) {
+    throw std::runtime_error("Missing string field: " + field);
+  }
+  return it->second.GetString();
+}
+
+bool BoolField(const json::Object& object, const std::string& field,
+               bool absent_value) {
+  auto it = object.find(field);
+  if (it == object.end()) return absent_value;
+  if (!it->second.IsBool()) {
+    throw std::runtime_error("Invalid boolean field: " + field);
+  }
+  return it->second.GetBool();
+}
+
+double NumberField(const json::Object& object, const std::string& field,
+                   double absent_value) {
+  auto it = object.find(field);
+  if (it == object.end()) return absent_value;
+  if (it->second.IsDouble()) return it->second.GetDouble();
+  if (it->second.IsInt()) return static_cast<double>(it->second.GetInt());
+  return absent_value;
+}
+
+}  // namespace open_spiel::dune_imperium::play_search_tournament
+
 int main(int argc, char** argv) {
+  using namespace open_spiel;
+  using namespace open_spiel::dune_imperium::play_search_tournament;
+
   absl::ParseCommandLine(argc, argv);
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
@@ -825,7 +503,8 @@ int main(int argc, char** argv) {
     const Options o = ReadOptions(argc, argv);
     RunControl control;
     control.max_seconds = o.max_seconds;
-    const auto completed = ReadCompleted(o);
+    Summary summary;
+    const auto completed = ReadCompleted(o, &summary);
     std::vector<int> pending;
     int skipped = 0;
     if (o.roots_path.empty()) {
@@ -842,7 +521,13 @@ int main(int argc, char** argv) {
         }
       }
       if (pending.empty()) {
-        std::cout << "[DONE] requested games already complete: " << skipped << '\n';
+        std::cout << "[DONE] requested games already complete: " << skipped
+                  << " win_rate=" << summary.win_rate()
+                  << " avg_utility=" << summary.avg_utility()
+                  << " ending_round=" << summary.avg_ending_round()
+                  << " cand_r7_track_vp=" << summary.avg_cand_r7_track_vp()
+                  << " max4_r7_track_vp=" << summary.avg_max4_r7_track_vp()
+                  << " frac_rounds_le_7=" << summary.frac_rounds_le_7() << '\n';
         return 0;
       }
     }
@@ -865,52 +550,21 @@ int main(int argc, char** argv) {
     auto game = LoadGame("dune_imperium");
     if (!o.roots_path.empty()) return RunRoots(o, *game, candidate, control, completed, output);
 
-    std::atomic<size_t> next{0};
-    std::mutex writer;
-    int done = 0;
-    Summary summary;
-    std::string error;
-    const auto play_start = Clock::now();
-    auto worker = [&]() {
-      try {
-        while (!control.Stop()) {
-          const size_t index = next.fetch_add(1);
-          if (index >= pending.size()) break;
-          auto result = PlayGame(pending[index], *game, candidate, opponent, o, control);
-          if (!result) break;
-          const auto row = GameRecord(*result, o);
-          std::lock_guard<std::mutex> lock(writer);
-          summary.completed_games++;
-          summary.sum_paired_corr += result->sum_paired_corr;
-          summary.sum_paired_diff_var += result->sum_paired_diff_var;
-          summary.paired_corr_pairs += result->paired_corr_pairs;
-          summary.paired_diff_var_pairs += result->paired_diff_var_pairs;
-          output << json::ToString(row) << '\n' << std::flush;
-          if (!output) throw std::runtime_error("Failed to append completed game");
-          ++done;
-          const double elapsed = SecondsSince(play_start);
-          const double eta = elapsed / done * (pending.size() - done);
-          std::cout << "[GAME] " << done + skipped << '/' << o.games
-                    << " id=" << result->game_id << " seat=" << result->seat
-                    << " placement=" << result->placement << " utility="
-                    << result->returns[result->seat] << " elapsed=" << elapsed
-                    << "s eta=" << eta << "s\n" << std::flush;
-        }
-      } catch (const std::exception& e) {
-        control.failed.store(true);
-        std::lock_guard<std::mutex> lock(writer);
-        if (error.empty()) error = e.what();
-      }
-    };
-    std::vector<std::thread> workers;
-    for (int i = 0; i < o.threads; ++i) workers.emplace_back(worker);
-    for (auto& thread : workers) thread.join();
+    const auto stats = RunTournamentGames(
+        o, *game, candidate, opponent, control, pending, skipped, summary, output);
+    const int done = stats.newly_completed;
     std::cout << "[DONE] completed=" << done + skipped << '/' << o.games
               << " newly_completed=" << done << " skipped=" << skipped
               << " elapsed=" << SecondsSince(control.start)
               << "s network_evaluations=" << g_total_network_evaluations.load()
+              << " win_rate=" << summary.win_rate()
+              << " avg_utility=" << summary.avg_utility()
+              << " ending_round=" << summary.avg_ending_round()
+              << " cand_r7_track_vp=" << summary.avg_cand_r7_track_vp()
+              << " max4_r7_track_vp=" << summary.avg_max4_r7_track_vp()
+              << " frac_rounds_le_7=" << summary.frac_rounds_le_7()
               << '\n' << std::flush;
-    if (!error.empty()) throw std::runtime_error(error);
+    if (!stats.error.empty()) throw std::runtime_error(stats.error);
     return done + skipped == o.games ? 0 : 2;
   } catch (const std::exception& e) {
     std::cerr << "[ERROR] " << e.what() << '\n';

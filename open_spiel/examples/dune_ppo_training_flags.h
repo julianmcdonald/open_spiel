@@ -135,5 +135,12 @@ ABSL_DECLARE_FLAG(int, r765_collateral_check_interval);
 ABSL_DECLARE_FLAG(double, r765_collateral_min_all_agree);
 ABSL_DECLARE_FLAG(double, r765_collateral_min_hp65_agree);
 
+// V5 appendix LR scaling & terminal win-speed flags.
+ABSL_DECLARE_FLAG(double, v5_appendix_lr_mult);
+ABSL_DECLARE_FLAG(double, win_speed_bonus_per_round);
+ABSL_DECLARE_FLAG(double, r765_teacher_win_speed_tiebreak_eps);
+ABSL_DECLARE_FLAG(bool, r765_teacher_unbiased_stage2_gate);
+ABSL_DECLARE_FLAG(bool, r765_teacher_ceiling_aware_margin);
+
 #endif  // OPEN_SPIEL_EXAMPLES_DUNE_PPO_TRAINING_FLAGS_H_
 

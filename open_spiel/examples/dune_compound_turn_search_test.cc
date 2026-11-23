@@ -1,6 +1,10 @@
 // Unit test for TurnSearchTree and compound turn search
 
 #include "open_spiel/examples/dune_compound_turn_search.h"
+
+#include <array>
+#include <atomic>
+
 #include "open_spiel/spiel_utils.h"
 
 namespace open_spiel {
@@ -143,6 +147,462 @@ void DescendantPublicKnowledgeCorrectionTest() {
   SPIEL_CHECK_EQ(zone_correction.GetVisits(continuation), 0);
 }
 
+class ImperiumSingletonReshuffleCrnTestState : public DuneImperiumState {
+ public:
+  ImperiumSingletonReshuffleCrnTestState(
+      const std::shared_ptr<const Game>& game, bool is_branch_b)
+      : DuneImperiumState(game), is_branch_b_(is_branch_b) {
+    // Fresh DuneImperiumState starts at pending_imperium_slot_ == 0 (stream 1).
+    if (!is_branch_b_) {
+      // Branch A: singleton final card {30} before reshuffle into {30, 31, 32, 33}.
+      SetImperiumDrawDeckForTesting({30});
+    } else {
+      // Branch B: 2 cards {20, 21} before reshuffle into {30, 31, 32, 33}.
+      SetImperiumDrawDeckForTesting({20, 21});
+    }
+    initial_history_size_ = History().size();
+  }
+
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<ImperiumSingletonReshuffleCrnTestState>(*this);
+  }
+
+  void ApplyAction(Action action) override {
+    DuneImperiumState::ApplyAction(action);
+    ++draws_applied_;
+    if (!is_branch_b_ && draws_applied_ == 1) {
+      SetImperiumDrawDeckForTesting({30, 31, 32, 33});
+    } else if (is_branch_b_ && draws_applied_ == 2) {
+      SetImperiumDrawDeckForTesting({30, 31, 32, 33});
+    }
+  }
+
+  bool is_done() const {
+    return draws_applied_ >= (is_branch_b_ ? 3 : 2);
+  }
+
+  bool IsTerminal() const override {
+    return is_done() || DuneImperiumState::IsTerminal();
+  }
+
+  Player CurrentPlayer() const override {
+    if (is_done()) return kTerminalPlayerId;
+    return DuneImperiumState::CurrentPlayer();
+  }
+
+  std::vector<Action> history_actions() const {
+    const std::vector<Action> hist = History();
+    return std::vector<Action>(hist.begin() + initial_history_size_, hist.end());
+  }
+
+ private:
+  bool is_branch_b_ = false;
+  int draws_applied_ = 0;
+  size_t initial_history_size_ = 0;
+};
+
+class IndexedWorldTerminalState : public State {
+ public:
+  IndexedWorldTerminalState(
+      std::shared_ptr<const Game> game,
+      std::vector<Action> legal,
+      Action challenger,
+      double raw_return,
+      double cand_return)
+      : State(std::move(game)),
+        legal_(std::move(legal)),
+        challenger_(challenger),
+        raw_return_(raw_return),
+        cand_return_(cand_return) {}
+
+  Player CurrentPlayer() const override {
+    return terminal_ ? kTerminalPlayerId : 0;
+  }
+  std::vector<Action> LegalActions() const override {
+    if (terminal_) return {};
+    return legal_;
+  }
+  std::string ActionToString(Player, Action action_id) const override {
+    return std::to_string(action_id);
+  }
+  std::string ToString() const override { return "IndexedWorldTerminalState"; }
+  bool IsTerminal() const override { return terminal_; }
+  std::vector<double> Returns() const override {
+    const double u = (chosen_ == challenger_) ? cand_return_ : raw_return_;
+    return {u, -u, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<IndexedWorldTerminalState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action action_id) override {
+    chosen_ = action_id;
+    terminal_ = true;
+  }
+
+ private:
+  std::vector<Action> legal_;
+  Action challenger_;
+  double raw_return_;
+  double cand_return_;
+  Action chosen_ = kInvalidAction;
+  bool terminal_ = false;
+};
+
+class StaticPriorEvaluator : public BatchedNNEvaluator {
+ public:
+  explicit StaticPriorEvaluator(ActionsAndProbs prior)
+      : BatchedNNEvaluator(nullptr, 10.0f), prior_(std::move(prior)) {}
+  ActionsAndProbs Prior(const State&) override { return prior_; }
+  std::vector<double> Evaluate(const State& state) override {
+    return state.Returns();
+  }
+
+ private:
+  ActionsAndProbs prior_;
+};
+
+void PlayTimeSearchAndBeliefFixesTest() {
+  const auto game = LoadGame("dune_imperium");
+
+  // 1. B2: TurnSearchTree::HasConfirmedSubtree and BestConfirmedAction
+  {
+    const std::vector<Action> legal = {10, 20, 30};
+    const ActionsAndProbs raw_prior = {{10, 0.55}, {20, 0.15}, {30, 0.30}};
+
+    // 1a. 1-visit lucky +2.25 child must NOT override 32-visit a_raw (+1.60)
+    TurnSearchTree lucky_tree;
+    for (int i = 0; i < 32; ++i) lucky_tree.RecordRollout(10, {111}, 1.60);
+    lucky_tree.RecordRollout(20, {111}, 2.25);
+    SPIEL_CHECK_GT(lucky_tree.GetMeanUtility(20), lucky_tree.GetMeanUtility(10));
+    SPIEL_CHECK_TRUE(lucky_tree.HasConfirmedSubtree(10, 16));
+    SPIEL_CHECK_EQ(lucky_tree.BestConfirmedAction(10, raw_prior, legal), 10);
+    SPIEL_CHECK_EQ(lucky_tree.BestConfirmedAction(10, raw_prior), 10);
+
+    // 1b. Insufficient raw_visits (< 16) must NOT allow override
+    TurnSearchTree under_visited_raw;
+    for (int i = 0; i < 8; ++i) under_visited_raw.RecordRollout(10, {111}, 1.20);
+    for (int i = 0; i < 24; ++i) under_visited_raw.RecordRollout(20, {111}, 2.00);
+    SPIEL_CHECK_FALSE(under_visited_raw.HasConfirmedSubtree(10, 16));
+    SPIEL_CHECK_EQ(under_visited_raw.BestConfirmedAction(10, raw_prior, legal), 10);
+
+    // 1c. Once raw_visits >= 16 and best_visits >= 16 with margin cleared -> overrides!
+    for (int i = 0; i < 12; ++i) under_visited_raw.RecordRollout(10, {111}, 1.20);
+    SPIEL_CHECK_TRUE(under_visited_raw.HasConfirmedSubtree(10, 16));
+    SPIEL_CHECK_EQ(under_visited_raw.BestConfirmedAction(10, raw_prior, legal), 20);
+
+    // 1d. Near +2.25 ceiling in BestConfirmedAction: eff_margin shrinks smoothly
+    TurnSearchTree endgame_tree;
+    const ActionsAndProbs eq_prior = {{10, 0.45}, {20, 0.45}, {30, 0.10}};
+    for (int i = 0; i < 20; ++i) endgame_tree.RecordRollout(10, {111}, 2.18);
+    for (int i = 0; i < 20; ++i) endgame_tree.RecordRollout(20, {111}, 2.25);
+    SPIEL_CHECK_EQ(endgame_tree.BestConfirmedAction(10, eq_prior, legal), 20);
+  }
+
+  // 2. B3 + Real Engine Terminal-Round Check (GetCurrentRound() at IsTerminal(), NO - 1!)
+  {
+    // Advance a real DuneImperiumState to kRecall in Round 1 using legal actions
+    auto base = game->NewInitialState();
+    auto* base_dune = static_cast<DuneImperiumState*>(base.get());
+    std::mt19937_64 step_rng(20261110ULL);
+    for (int steps = 0; !base->IsTerminal() && base_dune->phase() != GamePhase::kRecall; ++steps) {
+      SPIEL_CHECK_LT(steps, 5000);
+      if (base->IsChanceNode()) {
+        auto outs = base->ChanceOutcomes();
+        double u = std::generate_canonical<double, 53>(step_rng);
+        base->ApplyAction(open_spiel::SampleAction(outs, u).first);
+      } else {
+        auto leg = base->LegalActions();
+        SPIEL_CHECK_FALSE(leg.empty());
+        // Prefer Reveal/EndTurn when available to reach kRecall quickly
+        Action pick = leg.front();
+        if (std::find(leg.begin(), leg.end(), kActionEndTurn) != leg.end()) {
+          pick = kActionEndTurn;
+        } else if (std::find(leg.begin(), leg.end(), kActionReveal) != leg.end()) {
+          pick = kActionReveal;
+        } else if (std::find(leg.begin(), leg.end(), kActionCombatPass) != leg.end()) {
+          pick = kActionCombatPass;
+        }
+        base->ApplyAction(pick);
+      }
+    }
+    SPIEL_CHECK_TRUE(base_dune->phase() == GamePhase::kRecall);
+    for (int p = 0; p < kNumPlayers; ++p) {
+      base_dune->SetPlayerIntriguesForTesting(p, {});
+    }
+    // Drain any non-EndRound recall choices so kActionEndRound is the sole action
+    while (!base->IsTerminal() && base_dune->phase() == GamePhase::kRecall) {
+      auto leg = base->LegalActions();
+      if (leg.size() == 1 && leg[0] == kActionEndRound) break;
+      base->ApplyAction(leg.front());
+    }
+    SPIEL_CHECK_EQ(base->LegalActions().size(), 1);
+    SPIEL_CHECK_EQ(base->LegalActions().front(), kActionEndRound);
+
+    auto make_recall_clone = [&](int round_num, int vp0, int vp1, int vp2, int vp3) {
+      auto c = base->Clone();
+      auto* d = static_cast<DuneImperiumState*>(c.get());
+      d->SetRoundNumberForTesting(round_num);
+      d->SetPlayerVpForTesting(0, vp0);
+      d->SetPlayerVpForTesting(1, vp1);
+      d->SetPlayerVpForTesting(2, vp2);
+      d->SetPlayerVpForTesting(3, vp3);
+      return c;
+    };
+
+    // Round 7 solo win (>= 11 VP in 4p): GetCurrentRound() at IsTerminal() MUST be 7 (NOT 8!)
+    auto r7_state = make_recall_clone(7, 11, 8, 6, 5);
+    auto r7_eps0_state = r7_state->Clone();
+    auto r7_p1_state = r7_state->Clone();
+    const auto traj_r7 = SimulateRolloutWithTurnTrajectory(
+        r7_state.get(), /*search_player=*/0, /*evaluator=*/nullptr, /*seed=*/1ULL,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+        false, nullptr, nullptr, nullptr, false, /*win_speed_tiebreak_eps=*/0.05);
+    SPIEL_CHECK_TRUE(r7_state->IsTerminal());
+    SPIEL_CHECK_EQ(static_cast<DuneImperiumState*>(r7_state.get())->GetCurrentRound(), 7);
+    SPIEL_CHECK_FLOAT_EQ(r7_state->Returns()[0], 2.25);
+    SPIEL_CHECK_FLOAT_EQ(traj_r7.terminal_utility, 2.40);  // 2.25 + 0.05 * (10 - 7)
+
+    // With eps = 0.0, Round-7 solo win stays bit-exact +2.25
+    const auto traj_r7_eps0 = SimulateRolloutWithTurnTrajectory(
+        r7_eps0_state.get(), /*search_player=*/0, /*evaluator=*/nullptr, /*seed=*/1ULL,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+        false, nullptr, nullptr, nullptr, false, /*win_speed_tiebreak_eps=*/0.0);
+    SPIEL_CHECK_FLOAT_EQ(traj_r7_eps0.terminal_utility, 2.25);
+
+    // 2nd place (+0.25) in Round 7 is untouched by win_speed_tiebreak_eps
+    const auto traj_r7_p1 = SimulateRolloutWithTurnTrajectory(
+        r7_p1_state.get(), /*search_player=*/1, /*evaluator=*/nullptr, /*seed=*/1ULL,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+        false, nullptr, nullptr, nullptr, false, /*win_speed_tiebreak_eps=*/0.05);
+    SPIEL_CHECK_FLOAT_EQ(traj_r7_p1.terminal_utility, 0.25);
+
+    // Round 8 solo win: GetCurrentRound() == 8 -> 2.25 + 0.05 * (10 - 8) = 2.35
+    auto r8_state = make_recall_clone(8, 12, 8, 6, 5);
+    const auto traj_r8 = SimulateRolloutWithTurnTrajectory(
+        r8_state.get(), /*search_player=*/0, /*evaluator=*/nullptr, /*seed=*/1ULL,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+        false, nullptr, nullptr, nullptr, false, /*win_speed_tiebreak_eps=*/0.05);
+    SPIEL_CHECK_TRUE(r8_state->IsTerminal());
+    SPIEL_CHECK_EQ(static_cast<DuneImperiumState*>(r8_state.get())->GetCurrentRound(), 8);
+    SPIEL_CHECK_FLOAT_EQ(traj_r8.terminal_utility, 2.35);
+
+    // Round 10 solo win (< 10 VP, round == kMaxRounds): GetCurrentRound() == 10 -> 2.25
+    auto r10_state = make_recall_clone(10, 9, 8, 6, 5);
+    const auto traj_r10 = SimulateRolloutWithTurnTrajectory(
+        r10_state.get(), /*search_player=*/0, /*evaluator=*/nullptr, /*seed=*/1ULL,
+        SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+        false, nullptr, nullptr, nullptr, false, /*win_speed_tiebreak_eps=*/0.05);
+    SPIEL_CHECK_TRUE(r10_state->IsTerminal());
+    SPIEL_CHECK_EQ(static_cast<DuneImperiumState*>(r10_state.get())->GetCurrentRound(), 10);
+    SPIEL_CHECK_FLOAT_EQ(traj_r10.terminal_utility, 2.25);
+
+    // Strict game-theoretic ranking: R7 win (2.40) > R8 win (2.35) > R10 win (2.25) >> 2nd place (0.25)
+    SPIEL_CHECK_GT(traj_r7.terminal_utility, traj_r8.terminal_utility);
+    SPIEL_CHECK_GT(traj_r8.terminal_utility, traj_r10.terminal_utility);
+    SPIEL_CHECK_GT(traj_r10.terminal_utility, traj_r7_p1.terminal_utility + 1.90);
+
+    // Full organic game without any ForTesting setters: GetCurrentRound() at IsTerminal() in [1, 10]
+    auto organic = game->NewInitialState();
+    std::mt19937_64 org_rng(777ULL);
+    for (int steps = 0; !organic->IsTerminal(); ++steps) {
+      SPIEL_CHECK_LT(steps, 20000);
+      if (organic->IsChanceNode()) {
+        auto outs = organic->ChanceOutcomes();
+        double u = std::generate_canonical<double, 53>(org_rng);
+        organic->ApplyAction(open_spiel::SampleAction(outs, u).first);
+      } else {
+        auto leg = organic->LegalActions();
+        std::uniform_int_distribution<size_t> dist(0, leg.size() - 1);
+        organic->ApplyAction(leg[dist(org_rng)]);
+      }
+    }
+    const int org_end_round =
+        static_cast<const DuneImperiumState*>(organic.get())->GetCurrentRound();
+    SPIEL_CHECK_GE(org_end_round, 1);
+    SPIEL_CHECK_LE(org_end_round, 10);
+
+    // Ceiling-aware margin verification:
+    // Bit-exact 0.15 for all q_raw <= 1.95
+    SPIEL_CHECK_FLOAT_EQ(ComputeEffectiveOverrideMargin(0.15, 0.50, 0.0, true), 0.15);
+    SPIEL_CHECK_FLOAT_EQ(ComputeEffectiveOverrideMargin(0.15, 1.95, 0.0, true), 0.15);
+    // Smooth headroom scaling near +2.25 unlocks +2.25 R7 win over +2.15 R8 baseline
+    const double eff_m_215 = ComputeEffectiveOverrideMargin(0.15, 2.15, 0.0, true);
+    SPIEL_CHECK_LT(eff_m_215, 0.10);
+    SPIEL_CHECK_GE(eff_m_215, 0.03);
+
+    IndexedWorldTerminalState ceiling_root(game, {10, 20}, /*challenger=*/20, 2.15, 2.25);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evals = {
+        std::make_shared<StaticPriorEvaluator>(ActionsAndProbs{{10, 0.70}, {20, 0.30}})};
+
+    CompoundSearchOptions opts_locked;
+    opts_locked.ceiling_aware_margin = false;
+    opts_locked.win_speed_tiebreak_eps = 0.0;
+    const auto res_locked = CompoundRolloutSearchDecision(
+        ceiling_root, 0, nullptr, evals, /*top_k=*/2, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15, TreeReuseMode::kTargetFill, /*decision_seed=*/99ULL,
+        SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+        SearchRolloutCrnMode::kSequential, nullptr, /*min_paired_t_stat=*/1.0, opts_locked);
+    SPIEL_CHECK_FALSE(res_locked.overridden);
+    SPIEL_CHECK_EQ(res_locked.action, 10);
+
+    CompoundSearchOptions opts_ceiling;
+    opts_ceiling.ceiling_aware_margin = true;
+    opts_ceiling.win_speed_tiebreak_eps = 0.0;
+    const auto res_ceiling = CompoundRolloutSearchDecision(
+        ceiling_root, 0, nullptr, evals, /*top_k=*/2, /*rollouts_per_action=*/8,
+        /*min_override_margin=*/0.15, TreeReuseMode::kTargetFill, /*decision_seed=*/99ULL,
+        SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+        SearchRolloutCrnMode::kSequential, nullptr, /*min_paired_t_stat=*/1.0, opts_ceiling);
+    SPIEL_CHECK_TRUE(res_ceiling.overridden);
+    SPIEL_CHECK_EQ(res_ceiling.action, 20);
+  }
+
+  // 3. B4: Empirical-Bayes variance floor & single-flip t == 1.0 guard
+  {
+    // N = 2, var_d = 0, mean_d = 0.15 -> se_eb = sqrt((0 + 0.04/2)/2) = 0.10 -> t_stat = 1.5
+    const std::vector<double> raw_2 = {0.50, 0.50};
+    const std::vector<double> cand_2 = {0.65, 0.65};
+    const auto eb2 = ComputePairedEbDiffStats(cand_2.data(), raw_2.data(), 2);
+    SPIEL_CHECK_FLOAT_EQ(eb2.se_eb, 0.10);
+    SPIEL_CHECK_FLOAT_EQ(eb2.t_stat, 1.50);
+
+    // N = 16, var_d = 0, mean_d = 0.20 -> se_eb = 0.20 / 16 = 0.0125 -> t_stat = 16.0
+    const std::vector<double> raw_16(16, 0.0);
+    const std::vector<double> cand_16(16, 0.20);
+    const auto eb16 = ComputePairedEbDiffStats(cand_16.data(), raw_16.data(), 16);
+    SPIEL_CHECK_FLOAT_EQ(eb16.se_eb, 0.0125);
+    SPIEL_CHECK_FLOAT_EQ(eb16.t_stat, 16.0);
+
+    // Single-world flip [+2.0, 0, ..., 0] across N = 10 worlds MUST be rejected
+    const uint64_t flip_seed = 20261110ULL;
+    const uint64_t world0_seed = dune_seed::DeriveSeed(flip_seed, 0);
+    const uint64_t world1_seed = dune_seed::DeriveSeed(flip_seed, 1);
+    IndexedWorldTerminalState dummy_root(game, {10, 20}, 20, 0.0, 0.0);
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> evals = {
+        std::make_shared<StaticPriorEvaluator>(ActionsAndProbs{{10, 0.70}, {20, 0.30}})};
+
+    SearchWorldSampler single_flip_sampler = [&](uint64_t wseed) -> std::unique_ptr<State> {
+      const double cand_ret = (wseed == world0_seed) ? 2.0 : 0.0;
+      return std::make_unique<IndexedWorldTerminalState>(game, std::vector<Action>{10, 20}, 20, 0.0, cand_ret);
+    };
+    const auto res_single_flip = CompoundRolloutSearchDecision(
+        dummy_root, 0, nullptr, evals, /*top_k=*/2, /*rollouts_per_action=*/10,
+        /*min_override_margin=*/0.15, TreeReuseMode::kTargetFill, flip_seed,
+        SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+        SearchRolloutCrnMode::kSequential, single_flip_sampler, /*min_paired_t_stat=*/1.0);
+    SPIEL_CHECK_FALSE(res_single_flip.overridden);
+    SPIEL_CHECK_EQ(res_single_flip.action, 10);
+
+    // Two-world flip [+1.5, +1.5, 0, ..., 0] across N = 10 worlds clears pos_count >= 2 & t_stat >= 1.0
+    SearchWorldSampler two_flip_sampler = [&](uint64_t wseed) -> std::unique_ptr<State> {
+      const double cand_ret = (wseed == world0_seed || wseed == world1_seed) ? 1.5 : 0.0;
+      return std::make_unique<IndexedWorldTerminalState>(game, std::vector<Action>{10, 20}, 20, 0.0, cand_ret);
+    };
+    const auto res_two_flip = CompoundRolloutSearchDecision(
+        dummy_root, 0, nullptr, evals, /*top_k=*/2, /*rollouts_per_action=*/10,
+        /*min_override_margin=*/0.15, TreeReuseMode::kTargetFill, flip_seed,
+        SearchPairingMode::kPaired, SearchTruncationMode::kTerminal,
+        SearchRolloutCrnMode::kSequential, two_flip_sampler, /*min_paired_t_stat=*/1.0);
+    SPIEL_CHECK_TRUE(res_two_flip.overridden);
+    SPIEL_CHECK_EQ(res_two_flip.action, 20);
+  }
+
+  // 4. B7: kEventKeyedCrn singleton final-card draw (size 1 -> reshuffle) epoch synchronization
+  {
+    int matches = 0;
+    const int num_seeds = 50;
+    for (uint64_t seed = 1; seed <= num_seeds; ++seed) {
+      ImperiumSingletonReshuffleCrnTestState branch_a(game, /*is_branch_b=*/false);
+      ImperiumSingletonReshuffleCrnTestState branch_b(game, /*is_branch_b=*/true);
+      SimulateRolloutWithTurnTrajectory(
+          &branch_a, 0, nullptr, seed, SearchTruncationMode::kTerminal,
+          SearchRolloutCrnMode::kEventKeyedCrn);
+      SimulateRolloutWithTurnTrajectory(
+          &branch_b, 0, nullptr, seed, SearchTruncationMode::kTerminal,
+          SearchRolloutCrnMode::kEventKeyedCrn);
+      const auto ha = branch_a.history_actions();
+      const auto hb = branch_b.history_actions();
+      SPIEL_CHECK_EQ(ha.size(), 2);
+      SPIEL_CHECK_EQ(hb.size(), 3);
+      SPIEL_CHECK_EQ(ha[0], 30);  // singleton pre-reshuffle card
+      if (ha[1] == hb[2]) {
+        ++matches;
+      }
+    }
+    SPIEL_CHECK_EQ(matches, num_seeds);
+  }
+
+  // 5. B8: IsCardOrTechAcquisitionAction & IsBuyDecisionState for Tech and Tleilaxu buys
+  {
+    for (Action a = kActionBuyImperiumRow0; a < kActionBuyImperiumRow0 + 8; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    for (Action a = kActionBuyHelenaReserve0; a < kActionBuyHelenaReserve0 + 8; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(kActionBuyReserveArrakisLiaison));
+    SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(kActionBuyReserveTheSpiceMustFlow));
+
+    for (Action a = kActionTechAcquire0; a < kActionTechAcquireSkip; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionTechAcquireSkip));
+
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionTleilaxuAcquire0));
+    for (Action a = kActionTleilaxuAcquire0 + 1; a < kActionTleilaxuAcquireSkip; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionTleilaxuAcquireSkip));
+
+    for (Action a = kActionIntrigueChoiceTech0; a < kActionIntrigueChoiceTechSkip; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionIntrigueChoiceTechSkip));
+
+    for (Action a = kActionTechAcquireWithSolari0; a < kActionTechAcquireWithSolariSkip; ++a) {
+      SPIEL_CHECK_TRUE(IsCardOrTechAcquisitionAction(a));
+    }
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionTechAcquireWithSolariSkip));
+    SPIEL_CHECK_FALSE(IsCardOrTechAcquisitionAction(kActionEndTurn));
+
+    IndexedWorldTerminalState tech_state(
+        game, {kActionTechAcquire0, kActionTechAcquire0 + 1, kActionTechAcquireSkip},
+        kActionTechAcquire0 + 1, 0.0, 1.0);
+    IndexedWorldTerminalState tlei_state(
+        game, {kActionTleilaxuAcquire0 + 1, kActionTleilaxuAcquireSkip},
+        kActionTleilaxuAcquire0 + 1, 0.0, 1.0);
+    IndexedWorldTerminalState solari_tech_state(
+        game, {kActionTechAcquireWithSolari0, kActionTechAcquireWithSolariSkip},
+        kActionTechAcquireWithSolari0, 0.0, 1.0);
+    SPIEL_CHECK_TRUE(IsBuyDecisionState(tech_state));
+    SPIEL_CHECK_TRUE(IsBuyDecisionState(tlei_state));
+    SPIEL_CHECK_TRUE(IsBuyDecisionState(solari_tech_state));
+  }
+
+  // 6. B0: ComputeKlRegularizedSearchPolicy normalization, advantage boost, and unvisited ratio
+  {
+    const std::vector<Action> legals = {10, 20, 30, 40};
+    const ActionsAndProbs prior = {{10, 0.50}, {20, 0.20}, {30, 0.20}, {40, 0.10}};
+    const std::vector<int> visits = {32, 32, 0, 0};
+    const std::vector<double> q_vals = {0.40, 1.10, 0.40, 0.40};
+    const auto kl_pi = ComputeKlRegularizedSearchPolicy(
+        prior, legals, /*raw_action=*/10, visits, q_vals, /*tau=*/0.25);
+    SPIEL_CHECK_EQ(kl_pi.size(), 4);
+    double sum = 0.0;
+    for (const auto& [a, p] : kl_pi) {
+      SPIEL_CHECK_GT(p, 0.0);
+      sum += p;
+    }
+    SPIEL_CHECK_FLOAT_EQ(sum, 1.0);
+    // Action 20 has higher Q (+0.70 over raw 10) -> boosted relative to raw prior ratio (0.20 / 0.50 = 0.40)
+    SPIEL_CHECK_GT(kl_pi[1].second / kl_pi[0].second, 0.20 / 0.50);
+    // Unvisited actions 30 and 40 preserve their exact 2:1 relative prior ratio
+    SPIEL_CHECK_FLOAT_EQ(kl_pi[2].second / kl_pi[3].second, 2.0);
+  }
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -153,6 +613,9 @@ int main(int argc, char** argv) {
 
   DescendantPublicKnowledgeCorrectionTest();
   if (argc > 1 && std::string(argv[1]) == "public-card-descendant") return 0;
+
+  PlayTimeSearchAndBeliefFixesTest();
+  if (argc > 1 && std::string(argv[1]) == "play-time-fixes") return 0;
 
   TurnSearchTree tree;
 
@@ -654,7 +1117,7 @@ int main(int argc, char** argv) {
     SPIEL_CHECK_TRUE(state->IsChanceNode());
 
     auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
-        dune_imperium::kFullPublicInformationStateSize, 256, 2391, 2, false, false, 0, true);
+        dune_imperium::kOrderedCardSlotsInformationStateSize, 128, 2391, 2, false, false, 0, false);
     std::shared_mutex mutex;
     auto coord = std::make_shared<BatchedEvaluator>(
         net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
@@ -664,7 +1127,7 @@ int main(int argc, char** argv) {
     SearchSnapshot snap;
     snap.sim_state = state->Clone();
     snap.player = 0;
-    snap.observation.assign(dune_imperium::kFullPublicInformationStateSize, 0.0f);
+    snap.observation.assign(dune_imperium::kOrderedCardSlotsInformationStateSize, 0.0f);
     snap.legal_actions = {1, 2};
 
     std::vector<SearchSnapshot> snapshots;
@@ -732,11 +1195,12 @@ int main(int argc, char** argv) {
     std::cout << "Running Test 8: Parity between BatchCompoundSearchSupervision and CompoundRolloutSearchDecision...\n";
     std::shared_ptr<const Game> game = LoadGame("dune_imperium");
 
+    torch::manual_seed(42);
     auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
-        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+        dune_imperium::kOrderedCardSlotsInformationStateSize, 128, 2391, 2, false, false, 0, false);
     std::shared_mutex mutex;
     auto coord = std::make_shared<BatchedEvaluator>(
-        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+        net, 1, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
     auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
     std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
 
@@ -872,11 +1336,12 @@ int main(int argc, char** argv) {
 
     // Test BatchCompoundSearchSupervision in override_gated mode
     std::shared_ptr<const Game> game = LoadGame("dune_imperium");
+    torch::manual_seed(42);
     auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
-        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+        dune_imperium::kOrderedCardSlotsInformationStateSize, 128, 2391, 2, false, false, 0, false);
     std::shared_mutex mutex;
     auto coord = std::make_shared<BatchedEvaluator>(
-        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+        net, 1, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
     auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
     std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
 
@@ -965,11 +1430,12 @@ int main(int argc, char** argv) {
     SPIEL_CHECK_EQ(rev_cat, R755SearchCategory::kRevealPurchase);
 
     // 2. CompoundRolloutSearchDecision with min_override_t_stat gating
+    torch::manual_seed(42);
     auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
-        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+        dune_imperium::kOrderedCardSlotsInformationStateSize, 128, 2391, 2, false, false, 0, false);
     std::shared_mutex mutex;
     auto coord = std::make_shared<BatchedEvaluator>(
-        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+        net, 1, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
     auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
     std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
 
@@ -1056,11 +1522,12 @@ int main(int argc, char** argv) {
     }
     const Player cur_p = state->CurrentPlayer();
 
+    torch::manual_seed(42);
     auto net = std::make_shared<SharedDunePolicyValueNetImpl>(
-        dune_imperium::kFullPublicInformationStateSize, 2048, 2391, 2, false, false, 0, true);
+        dune_imperium::kOrderedCardSlotsInformationStateSize, 128, 2391, 2, false, false, 0, false);
     std::shared_mutex mutex;
     auto coord = std::make_shared<BatchedEvaluator>(
-        net, 16, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
+        net, 1, 1, torch::kCPU, &mutex, 10.0f, false, false, false, true, true);
     auto nn_eval = std::make_shared<BatchedNNEvaluator>(coord, 10.0f);
     std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {nn_eval};
 

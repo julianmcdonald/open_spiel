@@ -1,0 +1,666 @@
+#include "dune_search_session_internal.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <random>
+
+#include "dune_seed_utils.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
+
+namespace open_spiel {
+
+DuneSearchResult DuneSearchSession::Search(const State& state, double remaining_time_ms) {
+  if (has_pending_commit_) {
+    SpielFatalError("DuneSearchSession::Search called while a commit is still pending!");
+  }
+  intermediate_re_root_status_ = "none";
+  DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
+  const dune_imperium::DuneImperiumState& dune_state =
+      static_cast<const dune_imperium::DuneImperiumState&>(state);
+  const std::string public_constraints = dune_state.PublicCardKnowledgeDigest();
+  if (state.History() == last_input_history_ &&
+      !last_public_card_constraints_.empty() &&
+      public_constraints != last_public_card_constraints_) {
+    // A capture can correct knowledge without applying an action. Invalidate
+    // the cached worlds while retaining the current turn's clocks and budget.
+    HandleReRootMismatch("public_card_knowledge_correction");
+  }
+
+  // Descendant re-root validation check
+  if (has_active_session_ && state.History() != last_input_history_) {
+    if (state.CurrentPlayer() != active_player_ || dune_state.GetCurrentRound() != round_) {
+      ResetSession("seat_or_round_boundary");
+    } else {
+      const std::vector<Action>& history = state.History();
+      bool is_descendant = false;
+      if (history.size() >= session_history_.size()) {
+        is_descendant = true;
+        for (size_t i = 0; i < session_history_.size(); ++i) {
+          if (history[i] != session_history_[i]) {
+            std::cerr << "DEBUG RE-ROOT MISMATCH at index " << i << ": history=" << history[i]
+                      << ", session_history=" << session_history_[i] << std::endl;
+            is_descendant = false;
+            break;
+          }
+        }
+      }
+      if (is_descendant) {
+        last_re_root_status_ = "hit";
+      } else {
+        if (role != DuneDecisionRole::kAgentPrimary) {
+          HandleReRootMismatch("re_root_mismatch");
+        }
+      }
+    }
+    intermediate_re_root_status_ = last_re_root_status_;
+  }
+
+  // Session start boundary
+  if (role == DuneDecisionRole::kAgentPrimary) {
+    if (!has_active_session_ || state.History() != last_input_history_) {
+      std::string pending_reason = last_reset_reason_;
+      ResetSession("new_placement_activation");
+      if (pending_reason != "none" && pending_reason != "initialization") {
+        last_reset_reason_ = pending_reason;
+      }
+      has_active_session_ = true;
+      active_player_ = state.CurrentPlayer();
+      round_ = dune_state.GetCurrentRound();
+      session_id_ = absl::StrCat("session_", episode_id_, "_r", round_, "_p", active_player_, "_d", decision_id_++);
+    }
+  }
+
+  // Short window transition budget sharing
+  last_public_card_constraints_ = public_constraints;
+  bool is_short_window_role = (role == DuneDecisionRole::kPurchase ||
+                               role == DuneDecisionRole::kCombatIntrigue ||
+                               role == DuneDecisionRole::kOtherOptional);
+  if (is_short_window_role) {
+    // Under exact per-root budgets the pool resets at EVERY in-scope root, not
+    // only when the role changes -- otherwise two consecutive roots of the same
+    // short-window role share one budget and the second receives zero.
+    // The extra condition is deliberately ALSO gated on the budget being armed.
+    // With a zero budget these roles return policy-only immediately below, so
+    // resetting more often could only differ by a side effect of
+    // short_bot_->Reset() -- and the narrow teacher must stay bit-identical for
+    // the recorded parity chains to remain references.
+    if (last_role_ != role ||
+        (config_.exact_short_window_budgets &&
+         config_.purchase_combat_budget > 0)) {
+      short_bot_->Reset();
+      short_window_start_time_ = std::chrono::steady_clock::now();
+      short_sims_completed_ = 0;
+    }
+  }
+  if (role != DuneDecisionRole::kForcedOrBookkeeping && role != DuneDecisionRole::kLeaderSelection) {
+    last_role_ = role;
+  }
+
+  std::shared_ptr<DunePUCTISMCTSBot> active_bot = is_short_window_role ? short_bot_ : placement_bot_;
+
+  // Resolve the live-deadline budget up front, so that BOTH the deadline the
+  // search actually runs against and the deadline telemetry reports come from
+  // one place. This used to be a hardcoded 52000.0 in two independent spots
+  // (deadline init and hard_time_limit_ms), which meant every kLiveDeadline run
+  // silently measured a 52s deadline no matter what the caller configured, and
+  // the telemetry confirmed the lie. A measurement instrument must not invent
+  // its own deadline: if no budget is configured, that is a fatal
+  // misconfiguration, not something to paper over with a default.
+  //
+  // Resolved BEFORE the policy-only fallback lambda below so that (a) the
+  // fallback path can report the same configured limits as the searched path,
+  // and (b) a misconfigured live run fails at its very first decision rather
+  // than only once it reaches a strategic one.
+  double resolved_live_deadline_ms = -1.0;
+  if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
+    resolved_live_deadline_ms = (remaining_time_ms >= 0.0)
+                                    ? remaining_time_ms
+                                    : config_.relative_time_budget_ms;
+    if (!std::isfinite(resolved_live_deadline_ms) ||
+        resolved_live_deadline_ms < 0.0 ||
+        (remaining_time_ms < 0.0 && resolved_live_deadline_ms <= 0.0)) {
+      SpielFatalError(absl::StrCat(
+          "DuneSearchSession: kLiveDeadline budget mode entered with no usable "
+          "time budget (resolved=",
+          resolved_live_deadline_ms,
+          " ms). Pass a positive, finite remaining_time_ms via "
+          "SearchAndSelectWithDeadline(), or configure a positive finite "
+          "DuneSearchConfig::relative_time_budget_ms. Note --disable_time_limit "
+          "sets that budget to infinity, which is meaningless in live mode."));
+    }
+  }
+
+  // Standard policy fallback result initialization
+  auto get_policy_only_result = [&](const std::string& fallback_reason) {
+    DuneSearchResult res;
+    if (state.IsChanceNode()) {
+      res.policy = state.ChanceOutcomes();
+    } else {
+      res.policy = evaluators_[state.CurrentPlayer()]->Prior(state);
+    }
+    res.raw_policy = res.policy;
+    res.simulations_completed = 0;
+    res.elapsed_time_ms = 0.0;
+    res.timeout_status = false;
+    res.used_fallback = true;
+    res.fallback_reason = fallback_reason;
+    res.inference_count = 1;
+
+    // Fill telemetry
+    res.diagnostics.protocol_version = "v2";
+    res.diagnostics.session_id = session_id_;
+    res.diagnostics.searched_seat = state.CurrentPlayer();
+    res.diagnostics.round = dune_state.GetCurrentRound();
+    res.diagnostics.phase = dune_search_session_internal::LocalPhaseToString(dune_state.phase());
+    res.diagnostics.decision_role = absl::StrCat(static_cast<int>(role));
+    res.diagnostics.budget_mode = absl::StrCat(static_cast<int>(budget_mode_));
+    // HARD limits describe what this decision was CONFIGURED to get; SOFT
+    // limits and elapsed describe what it actually got, which on this path is
+    // nothing (no search ran). Before WO-1 the hard limits were emitted as 0
+    // here, which made ~62% of live-mode search.jsonl rows indistinguishable
+    // from "zero budget configured" -- see the README note on grouping by
+    // hard_time_limit_ms in historical runs.
+    res.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role, role);
+    res.diagnostics.soft_sim_limit = 0;
+    res.diagnostics.hard_time_limit_ms =
+        ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
+    res.diagnostics.soft_time_limit_ms = 0.0;
+    res.diagnostics.elapsed_search_time_ms = 0.0;
+    res.diagnostics.inherited_root_visits = 0;
+    res.diagnostics.newly_completed_simulations = 0;
+    res.diagnostics.session_cumulative_simulations = session_new_simulations_completed_;
+    res.diagnostics.short_window_cumulative_simulations = short_sims_completed_;
+    res.diagnostics.session_cumulative_search_time_ms = session_elapsed_time_ms_;
+    res.diagnostics.long_agent_session_cumulative_time_ms = long_agent_elapsed_time_ms_;
+    res.diagnostics.re_root_status = last_re_root_status_;
+    res.diagnostics.post_chance_branch_miss = post_chance_branch_miss_;
+    res.diagnostics.root_coverage = 0.0;
+    res.diagnostics.reset_reason = fallback_reason;
+    res.diagnostics.tree_node_count = active_bot->nodes_.size();
+    res.diagnostics.inference_count = 1;
+    res.diagnostics.legality_result = true;
+    res.diagnostics.fallback_reason = fallback_reason;
+
+    res.diagnostics.actions.reserve(res.policy.size());
+    res.diagnostics.priors.reserve(res.policy.size());
+    res.diagnostics.visit_counts.assign(res.policy.size(), 0);
+    res.diagnostics.q_values.assign(res.policy.size(), 0.0);
+    for (const auto& ap : res.policy) {
+      res.diagnostics.actions.push_back(ap.first);
+      res.diagnostics.priors.push_back(ap.second);
+    }
+
+    last_search_state_ = state.Clone();
+    has_pending_commit_ = true;
+    last_requested_max_sims_ = 0;
+    last_search_result_ = res;
+    return res;
+  };
+
+  // 1. Zero simulations for bookkeeping, and for a leader draft UNLESS the
+  // WO-LEADER-1A flag makes it search-eligible. Splitting the two roles keeps
+  // the default path (search_leader_draft == false) bit-for-bit identical:
+  // both bookkeeping and leader nodes still return the "forced_or_bookkeeping"
+  // policy-only result. When search_leader_draft is true, kLeaderSelection
+  // falls through to the budget setup and search below.
+  if (role == DuneDecisionRole::kForcedOrBookkeeping) {
+    return get_policy_only_result("forced_or_bookkeeping");
+  }
+  if (role == DuneDecisionRole::kLeaderSelection && !config_.search_leader_draft) {
+    return get_policy_only_result("forced_or_bookkeeping");
+  }
+
+  // 2. Budget limits setup setup based on role and mode
+  int max_sims = config_.max_simulations;
+  double max_time_ms = config_.relative_time_budget_ms;
+
+  bool limit_exceeded = false;
+  std::string limit_reason = "";
+
+  if (is_short_window_role) {
+    // If purchase_combat_budget is configured to 0 or less, short-window decisions
+    // are routed directly to the policy-only fallback without search.
+    // Zero simulations are completed, making further budget deduction moot.
+    if (config_.purchase_combat_budget <= 0) {
+      return get_policy_only_result("policy_only_purchase_combat");
+    }
+    // kPolicyOnly means policy-only at EVERY role, not only the agent ones.
+    //
+    // This check lived solely in the kAgentPrimary/kAgentContinuation branch
+    // below, which was invisible for as long as the only raw control ever run
+    // was the NARROW one: at purchase_combat_budget == 0 the short-window roles
+    // took the early return immediately above and never reached a budget. The
+    // moment the WIDE-MATCHED control (raw at budget 64) exists, the same
+    // branch falls straight through to RunSearch -- so the control ran a real
+    // 64-simulation search at every kPurchase / kCombatIntrigue /
+    // kOtherOptional root, then discarded the result and played the raw-prior
+    // argmax anyway. Behaviourally the arm was still a control; it simply paid
+    // a searched arm's compute bill to be one, reported zero requested
+    // simulations against nonzero completed ones, and would have failed the
+    // registered "the control spent nothing" gate at hour N of the audit.
+    //
+    // Ordered AFTER the budget test on purpose, so the narrow control keeps
+    // emitting "policy_only_purchase_combat" and nothing about the existing
+    // instrument moves.
+    if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly) {
+      return get_policy_only_result("policy_only_mode");
+    }
+    max_sims = config_.purchase_combat_budget - short_sims_completed_;
+    if (budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) {
+      int overall_remaining = config_.fixed_session_limit - session_new_simulations_completed_ - short_sims_completed_;
+      if (overall_remaining < max_sims) {
+        max_sims = overall_remaining;
+      }
+    } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingFullFast) {
+      int total_limit = is_full_session_ ? 64 : 8;
+      int overall_remaining = total_limit - session_new_simulations_completed_ - short_sims_completed_;
+      if (overall_remaining < max_sims) {
+        max_sims = overall_remaining;
+      }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(now - short_window_start_time_).count();
+    if (config_.exact_short_window_budgets) {
+      // The registered watchdog is the ONLY time authority. The 500 ms window
+      // below is a latency allowance for a live session; against an audit's
+      // 64-simulation root it is a truncation nobody asked for and, because
+      // these roles report through no role-stats bucket in the caller, one
+      // nobody would see.
+      max_time_ms = config_.relative_time_budget_ms;
+    } else {
+      max_time_ms = (config_.relative_time_budget_ms == std::numeric_limits<double>::infinity())
+          ? std::numeric_limits<double>::infinity()
+          : (500.0 - elapsed_ms);
+    }
+
+    if (max_sims <= 0 || max_time_ms <= 0.0) {
+      // Budget exhausted for this short window (e.g. the primary decision
+      // consumed the whole fixed session budget with reserve == 0). Do NOT
+      // fall through to RunSearch with zeroed limits: max_time_ms == 0 trips
+      // RunSearch's expired-deadline pre-loop check, which returned a UNIFORM
+      // policy that then got played verbatim at ~32% of decisions (the
+      // Phase 18A Step 2 regression). Degrade to the raw network prior on the
+      // true current state instead — identical to the purchase_combat_budget
+      // <= 0 routing whose diagnostic run validated this behavior.
+      return get_policy_only_result("short_window_budget_exceeded");
+    }
+  } else if (role == DuneDecisionRole::kAgentPrimary || role == DuneDecisionRole::kAgentContinuation) {
+    if (budget_mode_ == DuneSearchBudgetMode::kPolicyOnly) {
+      return get_policy_only_result("policy_only_mode");
+    }
+
+    if (budget_mode_ == DuneSearchBudgetMode::kFixedSessionSimulations) {
+      int reserve = (role == DuneDecisionRole::kAgentPrimary) ? config_.fixed_continuation_reserve : 0;
+      max_sims = config_.fixed_session_limit - reserve - session_new_simulations_completed_ - short_sims_completed_;
+      if (max_sims <= 0) {
+        max_sims = 0;
+        limit_exceeded = true;
+        limit_reason = "fixed_session_limit_exceeded";
+      }
+    } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingFullFast) {
+      if (!training_full_fast_rolled_) {
+        uint64_t session_seed = DeriveTrainingFullFastSeed(
+            config_.seed, round_, active_player_, episode_id_, decision_id_);
+        // MakeRng32 seeds through a seed_seq over both halves; the plain
+        // mt19937(seed) ctor would truncate the derived seed to 32 bits.
+        std::mt19937 roll_rng = dune_seed::MakeRng32(session_seed);
+        is_full_session_ = (roll_rng() % 4 == 0); // 25% chance of full search
+        training_full_fast_rolled_ = true;
+      }
+
+      // Dynamic config adjusting for full vs fast searches:
+      if (is_full_session_) {
+        placement_bot_->GetConfig().temperature = 1.0;
+        placement_bot_->GetConfig().dirichlet_epsilon = 0.25;
+        placement_bot_->GetConfig().root_prior_temperature = config_.training_root_prior_temperature;
+      } else {
+        placement_bot_->GetConfig().temperature = 0.0;
+        placement_bot_->GetConfig().dirichlet_epsilon = 0.0;
+        placement_bot_->GetConfig().root_prior_temperature = 1.0; // unflattened / raw prior
+      }
+
+      int reserve = 0;
+      if (role == DuneDecisionRole::kAgentPrimary && is_full_session_) {
+        reserve = config_.fixed_continuation_reserve;
+      }
+      int total_limit = is_full_session_ ? 64 : 8;
+      max_sims = total_limit - reserve - session_new_simulations_completed_ - short_sims_completed_;
+      if (max_sims <= 0) {
+        max_sims = 0;
+        limit_exceeded = true;
+        limit_reason = "training_full_fast_limit_exceeded";
+      }
+    } else if (budget_mode_ == DuneSearchBudgetMode::kTrainingPolicyIteration) {
+      // INDEPENDENT per-role budgets. Deliberately no subtraction of
+      // session_new_simulations_completed_ or short_sims_completed_: that
+      // subtraction is what makes kFixedSessionSimulations a session POOL, and
+      // pooling is exactly the property this mode exists to remove. The primary
+      // spends pi_primary_simulations; every continuation then gets a full
+      // pi_continuation_simulations of NEW simulations on the retained tree.
+      max_sims = (role == DuneDecisionRole::kAgentPrimary)
+                     ? config_.pi_primary_simulations
+                     : config_.pi_continuation_simulations;
+      if (max_sims <= 0) {
+        max_sims = 0;
+        limit_exceeded = true;
+        limit_reason = "search_pi_budget_not_configured";
+      }
+      // A fixed-simulation search stops on the COUNT; the time budget is only a
+      // runaway guard, as on the leader path.
+      max_time_ms = config_.relative_time_budget_ms;
+    } else if (budget_mode_ == DuneSearchBudgetMode::kLiveDeadline) {
+      if (!live_deadline_initialized_ && resolved_live_deadline_ms > 0.0) {
+        absolute_live_deadline_ =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+                static_cast<int64_t>(resolved_live_deadline_ms));
+        live_deadline_budget_ms_ = resolved_live_deadline_ms;
+        live_deadline_initialized_ = true;
+      }
+      if (resolved_live_deadline_ms == 0.0) {
+        max_time_ms = 0.0;
+      } else {
+        auto now = std::chrono::steady_clock::now();
+        double reserve_sec = 0.0;
+        if (role == DuneDecisionRole::kAgentPrimary) {
+          reserve_sec = config_.live_continuation_reserve_seconds;
+          if (reserve_sec * 1000.0 >= live_deadline_budget_ms_) {
+            reserve_sec = 0.5 * (live_deadline_budget_ms_ / 1000.0);
+          }
+        }
+        double remaining_sec =
+            std::chrono::duration<double>(absolute_live_deadline_ - now).count() -
+            reserve_sec;
+        max_time_ms = remaining_sec * 1000.0;
+      }
+      if (max_time_ms <= 0.0) {
+        // Live deadline reached: calling RunSearch with max_time_ms == 0 trips
+        // the expired-deadline pre-loop check and returns a uniform policy (the
+        // same poison as the short-window path, but in live play). Degrade to
+        // the raw network prior on the true current state instead.
+        return get_policy_only_result("live_deadline_reached");
+      }
+      max_sims = config_.max_simulations;
+    }
+  } else if (role == DuneDecisionRole::kLeaderSelection) {
+    // WO-LEADER-1A: search-eligible leader draft. Only reached when
+    // config_.search_leader_draft is true (the default path returned the
+    // "forced_or_bookkeeping" policy-only result above). A leader draft is a
+    // once-per-seat decision that is neither a short-window role nor an
+    // agent-turn role, so it runs on the placement bot with a dedicated,
+    // fixed simulation budget independent of the session budgets.
+    if (config_.leader_draft_simulations <= 0) {
+      // Starved by configuration. Degrade to the raw network prior carrying
+      // the leader node's OWN fallback reason -- never "forced_or_bookkeeping",
+      // and never a uniform policy (get_policy_only_result returns the
+      // evaluator prior, which SelectControllerAction argmaxes at temperature
+      // 0). Obeys the search/eval parity invariant.
+      return get_policy_only_result("leader_draft_no_budget");
+    }
+    max_sims = config_.leader_draft_simulations;
+    // A fixed-simulation search stops on the COUNT; the time budget is only a
+    // guard against a runaway clock. Reuse the configured relative budget so a
+    // live/finite deadline still bounds the leader search.
+    max_time_ms = config_.relative_time_budget_ms;
+  }
+
+  // 3. Re-routing key matching check
+  int inherited_visits = 0;
+  if (has_active_session_) {
+    auto root_key = active_bot->GetStateKey(state);
+    auto it = active_bot->nodes_.find(root_key);
+    if (it != active_bot->nodes_.end()) {
+      last_re_root_status_ = "hit";
+      inherited_visits = it->second->total_visits;
+    } else {
+      if (role == DuneDecisionRole::kAgentContinuation || role == DuneDecisionRole::kOtherOptional) {
+        last_re_root_status_ = "miss";
+        post_chance_branch_miss_ = true;
+      } else {
+        last_re_root_status_ = "none";
+      }
+    }
+  } else {
+    last_re_root_status_ = "none";
+  }
+
+  // Run the MCTS search with limits and RNG seed continuity
+  int start_sim_index = is_short_window_role ? short_cumulative_counter_ : cumulative_simulations_;
+  DuneSearchResult result = active_bot->RunSearch(state, max_sims, max_time_ms, start_sim_index);
+
+  if (limit_exceeded) {
+    // The session-level budget was exhausted, so max_sims was clamped to 0 and
+    // RunSearch could only degrade to a low-coverage/zero-visit fallback.
+    // Record WHICH session limit was hit in a separate field and mark the
+    // fallback, but do NOT overwrite RunSearch's own fallback_reason (e.g.
+    // "low_coverage"): clobbering it here hid the real search behavior for days.
+    result.diagnostics.budget_limit_reason = limit_reason;
+    result.used_fallback = true;
+  }
+
+  // Update session counters
+  if (is_short_window_role) {
+    short_sims_completed_ += result.simulations_completed;
+    short_cumulative_counter_ += result.simulations_completed;
+  } else {
+    session_new_simulations_completed_ += result.simulations_completed;
+    cumulative_simulations_ += result.simulations_completed;
+  }
+  session_elapsed_time_ms_ += result.elapsed_time_ms;
+  if (!is_short_window_role) {
+    long_agent_elapsed_time_ms_ += result.elapsed_time_ms;
+  }
+
+  // Add rich telemetry and audit record fields
+  result.diagnostics.protocol_version = "v2";
+  result.diagnostics.session_id = session_id_;
+  result.diagnostics.searched_seat = state.CurrentPlayer();
+  result.diagnostics.round = dune_state.GetCurrentRound();
+  result.diagnostics.phase = dune_search_session_internal::LocalPhaseToString(dune_state.phase());
+  result.diagnostics.decision_role = absl::StrCat(static_cast<int>(role));
+  result.diagnostics.budget_mode = absl::StrCat(static_cast<int>(budget_mode_));
+  result.diagnostics.hard_sim_limit = ConfiguredHardSimLimit(is_short_window_role, role);
+  result.diagnostics.soft_sim_limit = max_sims;
+  result.diagnostics.hard_time_limit_ms =
+      ConfiguredHardTimeLimitMs(resolved_live_deadline_ms);
+  result.diagnostics.soft_time_limit_ms = max_time_ms;
+  result.diagnostics.elapsed_search_time_ms = result.elapsed_time_ms;
+  // max_sim_duration_ms is populated by DunePUCTISMCTSBot::RunSearch and is
+  // deliberately left intact here: it is the predictor margin the watchdog
+  // actually used, not a session-level reconstruction.
+  result.diagnostics.inherited_root_visits = inherited_visits;
+  result.diagnostics.newly_completed_simulations = result.simulations_completed;
+  result.diagnostics.session_cumulative_simulations = session_new_simulations_completed_;
+  result.diagnostics.short_window_cumulative_simulations = short_sims_completed_;
+  result.diagnostics.session_cumulative_search_time_ms = session_elapsed_time_ms_;
+  result.diagnostics.long_agent_session_cumulative_time_ms = long_agent_elapsed_time_ms_;
+  result.diagnostics.re_root_status = last_re_root_status_;
+  result.diagnostics.post_chance_branch_miss = post_chance_branch_miss_;
+  result.diagnostics.root_coverage = result.diagnostics.covered_prior_mass;
+  result.diagnostics.reset_reason = last_reset_reason_;
+  last_reset_reason_ = "none"; // Clear it after use so it doesn't persist
+  result.diagnostics.tree_node_count = active_bot->nodes_.size();
+  result.diagnostics.inference_count = result.inference_count;
+  result.diagnostics.fallback_reason = result.fallback_reason;
+
+  if (kl_policy_tau_ > 0.0 && !result.used_fallback &&
+      result.diagnostics.total_root_visits > 0 &&
+      !result.diagnostics.actions.empty()) {
+    const ActionsAndProbs& prior_src =
+        !result.raw_policy.empty() ? result.raw_policy : result.policy;
+    result.policy = dune_imperium::ComputeKlRegularizedSearchPolicy(
+        prior_src, result.diagnostics.actions,
+        result.diagnostics.raw_reference_action,
+        result.diagnostics.visit_counts, result.diagnostics.q_values,
+        kl_policy_tau_);
+  }
+
+  last_search_state_ = state.Clone();
+  has_pending_commit_ = true;
+  last_requested_max_sims_ = max_sims;
+  last_search_result_ = result;
+
+  return result;
+}
+
+ControllerDecision DuneSearchSession::SelectControllerAction(
+    const State& state,
+    const DuneSearchResult& search_result,
+    double r_val) {
+  ControllerDecision decision;
+
+  // 1. Raw Reference Action
+  ActionsAndProbs raw_prior;
+  if (state.IsChanceNode()) {
+    raw_prior = state.ChanceOutcomes();
+  } else {
+    if (!search_result.raw_policy.empty()) {
+      raw_prior = search_result.raw_policy;
+    } else {
+      Player p = state.CurrentPlayer();
+      if (p >= 0 && p < evaluators_.size()) {
+        raw_prior = evaluators_[p]->Prior(state);
+      }
+    }
+    if (raw_prior.empty()) {
+      std::vector<Action> legals = state.LegalActions();
+      for (Action a : legals) {
+        raw_prior.push_back({a, 1.0 / legals.size()});
+      }
+    }
+  }
+  decision.raw_reference_action =
+      dune_search_session_internal::PickActionRespectingTemperature(
+          raw_prior, config_.temperature, r_val);
+
+  // 2. MCTS Proposed Action
+  decision.mcts_proposed_action =
+      dune_search_session_internal::ArgmaxVisitAction(search_result.diagnostics);
+
+  // Get decision role
+  DuneDecisionRole role = ClassifyDuneDecisionRole(state, state.CurrentPlayer(), has_active_session_);
+
+  // Per-role logic
+  if (role == DuneDecisionRole::kAgentPrimary) {
+    if (config_.conservative_override_enabled) {
+      // Enforce the conservative override protocol
+      decision.pass_complete_search = (search_result.simulations_completed == last_requested_max_sims_ &&
+                                       !search_result.timeout_status &&
+                                       search_result.fallback_reason == "none");
+
+      std::vector<Action> legal_actions = state.LegalActions();
+      decision.pass_min_actions = (search_result.diagnostics.num_covered_actions >= std::min<int>(3, legal_actions.size()));
+      decision.pass_prior_mass = (search_result.diagnostics.covered_prior_mass >= config_.conservative_covered_prior_threshold);
+
+      int raw_visits = dune_search_session_internal::GetActionVisits(
+          search_result.diagnostics, decision.raw_reference_action);
+      int mcts_visits = dune_search_session_internal::GetActionVisits(
+          search_result.diagnostics, decision.mcts_proposed_action);
+      decision.pass_meaningful_visits = (raw_visits >= config_.conservative_meaningful_visit_threshold &&
+                                         mcts_visits >= config_.conservative_meaningful_visit_threshold);
+
+      double q_proposed = dune_search_session_internal::GetActionQValue(
+          search_result.diagnostics, decision.mcts_proposed_action);
+      double q_raw = dune_search_session_internal::GetActionQValue(
+          search_result.diagnostics, decision.raw_reference_action);
+      decision.pass_q_margin = (decision.mcts_proposed_action == decision.raw_reference_action) ||
+                               ((q_proposed - q_raw) >= config_.conservative_q_margin_threshold);
+
+      decision.stability_checkpoint_reached = search_result.diagnostics.stability_checkpoint_reached;
+      decision.stability_agreement = search_result.diagnostics.stability_agreement;
+      decision.pass_stability = decision.stability_agreement;
+
+      if (decision.pass_complete_search &&
+          decision.pass_min_actions &&
+          decision.pass_prior_mass &&
+          decision.pass_meaningful_visits &&
+          decision.pass_q_margin &&
+          decision.pass_stability) {
+        decision.selected_action = decision.mcts_proposed_action;
+        decision.mcts_overrode_raw = (decision.mcts_proposed_action != decision.raw_reference_action);
+        decision.confidence_fallback = false;
+      } else {
+        decision.selected_action = decision.raw_reference_action;
+        decision.mcts_overrode_raw = false;
+        decision.confidence_fallback = true;
+      }
+    } else {
+      // Legacy primary role logic (non-conservative MCTS action selection)
+      if (search_result.policy.empty()) {
+        decision.selected_action = decision.raw_reference_action;
+      } else {
+        decision.selected_action =
+            dune_search_session_internal::PickActionRespectingTemperature(
+                search_result.policy, config_.temperature, r_val);
+      }
+      decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+      decision.confidence_fallback = search_result.used_fallback;
+    }
+  } else if (role == DuneDecisionRole::kAgentContinuation) {
+    if (config_.conservative_override_enabled && config_.conservative_continuation_overrides_disabled) {
+      // Disable continuation overrides: return raw_ref, confidence_fallback = true
+      decision.selected_action = decision.raw_reference_action;
+      decision.confidence_fallback = true;
+      decision.mcts_overrode_raw = false;
+    } else {
+      // Legacy continuation routing
+      if (search_result.policy.empty()) {
+        decision.selected_action = decision.raw_reference_action;
+      } else {
+        decision.selected_action =
+            dune_search_session_internal::PickActionRespectingTemperature(
+                search_result.policy, config_.temperature, r_val);
+      }
+      decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+      decision.confidence_fallback = search_result.used_fallback;
+    }
+  } else if (role == DuneDecisionRole::kLeaderSelection && config_.search_leader_draft) {
+    // WO-LEADER-1A: consume the leader search result like an ordinary searched
+    // role. On success search_result.policy is the visit-based final policy; on
+    // a starved leader node Search() set it to the raw network prior, so this
+    // reduces to the raw-prior argmax (never uniform), with an empty-policy
+    // guard for defense in depth. Default-inert: when search_leader_draft is
+    // false, kLeaderSelection falls through to the unchanged branch below.
+    if (search_result.policy.empty()) {
+      decision.selected_action = decision.raw_reference_action;
+    } else {
+      decision.selected_action =
+          dune_search_session_internal::PickActionRespectingTemperature(
+              search_result.policy, config_.temperature, r_val);
+    }
+    decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+    decision.confidence_fallback = search_result.used_fallback;
+  } else if (role == DuneDecisionRole::kForcedOrBookkeeping || role == DuneDecisionRole::kLeaderSelection) {
+    std::vector<Action> legal_actions = state.LegalActions();
+    if (role == DuneDecisionRole::kForcedOrBookkeeping && legal_actions.size() == 1) {
+      decision.selected_action = legal_actions[0];
+    } else {
+      decision.selected_action = decision.raw_reference_action;
+    }
+    decision.confidence_fallback = true;
+    decision.mcts_overrode_raw = false;
+  } else if (role == DuneDecisionRole::kPurchase ||
+             role == DuneDecisionRole::kCombatIntrigue ||
+             role == DuneDecisionRole::kOtherOptional) {
+    // Preserve their configured routing (use search result directly)
+    if (search_result.policy.empty()) {
+      decision.selected_action = decision.raw_reference_action;
+    } else {
+      decision.selected_action =
+          dune_search_session_internal::PickActionRespectingTemperature(
+              search_result.policy, config_.temperature, r_val);
+    }
+    decision.mcts_overrode_raw = (decision.selected_action != decision.raw_reference_action);
+    decision.confidence_fallback = search_result.used_fallback;
+  } else {
+    SpielFatalError("Unknown/unhandled DuneDecisionRole in SelectControllerAction");
+  }
+
+  return decision;
+}
+
+}  // namespace open_spiel

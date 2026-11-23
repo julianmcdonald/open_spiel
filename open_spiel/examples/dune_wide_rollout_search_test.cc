@@ -1389,12 +1389,18 @@ void DepthGuardTest() {
     }
     LoadModelCheckpointRobust(deep_model, deep_pt, torch::kCPU);
   } catch (...) {
-    open_spiel::SetErrorHandler(nullptr);
+    open_spiel::SetErrorHandler([](const std::string& err) {
+      std::cerr << "Fatal Error: " << err << std::endl;
+      std::exit(1);
+    });
     std::filesystem::remove_all(temp_dir);
     throw;
   }
 
-  open_spiel::SetErrorHandler(nullptr);
+  open_spiel::SetErrorHandler([](const std::string& err) {
+    std::cerr << "Fatal Error: " << err << std::endl;
+    std::exit(1);
+  });
   std::filesystem::remove_all(temp_dir);
 }
 
@@ -2448,6 +2454,797 @@ void PendingJointOverrideStage2ConfirmedOnlyTest(const std::shared_ptr<const Gam
   }
 }
 
+class DeterministicWorldTableState : public State {
+ public:
+  DeterministicWorldTableState(
+      std::shared_ptr<const Game> game,
+      std::vector<Action> actions,
+      Action challenger_action,
+      double base_raw_return,
+      std::vector<double> world_diffs)
+      : State(game),
+        actions_(std::move(actions)),
+        challenger_action_(challenger_action),
+        base_raw_return_(base_raw_return),
+        world_diffs_(std::move(world_diffs)),
+        counters_(std::make_shared<std::array<std::atomic<int>, 2048>>()) {
+    for (auto& c : *counters_) c.store(0, std::memory_order_relaxed);
+  }
+
+  Player CurrentPlayer() const override {
+    return phase_ >= 1 ? kTerminalPlayerId : 0;
+  }
+  std::vector<Action> LegalActions() const override {
+    if (phase_ == 0) return actions_;
+    return {};
+  }
+  std::string ActionToString(Player, Action action) const override {
+    return std::to_string(action);
+  }
+  std::string ToString() const override { return "DeterministicWorldTableState"; }
+  bool IsTerminal() const override { return phase_ >= 1; }
+  std::vector<double> Returns() const override {
+    double u = base_raw_return_;
+    if (selected_ == challenger_action_ && !world_diffs_.empty()) {
+      const size_t idx =
+          static_cast<size_t>(std::max(0, world_idx_)) % world_diffs_.size();
+      u += world_diffs_[idx];
+    }
+    return {u, -u, 0.0, 0.0};
+  }
+  std::unique_ptr<State> Clone() const override {
+    return std::make_unique<DeterministicWorldTableState>(*this);
+  }
+
+ protected:
+  void DoApplyAction(Action action) override {
+    if (phase_ == 0) {
+      selected_ = action;
+      if (action >= 0 && action < 2048) {
+        world_idx_ = (*counters_)[action].fetch_add(1, std::memory_order_relaxed);
+      }
+      phase_ = 1;
+    }
+  }
+
+ private:
+  std::vector<Action> actions_;
+  Action challenger_action_;
+  double base_raw_return_;
+  std::vector<double> world_diffs_;
+  std::shared_ptr<std::array<std::atomic<int>, 2048>> counters_;
+  int phase_ = 0;
+  Action selected_ = kInvalidAction;
+  int world_idx_ = 0;
+};
+
+class BuyMenuPriorEvaluator : public BatchedNNEvaluator {
+ public:
+  explicit BuyMenuPriorEvaluator(ActionsAndProbs prior)
+      : BatchedNNEvaluator(nullptr, 10.0f), prior_(std::move(prior)) {}
+  ActionsAndProbs Prior(const State&) override { return prior_; }
+
+ private:
+  ActionsAndProbs prior_;
+};
+
+void WideRolloutAndSessionFixesTest(const std::shared_ptr<const Game>& game) {
+  const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+      std::make_shared<FixedPriorEvaluator>()};
+
+  // 1. B4: Single-world flip rejection + finite Empirical-Bayes t-stat in wide search
+  {
+    const std::vector<Action> actions = {10, 11};
+    std::vector<double> single_flip_12(12, 0.0);
+    single_flip_12[0] = 2.4;  // mean_d = 0.20 > 0.15, sample t = 1.0, pos_count = 1
+    DeterministicWorldTableState s_flip_paired(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.50,
+        single_flip_12);
+    const auto res_flip_paired = PairedPriorSortedRolloutSearchDecision(
+        s_flip_paired, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        actions, /*rollouts_per_action=*/12, /*min_override_margin=*/0.15,
+        /*min_t_stat=*/1.0, /*decision_seed=*/42);
+    SPIEL_CHECK_FALSE(res_flip_paired.overridden);
+    SPIEL_CHECK_EQ(res_flip_paired.action, 10);
+
+    // Same single-world flip in SuccessiveHalvingRolloutSearchDecision (K=2, ref=8 -> 6+6=12)
+    std::vector<double> single_flip_12_sh(12, 0.0);
+    single_flip_12_sh[0] = 2.4;  // Stage 1 mean_d = +0.40, pooled mean_d = +0.20, pos_count = 1
+    DeterministicWorldTableState s_flip_sh(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.50,
+        single_flip_12_sh);
+    const auto res_flip_sh = SuccessiveHalvingRolloutSearchDecision(
+        s_flip_sh, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42);
+    SPIEL_CHECK_FALSE(res_flip_sh.overridden);
+    SPIEL_CHECK_EQ(res_flip_sh.action, 10);
+
+    // Zero sample variance at N=8, mean_d=0.30 -> se_eb = 0.20 / 8 = 0.025 -> t_stat = 12.0 (not 100.0!)
+    std::vector<double> const_diff_8(8, 0.30);
+    DeterministicWorldTableState s_eb_pass(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.50,
+        const_diff_8);
+    const auto res_eb_pass = PairedPriorSortedRolloutSearchDecision(
+        s_eb_pass, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        actions, /*rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*min_t_stat=*/11.5, /*decision_seed=*/42);
+    SPIEL_CHECK_TRUE(res_eb_pass.overridden);
+    SPIEL_CHECK_EQ(res_eb_pass.action, 11);
+
+    DeterministicWorldTableState s_eb_reject(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.50,
+        const_diff_8);
+    const auto res_eb_reject = PairedPriorSortedRolloutSearchDecision(
+        s_eb_reject, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        actions, /*rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*min_t_stat=*/12.5, /*decision_seed=*/42);
+    SPIEL_CHECK_FALSE(res_eb_reject.overridden);
+    SPIEL_CHECK_EQ(res_eb_reject.action, 10);
+  }
+
+  // 2. B3: Ceiling-aware margin near +2.25 in PairedPriorSorted & SuccessiveHalving
+  {
+    const std::vector<Action> actions = {10, 11};
+    // q_raw = 2.15, q_cand = 2.25 -> diff = +0.10 (< 0.15 raw margin, > 0.045 ceiling-aware margin)
+    std::vector<double> endgame_diffs(24, 0.10);
+
+    DeterministicWorldTableState s_locked(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/2.15,
+        endgame_diffs);
+    const auto res_locked = SuccessiveHalvingRolloutSearchDecision(
+        s_locked, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0, /*fixed_top_k=*/0,
+        /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+        /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+        /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+        /*all_buy_candidates=*/false, /*win_speed_tiebreak_eps=*/0.0,
+        /*ceiling_aware_margin=*/false);
+    SPIEL_CHECK_FALSE(res_locked.overridden);
+
+    DeterministicWorldTableState s_unlocked(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/2.15,
+        endgame_diffs);
+    const auto res_unlocked = SuccessiveHalvingRolloutSearchDecision(
+        s_unlocked, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42);
+    SPIEL_CHECK_TRUE(res_unlocked.overridden);
+    SPIEL_CHECK_EQ(res_unlocked.action, 11);
+  }
+
+  // 3. B5: K == 2 unbiased_stage2_gate rejects Stage-1 fluke and confirms genuine Stage-2 win
+  {
+    const std::vector<Action> actions = {10, 11};
+    // K=2, ref=8 -> total_budget=24, r_stage1 = 6, r_stage2 = 6.
+    // Stage 1 (0..5) has +1.00 fluke; Stage 2 (6..11) has +0.05 (< 0.15 margin).
+    std::vector<double> stage1_fluke(12, 0.05);
+    for (int i = 0; i < 6; ++i) stage1_fluke[i] = 1.00;
+
+    DeterministicWorldTableState s_pooled(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.20,
+        stage1_fluke);
+    const auto res_pooled = SuccessiveHalvingRolloutSearchDecision(
+        s_pooled, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/false);
+    SPIEL_CHECK_TRUE(res_pooled.overridden);
+
+    DeterministicWorldTableState s_unbiased(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.20,
+        stage1_fluke);
+    const auto res_unbiased = SuccessiveHalvingRolloutSearchDecision(
+        s_unbiased, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/true);
+    SPIEL_CHECK_FALSE(res_unbiased.overridden);
+    SPIEL_CHECK_EQ(res_unbiased.action, 10);
+
+    // Genuine Stage 2 win (+0.30 across all 12 worlds) passes unbiased_stage2_gate
+    std::vector<double> genuine_win(12, 0.30);
+    DeterministicWorldTableState s_genuine(
+        game, actions, /*challenger_action=*/11, /*base_raw_return=*/0.20,
+        genuine_win);
+    const auto res_genuine = SuccessiveHalvingRolloutSearchDecision(
+        s_genuine, /*search_player=*/0, /*turn_tree=*/nullptr, evaluators,
+        /*reference_rollouts_per_action=*/8, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/true);
+    SPIEL_CHECK_TRUE(res_genuine.overridden);
+    SPIEL_CHECK_EQ(res_genuine.action, 11);
+  }
+
+  // 4. B8: SelectOrderedCandidatesAndPriors & SuccessiveHalving include Tech/Tleilaxu buys, exclude Skips
+  {
+    const std::vector<Action> buy_legals = {
+        kActionEndTurn,
+        kActionBuyImperiumRow0 + 0,
+        kActionBuyImperiumRow0 + 1,
+        kActionBuyImperiumRow0 + 2,
+        kActionBuyImperiumRow0 + 3,
+        kActionBuyImperiumRow0 + 4,
+        kActionTechAcquire0,
+        kActionTechAcquireSkip,
+        kActionTleilaxuAcquire0,
+        kActionTleilaxuAcquire0 + 1,
+        kActionTleilaxuAcquireSkip,
+        kActionIntrigueChoiceTech0,
+        kActionIntrigueChoiceTechSkip,
+        kActionTechAcquireWithSolari0,
+        kActionTechAcquireWithSolariSkip};
+    ActionsAndProbs buy_prior = {
+        {kActionEndTurn, 0.30},
+        {kActionBuyImperiumRow0 + 0, 0.20},
+        {kActionBuyImperiumRow0 + 1, 0.15},
+        {kActionBuyImperiumRow0 + 2, 0.15},
+        {kActionBuyImperiumRow0 + 3, 0.10},
+        {kActionBuyImperiumRow0 + 4, 0.02},
+        {kActionTechAcquire0, 0.01},
+        {kActionTechAcquireSkip, 0.01},
+        {kActionTleilaxuAcquire0, 0.01},
+        {kActionTleilaxuAcquire0 + 1, 0.01},
+        {kActionTleilaxuAcquireSkip, 0.01},
+        {kActionIntrigueChoiceTech0, 0.01},
+        {kActionIntrigueChoiceTechSkip, 0.01},
+        {kActionTechAcquireWithSolari0, 0.005},
+        {kActionTechAcquireWithSolariSkip, 0.005}};
+
+    auto [cands_top5_only, priors_top5_only] =
+        SelectOrderedCandidatesAndPriors(buy_prior, buy_legals, /*fixed_top_k=*/5,
+                                         /*all_buy_candidates=*/false);
+    SPIEL_CHECK_EQ(cands_top5_only.size(), 5);
+
+    auto [cands_all_buys, priors_all_buys] =
+        SelectOrderedCandidatesAndPriors(buy_prior, buy_legals, /*fixed_top_k=*/5,
+                                         /*all_buy_candidates=*/true);
+    auto has_act = [&](Action a) {
+      return std::find(cands_all_buys.begin(), cands_all_buys.end(), a) !=
+             cands_all_buys.end();
+    };
+    SPIEL_CHECK_TRUE(has_act(kActionBuyImperiumRow0 + 4));
+    SPIEL_CHECK_TRUE(has_act(kActionTechAcquire0));
+    SPIEL_CHECK_TRUE(has_act(kActionTleilaxuAcquire0 + 1));
+    SPIEL_CHECK_TRUE(has_act(kActionIntrigueChoiceTech0));
+    SPIEL_CHECK_TRUE(has_act(kActionTechAcquireWithSolari0));
+    // Skips and Reclaimed Forces (90) must NOT be pulled in as buy candidates
+    SPIEL_CHECK_FALSE(has_act(kActionTechAcquireSkip));
+    SPIEL_CHECK_FALSE(has_act(kActionTleilaxuAcquire0));
+    SPIEL_CHECK_FALSE(has_act(kActionTleilaxuAcquireSkip));
+    SPIEL_CHECK_FALSE(has_act(kActionIntrigueChoiceTechSkip));
+    SPIEL_CHECK_FALSE(has_act(kActionTechAcquireWithSolariSkip));
+
+    // Also verify SuccessiveHalvingRolloutSearchDecision evaluates a low-prior Tech buy winner
+    DeterministicWorldTableState s_tech_buy(
+        game, buy_legals, /*challenger_action=*/kActionTechAcquireWithSolari0,
+        /*base_raw_return=*/0.10, std::vector<double>(32, 1.00));
+    std::vector<std::shared_ptr<BatchedNNEvaluator>> buy_evals = {
+        std::make_shared<BuyMenuPriorEvaluator>(buy_prior)};
+    const auto res_tech_buy = SuccessiveHalvingRolloutSearchDecision(
+        s_tech_buy, /*search_player=*/0, /*turn_tree=*/nullptr, buy_evals,
+        /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+        /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/true, /*max_time_ms=*/-1.0, /*fixed_top_k=*/5,
+        /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+        /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+        /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+        /*all_buy_candidates=*/true);
+    SPIEL_CHECK_TRUE(res_tech_buy.overridden);
+    SPIEL_CHECK_EQ(res_tech_buy.action, kActionTechAcquireWithSolari0);
+  }
+
+  // 5. B0 + B6: DuneAdaptiveRolloutSession Superhuman profile, KL policy output, and joint_followup_cache policy
+  {
+    auto state = game->NewInitialState();
+    auto* dune = static_cast<DuneImperiumState*>(state.get());
+    for (int steps = 0;; ++steps) {
+      SPIEL_CHECK_LT(steps, 1000);
+      if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+      state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                               : state->LegalActions().front());
+    }
+
+    const auto temp_dir = std::filesystem::temp_directory_path() /
+        ("dune_playtime_fixes_session_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(temp_dir);
+    const int previous_cpu_threads = at::get_num_threads();
+    at::set_num_threads(1);
+    try {
+      const auto checkpoint = (temp_dir / "tiny.pt").string();
+      auto model = std::make_shared<SharedDunePolicyValueNetImpl>(
+          kLegacyInformationStateSize, /*hidden_dim=*/16,
+          kNumDistinctPlayerActions, /*num_blocks=*/1);
+      {
+        torch::NoGradGuard no_grad;
+        for (auto& parameter : model->parameters()) parameter.zero_();
+      }
+      torch::save(model, checkpoint);
+      {
+        const auto schema = GetInformationStateSchema(MarketAppendixMode::kNone);
+        std::ofstream metadata(temp_dir / "tiny.json");
+        metadata << "{\"observation_dim\":" << kLegacyInformationStateSize
+                 << ",\"hidden_dim\":16,\"num_blocks\":1,"
+                 << "\"market_appendix_mode\":\"none\","
+                 << "\"feature_schema_sha256\":\"" << schema.sha256 << "\","
+                 << "\"enable_semantic_scorer\":false}\n";
+      }
+
+      DuneAdaptiveRolloutSession sh_session(
+          checkpoint, "cpu", /*hidden_dim=*/16, /*num_blocks=*/1,
+          /*reference_rollouts_per_action=*/4, /*leader_rollouts=*/2,
+          /*target_batch_size=*/16, /*seed=*/20261110ULL,
+          /*use_successive_halving=*/true, /*fixed_top5_candidates=*/true,
+          /*max_inflight_worlds=*/4, /*num_evaluators=*/1);
+      sh_session.ApplySessionConfig(DuneSearchSessionConfig::Superhuman());
+      SPIEL_CHECK_TRUE(sh_session.superhuman_mode());
+      SPIEL_CHECK_TRUE(sh_session.full_search());
+      SPIEL_CHECK_FALSE(sh_session.search_v2());
+      SPIEL_CHECK_TRUE(sh_session.unbiased_stage2_gate());
+      SPIEL_CHECK_TRUE(sh_session.ceiling_aware_margin());
+      SPIEL_CHECK_TRUE(sh_session.all_buy_candidates());
+      SPIEL_CHECK_TRUE(sh_session.fixed_top5_candidates());
+      SPIEL_CHECK_TRUE(sh_session.use_event_keyed_crn());
+      SPIEL_CHECK_FLOAT_EQ(sh_session.win_speed_tiebreak_eps(), 0.05);
+
+      sh_session.set_kl_policy_tau(0.25);
+      sh_session.set_reserve_ms(0.0);
+      const auto sh_res = sh_session.Search(*state, 5000.0);
+      sh_session.DiscardPendingAction();
+      SPIEL_CHECK_GT(sh_res.simulations_completed, 0);
+      SPIEL_CHECK_EQ(sh_res.policy.size(), state->LegalActions().size());
+      double kl_sum = 0.0;
+      for (const auto& [act, prob] : sh_res.policy) {
+        SPIEL_CHECK_GT(prob, 0.0);
+        SPIEL_CHECK_TRUE(std::isfinite(prob));
+        kl_sum += prob;
+      }
+      SPIEL_CHECK_LT(std::abs(kl_sum - 1.0), 1e-6);
+
+      // B6: joint_followup_cache hit updates result.policy to one-hot on selected_action
+      DuneAdaptiveRolloutSession v2_session(
+          checkpoint, "cpu", /*hidden_dim=*/16, /*num_blocks=*/1,
+          /*reference_rollouts_per_action=*/6, /*leader_rollouts=*/2,
+          /*target_batch_size=*/16, /*seed=*/1138,
+          /*use_successive_halving=*/true, /*fixed_top5_candidates=*/false,
+          /*max_inflight_worlds=*/4, /*num_evaluators=*/1,
+          /*top5_min_budget=*/576, /*all_buy_candidates=*/true,
+          /*enable_fp8_trunk=*/false, /*search_v2=*/true);
+      auto v2_state = state->Clone();
+      const auto r0 = v2_session.Search(*v2_state, 3000.0);
+      v2_session.DiscardPendingAction();
+      if (r0.diagnostics.selected_action >= kActionSelectAgentCard0 &&
+          r0.diagnostics.selected_action < kActionSelectAgentCard0 + kNumImperiumCardIds) {
+        v2_state->ApplyAction(r0.diagnostics.selected_action);
+        const auto r1 = v2_session.Search(*v2_state, 3000.0);
+        v2_session.DiscardPendingAction();
+        SPIEL_CHECK_EQ(r1.diagnostics.termination_reason, "joint_followup_cache");
+        const auto leg1 = v2_state->LegalActions();
+        SPIEL_CHECK_EQ(r1.policy.size(), leg1.size());
+        double cache_prob_sum = 0.0;
+        for (const auto& [act, prob] : r1.policy) {
+          if (act == r1.diagnostics.selected_action) {
+            SPIEL_CHECK_FLOAT_EQ(prob, 1.0);
+          } else {
+            SPIEL_CHECK_FLOAT_EQ(prob, 0.0);
+          }
+          cache_prob_sum += prob;
+        }
+        SPIEL_CHECK_FLOAT_EQ(cache_prob_sum, 1.0);
+        const bool expected_override =
+            (r1.diagnostics.selected_action != r1.diagnostics.raw_reference_action);
+        SPIEL_CHECK_EQ(r1.diagnostics.mcts_overrode_raw, expected_override);
+        SPIEL_CHECK_EQ(r1.diagnostics.search_accepted, expected_override);
+      }
+    } catch (...) {
+      at::set_num_threads(previous_cpu_threads);
+      std::filesystem::remove_all(temp_dir);
+      throw;
+    }
+    at::set_num_threads(previous_cpu_threads);
+    std::filesystem::remove_all(temp_dir);
+  }
+
+  // 7. PendingJointAgentOverride ceiling-aware follow-up confirmation with win_speed_tiebreak_eps
+  {
+    PendingJointAgentOverride pending;
+    pending.active = true;
+    pending.root_uid = 4242ULL;
+    pending.stage1_kept_worlds = 16;
+    pending.root_hand_size = 5;
+    pending.root_intrigue_count = 1;
+    pending.chosen_first_action = 100;
+    pending.expected_graft_action = kInvalidAction;
+    pending.expected_second_action = kActionAgentSpaceConspire + 1;
+    pending.chosen_candidate_index = 1;
+
+    JointAgentCandidate alt_cand;
+    alt_cand.first_action = 100;
+    alt_cand.graft_action = kInvalidAction;
+    alt_cand.second_action = kActionAgentSpaceConspire;
+    alt_cand.joint_prior = 0.60;
+
+    JointAgentCandidate chosen_cand;
+    chosen_cand.first_action = 100;
+    chosen_cand.graft_action = kInvalidAction;
+    chosen_cand.second_action = kActionAgentSpaceConspire + 1;
+    chosen_cand.joint_prior = 0.25;
+
+    pending.joint_candidates = {alt_cand, chosen_cand};
+    // Alt wins solo in Round 8 (+2.25 + 2*0.05 = 2.35); Chosen wins solo in Round 7 (+2.25 + 3*0.05 = 2.40).
+    // Diff is +0.05 (< flat 0.10 total margin, >= ceiling-aware 0.03 margin).
+    pending.per_candidate_rollouts = {
+        std::vector<double>(48, 2.35),
+        std::vector<double>(48, 2.40),
+    };
+
+    PendingJointAgentOverride pending_no_ceil = pending;
+    const std::vector<Action> space_legals = {
+        kActionAgentSpaceConspire, kActionAgentSpaceConspire + 1};
+    auto res_no_ceil = AdvancePendingJointAgentOverride(
+        &pending_no_ceil, space_legals, kActionAgentSpaceConspire,
+        /*cur_hand_size=*/5, /*cur_intrigue_count=*/1,
+        /*saw_chance_node=*/false, /*min_s2_worlds=*/24,
+        /*win_speed_tiebreak_eps=*/0.05, /*ceiling_aware_margin=*/false);
+    SPIEL_CHECK_TRUE(res_no_ceil.execute_override);
+    SPIEL_CHECK_FALSE(res_no_ceil.emit_aux_target);
+
+    auto res_ceil = AdvancePendingJointAgentOverride(
+        &pending, space_legals, kActionAgentSpaceConspire,
+        /*cur_hand_size=*/5, /*cur_intrigue_count=*/1,
+        /*saw_chance_node=*/false, /*min_s2_worlds=*/24,
+        /*win_speed_tiebreak_eps=*/0.05, /*ceiling_aware_margin=*/true);
+    SPIEL_CHECK_TRUE(res_ceil.execute_override);
+    SPIEL_CHECK_TRUE(res_ceil.emit_aux_target);
+    SPIEL_CHECK_FLOAT_NEAR(res_ceil.chosen_mean_q - res_ceil.challenger_mean_q, 0.05, 1e-6);
+  }
+
+  // 8. Progressive Stage-1 waves under full_clock_stage2 avoid lockstep starvation when r_stage1 over-estimates budget
+  {
+    const auto actions5 = Actions(5);
+    const Action challenger = actions5[1];
+    SleepingPayoffState slow_state(
+        game, actions5, challenger, /*advantage=*/1.0, /*sleep_ms_per_step=*/2);
+    TurnSearchTree tree;
+    const auto tight_res = SuccessiveHalvingRolloutSearchDecision(
+        slow_state, /*search_player=*/0, &tree, evaluators,
+        /*reference_rollouts_per_action=*/400, /*min_override_margin=*/0.15,
+        /*decision_seed=*/9911ULL, SearchRolloutCrnMode::kSequential,
+        /*unbiased_stage2_gate=*/false, /*max_time_ms=*/220.0,
+        /*top_k_candidates=*/0, /*max_inflight_worlds=*/64,
+        /*use_bounded_pool_when_unclocked=*/false,
+        /*full_clock_stage2=*/true);
+    SPIEL_CHECK_GE(tight_res.stage1_kept_worlds, 2);
+    SPIEL_CHECK_NE(tight_res.termination_reason, "stage1_starved");
+    SPIEL_CHECK_EQ(tight_res.action, challenger);
+    SPIEL_CHECK_TRUE(tight_res.overridden);
+  }
+}
+
+void EndgamePly2NonClairvoyanceTest(const std::shared_ptr<const Game>& game) {
+  auto state_a = game->NewInitialState();
+  auto* dune_a = static_cast<DuneImperiumState*>(state_a.get());
+  for (int steps = 0; steps < 1000; ++steps) {
+    if (!state_a->IsChanceNode() && dune_a->phase() == GamePhase::kAgentTurns &&
+        state_a->CurrentPlayer() == 0) {
+      break;
+    }
+    state_a->ApplyAction(state_a->IsChanceNode() ? state_a->ChanceOutcomes().front().first
+                                                 : state_a->LegalActions().front());
+  }
+  dune_a->SetRoundNumberForTesting(7);
+
+  auto state_b = state_a->Clone();
+  auto* dune_b = static_cast<DuneImperiumState*>(state_b.get());
+
+  // Opponent 1 holds Ambush (0, combat) in state A vs Windfall (59, plot) in state B
+  dune_a->SetPlayerIntrigueHandForTesting(1, {0});
+  dune_b->SetPlayerIntrigueHandForTesting(1, {59});
+
+  // Verify that InformationStateString for observer player 0 is bit-for-bit identical!
+  SPIEL_CHECK_EQ(state_a->InformationStateString(0), state_b->InformationStateString(0));
+
+  EndgamePly2Config ply2_cfg;
+  ply2_cfg.enabled = true;
+  ply2_cfg.stage2_only = false;
+  ply2_cfg.min_round = 6;
+  ply2_cfg.inner_worlds = 2;
+  ply2_cfg.margin = 0.05;
+  ply2_cfg.max_top1_prior = 0.99;
+  ply2_cfg.min_top2_prior = 0.01;
+
+  auto evaluator = std::make_shared<FixedPriorEvaluator>();
+
+  const uint64_t test_seed = 0x12345678ULL;
+  auto traj_a = SimulateRolloutWithTurnTrajectory(
+      state_a.get(), 0, evaluator.get(), test_seed,
+      SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+      /*sample_opponent_leader_draft=*/false, /*deadline=*/nullptr,
+      /*out_steps=*/nullptr, /*out_nn_evals=*/nullptr,
+      /*center_4seat_leaf_values=*/false, /*win_speed_tiebreak_eps=*/0.0,
+      &ply2_cfg);
+
+  auto traj_b = SimulateRolloutWithTurnTrajectory(
+      state_b.get(), 0, evaluator.get(), test_seed,
+      SearchTruncationMode::kTerminal, SearchRolloutCrnMode::kSequential,
+      /*sample_opponent_leader_draft=*/false, /*deadline=*/nullptr,
+      /*out_steps=*/nullptr, /*out_nn_evals=*/nullptr,
+      /*center_4seat_leaf_values=*/false, /*win_speed_tiebreak_eps=*/0.0,
+      &ply2_cfg);
+
+  SPIEL_CHECK_EQ(traj_a.intra_turn_actions, traj_b.intra_turn_actions);
+  SPIEL_CHECK_FLOAT_NEAR(traj_a.terminal_utility, traj_b.terminal_utility, 1e-9);
+}
+
+class AgentCardPriorEvaluator : public BatchedNNEvaluator {
+ public:
+  explicit AgentCardPriorEvaluator() : BatchedNNEvaluator(nullptr, 10.0f) {}
+  ActionsAndProbs Prior(const State& state) override {
+    ActionsAndProbs prior;
+    auto legals = state.LegalActions();
+    for (size_t i = 0; i < legals.size(); ++i) {
+      Action a = legals[i];
+      if (IsSelectAgentCardAction(a)) {
+        prior.push_back({a, 0.8 - 0.01 * i});
+      } else if (IsBoardSpaceAction(a)) {
+        prior.push_back({a, 0.5 - 0.01 * i});
+      } else {
+        prior.push_back({a, 0.01});
+      }
+    }
+    double sum = 0.0;
+    for (auto& ap : prior) sum += ap.second;
+    if (sum > 0.0) {
+      for (auto& ap : prior) ap.second /= sum;
+    }
+    return prior;
+  }
+};
+
+void MacroSpaceCandidateExpansionTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+  for (int steps = 0; steps < 1000; ++steps) {
+    if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns &&
+        state->CurrentPlayer() == 0) {
+      break;
+    }
+    state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                             : state->LegalActions().front());
+  }
+  dune->SetRoundNumberForTesting(6);
+
+  auto legals = state->LegalActions();
+  bool has_card_play = std::any_of(legals.begin(), legals.end(), [](Action a) {
+    return IsSelectAgentCardAction(a);
+  });
+  SPIEL_CHECK_TRUE(has_card_play);
+
+  MacroSpaceConfig macro_cfg;
+  macro_cfg.enabled = true;
+  macro_cfg.min_round = 1;
+
+  auto evaluator = std::make_shared<AgentCardPriorEvaluator>();
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {evaluator};
+
+  TurnSearchTree tree;
+  auto res = SuccessiveHalvingRolloutSearchDecision(
+      *state, 0, &tree, evaluators,
+      /*reference_rollouts_per_action=*/4, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42ULL, SearchRolloutCrnMode::kSequential,
+      /*unbiased_stage2_gate=*/false, /*max_time_ms=*/-1.0,
+      /*fixed_top_k=*/0, /*max_inflight_worlds=*/4,
+      /*use_bounded_pool_when_unclocked=*/false,
+      /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+      /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+      /*all_buy_candidates=*/false, /*win_speed_tiebreak_eps=*/0.0,
+      /*ceiling_aware_margin=*/true,
+      macro_cfg);
+
+  SPIEL_CHECK_NE(res.chosen_second_action, kInvalidAction);
+  SPIEL_CHECK_TRUE(IsBoardSpaceAction(res.chosen_second_action));
+
+  SPIEL_CHECK_TRUE(tree.current_node() != nullptr);
+  auto it = tree.current_node()->children.find(res.action);
+  SPIEL_CHECK_TRUE(it != tree.current_node()->children.end());
+  SPIEL_CHECK_GE(it->second->visits, 1);
+  bool has_space_child = false;
+  for (const auto& [child_act, child_node] : it->second->children) {
+    if (IsBoardSpaceAction(child_act)) {
+      has_space_child = true;
+      break;
+    }
+  }
+  SPIEL_CHECK_TRUE(has_space_child);
+}
+
+void IntrigueBeliefReweightingPreservesMultisetTest(const std::shared_ptr<const Game>& game) {
+  auto state = game->NewInitialState();
+  auto* dune = static_cast<DuneImperiumState*>(state.get());
+
+  dune->SetPlayerIntrigueHandForTesting(0, {1});
+  dune->SetPlayerIntrigueHandForTesting(1, {0, 8});
+  dune->SetPlayerIntrigueHandForTesting(2, {2});
+  dune->SetPlayerIntrigueHandForTesting(3, {3});
+  dune->SetIntrigueDrawDeckForTesting({5, 6, 10, 14, 59});
+
+  std::multiset<int> before_multiset;
+  for (int p = 1; p < 4; ++p) {
+    for (int cid : dune->GetIntrigueHandForTesting(p)) before_multiset.insert(cid);
+  }
+  for (int cid : dune->GetIntrigueDrawDeckForTesting()) before_multiset.insert(cid);
+
+  IntrigueBeliefConfig belief_cfg;
+  belief_cfg.enabled = true;
+  belief_cfg.mean_age[1] = 2.0;
+  belief_cfg.close_passes[1] = 3;
+  belief_cfg.held_age_combat_log_slope = 0.25;
+  belief_cfg.held_age_endgame_log_slope = 0.30;
+  belief_cfg.close_pass_combat_log_penalty = -1.20;
+
+  auto cloned = state->Clone();
+  auto* cloned_dune = static_cast<DuneImperiumState*>(cloned.get());
+  ApplyOpponentIntrigueBeliefReweighting(*cloned_dune, 0, belief_cfg, 123456ULL);
+
+  // 1. Hand sizes 100% preserved
+  SPIEL_CHECK_EQ(cloned_dune->GetIntrigueHandForTesting(1).size(), 2);
+  SPIEL_CHECK_EQ(cloned_dune->GetIntrigueHandForTesting(2).size(), 1);
+  SPIEL_CHECK_EQ(cloned_dune->GetIntrigueHandForTesting(3).size(), 1);
+  SPIEL_CHECK_EQ(cloned_dune->GetIntrigueHandForTesting(0).size(), 1);
+
+  // 2. Multiset 100% preserved
+  std::multiset<int> after_multiset;
+  for (int p = 1; p < 4; ++p) {
+    for (int cid : cloned_dune->GetIntrigueHandForTesting(p)) after_multiset.insert(cid);
+  }
+  for (int cid : cloned_dune->GetIntrigueDrawDeckForTesting()) after_multiset.insert(cid);
+  SPIEL_CHECK_TRUE(before_multiset == after_multiset);
+
+  // 3. Observer hand untouched
+  SPIEL_CHECK_EQ(cloned_dune->GetIntrigueHandForTesting(0)[0], 1);
+
+  // 4. Combat frequency shift
+  IntrigueBeliefConfig neutral_cfg = belief_cfg;
+  neutral_cfg.close_passes[1] = 0;
+  neutral_cfg.mean_age[1] = 0.0;
+
+  int penalty_combat_count = 0;
+  int neutral_combat_count = 0;
+  const int trials = 200;
+  for (int t = 0; t < trials; ++t) {
+    auto sim_pen = state->Clone();
+    ApplyOpponentIntrigueBeliefReweighting(*static_cast<DuneImperiumState*>(sim_pen.get()), 0, belief_cfg, 1000ULL + t);
+    for (int cid : static_cast<DuneImperiumState*>(sim_pen.get())->GetIntrigueHandForTesting(1)) {
+      const auto* ic = FindIntrigueCardById(cid);
+      if (ic && (ic->phase_mask & kIntriguePhaseCombatMask) != 0) ++penalty_combat_count;
+    }
+
+    auto sim_neu = state->Clone();
+    ApplyOpponentIntrigueBeliefReweighting(*static_cast<DuneImperiumState*>(sim_neu.get()), 0, neutral_cfg, 1000ULL + t);
+    for (int cid : static_cast<DuneImperiumState*>(sim_neu.get())->GetIntrigueHandForTesting(1)) {
+      const auto* ic = FindIntrigueCardById(cid);
+      if (ic && (ic->phase_mask & kIntriguePhaseCombatMask) != 0) ++neutral_combat_count;
+    }
+  }
+
+  SPIEL_CHECK_LT(penalty_combat_count, neutral_combat_count);
+}
+
+void OptionalAbilityRescueTest(const std::shared_ptr<const Game>& game) {
+  SPIEL_CHECK_TRUE(IsRescuableOptionalAbilityAction(kActionPlayKwisatzHaderach, false));
+  SPIEL_CHECK_TRUE(IsRescuableOptionalAbilityAction(142, false));
+  SPIEL_CHECK_TRUE(IsRescuableOptionalAbilityAction(632, false));
+  SPIEL_CHECK_TRUE(IsRescuableOptionalAbilityAction(2338, false));
+  SPIEL_CHECK_FALSE(IsRescuableOptionalAbilityAction(741, false));
+  SPIEL_CHECK_FALSE(IsRescuableOptionalAbilityAction(kActionFamilyAtomics, false));
+  SPIEL_CHECK_FALSE(IsRescuableOptionalAbilityAction(823, false));
+
+  SPIEL_CHECK_TRUE(IsRescuableOptionalAbilityAction(kActionFamilyAtomics, true));
+  SPIEL_CHECK_FALSE(IsRescuableOptionalAbilityAction(632, true));
+  SPIEL_CHECK_FALSE(IsRescuableOptionalAbilityAction(2338, true));
+
+  // Non-buy state: Spy Satellites (632) ranked #7 is pruned when rescue=false and rescued when rescue=true.
+  const std::vector<Action> non_buy_legals = {600, 601, 602, 603, 604, 605, 632};
+  const ActionsAndProbs non_buy_prior = {
+      {600, 0.30}, {601, 0.25}, {602, 0.20}, {603, 0.12},
+      {604, 0.08}, {605, 0.04}, {632, 0.01}};
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> non_buy_evals = {
+      std::make_shared<BuyMenuPriorEvaluator>(non_buy_prior)};
+
+  DeterministicWorldTableState s_non_buy_off(
+      game, non_buy_legals, /*challenger_action=*/632,
+      /*base_raw_return=*/0.10, std::vector<double>(32, 1.00));
+  const auto res_off = SuccessiveHalvingRolloutSearchDecision(
+      s_non_buy_off, /*search_player=*/0, /*turn_tree=*/nullptr, non_buy_evals,
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*unbiased_stage2_gate=*/true, /*max_time_ms=*/-1.0, /*fixed_top_k=*/5,
+      /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+      /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+      /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+      /*all_buy_candidates=*/true, /*win_speed_tiebreak_eps=*/0.0,
+      /*ceiling_aware_margin=*/true, /*macro_cfg=*/{},
+      /*forced_include_action=*/kInvalidAction, /*prior_eval_override=*/nullptr,
+      /*ply2_cfg=*/nullptr, /*belief_cfg=*/nullptr,
+      /*rescue_optional_abilities=*/false);
+  SPIEL_CHECK_FALSE(res_off.overridden);
+  SPIEL_CHECK_EQ(res_off.action, 600);
+
+  DeterministicWorldTableState s_non_buy_on(
+      game, non_buy_legals, /*challenger_action=*/632,
+      /*base_raw_return=*/0.10, std::vector<double>(32, 1.00));
+  const auto res_on = SuccessiveHalvingRolloutSearchDecision(
+      s_non_buy_on, /*search_player=*/0, /*turn_tree=*/nullptr, non_buy_evals,
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*unbiased_stage2_gate=*/true, /*max_time_ms=*/-1.0, /*fixed_top_k=*/5,
+      /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+      /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+      /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+      /*all_buy_candidates=*/true, /*win_speed_tiebreak_eps=*/0.0,
+      /*ceiling_aware_margin=*/true, /*macro_cfg=*/{},
+      /*forced_include_action=*/kInvalidAction, /*prior_eval_override=*/nullptr,
+      /*ply2_cfg=*/nullptr, /*belief_cfg=*/nullptr,
+      /*rescue_optional_abilities=*/true);
+  SPIEL_CHECK_TRUE(res_on.overridden);
+  SPIEL_CHECK_EQ(res_on.action, 632);
+
+  // Off-reveal specimen (741) and Atomics (1591) stay pruned when rescue=true.
+  const std::vector<Action> excl_legals = {600, 601, 602, 603, 604, 741, kActionFamilyAtomics};
+  const ActionsAndProbs excl_prior = {
+      {600, 0.30}, {601, 0.25}, {602, 0.20}, {603, 0.12},
+      {604, 0.11}, {741, 0.01}, {kActionFamilyAtomics, 0.01}};
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> excl_evals = {
+      std::make_shared<BuyMenuPriorEvaluator>(excl_prior)};
+  DeterministicWorldTableState s_excl(
+      game, excl_legals, /*challenger_action=*/kActionFamilyAtomics,
+      /*base_raw_return=*/0.10, std::vector<double>(32, 1.00));
+  const auto res_excl = SuccessiveHalvingRolloutSearchDecision(
+      s_excl, /*search_player=*/0, /*turn_tree=*/nullptr, excl_evals,
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*unbiased_stage2_gate=*/true, /*max_time_ms=*/-1.0, /*fixed_top_k=*/5,
+      /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+      /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+      /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+      /*all_buy_candidates=*/true, /*win_speed_tiebreak_eps=*/0.0,
+      /*ceiling_aware_margin=*/true, /*macro_cfg=*/{},
+      /*forced_include_action=*/kInvalidAction, /*prior_eval_override=*/nullptr,
+      /*ply2_cfg=*/nullptr, /*belief_cfg=*/nullptr,
+      /*rescue_optional_abilities=*/true);
+  SPIEL_CHECK_FALSE(res_excl.overridden);
+  SPIEL_CHECK_EQ(res_excl.action, 600);
+
+  // Buy state: FamilyAtomics (1591) ranked #7 is rescued when rescue=true.
+  const std::vector<Action> buy_legals = {10, 11, 12, 13, 14, 15, kActionFamilyAtomics};
+  const ActionsAndProbs buy_prior = {
+      {10, 0.30}, {11, 0.25}, {12, 0.20}, {13, 0.12},
+      {14, 0.10}, {15, 0.02}, {kActionFamilyAtomics, 0.01}};
+  std::vector<std::shared_ptr<BatchedNNEvaluator>> buy_evals = {
+      std::make_shared<BuyMenuPriorEvaluator>(buy_prior)};
+  DeterministicWorldTableState s_buy_atomics(
+      game, buy_legals, /*challenger_action=*/kActionFamilyAtomics,
+      /*base_raw_return=*/0.10, std::vector<double>(32, 1.00));
+  const auto res_buy_atomics = SuccessiveHalvingRolloutSearchDecision(
+      s_buy_atomics, /*search_player=*/0, /*turn_tree=*/nullptr, buy_evals,
+      /*reference_rollouts_per_action=*/16, /*min_override_margin=*/0.15,
+      /*decision_seed=*/42, SearchRolloutCrnMode::kSequential,
+      /*unbiased_stage2_gate=*/true, /*max_time_ms=*/-1.0, /*fixed_top_k=*/5,
+      /*max_inflight_worlds=*/32, /*use_bounded_pool_when_unclocked=*/false,
+      /*full_clock_stage2=*/false, /*prior_log_ratio_weight=*/0.0,
+      /*stage1_high_conf_prior_skip=*/0.0, /*precomputed_raw_prior=*/nullptr,
+      /*all_buy_candidates=*/false, /*win_speed_tiebreak_eps=*/0.0,
+      /*ceiling_aware_margin=*/true, /*macro_cfg=*/{},
+      /*forced_include_action=*/kInvalidAction, /*prior_eval_override=*/nullptr,
+      /*ply2_cfg=*/nullptr, /*belief_cfg=*/nullptr,
+      /*rescue_optional_abilities=*/true);
+  SPIEL_CHECK_TRUE(res_buy_atomics.overridden);
+  SPIEL_CHECK_EQ(res_buy_atomics.action, kActionFamilyAtomics);
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -2463,6 +3260,10 @@ int main(int argc, char** argv) {
     return 0;
   }
   const auto game = open_spiel::LoadGame("dune_imperium");
+  if (argc > 1 && std::string(argv[1]) == "play-time-fixes") {
+    WideRolloutAndSessionFixesTest(game);
+    return 0;
+  }
   NativeLegacyDelegationTest(game);
   NativeWideBudgetAndPairingTest(game);
   NativeWideCompoundParityTest(game);
@@ -2487,4 +3288,15 @@ int main(int argc, char** argv) {
   SearchV2SameCardSpaceOverrideChosenUtilityTest(game);
   SearchV2UnclockedLegacyParityAndOptIn3ArmTest(game);
   PendingJointOverrideStage2ConfirmedOnlyTest(game);
+  std::cout << "[RUNNING] WideRolloutAndSessionFixesTest" << std::endl;
+  WideRolloutAndSessionFixesTest(game);
+  std::cout << "[RUNNING] EndgamePly2NonClairvoyanceTest" << std::endl;
+  EndgamePly2NonClairvoyanceTest(game);
+  std::cout << "[RUNNING] MacroSpaceCandidateExpansionTest" << std::endl;
+  MacroSpaceCandidateExpansionTest(game);
+  std::cout << "[RUNNING] IntrigueBeliefReweightingPreservesMultisetTest" << std::endl;
+  IntrigueBeliefReweightingPreservesMultisetTest(game);
+  std::cout << "[RUNNING] OptionalAbilityRescueTest" << std::endl;
+  OptionalAbilityRescueTest(game);
+  std::cout << "[ALL TESTS PASSED]" << std::endl;
 }

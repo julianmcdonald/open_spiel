@@ -63,6 +63,10 @@ set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   pybind11/games_dots_and_boxes.h
   pybind11/games_dune_imperium.cc
   pybind11/games_dune_imperium.h
+  pybind11/games_dune_imperium_internal.h
+  pybind11/games_dune_imperium_state.cc
+  pybind11/games_dune_imperium_search.cc
+  pybind11/games_dune_imperium_v5_scorer.cc
   pybind11/games_euchre.cc
   pybind11/games_euchre.h
   pybind11/games_gin_rummy.cc

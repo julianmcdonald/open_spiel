@@ -1155,14 +1155,11 @@ void TestCorrectedTerminalRounds() {
   const dune_imperium::DuneImperiumState* dune_state =
       static_cast<const dune_imperium::DuneImperiumState*>(state.get());
 
-  int raw_round = dune_state->GetCurrentRound();
-  int corrected_round = raw_round - 1; // since the game is terminal
+  int terminal_round = dune_state->GetCurrentRound();
 
-  // Verify that the engine's raw round has been incremented by one
-  assert(raw_round == last_round + 1);
-  // Verify that our corrected round perfectly matches the final active round
-  assert(corrected_round == last_round);
-  assert(corrected_round >= 1 && corrected_round <= 10);
+  // Verify that terminal states preserve the final active round directly (no off-by-one).
+  assert(terminal_round == last_round);
+  assert(terminal_round >= 1 && terminal_round <= 10);
 
   std::cout << "Test 22 Passed!\n\n";
 }
