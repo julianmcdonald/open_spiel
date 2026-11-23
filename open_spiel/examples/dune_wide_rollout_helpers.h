@@ -517,8 +517,8 @@ inline int RunSHStage1ClockedWaves(
   const int w0 = std::min(
       r_stage1,
       (max_time_ms <= 1600.0)
-          ? 3
-          : ((max_time_ms <= 3500.0) ? 5 : std::clamp(r_stage1 / 2, 4, 32)));
+          ? 2
+          : ((max_time_ms <= 3500.0) ? 4 : std::clamp(r_stage1 / 2, 4, 32)));
   RunClockedPairedRolloutStage(
       state, dune, search_player, evaluators, ordered_candidates,
       candidate_indices, w0, /*world_seed_offset=*/0,

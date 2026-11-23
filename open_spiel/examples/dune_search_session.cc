@@ -232,6 +232,17 @@ void InitCudaSuperhumanPriors(std::array<double, 12>& ms_per_round,
                               double& ms_ema,
                               int rollout_num_blocks,
                               bool& initialized_flag) {
+  if (rollout_num_blocks >= 32) {
+    constexpr std::array<double, 12> kCalib32bMs = {
+        {26.5, 25.3, 22.4, 20.4, 15.9, 13.6, 9.1, 6.0, 3.2, 1.7, 1.0, 0.8}};
+    const double scale32 = static_cast<double>(rollout_num_blocks) / 32.0;
+    for (size_t i = 0; i < 12; ++i) {
+      ms_per_round[i] = kCalib32bMs[i] * scale32;
+    }
+    ms_ema = 8.6 * scale32;
+    initialized_flag = true;
+    return;
+  }
   constexpr std::array<double, 12> kBase16bMs = {
       {8.5, 5.2, 4.6, 4.1, 3.6, 3.0, 2.5, 2.0, 1.6, 1.3, 1.1, 0.9}};
   const double block_scale =

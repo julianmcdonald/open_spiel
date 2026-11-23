@@ -549,7 +549,7 @@ DuneSearchResult DuneAdaptiveRolloutSession::Search(const State& state,
               impl_ && impl_->device.is_cuda(), reserve_ms_,
               reference_rollouts_per_action_, available_after_reserve_ms,
               remaining_time_ms, round_ms_est, impl_->evaluators.front().get(),
-              result, target_ms, ref_rollouts);
+              result, target_ms, ref_rollouts, rollout_num_blocks_);
         }
 
         if (!search_v2_ && !superhuman_mode_ && remaining_time_ms >= 0.0 && ref_rollouts < 4) {

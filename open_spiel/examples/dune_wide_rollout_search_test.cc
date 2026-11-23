@@ -14,6 +14,7 @@
 
 #include "open_spiel/examples/dune_network.h"
 #include "open_spiel/examples/dune_search_session.h"
+#include "open_spiel/examples/dune_search_session_internal.h"
 #include "open_spiel/games/dune_imperium/dune_imperium.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
@@ -3245,6 +3246,134 @@ void OptionalAbilityRescueTest(const std::shared_ptr<const Game>& game) {
   SPIEL_CHECK_EQ(res_buy_atomics.action, kActionFamilyAtomics);
 }
 
+void Cuda32bPriorAndWaveFloorTest(const std::shared_ptr<const Game>& game) {
+  // 1. InitCudaSuperhumanPriors for 16, 24, and 32 blocks
+  {
+    constexpr std::array<double, 12> kExpected16 = {
+        {8.5, 5.2, 4.6, 4.1, 3.6, 3.0, 2.5, 2.0, 1.6, 1.3, 1.1, 0.9}};
+    constexpr std::array<double, 12> kExpected32 = {
+        {26.5, 25.3, 22.4, 20.4, 15.9, 13.6, 9.1, 6.0, 3.2, 1.7, 1.0, 0.8}};
+
+    std::array<double, 12> ms16{};
+    double ema16 = 0.0;
+    bool init16 = false;
+    dune_search_session_internal::InitCudaSuperhumanPriors(ms16, ema16, 16, init16);
+    SPIEL_CHECK_TRUE(init16);
+    SPIEL_CHECK_FLOAT_NEAR(ema16, 4.0, 1e-9);
+    for (size_t i = 0; i < 12; ++i) {
+      SPIEL_CHECK_FLOAT_NEAR(ms16[i], kExpected16[i], 1e-9);
+    }
+
+    std::array<double, 12> ms24{};
+    double ema24 = 0.0;
+    bool init24 = false;
+    dune_search_session_internal::InitCudaSuperhumanPriors(ms24, ema24, 24, init24);
+    SPIEL_CHECK_TRUE(init24);
+    SPIEL_CHECK_FLOAT_NEAR(ema24, 6.0, 1e-9);
+    for (size_t i = 0; i < 12; ++i) {
+      SPIEL_CHECK_FLOAT_NEAR(ms24[i], kExpected16[i] * 1.5, 1e-9);
+    }
+
+    std::array<double, 12> ms32{};
+    double ema32 = 0.0;
+    bool init32 = false;
+    dune_search_session_internal::InitCudaSuperhumanPriors(ms32, ema32, 32, init32);
+    SPIEL_CHECK_TRUE(init32);
+    SPIEL_CHECK_FLOAT_NEAR(ema32, 8.6, 1e-9);
+    for (size_t i = 0; i < 12; ++i) {
+      SPIEL_CHECK_FLOAT_NEAR(ms32[i], kExpected32[i], 1e-9);
+    }
+  }
+
+  // 2. PlanV1SearchBudget wave floor scaling at Round 3 (16b vs 32b)
+  {
+    auto state = game->NewInitialState();
+    auto* dune = static_cast<DuneImperiumState*>(state.get());
+    for (int steps = 0;; ++steps) {
+      SPIEL_CHECK_LT(steps, 1000);
+      if (!state->IsChanceNode() && dune->phase() == GamePhase::kAgentTurns) break;
+      state->ApplyAction(state->IsChanceNode() ? state->ChanceOutcomes().front().first
+                                               : state->LegalActions().front());
+    }
+    dune->SetRoundNumberForTesting(3);
+    const Player p = state->CurrentPlayer();
+    const auto legal = state->LegalActions();
+    ActionsAndProbs raw_prior;
+    for (Action a : legal) {
+      raw_prior.emplace_back(a, 1.0 / static_cast<double>(legal.size()));
+    }
+
+    DuneSearchResult res16;
+    double target16 = 0.0;
+    int ref16 = 0;
+    dune_search_session_internal::PlanV1SearchBudget(
+        *state, *dune, p, legal, raw_prior,
+        /*is_agent_turn_phase=*/false, /*full_search=*/true,
+        /*superhuman_mode=*/true, /*is_cuda=*/true, /*reserve_ms=*/10000.0,
+        /*reference_rollouts_per_action=*/32,
+        /*available_after_reserve_ms=*/750.0,
+        /*remaining_time_ms=*/50000.0, /*round_ms_est=*/8.2,
+        /*prior_eval=*/nullptr, res16, target16, ref16, /*rollout_num_blocks=*/16);
+    SPIEL_CHECK_GE(ref16, 4);
+
+    DuneSearchResult res32_starve;
+    double target32_starve = 0.0;
+    int ref32_starve = 0;
+    dune_search_session_internal::PlanV1SearchBudget(
+        *state, *dune, p, legal, raw_prior,
+        /*is_agent_turn_phase=*/false, /*full_search=*/true,
+        /*superhuman_mode=*/true, /*is_cuda=*/true, /*reserve_ms=*/10000.0,
+        /*reference_rollouts_per_action=*/32,
+        /*available_after_reserve_ms=*/750.0,
+        /*remaining_time_ms=*/50000.0, /*round_ms_est=*/20.4,
+        /*prior_eval=*/nullptr, res32_starve, target32_starve, ref32_starve,
+        /*rollout_num_blocks=*/32);
+    SPIEL_CHECK_EQ(ref32_starve, 0);
+
+    DuneSearchResult res32_ok;
+    double target32_ok = 0.0;
+    int ref32_ok = 0;
+    dune_search_session_internal::PlanV1SearchBudget(
+        *state, *dune, p, legal, raw_prior,
+        /*is_agent_turn_phase=*/false, /*full_search=*/true,
+        /*superhuman_mode=*/true, /*is_cuda=*/true, /*reserve_ms=*/10000.0,
+        /*reference_rollouts_per_action=*/32,
+        /*available_after_reserve_ms=*/1200.0,
+        /*remaining_time_ms=*/50000.0, /*round_ms_est=*/20.4,
+        /*prior_eval=*/nullptr, res32_ok, target32_ok, ref32_ok,
+        /*rollout_num_blocks=*/32);
+    SPIEL_CHECK_GE(target32_ok, 860.0);
+    SPIEL_CHECK_GE(ref32_ok, 4);
+  }
+
+  // 3. Stage-1 tight-budget w0 == 2 verification on <= 1600 ms
+  {
+    const auto actions2 = Actions(2);
+    const std::vector<std::shared_ptr<BatchedNNEvaluator>> evaluators = {
+        std::make_shared<FixedPriorEvaluator>()};
+    SleepingPayoffState slow_state(
+        game, actions2, actions2[1], /*advantage=*/1.0, /*sleep_ms_per_step=*/55);
+    std::vector<std::vector<double>> per_candidate_rollouts(actions2.size());
+    int new_rollouts_executed = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const int waves = RunSHStage1ClockedWaves(
+        slow_state, /*dune=*/nullptr, /*search_player=*/0, evaluators,
+        actions2, /*r_stage1=*/10, /*decision_seed=*/4242ULL,
+        SearchRolloutCrnMode::kSequential, /*has_deadline=*/true,
+        /*full_clock_stage2=*/true, /*max_time_ms=*/600.0,
+        /*s1_deadline_frac=*/0.50, now,
+        now + std::chrono::milliseconds(300),
+        now + std::chrono::milliseconds(600), now,
+        /*max_inflight_worlds=*/64, /*active_tree=*/nullptr,
+        per_candidate_rollouts, new_rollouts_executed,
+        /*second_actions=*/{}, /*graft_actions=*/{},
+        /*win_speed_tiebreak_eps=*/0.0,
+        /*eff_ply2_s1=*/nullptr, /*belief_cfg=*/nullptr);
+    SPIEL_CHECK_EQ(waves, 1);
+    SPIEL_CHECK_EQ(per_candidate_rollouts[0].size(), 2u);
+  }
+}
+
 }  // namespace
 }  // namespace dune_imperium
 }  // namespace open_spiel
@@ -3298,5 +3427,7 @@ int main(int argc, char** argv) {
   IntrigueBeliefReweightingPreservesMultisetTest(game);
   std::cout << "[RUNNING] OptionalAbilityRescueTest" << std::endl;
   OptionalAbilityRescueTest(game);
+  std::cout << "[RUNNING] Cuda32bPriorAndWaveFloorTest" << std::endl;
+  Cuda32bPriorAndWaveFloorTest(game);
   std::cout << "[ALL TESTS PASSED]" << std::endl;
 }

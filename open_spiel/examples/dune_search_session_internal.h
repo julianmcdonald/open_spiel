@@ -264,7 +264,8 @@ void PlanV1SearchBudget(
     BatchedNNEvaluator* prior_eval,
     DuneSearchResult& result,
     double& target_ms,
-    int& ref_rollouts);
+    int& ref_rollouts,
+    int rollout_num_blocks = 16);
 
 }  // namespace dune_search_session_internal
 

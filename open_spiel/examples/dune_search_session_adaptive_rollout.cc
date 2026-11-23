@@ -620,7 +620,8 @@ void PlanV1SearchBudget(
     BatchedNNEvaluator* prior_eval,
     DuneSearchResult& result,
     double& target_ms,
-    int& ref_rollouts) {
+    int& ref_rollouts,
+    int rollout_num_blocks) {
   double usable_ms = full_search
       ? ((is_agent_turn_phase ? 0.980 : 0.980) * available_after_reserve_ms)
       : available_after_reserve_ms;
@@ -699,8 +700,14 @@ void PlanV1SearchBudget(
   static constexpr double kMinCudaWaveMs[11] = {
       700.0, 620.0, 520.0, 430.0, 340.0, 260.0, 190.0, 150.0, 120.0, 100.0, 90.0};
   const int cur_r_clamped = std::clamp(dune_state.GetCurrentRound(), 1, 10);
+  const double wave_block_scale =
+      (rollout_num_blocks > 16)
+          ? (static_cast<double>(rollout_num_blocks) / 16.0)
+          : 1.0;
   const double cuda_wave_floor_ms =
-      (superhuman_mode && is_cuda) ? kMinCudaWaveMs[cur_r_clamped] : 240.0;
+      (superhuman_mode && is_cuda)
+          ? (kMinCudaWaveMs[cur_r_clamped] * wave_block_scale)
+          : 240.0;
   const double min_subdecision_ms = superhuman_mode
       ? std::max(cuda_wave_floor_ms, 10.0 * round_ms_est)
       : std::max(1800.0, 24.0 * round_ms_est);
