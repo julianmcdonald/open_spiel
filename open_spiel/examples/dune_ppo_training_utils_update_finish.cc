@@ -602,8 +602,7 @@ void RunTrainPpoUpdateFinishPass(TrainPpoUpdateContext& ctx) {
         torch::Tensor selected_lp = log_probs.gather(1, da.unsqueeze(1)).squeeze(1);
 
         torch::Tensor log_ratio = selected_lp - dolp;
-        torch::Tensor ratio = torch::exp(log_ratio);
-        torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+        torch::Tensor approx_kl = ApproxKlK3Tensor(log_ratio);
 
         kl_sum += approx_kl.sum().item<double>();
         if (ctx.ema_model != nullptr) {

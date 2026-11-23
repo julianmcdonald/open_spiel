@@ -554,6 +554,22 @@ torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
   return ApplyLogitCapTensor(logits_f32 - LegalLogitMean(logits_f32, legal_mask),
                              logit_cap);
 }
+
+torch::Tensor ApproxKlK3Tensor(const torch::Tensor& log_ratio) {
+  torch::Tensor x = log_ratio.to(torch::kFloat32);
+  // Precompute exact factorials 2!..12! in double before casting 1/k! to FP32.
+  double fact[13];
+  fact[0] = 1.0;
+  fact[1] = 1.0;
+  for (int k = 2; k <= 12; ++k) {
+    fact[k] = fact[k - 1] * static_cast<double>(k);
+  }
+  torch::Tensor poly = torch::full_like(x, static_cast<float>(1.0 / fact[12]));
+  for (int k = 11; k >= 2; --k) {
+    poly = static_cast<float>(1.0 / fact[k]) + x * poly;
+  }
+  return torch::where(x.abs() < 0.5f, x * x * poly, torch::expm1(x) - x);
+}
 #endif  // OPEN_SPIEL_BUILD_WITH_LIBTORCH
 
 std::vector<double> ComputeTerminalReturns(

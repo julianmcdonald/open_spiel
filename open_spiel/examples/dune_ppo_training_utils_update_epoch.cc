@@ -174,7 +174,7 @@ void RunNonMicrobatchPpoForwardBackward(
       if (mb.mb_num_onpolicy_nontrivial > 0) {
         torch::Tensor mb_onpolicy_nontrivial =
             mb.mb_nontrivial & mb.mb_off_policy.logical_not();
-        mb.approx_kl = ((ratio - 1.0f) - log_ratio)
+        mb.approx_kl = ApproxKlK3Tensor(log_ratio)
                            .masked_select(mb_onpolicy_nontrivial)
                            .mean();
       } else {

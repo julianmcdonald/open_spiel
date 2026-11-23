@@ -556,6 +556,10 @@ torch::Tensor CenterAndCapLogitsTensor(const torch::Tensor& logits,
                                        const torch::Tensor& legal_mask,
                                        float logit_cap);
 
+// Numerically stable Monte Carlo K3 KL estimator E2(x) = exp(x) - 1 - x
+// evaluated in FP32 (Amos 2026, arXiv:2611.18511v1, Appendix A e2).
+torch::Tensor ApproxKlK3Tensor(const torch::Tensor& log_ratio);
+
 float ComputeRewardLambda(uint64_t env_steps, uint64_t start_steps, uint64_t decay_steps);
 
 // WO-PERF-1 (R2: per-model): re-arm the per-model "first TrainPpoUpdate in

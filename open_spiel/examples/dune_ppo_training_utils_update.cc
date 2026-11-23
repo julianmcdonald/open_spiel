@@ -162,8 +162,7 @@ bool RunTrainPpoUpdatePrepass(TrainPpoUpdateContext& ctx) {
             torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
 
             torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-            torch::Tensor ratio = torch::exp(log_ratio);
-            torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+            torch::Tensor approx_kl = ApproxKlK3Tensor(log_ratio);
 
             torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
             if (masked_kl.numel() > 0) {
@@ -220,8 +219,7 @@ bool RunTrainPpoUpdatePrepass(TrainPpoUpdateContext& ctx) {
             torch::Tensor selected_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1);
 
             torch::Tensor log_ratio = selected_log_probs - mb_old_log_probs;
-            torch::Tensor ratio = torch::exp(log_ratio);
-            torch::Tensor approx_kl = (ratio - 1.0f) - log_ratio;
+            torch::Tensor approx_kl = ApproxKlK3Tensor(log_ratio);
 
             torch::Tensor masked_kl = approx_kl.masked_select(mb_nontrivial);
             if (masked_kl.numel() > 0) {

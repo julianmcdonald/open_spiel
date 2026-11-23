@@ -7025,6 +7025,63 @@ int main() {
       run_parity_case(torch::Device(torch::kCUDA, 0), /*amp=*/true, /*tol=*/5e-3f);
     }
   } TEST_END();
+
+  TEST_BEGIN("ApproxKlK3Tensor Numerical Accuracy Near Zero") {
+    const std::vector<double> vals = {
+        0.0, 1e-7, -1e-7, 1e-5, -1e-5, 1e-3, -1e-3,
+        0.1, -0.1, 0.499, -0.499, 0.501, -0.501, 1.5, -2.0};
+    std::vector<float> vals_f32;
+    vals_f32.reserve(vals.size());
+    for (double xd : vals) {
+      vals_f32.push_back(static_cast<float>(xd));
+    }
+
+    auto run_device_check = [&](const torch::Device& dev) {
+      torch::Tensor x =
+          torch::tensor(vals_f32, torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+      torch::Tensor out = ApproxKlK3Tensor(x);
+      UTILS_CHECK(out.dtype() == torch::kFloat32);
+      torch::Tensor out_cpu = out.to(torch::kCPU);
+      auto acc = out_cpu.accessor<float, 1>();
+      for (size_t i = 0; i < vals.size(); ++i) {
+        const double xd = static_cast<double>(vals_f32[i]);
+        const double ref =
+            (std::abs(xd) < 1e-3)
+                ? xd * xd * (0.5 + xd / 6.0 + xd * xd / 24.0 + xd * xd * xd / 120.0)
+                : (std::expm1(xd) - xd);
+        const float got = acc[static_cast<int64_t>(i)];
+        UTILS_CHECK(got >= 0.0f);
+        if (vals_f32[i] == 0.0f) {
+          UTILS_CHECK(got == 0.0f);
+        } else {
+          UTILS_CHECK(ref > 0.0);
+          const double rel_err = std::abs(static_cast<double>(got) - ref) / ref;
+          UTILS_CHECK(rel_err < 1e-5);
+          if (std::abs(vals_f32[i] - 1e-5f) < 1e-12f) {
+            UTILS_CHECK(rel_err < 1e-6);
+            const float x_f = vals_f32[i];
+            const float naive = (std::exp(x_f) - 1.0f) - x_f;
+            const double naive_rel_err =
+                std::abs(static_cast<double>(naive) - ref) / ref;
+            UTILS_CHECK(naive_rel_err > 0.05);
+          }
+        }
+      }
+
+      // Verify BF16 inputs cast cleanly to FP32 inside ApproxKlK3Tensor.
+      torch::Tensor x_bf16 = x.to(torch::kBFloat16);
+      torch::Tensor out_bf16 = ApproxKlK3Tensor(x_bf16);
+      UTILS_CHECK(out_bf16.dtype() == torch::kFloat32);
+      torch::Tensor expected_bf16 = ApproxKlK3Tensor(x_bf16.to(torch::kFloat32));
+      UTILS_CHECK(torch::allclose(out_bf16, expected_bf16, 1e-7, 1e-12));
+      UTILS_CHECK((out_bf16 >= 0.0f).all().item<bool>());
+    };
+
+    run_device_check(torch::Device(torch::kCPU));
+    if (torch::cuda::is_available()) {
+      run_device_check(torch::Device(torch::kCUDA, 0));
+    }
+  } TEST_END();
 #endif
 
   std::cout << "\nAll " << pass_count << "/" << test_count << " tests PASSED!\n";

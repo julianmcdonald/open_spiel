@@ -429,7 +429,7 @@ void RunMicrobatchPpoForwardBackward(
           torch::Tensor sub_onpolicy_nt =
               sub_nt & sub_off_policy.logical_not();
           acc_approx_kl +=
-              (((ratio - 1.0f) - log_ratio)
+              (ApproxKlK3Tensor(log_ratio)
                    .masked_select(sub_onpolicy_nt)
                    .sum() /
                static_cast<float>(mb.mb_num_onpolicy_nontrivial))
