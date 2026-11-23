@@ -7,13 +7,16 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "dune_network_model.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_format.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/utils/json.h"
 
@@ -509,6 +512,256 @@ inline void RequireLegacy5580CheckpointOrDie(const std::string& checkpoint_path)
     SpielFatalError("Invalid checkpoint sidecar JSON: " + metadata_path.string());
   }
   RequireLegacy5580ManifestOrDie(metadata->GetObject(), checkpoint_path);
+}
+
+struct DetectedModelDimensions {
+  int hidden_dim = 0;
+  int num_blocks = 0;
+  int64_t input_dim = 0;
+  bool has_input_dim = false;
+  std::string market_mode;
+  dune_imperium::DeckPoolSemantics deck_pool_semantics =
+      dune_imperium::DeckPoolSemantics::kLegacy;
+  std::string semantic_descriptor_schema;
+  bool slot_indexed_out_layer_f = false;
+  bool use_nonlinear_value_head = false;
+  bool enable_zone_encoder = false;
+};
+
+inline bool DetectModelDimensions(const std::string& model_path,
+                                  DetectedModelDimensions* out,
+                                  bool require_sidecar_json = false) {
+  SPIEL_CHECK_TRUE(out != nullptr);
+  *out = DetectedModelDimensions{};
+
+  // 1. Locate sidecar JSON (<stem>.json, resolved symlink .json, or manifest.json).
+  std::string json_path;
+  std::filesystem::path p(model_path);
+  std::filesystem::path p_json = p;
+  p_json.replace_extension(".json");
+  if (std::filesystem::exists(p_json)) {
+    json_path = p_json.string();
+  } else {
+    std::error_code ec;
+    if (std::filesystem::is_symlink(p, ec)) {
+      auto resolved = std::filesystem::canonical(p, ec);
+      if (!ec) {
+        resolved.replace_extension(".json");
+        if (std::filesystem::exists(resolved)) {
+          json_path = resolved.string();
+        }
+      }
+    }
+    if (json_path.empty()) {
+      std::filesystem::path p_manifest = p.parent_path() / "manifest.json";
+      if (std::filesystem::exists(p_manifest)) {
+        json_path = p_manifest.string();
+      }
+    }
+  }
+
+  if (require_sidecar_json && json_path.empty()) {
+    SpielFatalError(
+        "DetectModelDimensions: Missing required checkpoint sidecar JSON for " +
+        model_path);
+  }
+
+  if (!json_path.empty()) {
+    try {
+      std::ifstream f(json_path);
+      if (f) {
+        std::string content((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+        auto val_opt = json::FromString(content);
+        if (val_opt.has_value() && val_opt->IsObject()) {
+          const auto& obj = val_opt->GetObject();
+          auto read_bool = [&obj](const char* key) -> bool {
+            auto it = obj.find(key);
+            if (it == obj.end()) return false;
+            return (it->second.IsBool() && it->second.GetBool()) ||
+                   (it->second.IsString() && it->second.GetString() == "true");
+          };
+
+          auto it_od = obj.find("observation_dim");
+          if (it_od != obj.end() && it_od->second.IsInt()) {
+            out->input_dim = it_od->second.GetInt();
+            out->has_input_dim = true;
+          }
+          auto it_mm = obj.find("market_appendix_mode");
+          if (it_mm != obj.end() && it_mm->second.IsString()) {
+            out->market_mode = it_mm->second.GetString();
+          }
+          auto it_sem = obj.find("deck_pool_semantics");
+          if (it_sem != obj.end() && it_sem->second.IsString()) {
+            out->deck_pool_semantics =
+                dune_imperium::ParseDeckPoolSemanticsOrDie(
+                    it_sem->second.GetString());
+          }
+          if (require_sidecar_json && out->has_input_dim &&
+              dune_imperium::IsExtendedInformationStateSize(out->input_dim)) {
+            if (it_mm == obj.end() || !it_mm->second.IsString()) {
+              SpielFatalError("Missing card-slot input mode for " + model_path);
+            }
+            const auto mode = dune_imperium::ParseMarketAppendixMode(
+                it_mm->second.GetString());
+            const auto schema = dune_imperium::GetInformationStateSchema(
+                mode, out->deck_pool_semantics);
+            SPIEL_CHECK_EQ(out->input_dim, schema.size);
+            auto it_schema = obj.find("feature_schema_sha256");
+            std::string schema_hash =
+                (it_schema != obj.end() && it_schema->second.IsString())
+                    ? it_schema->second.GetString()
+                    : "";
+            if (schema_hash != schema.sha256) {
+              SpielFatalError(absl::StrFormat(
+                  "Expanded model checkpoint %s has invalid or missing "
+                  "feature_schema_sha256 ('%s', expected '%s')",
+                  model_path, schema_hash, schema.sha256));
+            }
+          }
+          auto it_sds = obj.find("semantic_descriptor_schema");
+          if (it_sds != obj.end() && it_sds->second.IsString()) {
+            std::string schema = it_sds->second.GetString();
+            if (require_sidecar_json &&
+                schema != dune_semantic::kDescriptorSchemaVersionV2 &&
+                schema != dune_semantic::kDescriptorSchemaVersionV3 &&
+                schema != dune_semantic::kDescriptorSchemaVersionV4 &&
+                schema != dune_semantic::kDescriptorSchemaVersionV5) {
+              SpielFatalError(absl::StrFormat(
+                  "Model checkpoint %s has invalid semantic_descriptor_schema "
+                  "('%s')",
+                  model_path, schema));
+            }
+            out->semantic_descriptor_schema = std::move(schema);
+          }
+          out->slot_indexed_out_layer_f = read_bool("slot_indexed_out_layer_f");
+          out->use_nonlinear_value_head = read_bool("use_nonlinear_value_head");
+          out->enable_zone_encoder = read_bool("enable_zone_encoder");
+
+          if (require_sidecar_json) {
+            if (read_bool("enable_semantic_scorer") &&
+                (it_sds == obj.end() || !it_sds->second.IsString())) {
+              SpielFatalError(absl::StrFormat(
+                  "Model checkpoint %s has enable_semantic_scorer=true but "
+                  "missing or invalid semantic_descriptor_schema",
+                  model_path));
+            }
+            if (out->has_input_dim &&
+                dune_imperium::IsFullPublicInformationStateSize(
+                    out->input_dim)) {
+              if (!read_bool("enable_semantic_scorer")) {
+                SpielFatalError(absl::StrFormat(
+                    "Model checkpoint %s with full public information input "
+                    "dim requires enable_semantic_scorer=true",
+                    model_path));
+              }
+              if (it_sds == obj.end() || !it_sds->second.IsString() ||
+                  (it_sds->second.GetString() !=
+                       dune_semantic::kDescriptorSchemaVersionV3 &&
+                   it_sds->second.GetString() !=
+                       dune_semantic::kDescriptorSchemaVersionV4 &&
+                   it_sds->second.GetString() !=
+                       dune_semantic::kDescriptorSchemaVersionV5)) {
+                SpielFatalError(absl::StrFormat(
+                    "Model checkpoint %s with 9182 input dim requires "
+                    "semantic_descriptor_schema='%s', '%s', or '%s'",
+                    model_path, dune_semantic::kDescriptorSchemaVersionV3,
+                    dune_semantic::kDescriptorSchemaVersionV4,
+                    dune_semantic::kDescriptorSchemaVersionV5));
+              }
+            }
+          }
+
+          auto it_hd = obj.find("hidden_dim");
+          auto it_nb = obj.find("num_blocks");
+          if (it_hd != obj.end() && it_hd->second.IsInt() &&
+              it_nb != obj.end() && it_nb->second.IsInt()) {
+            out->hidden_dim = static_cast<int>(it_hd->second.GetInt());
+            out->num_blocks = static_cast<int>(it_nb->second.GetInt());
+            return true;
+          }
+          auto it_arch = obj.find("architecture");
+          if (it_arch != obj.end() && it_arch->second.IsObject()) {
+            const auto& arch_obj = it_arch->second.GetObject();
+            auto it_arch_hd = arch_obj.find("hidden_dim");
+            auto it_arch_nb = arch_obj.find("num_blocks");
+            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
+                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
+              out->hidden_dim = static_cast<int>(it_arch_hd->second.GetInt());
+              out->num_blocks = static_cast<int>(it_arch_nb->second.GetInt());
+              return true;
+            }
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      if (require_sidecar_json) {
+        SpielFatalError(absl::StrFormat(
+            "Error reading or parsing sidecar JSON for %s: %s", model_path,
+            e.what()));
+      }
+      std::cerr << "Error parsing sidecar JSON for " << model_path << ": "
+                << e.what() << "\n";
+    }
+  }
+
+  // 2. Fall back to weights key-based inspection.
+  try {
+    torch::serialize::InputArchive archive;
+    archive.load_from(model_path, torch::kCPU);
+
+    torch::serialize::InputArchive input_layer_archive;
+    archive.read("input_layer", input_layer_archive);
+    torch::Tensor weight;
+    input_layer_archive.read("weight", weight);
+    if (require_sidecar_json) {
+      if (dune_imperium::IsExtendedInformationStateSize(weight.size(1))) {
+        SpielFatalError(
+            "Extended information state checkpoint requires valid schema "
+            "metadata: " +
+            model_path);
+      }
+      torch::serialize::InputArchive s_arch;
+      if (archive.try_read("semantic_scorer", s_arch)) {
+        SpielFatalError(
+            "Checkpoint contains semantic_scorer module but sidecar metadata "
+            "is missing or invalid: " +
+            model_path);
+      }
+    }
+    out->hidden_dim = static_cast<int>(weight.size(0));
+    out->input_dim = weight.size(1);
+    out->has_input_dim = true;
+
+    int blocks = 0;
+    while (true) {
+      torch::serialize::InputArchive res_archive;
+      if (!archive.try_read("res" + std::to_string(blocks + 1), res_archive)) {
+        break;
+      }
+      ++blocks;
+    }
+    out->num_blocks = blocks;
+
+    torch::serialize::InputArchive vh2_arch;
+    if (archive.try_read("value_head2", vh2_arch)) {
+      out->use_nonlinear_value_head = true;
+    }
+
+    if (require_sidecar_json) {
+      std::cerr << "WARNING: Manifest JSON not found for model checkpoint "
+                << model_path << ". Auto-detected architecture (hidden_dim="
+                << out->hidden_dim << ", num_blocks=" << out->num_blocks
+                << ") from weight keys. "
+                << "Note: this inspection logic is coupled to the "
+                << "SharedDunePolicyValueNetImpl class architecture.\n";
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to detect model dimensions from " << model_path
+              << ": " << e.what() << "\n";
+    return false;
+  }
 }
 
 }  // namespace open_spiel

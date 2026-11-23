@@ -70,196 +70,34 @@ bool DetectModelDimensions(
     dune_imperium::DeckPoolSemantics* deck_pool_semantics,
     std::string* semantic_descriptor_schema,
     bool* slot_indexed_out_layer_f) {
-  // 1. Try to find a JSON file
-  std::string json_path = "";
-  std::filesystem::path p(model_path);
-  std::filesystem::path p_json = p;
-  p_json.replace_extension(".json");
-  if (std::filesystem::exists(p_json)) {
-    json_path = p_json.string();
-  } else {
-    std::filesystem::path p_parent_manifest = p.parent_path() / "manifest.json";
-    if (std::filesystem::exists(p_parent_manifest)) {
-      json_path = p_parent_manifest.string();
-    }
-  }
-
-  if (json_path.empty()) {
-    SpielFatalError("DetectModelDimensions: Missing required checkpoint sidecar JSON for " + model_path);
-  }
-
-  if (!json_path.empty()) {
-    try {
-      std::ifstream f(json_path);
-      if (f) {
-        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        auto val_opt = json::FromString(content);
-        if (val_opt.has_value() && val_opt->IsObject()) {
-          const auto& obj = val_opt->GetObject();
-          if (input_dim != nullptr) {
-            auto it_od = obj.find("observation_dim");
-            if (it_od != obj.end() && it_od->second.IsInt()) {
-              *input_dim = static_cast<int>(it_od->second.GetInt());
-            }
-          }
-          if (market_mode != nullptr) {
-            auto it_mm = obj.find("market_appendix_mode");
-            if (it_mm != obj.end() && it_mm->second.IsString()) {
-              *market_mode = it_mm->second.GetString();
-            }
-          }
-          dune_imperium::DeckPoolSemantics sem = dune_imperium::DeckPoolSemantics::kLegacy;
-          auto it_sem = obj.find("deck_pool_semantics");
-          if (it_sem != obj.end() && it_sem->second.IsString()) {
-            sem = dune_imperium::ParseDeckPoolSemanticsOrDie(it_sem->second.GetString());
-          }
-          if (deck_pool_semantics != nullptr) {
-            *deck_pool_semantics = sem;
-          }
-          if (input_dim != nullptr && dune_imperium::IsExtendedInformationStateSize(*input_dim)) {
-            auto it_mode = obj.find("market_appendix_mode");
-            if (it_mode == obj.end() || !it_mode->second.IsString()) {
-              SpielFatalError("Missing card-slot input mode for " + model_path);
-            }
-            const auto mode = ParseMarketMode(it_mode->second.GetString());
-            const auto schema = dune_imperium::GetInformationStateSchema(mode, sem);
-            SPIEL_CHECK_EQ(*input_dim, schema.size);
-            auto it_schema = obj.find("feature_schema_sha256");
-            std::string schema_hash = (it_schema != obj.end() && it_schema->second.IsString()) ? it_schema->second.GetString() : "";
-            if (schema_hash != schema.sha256) {
-              SpielFatalError(absl::StrFormat(
-                  "Expanded model checkpoint %s has invalid or missing feature_schema_sha256 ('%s', expected '%s')",
-                  model_path, schema_hash, schema.sha256));
-            }
-          }
-          auto it_sds = obj.find("semantic_descriptor_schema");
-          if (it_sds != obj.end() && it_sds->second.IsString()) {
-            std::string schema = it_sds->second.GetString();
-            if (schema != dune_semantic::kDescriptorSchemaVersionV2 &&
-                schema != dune_semantic::kDescriptorSchemaVersionV3 &&
-                schema != dune_semantic::kDescriptorSchemaVersionV4 &&
-                schema != dune_semantic::kDescriptorSchemaVersionV5) {
-              SpielFatalError(absl::StrFormat(
-                  "Model checkpoint %s has invalid semantic_descriptor_schema ('%s')",
-                  model_path, schema));
-            }
-            if (semantic_descriptor_schema != nullptr) {
-              *semantic_descriptor_schema = schema;
-            }
-          }
-          if (slot_indexed_out_layer_f != nullptr) {
-            auto it_sif = obj.find("slot_indexed_out_layer_f");
-            if (it_sif != obj.end()) {
-              *slot_indexed_out_layer_f = (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
-                                          (it_sif->second.IsString() && it_sif->second.GetString() == "true");
-            } else {
-              *slot_indexed_out_layer_f = false;
-            }
-          }
-          auto it_ess = obj.find("enable_semantic_scorer");
-          if (it_ess != obj.end()) {
-            bool enabled = (it_ess->second.IsBool() && it_ess->second.GetBool()) ||
-                           (it_ess->second.IsString() && it_ess->second.GetString() == "true");
-            if (enabled) {
-              if (it_sds == obj.end() || !it_sds->second.IsString()) {
-                SpielFatalError(absl::StrFormat(
-                    "Model checkpoint %s has enable_semantic_scorer=true but missing or invalid semantic_descriptor_schema",
-                    model_path));
-              }
-            }
-          }
-          if (input_dim != nullptr && dune_imperium::IsFullPublicInformationStateSize(*input_dim)) {
-            auto it_ess_9182 = obj.find("enable_semantic_scorer");
-            bool enabled = it_ess_9182 != obj.end() &&
-                           ((it_ess_9182->second.IsBool() && it_ess_9182->second.GetBool()) ||
-                            (it_ess_9182->second.IsString() && it_ess_9182->second.GetString() == "true"));
-            if (!enabled) {
-              SpielFatalError(absl::StrFormat(
-                  "Model checkpoint %s with full public information input dim requires enable_semantic_scorer=true",
-                  model_path));
-            }
-            if (it_sds == obj.end() || !it_sds->second.IsString() ||
-                (it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV3 &&
-                 it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV4 &&
-                 it_sds->second.GetString() != dune_semantic::kDescriptorSchemaVersionV5)) {
-              SpielFatalError(absl::StrFormat(
-                  "Model checkpoint %s with 9182 input dim requires semantic_descriptor_schema='%s', '%s', or '%s'",
-                  model_path, dune_semantic::kDescriptorSchemaVersionV3,
-                  dune_semantic::kDescriptorSchemaVersionV4,
-                  dune_semantic::kDescriptorSchemaVersionV5));
-            }
-          }
-          auto it_hd = obj.find("hidden_dim");
-          auto it_nb = obj.find("num_blocks");
-          if (it_hd != obj.end() && it_hd->second.IsInt() &&
-              it_nb != obj.end() && it_nb->second.IsInt()) {
-            *hidden_dim = it_hd->second.GetInt();
-            *num_blocks = it_nb->second.GetInt();
-            return true;
-          }
-          auto it_arch = obj.find("architecture");
-          if (it_arch != obj.end() && it_arch->second.IsObject()) {
-            const auto& arch_obj = it_arch->second.GetObject();
-            auto it_arch_hd = arch_obj.find("hidden_dim");
-            auto it_arch_nb = arch_obj.find("num_blocks");
-            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
-                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
-              *hidden_dim = it_arch_hd->second.GetInt();
-              *num_blocks = it_arch_nb->second.GetInt();
-              return true;
-            }
-          }
-        }
-      }
-    } catch (const std::exception& e) {
-      SpielFatalError(absl::StrFormat("Error reading or parsing sidecar JSON for %s: %s", model_path, e.what()));
-    }
-  }
-
-  // 2. Fall back to weights key-based inspection
-  try {
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_path, torch::kCPU);
-
-    torch::serialize::InputArchive input_layer_archive;
-    archive.read("input_layer", input_layer_archive);
-    torch::Tensor weight;
-    input_layer_archive.read("weight", weight);
-    if (dune_imperium::IsExtendedInformationStateSize(weight.size(1))) {
-      SpielFatalError("Extended information state checkpoint requires valid schema metadata: " + model_path);
-    }
-    torch::serialize::InputArchive s_arch;
-    if (archive.try_read("semantic_scorer", s_arch)) {
-      SpielFatalError("Checkpoint contains semantic_scorer module but sidecar metadata is missing or invalid: " + model_path);
-    }
-    *hidden_dim = weight.size(0);
-    if (input_dim != nullptr) {
-      *input_dim = weight.size(1);
-    }
-
-    int blocks = 0;
-    while (true) {
-      torch::serialize::InputArchive res_archive;
-      std::string block_name = "res" + std::to_string(blocks + 1);
-      try {
-        archive.read(block_name, res_archive);
-        blocks++;
-      } catch (...) {
-        break;
-      }
-    }
-    *num_blocks = blocks;
-
-    std::cerr << "WARNING: Manifest JSON not found for model checkpoint " << model_path
-              << ". Auto-detected architecture (hidden_dim=" << *hidden_dim
-              << ", num_blocks=" << *num_blocks << ") from weight keys. "
-              << "Note: this inspection logic is coupled to the SharedDunePolicyValueNetImpl class architecture.\n";
-    return true;
-  } catch (const std::exception& e) {
-    std::cerr << "ERROR: Failed to detect model dimensions or load archive from " << model_path
-              << ": " << e.what() << "\n";
+  open_spiel::DetectedModelDimensions detected;
+  if (!open_spiel::DetectModelDimensions(
+          model_path, &detected, /*require_sidecar_json=*/true)) {
     return false;
   }
+  if (hidden_dim != nullptr) {
+    *hidden_dim = detected.hidden_dim;
+  }
+  if (num_blocks != nullptr) {
+    *num_blocks = detected.num_blocks;
+  }
+  if (input_dim != nullptr && detected.has_input_dim) {
+    *input_dim = static_cast<int>(detected.input_dim);
+  }
+  if (market_mode != nullptr && !detected.market_mode.empty()) {
+    *market_mode = detected.market_mode;
+  }
+  if (deck_pool_semantics != nullptr) {
+    *deck_pool_semantics = detected.deck_pool_semantics;
+  }
+  if (semantic_descriptor_schema != nullptr &&
+      !detected.semantic_descriptor_schema.empty()) {
+    *semantic_descriptor_schema = detected.semantic_descriptor_schema;
+  }
+  if (slot_indexed_out_layer_f != nullptr) {
+    *slot_indexed_out_layer_f = detected.slot_indexed_out_layer_f;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

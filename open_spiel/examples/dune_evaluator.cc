@@ -20,147 +20,6 @@
 
 using namespace open_spiel;
 
-namespace {
-
-bool DetectModelDimensions(
-    const std::string& model_path,
-    int64_t* hidden_dim,
-    int* num_blocks,
-    int64_t* input_dim,
-    std::string* semantic_descriptor_schema,
-    bool* slot_indexed_out_layer_f,
-    bool* use_nonlinear_value_head,
-    bool* enable_zone_encoder) {
-  std::string json_path;
-  std::filesystem::path p(model_path);
-  std::filesystem::path p_json = p;
-  p_json.replace_extension(".json");
-  if (std::filesystem::exists(p_json)) {
-    json_path = p_json.string();
-  } else {
-    std::error_code ec;
-    if (std::filesystem::is_symlink(p, ec)) {
-      auto resolved = std::filesystem::canonical(p, ec);
-      if (!ec) {
-        resolved.replace_extension(".json");
-        if (std::filesystem::exists(resolved)) {
-          json_path = resolved.string();
-        }
-      }
-    }
-    if (json_path.empty()) {
-      std::filesystem::path p_manifest = p.parent_path() / "manifest.json";
-      if (std::filesystem::exists(p_manifest)) {
-        json_path = p_manifest.string();
-      }
-    }
-  }
-
-  if (!json_path.empty()) {
-    try {
-      std::ifstream f(json_path);
-      if (f) {
-        std::string content((std::istreambuf_iterator<char>(f)),
-                            std::istreambuf_iterator<char>());
-        auto val_opt = json::FromString(content);
-        if (val_opt.has_value() && val_opt->IsObject()) {
-          const auto& obj = val_opt->GetObject();
-          if (input_dim != nullptr) {
-            auto it_od = obj.find("observation_dim");
-            if (it_od != obj.end() && it_od->second.IsInt()) {
-              *input_dim = it_od->second.GetInt();
-            }
-          }
-          if (semantic_descriptor_schema != nullptr) {
-            auto it_sds = obj.find("semantic_descriptor_schema");
-            if (it_sds != obj.end() && it_sds->second.IsString()) {
-              *semantic_descriptor_schema = it_sds->second.GetString();
-            }
-          }
-          if (slot_indexed_out_layer_f != nullptr) {
-            auto it_sif = obj.find("slot_indexed_out_layer_f");
-            if (it_sif != obj.end()) {
-              *slot_indexed_out_layer_f =
-                  (it_sif->second.IsBool() && it_sif->second.GetBool()) ||
-                  (it_sif->second.IsString() && it_sif->second.GetString() == "true");
-            }
-          }
-          if (use_nonlinear_value_head != nullptr) {
-            auto it_nl = obj.find("use_nonlinear_value_head");
-            if (it_nl != obj.end()) {
-              *use_nonlinear_value_head =
-                  (it_nl->second.IsBool() && it_nl->second.GetBool()) ||
-                  (it_nl->second.IsString() && it_nl->second.GetString() == "true");
-            }
-          }
-          if (enable_zone_encoder != nullptr) {
-            auto it_ze = obj.find("enable_zone_encoder");
-            if (it_ze != obj.end()) {
-              *enable_zone_encoder =
-                  (it_ze->second.IsBool() && it_ze->second.GetBool()) ||
-                  (it_ze->second.IsString() && it_ze->second.GetString() == "true");
-            }
-          }
-          auto it_hd = obj.find("hidden_dim");
-          auto it_nb = obj.find("num_blocks");
-          if (it_hd != obj.end() && it_hd->second.IsInt() &&
-              it_nb != obj.end() && it_nb->second.IsInt()) {
-            *hidden_dim = it_hd->second.GetInt();
-            *num_blocks = static_cast<int>(it_nb->second.GetInt());
-            return true;
-          }
-          auto it_arch = obj.find("architecture");
-          if (it_arch != obj.end() && it_arch->second.IsObject()) {
-            const auto& arch_obj = it_arch->second.GetObject();
-            auto it_arch_hd = arch_obj.find("hidden_dim");
-            auto it_arch_nb = arch_obj.find("num_blocks");
-            if (it_arch_hd != arch_obj.end() && it_arch_hd->second.IsInt() &&
-                it_arch_nb != arch_obj.end() && it_arch_nb->second.IsInt()) {
-              *hidden_dim = it_arch_hd->second.GetInt();
-              *num_blocks = static_cast<int>(it_arch_nb->second.GetInt());
-              return true;
-            }
-          }
-        }
-      }
-    } catch (const std::exception& e) {
-      std::cerr << "Error parsing sidecar JSON for " << model_path << ": " << e.what() << "\n";
-    }
-  }
-
-  try {
-    torch::serialize::InputArchive archive;
-    archive.load_from(model_path, torch::kCPU);
-    torch::serialize::InputArchive in_arch;
-    archive.read("input_layer", in_arch);
-    torch::Tensor weight;
-    in_arch.read("weight", weight);
-    *hidden_dim = weight.size(0);
-    if (input_dim != nullptr) {
-      *input_dim = weight.size(1);
-    }
-    int blocks = 0;
-    while (true) {
-      torch::serialize::InputArchive res_arch;
-      if (!archive.try_read("res" + std::to_string(blocks + 1), res_arch)) {
-        break;
-      }
-      ++blocks;
-    }
-    *num_blocks = blocks;
-    if (use_nonlinear_value_head != nullptr) {
-      torch::serialize::InputArchive vh2_arch;
-      *use_nonlinear_value_head = archive.try_read("value_head2", vh2_arch);
-    }
-    return true;
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to detect model dimensions from " << model_path << ": " << e.what() << "\n";
-    return false;
-  }
-}
-
-}  // namespace
-
 struct ActionProb {
   Action action;
   float probability;
@@ -568,17 +427,24 @@ int main(int argc, char* argv[]) {
   // 3. Auto-detect model dimensions and initialize network
   int64_t obs_size = game->InformationStateTensorShape()[0];
   int64_t action_size = game->NumDistinctActions();
-  std::string detected_schema = dune_semantic::kDescriptorSchemaVersionV3;
-  bool slot_indexed_f = false;
-  bool use_nonlinear_value_head = false;
-  bool enable_zone_encoder = false;
-  if (!DetectModelDimensions(
-          model_checkpoint, &hidden_dim, &num_blocks, &obs_size,
-          &detected_schema, &slot_indexed_f, &use_nonlinear_value_head,
-          &enable_zone_encoder)) {
+  open_spiel::DetectedModelDimensions detected;
+  if (!open_spiel::DetectModelDimensions(
+          model_checkpoint, &detected, /*require_sidecar_json=*/false)) {
     std::cerr << "[ERROR] Could not detect model dimensions for " << model_checkpoint << "\n";
     return 1;
   }
+  hidden_dim = detected.hidden_dim;
+  num_blocks = detected.num_blocks;
+  if (detected.has_input_dim) {
+    obs_size = detected.input_dim;
+  }
+  const std::string detected_schema =
+      detected.semantic_descriptor_schema.empty()
+          ? std::string(dune_semantic::kDescriptorSchemaVersionV3)
+          : detected.semantic_descriptor_schema;
+  const bool slot_indexed_f = detected.slot_indexed_out_layer_f;
+  const bool use_nonlinear_value_head = detected.use_nonlinear_value_head;
+  const bool enable_zone_encoder = detected.enable_zone_encoder;
   const bool has_semantic_scorer =
       CheckpointHasSemanticScorer(model_checkpoint, torch::kCPU);
 
